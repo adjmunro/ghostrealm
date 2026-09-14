@@ -5,9 +5,12 @@
 //! Built and tested headless; depends on no windowing, GPU, VT, or PTY code.
 
 pub mod command;
+pub mod config;
 pub mod fuzzy;
 pub mod registry;
 pub mod tree;
+
+pub use config::Config;
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};

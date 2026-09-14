@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{Args, Rect, Registry, SurfaceId, TabStatus};
+use ghostrealm_core::{Args, Config, Rect, Registry, SurfaceId, TabStatus};
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -23,16 +23,12 @@ use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState};
 
-const FONT_SIZE: f32 = 15.0;
-const LINE_HEIGHT: f32 = 18.0;
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
 /// Focused-pane border thickness, in physical pixels.
 const BORDER: f32 = 2.0;
 /// Max command-palette results shown at once.
 const PALETTE_MAX: usize = 12;
-/// Sidebar width in logical pixels (scaled at runtime).
-const SIDEBAR_W: f32 = 190.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -188,6 +184,7 @@ struct State {
 
     app: AppState,
     registry: Registry<AppState>,
+    cfg: Config,
     mods: Mods,
     scale: f32,
     cell_w: f32,
@@ -247,7 +244,13 @@ impl State {
         let palette_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
-        let (cell_w, cell_h) = measure_cell(&mut font_system, scale);
+        let cfg = ghostrealm_core::config::load_or_create();
+        let (cell_w, cell_h) = measure_cell(
+            &mut font_system,
+            scale,
+            cfg.terminal.font_size,
+            cfg.terminal.line_height,
+        );
 
         // App state: terminals wake the event loop through the proxy.
         let waker: Arc<dyn Fn() + Send + Sync> = {
@@ -297,6 +300,7 @@ impl State {
             quad_capacity,
             app,
             registry,
+            cfg,
             mods: Mods::default(),
             scale,
             cell_w,
@@ -310,9 +314,21 @@ impl State {
         self.dirty = true;
     }
 
+    fn metrics(&self) -> Metrics {
+        Metrics::new(
+            self.cfg.terminal.font_size * self.scale,
+            self.cfg.terminal.line_height * self.scale,
+        )
+    }
+
     fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
-        let (cw, ch) = measure_cell(&mut self.font_system, scale);
+        let (cw, ch) = measure_cell(
+            &mut self.font_system,
+            scale,
+            self.cfg.terminal.font_size,
+            self.cfg.terminal.line_height,
+        );
         self.cell_w = cw;
         self.cell_h = ch;
         self.dirty = true;
@@ -347,7 +363,7 @@ impl State {
     }
 
     fn sidebar_width(&self) -> f32 {
-        SIDEBAR_W * self.scale
+        self.cfg.sidebar.width * self.scale
     }
 
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
@@ -400,7 +416,7 @@ impl State {
         let bar_w = self.sidebar_width();
         let row_h = self.cell_h + 8.0 * self.scale;
         let pad = 8.0 * self.scale;
-        let metrics = Metrics::new(FONT_SIZE * self.scale, LINE_HEIGHT * self.scale);
+        let metrics = self.metrics();
         let active = self.app.tree.active_vtab();
         let vtabs: Vec<(String, TabStatus, bool)> = self
             .app
@@ -642,7 +658,7 @@ impl State {
             .map(|h| h.meta.title.to_string())
             .collect();
 
-        let metrics = Metrics::new(FONT_SIZE * self.scale, LINE_HEIGHT * self.scale);
+        let metrics = self.metrics();
         let line_h = self.cell_h;
         let pad = 10.0 * self.scale;
         let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
@@ -687,7 +703,7 @@ impl State {
                 },
                 sw,
                 sh,
-                [60, 90, 150],
+                self.cfg.chrome.accent,
                 0.9,
             ));
         }
@@ -771,7 +787,7 @@ impl State {
             self.prev_layout = layout.clone();
         }
 
-        let metrics = Metrics::new(FONT_SIZE * self.scale, LINE_HEIGHT * self.scale);
+        let metrics = self.metrics();
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut overlay_quads: Vec<QuadInstance> = Vec::new();
         let mut placements: Vec<Placement> = Vec::new();
@@ -856,7 +872,7 @@ impl State {
                 ));
             }
             if *focused && layout.len() > 1 {
-                push_border(&mut overlay_quads, *rect, sw, sh, [90, 140, 220]);
+                push_border(&mut overlay_quads, *rect, sw, sh, self.cfg.chrome.accent);
             }
         }
 
@@ -971,6 +987,7 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        let bg = self.cfg.chrome.background;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -981,9 +998,9 @@ impl State {
                     ops: wgpu::Operations {
                         // Divider/background behind panes.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: srgb_to_linear(20),
-                            g: srgb_to_linear(20),
-                            b: srgb_to_linear(24),
+                            r: srgb_to_linear(bg[0]),
+                            g: srgb_to_linear(bg[1]),
+                            b: srgb_to_linear(bg[2]),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -1178,8 +1195,13 @@ fn srgb_to_linear(c: u8) -> f64 {
     }
 }
 
-fn measure_cell(font_system: &mut FontSystem, scale: f32) -> (f32, f32) {
-    let metrics = Metrics::new(FONT_SIZE * scale, LINE_HEIGHT * scale);
+fn measure_cell(
+    font_system: &mut FontSystem,
+    scale: f32,
+    font_size: f32,
+    line_height: f32,
+) -> (f32, f32) {
+    let metrics = Metrics::new(font_size * scale, line_height * scale);
     let mut buf = Buffer::new(font_system, metrics);
     buf.set_text(
         "MMMMMMMMMM",
@@ -1193,8 +1215,8 @@ fn measure_cell(font_system: &mut FontSystem, scale: f32) -> (f32, f32) {
         .next()
         .map(|r| r.line_w / 10.0)
         .filter(|w| *w > 0.0)
-        .unwrap_or(FONT_SIZE * scale * 0.6);
-    (w, LINE_HEIGHT * scale)
+        .unwrap_or(font_size * scale * 0.6);
+    (w, line_height * scale)
 }
 
 fn build_quad_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
@@ -1271,14 +1293,17 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_quad_pipeline, measure_cell, QuadInstance, FONT_SIZE, LINE_HEIGHT};
+    use super::{build_quad_pipeline, measure_cell, QuadInstance};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
     use std::time::{Duration, Instant};
+
+    const FONT_SIZE: f32 = 15.0;
+    const LINE_HEIGHT: f32 = 18.0;
 
     #[test]
     fn full_screen_shaping_cost() {
         let mut font_system = FontSystem::new();
-        let (_cw, _ch) = measure_cell(&mut font_system, 1.0);
+        let (_cw, _ch) = measure_cell(&mut font_system, 1.0, FONT_SIZE, LINE_HEIGHT);
         let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
         let rows = 24usize;
         let cols = 80usize;
