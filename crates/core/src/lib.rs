@@ -7,6 +7,8 @@
 pub mod command;
 pub mod fuzzy;
 pub mod registry;
+pub mod tree;
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
+pub use tree::{Axis, Node, Pane, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};
