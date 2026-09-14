@@ -366,7 +366,7 @@ impl State {
             let idx = ((y - pad) / row_h).floor() as usize;
             if let Some(v) = self.app.tree.vtabs().get(idx) {
                 let id = v.id;
-                self.app.tree.focus_vtab(id);
+                self.app.focus_vtab(id);
                 self.dirty = true;
             }
             return;

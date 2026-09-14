@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, Tree, VtabId,
+    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, TabStatus,
+    Tree, VtabId,
 };
 use ghostrealm_terminal::{KeyPress, Lifecycle, TerminalBackend};
 use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, PtyWaker};
@@ -173,6 +174,41 @@ impl AppState {
         }
     }
 
+    /// Focus a vtab, clearing an `unread` status to `read` (a sticky
+    /// `needs_input` is preserved).
+    pub fn focus_vtab(&mut self, id: VtabId) {
+        if !self.tree.focus_vtab(id) {
+            return;
+        }
+        let clear = self
+            .tree
+            .vtab(id)
+            .map(|v| matches!(v.status, TabStatus::Unread { .. }))
+            .unwrap_or(false);
+        if clear {
+            self.tree.set_status(id, TabStatus::Read);
+        }
+    }
+
+    /// Set the active vtab's inbox status (used by mark-read / needs-input etc).
+    pub fn set_active_status(&mut self, status: TabStatus) {
+        if let Some(vt) = self.active() {
+            self.tree.set_status(vt, status);
+        }
+    }
+
+    fn vtab_of_surface(&self, sid: SurfaceId) -> Option<VtabId> {
+        self.tree
+            .vtabs()
+            .iter()
+            .find(|v| {
+                v.panes()
+                    .iter()
+                    .any(|p| p.surfaces.iter().any(|s| s.id == sid))
+            })
+            .map(|v| v.id)
+    }
+
     /// The active surface of the focused pane of the active vtab.
     pub fn focused_surface(&self) -> Option<SurfaceId> {
         let vt = self.active()?;
@@ -223,11 +259,14 @@ impl AppState {
     /// Pump all terminals and sync program-set surface titles into the tree.
     /// Returns true if any terminal produced output (the grid may have changed).
     pub fn pump_all(&mut self) -> bool {
+        let active = self.tree.active_vtab();
         let mut changed = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
+        let mut changed_surfaces: Vec<SurfaceId> = Vec::new();
         for (id, term) in self.surfaces.iter_mut() {
             if term.pump() {
                 changed = true;
+                changed_surfaces.push(*id);
             }
             if let Some(t) = term.title() {
                 titles.push((*id, t));
@@ -235,6 +274,24 @@ impl AppState {
         }
         for (id, title) in titles {
             self.tree.set_surface_title(id, title, false);
+        }
+        // Output in a background vtab marks it unread (needs_input is sticky).
+        for sid in changed_surfaces {
+            let Some(vt) = self.vtab_of_surface(sid) else {
+                continue;
+            };
+            if Some(vt) == active {
+                continue;
+            }
+            let sticky = self
+                .tree
+                .vtab(vt)
+                .map(|v| matches!(v.status, TabStatus::NeedsInput))
+                .unwrap_or(false);
+            if !sticky {
+                self.tree
+                    .set_status(vt, TabStatus::Unread { success: true });
+            }
         }
         changed
     }
@@ -369,6 +426,54 @@ mod tests {
     }
 
     #[test]
+    fn background_output_marks_unread_and_focus_clears() {
+        // Both tabs print after a short delay; tab a is active, tab b is not.
+        let mut s = AppState::new().with_shell_line("sleep 0.15; printf DONE; sleep 3");
+        let a = s.new_vtab().unwrap();
+        let b = s.new_vtab().unwrap();
+        s.focus_vtab(a); // a active, b in the background
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            s.pump_all();
+            let b_status = s.tree.vtab(b).unwrap().status;
+            if matches!(b_status, TabStatus::Unread { .. }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background tab never went unread"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // a stayed read (its output arrived while it was active).
+        assert_eq!(s.tree.vtab(a).unwrap().status, TabStatus::Read);
+        // Focusing b clears it.
+        s.focus_vtab(b);
+        assert_eq!(s.tree.vtab(b).unwrap().status, TabStatus::Read);
+    }
+
+    #[test]
+    fn needs_input_is_sticky_over_output() {
+        let mut s = AppState::new().with_shell_line("sleep 0.15; printf X; sleep 3");
+        let a = s.new_vtab().unwrap();
+        let b = s.new_vtab().unwrap();
+        s.focus_vtab(a);
+        s.tree.set_status(b, TabStatus::NeedsInput);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            s.pump_all();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            s.tree.vtab(b).unwrap().status,
+            TabStatus::NeedsInput,
+            "needs_input must not be overwritten by background output"
+        );
+    }
+
+    #[test]
     fn write_input_reaches_child() {
         // `cat` echoes its stdin back through the PTY.
         let mut s = AppState::new().with_shell_line("cat");
@@ -489,6 +594,39 @@ pub fn build_registry() -> Registry<AppState> {
         ),
         Box::new(|s: &mut AppState, _| {
             s.new_surface_in_focused().map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.mark_read",
+            "Mark Tab Read",
+            "Clear the active tab's inbox status",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::Read);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.needs_input",
+            "Mark Tab Needs Input",
+            "Flag the active tab as blocked awaiting the user (agent self-report)",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::NeedsInput);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.dismiss",
+            "Dismiss Tab Status",
+            "Clear a sticky needs-input flag",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::Read);
             Ok(CmdOutcome::ok())
         }),
     );
