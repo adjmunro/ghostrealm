@@ -11,4 +11,4 @@ pub mod tree;
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
-pub use tree::{Axis, Node, Pane, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};
+pub use tree::{Axis, Node, Pane, PaneId, Rect, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};

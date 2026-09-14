@@ -62,6 +62,15 @@ pub enum Axis {
     TopBottom,
 }
 
+/// A pixel rectangle (used for pane layout). Backend/GPU-agnostic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 /// A node in a vtab's binary split tree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
@@ -75,6 +84,77 @@ pub enum Node {
 }
 
 impl Node {
+    /// Compute the pixel rect of every leaf pane within `rect`, splitting by the
+    /// stored ratios and leaving a `gap` between split children (the divider).
+    pub fn layout(&self, rect: Rect, gap: f32) -> Vec<(PaneId, Rect)> {
+        let mut out = Vec::new();
+        self.layout_into(rect, gap, &mut out);
+        out
+    }
+
+    fn layout_into(&self, rect: Rect, gap: f32, out: &mut Vec<(PaneId, Rect)>) {
+        match self {
+            Node::Leaf(p) => out.push((p.id, rect)),
+            Node::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match axis {
+                Axis::LeftRight => {
+                    let avail = (rect.w - gap).max(0.0);
+                    let fw = (avail * ratio).max(0.0);
+                    let sw = (avail - fw).max(0.0);
+                    first.layout_into(
+                        Rect {
+                            x: rect.x,
+                            y: rect.y,
+                            w: fw,
+                            h: rect.h,
+                        },
+                        gap,
+                        out,
+                    );
+                    second.layout_into(
+                        Rect {
+                            x: rect.x + fw + gap,
+                            y: rect.y,
+                            w: sw,
+                            h: rect.h,
+                        },
+                        gap,
+                        out,
+                    );
+                }
+                Axis::TopBottom => {
+                    let avail = (rect.h - gap).max(0.0);
+                    let fh = (avail * ratio).max(0.0);
+                    let sh = (avail - fh).max(0.0);
+                    first.layout_into(
+                        Rect {
+                            x: rect.x,
+                            y: rect.y,
+                            w: rect.w,
+                            h: fh,
+                        },
+                        gap,
+                        out,
+                    );
+                    second.layout_into(
+                        Rect {
+                            x: rect.x,
+                            y: rect.y + fh + gap,
+                            w: rect.w,
+                            h: sh,
+                        },
+                        gap,
+                        out,
+                    );
+                }
+            },
+        }
+    }
+
     fn collect_panes<'a>(&'a self, out: &mut Vec<&'a Pane>) {
         match self {
             Node::Leaf(p) => out.push(p),
@@ -177,6 +257,10 @@ impl Vtab {
     }
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.root.find_pane_mut(id)
+    }
+    /// Pixel rect of each pane in this vtab within `rect`.
+    pub fn layout(&self, rect: Rect, gap: f32) -> Vec<(PaneId, Rect)> {
+        self.root.layout(rect, gap)
     }
 }
 
@@ -505,6 +589,87 @@ mod tests {
         t.set_surface_title(surf, "bash", false); // program tries to change it
         let v = &t.vtabs()[0];
         assert_eq!(v.panes()[0].surfaces[0].title, "my-editor");
+    }
+
+    #[test]
+    fn layout_single_pane_fills_rect() {
+        let mut t = Tree::new();
+        let (vt, _, _) = t.add_vtab("a");
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let panes = t.vtab(vt).unwrap().layout(rect, 4.0);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].1, rect);
+    }
+
+    #[test]
+    fn layout_leftright_splits_width_with_gap() {
+        let mut t = Tree::new();
+        let (vt, pane, _) = t.add_vtab("a");
+        t.split(vt, pane, Axis::LeftRight).unwrap();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 804.0,
+            h: 600.0,
+        };
+        let panes = t.vtab(vt).unwrap().layout(rect, 4.0);
+        assert_eq!(panes.len(), 2);
+        // 0.5 ratio of (804-4)=800 → 400 each; second starts after first+gap.
+        assert_eq!(
+            panes[0].1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 600.0
+            }
+        );
+        assert_eq!(
+            panes[1].1,
+            Rect {
+                x: 404.0,
+                y: 0.0,
+                w: 400.0,
+                h: 600.0
+            }
+        );
+    }
+
+    #[test]
+    fn layout_topbottom_splits_height() {
+        let mut t = Tree::new();
+        let (vt, pane, _) = t.add_vtab("a");
+        t.split(vt, pane, Axis::TopBottom).unwrap();
+        let rect = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 300.0,
+            h: 204.0,
+        };
+        let panes = t.vtab(vt).unwrap().layout(rect, 4.0);
+        assert_eq!(
+            panes[0].1,
+            Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 300.0,
+                h: 100.0
+            }
+        );
+        assert_eq!(
+            panes[1].1,
+            Rect {
+                x: 10.0,
+                y: 124.0,
+                w: 300.0,
+                h: 100.0
+            }
+        );
     }
 
     #[test]
