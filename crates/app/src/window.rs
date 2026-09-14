@@ -325,6 +325,26 @@ impl State {
         self.dirty = true;
     }
 
+    /// Canonical chord string for the current modifiers + `c` (matches
+    /// `ghostrealm_core::config::normalize_chord`'s order).
+    fn chord_string(&self, c: char) -> String {
+        let mut s = String::new();
+        if self.mods.ctrl {
+            s.push_str("ctrl+");
+        }
+        if self.mods.alt {
+            s.push_str("alt+");
+        }
+        if self.mods.shift {
+            s.push_str("shift+");
+        }
+        if self.mods.super_ {
+            s.push_str("cmd+");
+        }
+        s.push(c.to_ascii_lowercase());
+        s
+    }
+
     fn metrics(&self) -> Metrics {
         Metrics::new(
             self.cfg.terminal.font_size * self.scale,
@@ -572,30 +592,20 @@ impl State {
         // Cmd-chords drive the app via the registry; everything else goes to the
         // focused terminal. (Cmd is reserved so app shortcuts never reach a shell.)
         if self.mods.super_ {
-            let ch = match &event.logical_key {
+            if let Some(c) = match &event.logical_key {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
-            };
-            if let Some(c) = ch {
-                if c.eq_ignore_ascii_case(&'k') {
-                    self.palette = Some(Palette {
-                        query: String::new(),
-                        selected: 0,
-                    });
-                    self.dirty = true;
-                    return;
-                }
-                let id = match (c.to_ascii_lowercase(), self.mods.shift) {
-                    ('t', _) => Some("tab.new"),
-                    ('d', false) => Some("split.leftright"),
-                    ('d', true) => Some("split.topbottom"),
-                    ('w', _) => Some("pane.close"),
-                    (']', _) => Some("pane.focus_next"),
-                    ('n', _) => Some("surface.new"),
-                    _ => None,
-                };
-                if let Some(id) = id {
-                    let _ = self.registry.execute(id, &Args::new(), &mut self.app);
+            } {
+                let chord = self.chord_string(c);
+                if let Some(id) = self.cfg.binding(&chord) {
+                    if id == "palette.toggle" {
+                        self.palette = Some(Palette {
+                            query: String::new(),
+                            selected: 0,
+                        });
+                    } else {
+                        let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                    }
                     self.dirty = true;
                 }
             }

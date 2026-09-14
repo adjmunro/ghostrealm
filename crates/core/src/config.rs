@@ -3,6 +3,7 @@
 //! new keys don't break old files. On first run the documented default is
 //! written out.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,78 @@ pub struct Config {
     pub chrome: Chrome,
     pub tabs: Tabs,
     pub inbox: Inbox,
+    /// `[keybindings]`: chord -> command id, overlaying the built-in defaults.
+    /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
+    /// app handles specially (open the command palette).
+    pub keybindings: HashMap<String, String>,
+}
+
+impl Config {
+    /// Resolve a chord (any modifier order/alias) to a command id: a user
+    /// override wins, else the built-in default, else `None`.
+    pub fn binding(&self, chord: &str) -> Option<String> {
+        let target = normalize_chord(chord)?;
+        for (k, v) in &self.keybindings {
+            if normalize_chord(k).as_deref() == Some(target.as_str()) {
+                return Some(v.clone());
+            }
+        }
+        default_bindings()
+            .get(target.as_str())
+            .map(|s| s.to_string())
+    }
+}
+
+/// Built-in chord -> command id defaults (canonical chord form).
+fn default_bindings() -> HashMap<&'static str, &'static str> {
+    HashMap::from([
+        ("cmd+k", "palette.toggle"),
+        ("cmd+t", "tab.new"),
+        ("cmd+w", "pane.close"),
+        ("cmd+d", "split.leftright"),
+        ("cmd+shift+d", "split.topbottom"),
+        ("cmd+n", "surface.new"),
+        ("cmd+]", "pane.focus_next"),
+    ])
+}
+
+/// Canonicalise a chord string: lowercase, modifier aliases folded, fixed
+/// modifier order (`ctrl+alt+shift+cmd+<key>`). Returns `None` if it has no key
+/// or more than one non-modifier token.
+pub fn normalize_chord(chord: &str) -> Option<String> {
+    let (mut ctrl, mut alt, mut shift, mut cmd) = (false, false, false, false);
+    let mut key: Option<String> = None;
+    for tok in chord.split('+') {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "opt" | "option" => alt = true,
+            "shift" => shift = true,
+            "cmd" | "super" | "win" | "meta" | "command" => cmd = true,
+            other => {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(other.to_string());
+            }
+        }
+    }
+    let key = key?;
+    let mut s = String::new();
+    if ctrl {
+        s.push_str("ctrl+");
+    }
+    if alt {
+        s.push_str("alt+");
+    }
+    if shift {
+        s.push_str("shift+");
+    }
+    if cmd {
+        s.push_str("cmd+");
+    }
+    s.push_str(&key);
+    Some(s)
 }
 
 /// The default config written on first run. Kept in sync with [`Config::default`]
@@ -142,6 +215,17 @@ autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
 [inbox]
 auto_read_after = 60    # seconds of focus before unread -> read (0 = manual only)
 auto_unread_before = 10 # grace seconds after read to re-mark unread on unfocus
+
+[keybindings]
+# Override chord -> command id (Cmd chords only; others go to the terminal).
+# Unset entries use the built-in defaults:
+#   "cmd+k" = "palette.toggle"
+#   "cmd+t" = "tab.new"
+#   "cmd+w" = "pane.close"
+#   "cmd+d" = "split.leftright"
+#   "cmd+shift+d" = "split.topbottom"
+#   "cmd+n" = "surface.new"
+#   "cmd+]" = "pane.focus_next"
 "#;
 
 /// The config file path: `$XDG_CONFIG_HOME/ghostrealm/config.toml`, falling back
@@ -216,5 +300,27 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn normalize_chord_canonicalises_order_and_aliases() {
+        assert_eq!(
+            normalize_chord("Shift+Super+D").as_deref(),
+            Some("shift+cmd+d")
+        );
+        assert_eq!(normalize_chord("command+t").as_deref(), Some("cmd+t"));
+        assert_eq!(normalize_chord("ctrl").as_deref(), None); // no key
+    }
+
+    #[test]
+    fn binding_uses_defaults_then_overrides() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.new"));
+        assert_eq!(cfg.binding("cmd+k").as_deref(), Some("palette.toggle"));
+        assert_eq!(cfg.binding("cmd+j"), None);
+        // A user override wins, in any modifier order/alias.
+        cfg.keybindings
+            .insert("Super+T".to_string(), "tab.close".to_string());
+        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.close"));
     }
 }
