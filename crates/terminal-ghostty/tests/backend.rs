@@ -59,9 +59,8 @@ fn renders_child_output_into_grid() {
 #[test]
 fn applies_sgr_colors() {
     // Bright-red "X" via SGR, then reset.
-    let mut term =
-        GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("printf '\\033[91mX\\033[0m'")))
-            .expect("spawn backend");
+    let mut term = GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("printf '\\033[91mX\\033[0m'")))
+        .expect("spawn backend");
     pump_until_exit(&mut term, Duration::from_secs(5));
     let grid = term.snapshot();
     let cell = grid.cell(0, 0).expect("cell (0,0)");
@@ -80,8 +79,7 @@ fn applies_sgr_colors() {
 
 #[test]
 fn detects_child_exit() {
-    let mut term =
-        GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("exit 7"))).expect("spawn backend");
+    let mut term = GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("exit 7"))).expect("spawn backend");
     pump_until_exit(&mut term, Duration::from_secs(5));
     match term.lifecycle() {
         Lifecycle::Exited(code) => assert_eq!(
@@ -103,7 +101,11 @@ fn encodes_basic_keys() {
         GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("sleep 2"))).expect("spawn backend");
 
     let enter = term
-        .encode_key(&KeyPress { key: Key::Enter, mods: Mods::default(), text: None })
+        .encode_key(&KeyPress {
+            key: Key::Enter,
+            mods: Mods::default(),
+            text: None,
+        })
         .expect("encode enter");
     assert_eq!(
         enter, b"\r",
@@ -123,7 +125,10 @@ fn encodes_basic_keys() {
     let ctrl_c = term
         .encode_key(&KeyPress {
             key: Key::Char('c'),
-            mods: Mods { ctrl: true, ..Default::default() },
+            mods: Mods {
+                ctrl: true,
+                ..Default::default()
+            },
             text: None,
         })
         .expect("encode ctrl-c");

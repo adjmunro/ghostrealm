@@ -152,8 +152,7 @@ impl GhosttyTerminal {
         let cursor_vp = snap.cursor_viewport().context("cursor")?;
         let cursor_visible = snap.cursor_visible().unwrap_or(false);
 
-        let mut cells: Vec<Cell> =
-            Vec::with_capacity(cols as usize * rows as usize);
+        let mut cells: Vec<Cell> = Vec::with_capacity(cols as usize * rows as usize);
 
         let mut row_iter = RowIterator::new().context("row iter")?;
         let mut cell_iter = CellIterator::new().context("cell iter")?;
@@ -165,8 +164,18 @@ impl GhosttyTerminal {
             let mut cells_it = cell_iter.update(row).context("cell update")?;
             while let Some(cell) = cells_it.next() {
                 let style = cell.style().unwrap_or_default();
-                let mut fg = cell.fg_color().ok().flatten().map(rgb).unwrap_or(default_fg);
-                let mut bg = cell.bg_color().ok().flatten().map(rgb).unwrap_or(default_bg);
+                let mut fg = cell
+                    .fg_color()
+                    .ok()
+                    .flatten()
+                    .map(rgb)
+                    .unwrap_or(default_fg);
+                let mut bg = cell
+                    .bg_color()
+                    .ok()
+                    .flatten()
+                    .map(rgb)
+                    .unwrap_or(default_bg);
                 if style.inverse {
                     std::mem::swap(&mut fg, &mut bg);
                 }
@@ -187,7 +196,16 @@ impl GhosttyTerminal {
                     break;
                 }
             }
-            row_cells.resize(cols as usize, Cell { text: String::new(), fg: default_fg, bg: default_bg, attrs: CellAttrs::default(), wide: false });
+            row_cells.resize(
+                cols as usize,
+                Cell {
+                    text: String::new(),
+                    fg: default_fg,
+                    bg: default_bg,
+                    attrs: CellAttrs::default(),
+                    wide: false,
+                },
+            );
             cells.append(&mut row_cells);
             produced_rows += 1;
             if produced_rows >= rows {
@@ -197,15 +215,38 @@ impl GhosttyTerminal {
         // Pad any rows the iterator did not yield (e.g. all-blank tail).
         let want = cols as usize * rows as usize;
         if cells.len() < want {
-            cells.resize(want, Cell { text: String::new(), fg: default_fg, bg: default_bg, attrs: CellAttrs::default(), wide: false });
+            cells.resize(
+                want,
+                Cell {
+                    text: String::new(),
+                    fg: default_fg,
+                    bg: default_bg,
+                    attrs: CellAttrs::default(),
+                    wide: false,
+                },
+            );
         }
 
         let cursor = match cursor_vp {
-            Some(c) => Cursor { col: c.x, row: c.y, visible: cursor_visible },
-            None => Cursor { col: 0, row: 0, visible: false },
+            Some(c) => Cursor {
+                col: c.x,
+                row: c.y,
+                visible: cursor_visible,
+            },
+            None => Cursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
         };
 
-        Ok(Grid { size: GridSize { cols, rows }, cells, cursor, default_fg, default_bg })
+        Ok(Grid {
+            size: GridSize { cols, rows },
+            cells,
+            cursor,
+            default_fg,
+            default_bg,
+        })
     }
 
     fn map_key(key: Key) -> vtkey::Key {
@@ -276,7 +317,9 @@ impl GhosttyTerminal {
         }
         self.encoder.set_options_from_terminal(&self.term);
         let mut out = Vec::new();
-        self.encoder.encode_to_vec(&event, &mut out).context("encode key")?;
+        self.encoder
+            .encode_to_vec(&event, &mut out)
+            .context("encode key")?;
         Ok(out)
     }
 }
@@ -349,7 +392,11 @@ impl TerminalBackend for GhosttyTerminal {
     }
 
     fn title(&self) -> Option<String> {
-        self.term.title().ok().map(|s| s.to_string()).filter(|s| !s.is_empty())
+        self.term
+            .title()
+            .ok()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn lifecycle(&mut self) -> Lifecycle {

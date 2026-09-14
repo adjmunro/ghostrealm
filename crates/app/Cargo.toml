@@ -11,3 +11,8 @@ ghostrealm-core.workspace = true
 ghostrealm-terminal.workspace = true
 ghostrealm-terminal-ghostty.workspace = true
 anyhow.workspace = true
+winit = "0.30"
+wgpu = "30"
+glyphon = "0.12"
+pollster = "0.4"
+bytemuck = { version = "1.25.2", features = ["derive"] }

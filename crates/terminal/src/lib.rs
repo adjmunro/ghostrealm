@@ -36,7 +36,13 @@ pub struct Cell {
 
 impl Cell {
     fn blank(fg: Rgb, bg: Rgb) -> Self {
-        Cell { text: String::new(), fg, bg, attrs: CellAttrs::default(), wide: false }
+        Cell {
+            text: String::new(),
+            fg,
+            bg,
+            attrs: CellAttrs::default(),
+            wide: false,
+        }
     }
 }
 
@@ -74,7 +80,11 @@ impl Grid {
         Grid {
             size,
             cells: vec![Cell::blank(default_fg, default_bg); count],
-            cursor: Cursor { col: 0, row: 0, visible: false },
+            cursor: Cursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
             default_fg,
             default_bg,
         }
@@ -85,7 +95,8 @@ impl Grid {
         if col >= self.size.cols || row >= self.size.rows {
             return None;
         }
-        self.cells.get(row as usize * self.size.cols as usize + col as usize)
+        self.cells
+            .get(row as usize * self.size.cols as usize + col as usize)
     }
 }
 
