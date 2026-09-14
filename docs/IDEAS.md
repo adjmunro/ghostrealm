@@ -20,3 +20,12 @@ vtabs/panes and want a new full-width pane the same height across the bottom, no
 nested inside one of them. The binary split tree can't express that as a simple
 leaf split; may need drop zones at the workspace edges (split the whole workspace)
 vs pane-interior zones (split that leaf). Mull over the tree model implications.
+
+---
+
+Shell LSP assist (exploratory — not yet): help write good zsh while typing in the
+terminal — completions/diagnostics from a shell language server (or shellcheck for
+diagnostics). Open questions: how to hook into the live command line without a real
+editor buffer (the shell owns the line), whether to intercept before the PTY or run
+it against a scratch buffer, and how it interacts with the shell's own completion.
+Likely pairs with the basic text-editor pane (TODO) where we *do* own the buffer.

@@ -171,3 +171,27 @@
   config flag (e.g. [input] focus_follows_mouse) and, when on, update focused_pane
   on CursorMoved hit-test. Decide the default.
 - Reason: requested; common tiling-WM behaviour.
+
+---
+
+[2026-09-15@af1c592] "Run Anything" — double-Ctrl (IntelliJ style)
+
+- Requires: double-tap detector (shared with the double-Shift palette trigger)
+- Detail: Double-tap Ctrl opens a single-line input; on Enter, open a NEW vtab and
+  run the typed command in the user's default shell (like IntelliJ "Run Anything").
+  Reuse the palette overlay's input rendering; distinguish mode (command vs command-
+  palette). Configurable trigger via [keybindings].
+- Reason: fast "spawn a tab running X" flow.
+
+---
+
+[2026-09-15@af1c592] Basic text-editor pane (non-terminal surface type)
+
+- Requires: perf work first (per user); generalising a pane's content beyond a
+  terminal surface
+- Detail: A minimal editable text frame as an alternative pane/surface content, so
+  panes aren't only terminals. Needs the model to allow a surface to be a terminal
+  OR an editor buffer, plus text input/editing + rendering (reuse the glyphon text
+  path). Keep scope minimal to start (open/edit/save a file). May later host the
+  shell-LSP idea (see IDEAS.md).
+- Reason: requested; expands the app beyond terminals.
