@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/terminal",
+    "crates/terminal-ghostty",
+    "crates/core",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+ghostrealm-terminal = { path = "crates/terminal" }
+ghostrealm-terminal-ghostty = { path = "crates/terminal-ghostty" }
+ghostrealm-core = { path = "crates/core" }
+
+# libghostty-vt: git, not crates.io — the published crate pins a Zig-0.15-era
+# Ghostty. This rev pins Ghostty 22d13172 (requires Zig 0.16.0, see mise.toml).
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0" }
+portable-pty = "0.9"
+anyhow = "1"

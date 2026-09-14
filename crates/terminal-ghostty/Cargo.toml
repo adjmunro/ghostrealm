@@ -1,0 +1,12 @@
+[package]
+name = "ghostrealm-terminal-ghostty"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ghostrealm-terminal.workspace = true
+libghostty-vt.workspace = true
+portable-pty.workspace = true
+anyhow.workspace = true
