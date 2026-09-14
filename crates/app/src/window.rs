@@ -179,6 +179,8 @@ struct State {
     palette: Option<Palette>,
     /// Text buffers for the sidebar's vtab names (drawn in the main text pass).
     sidebar_buffers: Vec<Buffer>,
+    /// Text buffers for pane tab-strip labels (drawn in the main text pass).
+    strip_buffers: Vec<Buffer>,
     /// Last cursor position in physical pixels, for click hit-testing.
     cursor: (f32, f32),
 
@@ -199,6 +201,14 @@ struct State {
 struct Palette {
     query: String,
     selected: usize,
+}
+
+/// A pane resolved for rendering: its rect, focus, and its surfaces
+/// (id, display title, is-active).
+struct PaneRender {
+    rect: Rect,
+    focused: bool,
+    surfaces: Vec<(SurfaceId, String, bool)>,
 }
 
 impl State {
@@ -294,6 +304,7 @@ impl State {
             palette_buffers: Vec::new(),
             palette: None,
             sidebar_buffers: Vec::new(),
+            strip_buffers: Vec::new(),
             cursor: (0.0, 0.0),
             quad_pipeline,
             quad_buffer,
@@ -344,8 +355,18 @@ impl State {
         self.dirty = true;
     }
 
-    /// The active vtab's panes as (active surface, pixel rect, focused).
-    fn active_layout(&self, workspace: Rect) -> Vec<(SurfaceId, Rect, bool)> {
+    /// Height of a pane's horizontal tab strip in physical pixels.
+    fn strip_height(&self) -> f32 {
+        self.cell_h + 6.0 * self.scale
+    }
+
+    /// Whether a pane with `n` surfaces shows a tab strip.
+    fn strip_shown(&self, n: usize) -> bool {
+        n > 1 || !self.cfg.tabs.autohide_single_tab
+    }
+
+    /// The active vtab's panes with full surface info, laid out in `workspace`.
+    fn active_panes(&self, workspace: Rect) -> Vec<PaneRender> {
         let Some(vt) = self.app.tree.active_vtab() else {
             return Vec::new();
         };
@@ -356,8 +377,24 @@ impl State {
             .into_iter()
             .filter_map(|(pid, rect)| {
                 let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
-                let sid = pane.active_surface()?.id;
-                Some((sid, rect, pid == vtab.focused_pane))
+                let surfaces = pane
+                    .surfaces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let title = if s.title.is_empty() {
+                            "sh".to_string()
+                        } else {
+                            s.title.clone()
+                        };
+                        (s.id, title, i == pane.active)
+                    })
+                    .collect();
+                Some(PaneRender {
+                    rect,
+                    focused: pid == vtab.focused_pane,
+                    surfaces,
+                })
             })
             .collect()
     }
@@ -394,20 +431,45 @@ impl State {
             w: sw - sidebar_w,
             h: sh,
         };
-        if let Some(vt) = self.app.tree.active_vtab() {
-            let hit = self.app.tree.vtab(vt).and_then(|vtab| {
-                vtab.layout(workspace, DIVIDER)
-                    .into_iter()
-                    .find(|(_, r)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
-                    .map(|(pid, _)| pid)
-            });
-            if let Some(pid) = hit {
-                if let Some(vtab) = self.app.tree.vtab_mut(vt) {
-                    vtab.focused_pane = pid;
-                    self.dirty = true;
-                }
+        let Some(vt) = self.app.tree.active_vtab() else {
+            return;
+        };
+        // (pane id, rect, surface count) of the pane under the cursor.
+        let hit = self.app.tree.vtab(vt).and_then(|vtab| {
+            vtab.layout(workspace, DIVIDER)
+                .into_iter()
+                .find_map(|(pid, r)| {
+                    if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                        let n = vtab
+                            .panes()
+                            .into_iter()
+                            .find(|p| p.id == pid)
+                            .map(|p| p.surfaces.len());
+                        n.map(|n| (pid, r, n))
+                    } else {
+                        None
+                    }
+                })
+        });
+        let Some((pid, rect, n)) = hit else { return };
+
+        // A click in a visible tab strip switches the pane's active surface.
+        let strip_h = if self.strip_shown(n) {
+            self.strip_height()
+        } else {
+            0.0
+        };
+        if strip_h > 0.0 && y < rect.y + strip_h {
+            let tab_w = rect.w / n.max(1) as f32;
+            let idx = (((x - rect.x) / tab_w).floor() as usize).min(n - 1);
+            if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
+                pane.active = idx;
             }
         }
+        if let Some(vtab) = self.app.tree.vtab_mut(vt) {
+            vtab.focused_pane = pid;
+        }
+        self.dirty = true;
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -773,40 +835,137 @@ impl State {
             w: (sw - sidebar_w).max(1.0),
             h: sh,
         };
-        let layout = self.active_layout(workspace);
+        let panes = self.active_panes(workspace);
+
+        // Resolve each pane's tab-strip height and terminal (below-strip) rect.
+        let mut resolved: Vec<(PaneRender, f32, Rect)> = Vec::with_capacity(panes.len());
+        for pr in panes {
+            let strip_h = if self.strip_shown(pr.surfaces.len()) {
+                self.strip_height()
+            } else {
+                0.0
+            };
+            let term = Rect {
+                x: pr.rect.x,
+                y: pr.rect.y + strip_h,
+                w: pr.rect.w,
+                h: (pr.rect.h - strip_h).max(1.0),
+            };
+            resolved.push((pr, strip_h, term));
+        }
 
         // Layout changed → resize each pane's terminal and invalidate row cache.
-        if layout != self.prev_layout {
+        let layout_sig: Vec<(SurfaceId, Rect, bool)> = resolved
+            .iter()
+            .filter_map(|(pr, _, term)| {
+                let sid = pr
+                    .surfaces
+                    .iter()
+                    .find(|(_, _, a)| *a)
+                    .map(|(id, _, _)| *id)?;
+                Some((sid, *term, pr.focused))
+            })
+            .collect();
+        if layout_sig != self.prev_layout {
             let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
-            for (sid, rect, _) in &layout {
-                let cols = ((rect.w / self.cell_w).floor() as u16).max(1);
-                let rows = ((rect.h / self.cell_h).floor() as u16).max(1);
+            for (sid, term, _) in &layout_sig {
+                let cols = ((term.w / self.cell_w).floor() as u16).max(1);
+                let rows = ((term.h / self.cell_h).floor() as u16).max(1);
                 self.app.resize_surface(*sid, cols, rows, cw, ch);
             }
             self.prev_row_hash.clear();
-            self.prev_layout = layout.clone();
+            self.prev_layout = layout_sig;
         }
 
         let metrics = self.metrics();
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut overlay_quads: Vec<QuadInstance> = Vec::new();
         let mut placements: Vec<Placement> = Vec::new();
+        let mut strip_placements: Vec<Placement> = Vec::new();
         let mut pool_idx = 0usize;
+        let mut strip_idx = 0usize;
+        let multi_pane = resolved.len() > 1;
 
-        for (sid, rect, focused) in &layout {
-            let grid = match self.app.terminal(*sid) {
+        for (pr, strip_h, term) in &resolved {
+            // Horizontal tab strip (autohidden for single-surface panes).
+            if *strip_h > 0.0 {
+                let n = pr.surfaces.len().max(1);
+                let tab_w = pr.rect.w / n as f32;
+                bg_quads.push(rect_quad(
+                    Rect {
+                        x: pr.rect.x,
+                        y: pr.rect.y,
+                        w: pr.rect.w,
+                        h: *strip_h,
+                    },
+                    sw,
+                    sh,
+                    self.cfg.chrome.sidebar,
+                    1.0,
+                ));
+                for (i, (_sid, title, is_active)) in pr.surfaces.iter().enumerate() {
+                    let tab_x = pr.rect.x + i as f32 * tab_w;
+                    if *is_active {
+                        bg_quads.push(rect_quad(
+                            Rect {
+                                x: tab_x,
+                                y: pr.rect.y,
+                                w: tab_w,
+                                h: *strip_h,
+                            },
+                            sw,
+                            sh,
+                            self.cfg.chrome.accent,
+                            0.5,
+                        ));
+                    }
+                    let pad = 6.0 * self.scale;
+                    if strip_idx >= self.strip_buffers.len() {
+                        self.strip_buffers
+                            .push(Buffer::new(&mut self.font_system, metrics));
+                    }
+                    let buf = &mut self.strip_buffers[strip_idx];
+                    buf.set_metrics(metrics);
+                    buf.set_size(Some((tab_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+                    buf.set_rich_text(
+                        std::iter::once((title.as_str(), attrs_for([220, 220, 230]))),
+                        &Attrs::new().family(Family::SansSerif),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    strip_placements.push(Placement {
+                        idx: strip_idx,
+                        left: tab_x + pad,
+                        top: pr.rect.y + (*strip_h - self.cell_h) * 0.5,
+                        bounds: TextBounds {
+                            left: tab_x as i32,
+                            top: pr.rect.y as i32,
+                            right: (tab_x + tab_w) as i32,
+                            bottom: (pr.rect.y + *strip_h) as i32,
+                        },
+                        color: [220, 220, 230],
+                    });
+                    strip_idx += 1;
+                }
+            }
+
+            let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
+                continue;
+            };
+            let grid = match self.app.terminal(*active_sid) {
                 Some(t) => t.snapshot(),
                 None => continue,
             };
-            // Pane background fills its rect (dividers show the clear colour).
-            bg_quads.push(rect_quad(*rect, sw, sh, grid.default_bg, 1.0));
+            // Pane background fills its terminal rect.
+            bg_quads.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
 
             for row in 0..grid.size.rows {
                 for col in 0..grid.size.cols {
                     if let Some(c) = grid.cell(col, row) {
                         if c.bg != grid.default_bg {
                             bg_quads.push(rect_quad(
-                                cell_rect(*rect, col, row, self.cell_w, self.cell_h),
+                                cell_rect(*term, col, row, self.cell_w, self.cell_h),
                                 sw,
                                 sh,
                                 c.bg,
@@ -825,7 +984,7 @@ impl State {
                 }
                 let unchanged = self.prev_row_hash.get(pool_idx).copied().flatten() == Some(hash);
                 let buf = &mut self.row_buffers[pool_idx];
-                buf.set_size(Some(rect.w.max(1.0)), Some(self.cell_h));
+                buf.set_size(Some(term.w.max(1.0)), Some(self.cell_h));
                 if !unchanged {
                     buf.set_metrics(metrics);
                     buf.set_rich_text(
@@ -839,13 +998,13 @@ impl State {
                 }
                 placements.push(Placement {
                     idx: pool_idx,
-                    left: rect.x,
-                    top: rect.y + row as f32 * self.cell_h,
+                    left: term.x,
+                    top: term.y + row as f32 * self.cell_h,
                     bounds: TextBounds {
-                        left: rect.x as i32,
-                        top: rect.y as i32,
-                        right: (rect.x + rect.w) as i32,
-                        bottom: (rect.y + rect.h) as i32,
+                        left: term.x as i32,
+                        top: term.y as i32,
+                        right: (term.x + term.w) as i32,
+                        bottom: (term.y + term.h) as i32,
                     },
                     color: grid.default_fg,
                 });
@@ -859,7 +1018,7 @@ impl State {
                     .unwrap_or(grid.default_fg);
                 overlay_quads.push(rect_quad(
                     cell_rect(
-                        *rect,
+                        *term,
                         grid.cursor.col,
                         grid.cursor.row,
                         self.cell_w,
@@ -871,8 +1030,8 @@ impl State {
                     0.6,
                 ));
             }
-            if *focused && layout.len() > 1 {
-                push_border(&mut overlay_quads, *rect, sw, sh, self.cfg.chrome.accent);
+            if pr.focused && multi_pane {
+                push_border(&mut overlay_quads, pr.rect, sw, sh, self.cfg.chrome.accent);
             }
         }
 
@@ -913,6 +1072,15 @@ impl State {
             .collect();
         text_areas.extend(sidebar_placements.iter().map(|p| TextArea {
             buffer: &self.sidebar_buffers[p.idx],
+            left: p.left,
+            top: p.top,
+            scale: 1.0,
+            bounds: p.bounds,
+            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+            custom_glyphs: &[],
+        }));
+        text_areas.extend(strip_placements.iter().map(|p| TextArea {
+            buffer: &self.strip_buffers[p.idx],
             left: p.left,
             top: p.top,
             scale: 1.0,

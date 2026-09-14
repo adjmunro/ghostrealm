@@ -91,6 +91,22 @@ impl Default for Inbox {
     }
 }
 
+/// `[tabs]`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tabs {
+    /// Hide a pane's horizontal tab strip when it holds only one terminal.
+    pub autohide_single_tab: bool,
+}
+
+impl Default for Tabs {
+    fn default() -> Self {
+        Tabs {
+            autohide_single_tab: true,
+        }
+    }
+}
+
 /// The whole config.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -98,6 +114,7 @@ pub struct Config {
     pub sidebar: Sidebar,
     pub terminal: Terminal,
     pub chrome: Chrome,
+    pub tabs: Tabs,
     pub inbox: Inbox,
 }
 
@@ -118,6 +135,9 @@ line_height = 18.0
 background = [20, 20, 24]   # behind panes / split dividers
 sidebar = [24, 24, 30]
 accent = [90, 140, 220]     # focused-pane border, palette selection
+
+[tabs]
+autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
 
 [inbox]
 auto_read_after = 60    # seconds of focus before unread -> read (0 = manual only)
