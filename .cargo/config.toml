@@ -1,0 +1,4 @@
+# Local builds compile libghostty-vt-sys (via Zig) for the build machine's CPU.
+# Drop/override this for a distributable baseline binary.
+[env]
+LIBGHOSTTY_VT_SYS_CPU = "native"
