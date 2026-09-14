@@ -53,13 +53,17 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 ## Status
 
 - [x] Phase 1: libghostty verification + backend + window spike.
-- [~] Phase 2: command registry [x] + tab/split tree [x] (both headless-tested);
-      palette overlay + AppState integration into the app still to do.
-- [ ] Phase 3: agent control/introspection channel (bumped ahead of shell polish).
-- [ ] Phase 4: sidebar, splits, per-split tab strips, focus routing.
+- [~] Phase 2: command registry [x] + tab/split tree [x]; palette overlay to do.
+- [x] Phase 3: agent control/introspection channel — `AppState` (Tree + registry +
+      terminals) + a JSON drive/observe channel (`ghostrealm agent`). A working,
+      agent-drivable multiplexer, verified headlessly.
+- [ ] Phase 4: render `AppState`'s active vtab as a multi-pane GUI (currently the
+      window still hosts a single standalone terminal), sidebar of vtabs, per-pane
+      htab strips, focus routing; then palette overlay.
 - [ ] Phase 5: status/inbox state machine.
 - [ ] Phase 6: settings TOML + styling inheritance.
 
-Next keystone: wire `core` (`Tree` + `Registry<AppState>` + a `SurfaceId ->
-GhosttyTerminal` map) into the app so the window becomes a real multiplexer; that
-unblocks the palette, sidebar, and agent channel. See [TODO.md](TODO.md).
+Next keystone: make `window.rs` render `AppState` (recurse `Node` → pane rects,
+draw each surface's grid in its rect, route input/resize through `AppState`)
+instead of owning one `GhosttyTerminal`. That turns the window into the real
+multiplexer and lets the palette overlay reuse the registry. See [TODO.md](TODO.md).
