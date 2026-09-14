@@ -30,9 +30,10 @@
 
 ---
 
-[2026-09-14T20:12+1200@no-vcs]
+[2026-09-14T20:12+1200@e96f61f0]
 
-> `@no-vcs`: repository not yet under version control at time of writing; replace with SHA once initialised.
+> Baseline: written before version control; dated to the project's first commit
+> (`e96f61f chore(repo): initialise project baseline`).
 
 - Category: Terminal backend / core dependency
 - Detail: Build on `libghostty-vt` (VT engine only) + own PTY (`portable-pty`) + own wgpu glyph renderer + font/shaping stack (`cosmic-text` candidate). `libghostty-vt` gives cells; we draw pixels. Ghostling (single-file reference terminal shipped with the crate) is the renderer starting point.
