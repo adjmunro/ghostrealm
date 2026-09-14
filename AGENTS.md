@@ -19,6 +19,11 @@
 - Do not bump Zig blindly: its major.minor must equal the pinned Ghostty's `build.zig.zon` `minimum_zig_version`, and it must be new enough to link this host's macOS SDK. See [`docs/libghostty-findings.md`](docs/libghostty-findings.md) → "Build toolchain".
 - `libghostty-vt` comes from git (pinned `rev`), not crates.io — the published crate is stale.
 
+## Verifying the app
+
+- The sandbox has no display: a launched `ghostrealm` window never fires winit's `resumed`, so it neither draws nor writes its config — it just idles without error. A "still alive after 2s" smoke check only proves it didn't crash at startup; it does NOT prove rendering. Don't claim the GUI works from that alone.
+- Verify headlessly instead: `cargo test` (core logic, backend PTY/VT, agent protocol, inbox, config) + the offscreen wgpu render test. Drive behaviour through `ghostrealm agent` (JSON on stdin/stdout) or `ghostrealm dump <cmd>` (grid as text). Real visual confirmation needs a human on a desktop session.
+
 ## Editing Agents.md
 
 > Agents.md is a record of **mistakes**.

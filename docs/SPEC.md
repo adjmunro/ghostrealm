@@ -53,17 +53,24 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 ## Status
 
 - [x] Phase 1: libghostty verification + backend + window spike.
-- [~] Phase 2: command registry [x] + tab/split tree [x]; palette overlay to do.
-- [x] Phase 3: agent control/introspection channel — `AppState` (Tree + registry +
-      terminals) + a JSON drive/observe channel (`ghostrealm agent`). A working,
-      agent-drivable multiplexer, verified headlessly.
-- [ ] Phase 4: render `AppState`'s active vtab as a multi-pane GUI (currently the
-      window still hosts a single standalone terminal), sidebar of vtabs, per-pane
-      htab strips, focus routing; then palette overlay.
-- [ ] Phase 5: status/inbox state machine.
-- [ ] Phase 6: settings TOML + styling inheritance.
+- [x] Phase 2: command registry + tab/split tree + command palette (Cmd+K).
+- [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON).
+- [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
+      htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
+- [~] Phase 5: inbox status — background output → unread, focus → read, sticky
+      needs_input (agent/palette settable). To do: busy detection (foreground
+      process-group / OSC 133) and the auto-read dwell timer.
+- [~] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
+      colours, autohide). To do: Ghostty palette inheritance, config-driven
+      keybindings, sidebar `side = right`.
 
-Next keystone: make `window.rs` render `AppState` (recurse `Node` → pane rects,
-draw each surface's grid in its rect, route input/resize through `AppState`)
-instead of owning one `GhosttyTerminal`. That turns the window into the real
-multiplexer and lets the palette overlay reuse the registry. See [TODO.md](TODO.md).
+Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
+sidebar/inbox, palette, config, and the agent channel are all in and tested.
+
+## Verifying the GUI
+
+The dev sandbox has no display, so `resumed` never fires there — the window,
+config-file creation, and interactive paths only run on a real desktop session.
+Automated coverage stands in: 44 tests (core logic, backend PTY/VT, agent
+protocol, inbox, config) plus a headless offscreen render test. Eyeball the
+window by running `ghostrealm` on a real session.
