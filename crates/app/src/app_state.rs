@@ -14,7 +14,7 @@ use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, TabStatus,
     Tree, VtabId,
 };
-use ghostrealm_terminal::{KeyPress, Lifecycle, TerminalBackend};
+use ghostrealm_terminal::{KeyPress, Lifecycle, Scroll, TerminalBackend};
 use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, PtyWaker};
 
 /// Default grid size for a surface before the GUI assigns it a pane rect.
@@ -59,7 +59,15 @@ impl AppState {
     }
 
     fn spawn_surface(&mut self, id: SurfaceId) -> Result<()> {
-        let cmd = self.shell_line.as_ref().map(|line| {
+        self.spawn_surface_cmd(id, None)
+    }
+
+    /// Spawn a surface's terminal. `cmd_line`, when given, runs `sh -c <cmd_line>`
+    /// for this surface only; otherwise the configured shell line (or login shell)
+    /// is used.
+    fn spawn_surface_cmd(&mut self, id: SurfaceId, cmd_line: Option<&str>) -> Result<()> {
+        let line = cmd_line.or(self.shell_line.as_deref());
+        let cmd = line.map(|line| {
             let mut c = CommandBuilder::new("/bin/sh");
             c.arg("-c");
             c.arg(line);
@@ -91,6 +99,18 @@ impl AppState {
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
         self.spawn_surface(surf)?;
+        Ok(vt)
+    }
+
+    /// Create a new vtab that runs `command_line` in a fresh shell ("Run
+    /// Anything"). The vtab is named after the command until the program sets its
+    /// own title; it becomes active.
+    pub fn new_vtab_running(&mut self, command_line: impl Into<String>) -> Result<VtabId> {
+        let line = command_line.into();
+        let name = line.split_whitespace().next().unwrap_or("run").to_string();
+        self.next_tab_number += 1;
+        let (vt, _pane, surf) = self.tree.add_vtab(name);
+        self.spawn_surface_cmd(surf, Some(&line))?;
         Ok(vt)
     }
 
@@ -228,14 +248,30 @@ impl AppState {
         }
     }
 
-    /// Encode and send a key press to the focused surface.
+    /// Encode and send a key press to the focused surface. Input snaps the
+    /// viewport back to the live bottom, as terminals do.
     pub fn send_key_to_focused(&mut self, press: &KeyPress) -> bool {
         match self
             .focused_surface()
             .and_then(|id| self.surfaces.get_mut(&id))
         {
             Some(t) => {
+                t.scroll(Scroll::Bottom);
                 t.send_key(press);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Scroll the focused surface's scrollback viewport.
+    pub fn scroll_focused(&mut self, scroll: Scroll) -> bool {
+        match self
+            .focused_surface()
+            .and_then(|id| self.surfaces.get_mut(&id))
+        {
+            Some(t) => {
+                t.scroll(scroll);
                 true
             }
             None => false,
@@ -259,15 +295,26 @@ impl AppState {
     /// Pump all terminals and sync program-set surface titles into the tree.
     /// Returns true if any terminal produced output (the grid may have changed).
     pub fn pump_all(&mut self) -> bool {
+        self.pump_all_budgeted(usize::MAX).0
+    }
+
+    /// Pump all terminals, bounding each to roughly `budget` bytes of output so a
+    /// flood in one surface cannot monopolise a frame. Returns
+    /// `(changed, more_pending)`: `more_pending` means at least one surface still
+    /// has queued output and should be pumped again promptly.
+    pub fn pump_all_budgeted(&mut self, budget: usize) -> (bool, bool) {
         let active = self.tree.active_vtab();
         let mut changed = false;
+        let mut more = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
         let mut changed_surfaces: Vec<SurfaceId> = Vec::new();
         for (id, term) in self.surfaces.iter_mut() {
-            if term.pump() {
+            let pumped = term.pump_budgeted(budget);
+            if pumped.changed {
                 changed = true;
                 changed_surfaces.push(*id);
             }
+            more |= pumped.more;
             if let Some(t) = term.title() {
                 titles.push((*id, t));
             }
@@ -293,7 +340,20 @@ impl AppState {
                     .set_status(vt, TabStatus::Unread { success: true });
             }
         }
-        changed
+        (changed, more)
+    }
+
+    /// Whether a live terminal exists for `id`.
+    pub fn has_surface(&self, id: SurfaceId) -> bool {
+        self.surfaces.contains_key(&id)
+    }
+
+    /// Whether a surface's grid changed since it was last snapshotted.
+    pub fn surface_needs_snapshot(&self, id: SurfaceId) -> bool {
+        self.surfaces
+            .get(&id)
+            .map(|t| t.needs_snapshot())
+            .unwrap_or(false)
     }
 
     /// A human/agent-readable dump of the workspace structure.
@@ -498,6 +558,31 @@ mod tests {
             s.terminal(surf).is_some(),
             "new_vtab should spawn a terminal for its surface"
         );
+    }
+
+    #[test]
+    fn new_vtab_running_executes_its_command() {
+        // The run-anything path spawns a vtab whose surface runs the given command,
+        // independent of the app's configured shell line.
+        let mut s = AppState::new().with_shell_line("sleep 5");
+        let vt = s.new_vtab_running("printf RUN-MARKER; sleep 2").unwrap();
+        let surf = s.tree.vtab(vt).unwrap().panes()[0].surfaces[0].id;
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = s.surface_text(surf).unwrap_or_default();
+            if text.contains("RUN-MARKER") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            text.contains("RUN-MARKER"),
+            "new_vtab_running should run its own command, not the shell line; got:\n{text}"
+        );
+        // The vtab is named after the command's first token.
+        assert_eq!(s.tree.vtab(vt).unwrap().name, "printf");
     }
 
     #[test]

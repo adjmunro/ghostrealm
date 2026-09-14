@@ -90,6 +90,22 @@ impl Grid {
         }
     }
 
+    /// An empty 0×0 grid. Useful as a reusable target for
+    /// [`snapshot_into`](TerminalBackend::snapshot_into), whose fill resizes it.
+    pub fn empty() -> Self {
+        Grid {
+            size: GridSize { cols: 0, rows: 0 },
+            cells: Vec::new(),
+            cursor: Cursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
+            default_fg: [0, 0, 0],
+            default_bg: [0, 0, 0],
+        }
+    }
+
     /// Cell at `(col, row)`, or `None` if out of bounds.
     pub fn cell(&self, col: u16, row: u16) -> Option<&Cell> {
         if col >= self.size.cols || row >= self.size.rows {
@@ -98,6 +114,27 @@ impl Grid {
         self.cells
             .get(row as usize * self.size.cols as usize + col as usize)
     }
+}
+
+/// Outcome of a budgeted [`pump`](TerminalBackend::pump_budgeted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pumped {
+    /// The grid may have changed and should be re-snapshotted/redrawn.
+    pub changed: bool,
+    /// The budget was hit with child output still queued; pump again soon.
+    pub more: bool,
+}
+
+/// A viewport scroll request, backend-neutral.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    /// Move the viewport by `n` lines: negative scrolls up into history (older),
+    /// positive scrolls down toward the live bottom.
+    Delta(i32),
+    /// Jump to the oldest scrollback line.
+    Top,
+    /// Jump to the live bottom (newest output).
+    Bottom,
 }
 
 /// Whether the child process is still running.
@@ -163,12 +200,42 @@ pub trait TerminalBackend {
     /// Write raw bytes to the child (e.g. bracketed paste payloads).
     fn write_bytes(&mut self, bytes: &[u8]);
 
+    /// Move the scrollback viewport. Marks the grid dirty so the next frame
+    /// re-snapshots the scrolled region.
+    fn scroll(&mut self, scroll: Scroll);
+
     /// Drain any pending child output into the terminal state. Returns `true`
     /// if the grid may have changed and should be re-snapshotted/redrawn.
     fn pump(&mut self) -> bool;
 
+    /// Like [`pump`](Self::pump) but stops after roughly `max_bytes` of child
+    /// output so one giant burst cannot monopolise a frame. The default drains
+    /// everything (ignoring the budget); backends that can bound the work
+    /// override this.
+    fn pump_budgeted(&mut self, _max_bytes: usize) -> Pumped {
+        Pumped {
+            changed: self.pump(),
+            more: false,
+        }
+    }
+
     /// Build a snapshot of the current grid for rendering.
     fn snapshot(&mut self) -> Grid;
+
+    /// Snapshot into an existing [`Grid`], reusing its allocations (cell strings,
+    /// the cell vector). The hot render path passes the surface's previous grid so
+    /// a steady stream of snapshots does not re-allocate every cell each frame.
+    /// The default just overwrites `out`; efficient backends override it.
+    fn snapshot_into(&mut self, out: &mut Grid) {
+        *out = self.snapshot();
+    }
+
+    /// Whether the grid changed since the last [`snapshot`](Self::snapshot) and
+    /// so needs re-snapshotting. Backends that cannot tell return `true`
+    /// (always re-snapshot).
+    fn needs_snapshot(&self) -> bool {
+        true
+    }
 
     /// The program-set title (OSC 0/2), if any.
     fn title(&self) -> Option<String>;

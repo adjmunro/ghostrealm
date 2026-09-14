@@ -5,6 +5,8 @@
 
 pub mod agent;
 pub mod app_state;
+pub mod row_cache;
+pub mod tap;
 pub mod window;
 
 use std::time::{Duration, Instant};

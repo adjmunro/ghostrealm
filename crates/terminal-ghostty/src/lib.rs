@@ -13,11 +13,13 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use anyhow::{Context, Result};
 use ghostrealm_terminal::{
-    Cell, CellAttrs, Cursor, Grid, GridSize, Key, KeyPress, Lifecycle, Mods, Rgb, TerminalBackend,
+    Cell, CellAttrs, Cursor, Grid, GridSize, Key, KeyPress, Lifecycle, Mods, Pumped, Rgb, Scroll,
+    TerminalBackend,
 };
 use libghostty_vt::key as vtkey;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::{RgbColor, Underline};
+use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::Terminal;
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 
@@ -33,8 +35,23 @@ fn rgb(c: RgbColor) -> Rgb {
     [c.r, c.g, c.b]
 }
 
+fn blank_cell(fg: Rgb, bg: Rgb) -> Cell {
+    Cell {
+        text: String::new(),
+        fg,
+        bg,
+        attrs: CellAttrs::default(),
+        wide: false,
+    }
+}
+
 pub struct GhosttyTerminal {
     term: Terminal<'static, 'static>,
+    /// Render scratch objects, kept across snapshots — `update()` reuses them
+    /// each frame instead of allocating fresh VT render state and iterators.
+    render_state: RenderState<'static>,
+    row_iter: RowIterator<'static>,
+    cell_iter: CellIterator<'static>,
     /// Kept alive for resize; the reader is cloned from it and the writer taken.
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -51,6 +68,9 @@ pub struct GhosttyTerminal {
     exited: Option<Option<i32>>,
     /// The reader thread signalled EOF (child's PTY closed).
     reader_done: bool,
+    /// Grid changed since the last `snapshot()`; lets the app skip re-snapshotting
+    /// an idle surface. Set by `pump`/`resize`, cleared by `snapshot`.
+    dirty: bool,
 }
 
 impl GhosttyTerminal {
@@ -140,9 +160,15 @@ impl GhosttyTerminal {
         }
 
         let encoder = vtkey::Encoder::new().context("create key encoder")?;
+        let render_state = RenderState::new().context("render state")?;
+        let row_iter = RowIterator::new().context("row iter")?;
+        let cell_iter = CellIterator::new().context("cell iter")?;
 
         Ok(Self {
             term,
+            render_state,
+            row_iter,
+            cell_iter,
             master: pair.master,
             writer,
             child,
@@ -153,6 +179,7 @@ impl GhosttyTerminal {
             cell_h,
             exited: None,
             reader_done: false,
+            dirty: true,
         })
     }
 
@@ -166,9 +193,10 @@ impl GhosttyTerminal {
         let _ = self.writer.flush();
     }
 
-    fn build_grid(&mut self) -> Result<Grid> {
-        let mut rs = RenderState::new().context("render state")?;
-        let snap = rs.update(&self.term).context("snapshot")?;
+    /// Fill `out` from the current VT state, reusing its cell vector and each
+    /// cell's string buffer (no per-cell allocation in steady state).
+    fn build_into(&mut self, out: &mut Grid) -> Result<()> {
+        let snap = self.render_state.update(&self.term).context("snapshot")?;
 
         let cols = snap.cols().context("cols")?;
         let rows = snap.rows().context("rows")?;
@@ -178,82 +206,74 @@ impl GhosttyTerminal {
         let cursor_vp = snap.cursor_viewport().context("cursor")?;
         let cursor_visible = snap.cursor_visible().unwrap_or(false);
 
-        let mut cells: Vec<Cell> = Vec::with_capacity(cols as usize * rows as usize);
+        let want = cols as usize * rows as usize;
+        let cells = &mut out.cells;
+        if cells.len() < want {
+            cells.resize(want, blank_cell(default_fg, default_bg));
+        }
 
-        let mut row_iter = RowIterator::new().context("row iter")?;
-        let mut cell_iter = CellIterator::new().context("cell iter")?;
-        let mut rows_it = row_iter.update(&snap).context("row update")?;
+        // Reset a cell to blank, keeping its string allocation.
+        let blank = |dst: &mut Cell| {
+            dst.text.clear();
+            dst.fg = default_fg;
+            dst.bg = default_bg;
+            dst.attrs = CellAttrs::default();
+            dst.wide = false;
+        };
 
+        let mut rows_it = self.row_iter.update(&snap).context("row update")?;
         let mut produced_rows = 0u16;
         while let Some(row) = rows_it.next() {
-            let mut row_cells: Vec<Cell> = Vec::with_capacity(cols as usize);
-            let mut cells_it = cell_iter.update(row).context("cell update")?;
+            let base = produced_rows as usize * cols as usize;
+            let mut cells_it = self.cell_iter.update(row).context("cell update")?;
+            let mut col = 0u16;
             while let Some(cell) = cells_it.next() {
+                if col >= cols {
+                    break;
+                }
                 let style = cell.style().unwrap_or_default();
-                let mut fg = cell
-                    .fg_color()
-                    .ok()
-                    .flatten()
-                    .map(rgb)
-                    .unwrap_or(default_fg);
-                let mut bg = cell
-                    .bg_color()
-                    .ok()
-                    .flatten()
-                    .map(rgb)
-                    .unwrap_or(default_bg);
+                let mut fg = cell.fg_color().ok().flatten().map(rgb).unwrap_or(default_fg);
+                let mut bg = cell.bg_color().ok().flatten().map(rgb).unwrap_or(default_bg);
                 if style.inverse {
                     std::mem::swap(&mut fg, &mut bg);
                 }
-                let text: String = cell.graphemes().unwrap_or_default().into_iter().collect();
-                row_cells.push(Cell {
-                    text,
-                    fg,
-                    bg,
-                    attrs: CellAttrs {
-                        bold: style.bold,
-                        italic: style.italic,
-                        underline: style.underline != Underline::None,
-                        dim: style.faint,
-                    },
-                    wide: false,
-                });
-                if row_cells.len() >= cols as usize {
-                    break;
-                }
+                let dst = &mut cells[base + col as usize];
+                dst.text.clear();
+                let _ = cell.graphemes_utf8(&mut dst.text);
+                dst.fg = fg;
+                dst.bg = bg;
+                dst.attrs = CellAttrs {
+                    bold: style.bold,
+                    italic: style.italic,
+                    underline: style.underline != Underline::None,
+                    dim: style.faint,
+                };
+                dst.wide = false;
+                col += 1;
             }
-            row_cells.resize(
-                cols as usize,
-                Cell {
-                    text: String::new(),
-                    fg: default_fg,
-                    bg: default_bg,
-                    attrs: CellAttrs::default(),
-                    wide: false,
-                },
-            );
-            cells.append(&mut row_cells);
+            // Blank the rest of the row the iterator did not fill.
+            while col < cols {
+                blank(&mut cells[base + col as usize]);
+                col += 1;
+            }
             produced_rows += 1;
             if produced_rows >= rows {
                 break;
             }
         }
-        // Pad any rows the iterator did not yield (e.g. all-blank tail).
-        let want = cols as usize * rows as usize;
-        if cells.len() < want {
-            cells.resize(
-                want,
-                Cell {
-                    text: String::new(),
-                    fg: default_fg,
-                    bg: default_bg,
-                    attrs: CellAttrs::default(),
-                    wide: false,
-                },
-            );
+        // Blank any rows the iterator did not yield (e.g. an all-blank tail).
+        for r in produced_rows..rows {
+            let base = r as usize * cols as usize;
+            for c in 0..cols as usize {
+                blank(&mut cells[base + c]);
+            }
         }
+        cells.truncate(want);
 
-        let cursor = match cursor_vp {
+        out.size = GridSize { cols, rows };
+        out.default_fg = default_fg;
+        out.default_bg = default_bg;
+        out.cursor = match cursor_vp {
             Some(c) => Cursor {
                 col: c.x,
                 row: c.y,
@@ -265,14 +285,7 @@ impl GhosttyTerminal {
                 visible: false,
             },
         };
-
-        Ok(Grid {
-            size: GridSize { cols, rows },
-            cells,
-            cursor,
-            default_fg,
-            default_bg,
-        })
+        Ok(())
     }
 
     fn map_key(key: Key) -> vtkey::Key {
@@ -364,6 +377,7 @@ impl TerminalBackend for GhosttyTerminal {
             pixel_height: (rows as u32 * cell_h_px) as u16,
         });
         let _ = self.term.resize(cols, rows, cell_w_px, cell_h_px);
+        self.dirty = true;
     }
 
     fn send_key(&mut self, press: &KeyPress) {
@@ -380,14 +394,36 @@ impl TerminalBackend for GhosttyTerminal {
         let _ = self.writer.flush();
     }
 
+    fn scroll(&mut self, scroll: Scroll) {
+        let vp = match scroll {
+            Scroll::Delta(n) => ScrollViewport::Delta(n as isize),
+            Scroll::Top => ScrollViewport::Top,
+            Scroll::Bottom => ScrollViewport::Bottom,
+        };
+        self.term.scroll_viewport(vp);
+        self.dirty = true;
+    }
+
     fn pump(&mut self) -> bool {
+        self.pump_budgeted(usize::MAX).changed
+    }
+
+    fn pump_budgeted(&mut self, max_bytes: usize) -> Pumped {
         let mut changed = false;
+        let mut bytes = 0usize;
+        let mut more = false;
         loop {
+            if bytes >= max_bytes {
+                // Budget spent; anything still queued waits for the next pump.
+                more = true;
+                break;
+            }
             match self.rx.try_recv() {
                 Ok(chunk) => {
                     if chunk.is_empty() {
                         self.reader_done = true;
                     } else {
+                        bytes += chunk.len();
                         self.term.vt_write(&chunk);
                         changed = true;
                     }
@@ -400,20 +436,29 @@ impl TerminalBackend for GhosttyTerminal {
             }
         }
         if changed {
+            self.dirty = true;
             self.flush_pty_out();
         }
-        changed
+        Pumped { changed, more }
+    }
+
+    fn needs_snapshot(&self) -> bool {
+        self.dirty
     }
 
     fn snapshot(&mut self) -> Grid {
-        match self.build_grid() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("ghostrealm: snapshot failed: {e:#}");
-                let cols = self.term.cols().unwrap_or(0);
-                let rows = self.term.rows().unwrap_or(0);
-                Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0])
-            }
+        let mut g = Grid::empty();
+        self.snapshot_into(&mut g);
+        g
+    }
+
+    fn snapshot_into(&mut self, out: &mut Grid) {
+        self.dirty = false;
+        if let Err(e) = self.build_into(out) {
+            eprintln!("ghostrealm: snapshot failed: {e:#}");
+            let cols = self.term.cols().unwrap_or(0);
+            let rows = self.term.rows().unwrap_or(0);
+            *out = Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0]);
         }
     }
 

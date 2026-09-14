@@ -5,23 +5,28 @@
 //! foreground text via glyphon), all in one wgpu scene. Cmd-chords run app
 //! commands through the registry; other keys go to the focused surface.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::{Args, Config, Rect, Registry, SurfaceId, TabStatus};
-use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, TerminalBackend};
+use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState};
+use crate::row_cache::RowCache;
+use crate::tap::TapDetector;
 
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
@@ -29,6 +34,19 @@ const DIVIDER: f32 = 6.0;
 const BORDER: f32 = 2.0;
 /// Max command-palette results shown at once.
 const PALETTE_MAX: usize = 12;
+/// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
+/// output wakes into at most one redraw per interval so input stays responsive.
+const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+/// Max child-output bytes drained per surface per frame. Bounds VT-parse work so
+/// one burst can't stall a frame; the remainder is pumped on following frames.
+const PUMP_BUDGET: usize = 512 * 1024;
+/// Soft cap on cached shaped rows. Comfortably holds several full screens so
+/// scrollback and multiple surfaces stay warm; trimmed after each frame.
+const ROW_CACHE_CAP: usize = 4096;
+/// Scrollback lines per mouse-wheel notch.
+const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+/// Max gap between two Shift taps to count as a palette double-tap.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -58,6 +76,7 @@ pub fn run(command_line: Option<String>) -> Result<()> {
         state: None,
         command_line,
         proxy,
+        wake_pending: Arc::new(AtomicBool::new(false)),
     };
     event_loop.run_app(&mut app).context("run app")?;
     Ok(())
@@ -67,6 +86,10 @@ struct App {
     state: Option<State>,
     command_line: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
+    /// Set by the reader threads, cleared when the loop consumes a wake. Lets the
+    /// waker send at most one pending `PtyOutput` event no matter how many chunks
+    /// arrive, so a flood doesn't drown the event queue.
+    wake_pending: Arc<AtomicBool>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -82,6 +105,7 @@ impl ApplicationHandler<UserEvent> for App {
             window,
             self.command_line.clone(),
             self.proxy.clone(),
+            self.wake_pending.clone(),
         )) {
             Ok(s) => {
                 s.window.request_redraw();
@@ -95,9 +119,33 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // A terminal produced output. Let the waker send another wake now, and
+        // note that a frame is due; `about_to_wait` paces the actual redraw so a
+        // flood of output can't outrun input handling.
+        self.wake_pending.store(false, Ordering::Release);
         if let Some(state) = &mut self.state {
-            state.mark_dirty();
-            state.window.request_redraw();
+            state.pty_pending = true;
+        }
+    }
+
+    /// Pace PTY-driven redraws: at most one per `FRAME_INTERVAL`, and never in a
+    /// way that starves queued input (winit delivers input events, waking the
+    /// `WaitUntil` sleep, before this schedules the next frame).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = &mut self.state else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        if state.pty_pending {
+            let now = Instant::now();
+            if now >= state.next_frame {
+                state.window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_frame));
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -124,6 +172,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = (position.x as f32, position.y as f32);
+                if state.palette.is_some() && state.palette_hover() {
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -133,10 +184,17 @@ impl ApplicationHandler<UserEvent> for App {
                 state.on_click();
                 state.window.request_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                state.on_scroll(delta);
+                state.window.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                let toggled = state.handle_key_taps(&event);
                 if event.state == ElementState::Pressed {
                     state.on_key(&event);
                     state.mark_dirty();
+                    state.window.request_redraw();
+                } else if toggled {
                     state.window.request_redraw();
                 }
             }
@@ -163,10 +221,18 @@ struct State {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// Pool of text buffers, one per visible grid row across all panes; reused
-    /// across frames. `prev_row_hash[i]` is the last shaped content of pool i.
-    row_buffers: Vec<Buffer>,
-    prev_row_hash: Vec<Option<u64>>,
+    /// Shaped terminal rows keyed by content, so scrolling and vtab/pane switching
+    /// reuse shaping instead of reshaping from scratch.
+    row_cache: RowCache,
+    /// Last snapshot per surface, reused for idle surfaces so a still pane costs
+    /// no snapshot; refreshed when the surface reports it changed or was resized.
+    grid_cache: HashMap<SurfaceId, Grid>,
+    /// Grid size we last resized each surface to, so a layout pass resizes a
+    /// surface's terminal only when its cell dimensions actually change.
+    surface_geom: HashMap<SurfaceId, (u16, u16)>,
+    /// Bumped when font metrics change (scale/size); folded into row-cache keys so
+    /// stale shaping never survives a metrics change.
+    metrics_gen: u64,
 
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
@@ -177,6 +243,11 @@ struct State {
     palette_renderer: TextRenderer,
     palette_buffers: Vec<Buffer>,
     palette: Option<Palette>,
+    /// Last-rendered palette panel rect (physical px), for click-outside dismissal.
+    palette_panel: Rect,
+    /// Last-rendered palette result rows: (row rect, command id), for click/hover
+    /// hit-testing. Rebuilt each frame the palette is open.
+    palette_rows: Vec<(Rect, String)>,
     /// Text buffers for the sidebar's vtab names (drawn in the main text pass).
     sidebar_buffers: Vec<Buffer>,
     /// Text buffers for pane tab-strip labels (drawn in the main text pass).
@@ -192,15 +263,31 @@ struct State {
     cell_w: f32,
     cell_h: f32,
     dirty: bool,
-    /// Last frame's pane layout (surface, rect, focused). A change triggers a
-    /// terminal resize pass and invalidates the row cache.
-    prev_layout: Vec<(SurfaceId, Rect, bool)>,
+    /// Child output is queued (or still mid-drain after a budgeted pump); a frame
+    /// is due. `about_to_wait` rate-limits it to `FRAME_INTERVAL`.
+    pty_pending: bool,
+    /// Earliest time the next PTY-driven frame may run.
+    next_frame: Instant,
+    /// Double-tap-Shift detector for the palette (IntelliJ "Search Everywhere").
+    shift_taps: TapDetector,
+    /// Double-tap-Ctrl detector for "Run Anything".
+    ctrl_taps: TapDetector,
 }
 
-/// Command-palette UI state.
+/// What the overlay input does with its text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    /// Fuzzy-search the command registry; Enter runs the selected command.
+    Commands,
+    /// "Run Anything": Enter opens a new vtab running the typed command line.
+    Run,
+}
+
+/// Command-palette / run-anything overlay state.
 struct Palette {
     query: String,
     selected: usize,
+    mode: PaletteMode,
 }
 
 /// A pane resolved for rendering: its rect, focus, and its surfaces
@@ -216,6 +303,7 @@ impl State {
         window: Arc<Window>,
         command_line: Option<String>,
         proxy: EventLoopProxy<UserEvent>,
+        wake_pending: Arc<AtomicBool>,
     ) -> Result<Self> {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
@@ -262,11 +350,15 @@ impl State {
             cfg.terminal.line_height,
         );
 
-        // App state: terminals wake the event loop through the proxy.
+        // App state: terminals wake the event loop through the proxy. The atomic
+        // collapses a burst of chunk-wakes into a single queued event — the loop
+        // clears it when it consumes the wake, so we send again only once it has.
         let waker: Arc<dyn Fn() + Send + Sync> = {
             let proxy = proxy.clone();
             Arc::new(move || {
-                let _ = proxy.send_event(UserEvent::PtyOutput);
+                if !wake_pending.swap(true, Ordering::AcqRel) {
+                    let _ = proxy.send_event(UserEvent::PtyOutput);
+                }
             })
         };
         let mut app = AppState::new();
@@ -298,11 +390,20 @@ impl State {
             viewport,
             atlas,
             text_renderer,
-            row_buffers: Vec::new(),
-            prev_row_hash: Vec::new(),
+            row_cache: RowCache::new(ROW_CACHE_CAP),
+            grid_cache: HashMap::new(),
+            surface_geom: HashMap::new(),
+            metrics_gen: 0,
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
+            palette_panel: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            palette_rows: Vec::new(),
             sidebar_buffers: Vec::new(),
             strip_buffers: Vec::new(),
             cursor: (0.0, 0.0),
@@ -317,7 +418,10 @@ impl State {
             cell_w,
             cell_h,
             dirty: true,
-            prev_layout: Vec::new(),
+            pty_pending: false,
+            next_frame: Instant::now(),
+            shift_taps: TapDetector::new(DOUBLE_TAP_WINDOW),
+            ctrl_taps: TapDetector::new(DOUBLE_TAP_WINDOW),
         })
     }
 
@@ -362,6 +466,8 @@ impl State {
         );
         self.cell_w = cw;
         self.cell_h = ch;
+        // Metrics changed: existing shaping is stale.
+        self.metrics_gen = self.metrics_gen.wrapping_add(1);
         self.dirty = true;
     }
 
@@ -426,6 +532,7 @@ impl State {
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
     fn on_click(&mut self) {
         if self.palette.is_some() {
+            self.palette_click();
             return;
         }
         let (x, y) = self.cursor;
@@ -490,6 +597,103 @@ impl State {
             vtab.focused_pane = pid;
         }
         self.dirty = true;
+    }
+
+    /// A click while the palette is open: run a clicked result, or dismiss when
+    /// the click lands outside the panel.
+    fn palette_click(&mut self) {
+        let (x, y) = self.cursor;
+        if let Some(id) = self
+            .palette_rows
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|(_, id)| id.clone())
+        {
+            self.palette = None;
+            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+            self.dirty = true;
+            return;
+        }
+        if !rect_contains(self.palette_panel, x, y) {
+            self.palette = None;
+        }
+        self.dirty = true;
+    }
+
+    /// Hover over a palette result highlights it. Returns whether the selection
+    /// moved (so the caller can redraw only on change).
+    fn palette_hover(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        let Some(idx) = self
+            .palette_rows
+            .iter()
+            .position(|(r, _)| rect_contains(*r, x, y))
+        else {
+            return false;
+        };
+        match self.palette.as_mut() {
+            Some(p) if p.selected != idx => {
+                p.selected = idx;
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The active surface of the pane under the cursor, if the cursor is over the
+    /// workspace (not the sidebar).
+    fn surface_under_cursor(&self) -> Option<SurfaceId> {
+        let (x, y) = self.cursor;
+        let sidebar_w = self.sidebar_width();
+        if x < sidebar_w {
+            return None;
+        }
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let workspace = Rect {
+            x: sidebar_w,
+            y: 0.0,
+            w: (sw - sidebar_w).max(1.0),
+            h: sh,
+        };
+        let vt = self.app.tree.active_vtab()?;
+        let vtab = self.app.tree.vtab(vt)?;
+        for (pid, r) in vtab.layout(workspace, DIVIDER) {
+            if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
+                return pane.active_surface().map(|s| s.id);
+            }
+        }
+        None
+    }
+
+    /// Scroll the scrollback of the pane under the cursor (or the focused pane).
+    fn on_scroll(&mut self, delta: MouseScrollDelta) {
+        if self.palette.is_some() {
+            return;
+        }
+        let lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => (y * SCROLL_LINES_PER_NOTCH).round() as i32,
+            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / self.cell_h).round() as i32,
+        };
+        if lines == 0 {
+            return;
+        }
+        // Wheel up (positive delta) reveals older history → negative viewport delta.
+        let scroll = Scroll::Delta(-lines);
+        let scrolled = match self.surface_under_cursor() {
+            Some(sid) => match self.app.terminal(sid) {
+                Some(t) => {
+                    t.scroll(scroll);
+                    true
+                }
+                None => false,
+            },
+            None => self.app.scroll_focused(scroll),
+        };
+        if scrolled {
+            self.dirty = true;
+        }
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -583,6 +787,71 @@ impl State {
         placements
     }
 
+    /// Open the command palette (fresh query, first result selected).
+    fn open_palette(&mut self) {
+        self.palette = Some(Palette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::Commands,
+        });
+        self.dirty = true;
+    }
+
+    /// Toggle the overlay in `mode`: close it if already open in that mode, else
+    /// (re)open it in that mode.
+    fn toggle_palette(&mut self, mode: PaletteMode) {
+        match &self.palette {
+            Some(p) if p.mode == mode => self.palette = None,
+            _ => {
+                self.palette = Some(Palette {
+                    query: String::new(),
+                    selected: 0,
+                    mode,
+                })
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Feed a key event to the double-tap detectors. Returns `true` if a double-tap
+    /// toggled the overlay (so the caller redraws). Shift/Ctrl never reach the
+    /// shell as lone taps, so this is safe to run for every key event.
+    fn handle_key_taps(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let is_shift = matches!(event.logical_key, WKey::Named(NamedKey::Shift));
+        let is_ctrl = matches!(event.logical_key, WKey::Named(NamedKey::Control));
+        match event.state {
+            ElementState::Pressed => {
+                if !event.repeat {
+                    // A press of one tracked modifier (or any other key) breaks a
+                    // lone-tap sequence of the other.
+                    if is_shift {
+                        self.shift_taps.press();
+                        self.ctrl_taps.interrupt();
+                    } else if is_ctrl {
+                        self.ctrl_taps.press();
+                        self.shift_taps.interrupt();
+                    } else {
+                        self.shift_taps.interrupt();
+                        self.ctrl_taps.interrupt();
+                    }
+                }
+                false
+            }
+            ElementState::Released => {
+                let now = Instant::now();
+                if is_shift && self.shift_taps.release(now) {
+                    self.toggle_palette(PaletteMode::Commands);
+                    return true;
+                }
+                if is_ctrl && self.ctrl_taps.release(now) {
+                    self.toggle_palette(PaletteMode::Run);
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
         // The palette, when open, owns the keyboard.
         if self.palette.is_some() {
@@ -599,10 +868,7 @@ impl State {
                 let chord = self.chord_string(c);
                 if let Some(id) = self.cfg.binding(&chord) {
                     if id == "palette.toggle" {
-                        self.palette = Some(Palette {
-                            query: String::new(),
-                            selected: 0,
-                        });
+                        self.open_palette();
                     } else {
                         let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
                     }
@@ -610,6 +876,23 @@ impl State {
                 }
             }
             return;
+        }
+
+        // Shift + Page/Home/End drives scrollback instead of reaching the shell.
+        if self.mods.shift {
+            let page = ((self.config.height as f32 / self.cell_h).floor() as i32 - 1).max(1);
+            let scroll = match &event.logical_key {
+                WKey::Named(NamedKey::PageUp) => Some(Scroll::Delta(-page)),
+                WKey::Named(NamedKey::PageDown) => Some(Scroll::Delta(page)),
+                WKey::Named(NamedKey::Home) => Some(Scroll::Top),
+                WKey::Named(NamedKey::End) => Some(Scroll::Bottom),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                self.app.scroll_focused(scroll);
+                self.dirty = true;
+                return;
+            }
         }
 
         let text = event.text.as_ref().map(|s| s.to_string());
@@ -658,21 +941,33 @@ impl State {
     }
 
     fn palette_key(&mut self, event: &winit::event::KeyEvent) {
-        let (query, selected) = match &self.palette {
-            Some(p) => (p.query.clone(), p.selected),
+        let (query, selected, mode) = match &self.palette {
+            Some(p) => (p.query.clone(), p.selected, p.mode),
             None => return,
         };
         match &event.logical_key {
             WKey::Named(NamedKey::Escape) => self.palette = None,
             WKey::Named(NamedKey::Enter) => {
-                let id = self
-                    .registry
-                    .search(&query, PALETTE_MAX)
-                    .get(selected)
-                    .map(|h| h.meta.id.to_string());
                 self.palette = None;
-                if let Some(id) = id {
-                    let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                match mode {
+                    PaletteMode::Commands => {
+                        let id = self
+                            .registry
+                            .search(&query, PALETTE_MAX)
+                            .get(selected)
+                            .map(|h| h.meta.id.to_string());
+                        if let Some(id) = id {
+                            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                        }
+                    }
+                    PaletteMode::Run => {
+                        let line = query.trim();
+                        if !line.is_empty() {
+                            if let Err(e) = self.app.new_vtab_running(line) {
+                                eprintln!("ghostrealm: run-anything failed: {e:#}");
+                            }
+                        }
+                    }
                 }
             }
             WKey::Named(NamedKey::Backspace) => {
@@ -719,16 +1014,21 @@ impl State {
     /// Build the palette overlay: push its dim/panel/selection quads and shape
     /// its text lines, returning their placements (indices into palette_buffers).
     fn build_palette(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
-        let (query, selected) = match &self.palette {
-            Some(p) => (p.query.clone(), p.selected),
+        let (query, selected, mode) = match &self.palette {
+            Some(p) => (p.query.clone(), p.selected, p.mode),
             None => return Vec::new(),
         };
-        let hits: Vec<String> = self
-            .registry
-            .search(&query, PALETTE_MAX)
-            .into_iter()
-            .map(|h| h.meta.title.to_string())
-            .collect();
+        // Command mode fuzzy-searches the registry; run mode takes the raw line.
+        let results: Vec<(String, String)> = match mode {
+            PaletteMode::Commands => self
+                .registry
+                .search(&query, PALETTE_MAX)
+                .into_iter()
+                .map(|h| (h.meta.id.to_string(), h.meta.title.to_string()))
+                .collect(),
+            PaletteMode::Run => Vec::new(),
+        };
+        let hits: Vec<String> = results.iter().map(|(_, t)| t.clone()).collect();
 
         let metrics = self.metrics();
         let line_h = self.cell_h;
@@ -738,6 +1038,29 @@ impl State {
         let panel_y = sh * 0.12;
         let line_count = 1 + hits.len().max(1); // query line + results (or "none")
         let panel_h = line_count as f32 * line_h + pad * 2.0;
+
+        // Record hit-test geometry for mouse click/hover.
+        self.palette_panel = Rect {
+            x: panel_x,
+            y: panel_y,
+            w: panel_w,
+            h: panel_h,
+        };
+        self.palette_rows = results
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                (
+                    Rect {
+                        x: panel_x,
+                        y: panel_y + pad + (1 + i) as f32 * line_h,
+                        w: panel_w,
+                        h: line_h,
+                    },
+                    id.clone(),
+                )
+            })
+            .collect();
 
         quads.push(rect_quad(
             Rect {
@@ -781,9 +1104,17 @@ impl State {
         }
 
         let mut lines: Vec<(String, [u8; 3])> = Vec::new();
-        lines.push((format!("\u{203a} {}", query), [235, 235, 245]));
+        let prompt = match mode {
+            PaletteMode::Commands => format!("\u{203a} {}", query),
+            PaletteMode::Run => format!("\u{2b95} {}", query),
+        };
+        lines.push((prompt, [235, 235, 245]));
         if hits.is_empty() {
-            lines.push(("  (no matching commands)".to_string(), [150, 150, 160]));
+            let hint = match mode {
+                PaletteMode::Commands => "  (no matching commands)",
+                PaletteMode::Run => "  (Enter to run in a new tab)",
+            };
+            lines.push((hint.to_string(), [150, 150, 160]));
         } else {
             for (i, title) in hits.iter().enumerate() {
                 let prefix = if i == selected.min(hits.len() - 1) {
@@ -830,9 +1161,14 @@ impl State {
     }
 
     fn render(&mut self) -> Result<()> {
-        if self.app.pump_all() {
+        // Drain a bounded slice of child output; anything past the budget is left
+        // for the next frame so a flood can't stretch one frame indefinitely.
+        let (changed, more) = self.app.pump_all_budgeted(PUMP_BUDGET);
+        if changed {
             self.dirty = true;
         }
+        self.pty_pending = more;
+        self.next_frame = Instant::now() + FRAME_INTERVAL;
         if !self.dirty {
             return Ok(());
         }
@@ -864,35 +1200,34 @@ impl State {
             resolved.push((pr, strip_h, term));
         }
 
-        // Layout changed → resize each pane's terminal and invalidate row cache.
-        let layout_sig: Vec<(SurfaceId, Rect, bool)> = resolved
-            .iter()
-            .filter_map(|(pr, _, term)| {
-                let sid = pr
-                    .surfaces
-                    .iter()
-                    .find(|(_, _, a)| *a)
-                    .map(|(id, _, _)| *id)?;
-                Some((sid, *term, pr.focused))
-            })
-            .collect();
-        if layout_sig != self.prev_layout {
-            let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
-            for (sid, term, _) in &layout_sig {
-                let cols = ((term.w / self.cell_w).floor() as u16).max(1);
-                let rows = ((term.h / self.cell_h).floor() as u16).max(1);
-                self.app.resize_surface(*sid, cols, rows, cw, ch);
+        // Resize a pane's terminal only when its cell dimensions actually change;
+        // a focus-only change or new content costs no resize. The content-keyed
+        // row cache is position-independent, so switching panes/vtabs or scrolling
+        // never invalidates it.
+        let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
+        for (pr, _, term) in &resolved {
+            let Some(sid) = pr
+                .surfaces
+                .iter()
+                .find(|(_, _, a)| *a)
+                .map(|(id, _, _)| *id)
+            else {
+                continue;
+            };
+            let cols = ((term.w / self.cell_w).floor() as u16).max(1);
+            let rows = ((term.h / self.cell_h).floor() as u16).max(1);
+            if self.surface_geom.get(&sid) != Some(&(cols, rows)) {
+                self.app.resize_surface(sid, cols, rows, cw, ch);
+                self.surface_geom.insert(sid, (cols, rows));
             }
-            self.prev_row_hash.clear();
-            self.prev_layout = layout_sig;
         }
 
+        self.row_cache.begin_frame(self.metrics_gen);
         let metrics = self.metrics();
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut overlay_quads: Vec<QuadInstance> = Vec::new();
-        let mut placements: Vec<Placement> = Vec::new();
+        let mut row_placements: Vec<RowPlacement> = Vec::new();
         let mut strip_placements: Vec<Placement> = Vec::new();
-        let mut pool_idx = 0usize;
         let mut strip_idx = 0usize;
         let multi_pane = resolved.len() > 1;
 
@@ -963,9 +1298,21 @@ impl State {
             let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
                 continue;
             };
-            let grid = match self.app.terminal(*active_sid) {
-                Some(t) => t.snapshot(),
-                None => continue,
+            let sid = *active_sid;
+            // Snapshot only when the surface actually changed since we last did;
+            // an idle pane reuses its cached grid.
+            if self.app.surface_needs_snapshot(sid) || !self.grid_cache.contains_key(&sid) {
+                // Reuse the surface's previous grid (its cell strings/vector) as
+                // the snapshot target so a steady stream of frames doesn't
+                // re-allocate every cell.
+                let mut g = self.grid_cache.remove(&sid).unwrap_or_else(Grid::empty);
+                if let Some(t) = self.app.terminal(sid) {
+                    t.snapshot_into(&mut g);
+                }
+                self.grid_cache.insert(sid, g);
+            }
+            let Some(grid) = self.grid_cache.get(&sid) else {
+                continue;
             };
             // Pane background fills its terminal rect.
             bg_quads.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
@@ -985,32 +1332,28 @@ impl State {
                     }
                 }
 
-                let spans = row_spans(&grid, row);
-                let hash = hash_spans(&spans);
-                // Grow the pools independently: prev_row_hash is cleared on
-                // layout change while row_buffers is not, so they can desync.
-                if pool_idx >= self.row_buffers.len() {
-                    self.row_buffers.push(Buffer::new(&mut self.font_system, metrics));
-                }
-                if pool_idx >= self.prev_row_hash.len() {
-                    self.prev_row_hash.push(None);
-                }
-                let unchanged = self.prev_row_hash.get(pool_idx).copied().flatten() == Some(hash);
-                let buf = &mut self.row_buffers[pool_idx];
-                buf.set_size(Some(term.w.max(1.0)), Some(self.cell_h));
-                if !unchanged {
-                    buf.set_metrics(metrics);
-                    buf.set_rich_text(
-                        spans.iter().map(|(t, c)| (t.as_str(), attrs_for(*c))),
-                        &Attrs::new().family(Family::Monospace),
-                        Shaping::Advanced,
-                        None,
-                    );
-                    buf.shape_until_scroll(&mut self.font_system, false);
-                    self.prev_row_hash[pool_idx] = Some(hash);
-                }
-                placements.push(Placement {
-                    idx: pool_idx,
+                // Cheap content key (no span strings); shape only on a miss.
+                let key = self.row_cache.row_key((0..grid.size.cols).map(|col| {
+                    match grid.cell(col, row) {
+                        Some(c) => (c.text.as_str(), c.fg),
+                        None => ("", grid.default_fg),
+                    }
+                }));
+                let spans = if self.row_cache.buffer(key).is_some() {
+                    Vec::new()
+                } else {
+                    row_spans(grid, row)
+                };
+                self.row_cache.ensure(
+                    key,
+                    &mut self.font_system,
+                    metrics,
+                    term.w,
+                    self.cell_h,
+                    &spans,
+                );
+                row_placements.push(RowPlacement {
+                    key,
                     left: term.x,
                     top: term.y + row as f32 * self.cell_h,
                     bounds: TextBounds {
@@ -1021,7 +1364,6 @@ impl State {
                     },
                     color: grid.default_fg,
                 });
-                pool_idx += 1;
             }
 
             if grid.cursor.visible {
@@ -1071,16 +1413,18 @@ impl State {
             },
         );
 
-        let mut text_areas: Vec<TextArea> = placements
+        let mut text_areas: Vec<TextArea> = row_placements
             .iter()
-            .map(|p| TextArea {
-                buffer: &self.row_buffers[p.idx],
-                left: p.left,
-                top: p.top,
-                scale: 1.0,
-                bounds: p.bounds,
-                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                custom_glyphs: &[],
+            .filter_map(|p| {
+                self.row_cache.buffer(p.key).map(|buffer| TextArea {
+                    buffer,
+                    left: p.left,
+                    top: p.top,
+                    scale: 1.0,
+                    bounds: p.bounds,
+                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                    custom_glyphs: &[],
+                })
             })
             .collect();
         text_areas.extend(sidebar_placements.iter().map(|p| TextArea {
@@ -1113,6 +1457,11 @@ impl State {
                 &mut self.swash_cache,
             )
             .context("text prepare")?;
+        // The row buffers are no longer borrowed; trim the cache to its cap and
+        // drop grids/geometry for surfaces that have closed.
+        self.row_cache.end_frame();
+        self.grid_cache.retain(|sid, _| self.app.has_surface(*sid));
+        self.surface_geom.retain(|sid, _| self.app.has_surface(*sid));
 
         if !palette_placements.is_empty() {
             let areas: Vec<TextArea> = palette_placements
@@ -1239,9 +1588,20 @@ impl State {
     }
 }
 
-/// A shaped row buffer's placement for this frame.
+/// A chrome text buffer's placement for this frame (sidebar / strip / palette),
+/// indexing that widget's own buffer pool.
 struct Placement {
     idx: usize,
+    left: f32,
+    top: f32,
+    bounds: TextBounds,
+    color: [u8; 3],
+}
+
+/// A terminal row's placement this frame, referring to its shaped buffer in the
+/// content-keyed [`RowCache`] rather than a positional pool slot.
+struct RowPlacement {
+    key: u64,
     left: f32,
     top: f32,
     bounds: TextBounds,
@@ -1270,11 +1630,9 @@ fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
     spans
 }
 
-fn hash_spans(spans: &[(String, [u8; 3])]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    spans.hash(&mut h);
-    h.finish()
+/// Whether point `(x, y)` lies inside `r` (half-open on the far edges).
+fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
 /// Absolute pixel rect of cell (col,row) inside pane `pane`.
@@ -1474,9 +1832,25 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_quad_pipeline, measure_cell, QuadInstance};
+    use super::{build_quad_pipeline, measure_cell, rect_contains, QuadInstance};
+    use ghostrealm_core::Rect;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 30.0,
+        };
+        assert!(rect_contains(r, 10.0, 20.0), "top-left corner is inside");
+        assert!(rect_contains(r, 60.0, 35.0), "centre is inside");
+        assert!(!rect_contains(r, 110.0, 35.0), "right edge is exclusive");
+        assert!(!rect_contains(r, 60.0, 50.0), "bottom edge is exclusive");
+        assert!(!rect_contains(r, 9.0, 35.0), "left of the rect is outside");
+    }
 
     const FONT_SIZE: f32 = 15.0;
     const LINE_HEIGHT: f32 = 18.0;
