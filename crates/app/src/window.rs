@@ -29,6 +29,8 @@ const LINE_HEIGHT: f32 = 18.0;
 const DIVIDER: f32 = 6.0;
 /// Focused-pane border thickness, in physical pixels.
 const BORDER: f32 = 2.0;
+/// Max command-palette results shown at once.
+const PALETTE_MAX: usize = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -161,6 +163,12 @@ struct State {
     quad_buffer: wgpu::Buffer,
     quad_capacity: u64,
 
+    /// Separate text renderer for the palette so its text draws above the panel
+    /// (terminal text and palette text can't share one pass with a quad between).
+    palette_renderer: TextRenderer,
+    palette_buffers: Vec<Buffer>,
+    palette: Option<Palette>,
+
     app: AppState,
     registry: Registry<AppState>,
     mods: Mods,
@@ -171,6 +179,12 @@ struct State {
     /// Last frame's pane layout (surface, rect, focused). A change triggers a
     /// terminal resize pass and invalidates the row cache.
     prev_layout: Vec<(SurfaceId, Rect, bool)>,
+}
+
+/// Command-palette UI state.
+struct Palette {
+    query: String,
+    selected: usize,
 }
 
 impl State {
@@ -213,6 +227,8 @@ impl State {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let palette_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         let (cell_w, cell_h) = measure_cell(&mut font_system, scale);
 
@@ -254,6 +270,9 @@ impl State {
             text_renderer,
             row_buffers: Vec::new(),
             prev_row_hash: Vec::new(),
+            palette_renderer,
+            palette_buffers: Vec::new(),
+            palette: None,
             quad_pipeline,
             quad_buffer,
             quad_capacity,
@@ -315,6 +334,11 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
+        // The palette, when open, owns the keyboard.
+        if self.palette.is_some() {
+            self.palette_key(event);
+            return;
+        }
         // Cmd-chords drive the app via the registry; everything else goes to the
         // focused terminal. (Cmd is reserved so app shortcuts never reach a shell.)
         if self.mods.super_ {
@@ -323,6 +347,14 @@ impl State {
                 _ => None,
             };
             if let Some(c) = ch {
+                if c.to_ascii_lowercase() == 'k' {
+                    self.palette = Some(Palette {
+                        query: String::new(),
+                        selected: 0,
+                    });
+                    self.dirty = true;
+                    return;
+                }
                 let id = match (c.to_ascii_lowercase(), self.mods.shift) {
                     ('t', _) => Some("tab.new"),
                     ('d', false) => Some("split.leftright"),
@@ -383,6 +415,178 @@ impl State {
             mods: self.mods,
             text,
         });
+    }
+
+    fn palette_key(&mut self, event: &winit::event::KeyEvent) {
+        let (query, selected) = match &self.palette {
+            Some(p) => (p.query.clone(), p.selected),
+            None => return,
+        };
+        match &event.logical_key {
+            WKey::Named(NamedKey::Escape) => self.palette = None,
+            WKey::Named(NamedKey::Enter) => {
+                let id = self
+                    .registry
+                    .search(&query, PALETTE_MAX)
+                    .get(selected)
+                    .map(|h| h.meta.id.to_string());
+                self.palette = None;
+                if let Some(id) = id {
+                    let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                }
+            }
+            WKey::Named(NamedKey::Backspace) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.pop();
+                    p.selected = 0;
+                }
+            }
+            WKey::Named(NamedKey::ArrowDown) => {
+                let n = self.registry.search(&query, PALETTE_MAX).len();
+                if let Some(p) = self.palette.as_mut() {
+                    if n > 0 {
+                        p.selected = (selected + 1) % n;
+                    }
+                }
+            }
+            WKey::Named(NamedKey::ArrowUp) => {
+                let n = self.registry.search(&query, PALETTE_MAX).len();
+                if let Some(p) = self.palette.as_mut() {
+                    if n > 0 {
+                        p.selected = (selected + n - 1) % n;
+                    }
+                }
+            }
+            WKey::Named(NamedKey::Space) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push(' ');
+                    p.selected = 0;
+                }
+            }
+            WKey::Character(s) => {
+                if let Some(c) = s.chars().next() {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.push(c);
+                        p.selected = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Build the palette overlay: push its dim/panel/selection quads and shape
+    /// its text lines, returning their placements (indices into palette_buffers).
+    fn build_palette(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+        let (query, selected) = match &self.palette {
+            Some(p) => (p.query.clone(), p.selected),
+            None => return Vec::new(),
+        };
+        let hits: Vec<String> = self
+            .registry
+            .search(&query, PALETTE_MAX)
+            .into_iter()
+            .map(|h| h.meta.title.to_string())
+            .collect();
+
+        let metrics = Metrics::new(FONT_SIZE * self.scale, LINE_HEIGHT * self.scale);
+        let line_h = self.cell_h;
+        let pad = 10.0 * self.scale;
+        let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
+        let panel_x = ((sw - panel_w) / 2.0).max(0.0);
+        let panel_y = sh * 0.12;
+        let line_count = 1 + hits.len().max(1); // query line + results (or "none")
+        let panel_h = line_count as f32 * line_h + pad * 2.0;
+
+        quads.push(rect_quad(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: sw,
+                h: sh,
+            },
+            sw,
+            sh,
+            [0, 0, 0],
+            0.45,
+        ));
+        quads.push(rect_quad(
+            Rect {
+                x: panel_x,
+                y: panel_y,
+                w: panel_w,
+                h: panel_h,
+            },
+            sw,
+            sh,
+            [28, 28, 36],
+            0.98,
+        ));
+        if !hits.is_empty() {
+            let sel = selected.min(hits.len() - 1);
+            let sel_y = panel_y + pad + (1 + sel) as f32 * line_h;
+            quads.push(rect_quad(
+                Rect {
+                    x: panel_x + pad * 0.5,
+                    y: sel_y,
+                    w: panel_w - pad,
+                    h: line_h,
+                },
+                sw,
+                sh,
+                [60, 90, 150],
+                0.9,
+            ));
+        }
+
+        let mut lines: Vec<(String, [u8; 3])> = Vec::new();
+        lines.push((format!("\u{203a} {}", query), [235, 235, 245]));
+        if hits.is_empty() {
+            lines.push(("  (no matching commands)".to_string(), [150, 150, 160]));
+        } else {
+            for (i, title) in hits.iter().enumerate() {
+                let prefix = if i == selected.min(hits.len() - 1) {
+                    "\u{25b8} "
+                } else {
+                    "  "
+                };
+                lines.push((format!("{prefix}{title}"), [235, 235, 245]));
+            }
+        }
+
+        while self.palette_buffers.len() < lines.len() {
+            let b = Buffer::new(&mut self.font_system, metrics);
+            self.palette_buffers.push(b);
+        }
+        let text_x = panel_x + pad;
+        let text_w = (panel_w - pad * 2.0).max(1.0);
+        let mut placements = Vec::with_capacity(lines.len());
+        for (i, (text, color)) in lines.iter().enumerate() {
+            let buf = &mut self.palette_buffers[i];
+            buf.set_metrics(metrics);
+            buf.set_size(Some(text_w), Some(line_h));
+            buf.set_rich_text(
+                std::iter::once((text.as_str(), attrs_for(*color))),
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+            placements.push(Placement {
+                idx: i,
+                left: text_x,
+                top: panel_y + pad + i as f32 * line_h,
+                bounds: TextBounds {
+                    left: panel_x as i32,
+                    top: panel_y as i32,
+                    right: (panel_x + panel_w) as i32,
+                    bottom: (panel_y + panel_h) as i32,
+                },
+                color: *color,
+            });
+        }
+        placements
     }
 
     fn render(&mut self) -> Result<()> {
@@ -497,6 +701,14 @@ impl State {
             }
         }
 
+        // Palette overlay: dim + panel + selection quads (drawn after terminal
+        // text), and its text (drawn last, via a second renderer).
+        let palette_placements = if self.palette.is_some() {
+            self.build_palette(sw, sh, &mut overlay_quads)
+        } else {
+            Vec::new()
+        };
+
         let n_bg = bg_quads.len() as u32;
         bg_quads.extend_from_slice(&overlay_quads);
         self.upload_quads(&bg_quads);
@@ -533,6 +745,32 @@ impl State {
                 &mut self.swash_cache,
             )
             .context("text prepare")?;
+
+        if !palette_placements.is_empty() {
+            let areas: Vec<TextArea> = palette_placements
+                .iter()
+                .map(|p| TextArea {
+                    buffer: &self.palette_buffers[p.idx],
+                    left: p.left,
+                    top: p.top,
+                    scale: 1.0,
+                    bounds: p.bounds,
+                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                    custom_glyphs: &[],
+                })
+                .collect();
+            self.palette_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .context("palette prepare")?;
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -599,6 +837,11 @@ impl State {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, n_bg..total);
+            }
+            if !palette_placements.is_empty() {
+                self.palette_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .context("palette render")?;
             }
         }
         self.queue.submit(Some(encoder.finish()));
