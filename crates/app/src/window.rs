@@ -515,7 +515,7 @@ impl State {
                 _ => None,
             };
             if let Some(c) = ch {
-                if c.to_ascii_lowercase() == 'k' {
+                if c.eq_ignore_ascii_case(&'k') {
                     self.palette = Some(Palette {
                         query: String::new(),
                         selected: 0,

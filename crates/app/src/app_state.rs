@@ -367,6 +367,121 @@ fn failed(e: anyhow::Error) -> CmdError {
     CmdError::Failed(format!("{e:#}"))
 }
 
+/// Build the command registry over [`AppState`]. This is the one catalog the
+/// palette, keybindings, and agent channel all use.
+pub fn build_registry() -> Registry<AppState> {
+    let mut r = Registry::new();
+
+    r.register(
+        CommandMeta::new("tab.new", "New Tab", "Open a new vertical tab"),
+        Box::new(|s: &mut AppState, _| {
+            let id = s.new_vtab().map_err(failed)?;
+            Ok(CmdOutcome::msg(format!("opened vtab {}", id.0)))
+        }),
+    );
+    r.register(
+        CommandMeta::new("tab.close", "Close Tab", "Close the active vertical tab"),
+        Box::new(|s: &mut AppState, _| {
+            s.close_active_vtab();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new("tab.rename", "Rename Tab", "Rename the active vertical tab")
+            .arg(ArgSpec::required("name", ArgKind::Str, "the new tab name")),
+        Box::new(|s: &mut AppState, a| {
+            s.rename_active_vtab(a.get_str("name")?);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "split.leftright",
+            "Split Left/Right",
+            "Split the focused pane side by side",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.split_focused(Axis::LeftRight).map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "split.topbottom",
+            "Split Top/Bottom",
+            "Split the focused pane stacked",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.split_focused(Axis::TopBottom).map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new("pane.close", "Close Pane", "Close the focused pane"),
+        Box::new(|s: &mut AppState, _| {
+            s.close_focused_pane();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "pane.focus_next",
+            "Focus Next Pane",
+            "Move focus to the next pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.focus_next_pane();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "surface.new",
+            "New Terminal Tab",
+            "Add a terminal tab to the focused pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.new_surface_in_focused().map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.mark_read",
+            "Mark Tab Read",
+            "Clear the active tab's inbox status",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::Read);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.needs_input",
+            "Mark Tab Needs Input",
+            "Flag the active tab as blocked awaiting the user (agent self-report)",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::NeedsInput);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "tab.dismiss",
+            "Dismiss Tab Status",
+            "Clear a sticky needs-input flag",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::Read);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,119 +632,4 @@ mod tests {
              Next steps: check spawn_surface wiring and pump/snapshot in surface_text."
         );
     }
-}
-
-/// Build the command registry over [`AppState`]. This is the one catalog the
-/// palette, keybindings, and agent channel all use.
-pub fn build_registry() -> Registry<AppState> {
-    let mut r = Registry::new();
-
-    r.register(
-        CommandMeta::new("tab.new", "New Tab", "Open a new vertical tab"),
-        Box::new(|s: &mut AppState, _| {
-            let id = s.new_vtab().map_err(failed)?;
-            Ok(CmdOutcome::msg(format!("opened vtab {}", id.0)))
-        }),
-    );
-    r.register(
-        CommandMeta::new("tab.close", "Close Tab", "Close the active vertical tab"),
-        Box::new(|s: &mut AppState, _| {
-            s.close_active_vtab();
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new("tab.rename", "Rename Tab", "Rename the active vertical tab")
-            .arg(ArgSpec::required("name", ArgKind::Str, "the new tab name")),
-        Box::new(|s: &mut AppState, a| {
-            s.rename_active_vtab(a.get_str("name")?);
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "split.leftright",
-            "Split Left/Right",
-            "Split the focused pane side by side",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.split_focused(Axis::LeftRight).map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "split.topbottom",
-            "Split Top/Bottom",
-            "Split the focused pane stacked",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.split_focused(Axis::TopBottom).map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new("pane.close", "Close Pane", "Close the focused pane"),
-        Box::new(|s: &mut AppState, _| {
-            s.close_focused_pane();
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "pane.focus_next",
-            "Focus Next Pane",
-            "Move focus to the next pane",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.focus_next_pane();
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "surface.new",
-            "New Terminal Tab",
-            "Add a terminal tab to the focused pane",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.new_surface_in_focused().map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "tab.mark_read",
-            "Mark Tab Read",
-            "Clear the active tab's inbox status",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.set_active_status(TabStatus::Read);
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "tab.needs_input",
-            "Mark Tab Needs Input",
-            "Flag the active tab as blocked awaiting the user (agent self-report)",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.set_active_status(TabStatus::NeedsInput);
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "tab.dismiss",
-            "Dismiss Tab Status",
-            "Clear a sticky needs-input flag",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.set_active_status(TabStatus::Read);
-            Ok(CmdOutcome::ok())
-        }),
-    );
-
-    r
 }

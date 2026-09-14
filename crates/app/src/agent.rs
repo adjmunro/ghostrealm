@@ -6,8 +6,8 @@
 //! - `{"op":"set","id":"...","args":{...}}`  → run a command
 //! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces
 //! - `{"op":"get","what":"surface","id":N}`  → a surface's grid as text
-//! - `{"op":"input","text":"ls\r","id":N}`   → type into a surface (id optional;
-//!                                             defaults to the focused surface)
+//! - `{"op":"input","text":"ls\r","id":N}`   → type into a surface (id optional,
+//!   defaulting to the focused surface)
 //! - `{"op":"pump"}`                         → drain terminal output
 //!
 //! One JSON object per request line, one JSON object per response line. Being
