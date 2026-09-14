@@ -17,7 +17,7 @@ use glyphon::{
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -34,12 +34,24 @@ struct QuadInstance {
     color: [f32; 4],
 }
 
+/// Wakes the event loop when a terminal produces output, so we redraw on demand
+/// instead of polling (and reshaping) every frame.
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    PtyOutput,
+}
+
 pub fn run(command_line: Option<String>) -> Result<()> {
-    let event_loop = EventLoop::new().context("create event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("create event loop")?;
+    // Event-driven: sleep until input, resize, or PTY output wakes us.
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
     let mut app = App {
         state: None,
         command_line,
+        proxy,
     };
     event_loop.run_app(&mut app).context("run app")?;
     Ok(())
@@ -48,9 +60,10 @@ pub fn run(command_line: Option<String>) -> Result<()> {
 struct App {
     state: Option<State>,
     command_line: Option<String>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -59,8 +72,15 @@ impl ApplicationHandler for App {
             .with_title("ghostrealm")
             .with_inner_size(LogicalSize::new(900.0, 560.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        match pollster::block_on(State::new(window, self.command_line.clone())) {
-            Ok(s) => self.state = Some(s),
+        match pollster::block_on(State::new(
+            window,
+            self.command_line.clone(),
+            self.proxy.clone(),
+        )) {
+            Ok(s) => {
+                s.window.request_redraw();
+                self.state = Some(s);
+            }
             Err(e) => {
                 eprintln!("ghostrealm: failed to init window state: {e:#}");
                 event_loop.exit();
@@ -68,13 +88,24 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        if let Some(state) = &mut self.state {
+            state.mark_dirty();
+            state.window.request_redraw();
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.resize(size.width, size.height);
+                state.window.request_redraw();
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.set_scale(scale_factor as f32);
+                state.window.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
@@ -88,6 +119,8 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     state.on_key(&event);
+                    state.mark_dirty();
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -96,12 +129,6 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
         }
     }
 }
@@ -132,10 +159,19 @@ struct State {
     cell_h: f32,
     cols: u16,
     rows: u16,
+    /// Whether the grid changed since the last draw. When false, a redraw skips
+    /// the expensive snapshot + text reshape entirely.
+    dirty: bool,
+    /// Per-row hash of the last shaped content, so only changed rows re-shape.
+    prev_row_hash: Vec<Option<u64>>,
 }
 
 impl State {
-    async fn new(window: Arc<Window>, command_line: Option<String>) -> Result<Self> {
+    async fn new(
+        window: Arc<Window>,
+        command_line: Option<String>,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
 
@@ -184,12 +220,19 @@ impl State {
             }
             None => CommandBuilder::new_default_prog(),
         };
-        let terminal = GhosttyTerminal::spawn(
+        let waker: ghostrealm_terminal_ghostty::PtyWaker = {
+            let proxy = proxy.clone();
+            Box::new(move || {
+                let _ = proxy.send_event(UserEvent::PtyOutput);
+            })
+        };
+        let terminal = GhosttyTerminal::spawn_with_waker(
             cols,
             rows,
             cell_w.round() as u32,
             cell_h.round() as u32,
             Some(cmd),
+            Some(waker),
         )
         .context("spawn terminal")?;
 
@@ -225,6 +268,8 @@ impl State {
             cell_h,
             cols,
             rows,
+            dirty: true,
+            prev_row_hash: Vec::new(),
         };
         state.rebuild_row_buffers();
         Ok(state)
@@ -241,6 +286,12 @@ impl State {
                 b
             })
             .collect();
+        // Fresh buffers have no shaped content; force every row to reshape once.
+        self.prev_row_hash = vec![None; self.rows as usize];
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     fn set_scale(&mut self, scale: f32) {
@@ -249,6 +300,7 @@ impl State {
         self.cell_w = cw;
         self.cell_h = ch;
         self.recompute_grid();
+        self.dirty = true;
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -259,6 +311,7 @@ impl State {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.recompute_grid();
+        self.dirty = true;
     }
 
     fn recompute_grid(&mut self) {
@@ -329,7 +382,13 @@ impl State {
     }
 
     fn render(&mut self) -> Result<()> {
-        self.terminal.pump();
+        if self.terminal.pump() {
+            self.dirty = true;
+        }
+        // Nothing changed since the last draw: skip the snapshot + reshape.
+        if !self.dirty {
+            return Ok(());
+        }
         let grid = self.terminal.snapshot();
 
         // Foreground text: one rich-text buffer per row, coloured per cell run.
@@ -339,6 +398,11 @@ impl State {
                 break;
             }
             let spans = row_spans(&grid, row as u16);
+            let hash = hash_spans(&spans);
+            // Only re-shape rows whose content actually changed.
+            if self.prev_row_hash.get(row).copied().flatten() == Some(hash) {
+                continue;
+            }
             let buf = &mut self.row_buffers[row];
             buf.set_metrics(metrics);
             buf.set_rich_text(
@@ -348,6 +412,9 @@ impl State {
                 None,
             );
             buf.shape_until_scroll(&mut self.font_system, false);
+            if let Some(slot) = self.prev_row_hash.get_mut(row) {
+                *slot = Some(hash);
+            }
         }
 
         // Background + cursor quads.
@@ -506,6 +573,7 @@ impl State {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         self.atlas.trim();
+        self.dirty = false;
         Ok(())
     }
 
@@ -548,6 +616,13 @@ fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
         }
     }
     spans
+}
+
+fn hash_spans(spans: &[(String, [u8; 3])]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    spans.hash(&mut h);
+    h.finish()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -681,7 +756,50 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_quad_pipeline, QuadInstance};
+    use super::{build_quad_pipeline, measure_cell, QuadInstance, FONT_SIZE, LINE_HEIGHT};
+    use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+    use std::time::{Duration, Instant};
+
+    /// Cost of re-shaping a full 80x24 screen — the work the old render loop did
+    /// on every frame. Guards the "only reshape on change" optimisation.
+    #[test]
+    fn full_screen_shaping_cost() {
+        let mut font_system = FontSystem::new();
+        let (_cw, _ch) = measure_cell(&mut font_system, 1.0);
+        let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
+        let rows = 24usize;
+        let cols = 80usize;
+        let mut buffers: Vec<Buffer> = (0..rows)
+            .map(|_| {
+                let mut b = Buffer::new(&mut font_system, metrics);
+                b.set_size(Some(2000.0), Some(LINE_HEIGHT));
+                b
+            })
+            .collect();
+        let line: String = "abcdefghij0123456789".chars().cycle().take(cols).collect();
+
+        let iters = 30u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            for b in &mut buffers {
+                b.set_text(
+                    &line,
+                    &Attrs::new().family(Family::Monospace),
+                    Shaping::Advanced,
+                    None,
+                );
+                b.shape_until_scroll(&mut font_system, false);
+            }
+        }
+        let per_frame = start.elapsed() / iters;
+        println!("full-screen reshape: {per_frame:?}/frame ({cols}x{rows})");
+        // At 60fps a frame budget is ~16ms; reshaping every frame near/over that
+        // is the lag. This is why we only reshape on change now.
+        assert!(
+            per_frame < Duration::from_millis(50),
+            "full-screen reshape unexpectedly slow: {per_frame:?}"
+        );
+    }
 
     /// Headless proof the quad pipeline produces pixels: render a full-target red
     /// quad to an offscreen texture and read the centre pixel back. Needs a GPU

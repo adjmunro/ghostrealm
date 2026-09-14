@@ -81,7 +81,8 @@
 
 - Requires: NO BLOCKERS
 - Detail: Small follow-ups: (1) DECISION.md's `@no-vcs` marker → the baseline SHA;
-  (2) wake the event loop on PTY output via an `EventLoopProxy` instead of the
-  continuous `Poll` redraw (CPU); (3) reuse `RenderState`/iterators across frames
-  in the backend instead of recreating them each `snapshot()` (perf).
+  (2) reuse `RenderState`/iterators across frames in the backend instead of
+  recreating them each `snapshot()` (~1ms/call, only paid on changed frames now).
 - Reason: correctness/perf/polish, none blocking.
+- Done: event-loop now wakes on PTY output via an `EventLoopProxy` + `Wait`, and
+  only reshapes changed rows on changed frames (fixed the input lag).

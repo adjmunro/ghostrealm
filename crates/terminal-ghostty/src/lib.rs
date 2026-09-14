@@ -25,6 +25,10 @@ use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 /// `portable-pty` directly.
 pub use portable_pty::CommandBuilder;
 
+/// Called by the reader thread after forwarding child output, so an event loop
+/// can wake and redraw instead of polling. `Send` only (it lives on the thread).
+pub type PtyWaker = Box<dyn FnMut() + Send + 'static>;
+
 fn rgb(c: RgbColor) -> Rgb {
     [c.r, c.g, c.b]
 }
@@ -58,6 +62,20 @@ impl GhosttyTerminal {
         cell_h: u32,
         command: Option<CommandBuilder>,
     ) -> Result<Self> {
+        Self::spawn_with_waker(cols, rows, cell_w, cell_h, command, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), plus a `waker` the reader thread invokes each
+    /// time it forwards output, so an event loop can redraw on demand rather than
+    /// polling every frame.
+    pub fn spawn_with_waker(
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+        command: Option<CommandBuilder>,
+        waker: Option<PtyWaker>,
+    ) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -86,6 +104,12 @@ impl GhosttyTerminal {
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
+                let mut waker = waker;
+                let mut wake = || {
+                    if let Some(w) = waker.as_mut() {
+                        w();
+                    }
+                };
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
@@ -94,12 +118,14 @@ impl GhosttyTerminal {
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
+                            wake();
                         }
                         Err(_) => break,
                     }
                 }
                 // Empty send marks EOF so the UI thread can notice promptly.
                 let _ = tx.send(Vec::new());
+                wake();
             })
             .context("spawn reader thread")?;
 
