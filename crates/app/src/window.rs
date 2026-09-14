@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{Args, Rect, Registry, SurfaceId};
+use ghostrealm_core::{Args, Rect, Registry, SurfaceId, TabStatus};
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -16,7 +16,7 @@ use glyphon::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
@@ -31,6 +31,8 @@ const DIVIDER: f32 = 6.0;
 const BORDER: f32 = 2.0;
 /// Max command-palette results shown at once.
 const PALETTE_MAX: usize = 12;
+/// Sidebar width in logical pixels (scaled at runtime).
+const SIDEBAR_W: f32 = 190.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -124,6 +126,17 @@ impl ApplicationHandler<UserEvent> for App {
                     super_: s.super_key(),
                 };
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                state.on_click();
+                state.window.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     state.on_key(&event);
@@ -168,6 +181,10 @@ struct State {
     palette_renderer: TextRenderer,
     palette_buffers: Vec<Buffer>,
     palette: Option<Palette>,
+    /// Text buffers for the sidebar's vtab names (drawn in the main text pass).
+    sidebar_buffers: Vec<Buffer>,
+    /// Last cursor position in physical pixels, for click hit-testing.
+    cursor: (f32, f32),
 
     app: AppState,
     registry: Registry<AppState>,
@@ -273,6 +290,8 @@ impl State {
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
+            sidebar_buffers: Vec::new(),
+            cursor: (0.0, 0.0),
             quad_pipeline,
             quad_buffer,
             quad_capacity,
@@ -310,20 +329,14 @@ impl State {
     }
 
     /// The active vtab's panes as (active surface, pixel rect, focused).
-    fn active_layout(&self, sw: f32, sh: f32) -> Vec<(SurfaceId, Rect, bool)> {
+    fn active_layout(&self, workspace: Rect) -> Vec<(SurfaceId, Rect, bool)> {
         let Some(vt) = self.app.tree.active_vtab() else {
             return Vec::new();
         };
         let Some(vtab) = self.app.tree.vtab(vt) else {
             return Vec::new();
         };
-        let full = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: sw,
-            h: sh,
-        };
-        vtab.layout(full, DIVIDER)
+        vtab.layout(workspace, DIVIDER)
             .into_iter()
             .filter_map(|(pid, rect)| {
                 let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
@@ -331,6 +344,145 @@ impl State {
                 Some((sid, rect, pid == vtab.focused_pane))
             })
             .collect()
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        SIDEBAR_W * self.scale
+    }
+
+    /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
+    fn on_click(&mut self) {
+        if self.palette.is_some() {
+            return;
+        }
+        let (x, y) = self.cursor;
+        let sidebar_w = self.sidebar_width();
+        if x < sidebar_w {
+            let row_h = self.cell_h + 8.0 * self.scale;
+            let pad = 8.0 * self.scale;
+            if y < pad {
+                return;
+            }
+            let idx = ((y - pad) / row_h).floor() as usize;
+            if let Some(v) = self.app.tree.vtabs().get(idx) {
+                let id = v.id;
+                self.app.tree.focus_vtab(id);
+                self.dirty = true;
+            }
+            return;
+        }
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let workspace = Rect {
+            x: sidebar_w,
+            y: 0.0,
+            w: sw - sidebar_w,
+            h: sh,
+        };
+        if let Some(vt) = self.app.tree.active_vtab() {
+            let hit = self.app.tree.vtab(vt).and_then(|vtab| {
+                vtab.layout(workspace, DIVIDER)
+                    .into_iter()
+                    .find(|(_, r)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+                    .map(|(pid, _)| pid)
+            });
+            if let Some(pid) = hit {
+                if let Some(vtab) = self.app.tree.vtab_mut(vt) {
+                    vtab.focused_pane = pid;
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Push sidebar quads and shape vtab-name text; returns placements into
+    /// `sidebar_buffers`.
+    fn build_sidebar(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+        let bar_w = self.sidebar_width();
+        let row_h = self.cell_h + 8.0 * self.scale;
+        let pad = 8.0 * self.scale;
+        let metrics = Metrics::new(FONT_SIZE * self.scale, LINE_HEIGHT * self.scale);
+        let active = self.app.tree.active_vtab();
+        let vtabs: Vec<(String, TabStatus, bool)> = self
+            .app
+            .tree
+            .vtabs()
+            .iter()
+            .map(|v| (v.name.clone(), v.status, Some(v.id) == active))
+            .collect();
+
+        quads.push(rect_quad(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: bar_w,
+                h: sh,
+            },
+            sw,
+            sh,
+            [24, 24, 30],
+            1.0,
+        ));
+
+        while self.sidebar_buffers.len() < vtabs.len() {
+            let b = Buffer::new(&mut self.font_system, metrics);
+            self.sidebar_buffers.push(b);
+        }
+
+        let dot = 6.0 * self.scale;
+        let text_x = pad + dot + 6.0 * self.scale;
+        let mut placements = Vec::with_capacity(vtabs.len());
+        for (i, (name, status, is_active)) in vtabs.iter().enumerate() {
+            let y = pad + i as f32 * row_h;
+            if *is_active {
+                quads.push(rect_quad(
+                    Rect {
+                        x: 0.0,
+                        y,
+                        w: bar_w,
+                        h: row_h,
+                    },
+                    sw,
+                    sh,
+                    [40, 44, 60],
+                    1.0,
+                ));
+            }
+            quads.push(rect_quad(
+                Rect {
+                    x: pad,
+                    y: y + (row_h - dot) * 0.5,
+                    w: dot,
+                    h: dot,
+                },
+                sw,
+                sh,
+                status_color(*status),
+                1.0,
+            ));
+            let buf = &mut self.sidebar_buffers[i];
+            buf.set_metrics(metrics);
+            buf.set_size(Some((bar_w - text_x - pad).max(1.0)), Some(self.cell_h));
+            buf.set_rich_text(
+                std::iter::once((name.as_str(), attrs_for([220, 220, 230]))),
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+            placements.push(Placement {
+                idx: i,
+                left: text_x,
+                top: y + (row_h - self.cell_h) * 0.5,
+                bounds: TextBounds {
+                    left: 0,
+                    top: y as i32,
+                    right: bar_w as i32,
+                    bottom: (y + row_h) as i32,
+                },
+                color: [220, 220, 230],
+            });
+        }
+        placements
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
@@ -598,7 +750,14 @@ impl State {
         }
 
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        let layout = self.active_layout(sw, sh);
+        let sidebar_w = self.sidebar_width();
+        let workspace = Rect {
+            x: sidebar_w,
+            y: 0.0,
+            w: (sw - sidebar_w).max(1.0),
+            h: sh,
+        };
+        let layout = self.active_layout(workspace);
 
         // Layout changed → resize each pane's terminal and invalidate row cache.
         if layout != self.prev_layout {
@@ -703,6 +862,9 @@ impl State {
 
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
+        // Sidebar (bg quads before text; its names join the main text pass).
+        let sidebar_placements = self.build_sidebar(sw, sh, &mut bg_quads);
+
         let palette_placements = if self.palette.is_some() {
             self.build_palette(sw, sh, &mut overlay_quads)
         } else {
@@ -721,7 +883,7 @@ impl State {
             },
         );
 
-        let text_areas: Vec<TextArea> = placements
+        let mut text_areas: Vec<TextArea> = placements
             .iter()
             .map(|p| TextArea {
                 buffer: &self.row_buffers[p.idx],
@@ -733,6 +895,15 @@ impl State {
                 custom_glyphs: &[],
             })
             .collect();
+        text_areas.extend(sidebar_placements.iter().map(|p| TextArea {
+            buffer: &self.sidebar_buffers[p.idx],
+            left: p.left,
+            top: p.top,
+            scale: 1.0,
+            bounds: p.bounds,
+            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+            custom_glyphs: &[],
+        }));
 
         self.text_renderer
             .prepare(
@@ -986,6 +1157,16 @@ fn push_border(out: &mut Vec<QuadInstance>, r: Rect, sw: f32, sh: f32, color: [u
         color,
         1.0,
     ));
+}
+
+fn status_color(status: TabStatus) -> [u8; 3] {
+    match status {
+        TabStatus::Read => [90, 90, 100],
+        TabStatus::Busy => [210, 180, 60],
+        TabStatus::Unread { success: true } => [80, 180, 90],
+        TabStatus::Unread { success: false } => [200, 80, 80],
+        TabStatus::NeedsInput => [210, 120, 40],
+    }
 }
 
 fn srgb_to_linear(c: u8) -> f64 {
