@@ -53,8 +53,13 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 ## Status
 
 - [x] Phase 1: libghostty verification + backend + window spike.
-- [ ] Phase 2: command registry + tab/split tree (headless).
+- [~] Phase 2: command registry [x] + tab/split tree [x] (both headless-tested);
+      palette overlay + AppState integration into the app still to do.
 - [ ] Phase 3: agent control/introspection channel (bumped ahead of shell polish).
 - [ ] Phase 4: sidebar, splits, per-split tab strips, focus routing.
 - [ ] Phase 5: status/inbox state machine.
 - [ ] Phase 6: settings TOML + styling inheritance.
+
+Next keystone: wire `core` (`Tree` + `Registry<AppState>` + a `SurfaceId ->
+GhosttyTerminal` map) into the app so the window becomes a real multiplexer; that
+unblocks the palette, sidebar, and agent channel. See [TODO.md](TODO.md).
