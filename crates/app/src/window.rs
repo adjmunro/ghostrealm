@@ -987,9 +987,12 @@ impl State {
 
                 let spans = row_spans(&grid, row);
                 let hash = hash_spans(&spans);
+                // Grow the pools independently: prev_row_hash is cleared on
+                // layout change while row_buffers is not, so they can desync.
                 if pool_idx >= self.row_buffers.len() {
-                    self.row_buffers
-                        .push(Buffer::new(&mut self.font_system, metrics));
+                    self.row_buffers.push(Buffer::new(&mut self.font_system, metrics));
+                }
+                if pool_idx >= self.prev_row_hash.len() {
                     self.prev_row_hash.push(None);
                 }
                 let unchanged = self.prev_row_hash.get(pool_idx).copied().flatten() == Some(hash);
