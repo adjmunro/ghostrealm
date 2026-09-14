@@ -1,0 +1,447 @@
+//! The live application state: the workspace [`Tree`] plus the terminals that
+//! back its surfaces, and the command registry built over it.
+//!
+//! This is the single source of truth the GUI, the palette, and the agent
+//! channel all act on. It is `!Send` (it owns VT engines) and lives on the UI
+//! thread. Terminal grid sizes default to a headless size until the GUI drives
+//! real per-pane sizes.
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+use ghostrealm_core::{
+    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, Tree, VtabId,
+};
+use ghostrealm_terminal::{Lifecycle, TerminalBackend};
+use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
+
+/// Default grid size for a surface before the GUI assigns it a pane rect.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_CELL_W: u32 = 8;
+const DEFAULT_CELL_H: u32 = 16;
+
+pub struct AppState {
+    pub tree: Tree,
+    surfaces: HashMap<SurfaceId, GhosttyTerminal>,
+    /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
+    shell_line: Option<String>,
+    next_tab_number: u32,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        AppState {
+            tree: Tree::new(),
+            surfaces: HashMap::new(),
+            shell_line: None,
+            next_tab_number: 1,
+        }
+    }
+
+    /// Use `sh -c <line>` for spawned surfaces instead of the login shell.
+    pub fn with_shell_line(mut self, line: impl Into<String>) -> Self {
+        self.shell_line = Some(line.into());
+        self
+    }
+
+    fn spawn_surface(&mut self, id: SurfaceId) -> Result<()> {
+        let cmd = self.shell_line.as_ref().map(|line| {
+            let mut c = CommandBuilder::new("/bin/sh");
+            c.arg("-c");
+            c.arg(line);
+            c
+        });
+        let term = GhosttyTerminal::spawn(
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            DEFAULT_CELL_W,
+            DEFAULT_CELL_H,
+            cmd,
+        )?;
+        self.surfaces.insert(id, term);
+        Ok(())
+    }
+
+    pub fn terminal(&mut self, id: SurfaceId) -> Option<&mut GhosttyTerminal> {
+        self.surfaces.get_mut(&id)
+    }
+
+    /// Create a new vtab with a spawned terminal; it becomes active.
+    pub fn new_vtab(&mut self) -> Result<VtabId> {
+        let name = format!("tab {}", self.next_tab_number);
+        self.next_tab_number += 1;
+        let (vt, _pane, surf) = self.tree.add_vtab(name);
+        self.spawn_surface(surf)?;
+        Ok(vt)
+    }
+
+    fn active(&self) -> Option<VtabId> {
+        self.tree.active_vtab()
+    }
+
+    fn focused_pane(&self) -> Option<(VtabId, ghostrealm_core::tree::PaneId)> {
+        let vt = self.active()?;
+        let v = self.tree.vtab(vt)?;
+        Some((vt, v.focused_pane))
+    }
+
+    pub fn split_focused(&mut self, axis: Axis) -> Result<()> {
+        let Some((vt, pane)) = self.focused_pane() else {
+            return Ok(());
+        };
+        if let Some((_new_pane, surf)) = self.tree.split(vt, pane, axis) {
+            self.spawn_surface(surf)?;
+        }
+        Ok(())
+    }
+
+    pub fn new_surface_in_focused(&mut self) -> Result<()> {
+        let Some((vt, pane)) = self.focused_pane() else {
+            return Ok(());
+        };
+        if let Some(surf) = self.tree.add_surface(vt, pane) {
+            self.spawn_surface(surf)?;
+        }
+        Ok(())
+    }
+
+    /// Cycle focus to the next pane in the active vtab.
+    pub fn focus_next_pane(&mut self) {
+        let Some(vt) = self.active() else { return };
+        let Some(v) = self.tree.vtab(vt) else { return };
+        let panes: Vec<_> = v.panes().iter().map(|p| p.id).collect();
+        if panes.len() < 2 {
+            return;
+        }
+        let cur = v.focused_pane;
+        let pos = panes.iter().position(|&p| p == cur).unwrap_or(0);
+        let next = panes[(pos + 1) % panes.len()];
+        if let Some(v) = self.tree.vtab_mut(vt) {
+            v.focused_pane = next;
+        }
+    }
+
+    pub fn close_focused_pane(&mut self) {
+        if let Some((vt, pane)) = self.focused_pane() {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_pane(vt, pane));
+        }
+    }
+
+    pub fn close_active_vtab(&mut self) {
+        if let Some(vt) = self.active() {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt));
+        }
+    }
+
+    /// Run a tree mutation, then drop terminals whose surfaces no longer exist.
+    fn prune_orphan_surfaces_after(&mut self, f: impl FnOnce(&mut Self) -> bool) {
+        f(self);
+        let live: std::collections::HashSet<SurfaceId> = self
+            .tree
+            .vtabs()
+            .iter()
+            .flat_map(|v| v.panes())
+            .flat_map(|p| p.surfaces.iter().map(|s| s.id))
+            .collect();
+        self.surfaces.retain(|id, _| live.contains(id));
+    }
+
+    pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
+        if let Some(vt) = self.active() {
+            if let Some(v) = self.tree.vtab_mut(vt) {
+                v.name = name.into();
+                v.user_named = true;
+            }
+        }
+    }
+
+    /// The active surface of the focused pane of the active vtab.
+    pub fn focused_surface(&self) -> Option<SurfaceId> {
+        let vt = self.active()?;
+        let v = self.tree.vtab(vt)?;
+        let pane = v.panes().into_iter().find(|p| p.id == v.focused_pane)?;
+        pane.active_surface().map(|s| s.id)
+    }
+
+    /// Write raw bytes to a surface's terminal (agent-driven input).
+    pub fn write_input(&mut self, id: SurfaceId, bytes: &[u8]) -> bool {
+        match self.surfaces.get_mut(&id) {
+            Some(t) => {
+                t.write_bytes(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Pump all terminals and sync program-set surface titles into the tree.
+    pub fn pump_all(&mut self) {
+        let mut titles: Vec<(SurfaceId, String)> = Vec::new();
+        for (id, term) in self.surfaces.iter_mut() {
+            term.pump();
+            if let Some(t) = term.title() {
+                titles.push((*id, t));
+            }
+        }
+        for (id, title) in titles {
+            self.tree.set_surface_title(id, title, false);
+        }
+    }
+
+    /// A human/agent-readable dump of the workspace structure.
+    pub fn describe(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let active = self.active();
+        for v in self.tree.vtabs() {
+            let act = if Some(v.id) == active {
+                " (active)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "vtab {} {:?} [{:?}]{}", v.id.0, v.name, v.status, act);
+            for p in v.panes() {
+                let foc = if p.id == v.focused_pane {
+                    " (focused)"
+                } else {
+                    ""
+                };
+                let _ = writeln!(out, "  pane {}{}", p.id.0, foc);
+                for (i, s) in p.surfaces.iter().enumerate() {
+                    let a = if i == p.active { " (active)" } else { "" };
+                    let title = if s.title.is_empty() {
+                        "<untitled>"
+                    } else {
+                        &s.title
+                    };
+                    let _ = writeln!(out, "    surface {} {:?}{}", s.id.0, title, a);
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(no vtabs)\n");
+        }
+        out
+    }
+
+    /// A text rendering of one surface's grid (pumps it first).
+    pub fn surface_text(&mut self, id: SurfaceId) -> Option<String> {
+        let term = self.surfaces.get_mut(&id)?;
+        term.pump();
+        let grid = term.snapshot();
+        let mut out = String::new();
+        for row in 0..grid.size.rows {
+            let mut line = String::new();
+            for col in 0..grid.size.cols {
+                match grid.cell(col, row) {
+                    Some(c) if !c.text.is_empty() => line.push_str(&c.text),
+                    _ => line.push(' '),
+                }
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    pub fn surface_lifecycle(&mut self, id: SurfaceId) -> Option<Lifecycle> {
+        self.surfaces.get_mut(&id).map(|t| t.lifecycle())
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn failed(e: anyhow::Error) -> CmdError {
+    CmdError::Failed(format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn new_vtab_spawns_a_surface() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        let vt = s.new_vtab().unwrap();
+        let v = s.tree.vtab(vt).unwrap();
+        assert_eq!(v.panes().len(), 1);
+        let surf = v.panes()[0].surfaces[0].id;
+        assert!(
+            s.terminal(surf).is_some(),
+            "new_vtab should spawn a terminal for its surface"
+        );
+    }
+
+    #[test]
+    fn split_spawns_a_second_terminal() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_vtab().unwrap();
+        s.split_focused(Axis::LeftRight).unwrap();
+        let vt = s.tree.active_vtab().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 2);
+        // Both surfaces should have live terminals.
+        let ids: Vec<_> = s
+            .tree
+            .vtab(vt)
+            .unwrap()
+            .panes()
+            .iter()
+            .map(|p| p.surfaces[0].id)
+            .collect();
+        for id in ids {
+            assert!(
+                s.terminal(id).is_some(),
+                "each split pane should have a terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_focused_pane_drops_its_terminal() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_vtab().unwrap();
+        s.split_focused(Axis::TopBottom).unwrap();
+        let before = s.tree.surface_count();
+        s.close_focused_pane();
+        let after = s.tree.surface_count();
+        assert_eq!(after, before - 1, "closing a pane should drop one surface");
+        assert_eq!(
+            s.surfaces.len(),
+            after,
+            "orphaned terminals should be pruned"
+        );
+    }
+
+    #[test]
+    fn write_input_reaches_child() {
+        // `cat` echoes its stdin back through the PTY.
+        let mut s = AppState::new().with_shell_line("cat");
+        let vt = s.new_vtab().unwrap();
+        let surf = s.tree.vtab(vt).unwrap().panes()[0].surfaces[0].id;
+        assert!(s.write_input(surf, b"hello-input\r"));
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = s.surface_text(surf).unwrap_or_default();
+            if text.contains("hello-input") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            text.contains("hello-input"),
+            "input written to a surface should appear in its grid, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn surface_captures_child_output() {
+        let mut s = AppState::new().with_shell_line("printf 'READY-MARKER'; sleep 2");
+        let vt = s.new_vtab().unwrap();
+        let surf = s.tree.vtab(vt).unwrap().panes()[0].surfaces[0].id;
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = s.surface_text(surf).unwrap_or_default();
+            if text.contains("READY-MARKER") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            text.contains("READY-MARKER"),
+            "surface grid should capture child output within the timeout, got:\n{text}\n\
+             Next steps: check spawn_surface wiring and pump/snapshot in surface_text."
+        );
+    }
+}
+
+/// Build the command registry over [`AppState`]. This is the one catalog the
+/// palette, keybindings, and agent channel all use.
+pub fn build_registry() -> Registry<AppState> {
+    let mut r = Registry::new();
+
+    r.register(
+        CommandMeta::new("tab.new", "New Tab", "Open a new vertical tab"),
+        Box::new(|s: &mut AppState, _| {
+            let id = s.new_vtab().map_err(failed)?;
+            Ok(CmdOutcome::msg(format!("opened vtab {}", id.0)))
+        }),
+    );
+    r.register(
+        CommandMeta::new("tab.close", "Close Tab", "Close the active vertical tab"),
+        Box::new(|s: &mut AppState, _| {
+            s.close_active_vtab();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new("tab.rename", "Rename Tab", "Rename the active vertical tab")
+            .arg(ArgSpec::required("name", ArgKind::Str, "the new tab name")),
+        Box::new(|s: &mut AppState, a| {
+            s.rename_active_vtab(a.get_str("name")?);
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "split.leftright",
+            "Split Left/Right",
+            "Split the focused pane side by side",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.split_focused(Axis::LeftRight).map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "split.topbottom",
+            "Split Top/Bottom",
+            "Split the focused pane stacked",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.split_focused(Axis::TopBottom).map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new("pane.close", "Close Pane", "Close the focused pane"),
+        Box::new(|s: &mut AppState, _| {
+            s.close_focused_pane();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "pane.focus_next",
+            "Focus Next Pane",
+            "Move focus to the next pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.focus_next_pane();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "surface.new",
+            "New Terminal Tab",
+            "Add a terminal tab to the focused pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.new_surface_in_focused().map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+
+    r
+}
