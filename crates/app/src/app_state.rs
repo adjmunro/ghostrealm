@@ -7,13 +7,14 @@
 //! real per-pane sizes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, Tree, VtabId,
 };
-use ghostrealm_terminal::{Lifecycle, TerminalBackend};
-use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
+use ghostrealm_terminal::{KeyPress, Lifecycle, TerminalBackend};
+use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, PtyWaker};
 
 /// Default grid size for a surface before the GUI assigns it a pane rect.
 const DEFAULT_COLS: u16 = 80;
@@ -26,6 +27,9 @@ pub struct AppState {
     surfaces: HashMap<SurfaceId, GhosttyTerminal>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
     shell_line: Option<String>,
+    /// Shared source for per-surface PTY wakers (the GUI wires this to its event
+    /// loop). Cloned into a fresh `PtyWaker` for each spawned terminal.
+    waker: Option<Arc<dyn Fn() + Send + Sync>>,
     next_tab_number: u32,
 }
 
@@ -35,6 +39,7 @@ impl AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
             shell_line: None,
+            waker: None,
             next_tab_number: 1,
         }
     }
@@ -45,6 +50,13 @@ impl AppState {
         self
     }
 
+    /// Wake `f` whenever any surface produces output (the GUI passes a closure
+    /// that pokes its event loop). Terminals spawned after this call use it.
+    pub fn with_waker(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.waker = Some(f);
+        self
+    }
+
     fn spawn_surface(&mut self, id: SurfaceId) -> Result<()> {
         let cmd = self.shell_line.as_ref().map(|line| {
             let mut c = CommandBuilder::new("/bin/sh");
@@ -52,12 +64,17 @@ impl AppState {
             c.arg(line);
             c
         });
-        let term = GhosttyTerminal::spawn(
+        let waker: Option<PtyWaker> = self.waker.clone().map(|src| {
+            let w: PtyWaker = Box::new(move || src());
+            w
+        });
+        let term = GhosttyTerminal::spawn_with_waker(
             DEFAULT_COLS,
             DEFAULT_ROWS,
             DEFAULT_CELL_W,
             DEFAULT_CELL_H,
             cmd,
+            waker,
         )?;
         self.surfaces.insert(id, term);
         Ok(())
@@ -175,11 +192,43 @@ impl AppState {
         }
     }
 
+    /// Encode and send a key press to the focused surface.
+    pub fn send_key_to_focused(&mut self, press: &KeyPress) -> bool {
+        match self
+            .focused_surface()
+            .and_then(|id| self.surfaces.get_mut(&id))
+        {
+            Some(t) => {
+                t.send_key(press);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resize a surface's terminal to a pane's grid dimensions.
+    pub fn resize_surface(
+        &mut self,
+        id: SurfaceId,
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+    ) {
+        if let Some(t) = self.surfaces.get_mut(&id) {
+            t.resize(cols, rows, cell_w, cell_h);
+        }
+    }
+
     /// Pump all terminals and sync program-set surface titles into the tree.
-    pub fn pump_all(&mut self) {
+    /// Returns true if any terminal produced output (the grid may have changed).
+    pub fn pump_all(&mut self) -> bool {
+        let mut changed = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
         for (id, term) in self.surfaces.iter_mut() {
-            term.pump();
+            if term.pump() {
+                changed = true;
+            }
             if let Some(t) = term.title() {
                 titles.push((*id, t));
             }
@@ -187,6 +236,7 @@ impl AppState {
         for (id, title) in titles {
             self.tree.set_surface_title(id, title, false);
         }
+        changed
     }
 
     /// A human/agent-readable dump of the workspace structure.
