@@ -209,15 +209,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Commands with arguments have no UI to collect them
+[2026-09-15@2e8e8c7] Commands with arguments — arg prompt done; file picker remains
 
 - Requires: NO BLOCKERS
-- Detail: Commands that take args (tab.rename, editor.open, a future editor save-as)
-  do nothing from the palette — there is no follow-up to enter the argument, so they
-  appear broken. Add an argument-input flow: after choosing such a command, prompt
-  for each required arg (reuse the Run-Anything single-line input); for a path arg,
-  a file picker (see the editor entry).
-- Reason: rename / open / save currently look broken.
+- Detail: DONE (ace4f7c): choosing a command with required args (Rename Workspace,
+  Open File in Editor) now prompts for each arg in the palette (name + description +
+  kind, enum options listed), validated per kind, then runs it. REMAINING: for a
+  path arg, a proper file picker instead of typing the path (ties to the editor
+  save-as/open dialog entry).
+- Reason: rename / open now work; path entry is still raw typing.
 
 ---
 
