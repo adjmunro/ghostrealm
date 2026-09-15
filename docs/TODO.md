@@ -382,3 +382,29 @@
 - Detail: Make the sidebar workspace rows taller and show the directory each is
   pinned to (its root dir) under/next to the name.
 - Reason: visibility of a workspace's cwd; pairs with the per-workspace root dir.
+
+---
+
+[2026-09-15@2e8e8c7] Config — default directory for new workspaces (default $HOME)
+
+- Requires: NO BLOCKERS (feeds the per-workspace root directory)
+- Detail: Add a config option (e.g. `[general] default_directory` or under a new
+  section) for the base directory new workspaces/terminals start in. Defaults to
+  `$HOME`; the user wants to override it to e.g. their Developer directory. A
+  workspace's own pinned root dir (context action) overrides this per workspace.
+- Reason: start new work where the user actually works, not always $HOME.
+
+---
+
+[2026-09-15@2e8e8c7] Settings UI (Cmd+,) over the config file
+
+- Requires: config write-back (round-trip TOML; today `load_or_create` only reads /
+  writes the default on first run)
+- Detail: No settings UI exists. `Cmd+,` (the standard macOS Settings shortcut)
+  should open a settings UI. Keep the config file as the single source of truth —
+  the UI is a front end that reads and writes `config.toml` (sections: sidebar,
+  terminal, chrome, tabs, input, inbox, keybindings, plus the new default_directory).
+  MVP: a form/overlay over the config sections (reuse the overlay/menu infra);
+  ideally preserve comments on write-back, else regenerate a documented file. If it
+  turns out complex, discuss scope first.
+- Reason: expected Mac Cmd+, settings; edit config without hand-editing TOML.
