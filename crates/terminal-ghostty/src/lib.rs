@@ -5,6 +5,9 @@
 //! work (reading the PTY master) and forwards raw bytes over a channel; every
 //! call into the VT engine happens in [`GhosttyTerminal::pump`] on this thread.
 
+pub mod threaded;
+pub use threaded::{ThreadedTerminal, UiWaker};
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};

@@ -23,7 +23,7 @@ use crate::editor::EditorBuffer;
 /// foreground process group hasn't moved yet — the command may not have forked
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
-use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, PtyWaker};
+use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 
 /// Default grid size for a surface before the GUI assigns it a pane rect.
 const DEFAULT_COLS: u16 = 80;
@@ -33,7 +33,7 @@ const DEFAULT_CELL_H: u32 = 16;
 
 pub struct AppState {
     pub tree: Tree,
-    surfaces: HashMap<SurfaceId, GhosttyTerminal>,
+    surfaces: HashMap<SurfaceId, ThreadedTerminal>,
     /// Surfaces whose content is a text editor rather than a terminal.
     editors: HashMap<SurfaceId, EditorBuffer>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
@@ -103,23 +103,21 @@ impl AppState {
             c.arg(line);
             c
         });
-        let waker: Option<PtyWaker> = self.waker.clone().map(|src| {
-            let w: PtyWaker = Box::new(move || src());
-            w
-        });
-        let term = GhosttyTerminal::spawn_with_waker(
+        // The VT runs on a worker thread; the UI waker pokes the event loop when
+        // the worker publishes a new grid.
+        let term = ThreadedTerminal::spawn(
             DEFAULT_COLS,
             DEFAULT_ROWS,
             DEFAULT_CELL_W,
             DEFAULT_CELL_H,
             cmd,
-            waker,
+            self.waker.clone(),
         )?;
         self.surfaces.insert(id, term);
         Ok(())
     }
 
-    pub fn terminal(&mut self, id: SurfaceId) -> Option<&mut GhosttyTerminal> {
+    pub fn terminal(&mut self, id: SurfaceId) -> Option<&mut ThreadedTerminal> {
         self.surfaces.get_mut(&id)
     }
 
