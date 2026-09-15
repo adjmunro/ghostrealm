@@ -86,8 +86,8 @@ pub struct Inbox {
 impl Default for Inbox {
     fn default() -> Self {
         Inbox {
-            auto_read_after: 60,
-            auto_unread_before: 10,
+            auto_read_after: 3,
+            auto_unread_before: 1,
         }
     }
 }
@@ -225,8 +225,8 @@ autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
 focus_follows_mouse = false  # hovering a pane focuses it (routes keyboard there)
 
 [inbox]
-auto_read_after = 60    # seconds of focus before unread -> read (0 = manual only)
-auto_unread_before = 10 # grace seconds after read to re-mark unread on unfocus
+auto_read_after = 3     # seconds of focus before unread -> read (0 = manual only)
+auto_unread_before = 1  # grace seconds after an auto-read to re-mark unread on unfocus
 
 [keybindings]
 # Override chord -> command id (Cmd chords only; others go to the terminal).

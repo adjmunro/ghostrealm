@@ -10,7 +10,7 @@ pub mod fuzzy;
 pub mod registry;
 pub mod tree;
 
-pub use config::{Config, Side};
+pub use config::{Config, Inbox, Side};
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};

@@ -57,10 +57,10 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 - [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON).
 - [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
-- [~] Phase 5: inbox status — background output → unread, focus → read, sticky
-      needs_input (agent/palette settable), busy from the foreground process-group
-      (+ optimistic on Enter). To do: OSC 133 exit code for unread success/failure
-      and the auto-read dwell timer.
+- [~] Phase 5: inbox status — background output → unread, sticky needs_input
+      (agent/palette settable), busy from the foreground process-group (+ optimistic
+      on Enter), auto-read dwell + unfocus grace. To do: OSC 133 exit code for
+      unread success/failure.
 - [~] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
       colours, autohide, config-driven keybindings, sidebar `side`). To do:
       Ghostty palette inheritance for chrome colours.

@@ -34,14 +34,13 @@
 [2026-09-15@1d4d22e]
 
 - Requires: NO BLOCKERS
-- Detail: Remainder of Phase 5. Busy detection is DONE: optimistic busy on Enter
-  (with a grace window) + authoritative busy/idle from the PTY foreground
-  process-group (`TerminalBackend::is_busy`), driving `TabStatus::Busy` and
-  clearing to read (foreground) / unread (background) on completion. Still to do:
-  (1) exit code via OSC 133 to set `Unread { success }` truthfully (today success
-  is always true); (2) the auto-read dwell timer (`inbox.auto_read_after`) with the
-  unfocus grace (`auto_unread_before`).
-- Reason: makes background job success/failure and auto-read real.
+- Detail: Remainder of Phase 5. DONE: busy detection (optimistic-on-Enter +
+  foreground process-group) and the auto-read dwell timer (`inbox.auto_read_after`
+  with the `auto_unread_before` unfocus grace, driven by `AppState::tick_inbox`
+  and a scheduled event-loop wake). Still to do: exit code via OSC 133 to set
+  `Unread { success }` truthfully (today success is always true) — needs the VT
+  engine to surface OSC 133 command state.
+- Reason: makes background job success/failure real (red vs green unread dot).
 
 ---
 

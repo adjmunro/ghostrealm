@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, TabStatus,
-    Tree, VtabId,
+    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, Registry, SurfaceId,
+    TabStatus, Tree, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
@@ -41,6 +41,13 @@ pub struct AppState {
     /// Per-vtab deadline until which an optimistic (post-Enter) busy status holds
     /// even if the foreground process group hasn't moved yet.
     optimistic_busy: HashMap<VtabId, Instant>,
+    /// Inbox timing config (auto-read dwell + unfocus grace).
+    inbox: Inbox,
+    /// When the active vtab was focused, for the auto-read dwell timer.
+    focus_started: Instant,
+    /// The vtab most recently auto-read by dwell, and when — for the unfocus grace
+    /// (leaving too soon after an auto-read reverts it to unread).
+    last_auto_read: Option<(VtabId, Instant)>,
 }
 
 impl AppState {
@@ -52,7 +59,15 @@ impl AppState {
             waker: None,
             next_tab_number: 1,
             optimistic_busy: HashMap::new(),
+            inbox: Inbox::default(),
+            focus_started: Instant::now(),
+            last_auto_read: None,
         }
+    }
+
+    /// Set the inbox timing config (auto-read dwell + unfocus grace).
+    pub fn set_inbox_config(&mut self, inbox: Inbox) {
+        self.inbox = inbox;
     }
 
     /// Use `sh -c <line>` for spawned surfaces instead of the login shell.
@@ -204,19 +219,80 @@ impl AppState {
         }
     }
 
-    /// Focus a vtab, clearing an `unread` status to `read` (a sticky
-    /// `needs_input` is preserved).
+    /// Focus a vtab. Unlike an email that opens as read, an unread tab is cleared
+    /// by the auto-read *dwell* ([`tick_inbox`](Self::tick_inbox)), not instantly —
+    /// so a quick glance doesn't consume it. Leaving a tab within the unfocus grace
+    /// after it auto-read reverts it to unread.
     pub fn focus_vtab(&mut self, id: VtabId) {
+        let prev = self.active();
         if !self.tree.focus_vtab(id) {
             return;
         }
-        let clear = self
+        if prev == Some(id) {
+            return;
+        }
+        // Unfocus grace: if we're leaving a tab that auto-read very recently, it
+        // didn't really get read — put it back to unread.
+        if let (Some(from), Some((ar_vt, ar_at))) = (prev, self.last_auto_read) {
+            let grace = Duration::from_secs(self.inbox.auto_unread_before as u64);
+            if from == ar_vt && ar_at.elapsed() < grace {
+                let sticky = self
+                    .tree
+                    .vtab(from)
+                    .map(|v| matches!(v.status, TabStatus::NeedsInput | TabStatus::Busy))
+                    .unwrap_or(false);
+                if !sticky {
+                    self.tree
+                        .set_status(from, TabStatus::Unread { success: true });
+                }
+            }
+        }
+        self.last_auto_read = None;
+        self.focus_started = Instant::now();
+    }
+
+    /// Advance the auto-read dwell: an unread active tab focused continuously for
+    /// `auto_read_after` seconds becomes read. `auto_read_after == 0` means manual
+    /// only. Call periodically (each frame and on a scheduled deadline). Returns
+    /// whether it changed a status.
+    pub fn tick_inbox(&mut self) -> bool {
+        let after = self.inbox.auto_read_after;
+        if after == 0 {
+            return false;
+        }
+        let Some(vt) = self.active() else {
+            return false;
+        };
+        let is_unread = self
             .tree
-            .vtab(id)
+            .vtab(vt)
             .map(|v| matches!(v.status, TabStatus::Unread { .. }))
             .unwrap_or(false);
-        if clear {
-            self.tree.set_status(id, TabStatus::Read);
+        if is_unread && self.focus_started.elapsed() >= Duration::from_secs(after as u64) {
+            self.tree.set_status(vt, TabStatus::Read);
+            self.last_auto_read = Some((vt, Instant::now()));
+            return true;
+        }
+        false
+    }
+
+    /// The next time an inbox timer should fire (a pending auto-read dwell), so the
+    /// event loop can wake for it even without other activity.
+    pub fn next_inbox_deadline(&self) -> Option<Instant> {
+        let after = self.inbox.auto_read_after;
+        if after == 0 {
+            return None;
+        }
+        let vt = self.active()?;
+        let is_unread = self
+            .tree
+            .vtab(vt)
+            .map(|v| matches!(v.status, TabStatus::Unread { .. }))
+            .unwrap_or(false);
+        if is_unread {
+            Some(self.focus_started + Duration::from_secs(after as u64))
+        } else {
+            None
         }
     }
 
@@ -717,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn background_output_marks_unread_and_focus_clears() {
+    fn background_output_marks_unread_and_dwell_reads() {
         // Both tabs print after a short delay; tab a is active, tab b is not.
         let mut s = AppState::new().with_shell_line("sleep 0.15; printf DONE; sleep 3");
         let a = s.new_vtab().unwrap();
@@ -739,9 +815,55 @@ mod tests {
         }
         // a stayed read (its output arrived while it was active).
         assert_eq!(s.tree.vtab(a).unwrap().status, TabStatus::Read);
-        // Focusing b clears it.
+
+        // Focusing b no longer clears instantly — the auto-read dwell does.
+        s.set_inbox_config(Inbox {
+            auto_read_after: 1,
+            auto_unread_before: 1,
+        });
         s.focus_vtab(b);
+        assert!(
+            matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
+            "focus alone must not clear unread; the dwell does"
+        );
+        s.tick_inbox();
+        assert!(
+            matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
+            "before the dwell elapses it stays unread"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        s.tick_inbox();
+        assert_eq!(
+            s.tree.vtab(b).unwrap().status,
+            TabStatus::Read,
+            "after the dwell, sustained focus marks it read"
+        );
+    }
+
+    #[test]
+    fn leaving_within_grace_reverts_auto_read() {
+        let mut s = AppState::new().with_shell_line("sleep 5");
+        let a = s.new_vtab().unwrap();
+        let b = s.new_vtab().unwrap();
+        s.set_inbox_config(Inbox {
+            auto_read_after: 1,
+            auto_unread_before: 5,
+        });
+        s.focus_vtab(a); // a active, b background
+        s.tree.set_status(b, TabStatus::Unread { success: true });
+
+        // Focus b, dwell until it auto-reads.
+        s.focus_vtab(b);
+        std::thread::sleep(Duration::from_millis(1100));
+        s.tick_inbox();
         assert_eq!(s.tree.vtab(b).unwrap().status, TabStatus::Read);
+
+        // Leaving b immediately (within the grace) reverts the auto-read.
+        s.focus_vtab(a);
+        assert!(
+            matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
+            "leaving within the unfocus grace should revert the auto-read to unread"
+        );
     }
 
     #[test]

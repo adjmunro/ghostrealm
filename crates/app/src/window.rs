@@ -136,16 +136,19 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        if state.pty_pending {
-            let now = Instant::now();
-            if now >= state.next_frame {
+        // Wake for whichever comes first: the next paced PTY frame or a pending
+        // inbox auto-read deadline.
+        let mut wake: Option<Instant> = state.pty_pending.then_some(state.next_frame);
+        if let Some(d) = state.app.next_inbox_deadline() {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
+        match wake {
+            Some(t) if Instant::now() >= t => {
                 state.window.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Wait);
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_frame));
             }
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -370,6 +373,7 @@ impl State {
             app = app.with_shell_line(line);
         }
         app = app.with_waker(waker);
+        app.set_inbox_config(cfg.inbox);
         app.new_vtab().context("open initial tab")?;
         let registry = build_registry();
 
@@ -1215,6 +1219,10 @@ impl State {
         }
         self.pty_pending = more;
         self.next_frame = Instant::now() + FRAME_INTERVAL;
+        // Advance the auto-read dwell; a status change needs a redraw.
+        if self.app.tick_inbox() {
+            self.dirty = true;
+        }
         if !self.dirty {
             return Ok(());
         }
