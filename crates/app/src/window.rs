@@ -381,6 +381,8 @@ enum MenuAction {
     MarkRead,
     MarkUnread,
     Dismiss,
+    Rename,
+    SetDir,
     Close,
 }
 
@@ -849,6 +851,8 @@ impl State {
             Some(TabStatus::NeedsInput) => items.push(("Dismiss".into(), MenuAction::Dismiss)),
             _ => items.push(("Mark unread".into(), MenuAction::MarkUnread)),
         }
+        items.push(("Rename…".into(), MenuAction::Rename));
+        items.push(("Set directory…".into(), MenuAction::SetDir));
         items.push(("Close workspace".into(), MenuAction::Close));
         self.menu = Some(Menu {
             target,
@@ -908,6 +912,16 @@ impl State {
                 .tree
                 .set_status(target, TabStatus::Unread { success: true }),
             MenuAction::Close => self.app.close_vtab(target),
+            // Rename / Set directory act on the active workspace, so focus the
+            // target first, then open the argument prompt for the command.
+            MenuAction::Rename => {
+                self.app.focus_vtab(target);
+                self.begin_command("tab.rename");
+            }
+            MenuAction::SetDir => {
+                self.app.focus_vtab(target);
+                self.begin_command("workspace.set_root");
+            }
         }
     }
 
@@ -1470,6 +1484,39 @@ impl State {
         placements
     }
 
+    /// Run a command by id: execute immediately if it needs no required args, else
+    /// open the palette to collect them (the argument prompt).
+    fn begin_command(&mut self, id: &str) {
+        let specs: Vec<ArgSpec> = self
+            .registry
+            .meta(id)
+            .map(|m| m.args.iter().filter(|a| a.required).cloned().collect())
+            .unwrap_or_default();
+        if specs.is_empty() {
+            let _ = self.registry.execute(id, &Args::new(), &mut self.app);
+        } else {
+            let title = self
+                .registry
+                .meta(id)
+                .map(|m| m.title.to_string())
+                .unwrap_or_default();
+            self.menu = None;
+            self.palette = Some(Palette {
+                query: String::new(),
+                selected: 0,
+                scroll: 0,
+                mode: PaletteMode::Commands,
+                pending: Some(PendingArgs {
+                    id: id.to_string(),
+                    title,
+                    specs,
+                    values: Vec::new(),
+                }),
+            });
+        }
+        self.dirty = true;
+    }
+
     /// Open the command palette (fresh query, first result selected).
     fn open_palette(&mut self) {
         self.menu = None;
@@ -1823,34 +1870,10 @@ impl State {
                         .palette_results(&query)
                         .get(selected)
                         .map(|(id, _, _)| id.clone());
+                    self.palette = None;
                     if let Some(id) = id {
-                        // A command with required args collects them first.
-                        let specs: Vec<ArgSpec> = self
-                            .registry
-                            .meta(&id)
-                            .map(|m| m.args.iter().filter(|a| a.required).cloned().collect())
-                            .unwrap_or_default();
-                        if specs.is_empty() {
-                            self.palette = None;
-                            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
-                        } else {
-                            let title = self
-                                .registry
-                                .meta(&id)
-                                .map(|m| m.title.to_string())
-                                .unwrap_or_default();
-                            if let Some(p) = self.palette.as_mut() {
-                                p.query.clear();
-                                p.pending = Some(PendingArgs {
-                                    id,
-                                    title,
-                                    specs,
-                                    values: Vec::new(),
-                                });
-                            }
-                        }
-                    } else {
-                        self.palette = None;
+                        // Executes now, or reopens the palette to collect args.
+                        self.begin_command(&id);
                     }
                 }
                 PaletteMode::Run => {
