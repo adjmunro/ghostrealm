@@ -29,3 +29,7 @@ diagnostics). Open questions: how to hook into the live command line without a r
 editor buffer (the shell owns the line), whether to intercept before the PTY or run
 it against a scratch buffer, and how it interacts with the shell's own completion.
 Likely pairs with the basic text-editor pane (TODO) where we *do* own the buffer.
+
+---
+
+Built-in web browser pane

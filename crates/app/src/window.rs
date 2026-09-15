@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{Args, Chrome, Config, Rect, Registry, Side, SurfaceId, TabStatus};
+use ghostrealm_core::{
+    ArgKind, ArgSpec, Args, Chrome, Config, Rect, Registry, Side, SurfaceId, TabStatus, Value,
+};
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -345,6 +347,15 @@ enum PaletteMode {
     Run,
 }
 
+/// Collecting arguments for a chosen command before running it.
+struct PendingArgs {
+    id: String,
+    title: String,
+    specs: Vec<ArgSpec>,
+    /// Values collected so far, one per spec in order.
+    values: Vec<Value>,
+}
+
 /// Command-palette / run-anything overlay state.
 struct Palette {
     query: String,
@@ -353,6 +364,9 @@ struct Palette {
     /// Index of the first visible result row (scroll offset).
     scroll: usize,
     mode: PaletteMode,
+    /// When set, the palette is collecting arguments for a chosen command; the
+    /// input line feeds the current argument instead of the search query.
+    pending: Option<PendingArgs>,
 }
 
 /// An action a sidebar context-menu item performs on its target vtab.
@@ -1319,6 +1333,7 @@ impl State {
             selected: 0,
             scroll: 0,
             mode: PaletteMode::Commands,
+            pending: None,
         });
         self.dirty = true;
     }
@@ -1335,6 +1350,7 @@ impl State {
                     selected: 0,
                     scroll: 0,
                     mode,
+                    pending: None,
                 })
             }
         }
@@ -1544,6 +1560,17 @@ impl State {
     }
 
     fn palette_key(&mut self, event: &winit::event::KeyEvent) {
+        // In argument-collection mode the input feeds the current arg, not search.
+        if self
+            .palette
+            .as_ref()
+            .map(|p| p.pending.is_some())
+            .unwrap_or(false)
+        {
+            self.palette_arg_key(event);
+            return;
+        }
+
         let (query, selected, mode) = match &self.palette {
             Some(p) => (p.query.clone(), p.selected, p.mode),
             None => return,
@@ -1557,28 +1584,52 @@ impl State {
         };
         match &event.logical_key {
             WKey::Named(NamedKey::Escape) => self.palette = None,
-            WKey::Named(NamedKey::Enter) => {
-                self.palette = None;
-                match mode {
-                    PaletteMode::Commands => {
-                        let id = self
-                            .palette_results(&query)
-                            .get(selected)
-                            .map(|(id, _, _)| id.clone());
-                        if let Some(id) = id {
+            WKey::Named(NamedKey::Enter) => match mode {
+                PaletteMode::Commands => {
+                    let id = self
+                        .palette_results(&query)
+                        .get(selected)
+                        .map(|(id, _, _)| id.clone());
+                    if let Some(id) = id {
+                        // A command with required args collects them first.
+                        let specs: Vec<ArgSpec> = self
+                            .registry
+                            .meta(&id)
+                            .map(|m| m.args.iter().filter(|a| a.required).cloned().collect())
+                            .unwrap_or_default();
+                        if specs.is_empty() {
+                            self.palette = None;
                             let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
-                        }
-                    }
-                    PaletteMode::Run => {
-                        let line = query.trim();
-                        if !line.is_empty() {
-                            if let Err(e) = self.app.new_vtab_running(line) {
-                                eprintln!("ghostrealm: run-anything failed: {e:#}");
+                        } else {
+                            let title = self
+                                .registry
+                                .meta(&id)
+                                .map(|m| m.title.to_string())
+                                .unwrap_or_default();
+                            if let Some(p) = self.palette.as_mut() {
+                                p.query.clear();
+                                p.pending = Some(PendingArgs {
+                                    id,
+                                    title,
+                                    specs,
+                                    values: Vec::new(),
+                                });
                             }
+                        }
+                    } else {
+                        self.palette = None;
+                    }
+                }
+                PaletteMode::Run => {
+                    let line = query.trim().to_string();
+                    self.palette = None;
+                    if !line.is_empty() {
+                        if let Err(e) = self.app.new_vtab_running(line) {
+                            eprintln!("ghostrealm: run-anything failed: {e:#}");
                         }
                     }
                 }
-            }
+            },
             WKey::Named(NamedKey::Backspace) => {
                 if let Some(p) = self.palette.as_mut() {
                     p.query.pop();
@@ -1623,23 +1674,98 @@ impl State {
         self.dirty = true;
     }
 
+    /// Key handling while the palette is collecting a command's arguments.
+    fn palette_arg_key(&mut self, event: &winit::event::KeyEvent) {
+        match &event.logical_key {
+            WKey::Named(NamedKey::Escape) => self.palette = None,
+            WKey::Named(NamedKey::Enter) => {
+                let mut run: Option<(String, Args)> = None;
+                if let Some(p) = self.palette.as_mut() {
+                    let query = p.query.clone();
+                    if let Some(pend) = p.pending.as_mut() {
+                        let idx = pend.values.len();
+                        if let Some(spec) = pend.specs.get(idx) {
+                            if let Some(val) = parse_arg_value(&spec.kind, &query) {
+                                pend.values.push(val);
+                                if pend.values.len() == pend.specs.len() {
+                                    let mut args = Args::new();
+                                    for (s, v) in pend.specs.iter().zip(&pend.values) {
+                                        args.insert(s.name, v.clone());
+                                    }
+                                    run = Some((pend.id.clone(), args));
+                                } else {
+                                    p.query.clear();
+                                }
+                            }
+                            // An unparseable value keeps the query for a retry.
+                        }
+                    }
+                }
+                if let Some((id, args)) = run {
+                    self.palette = None;
+                    let _ = self.registry.execute(&id, &args, &mut self.app);
+                }
+            }
+            WKey::Named(NamedKey::Backspace) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.pop();
+                }
+            }
+            WKey::Named(NamedKey::Space) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push(' ');
+                }
+            }
+            WKey::Character(s) => {
+                if let Some(c) = s.chars().next() {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
     /// Build the palette overlay: push its dim/panel/selection quads and shape
     /// its text lines, returning their placements (indices into palette_buffers).
     fn build_palette(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
-        let (query, mode) = match &self.palette {
-            Some(p) => (p.query.clone(), p.mode),
+        // Snapshot palette state, including any in-progress argument prompt.
+        let (query, mode, pending) = match &self.palette {
+            Some(p) => {
+                let pend = p.pending.as_ref().map(|pd| {
+                    let idx = pd.values.len();
+                    let (name, desc, kind_hint) = pd
+                        .specs
+                        .get(idx)
+                        .map(|s| {
+                            let kh = match &s.kind {
+                                ArgKind::Enum(vs) => format!("one of: {}", vs.join(", ")),
+                                k => k.to_string(),
+                            };
+                            (s.name.to_string(), s.description.to_string(), kh)
+                        })
+                        .unwrap_or_default();
+                    (pd.title.clone(), name, desc, kind_hint, idx, pd.specs.len())
+                });
+                (p.query.clone(), p.mode, pend)
+            }
             None => return Vec::new(),
         };
+
+        let is_search = pending.is_none() && mode == PaletteMode::Commands;
         // Command mode fuzzy-searches the registry (hidden commands excluded); run
-        // mode takes the raw line.
-        let results: Vec<(String, String, Option<String>)> = match mode {
-            PaletteMode::Commands => self.palette_results(&query),
-            PaletteMode::Run => Vec::new(),
+        // mode takes the raw line; arg mode collects an argument.
+        let results: Vec<(String, String, Option<String>)> = if is_search {
+            self.palette_results(&query)
+        } else {
+            Vec::new()
         };
         let n = results.len();
 
         // Clamp selection + scroll so the selected result stays visible.
-        let (sel, scroll) = {
+        let (sel, scroll) = if is_search {
             let p = self.palette.as_mut().unwrap();
             if n == 0 {
                 p.selected = 0;
@@ -1654,6 +1780,8 @@ impl State {
                 p.scroll = p.scroll.min(n.saturating_sub(PALETTE_VISIBLE));
             }
             (p.selected, p.scroll)
+        } else {
+            (0, 0)
         };
 
         let metrics = self.metrics();
@@ -1662,9 +1790,10 @@ impl State {
         let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
         let panel_x = ((sw - panel_w) / 2.0).max(0.0);
         let panel_y = sh * 0.12;
-        let body_rows = match mode {
-            PaletteMode::Commands if n > 0 => n.min(PALETTE_VISIBLE),
-            _ => 1, // a hint / "no matches" line
+        let body_rows = if is_search && n > 0 {
+            n.min(PALETTE_VISIBLE)
+        } else {
+            1 // a hint / "no matches" / arg-prompt line
         };
         let panel_h = (1 + body_rows) as f32 * line_h + pad * 2.0;
 
@@ -1700,7 +1829,7 @@ impl State {
             0.98,
         ));
         // Selection highlight at the selected result's visible row.
-        if mode == PaletteMode::Commands && n > 0 {
+        if is_search && n > 0 {
             let vis = sel - scroll;
             quads.push(rect_quad(
                 Rect {
@@ -1721,6 +1850,59 @@ impl State {
         let usable_cols = (((panel_w - pad * 2.0) / self.cell_w).floor() as usize).max(1);
         self.palette_rows.clear();
         let mut lines: Vec<Vec<(String, [u8; 3])>> = Vec::new();
+
+        if let Some((title, name, desc, kind_hint, idx, total)) = &pending {
+            // Argument-collection view: input the current argument.
+            lines.push(vec![(
+                format!("\u{203a} {title} — {name}: {query}"),
+                [235, 235, 245],
+            )]);
+            let more = if idx + 1 < *total {
+                "Enter for next"
+            } else {
+                "Enter to run"
+            };
+            let desc = if desc.is_empty() {
+                kind_hint.clone()
+            } else {
+                format!("{desc} · {kind_hint}")
+            };
+            lines.push(vec![(format!("  {desc} · {more}"), [150, 150, 160])]);
+
+            while self.palette_buffers.len() < lines.len() {
+                let b = Buffer::new(&mut self.font_system, metrics);
+                self.palette_buffers.push(b);
+            }
+            let text_x = panel_x + pad;
+            let text_w = (panel_w - pad * 2.0).max(1.0);
+            let mut placements = Vec::with_capacity(lines.len());
+            for (i, spans) in lines.iter().enumerate() {
+                let buf = &mut self.palette_buffers[i];
+                buf.set_metrics(metrics);
+                buf.set_size(Some(text_w), Some(line_h));
+                buf.set_rich_text(
+                    spans.iter().map(|(t, c)| (t.as_str(), attrs_for(*c))),
+                    &Attrs::new().family(Family::Monospace),
+                    Shaping::Advanced,
+                    None,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+                placements.push(Placement {
+                    idx: i,
+                    left: text_x,
+                    top: panel_y + pad + i as f32 * line_h,
+                    bounds: TextBounds {
+                        left: panel_x as i32,
+                        top: panel_y as i32,
+                        right: (panel_x + panel_w) as i32,
+                        bottom: (panel_y + panel_h) as i32,
+                    },
+                    color: [235, 235, 245],
+                });
+            }
+            return placements;
+        }
+
         let prompt = match mode {
             PaletteMode::Commands => format!("\u{203a} {}", query),
             PaletteMode::Run => format!("\u{2b95} {}", query),
@@ -2380,6 +2562,26 @@ fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
 /// Whether point `(x, y)` lies inside `r` (half-open on the far edges).
 fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// Parse a palette-entered argument string into a typed [`Value`] per its kind.
+/// Returns `None` when the input doesn't fit the kind (the palette re-prompts).
+fn parse_arg_value(kind: &ArgKind, s: &str) -> Option<Value> {
+    match kind {
+        ArgKind::Str => Some(Value::Str(s.to_string())),
+        ArgKind::Int => s.trim().parse::<i64>().ok().map(Value::Int),
+        ArgKind::Bool => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1" | "on" => Some(Value::Bool(true)),
+            "false" | "no" | "n" | "0" | "off" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        ArgKind::Enum(vs) => {
+            let s = s.trim();
+            vs.iter()
+                .any(|v| v == s)
+                .then(|| Value::Str(s.to_string()))
+        }
+    }
 }
 
 /// The text of a selection over `grid`, row-major, trailing spaces trimmed per
