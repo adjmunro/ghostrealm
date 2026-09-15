@@ -30,6 +30,9 @@ pub struct EditorBuffer {
     pub path: Option<PathBuf>,
     /// Unsaved edits since the last load/save.
     pub modified: bool,
+    /// Selection anchor (row, col); `None` = no selection. The selection spans
+    /// anchor..cursor.
+    pub anchor: Option<(usize, usize)>,
 }
 
 impl EditorBuffer {
@@ -41,6 +44,7 @@ impl EditorBuffer {
             scroll: 0,
             path: None,
             modified: false,
+            anchor: None,
         }
     }
 
@@ -56,6 +60,7 @@ impl EditorBuffer {
             scroll: 0,
             path: Some(path),
             modified: false,
+            anchor: None,
         }
     }
 
@@ -81,7 +86,78 @@ impl EditorBuffer {
             .unwrap_or_else(|| self.lines[row].len())
     }
 
+    /// The selection as ordered `((start_row, start_col), (end_row, end_col))`, or
+    /// `None` if there's no (non-empty) selection.
+    pub fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.anchor?;
+        let (a, b) = (anchor, self.cursor);
+        if a == b {
+            return None;
+        }
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The selected text (rows joined with `\n`), if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.selection()?;
+        let mut out = String::new();
+        for row in sr..=er {
+            let line = &self.lines[row];
+            let from = if row == sr { self.byte_of(sr, sc) } else { 0 };
+            let to = if row == er {
+                self.byte_of(er, ec)
+            } else {
+                line.len()
+            };
+            out.push_str(&line[from..to]);
+            if row != er {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Delete the selected text, placing the cursor at its start. Returns whether
+    /// anything was deleted.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(((sr, sc), (er, ec))) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        let start = self.byte_of(sr, sc);
+        let end = self.byte_of(er, ec);
+        if sr == er {
+            self.lines[sr].replace_range(start..end, "");
+        } else {
+            let tail = self.lines[er][end..].to_string();
+            self.lines[sr].truncate(start);
+            self.lines[sr].push_str(&tail);
+            self.lines.drain(sr + 1..=er);
+        }
+        self.cursor = (sr, sc);
+        self.anchor = None;
+        self.modified = true;
+        true
+    }
+
+    /// Insert text (may contain newlines), replacing any selection first.
+    pub fn insert_str(&mut self, s: &str) {
+        self.delete_selection();
+        for c in s.chars() {
+            if c == '\n' {
+                self.insert_newline();
+            } else if c != '\r' {
+                self.insert_char(c);
+            }
+        }
+    }
+
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         let b = self.byte_of(row, col);
         self.lines[row].insert(b, c);
@@ -90,6 +166,7 @@ impl EditorBuffer {
     }
 
     pub fn insert_newline(&mut self) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         let b = self.byte_of(row, col);
         let tail = self.lines[row].split_off(b);
@@ -99,8 +176,11 @@ impl EditorBuffer {
     }
 
     /// Delete the char before the cursor, joining with the previous line at the
-    /// start of a line.
+    /// start of a line. Deletes the selection instead when there is one.
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         if col > 0 {
             let b = self.byte_of(row, col - 1);
@@ -117,7 +197,11 @@ impl EditorBuffer {
     }
 
     /// Delete the char at the cursor, joining the next line at end of line.
+    /// Deletes the selection instead when there is one.
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         if col < self.line_len(row) {
             let b = self.byte_of(row, col);
@@ -130,7 +214,22 @@ impl EditorBuffer {
         }
     }
 
+    /// Move the cursor, clearing any selection (a plain, non-selecting move).
     pub fn move_cursor(&mut self, motion: Motion) {
+        self.anchor = None;
+        self.move_cursor_raw(motion);
+    }
+
+    /// Move the cursor while extending a selection (Shift+motion): anchors at the
+    /// current cursor if there's no selection yet.
+    pub fn move_cursor_selecting(&mut self, motion: Motion) {
+        if self.anchor.is_none() {
+            self.anchor = Some(self.cursor);
+        }
+        self.move_cursor_raw(motion);
+    }
+
+    fn move_cursor_raw(&mut self, motion: Motion) {
         let (row, col) = self.cursor;
         self.cursor = match motion {
             Motion::Left => {
@@ -158,6 +257,23 @@ impl EditorBuffer {
             Motion::Up | Motion::Down => (row, col),
             Motion::Home => (row, 0),
             Motion::End => (row, self.line_len(row)),
+        };
+    }
+
+    /// Move to the document start/end, optionally extending the selection.
+    pub fn move_document(&mut self, to_end: bool, selecting: bool) {
+        if selecting {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = if to_end {
+            let r = self.lines.len().saturating_sub(1);
+            (r, self.line_len(r))
+        } else {
+            (0, 0)
         };
     }
 
@@ -214,6 +330,44 @@ mod tests {
         assert_eq!(e.lines, vec!["abc".to_string(), "d".to_string()]);
         assert_eq!(e.cursor, (1, 1));
         assert!(e.modified);
+    }
+
+    #[test]
+    fn selection_copy_and_replace() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("hello world");
+        // Select the last 5 chars ("world") by shift-moving left from the end.
+        for _ in 0..5 {
+            e.move_cursor_selecting(Motion::Left);
+        }
+        assert_eq!(e.selected_text().as_deref(), Some("world"));
+        // Typing replaces the selection.
+        e.insert_str("there");
+        assert_eq!(e.lines, vec!["hello there"]);
+        assert!(e.selection().is_none(), "insert clears the selection");
+    }
+
+    #[test]
+    fn selection_spans_lines_and_deletes() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("ab\ncd\nef");
+        // cursor at end (2,2). Select back to (0,1): "b\ncd\ne".
+        e.cursor = (2, 1);
+        e.anchor = Some((0, 1));
+        assert_eq!(e.selected_text().as_deref(), Some("b\ncd\ne"));
+        e.delete_selection();
+        assert_eq!(e.lines, vec!["af"]);
+        assert_eq!(e.cursor, (0, 1));
+    }
+
+    #[test]
+    fn plain_move_clears_selection() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("abc");
+        e.move_cursor_selecting(Motion::Left);
+        assert!(e.selection().is_some());
+        e.move_cursor(Motion::Left);
+        assert!(e.selection().is_none(), "a non-selecting move clears it");
     }
 
     #[test]

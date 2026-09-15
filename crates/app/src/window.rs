@@ -1603,6 +1603,10 @@ impl State {
         // Cmd-chords drive the app via the registry; everything else goes to the
         // focused terminal. (Cmd is reserved so app shortcuts never reach a shell.)
         if self.mods.super_ {
+            // Editor Cmd combos (clipboard + line/doc nav) take priority.
+            if self.app.focused_is_editor() && self.editor_cmd_key(event) {
+                return;
+            }
             // Cmd+Arrow: line start/end in the focused terminal (Ctrl-A / Ctrl-E).
             if !self.app.focused_is_editor() {
                 let bytes: Option<&[u8]> = match &event.logical_key {
@@ -1669,8 +1673,9 @@ impl State {
             return;
         }
 
-        // Shift + Page/Home/End drives scrollback instead of reaching the shell.
-        if self.mods.shift {
+        // Shift + Page/Home/End drives scrollback (terminal only; the editor
+        // handles Shift itself for selection).
+        if self.mods.shift && !self.app.focused_is_editor() {
             let page = ((self.config.height as f32 / self.cell_h).floor() as i32 - 1).max(1);
             let scroll = match &event.logical_key {
                 WKey::Named(NamedKey::PageUp) => Some(Scroll::Delta(-page)),
@@ -1791,21 +1796,35 @@ impl State {
         });
     }
 
-    /// Route a key to the focused editor buffer.
+    /// Route a key to the focused editor buffer. Shift extends a selection.
     fn editor_key(&mut self, event: &winit::event::KeyEvent) {
+        let selecting = self.mods.shift;
         let Some(e) = self.app.focused_editor_mut() else {
             return;
         };
+        // Motions (Shift extends the selection, else it clears).
+        let motion = match &event.logical_key {
+            WKey::Named(NamedKey::ArrowLeft) => Some(Motion::Left),
+            WKey::Named(NamedKey::ArrowRight) => Some(Motion::Right),
+            WKey::Named(NamedKey::ArrowUp) => Some(Motion::Up),
+            WKey::Named(NamedKey::ArrowDown) => Some(Motion::Down),
+            WKey::Named(NamedKey::Home) => Some(Motion::Home),
+            WKey::Named(NamedKey::End) => Some(Motion::End),
+            _ => None,
+        };
+        if let Some(m) = motion {
+            if selecting {
+                e.move_cursor_selecting(m);
+            } else {
+                e.move_cursor(m);
+            }
+            self.dirty = true;
+            return;
+        }
         match &event.logical_key {
             WKey::Named(NamedKey::Enter) => e.insert_newline(),
             WKey::Named(NamedKey::Backspace) => e.backspace(),
             WKey::Named(NamedKey::Delete) => e.delete_forward(),
-            WKey::Named(NamedKey::ArrowLeft) => e.move_cursor(Motion::Left),
-            WKey::Named(NamedKey::ArrowRight) => e.move_cursor(Motion::Right),
-            WKey::Named(NamedKey::ArrowUp) => e.move_cursor(Motion::Up),
-            WKey::Named(NamedKey::ArrowDown) => e.move_cursor(Motion::Down),
-            WKey::Named(NamedKey::Home) => e.move_cursor(Motion::Home),
-            WKey::Named(NamedKey::End) => e.move_cursor(Motion::End),
             WKey::Named(NamedKey::Space) => e.insert_char(' '),
             WKey::Named(NamedKey::Tab) => {
                 for _ in 0..4 {
@@ -1820,6 +1839,75 @@ impl State {
             _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Cmd combos while an editor is focused: clipboard (C/X/V) and line/document
+    /// navigation (arrows). Returns whether the key was consumed.
+    fn editor_cmd_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let selecting = self.mods.shift;
+        if let WKey::Character(s) = &event.logical_key {
+            match s.chars().next().map(|c| c.to_ascii_lowercase()) {
+                Some('c') => {
+                    if let Some(t) = self.app.focused_editor_mut().and_then(|e| e.selected_text()) {
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            let _ = cb.set_text(t);
+                        }
+                    }
+                    return true;
+                }
+                Some('x') => {
+                    let cut = self.app.focused_editor_mut().and_then(|e| {
+                        let t = e.selected_text();
+                        if t.is_some() {
+                            e.delete_selection();
+                        }
+                        t
+                    });
+                    if let Some(t) = cut {
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            let _ = cb.set_text(t);
+                        }
+                        self.dirty = true;
+                    }
+                    return true;
+                }
+                Some('v') => {
+                    if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+                        if let Some(e) = self.app.focused_editor_mut() {
+                            e.insert_str(&text);
+                            self.dirty = true;
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Cmd+Left/Right = line start/end; Cmd+Up/Down = document start/end.
+        let Some(e) = self.app.focused_editor_mut() else {
+            return false;
+        };
+        match &event.logical_key {
+            WKey::Named(NamedKey::ArrowLeft) => {
+                if selecting {
+                    e.move_cursor_selecting(Motion::Home);
+                } else {
+                    e.move_cursor(Motion::Home);
+                }
+            }
+            WKey::Named(NamedKey::ArrowRight) => {
+                if selecting {
+                    e.move_cursor_selecting(Motion::End);
+                } else {
+                    e.move_cursor(Motion::End);
+                }
+            }
+            WKey::Named(NamedKey::ArrowUp) => e.move_document(false, selecting),
+            WKey::Named(NamedKey::ArrowDown) => e.move_document(true, selecting),
+            _ => return false,
+        }
+        self.dirty = true;
+        true
     }
 
     /// Ranked, human-visible command results for `query`: `(id, title, chord)`.
@@ -2381,18 +2469,51 @@ impl State {
                 if let Some(e) = self.app.editor_mut(sid) {
                     e.clamp_scroll(rows_vis);
                 }
-                let (scroll, cursor, visible): (usize, (usize, usize), Vec<String>) =
-                    match self.app.editor(sid) {
-                        Some(e) => (
-                            e.scroll,
-                            e.cursor,
-                            (0..rows_vis)
-                                .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
-                                .collect(),
-                        ),
-                        None => continue,
-                    };
+                #[allow(clippy::type_complexity)]
+                let (scroll, cursor, sel, visible): (
+                    usize,
+                    (usize, usize),
+                    Option<((usize, usize), (usize, usize))>,
+                    Vec<String>,
+                ) = match self.app.editor(sid) {
+                    Some(e) => (
+                        e.scroll,
+                        e.cursor,
+                        e.selection(),
+                        (0..rows_vis)
+                            .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
+                            .collect(),
+                    ),
+                    None => continue,
+                };
                 bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
+                // Selection highlight (behind text).
+                if let Some(((sr, sc), (er, ec))) = sel {
+                    for (i, line) in visible.iter().enumerate() {
+                        let row = scroll + i;
+                        if row < sr || row > er {
+                            continue;
+                        }
+                        let len = line.chars().count();
+                        let first = if row == sr { sc } else { 0 };
+                        let last = if row == er { ec } else { len }; // selection past EOL
+                        if last <= first {
+                            continue;
+                        }
+                        bg_quads.push(rect_quad(
+                            Rect {
+                                x: term.x + first as f32 * self.cell_w,
+                                y: term.y + i as f32 * self.cell_h,
+                                w: (last - first) as f32 * self.cell_w,
+                                h: self.cell_h,
+                            },
+                            sw,
+                            sh,
+                            self.chrome.accent,
+                            0.35,
+                        ));
+                    }
+                }
                 for (i, line) in visible.iter().enumerate() {
                     let key = self
                         .row_cache
