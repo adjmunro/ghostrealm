@@ -33,3 +33,7 @@ Likely pairs with the basic text-editor pane (TODO) where we *do* own the buffer
 ---
 
 Built-in web browser pane
+
+---
+
+Hide button in command palette: if clicked, appends command name to a list in config file, and gets filtered out from then on. Can be undone via config. Will have default "hide from human" list because some things just aren't that useful via search (e.g. things with real UI buttons or keyboard shortcuts) but the command palette currently shows every command in the registry regardless. Maybe also a "hide from agent" list which would restrict which tools are usable over MCP?

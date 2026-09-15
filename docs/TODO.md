@@ -196,6 +196,19 @@
 
 ---
 
+[2026-09-15@2e8e8c7] Palette — a "hide" button per command (config-persisted)
+
+- Requires: config write-back (persist the hide list); builds on CommandMeta::hidden
+- Detail: (user idea, IDEAS.md) A clickable hide control on a palette row appends the
+  command id to a hide list in the config; hidden ids are filtered out thereafter
+  (undoable by editing config). Ship a default "hide from human" list for commands
+  that aren't useful via search (things with real UI buttons / shortcuts) — today
+  only `hidden()` is hardcoded in the registry. Maybe also a "hide from agent" list
+  restricting which commands are usable over MCP.
+- Reason: keep the palette focused; user-tunable.
+
+---
+
 [2026-09-15@2e8e8c7] Command palette — MRU order + pinning (rest done)
 
 - Requires: persistent per-user state (MRU history, pins)
