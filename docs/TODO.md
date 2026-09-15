@@ -319,39 +319,20 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Config hot-reload on save (prep the app for it)
+[2026-09-15@2e8e8c7] Settings = the config file in our editor — core done; self-doc + backfill remain
 
-- Requires: NO BLOCKERS (foundation for the "config file is the settings UI" item)
-- Detail: Re-apply config when `config.toml` changes on disk (saved from our editor
-  or edited externally). Prep now: (1) factor "apply config" so it can run more than
-  once — re-resolve chrome, keybindings, inbox timings, tab autohide, sidebar side/
-  width, default_directory, and re-measure cell metrics if the font changed. Things
-  keyed off metrics (row cache, grid geometry) must invalidate on a font/scale
-  change (bump `metrics_gen`, clear caches, reflow terminals). (2) Reload trigger:
-  watch the file (or reload when the editor saves that path) and reload+re-apply +
-  request a redraw. Parse errors should surface non-fatally and keep the old config.
-- Reason: makes editing the config feel live; underpins the settings-in-editor flow.
-
----
-
-[2026-09-15@2e8e8c7] Settings = the config file opened in our editor (Cmd+,)
-
-- Requires: text-editor improvements (the editor is the settings UI); config
-  hot-reload on save
-- Detail: No bespoke settings UI. `Cmd+,` opens `config.toml` in the in-app editor
-  (creating it from the documented default if missing) — the file IS the settings
-  UI, so lean on making the editor good instead. Requirements:
-  1. The config file must be fully self-documenting. EVERY option carries a comment
-     with: a description, its constraints, and its default — numeric options show
-     their valid range, enum options list their variants (e.g. `side = "left" |
-     "right"`), list options show the allowed entries. The user should learn what's
-     available from the file alone.
-  2. A "backfill / doctor" action: add any keys the user's file is MISSING (plus
-     their documented comments) WITHOUT overwriting the values they've already set,
-     so upgrades surface new options without clobbering customisations. (Command
-     and/or offered on open.)
-  3. Changes take effect on save — hot-reload the config file and re-resolve the
-     dependent state (chrome, keybindings, inbox timings, default_directory, …), or
-     at minimum clearly document "applies on next launch".
-- Reason: simpler than a bespoke UI, keeps the file as the single source of truth,
-  and doubles down on the editor; self-documenting config is discoverable.
+- Requires: NO BLOCKERS
+- Detail: DONE (64a72b0): Cmd+, opens config.toml in an editor pane (created with
+  defaults if absent); saving it (Cmd+S) hot-reloads — apply_config re-resolves
+  chrome/inbox/default_directory and re-measures metrics on a font change (invalidate
+  shaping cache + reflow), keybindings/sidebar read live. REMAINING:
+  1. Make the config fully self-documenting: EVERY option's comment gives a
+     description, its constraints (numeric range, enum variants like
+     `side = "left" | "right"`, list options), and its default. Today only some
+     sections are documented.
+  2. A "backfill / doctor" action: merge MISSING keys (+ documented comments) into
+     an existing config WITHOUT overwriting the user's set values, so upgrades
+     surface new options without clobbering customisations.
+  3. Hot-reload on EXTERNAL edits (a file watcher) — today only our editor's save
+     triggers a reload. Also surface parse errors non-fatally (keep the old config).
+- Reason: the file is the settings UI; keep it discoverable and upgrade-safe.
