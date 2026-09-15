@@ -60,10 +60,12 @@
 [2026-09-15@1d4d22e]
 
 - Requires: NO BLOCKERS
-- Detail: Terminal mouse (selection, click-to-position, scroll/OSC mouse
-  reporting) inside a pane; right-click context menu on vtabs (mark read/unread,
-  dismiss, rename, close). Today mouse only switches vtab/pane/htab focus.
-- Reason: expected terminal UX; context actions are in the brief.
+- Detail: DONE: drag to select terminal text (highlight), copy on release and via
+  Cmd+C (arboard clipboard); mouse-wheel scrollback; the vtab right-click context
+  menu. Still to do: OSC mouse reporting — forward mouse events to TUI apps (vim,
+  htop, tmux) that enable mouse mode; needs the VT engine's mouse-mode state and
+  SGR mouse encoding. (Click-to-position is skipped — not meaningful for a shell.)
+- Reason: expected terminal UX; TUI apps want mouse events.
 
 ---
 

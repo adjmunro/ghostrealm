@@ -187,6 +187,10 @@ impl ApplicationHandler<UserEvent> for App {
                     if state.menu_hover() {
                         state.window.request_redraw();
                     }
+                } else if state.mouse_down {
+                    if state.update_selection() {
+                        state.window.request_redraw();
+                    }
                 } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
                     state.window.request_redraw();
                 }
@@ -197,7 +201,15 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 state.on_click();
+                state.begin_selection();
                 state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                state.end_selection();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -281,6 +293,16 @@ struct State {
     menu_buffers: Vec<Buffer>,
     /// The sidebar "+" new-tab button rect (physical px), for click hit-testing.
     new_tab_button: Rect,
+    /// Active terminal text selection, if any.
+    selection: Option<Selection>,
+    /// Left mouse button is held (for drag-selection).
+    mouse_down: bool,
+    /// Whether the current press has moved enough to count as a drag.
+    dragging: bool,
+    /// Physical-pixel position where the current press began.
+    press_px: (f32, f32),
+    /// System clipboard handle (None if unavailable).
+    clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
     cursor: (f32, f32),
 
@@ -332,6 +354,33 @@ enum MenuAction {
     MarkUnread,
     Dismiss,
     Close,
+}
+
+/// An active text selection within one surface's viewport (cell coordinates).
+#[derive(Clone, Copy)]
+struct Selection {
+    surface: SurfaceId,
+    /// Where the drag began.
+    anchor: (u16, u16),
+    /// Where it currently ends.
+    head: (u16, u16),
+}
+
+impl Selection {
+    /// (start, end) ordered row-major (start <= end).
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let a = (self.anchor.1, self.anchor.0);
+        let h = (self.head.1, self.head.0);
+        if a <= h {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
 }
 
 /// A right-click context menu over a sidebar vtab.
@@ -476,6 +525,11 @@ impl State {
                 w: 0.0,
                 h: 0.0,
             },
+            selection: None,
+            mouse_down: false,
+            dragging: false,
+            press_px: (0.0, 0.0),
+            clipboard: arboard::Clipboard::new().ok(),
             cursor: (0.0, 0.0),
             quad_pipeline,
             quad_buffer,
@@ -886,6 +940,123 @@ impl State {
         }
     }
 
+    /// The (surface, col, row) under a physical point, if it's over a terminal
+    /// cell (not the sidebar, a tab strip, or outside any pane).
+    fn cell_at(&self, x: f32, y: f32) -> Option<(SurfaceId, u16, u16)> {
+        if self.in_sidebar(x) {
+            return None;
+        }
+        let workspace = self.workspace_rect();
+        let vt = self.app.tree.active_vtab()?;
+        let vtab = self.app.tree.vtab(vt)?;
+        for (pid, r) in vtab.layout(workspace, DIVIDER) {
+            if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
+                continue;
+            }
+            let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
+            let sid = pane.active_surface()?.id;
+            let strip_h = if self.strip_shown(pane.surfaces.len()) {
+                self.strip_height()
+            } else {
+                0.0
+            };
+            let term_y = r.y + strip_h;
+            if y < term_y {
+                return None; // in the tab strip
+            }
+            let grid = self.grid_cache.get(&sid)?;
+            if grid.size.cols == 0 || grid.size.rows == 0 {
+                return None;
+            }
+            let col = (((x - r.x) / self.cell_w).floor().max(0.0) as u16)
+                .min(grid.size.cols - 1);
+            let row = (((y - term_y) / self.cell_h).floor().max(0.0) as u16)
+                .min(grid.size.rows - 1);
+            return Some((sid, col, row));
+        }
+        None
+    }
+
+    /// Begin a potential drag-selection at the current cursor (clears any prior
+    /// selection). No-op while an overlay owns input.
+    fn begin_selection(&mut self) {
+        if self.palette.is_some() || self.menu.is_some() {
+            return;
+        }
+        self.selection = None;
+        self.dragging = false;
+        self.mouse_down = true;
+        self.press_px = self.cursor;
+        if let Some((surface, col, row)) = self.cell_at(self.cursor.0, self.cursor.1) {
+            self.selection = Some(Selection {
+                surface,
+                anchor: (col, row),
+                head: (col, row),
+            });
+        }
+        self.dirty = true;
+    }
+
+    /// Extend the selection to the cursor during a drag. Returns whether it
+    /// changed (so the caller can redraw).
+    fn update_selection(&mut self) -> bool {
+        if !self.mouse_down {
+            return false;
+        }
+        let (x, y) = self.cursor;
+        // Ignore sub-pixel jitter until it's clearly a drag.
+        if !self.dragging {
+            let (dx, dy) = (x - self.press_px.0, y - self.press_px.1);
+            if dx * dx + dy * dy < 9.0 {
+                return false;
+            }
+            self.dragging = true;
+        }
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        let Some((surface, col, row)) = self.cell_at(x, y) else {
+            return false;
+        };
+        if surface != sel.surface {
+            return false; // don't select across panes
+        }
+        if sel.head == (col, row) {
+            return false;
+        }
+        if let Some(s) = self.selection.as_mut() {
+            s.head = (col, row);
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Finish a drag: copy a non-empty selection to the clipboard.
+    fn end_selection(&mut self) {
+        self.mouse_down = false;
+        if self.dragging {
+            self.copy_selection();
+        }
+        self.dragging = false;
+    }
+
+    /// Copy the current selection's text to the system clipboard.
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let Some(grid) = self.grid_cache.get(&sel.surface) else {
+            return;
+        };
+        let text = selection_text(grid, sel);
+        if !text.is_empty() {
+            if let Some(cb) = self.clipboard.as_mut() {
+                let _ = cb.set_text(text);
+            }
+        }
+    }
+
     /// Scroll the scrollback of the pane under the cursor (or the focused pane).
     fn on_scroll(&mut self, delta: MouseScrollDelta) {
         if self.palette.is_some() {
@@ -911,6 +1082,8 @@ impl State {
             None => self.app.scroll_focused(scroll),
         };
         if scrolled {
+            // The selection is viewport-relative; scrolling invalidates it.
+            self.selection = None;
             self.dirty = true;
         }
     }
@@ -1215,6 +1388,13 @@ impl State {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
             } {
+                // Cmd+C copies an active selection (else it falls through as a
+                // reserved Cmd chord).
+                if c.eq_ignore_ascii_case(&'c') && self.selection.map(|s| !s.is_empty()).unwrap_or(false)
+                {
+                    self.copy_selection();
+                    return;
+                }
                 let chord = self.chord_string(c);
                 if let Some(id) = self.cfg.binding(&chord) {
                     if id == "palette.toggle" {
@@ -1671,6 +1851,30 @@ impl State {
             // Pane background fills its terminal rect.
             bg_quads.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
 
+            // Selection highlight (behind text) for this surface.
+            if let Some(sel) = self.selection {
+                if sel.surface == sid {
+                    for row in 0..grid.size.rows {
+                        if let Some((first, last)) = selection_row_span(sel, row, grid.size.cols) {
+                            let x = term.x + first as f32 * self.cell_w;
+                            let w = (last - first + 1) as f32 * self.cell_w;
+                            bg_quads.push(rect_quad(
+                                Rect {
+                                    x,
+                                    y: term.y + row as f32 * self.cell_h,
+                                    w,
+                                    h: self.cell_h,
+                                },
+                                sw,
+                                sh,
+                                self.chrome.accent,
+                                0.35,
+                            ));
+                        }
+                    }
+                }
+            }
+
             for row in 0..grid.size.rows {
                 for col in 0..grid.size.cols {
                     if let Some(c) = grid.cell(col, row) {
@@ -2011,6 +2215,45 @@ fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
+/// The text of a selection over `grid`, row-major, trailing spaces trimmed per
+/// line and rows joined with newlines.
+fn selection_text(grid: &Grid, sel: Selection) -> String {
+    let ((sc, sr), (ec, er)) = sel.ordered();
+    let mut out = String::new();
+    for row in sr..=er.min(grid.size.rows.saturating_sub(1)) {
+        let first = if row == sr { sc } else { 0 };
+        let last = if row == er {
+            ec
+        } else {
+            grid.size.cols.saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in first..=last.min(grid.size.cols.saturating_sub(1)) {
+            match grid.cell(col, row) {
+                Some(c) if !c.text.is_empty() => line.push_str(&c.text),
+                _ => line.push(' '),
+            }
+        }
+        out.push_str(line.trim_end());
+        if row != er {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The inclusive column span `[first, last]` of a selection on `row`, if the row
+/// is within the selection; used to draw the highlight.
+fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
+    let ((sc, sr), (ec, er)) = sel.ordered();
+    if row < sr || row > er || cols == 0 {
+        return None;
+    }
+    let first = if row == sr { sc } else { 0 };
+    let last = if row == er { ec } else { cols - 1 };
+    Some((first.min(cols - 1), last.min(cols - 1)))
+}
+
 /// The sidebar rect for `side` given its width and the surface size (physical px).
 fn sidebar_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
     let x = match side {
@@ -2265,6 +2508,64 @@ mod tests {
             assert!((sb.w + ws.w - sw).abs() < 0.001, "regions tile the full width");
             assert!(sb.x >= ws.x + ws.w - 0.001 || ws.x >= sb.x + sb.w - 0.001, "no overlap");
         }
+    }
+
+    #[test]
+    fn selection_text_spans_and_trims() {
+        use super::{selection_text, Selection};
+        use ghostrealm_core::SurfaceId;
+        use ghostrealm_terminal::{Cell, CellAttrs, Cursor, Grid, GridSize};
+
+        // A 4x3 grid: "abc "/"def "/"ghi " (trailing blank column).
+        let rows = ["abc ", "def ", "ghi "];
+        let mut cells = Vec::new();
+        for r in rows {
+            for ch in r.chars() {
+                let text = if ch == ' ' { String::new() } else { ch.to_string() };
+                cells.push(Cell {
+                    text,
+                    fg: [200, 200, 200],
+                    bg: [0, 0, 0],
+                    attrs: CellAttrs::default(),
+                    wide: false,
+                });
+            }
+        }
+        let grid = Grid {
+            size: GridSize { cols: 4, rows: 3 },
+            cells,
+            cursor: Cursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
+            default_fg: [200, 200, 200],
+            default_bg: [0, 0, 0],
+        };
+
+        // Multi-row selection from (1,0) to (1,2): "bc" + full "def" + "gh".
+        let sel = Selection {
+            surface: SurfaceId(1),
+            anchor: (1, 0),
+            head: (1, 2),
+        };
+        assert_eq!(selection_text(&grid, sel), "bc\ndef\ngh");
+
+        // Anchor/head order doesn't matter.
+        let rev = Selection {
+            surface: SurfaceId(1),
+            anchor: (1, 2),
+            head: (1, 0),
+        };
+        assert_eq!(selection_text(&grid, rev), "bc\ndef\ngh");
+
+        // Single-row selection trims trailing blanks.
+        let one = Selection {
+            surface: SurfaceId(1),
+            anchor: (0, 0),
+            head: (3, 0),
+        };
+        assert_eq!(selection_text(&grid, one), "abc");
     }
 
     #[test]
