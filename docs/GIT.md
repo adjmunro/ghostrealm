@@ -2,9 +2,11 @@
 
 ## Cardinal Rules That Must Never Be Broken:
 
-- DO NOT PUSH WITHOUT EXPLICIT AUTHORISATION.
-- DO NOT COMMIT WITHOUT EXPLICIT AUTHORISATION.
-- PRIOR AUTHORISATION DOES NOT ENTAIL PRESENT OR FUTURE AUTHORISATION.
+- COMMITTING IS PRE-AUTHORISED: commit freely, without asking, whenever the work is
+  in a sensible state (follow the Commit Hygiene below). No per-commit approval is
+  needed.
+- DO NOT PUSH WITHOUT EXPLICIT AUTHORISATION. (Push authorisation is per-request:
+  prior push authorisation does not entail present or future push authorisation.)
 - NEVER PUSH TO `origin/develop`, `origin/main`, or `origin/master`. STOP. ASK YOUR HUMAN FOR FURTHER INSTRUCTIONS.
 - DO NOT COMMIT TO `develop`, `main`, or `master`. CREATE A NEW BRANCH WITH NO UPSTREAM.
 - IF THE LOCAL AND REMOTE BRANCH NAMES DO NOT MATCH, STOP. ASK YOUR HUMAN FOR FURTHER INSTRUCTION. DO NOT PROCEED.
