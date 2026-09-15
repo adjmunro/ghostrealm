@@ -107,13 +107,14 @@
 
 ---
 
-[2026-09-15@af1c592] Basic text-editor pane (non-terminal surface type)
+[2026-09-15@<uncommitted>] Text-editor pane — follow-ups
 
-- Requires: perf work first (per user); generalising a pane's content beyond a
-  terminal surface
-- Detail: A minimal editable text frame as an alternative pane/surface content, so
-  panes aren't only terminals. Needs the model to allow a surface to be a terminal
-  OR an editor buffer, plus text input/editing + rendering (reuse the glyphon text
-  path). Keep scope minimal to start (open/edit/save a file). May later host the
-  shell-LSP idea (see IDEAS.md).
+- Requires: NO BLOCKERS
+- Detail: A minimal editor surface now exists (`app::editor::EditorBuffer`): a
+  surface is a terminal OR an editor; `editor.scratch` / `editor.open <path>`
+  commands, typing/editing (arrows, Home/End, backspace/delete, newline), Cmd+S
+  save, rendered via the glyphon row path with a cursor bar. Follow-ups: selection
+  + copy/paste inside the editor, a modified/unsaved indicator + save-as prompt for
+  scratch buffers, mouse click-to-position, horizontal scroll for long lines, and
+  (later) the shell-LSP idea (IDEAS.md).
 - Reason: requested; expands the app beyond terminals.

@@ -17,6 +17,8 @@ use ghostrealm_core::{
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
+use crate::editor::EditorBuffer;
+
 /// After Enter, a vtab is shown busy for at least this long even if the shell's
 /// foreground process group hasn't moved yet — the command may not have forked
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
@@ -32,6 +34,8 @@ const DEFAULT_CELL_H: u32 = 16;
 pub struct AppState {
     pub tree: Tree,
     surfaces: HashMap<SurfaceId, GhosttyTerminal>,
+    /// Surfaces whose content is a text editor rather than a terminal.
+    editors: HashMap<SurfaceId, EditorBuffer>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
     shell_line: Option<String>,
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
@@ -55,6 +59,7 @@ impl AppState {
         AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
+            editors: HashMap::new(),
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -169,6 +174,45 @@ impl AppState {
         Ok(())
     }
 
+    /// Add an editor surface (a text buffer, not a terminal) to the focused pane
+    /// and make it active. `buffer` is a scratch or file-backed [`EditorBuffer`].
+    pub fn open_editor_in_focused(&mut self, buffer: EditorBuffer) {
+        let Some((vt, pane)) = self.focused_pane() else {
+            return;
+        };
+        if let Some(surf) = self.tree.add_surface(vt, pane) {
+            self.tree.set_surface_title(surf, buffer.title(), true);
+            self.editors.insert(surf, buffer);
+        }
+    }
+
+    /// Whether `id` is an editor surface.
+    pub fn is_editor(&self, id: SurfaceId) -> bool {
+        self.editors.contains_key(&id)
+    }
+
+    /// The editor buffer for `id`, if it is an editor surface.
+    pub fn editor(&self, id: SurfaceId) -> Option<&EditorBuffer> {
+        self.editors.get(&id)
+    }
+
+    pub fn editor_mut(&mut self, id: SurfaceId) -> Option<&mut EditorBuffer> {
+        self.editors.get_mut(&id)
+    }
+
+    /// Whether the focused surface is an editor.
+    pub fn focused_is_editor(&self) -> bool {
+        self.focused_surface()
+            .map(|id| self.is_editor(id))
+            .unwrap_or(false)
+    }
+
+    /// The focused surface's editor buffer, if it is an editor.
+    pub fn focused_editor_mut(&mut self) -> Option<&mut EditorBuffer> {
+        let id = self.focused_surface()?;
+        self.editors.get_mut(&id)
+    }
+
     /// Cycle focus to the next pane in the active vtab.
     pub fn focus_next_pane(&mut self) {
         let Some(vt) = self.active() else { return };
@@ -213,6 +257,7 @@ impl AppState {
             .flat_map(|p| p.surfaces.iter().map(|s| s.id))
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
+        self.editors.retain(|id, _| live.contains(id));
     }
 
     pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
@@ -504,9 +549,9 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// Whether a live terminal exists for `id`.
+    /// Whether a live surface (terminal or editor) exists for `id`.
     pub fn has_surface(&self, id: SurfaceId) -> bool {
-        self.surfaces.contains_key(&id)
+        self.surfaces.contains_key(&id) || self.editors.contains_key(&id)
     }
 
     /// Whether a surface's grid changed since it was last snapshotted.
@@ -663,6 +708,30 @@ pub fn build_registry() -> Registry<AppState> {
         ),
         Box::new(|s: &mut AppState, _| {
             s.new_surface_in_focused().map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "editor.scratch",
+            "New Editor",
+            "Open an empty text editor in the focused pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.open_editor_in_focused(EditorBuffer::scratch());
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "editor.open",
+            "Open File in Editor",
+            "Open a file in a text editor in the focused pane",
+        )
+        .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open")),
+        Box::new(|s: &mut AppState, a| {
+            let path = std::path::PathBuf::from(a.get_str("path")?);
+            s.open_editor_in_focused(EditorBuffer::open(path));
             Ok(CmdOutcome::ok())
         }),
     );
@@ -869,6 +938,26 @@ mod tests {
             matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
             "leaving within the unfocus grace should revert the auto-read to unread"
         );
+    }
+
+    #[test]
+    fn open_editor_creates_a_focused_editor_surface() {
+        let mut s = AppState::new().with_shell_line("sleep 2");
+        s.new_vtab().unwrap();
+        s.open_editor_in_focused(EditorBuffer::scratch());
+
+        assert!(s.focused_is_editor(), "the opened editor becomes focused");
+        let surf = s.focused_surface().unwrap();
+        assert!(s.is_editor(surf));
+        assert!(s.editor(surf).is_some());
+        assert!(
+            s.terminal(surf).is_none(),
+            "an editor surface has no terminal"
+        );
+
+        // Typing routes into the buffer.
+        s.focused_editor_mut().unwrap().insert_char('x');
+        assert_eq!(s.editor(surf).unwrap().lines, vec!["x".to_string()]);
     }
 
     #[test]

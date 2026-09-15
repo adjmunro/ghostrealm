@@ -25,6 +25,7 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState};
+use crate::editor::Motion;
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
 
@@ -48,6 +49,9 @@ const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 /// Quiet period after a window/split resize before the PTY grid is reflowed, so a
 /// drag coalesces into one reflow instead of one per intermediate size.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+/// Editor surface background / foreground (slightly distinct from a terminal).
+const EDITOR_BG: [u8; 3] = [26, 26, 32];
+const EDITOR_FG: [u8; 3] = [220, 220, 230];
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1395,6 +1399,14 @@ impl State {
                     self.copy_selection();
                     return;
                 }
+                // Cmd+S saves the focused editor.
+                if c.eq_ignore_ascii_case(&'s') && self.app.focused_is_editor() {
+                    if let Some(e) = self.app.focused_editor_mut() {
+                        let _ = e.save();
+                    }
+                    self.dirty = true;
+                    return;
+                }
                 let chord = self.chord_string(c);
                 if let Some(id) = self.cfg.binding(&chord) {
                     if id == "palette.toggle" {
@@ -1423,6 +1435,12 @@ impl State {
                 self.dirty = true;
                 return;
             }
+        }
+
+        // An editor surface consumes keys itself (no PTY).
+        if self.app.focused_is_editor() {
+            self.editor_key(event);
+            return;
         }
 
         let text = event.text.as_ref().map(|s| s.to_string());
@@ -1468,6 +1486,37 @@ impl State {
             mods: self.mods,
             text,
         });
+    }
+
+    /// Route a key to the focused editor buffer.
+    fn editor_key(&mut self, event: &winit::event::KeyEvent) {
+        let Some(e) = self.app.focused_editor_mut() else {
+            return;
+        };
+        match &event.logical_key {
+            WKey::Named(NamedKey::Enter) => e.insert_newline(),
+            WKey::Named(NamedKey::Backspace) => e.backspace(),
+            WKey::Named(NamedKey::Delete) => e.delete_forward(),
+            WKey::Named(NamedKey::ArrowLeft) => e.move_cursor(Motion::Left),
+            WKey::Named(NamedKey::ArrowRight) => e.move_cursor(Motion::Right),
+            WKey::Named(NamedKey::ArrowUp) => e.move_cursor(Motion::Up),
+            WKey::Named(NamedKey::ArrowDown) => e.move_cursor(Motion::Down),
+            WKey::Named(NamedKey::Home) => e.move_cursor(Motion::Home),
+            WKey::Named(NamedKey::End) => e.move_cursor(Motion::End),
+            WKey::Named(NamedKey::Space) => e.insert_char(' '),
+            WKey::Named(NamedKey::Tab) => {
+                for _ in 0..4 {
+                    e.insert_char(' ');
+                }
+            }
+            WKey::Character(s) => {
+                for c in s.chars() {
+                    e.insert_char(c);
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
     }
 
     fn palette_key(&mut self, event: &winit::event::KeyEvent) {
@@ -1833,6 +1882,70 @@ impl State {
                 continue;
             };
             let sid = *active_sid;
+
+            // Editor surface: render its text buffer instead of a terminal grid.
+            if self.app.is_editor(sid) {
+                let rows_vis = (term.h / self.cell_h).floor().max(1.0) as usize;
+                if let Some(e) = self.app.editor_mut(sid) {
+                    e.clamp_scroll(rows_vis);
+                }
+                let (scroll, cursor, visible): (usize, (usize, usize), Vec<String>) =
+                    match self.app.editor(sid) {
+                        Some(e) => (
+                            e.scroll,
+                            e.cursor,
+                            (0..rows_vis)
+                                .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
+                                .collect(),
+                        ),
+                        None => continue,
+                    };
+                bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
+                for (i, line) in visible.iter().enumerate() {
+                    let key = self
+                        .row_cache
+                        .row_key(std::iter::once((line.as_str(), EDITOR_FG)));
+                    let spans = if self.row_cache.buffer(key).is_some() {
+                        Vec::new()
+                    } else {
+                        vec![(line.clone(), EDITOR_FG)]
+                    };
+                    self.row_cache
+                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
+                    row_placements.push(RowPlacement {
+                        key,
+                        left: term.x,
+                        top: term.y + i as f32 * self.cell_h,
+                        bounds: TextBounds {
+                            left: term.x as i32,
+                            top: term.y as i32,
+                            right: (term.x + term.w) as i32,
+                            bottom: (term.y + term.h) as i32,
+                        },
+                        color: EDITOR_FG,
+                    });
+                }
+                // Cursor (thin bar), when in view.
+                if cursor.0 >= scroll && cursor.0 < scroll + rows_vis {
+                    overlay_quads.push(rect_quad(
+                        Rect {
+                            x: term.x + cursor.1 as f32 * self.cell_w,
+                            y: term.y + (cursor.0 - scroll) as f32 * self.cell_h,
+                            w: 2.0 * self.scale,
+                            h: self.cell_h,
+                        },
+                        sw,
+                        sh,
+                        self.chrome.accent,
+                        0.9,
+                    ));
+                }
+                if pr.focused && multi_pane {
+                    push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);
+                }
+                continue;
+            }
+
             // Snapshot only when the surface actually changed since we last did;
             // an idle pane reuses its cached grid.
             if self.app.surface_needs_snapshot(sid) || !self.grid_cache.contains_key(&sid) {
