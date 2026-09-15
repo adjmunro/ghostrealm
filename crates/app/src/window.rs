@@ -1599,6 +1599,15 @@ impl State {
                     self.extend_terminal_selection(dir, self.mods.alt);
                     return;
                 }
+                // Shift+Enter sends a newline (LF) as a raw byte — it does NOT go
+                // through the Enter path, so it never triggers the optimistic busy
+                // dot. (Whether the shell treats LF as a continuation vs submit is
+                // the shell's line-editor config.)
+                if matches!(event.logical_key, WKey::Named(NamedKey::Enter)) {
+                    self.selection = None;
+                    self.app.write_to_focused(b"\n");
+                    return;
+                }
             }
         }
 
