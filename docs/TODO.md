@@ -95,10 +95,11 @@
 [2026-09-15@<uncommitted>] Double-tap triggers: make them configurable
 
 - Requires: NO BLOCKERS
-- Detail: Double-tap Shift now toggles the palette (`tap::TapDetector`, keeping
-  Cmd+K). Remaining: expose the trigger + the 300ms window in config (the chord
-  model can't express a double-tap, so add e.g. `[input] double_tap_window_ms` and
-  a way to bind double-tap-<mod> -> command id), rather than the current hardcoding.
+- Detail: Double-tap Shift toggles the palette and double-tap Ctrl opens Run
+  Anything (`tap::TapDetector`, keeping Cmd+K). The window is now configurable
+  (`[input] double_tap_window_ms`). Remaining: make the *trigger* remappable —
+  which modifier maps to which action — which the chord model can't express;
+  Run Anything would first need to be expressible as a command id.
 - Reason: user's preferred muscle memory; keep it tunable/shareable.
 
 ---

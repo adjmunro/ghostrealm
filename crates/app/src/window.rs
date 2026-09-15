@@ -45,8 +45,6 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
-/// Max gap between two Shift taps to count as a palette double-tap.
-const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -354,6 +352,7 @@ impl State {
 
         let cfg = ghostrealm_core::config::load_or_create();
         let chrome = cfg.resolved_chrome();
+        let double_tap_window = Duration::from_millis(cfg.input.double_tap_window_ms as u64);
         let (cell_w, cell_h) = measure_cell(
             &mut font_system,
             scale,
@@ -433,8 +432,8 @@ impl State {
             dirty: true,
             pty_pending: false,
             next_frame: Instant::now(),
-            shift_taps: TapDetector::new(DOUBLE_TAP_WINDOW),
-            ctrl_taps: TapDetector::new(DOUBLE_TAP_WINDOW),
+            shift_taps: TapDetector::new(double_tap_window),
+            ctrl_taps: TapDetector::new(double_tap_window),
         })
     }
 

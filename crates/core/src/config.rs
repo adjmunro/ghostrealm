@@ -93,11 +93,22 @@ impl Default for Inbox {
 }
 
 /// `[input]`
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Input {
     /// Hovering a pane focuses it (routes keyboard there). Off by default.
     pub focus_follows_mouse: bool,
+    /// Max gap (ms) between the two taps of a double-tap trigger (palette / run).
+    pub double_tap_window_ms: u32,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Input {
+            focus_follows_mouse: false,
+            double_tap_window_ms: 300,
+        }
+    }
 }
 
 /// `[tabs]`
@@ -239,6 +250,7 @@ autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
 
 [input]
 focus_follows_mouse = false  # hovering a pane focuses it (routes keyboard there)
+double_tap_window_ms = 300    # max gap between the two taps of a double-tap trigger
 
 [inbox]
 auto_read_after = 3     # seconds of focus before unread -> read (0 = manual only)
