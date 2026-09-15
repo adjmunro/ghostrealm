@@ -260,42 +260,44 @@ pub fn normalize_chord(chord: &str) -> Option<String> {
 
 /// The default config written on first run. Kept in sync with [`Config::default`]
 /// by a test, so the comments here document the real defaults.
-pub const DEFAULT_CONFIG_TOML: &str = r#"# ghostrealm config. Commit/sync this as a dotfile.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# ghostrealm config. Commit/sync this as a dotfile. Each option below lists its
+# type, allowed values/range, and default. Edit + save (Cmd+S) to hot-reload.
 
-# Base directory new workspaces start in (a workspace's own pinned root overrides
-# it). Unset = $HOME. `~` is expanded. Example:
+# default_directory (string path | unset) — base directory new workspaces start in
+#   (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
 # default_directory = "~/Developer"
 
 [sidebar]
-side = "left"    # "left" or "right"
-width = 190.0    # logical pixels
+side = "left"    # "left" | "right"       (default "left")   — which edge the sidebar sits on
+width = 190.0    # number, logical px, > 0 (default 190.0)   — sidebar width
 
 [terminal]
-font_size = 15.0
-line_height = 18.0
+font_size = 15.0    # number, points, > 0 (default 15.0)
+line_height = 18.0  # number, points, > 0 (default 18.0)   — row height (>= font_size)
 
-# [chrome] — colours for our own UI, not the terminal contents. RGB [r, g, b].
-# Unset (the default): inherit from your Ghostty config (background/foreground/
-# cursor), falling back to the values below. Uncomment to override.
+# [chrome] — colours for our own UI (not the terminal contents). Each is RGB
+#   [r, g, b], components 0..=255. Unset (the default): inherit from your Ghostty
+#   config (background/foreground/cursor), falling back to the values below.
+#   Uncomment to override.
 # [chrome]
 # background = [20, 20, 24]   # behind panes / split dividers
 # sidebar = [24, 24, 30]
 # accent = [90, 140, 220]     # focused-pane border, palette selection
 
 [tabs]
-autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
+autohide_single_tab = true  # bool (default true) — hide a pane's tab strip when it has one terminal
 
 [input]
-focus_follows_mouse = false  # hovering a pane focuses it (routes keyboard there)
-double_tap_window_ms = 300    # max gap between the two taps of a double-tap trigger
+focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
+double_tap_window_ms = 300   # integer ms, >= 0 (default 300) — max gap between a double-tap's two taps
 
 [inbox]
-auto_read_after = 3     # seconds of focus before unread -> read (0 = manual only)
-auto_unread_before = 1  # grace seconds after an auto-read to re-mark unread on unfocus
+auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time before unread -> read (0 = manual only)
+auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an auto-read to re-mark unread on unfocus
 
 [keybindings]
-# Override chord -> command id (Cmd chords only; others go to the terminal).
-# Unset entries use the built-in defaults:
+# table of "chord" = "command id". Cmd chords only (others go to the terminal);
+# any modifier order/alias works. Unset entries use the built-in defaults:
 #   "cmd+k" = "palette.toggle"
 #   "cmd+t" = "tab.new"
 #   "cmd+w" = "pane.close"
@@ -304,6 +306,7 @@ auto_unread_before = 1  # grace seconds after an auto-read to re-mark unread on 
 #   "cmd+n" = "surface.new"
 #   "cmd+]" = "pane.focus_next"
 #   "cmd+[" = "pane.focus_prev"
+# Run any command by its id (see the palette). Example: "cmd+e" = "editor.scratch"
 "#;
 
 /// The config file path: `$XDG_CONFIG_HOME/ghostrealm/config.toml`, falling back
