@@ -1061,6 +1061,71 @@ impl State {
         self.press_cell = None;
     }
 
+    /// Extend (or start) a keyboard selection over the focused terminal grid by
+    /// one cell (or one word) in `dir`. The anchor is the current selection's, or
+    /// the terminal cursor if none. Not for editor surfaces.
+    fn extend_terminal_selection(&mut self, dir: ArrowDir, by_word: bool) {
+        let Some(sid) = self.app.focused_surface() else {
+            return;
+        };
+        if self.app.is_editor(sid) {
+            return;
+        }
+        let Some(grid) = self.grid_cache.get(&sid) else {
+            return;
+        };
+        let (cols, rows) = (grid.size.cols, grid.size.rows);
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let (anchor, mut head) = match self.selection {
+            Some(s) if s.surface == sid => (s.anchor, s.head),
+            _ => {
+                let c = (
+                    grid.cursor.col.min(cols - 1),
+                    grid.cursor.row.min(rows - 1),
+                );
+                (c, c)
+            }
+        };
+        match dir {
+            ArrowDir::Left => {
+                head.0 = if by_word {
+                    word_col(grid, head.1, head.0, false)
+                } else {
+                    head.0.saturating_sub(1)
+                };
+            }
+            ArrowDir::Right => {
+                head.0 = if by_word {
+                    word_col(grid, head.1, head.0, true)
+                } else {
+                    (head.0 + 1).min(cols - 1)
+                };
+            }
+            ArrowDir::Up => head.1 = head.1.saturating_sub(1),
+            ArrowDir::Down => head.1 = (head.1 + 1).min(rows - 1),
+        }
+        self.selection = Some(Selection {
+            surface: sid,
+            anchor,
+            head,
+        });
+        self.dirty = true;
+    }
+
+    /// Paste the clipboard into the focused terminal.
+    fn paste_to_terminal(&mut self) {
+        if let Some(cb) = self.clipboard.as_mut() {
+            if let Ok(text) = cb.get_text() {
+                if !text.is_empty() {
+                    self.app.write_to_focused(text.as_bytes());
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
     /// Copy the current selection's text to the system clipboard.
     fn copy_selection(&mut self) {
         let Some(sel) = self.selection else { return };
@@ -1450,6 +1515,24 @@ impl State {
         // Cmd-chords drive the app via the registry; everything else goes to the
         // focused terminal. (Cmd is reserved so app shortcuts never reach a shell.)
         if self.mods.super_ {
+            // Cmd+Arrow: line start/end in the focused terminal (Ctrl-A / Ctrl-E).
+            if !self.app.focused_is_editor() {
+                let bytes: Option<&[u8]> = match &event.logical_key {
+                    WKey::Named(NamedKey::ArrowLeft) | WKey::Named(NamedKey::ArrowUp) => {
+                        Some(&[0x01])
+                    }
+                    WKey::Named(NamedKey::ArrowRight) | WKey::Named(NamedKey::ArrowDown) => {
+                        Some(&[0x05])
+                    }
+                    _ => None,
+                };
+                if let Some(b) = bytes {
+                    self.selection = None;
+                    self.app.write_to_focused(b);
+                    self.dirty = true;
+                    return;
+                }
+            }
             if let Some(c) = match &event.logical_key {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
@@ -1459,6 +1542,11 @@ impl State {
                 if c.eq_ignore_ascii_case(&'c') && self.selection.map(|s| !s.is_empty()).unwrap_or(false)
                 {
                     self.copy_selection();
+                    return;
+                }
+                // Cmd+V pastes the clipboard into the focused terminal.
+                if c.eq_ignore_ascii_case(&'v') && !self.app.focused_is_editor() {
+                    self.paste_to_terminal();
                     return;
                 }
                 // Cmd+S saves the focused editor.
@@ -1497,6 +1585,49 @@ impl State {
                 self.dirty = true;
                 return;
             }
+            // Shift+Arrow extends a keyboard selection over the terminal grid
+            // (word-wise with Alt) instead of corrupting the shell input.
+            if !self.app.focused_is_editor() {
+                let dir = match &event.logical_key {
+                    WKey::Named(NamedKey::ArrowLeft) => Some(ArrowDir::Left),
+                    WKey::Named(NamedKey::ArrowRight) => Some(ArrowDir::Right),
+                    WKey::Named(NamedKey::ArrowUp) => Some(ArrowDir::Up),
+                    WKey::Named(NamedKey::ArrowDown) => Some(ArrowDir::Down),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    self.extend_terminal_selection(dir, self.mods.alt);
+                    return;
+                }
+            }
+        }
+
+        // Option+Left/Right = word motion in the terminal (readline ESC-b / ESC-f);
+        // Option+Up/Down send a plain arrow (avoid the corrupting modified CSI).
+        if self.mods.alt && !self.app.focused_is_editor() {
+            match &event.logical_key {
+                WKey::Named(NamedKey::ArrowLeft) => {
+                    self.selection = None;
+                    self.app.write_to_focused(b"\x1bb");
+                    return;
+                }
+                WKey::Named(NamedKey::ArrowRight) => {
+                    self.selection = None;
+                    self.app.write_to_focused(b"\x1bf");
+                    return;
+                }
+                WKey::Named(NamedKey::ArrowUp) | WKey::Named(NamedKey::ArrowDown) => {
+                    let up = matches!(event.logical_key, WKey::Named(NamedKey::ArrowUp));
+                    self.selection = None;
+                    self.app.send_key_to_focused(&KeyPress {
+                        key: if up { Key::Up } else { Key::Down },
+                        mods: Mods::default(),
+                        text: None,
+                    });
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // An editor surface consumes keys itself (no PTY).
@@ -1505,6 +1636,8 @@ impl State {
             return;
         }
 
+        // Any key that reaches the shell clears a keyboard selection.
+        self.selection = None;
         let text = event.text.as_ref().map(|s| s.to_string());
         let key = match &event.logical_key {
             WKey::Named(named) => match named {
@@ -2603,6 +2736,49 @@ fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
+/// A cursor/selection direction.
+#[derive(Clone, Copy)]
+enum ArrowDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// The next word boundary column on `row` from `col`, moving right (`forward`) or
+/// left. A word is a run of non-blank cells.
+fn word_col(grid: &Grid, row: u16, col: u16, forward: bool) -> u16 {
+    let cols = grid.size.cols;
+    if cols == 0 {
+        return 0;
+    }
+    let blank = |c: u16| {
+        grid.cell(c, row)
+            .map(|cell| cell.text.trim().is_empty())
+            .unwrap_or(true)
+    };
+    if forward {
+        let mut c = col;
+        // Skip the current word, then the gap, landing on the next word's start.
+        while c < cols - 1 && !blank(c) {
+            c += 1;
+        }
+        while c < cols - 1 && blank(c) {
+            c += 1;
+        }
+        c
+    } else {
+        let mut c = col;
+        while c > 0 && blank(c - 1) {
+            c -= 1;
+        }
+        while c > 0 && !blank(c - 1) {
+            c -= 1;
+        }
+        c
+    }
+}
+
 /// Parse a palette-entered argument string into a typed [`Value`] per its kind.
 /// Returns `None` when the input doesn't fit the kind (the palette re-prompts).
 fn parse_arg_value(kind: &ArgKind, s: &str) -> Option<Value> {
@@ -2974,6 +3150,44 @@ mod tests {
             head: (3, 0),
         };
         assert_eq!(selection_text(&grid, one), "abc");
+    }
+
+    #[test]
+    fn word_col_finds_word_boundaries() {
+        use super::word_col;
+        use ghostrealm_terminal::{Cell, CellAttrs, Cursor, Grid, GridSize};
+
+        // Row 0: "ab cd ef" (cols 0..8).
+        let text = "ab cd ef";
+        let cells: Vec<Cell> = text
+            .chars()
+            .map(|ch| Cell {
+                text: if ch == ' ' { String::new() } else { ch.to_string() },
+                fg: [0, 0, 0],
+                bg: [0, 0, 0],
+                attrs: CellAttrs::default(),
+                wide: false,
+            })
+            .collect();
+        let grid = Grid {
+            size: GridSize {
+                cols: text.len() as u16,
+                rows: 1,
+            },
+            cells,
+            cursor: Cursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
+            default_fg: [0, 0, 0],
+            default_bg: [0, 0, 0],
+        };
+
+        assert_eq!(word_col(&grid, 0, 0, true), 3, "forward from a -> start of cd");
+        assert_eq!(word_col(&grid, 0, 3, true), 6, "forward from cd -> start of ef");
+        assert_eq!(word_col(&grid, 0, 4, false), 3, "backward from d -> start of cd");
+        assert_eq!(word_col(&grid, 0, 7, false), 6, "backward from f -> start of ef");
     }
 
     #[test]

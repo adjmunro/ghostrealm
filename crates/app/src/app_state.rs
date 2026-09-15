@@ -435,6 +435,22 @@ impl AppState {
         sent
     }
 
+    /// Write raw bytes to the focused surface (e.g. a paste or a line-editing
+    /// escape sequence), snapping the viewport to the bottom first.
+    pub fn write_to_focused(&mut self, bytes: &[u8]) -> bool {
+        match self
+            .focused_surface()
+            .and_then(|id| self.surfaces.get_mut(&id))
+        {
+            Some(t) => {
+                t.scroll(Scroll::Bottom);
+                t.write_bytes(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Scroll the focused surface's scrollback viewport.
     pub fn scroll_focused(&mut self, scroll: Scroll) -> bool {
         match self
