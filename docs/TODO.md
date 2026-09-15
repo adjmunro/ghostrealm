@@ -154,31 +154,20 @@
 
 ---
 
-[2026-09-15@2e8e8c7] BUG — terminal Shift/Option+arrow keys corrupt text
+[2026-09-15@2e8e8c7] Editing keys — TERMINAL done; editor selection + Shift+Enter + cut remain
 
 - Requires: NO BLOCKERS
-- Detail: In a terminal, Shift+Left deletes a char, Shift+Right deletes to end of
-  line, Shift+Up = end of line, Shift+Down = start of line; Option+arrows do the
-  same. Clearly a wrong modified-arrow encoding (produces sequences zsh maps to
-  kill/word ops). Cmd+arrows do nothing; Ctrl+arrows are OS-handled (ignore).
-- Fix: correct/normalize the modified-arrow key encoding so it stops corrupting
-  input. (Then layer the editing-keys feature below.)
-- Reason: current behaviour destroys the input line.
-
----
-
-[2026-09-15@2e8e8c7] Editing keys — text-editor-style selection & navigation
-
-- Requires: the modified-arrow encoding fix (above); app-side keyboard selection
-- Detail: In BOTH the terminal input line and the editor pane, want standard
-  editing keys: Shift+arrow selects by char; Shift+Option+arrow selects by word;
-  Option+arrow moves by word; Cmd+Left/Right = line start/end; Cmd+Up/Down =
-  document start / end (editor) — in the single-line terminal, Cmd/plain Up==Left,
-  Down==Right; Cmd+C / Cmd+X / Cmd+V = copy / cut / paste; Shift+Enter inserts a
-  newline (does NOT submit to the shell and must NOT trigger the busy dot — today
-  it wrongly optimistically-busies). Terminal-line selection isn't native (the
-  shell owns the line), so implement app-side keyboard selection over the grid like
-  the mouse selection.
+- Detail: DONE (785bf9a) for the terminal: our modified-arrow encoding was correct
+  xterm — the fix was to stop forwarding those keys to the shell and handle them
+  app-side. Shift+Arrow now extends a keyboard grid selection (word-wise with
+  Option), Option+Left/Right send readline word motion (ESC-b/ESC-f), Option+Up/Down
+  send a plain arrow, Cmd+Left/Up = line start (Ctrl-A), Cmd+Right/Down = line end
+  (Ctrl-E), Cmd+C copies, Cmd+V pastes. REMAINING: (1) the SAME keys in the editor
+  pane (editor has no selection yet — add selection/copy/cut/paste + word/line nav);
+  (2) Cmd+X cut (editor; terminal cut isn't well-defined); (3) Shift+Enter inserts a
+  newline without submitting and without triggering the busy dot (today it submits-
+  ish and optimistically busies); (4) bracketed-paste wrapping so multi-line paste
+  doesn't auto-execute.
 - Reason: expected editor behaviour; the muscle memory the user relies on.
 
 ---
