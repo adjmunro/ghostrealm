@@ -27,7 +27,7 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState};
-use crate::editor::Motion;
+use crate::editor::{EditorBuffer, Motion};
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
 
@@ -585,6 +585,46 @@ impl State {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Re-apply a (possibly changed) config: re-resolve chrome, inbox timings, and
+    /// the default directory, and re-measure cell metrics if the font changed
+    /// (invalidating the shaping cache and forcing a reflow).
+    fn apply_config(&mut self, cfg: Config) {
+        let (cw, ch) = measure_cell(
+            &mut self.font_system,
+            self.scale,
+            cfg.terminal.font_size,
+            cfg.terminal.line_height,
+        );
+        if (cw - self.cell_w).abs() > 0.01 || (ch - self.cell_h).abs() > 0.01 {
+            self.cell_w = cw;
+            self.cell_h = ch;
+            self.metrics_gen = self.metrics_gen.wrapping_add(1);
+            self.surface_geom.clear(); // reflow terminals to the new cell size
+        }
+        self.chrome = cfg.resolved_chrome();
+        self.app.set_inbox_config(cfg.inbox);
+        self.app.set_default_dir(cfg.default_dir());
+        self.cfg = cfg;
+        self.dirty = true;
+    }
+
+    /// Reload the config file from disk and apply it (config is the source of truth).
+    fn reload_config(&mut self) {
+        let cfg = ghostrealm_core::config::load_or_create();
+        self.apply_config(cfg);
+        self.window.request_redraw();
+    }
+
+    /// Open the config file in an editor pane (creating it with defaults if absent).
+    /// Saving it (Cmd+S) hot-reloads the config.
+    fn open_config_editor(&mut self) {
+        if let Some(path) = ghostrealm_core::config::config_path() {
+            let _ = ghostrealm_core::config::load_or_create(); // ensure it exists
+            self.app.open_editor_in_focused(EditorBuffer::open(path));
+            self.dirty = true;
+        }
     }
 
     /// Canonical chord string for the current modifiers + `c` (matches
@@ -1550,12 +1590,23 @@ impl State {
                     self.paste_to_terminal();
                     return;
                 }
-                // Cmd+S saves the focused editor.
+                // Cmd+, opens the config file in an editor (settings live in the file).
+                if c == ',' {
+                    self.open_config_editor();
+                    return;
+                }
+                // Cmd+S saves the focused editor; saving the config hot-reloads it.
                 if c.eq_ignore_ascii_case(&'s') && self.app.focused_is_editor() {
-                    if let Some(e) = self.app.focused_editor_mut() {
+                    let saved = self.app.focused_editor_mut().and_then(|e| {
                         let _ = e.save();
-                    }
+                        e.path.clone()
+                    });
                     self.dirty = true;
+                    if saved.is_some()
+                        && saved == ghostrealm_core::config::config_path()
+                    {
+                        self.reload_config();
+                    }
                     return;
                 }
                 let chord = self.chord_string(c);
