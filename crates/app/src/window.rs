@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{Args, Config, Rect, Registry, SurfaceId, TabStatus};
+use ghostrealm_core::{Args, Config, Rect, Registry, Side, SurfaceId, TabStatus};
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -529,6 +529,33 @@ impl State {
         self.cfg.sidebar.width * self.scale
     }
 
+    /// The sidebar's rect in physical pixels (honours `[sidebar] side`).
+    fn sidebar_rect(&self) -> Rect {
+        sidebar_rect_for(
+            self.cfg.sidebar.side,
+            self.sidebar_width(),
+            self.config.width as f32,
+            self.config.height as f32,
+        )
+    }
+
+    /// The workspace (panes) rect in physical pixels — everything the sidebar
+    /// doesn't occupy.
+    fn workspace_rect(&self) -> Rect {
+        workspace_rect_for(
+            self.cfg.sidebar.side,
+            self.sidebar_width(),
+            self.config.width as f32,
+            self.config.height as f32,
+        )
+    }
+
+    /// Whether physical x-coordinate `x` falls in the sidebar column.
+    fn in_sidebar(&self, x: f32) -> bool {
+        let r = self.sidebar_rect();
+        x >= r.x && x < r.x + r.w
+    }
+
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
     fn on_click(&mut self) {
         if self.palette.is_some() {
@@ -536,8 +563,7 @@ impl State {
             return;
         }
         let (x, y) = self.cursor;
-        let sidebar_w = self.sidebar_width();
-        if x < sidebar_w {
+        if self.in_sidebar(x) {
             let row_h = self.cell_h + 8.0 * self.scale;
             let pad = 8.0 * self.scale;
             if y < pad {
@@ -551,13 +577,7 @@ impl State {
             }
             return;
         }
-        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        let workspace = Rect {
-            x: sidebar_w,
-            y: 0.0,
-            w: sw - sidebar_w,
-            h: sh,
-        };
+        let workspace = self.workspace_rect();
         let Some(vt) = self.app.tree.active_vtab() else {
             return;
         };
@@ -645,17 +665,10 @@ impl State {
     /// workspace (not the sidebar).
     fn surface_under_cursor(&self) -> Option<SurfaceId> {
         let (x, y) = self.cursor;
-        let sidebar_w = self.sidebar_width();
-        if x < sidebar_w {
+        if self.in_sidebar(x) {
             return None;
         }
-        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        let workspace = Rect {
-            x: sidebar_w,
-            y: 0.0,
-            w: (sw - sidebar_w).max(1.0),
-            h: sh,
-        };
+        let workspace = self.workspace_rect();
         let vt = self.app.tree.active_vtab()?;
         let vtab = self.app.tree.vtab(vt)?;
         for (pid, r) in vtab.layout(workspace, DIVIDER) {
@@ -700,6 +713,7 @@ impl State {
     /// `sidebar_buffers`.
     fn build_sidebar(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
         let bar_w = self.sidebar_width();
+        let bar_x = self.sidebar_rect().x;
         let row_h = self.cell_h + 8.0 * self.scale;
         let pad = 8.0 * self.scale;
         let metrics = self.metrics();
@@ -714,7 +728,7 @@ impl State {
 
         quads.push(rect_quad(
             Rect {
-                x: 0.0,
+                x: bar_x,
                 y: 0.0,
                 w: bar_w,
                 h: sh,
@@ -731,14 +745,14 @@ impl State {
         }
 
         let dot = 6.0 * self.scale;
-        let text_x = pad + dot + 6.0 * self.scale;
+        let text_x = bar_x + pad + dot + 6.0 * self.scale;
         let mut placements = Vec::with_capacity(vtabs.len());
         for (i, (name, status, is_active)) in vtabs.iter().enumerate() {
             let y = pad + i as f32 * row_h;
             if *is_active {
                 quads.push(rect_quad(
                     Rect {
-                        x: 0.0,
+                        x: bar_x,
                         y,
                         w: bar_w,
                         h: row_h,
@@ -751,7 +765,7 @@ impl State {
             }
             quads.push(rect_quad(
                 Rect {
-                    x: pad,
+                    x: bar_x + pad,
                     y: y + (row_h - dot) * 0.5,
                     w: dot,
                     h: dot,
@@ -763,7 +777,7 @@ impl State {
             ));
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
-            buf.set_size(Some((bar_w - text_x - pad).max(1.0)), Some(self.cell_h));
+            buf.set_size(Some((bar_x + bar_w - text_x - pad).max(1.0)), Some(self.cell_h));
             buf.set_rich_text(
                 std::iter::once((name.as_str(), attrs_for([220, 220, 230]))),
                 &Attrs::new().family(Family::SansSerif),
@@ -776,9 +790,9 @@ impl State {
                 left: text_x,
                 top: y + (row_h - self.cell_h) * 0.5,
                 bounds: TextBounds {
-                    left: 0,
+                    left: bar_x as i32,
                     top: y as i32,
-                    right: bar_w as i32,
+                    right: (bar_x + bar_w) as i32,
                     bottom: (y + row_h) as i32,
                 },
                 color: [220, 220, 230],
@@ -1174,13 +1188,7 @@ impl State {
         }
 
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        let sidebar_w = self.sidebar_width();
-        let workspace = Rect {
-            x: sidebar_w,
-            y: 0.0,
-            w: (sw - sidebar_w).max(1.0),
-            h: sh,
-        };
+        let workspace = self.workspace_rect();
         let panes = self.active_panes(workspace);
 
         // Resolve each pane's tab-strip height and terminal (below-strip) rect.
@@ -1635,6 +1643,34 @@ fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
+/// The sidebar rect for `side` given its width and the surface size (physical px).
+fn sidebar_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
+    let x = match side {
+        Side::Left => 0.0,
+        Side::Right => (sw - width).max(0.0),
+    };
+    Rect {
+        x,
+        y: 0.0,
+        w: width,
+        h: sh,
+    }
+}
+
+/// The workspace rect (everything the sidebar doesn't occupy) for `side`.
+fn workspace_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
+    let x = match side {
+        Side::Left => width,
+        Side::Right => 0.0,
+    };
+    Rect {
+        x,
+        y: 0.0,
+        w: (sw - width).max(1.0),
+        h: sh,
+    }
+}
+
 /// Absolute pixel rect of cell (col,row) inside pane `pane`.
 fn cell_rect(pane: Rect, col: u16, row: u16, cell_w: f32, cell_h: f32) -> Rect {
     Rect {
@@ -1832,10 +1868,36 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_quad_pipeline, measure_cell, rect_contains, QuadInstance};
-    use ghostrealm_core::Rect;
+    use super::{
+        build_quad_pipeline, measure_cell, rect_contains, sidebar_rect_for, workspace_rect_for,
+        QuadInstance,
+    };
+    use ghostrealm_core::{Rect, Side};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn sidebar_and_workspace_split_by_side() {
+        let (w, sw, sh) = (190.0, 1000.0, 600.0);
+
+        let sb = sidebar_rect_for(Side::Left, w, sw, sh);
+        let ws = workspace_rect_for(Side::Left, w, sw, sh);
+        assert_eq!((sb.x, sb.w), (0.0, 190.0), "left sidebar hugs x=0");
+        assert_eq!((ws.x, ws.w), (190.0, 810.0), "left workspace starts after it");
+
+        let sb = sidebar_rect_for(Side::Right, w, sw, sh);
+        let ws = workspace_rect_for(Side::Right, w, sw, sh);
+        assert_eq!((sb.x, sb.w), (810.0, 190.0), "right sidebar hugs the right edge");
+        assert_eq!((ws.x, ws.w), (0.0, 810.0), "right workspace starts at x=0");
+
+        // The two regions tile the width with no gap or overlap, either side.
+        for side in [Side::Left, Side::Right] {
+            let sb = sidebar_rect_for(side, w, sw, sh);
+            let ws = workspace_rect_for(side, w, sw, sh);
+            assert!((sb.w + ws.w - sw).abs() < 0.001, "regions tile the full width");
+            assert!(sb.x >= ws.x + ws.w - 0.001 || ws.x >= sb.x + sb.w - 0.001, "no overlap");
+        }
+    }
 
     #[test]
     fn rect_contains_is_half_open() {

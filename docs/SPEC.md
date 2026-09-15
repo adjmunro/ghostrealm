@@ -62,8 +62,8 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       (+ optimistic on Enter). To do: OSC 133 exit code for unread success/failure
       and the auto-read dwell timer.
 - [~] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
-      colours, autohide). To do: Ghostty palette inheritance, config-driven
-      keybindings, sidebar `side = right`.
+      colours, autohide, config-driven keybindings, sidebar `side`). To do:
+      Ghostty palette inheritance for chrome colours.
 
 Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
 sidebar/inbox, palette, config, and the agent channel are all in and tested.

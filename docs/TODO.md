@@ -47,15 +47,6 @@
 
 [2026-09-15@1d4d22e]
 
-- Requires: NO BLOCKERS
-- Detail: Config-driven keybindings ([keybindings] map chord -> command id) and
-  sidebar `side = "right"` layout. Chords currently hardcoded (Cmd+T/D/W/]/N/K).
-- Reason: Phase 6 remainder; the config fields exist, wiring does not.
-
----
-
-[2026-09-15@1d4d22e]
-
 - Requires: reading Ghostty's resolved palette
 - Detail: Chrome colour inheritance from the user's Ghostty config when [chrome]
   is unspecified (parse ~/.config/ghostty or read its palette). libghostty-vt does
