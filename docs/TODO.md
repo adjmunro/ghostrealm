@@ -44,13 +44,16 @@
 
 ---
 
-[2026-09-15@1d4d22e]
+[2026-09-15@<uncommitted>]
 
-- Requires: reading Ghostty's resolved palette
-- Detail: Chrome colour inheritance from the user's Ghostty config when [chrome]
-  is unspecified (parse ~/.config/ghostty or read its palette). libghostty-vt does
-  not expose this, so we parse it ourselves.
-- Reason: brief's "chrome inherits the resolved Ghostty palette by default".
+- Requires: NO BLOCKERS
+- Detail: Chrome inheritance now parses the user's Ghostty config directly
+  (`core::ghostty`) for background/foreground/cursor/selection/palette when
+  `[chrome]` is unset. Remaining: resolve Ghostty *themes* and `config-file`
+  includes — a `theme = ...` config with no explicit `background` inherits nothing
+  today (falls back to built-in defaults). Would need to locate and parse Ghostty's
+  theme files.
+- Reason: fuller fidelity to the brief's "resolved Ghostty palette".
 
 ---
 

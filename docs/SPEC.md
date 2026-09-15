@@ -61,9 +61,10 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       (agent/palette settable), busy from the foreground process-group (+ optimistic
       on Enter), auto-read dwell + unfocus grace. To do: OSC 133 exit code for
       unread success/failure.
-- [~] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
-      colours, autohide, config-driven keybindings, sidebar `side`). To do:
-      Ghostty palette inheritance for chrome colours.
+- [x] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
+      colours, autohide, config-driven keybindings, sidebar `side`, chrome
+      inheritance from the Ghostty config). Follow-up: resolve Ghostty themes for
+      inheritance (TODO.md).
 
 Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
 sidebar/inbox, palette, config, and the agent channel are all in and tested.

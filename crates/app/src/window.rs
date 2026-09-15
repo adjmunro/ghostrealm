@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{Args, Config, Rect, Registry, Side, SurfaceId, TabStatus};
+use ghostrealm_core::{Args, Chrome, Config, Rect, Registry, Side, SurfaceId, TabStatus};
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -265,6 +265,9 @@ struct State {
     app: AppState,
     registry: Registry<AppState>,
     cfg: Config,
+    /// Chrome colours resolved once at startup (explicit `[chrome]`, else inherited
+    /// from Ghostty, else defaults).
+    chrome: Chrome,
     mods: Mods,
     scale: f32,
     cell_w: f32,
@@ -350,6 +353,7 @@ impl State {
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         let cfg = ghostrealm_core::config::load_or_create();
+        let chrome = cfg.resolved_chrome();
         let (cell_w, cell_h) = measure_cell(
             &mut font_system,
             scale,
@@ -421,6 +425,7 @@ impl State {
             app,
             registry,
             cfg,
+            chrome,
             mods: Mods::default(),
             scale,
             cell_w,
@@ -771,7 +776,7 @@ impl State {
             },
             sw,
             sh,
-            [24, 24, 30],
+            self.chrome.sidebar,
             1.0,
         ));
 
@@ -1148,7 +1153,7 @@ impl State {
                 },
                 sw,
                 sh,
-                self.cfg.chrome.accent,
+                self.chrome.accent,
                 0.9,
             ));
         }
@@ -1293,7 +1298,7 @@ impl State {
                     },
                     sw,
                     sh,
-                    self.cfg.chrome.sidebar,
+                    self.chrome.sidebar,
                     1.0,
                 ));
                 for (i, (_sid, title, is_active)) in pr.surfaces.iter().enumerate() {
@@ -1308,7 +1313,7 @@ impl State {
                             },
                             sw,
                             sh,
-                            self.cfg.chrome.accent,
+                            self.chrome.accent,
                             0.5,
                         ));
                     }
@@ -1434,7 +1439,7 @@ impl State {
                 ));
             }
             if pr.focused && multi_pane {
-                push_border(&mut overlay_quads, pr.rect, sw, sh, self.cfg.chrome.accent);
+                push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);
             }
         }
 
@@ -1565,7 +1570,7 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let bg = self.cfg.chrome.background;
+        let bg = self.chrome.background;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),

@@ -122,7 +122,10 @@ impl Default for Tabs {
 pub struct Config {
     pub sidebar: Sidebar,
     pub terminal: Terminal,
-    pub chrome: Chrome,
+    /// Chrome colours for our own UI. Unset (`None`) means inherit from the user's
+    /// Ghostty config (falling back to the built-in defaults) — see
+    /// [`resolved_chrome`](Config::resolved_chrome).
+    pub chrome: Option<Chrome>,
     pub tabs: Tabs,
     pub input: Input,
     pub inbox: Inbox,
@@ -133,6 +136,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// The chrome colours to use: an explicit `[chrome]` if set, else colours
+    /// inherited from the user's Ghostty config, else the built-in defaults.
+    /// Does file I/O (reads the Ghostty config) when `[chrome]` is unset, so call
+    /// once and cache.
+    pub fn resolved_chrome(&self) -> Chrome {
+        self.chrome
+            .clone()
+            .or_else(crate::ghostty::inherited_chrome)
+            .unwrap_or_default()
+    }
+
     /// Resolve a chord (any modifier order/alias) to a command id: a user
     /// override wins, else the built-in default, else `None`.
     pub fn binding(&self, chord: &str) -> Option<String> {
@@ -212,11 +226,13 @@ width = 190.0    # logical pixels
 font_size = 15.0
 line_height = 18.0
 
-[chrome]
-# RGB [r, g, b]. Chrome colours for our own UI, not the terminal contents.
-background = [20, 20, 24]   # behind panes / split dividers
-sidebar = [24, 24, 30]
-accent = [90, 140, 220]     # focused-pane border, palette selection
+# [chrome] — colours for our own UI, not the terminal contents. RGB [r, g, b].
+# Unset (the default): inherit from your Ghostty config (background/foreground/
+# cursor), falling back to the values below. Uncomment to override.
+# [chrome]
+# background = [20, 20, 24]   # behind panes / split dividers
+# sidebar = [24, 24, 30]
+# accent = [90, 140, 220]     # focused-pane border, palette selection
 
 [tabs]
 autohide_single_tab = true  # hide a pane's tab strip when it has one terminal

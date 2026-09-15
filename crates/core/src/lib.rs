@@ -7,10 +7,11 @@
 pub mod command;
 pub mod config;
 pub mod fuzzy;
+pub mod ghostty;
 pub mod registry;
 pub mod tree;
 
-pub use config::{Config, Inbox, Side};
+pub use config::{Chrome, Config, Inbox, Side};
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
