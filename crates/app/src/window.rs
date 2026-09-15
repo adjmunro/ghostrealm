@@ -172,7 +172,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = (position.x as f32, position.y as f32);
-                if state.palette.is_some() && state.palette_hover() {
+                if state.palette.is_some() {
+                    if state.palette_hover() {
+                        state.window.request_redraw();
+                    }
+                } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
                     state.window.request_redraw();
                 }
             }
@@ -678,6 +682,34 @@ impl State {
             }
         }
         None
+    }
+
+    /// Move keyboard focus to the pane under the cursor (focus-follows-mouse).
+    /// Returns whether the focused pane changed.
+    fn focus_pane_under_cursor(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        if self.in_sidebar(x) {
+            return false;
+        }
+        let workspace = self.workspace_rect();
+        let Some(vt) = self.app.tree.active_vtab() else {
+            return false;
+        };
+        let hit = self.app.tree.vtab(vt).and_then(|vtab| {
+            vtab.layout(workspace, DIVIDER)
+                .into_iter()
+                .find(|(_, r)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+                .map(|(pid, _)| pid)
+        });
+        let Some(pid) = hit else { return false };
+        match self.app.tree.vtab_mut(vt) {
+            Some(vtab) if vtab.focused_pane != pid => {
+                vtab.focused_pane = pid;
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Scroll the scrollback of the pane under the cursor (or the focused pane).

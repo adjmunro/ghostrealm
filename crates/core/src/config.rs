@@ -92,6 +92,14 @@ impl Default for Inbox {
     }
 }
 
+/// `[input]`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Input {
+    /// Hovering a pane focuses it (routes keyboard there). Off by default.
+    pub focus_follows_mouse: bool,
+}
+
 /// `[tabs]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,6 +124,7 @@ pub struct Config {
     pub terminal: Terminal,
     pub chrome: Chrome,
     pub tabs: Tabs,
+    pub input: Input,
     pub inbox: Inbox,
     /// `[keybindings]`: chord -> command id, overlaying the built-in defaults.
     /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
@@ -211,6 +220,9 @@ accent = [90, 140, 220]     # focused-pane border, palette selection
 
 [tabs]
 autohide_single_tab = true  # hide a pane's tab strip when it has one terminal
+
+[input]
+focus_follows_mouse = false  # hovering a pane focuses it (routes keyboard there)
 
 [inbox]
 auto_read_after = 60    # seconds of focus before unread -> read (0 = manual only)

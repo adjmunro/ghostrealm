@@ -107,19 +107,9 @@
 - Detail: (1) Right-click a vtab → context menu: mark read/unread (show only the
   state-appropriate one — if read show "Mark unread", if unread show "Mark read"),
   Dismiss (when needs_input), rename, close, pin. (2) A "+" / new-vtab button at
-  the very bottom of the sidebar. (3) Add a `tab.mark_unread` registry command
-  (only `tab.mark_read` exists); the menu picks which to show from current state.
+  the very bottom of the sidebar. The `tab.mark_unread` and `tab.mark_read`
+  registry commands both exist now; the menu picks which to show from state.
 - Reason: brief's per-vtab context actions; discoverability.
-
----
-
-[2026-09-15@1641f11] Focus follows mouse in splits (configurable)
-
-- Requires: NO BLOCKERS
-- Detail: Hovering a pane focuses it (route keyboard there), as an option — add a
-  config flag (e.g. [input] focus_follows_mouse) and, when on, update focused_pane
-  on CursorMoved hit-test. Decide the default.
-- Reason: requested; common tiling-WM behaviour.
 
 ---
 

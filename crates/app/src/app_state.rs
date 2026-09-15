@@ -598,6 +598,17 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
+            "tab.mark_unread",
+            "Mark Tab Unread",
+            "Flag the active tab as unread",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.set_active_status(TabStatus::Unread { success: true });
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
             "tab.needs_input",
             "Mark Tab Needs Input",
             "Flag the active tab as blocked awaiting the user (agent self-report)",
@@ -731,6 +742,20 @@ mod tests {
         // Focusing b clears it.
         s.focus_vtab(b);
         assert_eq!(s.tree.vtab(b).unwrap().status, TabStatus::Read);
+    }
+
+    #[test]
+    fn mark_unread_command_sets_unread() {
+        let mut s = AppState::new().with_shell_line("sleep 2");
+        let vt = s.new_vtab().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().status, TabStatus::Read);
+        let mut r = build_registry();
+        r.execute("tab.mark_unread", &ghostrealm_core::Args::new(), &mut s)
+            .expect("tab.mark_unread runs");
+        assert!(
+            matches!(s.tree.vtab(vt).unwrap().status, TabStatus::Unread { .. }),
+            "tab.mark_unread should set the active tab unread"
+        );
     }
 
     #[test]
