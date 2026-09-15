@@ -131,6 +131,9 @@ impl Default for Tabs {
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Base directory new workspaces/terminals start in when the workspace has no
+    /// pinned root. `None` (unset) means `$HOME`. `~` is expanded.
+    pub default_directory: Option<String>,
     pub sidebar: Sidebar,
     pub terminal: Terminal,
     /// Chrome colours for our own UI. Unset (`None`) means inherit from the user's
@@ -147,6 +150,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// The resolved default directory for new workspaces (`~` expanded), or `None`
+    /// (meaning `$HOME` / the shell's default).
+    pub fn default_dir(&self) -> Option<PathBuf> {
+        let s = self.default_directory.as_ref()?.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(rest) = s.strip_prefix('~') {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(rest.trim_start_matches('/')))
+        } else {
+            Some(PathBuf::from(s))
+        }
+    }
+
     /// The chrome colours to use: an explicit `[chrome]` if set, else colours
     /// inherited from the user's Ghostty config, else the built-in defaults.
     /// Does file I/O (reads the Ghostty config) when `[chrome]` is unset, so call
@@ -243,6 +261,10 @@ pub fn normalize_chord(chord: &str) -> Option<String> {
 /// The default config written on first run. Kept in sync with [`Config::default`]
 /// by a test, so the comments here document the real defaults.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# ghostrealm config. Commit/sync this as a dotfile.
+
+# Base directory new workspaces start in (a workspace's own pinned root overrides
+# it). Unset = $HOME. `~` is expanded. Example:
+# default_directory = "~/Developer"
 
 [sidebar]
 side = "left"    # "left" or "right"

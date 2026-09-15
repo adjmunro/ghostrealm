@@ -47,6 +47,8 @@ pub struct AppState {
     optimistic_busy: HashMap<VtabId, Instant>,
     /// Inbox timing config (auto-read dwell + unfocus grace).
     inbox: Inbox,
+    /// Base directory new workspaces start in when they have no pinned root.
+    default_dir: Option<std::path::PathBuf>,
     /// When the active vtab was focused, for the auto-read dwell timer.
     focus_started: Instant,
     /// The vtab most recently auto-read by dwell, and when — for the unfocus grace
@@ -65,6 +67,7 @@ impl AppState {
             next_tab_number: 1,
             optimistic_busy: HashMap::new(),
             inbox: Inbox::default(),
+            default_dir: None,
             focus_started: Instant::now(),
             last_auto_read: None,
         }
@@ -73,6 +76,29 @@ impl AppState {
     /// Set the inbox timing config (auto-read dwell + unfocus grace).
     pub fn set_inbox_config(&mut self, inbox: Inbox) {
         self.inbox = inbox;
+    }
+
+    /// Set the base directory new workspaces start in (from config).
+    pub fn set_default_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.default_dir = dir;
+    }
+
+    /// The directory a new surface in `vt` should start in: the workspace's pinned
+    /// root, else the app default (else the shell's default when `None`).
+    fn resolve_cwd(&self, vt: VtabId) -> Option<std::path::PathBuf> {
+        self.tree
+            .vtab(vt)
+            .and_then(|v| v.root_dir.clone())
+            .or_else(|| self.default_dir.clone())
+    }
+
+    /// Pin the active workspace's root directory (new terminals/editors start here).
+    pub fn set_active_root_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        if let Some(vt) = self.active() {
+            if let Some(v) = self.tree.vtab_mut(vt) {
+                v.root_dir = Some(dir.into());
+            }
+        }
     }
 
     /// Use `sh -c <line>` for spawned surfaces instead of the login shell.
@@ -88,21 +114,33 @@ impl AppState {
         self
     }
 
-    fn spawn_surface(&mut self, id: SurfaceId) -> Result<()> {
-        self.spawn_surface_cmd(id, None)
+    /// Spawn a surface's terminal in workspace `vt`'s resolved cwd.
+    fn spawn_surface(&mut self, id: SurfaceId, vt: VtabId) -> Result<()> {
+        let cwd = self.resolve_cwd(vt);
+        self.spawn_surface_cmd(id, None, cwd)
     }
 
     /// Spawn a surface's terminal. `cmd_line`, when given, runs `sh -c <cmd_line>`
     /// for this surface only; otherwise the configured shell line (or login shell)
-    /// is used.
-    fn spawn_surface_cmd(&mut self, id: SurfaceId, cmd_line: Option<&str>) -> Result<()> {
-        let line = cmd_line.or(self.shell_line.as_deref());
-        let cmd = line.map(|line| {
-            let mut c = CommandBuilder::new("/bin/sh");
-            c.arg("-c");
-            c.arg(line);
-            c
-        });
+    /// is used. `cwd`, when it exists, is the working directory.
+    fn spawn_surface_cmd(
+        &mut self,
+        id: SurfaceId,
+        cmd_line: Option<&str>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<()> {
+        let mut cmd = match cmd_line.or(self.shell_line.as_deref()) {
+            Some(line) => {
+                let mut c = CommandBuilder::new("/bin/sh");
+                c.arg("-c");
+                c.arg(line);
+                c
+            }
+            None => CommandBuilder::new_default_prog(),
+        };
+        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+            cmd.cwd(dir);
+        }
         // The VT runs on a worker thread; the UI waker pokes the event loop when
         // the worker publishes a new grid.
         let term = ThreadedTerminal::spawn(
@@ -110,7 +148,7 @@ impl AppState {
             DEFAULT_ROWS,
             DEFAULT_CELL_W,
             DEFAULT_CELL_H,
-            cmd,
+            Some(cmd),
             self.waker.clone(),
         )?;
         self.surfaces.insert(id, term);
@@ -126,7 +164,7 @@ impl AppState {
         let name = format!("tab {}", self.next_tab_number);
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
-        self.spawn_surface(surf)?;
+        self.spawn_surface(surf, vt)?;
         Ok(vt)
     }
 
@@ -140,7 +178,7 @@ impl AppState {
         let name = line.split_whitespace().next().unwrap_or("run").to_string();
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
-        self.spawn_surface(surf)?; // the user's interactive shell, not `sh -c`
+        self.spawn_surface(surf, vt)?; // the user's interactive shell, not `sh -c`
         // Feed the command to the live shell (it echoes + runs it, then stays
         // interactive). The PTY buffers this until the shell is ready to read.
         let mut bytes = line.into_bytes();
@@ -166,7 +204,7 @@ impl AppState {
             return Ok(());
         };
         if let Some((_new_pane, surf)) = self.tree.split(vt, pane, axis) {
-            self.spawn_surface(surf)?;
+            self.spawn_surface(surf, vt)?;
         }
         Ok(())
     }
@@ -176,7 +214,7 @@ impl AppState {
             return Ok(());
         };
         if let Some(surf) = self.tree.add_surface(vt, pane) {
-            self.spawn_surface(surf)?;
+            self.spawn_surface(surf, vt)?;
         }
         Ok(())
     }
@@ -696,6 +734,22 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
+            "workspace.set_root",
+            "Set Workspace Directory",
+            "Pin the active workspace's root directory (new terminals start here)",
+        )
+        .arg(ArgSpec::required(
+            "path",
+            ArgKind::Str,
+            "the directory to pin",
+        )),
+        Box::new(|s: &mut AppState, a| {
+            s.set_active_root_dir(std::path::PathBuf::from(a.get_str("path")?));
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
             "split.leftright",
             "Split Left/Right",
             "Split the focused pane side by side",
@@ -983,6 +1037,37 @@ mod tests {
         assert!(
             matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
             "leaving within the unfocus grace should revert the auto-read to unread"
+        );
+    }
+
+    #[test]
+    fn new_surface_starts_in_the_workspace_root_dir() {
+        let dir = std::env::temp_dir().join(format!("ghostrealm-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.file_name().unwrap().to_string_lossy().into_owned();
+
+        // `sh` reads commands from the PTY; a surface spawned with a pinned root dir
+        // starts there, so `pwd` prints a path containing the marker directory.
+        let mut s = AppState::new().with_shell_line("sh");
+        s.new_vtab().unwrap();
+        s.set_active_root_dir(dir.clone());
+        s.new_surface_in_focused().unwrap();
+        let surf = s.focused_surface().unwrap();
+        assert!(s.write_input(surf, b"pwd\n"));
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = s.surface_text(surf).unwrap_or_default();
+            if text.contains(&marker) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir(&dir);
+        assert!(
+            text.contains(&marker),
+            "a surface in a workspace with a pinned root should start there; pwd:\n{text}"
         );
     }
 

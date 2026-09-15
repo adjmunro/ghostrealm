@@ -247,6 +247,9 @@ pub struct Vtab {
     pub status: TabStatus,
     pub root: Node,
     pub focused_pane: PaneId,
+    /// The directory new terminals/editors in this workspace start in. `None`
+    /// falls back to the app's default directory (then the shell's default).
+    pub root_dir: Option<std::path::PathBuf>,
 }
 
 impl Vtab {
@@ -316,6 +319,7 @@ impl Tree {
             status: TabStatus::Read,
             root: Node::Leaf(pane),
             focused_pane: pane_id,
+            root_dir: None,
         });
         self.active = Some(vtab_id);
         (vtab_id, pane_id, surface_id)

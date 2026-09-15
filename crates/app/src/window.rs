@@ -505,6 +505,7 @@ impl State {
         }
         app = app.with_waker(waker);
         app.set_inbox_config(cfg.inbox);
+        app.set_default_dir(cfg.default_dir());
         app.new_vtab().context("open initial tab")?;
         let registry = build_registry();
 
