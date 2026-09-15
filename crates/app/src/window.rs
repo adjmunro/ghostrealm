@@ -45,6 +45,9 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+/// Quiet period after a window/split resize before the PTY grid is reflowed, so a
+/// drag coalesces into one reflow instead of one per intermediate size.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -134,10 +137,13 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        // Wake for whichever comes first: the next paced PTY frame or a pending
-        // inbox auto-read deadline.
+        // Wake for whichever comes first: the next paced PTY frame, a pending
+        // inbox auto-read deadline, or the end of a resize-settle window.
         let mut wake: Option<Instant> = state.pty_pending.then_some(state.next_frame);
-        if let Some(d) = state.app.next_inbox_deadline() {
+        for d in [state.app.next_inbox_deadline(), state.resize_settle]
+            .into_iter()
+            .flatten()
+        {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
         match wake {
@@ -276,6 +282,9 @@ struct State {
     pty_pending: bool,
     /// Earliest time the next PTY-driven frame may run.
     next_frame: Instant,
+    /// While `Some(t)` and now < t, a resize is still in flight: the wgpu surface
+    /// tracks the window live, but PTY/VT reflow is deferred until it settles.
+    resize_settle: Option<Instant>,
     /// Double-tap-Shift detector for the palette (IntelliJ "Search Everywhere").
     shift_taps: TapDetector,
     /// Double-tap-Ctrl detector for "Run Anything".
@@ -432,6 +441,7 @@ impl State {
             dirty: true,
             pty_pending: false,
             next_frame: Instant::now(),
+            resize_settle: None,
             shift_taps: TapDetector::new(double_tap_window),
             ctrl_taps: TapDetector::new(double_tap_window),
         })
@@ -489,7 +499,10 @@ impl State {
         }
         self.config.width = w;
         self.config.height = h;
+        // The swapchain must track the window immediately; the (expensive) PTY/VT
+        // reflow is deferred until the drag settles.
         self.surface.configure(&self.device, &self.config);
+        self.resize_settle = Some(Instant::now() + RESIZE_DEBOUNCE);
         self.dirty = true;
     }
 
@@ -1255,7 +1268,12 @@ impl State {
         // Resize a pane's terminal only when its cell dimensions actually change;
         // a focus-only change or new content costs no resize. The content-keyed
         // row cache is position-independent, so switching panes/vtabs or scrolling
-        // never invalidates it.
+        // never invalidates it. During an in-flight resize the reflow is deferred
+        // (except a surface's first sizing, which must not start at the default).
+        if self.resize_settle.map(|t| Instant::now() >= t).unwrap_or(false) {
+            self.resize_settle = None;
+        }
+        let settling = self.resize_settle.is_some();
         let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
         for (pr, _, term) in &resolved {
             let Some(sid) = pr
@@ -1268,7 +1286,8 @@ impl State {
             };
             let cols = ((term.w / self.cell_w).floor() as u16).max(1);
             let rows = ((term.h / self.cell_h).floor() as u16).max(1);
-            if self.surface_geom.get(&sid) != Some(&(cols, rows)) {
+            let applied = self.surface_geom.get(&sid);
+            if applied != Some(&(cols, rows)) && (applied.is_none() || !settling) {
                 self.app.resize_surface(sid, cols, rows, cw, ch);
                 self.surface_geom.insert(sid, (cols, rows));
             }

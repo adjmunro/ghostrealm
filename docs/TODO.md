@@ -67,17 +67,6 @@
 
 ---
 
-[2026-09-15@1d4d22e]
-
-- Requires: NO BLOCKERS
-- Detail: Resize debounce during an active window/split drag: the per-frame resize
-  now fires only on an actual (cols,rows) change, so intermediate sizes still
-  reflow the PTY once per changed step; a short debounce would coalesce a drag into
-  one reflow at the end.
-- Reason: polish, none blocking.
-
----
-
 [2026-09-15@<uncommitted>] Verify the perf work on a real display
 
 - Requires: a desktop session (the dev sandbox has no display; `resumed` never
