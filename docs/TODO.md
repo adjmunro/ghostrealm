@@ -183,31 +183,6 @@
 
 ---
 
-[2026-09-15@2e8e8c7] BUG — a plain click in the terminal highlights a cell
-
-- Requires: NO BLOCKERS
-- Detail: A single left click (no drag) shows a highlight — a zero-length selection
-  (anchor == head) still renders one cell via `selection_row_span`. Clicking/
-  dragging in the blank space below the input line also selects.
-- Fix: only create/keep a selection once it is a real drag; never render an empty
-  selection. Optionally clamp selection to non-blank content.
-- Reason: a click shouldn't highlight anything.
-
----
-
-[2026-09-15@2e8e8c7] BUG — "Run Anything" terminal is dead / non-interactive
-
-- Requires: NO BLOCKERS
-- Detail: Run Anything spawns `/bin/sh -c <cmd>` — single-shot and non-interactive:
-  after the command you can't type, press Enter, or Ctrl-C, and it's `sh`, not the
-  user's shell (regular new terminals correctly use the login shell). It should
-  open an interactive session in the user's default shell and run the command in
-  it, staying interactive afterwards (e.g. spawn the login shell and feed
-  `<cmd>\n`, or `$SHELL -ic '<cmd>; exec $SHELL'`).
-- Reason: Run Anything should give a live shell, not a dead one.
-
----
-
 [2026-09-15@2e8e8c7] Naming — rename "vertical tabs" → "workspaces"
 
 - Requires: NO BLOCKERS
@@ -305,15 +280,6 @@
   listed (in-editor selection/copy/cut/paste, modified indicator, click-to-position,
   word-nav).
 - Reason: editor save/open are currently unusable.
-
----
-
-[2026-09-15@2e8e8c7] Add "Focus Previous Pane" (+ keybindings for pane focus)
-
-- Requires: NO BLOCKERS
-- Detail: Complement `pane.focus_next` with `pane.focus_prev`; give both default
-  keybindings and surface them in the palette.
-- Reason: symmetry; navigation.
 
 ---
 
