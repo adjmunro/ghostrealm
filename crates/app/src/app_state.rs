@@ -130,15 +130,24 @@ impl AppState {
         Ok(vt)
     }
 
-    /// Create a new vtab that runs `command_line` in a fresh shell ("Run
-    /// Anything"). The vtab is named after the command until the program sets its
-    /// own title; it becomes active.
+    /// Create a new vtab and run `command_line` in it ("Run Anything"): a normal
+    /// interactive shell (like a new terminal), with the command typed in and
+    /// submitted — so the session stays live and interactive afterwards. The vtab
+    /// is named after the command until the program sets its own title; it becomes
+    /// active.
     pub fn new_vtab_running(&mut self, command_line: impl Into<String>) -> Result<VtabId> {
         let line = command_line.into();
         let name = line.split_whitespace().next().unwrap_or("run").to_string();
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
-        self.spawn_surface_cmd(surf, Some(&line))?;
+        self.spawn_surface(surf)?; // the user's interactive shell, not `sh -c`
+        // Feed the command to the live shell (it echoes + runs it, then stays
+        // interactive). The PTY buffers this until the shell is ready to read.
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        if let Some(t) = self.surfaces.get_mut(&surf) {
+            t.write_bytes(&bytes);
+        }
         Ok(vt)
     }
 
@@ -211,20 +220,31 @@ impl AppState {
         self.editors.get_mut(&id)
     }
 
-    /// Cycle focus to the next pane in the active vtab.
-    pub fn focus_next_pane(&mut self) {
+    /// Cycle focus to the next (`+1`) or previous (`-1`) pane in the active vtab.
+    fn cycle_pane(&mut self, step: isize) {
         let Some(vt) = self.active() else { return };
         let Some(v) = self.tree.vtab(vt) else { return };
         let panes: Vec<_> = v.panes().iter().map(|p| p.id).collect();
-        if panes.len() < 2 {
+        let n = panes.len();
+        if n < 2 {
             return;
         }
         let cur = v.focused_pane;
-        let pos = panes.iter().position(|&p| p == cur).unwrap_or(0);
-        let next = panes[(pos + 1) % panes.len()];
+        let pos = panes.iter().position(|&p| p == cur).unwrap_or(0) as isize;
+        let next = panes[(pos + step).rem_euclid(n as isize) as usize];
         if let Some(v) = self.tree.vtab_mut(vt) {
             v.focused_pane = next;
         }
+    }
+
+    /// Cycle focus to the next pane in the active vtab.
+    pub fn focus_next_pane(&mut self) {
+        self.cycle_pane(1);
+    }
+
+    /// Cycle focus to the previous pane in the active vtab.
+    pub fn focus_prev_pane(&mut self) {
+        self.cycle_pane(-1);
     }
 
     pub fn close_focused_pane(&mut self) {
@@ -700,6 +720,17 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
+            "pane.focus_prev",
+            "Focus Previous Pane",
+            "Move focus to the previous pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.focus_prev_pane();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
             "surface.new",
             "New Terminal Tab",
             "Add a terminal tab to the focused pane",
@@ -800,10 +831,10 @@ mod tests {
     }
 
     #[test]
-    fn new_vtab_running_executes_its_command() {
-        // The run-anything path spawns a vtab whose surface runs the given command,
-        // independent of the app's configured shell line.
-        let mut s = AppState::new().with_shell_line("sleep 5");
+    fn new_vtab_running_types_its_command_into_a_live_shell() {
+        // Run Anything spawns an interactive shell and feeds it the command (so the
+        // session stays live). `sh` reads and runs commands from the PTY.
+        let mut s = AppState::new().with_shell_line("sh");
         let vt = s.new_vtab_running("printf RUN-MARKER; sleep 2").unwrap();
         let surf = s.tree.vtab(vt).unwrap().panes()[0].surfaces[0].id;
 

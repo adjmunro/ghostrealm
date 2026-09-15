@@ -183,6 +183,7 @@ fn default_bindings() -> HashMap<&'static str, &'static str> {
         ("cmd+shift+d", "split.topbottom"),
         ("cmd+n", "surface.new"),
         ("cmd+]", "pane.focus_next"),
+        ("cmd+[", "pane.focus_prev"),
     ])
 }
 
@@ -266,6 +267,7 @@ auto_unread_before = 1  # grace seconds after an auto-read to re-mark unread on 
 #   "cmd+shift+d" = "split.topbottom"
 #   "cmd+n" = "surface.new"
 #   "cmd+]" = "pane.focus_next"
+#   "cmd+[" = "pane.focus_prev"
 "#;
 
 /// The config file path: `$XDG_CONFIG_HOME/ghostrealm/config.toml`, falling back
