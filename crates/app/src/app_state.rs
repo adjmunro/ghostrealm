@@ -657,22 +657,22 @@ pub fn build_registry() -> Registry<AppState> {
     let mut r = Registry::new();
 
     r.register(
-        CommandMeta::new("tab.new", "New Tab", "Open a new vertical tab"),
+        CommandMeta::new("tab.new", "New Workspace", "Open a new workspace"),
         Box::new(|s: &mut AppState, _| {
             let id = s.new_vtab().map_err(failed)?;
-            Ok(CmdOutcome::msg(format!("opened vtab {}", id.0)))
+            Ok(CmdOutcome::msg(format!("opened workspace {}", id.0)))
         }),
     );
     r.register(
-        CommandMeta::new("tab.close", "Close Tab", "Close the active vertical tab"),
+        CommandMeta::new("tab.close", "Close Workspace", "Close the active workspace"),
         Box::new(|s: &mut AppState, _| {
             s.close_active_vtab();
             Ok(CmdOutcome::ok())
         }),
     );
     r.register(
-        CommandMeta::new("tab.rename", "Rename Tab", "Rename the active vertical tab")
-            .arg(ArgSpec::required("name", ArgKind::Str, "the new tab name")),
+        CommandMeta::new("tab.rename", "Rename Workspace", "Rename the active workspace")
+            .arg(ArgSpec::required("name", ArgKind::Str, "the new workspace name")),
         Box::new(|s: &mut AppState, a| {
             s.rename_active_vtab(a.get_str("name")?);
             Ok(CmdOutcome::ok())
@@ -767,8 +767,8 @@ pub fn build_registry() -> Registry<AppState> {
     r.register(
         CommandMeta::new(
             "tab.mark_read",
-            "Mark Tab Read",
-            "Clear the active tab's inbox status",
+            "Mark Workspace Read",
+            "Clear the active workspace's inbox status",
         ),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::Read);
@@ -778,8 +778,8 @@ pub fn build_registry() -> Registry<AppState> {
     r.register(
         CommandMeta::new(
             "tab.mark_unread",
-            "Mark Tab Unread",
-            "Flag the active tab as unread",
+            "Mark Workspace Unread",
+            "Flag the active workspace as unread",
         ),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::Unread { success: true });
@@ -789,8 +789,8 @@ pub fn build_registry() -> Registry<AppState> {
     r.register(
         CommandMeta::new(
             "tab.needs_input",
-            "Mark Tab Needs Input",
-            "Flag the active tab as blocked awaiting the user (agent self-report)",
+            "Mark Workspace Needs Input",
+            "Flag the active workspace as blocked awaiting the user (agent self-report)",
         ),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::NeedsInput);
@@ -800,7 +800,7 @@ pub fn build_registry() -> Registry<AppState> {
     r.register(
         CommandMeta::new(
             "tab.dismiss",
-            "Dismiss Tab Status",
+            "Dismiss Workspace Status",
             "Clear a sticky needs-input flag",
         ),
         Box::new(|s: &mut AppState, _| {

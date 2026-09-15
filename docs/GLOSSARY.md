@@ -4,10 +4,9 @@ Mutual project lexicon so we both know what we're talking about. Aim to be consi
 
 ---
 
-- Vertical tabs (vtabs): has a name, status, and clicking it will show a different workspace.
-- Horizontal tabs (htabs): top-bar tabs of a panel, belonging to the process in the panel.
-- Workspace: the main window area beside the sidebar. Different for each vtab.
-- Sidebar: the place where the vertical tabs live.
-- Panel: a single "window" within the workspace. One workspace may be geometrically split into multiple panels horizontally or vertically.
+- Workspace: a named, status-bearing entry in the sidebar; selecting it shows its panes in the main area. Each workspace owns its own recursive split tree of panes and (planned) a pinned root directory. This is the user-facing name; the code still calls it a vertical tab / `vtab` / `Vtab` / `VtabId` (an internal rename to "workspace tab" is a tracked follow-up).
+- Sidebar: the vertical list where the workspaces live.
+- Terminal tab (horizontal tab / htab): a tab in a pane's top strip, belonging to one terminal (or editor) surface in that pane; shown only when a pane holds more than one.
+- Panel / Pane: a single terminal-or-editor frame within a workspace. One workspace may be geometrically split into multiple panes horizontally or vertically.
 - Command palette: the popup window that allows the user to search and run command actions from the registry.
 - Command registry: the place where all "actions" an "actor" (user->UI button, user->palette, agent->MCP) can take live for lookup and execution.
