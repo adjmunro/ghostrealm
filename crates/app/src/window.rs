@@ -296,8 +296,14 @@ struct State {
     menu: Option<Menu>,
     /// Text buffers for the context-menu item labels (drawn via the overlay pass).
     menu_buffers: Vec<Buffer>,
-    /// The sidebar "+" new-tab button rect (physical px), for click hit-testing.
+    /// The sidebar "+" new-workspace button rect (physical px), for hit-testing.
     new_tab_button: Rect,
+    /// Vertical scroll offset of the workspace list (physical px).
+    sidebar_scroll: f32,
+    /// Max sidebar scroll (content height beyond the visible area).
+    sidebar_max_scroll: f32,
+    /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
+    sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Active terminal text selection, if any.
     selection: Option<Selection>,
     /// Left mouse button is held (for drag-selection).
@@ -547,6 +553,9 @@ impl State {
                 w: 0.0,
                 h: 0.0,
             },
+            sidebar_scroll: 0.0,
+            sidebar_max_scroll: 0.0,
+            sidebar_rows: Vec::new(),
             selection: None,
             mouse_down: false,
             dragging: false,
@@ -704,19 +713,12 @@ impl State {
         x >= r.x && x < r.x + r.w
     }
 
-    /// Height of one sidebar vtab row in physical pixels.
-    fn sidebar_row_h(&self) -> f32 {
-        self.cell_h + 8.0 * self.scale
-    }
-
-    /// The vtab index at sidebar y-coordinate `y`, if it lands on a row.
-    fn sidebar_row_at(&self, y: f32) -> Option<usize> {
-        let pad = 8.0 * self.scale;
-        if y < pad {
-            return None;
-        }
-        let idx = ((y - pad) / self.sidebar_row_h()).floor() as usize;
-        (idx < self.app.tree.vtabs().len()).then_some(idx)
+    /// The workspace vtab under a sidebar point, from the last render's rows.
+    fn sidebar_vtab_at(&self, x: f32, y: f32) -> Option<ghostrealm_core::VtabId> {
+        self.sidebar_rows
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|(_, id)| *id)
     }
 
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
@@ -736,8 +738,7 @@ impl State {
                 self.dirty = true;
                 return;
             }
-            if let Some(idx) = self.sidebar_row_at(y) {
-                let id = self.app.tree.vtabs()[idx].id;
+            if let Some(id) = self.sidebar_vtab_at(x, y) {
                 self.app.focus_vtab(id);
                 self.dirty = true;
             }
@@ -794,21 +795,20 @@ impl State {
             self.dirty = true;
             return;
         }
-        let Some(idx) = self.sidebar_row_at(y) else {
+        let Some(target) = self.sidebar_vtab_at(x, y) else {
             self.dirty = true;
             return;
         };
-        let v = &self.app.tree.vtabs()[idx];
-        let target = v.id;
+        let status = self.app.tree.vtab(target).map(|v| v.status);
         let mut items: Vec<(String, MenuAction)> = Vec::new();
-        match v.status {
-            TabStatus::Unread { .. } => items.push(("Mark read".into(), MenuAction::MarkRead)),
-            TabStatus::NeedsInput => items.push(("Dismiss".into(), MenuAction::Dismiss)),
-            TabStatus::Read | TabStatus::Busy => {
-                items.push(("Mark unread".into(), MenuAction::MarkUnread))
+        match status {
+            Some(TabStatus::Unread { .. }) => {
+                items.push(("Mark read".into(), MenuAction::MarkRead))
             }
+            Some(TabStatus::NeedsInput) => items.push(("Dismiss".into(), MenuAction::Dismiss)),
+            _ => items.push(("Mark unread".into(), MenuAction::MarkUnread)),
         }
-        items.push(("Close tab".into(), MenuAction::Close));
+        items.push(("Close workspace".into(), MenuAction::Close));
         self.menu = Some(Menu {
             target,
             anchor: (x, y),
@@ -1090,6 +1090,17 @@ impl State {
         if lines == 0 {
             return;
         }
+        // Over the sidebar, the wheel scrolls the workspace list, not the terminal.
+        if self.in_sidebar(self.cursor.0) {
+            let before = self.sidebar_scroll;
+            self.sidebar_scroll = (self.sidebar_scroll - lines as f32 * self.cell_h)
+                .clamp(0.0, self.sidebar_max_scroll);
+            if self.sidebar_scroll != before {
+                self.dirty = true;
+                self.frame_pending = true;
+            }
+            return;
+        }
         // Wheel up (positive delta) reveals older history → negative viewport delta.
         let scroll = Scroll::Delta(-lines);
         let scrolled = match self.surface_under_cursor() {
@@ -1118,15 +1129,18 @@ impl State {
         let bar_x = self.sidebar_rect().x;
         let row_h = self.cell_h + 8.0 * self.scale;
         let pad = 8.0 * self.scale;
+        let dot = 6.0 * self.scale;
+        let text_x = bar_x + pad + dot + 6.0 * self.scale;
         let metrics = self.metrics();
         let active = self.app.tree.active_vtab();
-        let vtabs: Vec<(String, TabStatus, bool)> = self
+        let vtabs: Vec<(ghostrealm_core::VtabId, String, TabStatus, bool)> = self
             .app
             .tree
             .vtabs()
             .iter()
-            .map(|v| (v.name.clone(), v.status, Some(v.id) == active))
+            .map(|v| (v.id, v.name.clone(), v.status, Some(v.id) == active))
             .collect();
+        let n = vtabs.len();
 
         quads.push(rect_quad(
             Rect {
@@ -1141,24 +1155,78 @@ impl State {
             1.0,
         ));
 
-        // One buffer per vtab plus one for the "+" new-tab button.
-        while self.sidebar_buffers.len() < vtabs.len() + 1 {
+        // One buffer per workspace plus one for the pinned "+" button.
+        while self.sidebar_buffers.len() < n + 1 {
             let b = Buffer::new(&mut self.font_system, metrics);
             self.sidebar_buffers.push(b);
         }
 
-        let dot = 6.0 * self.scale;
-        let text_x = bar_x + pad + dot + 6.0 * self.scale;
-        let mut placements = Vec::with_capacity(vtabs.len());
-        for (i, (name, status, is_active)) in vtabs.iter().enumerate() {
-            let y = pad + i as f32 * row_h;
+        let mut placements = Vec::new();
+
+        // Pinned "+" new-workspace button at the very top.
+        let btn_y = pad;
+        self.new_tab_button = Rect {
+            x: bar_x,
+            y: btn_y,
+            w: bar_w,
+            h: row_h,
+        };
+        {
+            let buf = &mut self.sidebar_buffers[n];
+            buf.set_metrics(metrics);
+            buf.set_size(Some((bar_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+            buf.set_rich_text(
+                std::iter::once(("+  New workspace", attrs_for([150, 150, 165]))),
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
+        placements.push(Placement {
+            idx: n,
+            left: bar_x + pad,
+            top: btn_y + (row_h - self.cell_h) * 0.5,
+            bounds: TextBounds {
+                left: bar_x as i32,
+                top: btn_y as i32,
+                right: (bar_x + bar_w) as i32,
+                bottom: (btn_y + row_h) as i32,
+            },
+            color: [150, 150, 165],
+        });
+
+        // Scrollable workspace list below the pinned button.
+        let list_top = pad + row_h;
+        let visible_h = (sh - list_top).max(0.0);
+        self.sidebar_max_scroll = (n as f32 * row_h - visible_h).max(0.0);
+        self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, self.sidebar_max_scroll);
+        let scroll = self.sidebar_scroll;
+
+        self.sidebar_rows.clear();
+        for (i, (id, name, status, is_active)) in vtabs.iter().enumerate() {
+            let y = list_top + i as f32 * row_h - scroll;
+            if y + row_h <= list_top || y >= sh {
+                continue; // scrolled out of the list viewport
+            }
+            let vis_top = y.max(list_top);
+            let vis_bot = (y + row_h).min(sh);
+            self.sidebar_rows.push((
+                Rect {
+                    x: bar_x,
+                    y: vis_top,
+                    w: bar_w,
+                    h: (vis_bot - vis_top).max(0.0),
+                },
+                *id,
+            ));
             if *is_active {
                 quads.push(rect_quad(
                     Rect {
                         x: bar_x,
-                        y,
+                        y: vis_top,
                         w: bar_w,
-                        h: row_h,
+                        h: vis_bot - vis_top,
                     },
                     sw,
                     sh,
@@ -1166,18 +1234,21 @@ impl State {
                     1.0,
                 ));
             }
-            quads.push(rect_quad(
-                Rect {
-                    x: bar_x + pad,
-                    y: y + (row_h - dot) * 0.5,
-                    w: dot,
-                    h: dot,
-                },
-                sw,
-                sh,
-                status_color(*status),
-                1.0,
-            ));
+            let dot_y = y + (row_h - dot) * 0.5;
+            if dot_y >= list_top && dot_y + dot <= sh {
+                quads.push(rect_quad(
+                    Rect {
+                        x: bar_x + pad,
+                        y: dot_y,
+                        w: dot,
+                        h: dot,
+                    },
+                    sw,
+                    sh,
+                    status_color(*status),
+                    1.0,
+                ));
+            }
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
             buf.set_size(Some((bar_x + bar_w - text_x - pad).max(1.0)), Some(self.cell_h));
@@ -1194,45 +1265,13 @@ impl State {
                 top: y + (row_h - self.cell_h) * 0.5,
                 bounds: TextBounds {
                     left: bar_x as i32,
-                    top: y as i32,
+                    top: vis_top as i32,
                     right: (bar_x + bar_w) as i32,
-                    bottom: (y + row_h) as i32,
+                    bottom: vis_bot as i32,
                 },
                 color: [220, 220, 230],
             });
         }
-
-        // "+" new-tab button below the last vtab row.
-        let btn_y = pad + vtabs.len() as f32 * row_h;
-        self.new_tab_button = Rect {
-            x: bar_x,
-            y: btn_y,
-            w: bar_w,
-            h: row_h,
-        };
-        let bi = vtabs.len();
-        let buf = &mut self.sidebar_buffers[bi];
-        buf.set_metrics(metrics);
-        buf.set_size(Some((bar_w - pad * 2.0).max(1.0)), Some(self.cell_h));
-        buf.set_rich_text(
-            std::iter::once(("+  New tab", attrs_for([150, 150, 165]))),
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
-        buf.shape_until_scroll(&mut self.font_system, false);
-        placements.push(Placement {
-            idx: bi,
-            left: bar_x + pad + dot + 6.0 * self.scale,
-            top: btn_y + (row_h - self.cell_h) * 0.5,
-            bounds: TextBounds {
-                left: bar_x as i32,
-                top: btn_y as i32,
-                right: (bar_x + bar_w) as i32,
-                bottom: (btn_y + row_h) as i32,
-            },
-            color: [150, 150, 165],
-        });
 
         placements
     }
