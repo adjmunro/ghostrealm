@@ -396,15 +396,24 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Settings UI (Cmd+,) over the config file
+[2026-09-15@2e8e8c7] Settings = the config file opened in our editor (Cmd+,)
 
-- Requires: config write-back (round-trip TOML; today `load_or_create` only reads /
-  writes the default on first run)
-- Detail: No settings UI exists. `Cmd+,` (the standard macOS Settings shortcut)
-  should open a settings UI. Keep the config file as the single source of truth —
-  the UI is a front end that reads and writes `config.toml` (sections: sidebar,
-  terminal, chrome, tabs, input, inbox, keybindings, plus the new default_directory).
-  MVP: a form/overlay over the config sections (reuse the overlay/menu infra);
-  ideally preserve comments on write-back, else regenerate a documented file. If it
-  turns out complex, discuss scope first.
-- Reason: expected Mac Cmd+, settings; edit config without hand-editing TOML.
+- Requires: text-editor improvements (the editor is the settings UI); config
+  hot-reload on save
+- Detail: No bespoke settings UI. `Cmd+,` opens `config.toml` in the in-app editor
+  (creating it from the documented default if missing) — the file IS the settings
+  UI, so lean on making the editor good instead. Requirements:
+  1. The config file must be fully self-documenting. EVERY option carries a comment
+     with: a description, its constraints, and its default — numeric options show
+     their valid range, enum options list their variants (e.g. `side = "left" |
+     "right"`), list options show the allowed entries. The user should learn what's
+     available from the file alone.
+  2. A "backfill / doctor" action: add any keys the user's file is MISSING (plus
+     their documented comments) WITHOUT overwriting the values they've already set,
+     so upgrades surface new options without clobbering customisations. (Command
+     and/or offered on open.)
+  3. Changes take effect on save — hot-reload the config file and re-resolve the
+     dependent state (chrome, keybindings, inbox timings, default_directory, …), or
+     at minimum clearly document "applies on next launch".
+- Reason: simpler than a bespoke UI, keeps the file as the single source of truth,
+  and doubles down on the editor; self-documenting config is discoverable.
