@@ -385,6 +385,21 @@
 
 ---
 
+[2026-09-15@2e8e8c7] Config hot-reload on save (prep the app for it)
+
+- Requires: NO BLOCKERS (foundation for the "config file is the settings UI" item)
+- Detail: Re-apply config when `config.toml` changes on disk (saved from our editor
+  or edited externally). Prep now: (1) factor "apply config" so it can run more than
+  once — re-resolve chrome, keybindings, inbox timings, tab autohide, sidebar side/
+  width, default_directory, and re-measure cell metrics if the font changed. Things
+  keyed off metrics (row cache, grid geometry) must invalidate on a font/scale
+  change (bump `metrics_gen`, clear caches, reflow terminals). (2) Reload trigger:
+  watch the file (or reload when the editor saves that path) and reload+re-apply +
+  request a redraw. Parse errors should surface non-fatally and keep the old config.
+- Reason: makes editing the config feel live; underpins the settings-in-editor flow.
+
+---
+
 [2026-09-15@2e8e8c7] Config — default directory for new workspaces (default $HOME)
 
 - Requires: NO BLOCKERS (feeds the per-workspace root directory)
