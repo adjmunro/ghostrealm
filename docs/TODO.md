@@ -127,36 +127,17 @@
 
 ---
 
-[2026-09-15@2e8e8c7] CRITICAL P1 — scrolling a terminal is very laggy
+[2026-09-15@2e8e8c7] Scroll lag — pacing landed; deeper cost is the render itself (P1 follow-up)
 
-- Requires: NO BLOCKERS
-- Detail: Mouse-wheel / trackpad scrolling a terminal is badly laggy — the single
-  worst issue. Hypothesis: each `WindowEvent::MouseWheel` calls `on_scroll` →
-  `terminal.scroll()` + an *immediate* `request_redraw`; scroll is NOT coalesced
-  through the frame clock the way PTY output is, so a trackpad flick fires many
-  events → many back-to-back snapshot + reshape + `present` (vsync-blocked) passes.
-  Newly-revealed scrollback rows also reshape (verify the content-keyed row cache
-  actually hits for them).
-- Approaches: accumulate wheel delta and apply once per paced frame (fold scroll
-  into `pty_pending`/`next_frame` pacing instead of `request_redraw` per event);
-  cap scroll redraws to the frame rate; confirm row-cache hits on scroll; profile.
+- Requires: the worker-thread architecture (below) for the full fix
+- Detail: DONE (b173b08): wheel events now apply the scroll to the VT immediately but
+  pace the redraw through the frame clock (frame_pending) instead of an immediate
+  request_redraw per event, so a flick coalesces into ~one render/frame instead of a
+  vsync-blocked backlog. REMAINING: each paced frame still re-snapshots the grid and
+  reshapes newly-revealed rows on the UI thread (~fine in release, heavier in debug);
+  the worker-thread architecture removes that from the UI thread entirely. Verify the
+  feel after that lands; if still stuttery, profile the snapshot/reshape.
 - Reason: user's #1 priority — scroll must feel instant.
-
----
-
-[2026-09-15@2e8e8c7] BUG/regression — window resize doesn't apply until you click
-
-- Requires: NO BLOCKERS
-- Detail: After resizing the window, panes/terminals don't reflow until you click
-  anywhere in the app (any location). Introduced by the resize debounce (b3cfeda):
-  the deferred reflow is scheduled via `ControlFlow::WaitUntil(resize_settle)` in
-  `about_to_wait`, but that timer doesn't reliably fire (macOS live-resize runs a
-  modal event loop; nothing re-triggers `about_to_wait` after the gesture), so the
-  reflow waits for the next input event. User wants LIVE/dynamic resize.
-- Fix: make resize reflow live again — the per-`(cols,rows)`-change guard already
-  avoids redundant reflows, so the debounce's deferral is what broke it. Remove the
-  deferral (apply each frame) or drive it via a mechanism that reliably redraws.
-- Reason: regression; dynamic resize expected.
 
 ---
 
