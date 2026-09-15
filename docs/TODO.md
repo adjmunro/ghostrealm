@@ -118,3 +118,267 @@
   scratch buffers, mouse click-to-position, horizontal scroll for long lines, and
   (later) the shell-LSP idea (IDEAS.md).
 - Reason: requested; expands the app beyond terminals.
+
+---
+
+> The entries below are from a live testing session (2026-09-15, @2e8e8c7). They
+> capture observed bugs/regressions and requests; diagnoses are hypotheses written
+> while the author still had the code context.
+
+---
+
+[2026-09-15@2e8e8c7] CRITICAL P1 — scrolling a terminal is very laggy
+
+- Requires: NO BLOCKERS
+- Detail: Mouse-wheel / trackpad scrolling a terminal is badly laggy — the single
+  worst issue. Hypothesis: each `WindowEvent::MouseWheel` calls `on_scroll` →
+  `terminal.scroll()` + an *immediate* `request_redraw`; scroll is NOT coalesced
+  through the frame clock the way PTY output is, so a trackpad flick fires many
+  events → many back-to-back snapshot + reshape + `present` (vsync-blocked) passes.
+  Newly-revealed scrollback rows also reshape (verify the content-keyed row cache
+  actually hits for them).
+- Approaches: accumulate wheel delta and apply once per paced frame (fold scroll
+  into `pty_pending`/`next_frame` pacing instead of `request_redraw` per event);
+  cap scroll redraws to the frame rate; confirm row-cache hits on scroll; profile.
+- Reason: user's #1 priority — scroll must feel instant.
+
+---
+
+[2026-09-15@2e8e8c7] BUG/regression — window resize doesn't apply until you click
+
+- Requires: NO BLOCKERS
+- Detail: After resizing the window, panes/terminals don't reflow until you click
+  anywhere in the app (any location). Introduced by the resize debounce (b3cfeda):
+  the deferred reflow is scheduled via `ControlFlow::WaitUntil(resize_settle)` in
+  `about_to_wait`, but that timer doesn't reliably fire (macOS live-resize runs a
+  modal event loop; nothing re-triggers `about_to_wait` after the gesture), so the
+  reflow waits for the next input event. User wants LIVE/dynamic resize.
+- Fix: make resize reflow live again — the per-`(cols,rows)`-change guard already
+  avoids redundant reflows, so the debounce's deferral is what broke it. Remove the
+  deferral (apply each frame) or drive it via a mechanism that reliably redraws.
+- Reason: regression; dynamic resize expected.
+
+---
+
+[2026-09-15@2e8e8c7] Responsiveness — heavy output (`eza --tree`, aliased `3`) beachballs
+
+- Requires: NO BLOCKERS
+- Detail: A heavy command still freezes the UI (spinning beachball); you cannot
+  switch workspace/pane until it finishes, then it catches up. VT parse + snapshot
+  + reshape run on the UI thread; a big burst blocks input despite the frame
+  throttle + pump budget.
+- Approaches: tighten the per-frame pump byte budget further; cap snapshot+reshape
+  work per frame (render partial, continue next frame); ensure key/mouse preempt a
+  heavy frame; consider a worker thread that owns the `!Send` VT engine and ships
+  finished grids back, or double-buffered snapshots.
+- Reason: a multiplexer must stay responsive under load. (Extends the earlier
+  responsiveness work, which helped but didn't fully solve the beachball.)
+
+---
+
+[2026-09-15@2e8e8c7] BUG — terminal Shift/Option+arrow keys corrupt text
+
+- Requires: NO BLOCKERS
+- Detail: In a terminal, Shift+Left deletes a char, Shift+Right deletes to end of
+  line, Shift+Up = end of line, Shift+Down = start of line; Option+arrows do the
+  same. Clearly a wrong modified-arrow encoding (produces sequences zsh maps to
+  kill/word ops). Cmd+arrows do nothing; Ctrl+arrows are OS-handled (ignore).
+- Fix: correct/normalize the modified-arrow key encoding so it stops corrupting
+  input. (Then layer the editing-keys feature below.)
+- Reason: current behaviour destroys the input line.
+
+---
+
+[2026-09-15@2e8e8c7] Editing keys — text-editor-style selection & navigation
+
+- Requires: the modified-arrow encoding fix (above); app-side keyboard selection
+- Detail: In BOTH the terminal input line and the editor pane, want standard
+  editing keys: Shift+arrow selects by char; Shift+Option+arrow selects by word;
+  Option+arrow moves by word; Cmd+Left/Right = line start/end; Cmd+Up/Down =
+  document start / end (editor) — in the single-line terminal, Cmd/plain Up==Left,
+  Down==Right; Cmd+C / Cmd+X / Cmd+V = copy / cut / paste; Shift+Enter inserts a
+  newline (does NOT submit to the shell and must NOT trigger the busy dot — today
+  it wrongly optimistically-busies). Terminal-line selection isn't native (the
+  shell owns the line), so implement app-side keyboard selection over the grid like
+  the mouse selection.
+- Reason: expected editor behaviour; the muscle memory the user relies on.
+
+---
+
+[2026-09-15@2e8e8c7] BUG — a plain click in the terminal highlights a cell
+
+- Requires: NO BLOCKERS
+- Detail: A single left click (no drag) shows a highlight — a zero-length selection
+  (anchor == head) still renders one cell via `selection_row_span`. Clicking/
+  dragging in the blank space below the input line also selects.
+- Fix: only create/keep a selection once it is a real drag; never render an empty
+  selection. Optionally clamp selection to non-blank content.
+- Reason: a click shouldn't highlight anything.
+
+---
+
+[2026-09-15@2e8e8c7] BUG — "Run Anything" terminal is dead / non-interactive
+
+- Requires: NO BLOCKERS
+- Detail: Run Anything spawns `/bin/sh -c <cmd>` — single-shot and non-interactive:
+  after the command you can't type, press Enter, or Ctrl-C, and it's `sh`, not the
+  user's shell (regular new terminals correctly use the login shell). It should
+  open an interactive session in the user's default shell and run the command in
+  it, staying interactive afterwards (e.g. spawn the login shell and feed
+  `<cmd>\n`, or `$SHELL -ic '<cmd>; exec $SHELL'`).
+- Reason: Run Anything should give a live shell, not a dead one.
+
+---
+
+[2026-09-15@2e8e8c7] Naming — rename "vertical tabs" → "workspaces"
+
+- Requires: NO BLOCKERS
+- Detail: In the UI, call vertical tabs "workspaces". Command labels are confusing:
+  "New Tab" / "Close Tab" / "Rename Tab" act on vertical tabs, not the pane's
+  horizontal tabs. Rename to New Workspace / Close Workspace / Rename Workspace, and
+  the pane htab actions to "New/Close Terminal Tab". Consider a scope prefix in
+  palette labels (e.g. leading `[workspace]` / `[terminal tab]`). Update GLOSSARY.md.
+  Internally, rename vtab → "workspace tab" where reasonable.
+- Reason: reduce confusion; consistent vocabulary (we already call it a workspace).
+
+---
+
+[2026-09-15@2e8e8c7] Command palette — scroll, MRU order, pinning, show keys, filter
+
+- Requires: NO BLOCKERS
+- Detail: (1) Results overflow the box (PALETTE_MAX) and aren't scrollable — you
+  can't reach commands below the fold (e.g. the split commands). Make results
+  scrollable (keep the current box size — it's liked). (2) Order by most-recently-
+  used. (3) Pinning: a clickable star on the right to keep favourites at the top,
+  with a pin icon (far right, keep the ▸ arrows). (4) Show a command's keybinding on
+  the right in a dimmer colour (discoverability — otherwise bindings are invisible).
+  (5) Filter/hide agent-only commands that make no sense for a human (e.g.
+  tab.needs_input).
+- Reason: usability + discoverability.
+
+---
+
+[2026-09-15@2e8e8c7] Commands with arguments have no UI to collect them
+
+- Requires: NO BLOCKERS
+- Detail: Commands that take args (tab.rename, editor.open, a future editor save-as)
+  do nothing from the palette — there is no follow-up to enter the argument, so they
+  appear broken. Add an argument-input flow: after choosing such a command, prompt
+  for each required arg (reuse the Run-Anything single-line input); for a path arg,
+  a file picker (see the editor entry).
+- Reason: rename / open / save currently look broken.
+
+---
+
+[2026-09-15@2e8e8c7] Context menu — rename (scoped), htab menu, close confirmation
+
+- Requires: the arg-input flow (rename needs text input)
+- Detail: (1) Rename belongs in the right-click context menu, scoped to what was
+  clicked — a workspace tab vs a horizontal/terminal tab. (2) Add a right-click
+  context menu for horizontal tabs too (rename, close, …). (3) "Close" should ask
+  for confirmation when it would close a workspace/pane containing more than one
+  pane.
+- Reason: rename is a broken palette command; context actions per tab type;
+  prevent accidental loss.
+
+---
+
+[2026-09-15@2e8e8c7] Splits — discoverability, draggable resize handles, ratios
+
+- Requires: NO BLOCKERS
+- Detail: (1) Split commands are hard to find (buried below the palette fold) — add
+  default keybindings and surface them. (2) Draggable split handles to resize panes
+  with the mouse. (3) A split currently halves the *current* pane; want free
+  resizing (including small panes) rather than a fixed half.
+- Reason: expected tiling UX.
+
+---
+
+[2026-09-15@2e8e8c7] Horizontal tabs — overflow scroll, drag-reorder, drag-to-split
+
+- Requires: NO BLOCKERS
+- Detail: (1) htabs shrink as you add more; add horizontal scroll when they overflow.
+  (2) Drag a htab (its name area, shown only when >1 tab) to reorder. (3) Drag a htab
+  out to a pane edge (side/top/bottom) to break it into a split — the drag-to-split
+  idea in IDEAS.md.
+- Reason: expected tab UX; requested drag-to-split.
+
+---
+
+[2026-09-15@2e8e8c7] Sidebar/workspaces — scroll, wheel routing, inbox sections, +, reorder
+
+- Requires: NO BLOCKERS
+- Detail: (1) With many workspaces (~34) the sidebar can't scroll — make it
+  scrollable. (2) Mouse wheel over the sidebar should scroll the workspace list, not
+  the terminal under it. (3) Implement the inbox sections: an unread / needs-input
+  group at the top, then the rest by order. (4) Move the "+" new-workspace button to
+  the very top (above all workspaces). (5) Drag workspace tabs to reorder.
+- Reason: the email-inbox model + scale.
+
+---
+
+[2026-09-15@2e8e8c7] Editor — save-as / open dialogs (file picker)
+
+- Requires: the arg-input flow
+- Detail: `editor.scratch` has no path, so Cmd+S can't save (no save-as dialog);
+  `editor.open` needs a path with no picker, so it does nothing. Add a save-as
+  dialog and a file picker — prefer a custom in-theme dialog (native acceptable as a
+  fallback). Ties into the arg-collection entry. Also the editor follow-ups already
+  listed (in-editor selection/copy/cut/paste, modified indicator, click-to-position,
+  word-nav).
+- Reason: editor save/open are currently unusable.
+
+---
+
+[2026-09-15@2e8e8c7] Add "Focus Previous Pane" (+ keybindings for pane focus)
+
+- Requires: NO BLOCKERS
+- Detail: Complement `pane.focus_next` with `pane.focus_prev`; give both default
+  keybindings and surface them in the palette.
+- Reason: symmetry; navigation.
+
+---
+
+[2026-09-15@2e8e8c7] ARCHITECTURE — run the VT (and all per-terminal work) off the UI thread
+
+- Requires: NO BLOCKERS (supersedes the "background thread" halves of the scroll /
+  `eza` responsiveness entries above — this is the real fix)
+- Detail: Move PTY reading + VT parsing + snapshot building onto a dedicated worker
+  thread PER terminal; the UI thread only renders and handles input. NOTE
+  (correcting an earlier claim that this was "hard because the VT is !Send"): `!Send`
+  only forbids *moving/sharing* the VT across threads — a worker thread that
+  *creates and solely owns* its `GhosttyTerminal` never crosses a thread boundary,
+  so `!Send` is fine. The worker: owns the VT+PTY, reads/parses, builds `Grid`
+  snapshots (`Grid` is plain Send data), and sends the latest grid to the UI over a
+  channel; the UI sends input (keys, resize, scroll) to the worker over a channel.
+  This decouples all terminal work from rendering and should eliminate the beachball
+  and most responsiveness issues at once.
+- Shape: `AppState.surfaces` become thread proxies (input tx + latest-grid rx +
+  title/busy/lifecycle state); `snapshot()` becomes "take the most recent grid the
+  worker sent"; `resize`/`scroll`/`send_key` become messages. Keep the seam
+  (`TerminalBackend`) so the single-threaded path stays for tests/`dump`/`agent`.
+- Reason: rendering must never block on terminal work; the user explicitly wants
+  everything but rendering off the UI thread.
+
+---
+
+[2026-09-15@2e8e8c7] Per-workspace root directory (cwd), pinnable
+
+- Requires: NO BLOCKERS (dir picker/arg-input helps for choosing the directory)
+- Detail: A context action on a workspace tab assigns it a root directory. New
+  terminal tabs AND editor surfaces created in that workspace start based in that
+  directory (spawn the shell with that cwd; the editor's open/save dialogs default
+  there). Scoped per workspace; changeable at any time (re-pin). Needs: store a
+  root dir on the workspace (tree model), thread it through `spawn_surface` (set
+  `CommandBuilder::cwd`), and a way to pick a directory.
+- Reason: requested; "air traffic control" for workspaces (see IDEAS.md — autogroup
+  new workspaces by directory later).
+
+---
+
+[2026-09-15@2e8e8c7] Taller workspace tabs showing the pinned directory
+
+- Requires: per-workspace root directory (above)
+- Detail: Make the sidebar workspace rows taller and show the directory each is
+  pinned to (its root dir) under/next to the name.
+- Reason: visibility of a workspace's cwd; pairs with the per-workspace root dir.
