@@ -95,12 +95,12 @@
 
 [2026-09-15@1641f11] Sidebar context menu + new-tab button; mark-unread
 
-- Requires: right-click menu widget (none yet)
-- Detail: (1) Right-click a vtab → context menu: mark read/unread (show only the
-  state-appropriate one — if read show "Mark unread", if unread show "Mark read"),
-  Dismiss (when needs_input), rename, close, pin. (2) A "+" / new-vtab button at
-  the very bottom of the sidebar. The `tab.mark_unread` and `tab.mark_read`
-  registry commands both exist now; the menu picks which to show from state.
+- Requires: NO BLOCKERS (a popup-menu widget now exists in window.rs: `Menu`)
+- Detail: DONE: right-click a sidebar vtab opens a context menu with the
+  state-appropriate mark read/unread, Dismiss (when needs_input), and Close; a "+"
+  new-tab button sits below the last vtab. Remaining: Rename (needs a single-line
+  input overlay bound to the target vtab — reuse the palette input in a rename
+  mode) and Pin (the tree has no pin/ordering concept yet).
 - Reason: brief's per-vtab context actions; discoverability.
 
 ---

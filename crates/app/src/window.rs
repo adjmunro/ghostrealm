@@ -183,6 +183,10 @@ impl ApplicationHandler<UserEvent> for App {
                     if state.palette_hover() {
                         state.window.request_redraw();
                     }
+                } else if state.menu.is_some() {
+                    if state.menu_hover() {
+                        state.window.request_redraw();
+                    }
                 } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
                     state.window.request_redraw();
                 }
@@ -193,6 +197,14 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 state.on_click();
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                state.on_right_click();
                 state.window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -263,6 +275,12 @@ struct State {
     sidebar_buffers: Vec<Buffer>,
     /// Text buffers for pane tab-strip labels (drawn in the main text pass).
     strip_buffers: Vec<Buffer>,
+    /// Sidebar context menu, when open.
+    menu: Option<Menu>,
+    /// Text buffers for the context-menu item labels (drawn via the overlay pass).
+    menu_buffers: Vec<Buffer>,
+    /// The sidebar "+" new-tab button rect (physical px), for click hit-testing.
+    new_tab_button: Rect,
     /// Last cursor position in physical pixels, for click hit-testing.
     cursor: (f32, f32),
 
@@ -305,6 +323,30 @@ struct Palette {
     query: String,
     selected: usize,
     mode: PaletteMode,
+}
+
+/// An action a sidebar context-menu item performs on its target vtab.
+#[derive(Clone, Copy)]
+enum MenuAction {
+    MarkRead,
+    MarkUnread,
+    Dismiss,
+    Close,
+}
+
+/// A right-click context menu over a sidebar vtab.
+struct Menu {
+    /// The vtab the actions apply to.
+    target: ghostrealm_core::VtabId,
+    /// Where the menu was opened (physical px); the panel is clamped on-screen.
+    anchor: (f32, f32),
+    items: Vec<(String, MenuAction)>,
+    /// Item under the cursor, for highlight.
+    hover: Option<usize>,
+    /// Per-item rects (physical px), filled at render for hit-testing.
+    rows: Vec<Rect>,
+    /// The panel rect (physical px), for click-outside dismissal.
+    panel: Rect,
 }
 
 /// A pane resolved for rendering: its rect, focus, and its surfaces
@@ -426,6 +468,14 @@ impl State {
             palette_rows: Vec::new(),
             sidebar_buffers: Vec::new(),
             strip_buffers: Vec::new(),
+            menu: None,
+            menu_buffers: Vec::new(),
+            new_tab_button: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
             cursor: (0.0, 0.0),
             quad_pipeline,
             quad_buffer,
@@ -581,22 +631,40 @@ impl State {
         x >= r.x && x < r.x + r.w
     }
 
+    /// Height of one sidebar vtab row in physical pixels.
+    fn sidebar_row_h(&self) -> f32 {
+        self.cell_h + 8.0 * self.scale
+    }
+
+    /// The vtab index at sidebar y-coordinate `y`, if it lands on a row.
+    fn sidebar_row_at(&self, y: f32) -> Option<usize> {
+        let pad = 8.0 * self.scale;
+        if y < pad {
+            return None;
+        }
+        let idx = ((y - pad) / self.sidebar_row_h()).floor() as usize;
+        (idx < self.app.tree.vtabs().len()).then_some(idx)
+    }
+
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
     fn on_click(&mut self) {
         if self.palette.is_some() {
             self.palette_click();
             return;
         }
+        if self.menu.is_some() {
+            self.menu_click();
+            return;
+        }
         let (x, y) = self.cursor;
         if self.in_sidebar(x) {
-            let row_h = self.cell_h + 8.0 * self.scale;
-            let pad = 8.0 * self.scale;
-            if y < pad {
+            if rect_contains(self.new_tab_button, x, y) {
+                let _ = self.app.new_vtab();
+                self.dirty = true;
                 return;
             }
-            let idx = ((y - pad) / row_h).floor() as usize;
-            if let Some(v) = self.app.tree.vtabs().get(idx) {
-                let id = v.id;
+            if let Some(idx) = self.sidebar_row_at(y) {
+                let id = self.app.tree.vtabs()[idx].id;
                 self.app.focus_vtab(id);
                 self.dirty = true;
             }
@@ -642,6 +710,91 @@ impl State {
             vtab.focused_pane = pid;
         }
         self.dirty = true;
+    }
+
+    /// Right-click opens a context menu over the sidebar vtab under the cursor.
+    fn on_right_click(&mut self) {
+        self.palette = None;
+        let (x, y) = self.cursor;
+        self.menu = None;
+        if !self.in_sidebar(x) {
+            self.dirty = true;
+            return;
+        }
+        let Some(idx) = self.sidebar_row_at(y) else {
+            self.dirty = true;
+            return;
+        };
+        let v = &self.app.tree.vtabs()[idx];
+        let target = v.id;
+        let mut items: Vec<(String, MenuAction)> = Vec::new();
+        match v.status {
+            TabStatus::Unread { .. } => items.push(("Mark read".into(), MenuAction::MarkRead)),
+            TabStatus::NeedsInput => items.push(("Dismiss".into(), MenuAction::Dismiss)),
+            TabStatus::Read | TabStatus::Busy => {
+                items.push(("Mark unread".into(), MenuAction::MarkUnread))
+            }
+        }
+        items.push(("Close tab".into(), MenuAction::Close));
+        self.menu = Some(Menu {
+            target,
+            anchor: (x, y),
+            items,
+            hover: None,
+            rows: Vec::new(),
+            panel: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+        });
+        self.dirty = true;
+    }
+
+    /// A left click while the context menu is open: run a clicked item, else close.
+    fn menu_click(&mut self) {
+        let (x, y) = self.cursor;
+        let hit = self.menu.as_ref().and_then(|m| {
+            m.rows
+                .iter()
+                .position(|r| rect_contains(*r, x, y))
+                .map(|i| (m.items[i].1, m.target))
+        });
+        self.menu = None;
+        if let Some((action, target)) = hit {
+            self.apply_menu_action(action, target);
+        }
+        self.dirty = true;
+    }
+
+    /// Highlight the menu item under the cursor; returns whether it changed.
+    fn menu_hover(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let idx = menu.rows.iter().position(|r| rect_contains(*r, x, y));
+        if menu.hover != idx {
+            menu.hover = idx;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction, target: ghostrealm_core::VtabId) {
+        match action {
+            MenuAction::MarkRead | MenuAction::Dismiss => {
+                self.app.tree.set_status(target, TabStatus::Read)
+            }
+            MenuAction::MarkUnread => self
+                .app
+                .tree
+                .set_status(target, TabStatus::Unread { success: true }),
+            MenuAction::Close => self.app.close_vtab(target),
+        }
     }
 
     /// A click while the palette is open: run a clicked result, or dismiss when
@@ -792,7 +945,8 @@ impl State {
             1.0,
         ));
 
-        while self.sidebar_buffers.len() < vtabs.len() {
+        // One buffer per vtab plus one for the "+" new-tab button.
+        while self.sidebar_buffers.len() < vtabs.len() + 1 {
             let b = Buffer::new(&mut self.font_system, metrics);
             self.sidebar_buffers.push(b);
         }
@@ -851,11 +1005,133 @@ impl State {
                 color: [220, 220, 230],
             });
         }
+
+        // "+" new-tab button below the last vtab row.
+        let btn_y = pad + vtabs.len() as f32 * row_h;
+        self.new_tab_button = Rect {
+            x: bar_x,
+            y: btn_y,
+            w: bar_w,
+            h: row_h,
+        };
+        let bi = vtabs.len();
+        let buf = &mut self.sidebar_buffers[bi];
+        buf.set_metrics(metrics);
+        buf.set_size(Some((bar_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+        buf.set_rich_text(
+            std::iter::once(("+  New tab", attrs_for([150, 150, 165]))),
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(&mut self.font_system, false);
+        placements.push(Placement {
+            idx: bi,
+            left: bar_x + pad + dot + 6.0 * self.scale,
+            top: btn_y + (row_h - self.cell_h) * 0.5,
+            bounds: TextBounds {
+                left: bar_x as i32,
+                top: btn_y as i32,
+                right: (bar_x + bar_w) as i32,
+                bottom: (btn_y + row_h) as i32,
+            },
+            color: [150, 150, 165],
+        });
+
+        placements
+    }
+
+    /// Build the context-menu overlay (panel + hover quads); shape item labels into
+    /// `menu_buffers`; record row/panel rects for hit-testing. Returns placements.
+    fn build_menu(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+        let (items, anchor, hover) = match &self.menu {
+            Some(m) => (m.items.clone(), m.anchor, m.hover),
+            None => return Vec::new(),
+        };
+        let metrics = self.metrics();
+        let pad = 8.0 * self.scale;
+        let row_h = self.cell_h + 6.0 * self.scale;
+        let maxlen = items
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(6) as f32;
+        let panel_w = (maxlen * self.cell_w + pad * 3.0).min(sw * 0.6);
+        let panel_h = items.len() as f32 * row_h + pad;
+        let px = anchor.0.min((sw - panel_w).max(0.0)).max(0.0);
+        let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
+
+        quads.push(rect_quad(
+            Rect {
+                x: px,
+                y: py,
+                w: panel_w,
+                h: panel_h,
+            },
+            sw,
+            sh,
+            [34, 34, 42],
+            0.98,
+        ));
+
+        while self.menu_buffers.len() < items.len() {
+            let b = Buffer::new(&mut self.font_system, metrics);
+            self.menu_buffers.push(b);
+        }
+
+        let mut rows = Vec::with_capacity(items.len());
+        let mut placements = Vec::with_capacity(items.len());
+        for (i, (label, _)) in items.iter().enumerate() {
+            let ry = py + pad * 0.5 + i as f32 * row_h;
+            let rrect = Rect {
+                x: px,
+                y: ry,
+                w: panel_w,
+                h: row_h,
+            };
+            if hover == Some(i) {
+                quads.push(rect_quad(rrect, sw, sh, self.chrome.accent, 0.5));
+            }
+            let buf = &mut self.menu_buffers[i];
+            buf.set_metrics(metrics);
+            buf.set_size(Some((panel_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+            buf.set_rich_text(
+                std::iter::once((label.as_str(), attrs_for([230, 230, 240]))),
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+            placements.push(Placement {
+                idx: i,
+                left: px + pad,
+                top: ry + (row_h - self.cell_h) * 0.5,
+                bounds: TextBounds {
+                    left: px as i32,
+                    top: ry as i32,
+                    right: (px + panel_w) as i32,
+                    bottom: (ry + row_h) as i32,
+                },
+                color: [230, 230, 240],
+            });
+            rows.push(rrect);
+        }
+
+        if let Some(m) = self.menu.as_mut() {
+            m.rows = rows;
+            m.panel = Rect {
+                x: px,
+                y: py,
+                w: panel_w,
+                h: panel_h,
+            };
+        }
         placements
     }
 
     /// Open the command palette (fresh query, first result selected).
     fn open_palette(&mut self) {
+        self.menu = None;
         self.palette = Some(Palette {
             query: String::new(),
             selected: 0,
@@ -867,6 +1143,7 @@ impl State {
     /// Toggle the overlay in `mode`: close it if already open in that mode, else
     /// (re)open it in that mode.
     fn toggle_palette(&mut self, mode: PaletteMode) {
+        self.menu = None;
         match &self.palette {
             Some(p) if p.mode == mode => self.palette = None,
             _ => {
@@ -923,6 +1200,12 @@ impl State {
         // The palette, when open, owns the keyboard.
         if self.palette.is_some() {
             self.palette_key(event);
+            return;
+        }
+        // A context menu is dismissed by Escape; other keys pass through.
+        if self.menu.is_some() && matches!(event.logical_key, WKey::Named(NamedKey::Escape)) {
+            self.menu = None;
+            self.dirty = true;
             return;
         }
         // Cmd-chords drive the app via the registry; everything else goes to the
@@ -1471,6 +1754,11 @@ impl State {
         } else {
             Vec::new()
         };
+        let menu_placements = if self.menu.is_some() {
+            self.build_menu(sw, sh, &mut overlay_quads)
+        } else {
+            Vec::new()
+        };
 
         let n_bg = bg_quads.len() as u32;
         bg_quads.extend_from_slice(&overlay_quads);
@@ -1534,8 +1822,10 @@ impl State {
         self.grid_cache.retain(|sid, _| self.app.has_surface(*sid));
         self.surface_geom.retain(|sid, _| self.app.has_surface(*sid));
 
-        if !palette_placements.is_empty() {
-            let areas: Vec<TextArea> = palette_placements
+        // Palette and menu are mutually exclusive; both draw above everything via
+        // the overlay text renderer.
+        let overlay_areas: Vec<TextArea> = if !palette_placements.is_empty() {
+            palette_placements
                 .iter()
                 .map(|p| TextArea {
                     buffer: &self.palette_buffers[p.idx],
@@ -1546,7 +1836,22 @@ impl State {
                     default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
                     custom_glyphs: &[],
                 })
-                .collect();
+                .collect()
+        } else {
+            menu_placements
+                .iter()
+                .map(|p| TextArea {
+                    buffer: &self.menu_buffers[p.idx],
+                    left: p.left,
+                    top: p.top,
+                    scale: 1.0,
+                    bounds: p.bounds,
+                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                    custom_glyphs: &[],
+                })
+                .collect()
+        };
+        if !overlay_areas.is_empty() {
             self.palette_renderer
                 .prepare(
                     &self.device,
@@ -1554,10 +1859,10 @@ impl State {
                     &mut self.font_system,
                     &mut self.atlas,
                     &self.viewport,
-                    areas,
+                    overlay_areas,
                     &mut self.swash_cache,
                 )
-                .context("palette prepare")?;
+                .context("overlay prepare")?;
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -1627,10 +1932,10 @@ impl State {
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, n_bg..total);
             }
-            if !palette_placements.is_empty() {
+            if !palette_placements.is_empty() || !menu_placements.is_empty() {
                 self.palette_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
-                    .context("palette render")?;
+                    .context("overlay render")?;
             }
         }
         self.queue.submit(Some(encoder.finish()));

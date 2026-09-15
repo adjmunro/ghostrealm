@@ -197,6 +197,11 @@ impl AppState {
         }
     }
 
+    /// Close a specific vtab by id (e.g. from the sidebar context menu).
+    pub fn close_vtab(&mut self, id: VtabId) {
+        self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(id));
+    }
+
     /// Run a tree mutation, then drop terminals whose surfaces no longer exist.
     fn prune_orphan_surfaces_after(&mut self, f: impl FnOnce(&mut Self) -> bool) {
         f(self);
@@ -863,6 +868,26 @@ mod tests {
         assert!(
             matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
             "leaving within the unfocus grace should revert the auto-read to unread"
+        );
+    }
+
+    #[test]
+    fn close_vtab_by_id_removes_it_and_prunes_its_surface() {
+        let mut s = AppState::new().with_shell_line("sleep 2");
+        let a = s.new_vtab().unwrap();
+        let b = s.new_vtab().unwrap();
+        let before = s.tree.vtabs().len();
+        let surfaces_before = s.surfaces.len();
+
+        s.close_vtab(a);
+
+        assert_eq!(s.tree.vtabs().len(), before - 1);
+        assert!(s.tree.vtab(a).is_none(), "the closed vtab is gone");
+        assert!(s.tree.vtab(b).is_some(), "other vtabs remain");
+        assert_eq!(
+            s.surfaces.len(),
+            surfaces_before - 1,
+            "the closed vtab's terminal is pruned"
         );
     }
 
