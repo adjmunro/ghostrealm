@@ -223,16 +223,16 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Context menu — rename (scoped), htab menu, close confirmation
+[2026-09-15@2e8e8c7] Context menu — htab menu + close confirmation (workspace rename/set-dir done)
 
-- Requires: the arg-input flow (rename needs text input)
-- Detail: (1) Rename belongs in the right-click context menu, scoped to what was
-  clicked — a workspace tab vs a horizontal/terminal tab. (2) Add a right-click
-  context menu for horizontal tabs too (rename, close, …). (3) "Close" should ask
-  for confirmation when it would close a workspace/pane containing more than one
-  pane.
-- Reason: rename is a broken palette command; context actions per tab type;
-  prevent accidental loss.
+- Requires: NO BLOCKERS
+- Detail: DONE (a3a8ef1): the workspace right-click menu now has Rename… and Set
+  directory… (they open the argument prompt). REMAINING: (1) a right-click context
+  menu for horizontal/terminal tabs (rename that surface, close it, …) — needs a
+  per-surface rename command; (2) "Close workspace" should confirm when the workspace
+  has more than one pane (avoid accidental loss) — needs a small confirm step (reuse
+  the Menu widget with Confirm/Cancel, or a dedicated confirm overlay).
+- Reason: context actions per tab type; prevent accidental loss.
 
 ---
 
