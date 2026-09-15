@@ -141,19 +141,16 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Responsiveness — heavy output (`eza --tree`, aliased `3`) beachballs
+[2026-09-15@2e8e8c7] Responsiveness — heavy output (`eza --tree`) beachball — likely fixed by threading
 
-- Requires: NO BLOCKERS
-- Detail: A heavy command still freezes the UI (spinning beachball); you cannot
-  switch workspace/pane until it finishes, then it catches up. VT parse + snapshot
-  + reshape run on the UI thread; a big burst blocks input despite the frame
-  throttle + pump budget.
-- Approaches: tighten the per-frame pump byte budget further; cap snapshot+reshape
-  work per frame (render partial, continue next frame); ensure key/mouse preempt a
-  heavy frame; consider a worker thread that owns the `!Send` VT engine and ships
-  finished grids back, or double-buffered snapshots.
-- Reason: a multiplexer must stay responsive under load. (Extends the earlier
-  responsiveness work, which helped but didn't fully solve the beachball.)
+- Requires: verify on a real display
+- Detail: The beachball came from VT parse + snapshot running on the UI thread. The
+  worker-thread architecture (92d5ca0) moves all of that off the UI thread, so
+  switching workspace/pane during a flood should stay responsive now. Only reshape
+  (glyphon) remains on the UI thread, bounded by the content-keyed row cache.
+  VERIFY, then close. If a flood still causes reshape-bound jank, cap reshape work
+  per frame (render partial, continue next frame).
+- Reason: a multiplexer must stay responsive under load.
 
 ---
 
@@ -320,26 +317,16 @@
 
 ---
 
-[2026-09-15@2e8e8c7] ARCHITECTURE — run the VT (and all per-terminal work) off the UI thread
+[2026-09-15@2e8e8c7] ARCHITECTURE — VT off the UI thread — DONE (92d5ca0)
 
-- Requires: NO BLOCKERS (supersedes the "background thread" halves of the scroll /
-  `eza` responsiveness entries above — this is the real fix)
-- Detail: Move PTY reading + VT parsing + snapshot building onto a dedicated worker
-  thread PER terminal; the UI thread only renders and handles input. NOTE
-  (correcting an earlier claim that this was "hard because the VT is !Send"): `!Send`
-  only forbids *moving/sharing* the VT across threads — a worker thread that
-  *creates and solely owns* its `GhosttyTerminal` never crosses a thread boundary,
-  so `!Send` is fine. The worker: owns the VT+PTY, reads/parses, builds `Grid`
-  snapshots (`Grid` is plain Send data), and sends the latest grid to the UI over a
-  channel; the UI sends input (keys, resize, scroll) to the worker over a channel.
-  This decouples all terminal work from rendering and should eliminate the beachball
-  and most responsiveness issues at once.
-- Shape: `AppState.surfaces` become thread proxies (input tx + latest-grid rx +
-  title/busy/lifecycle state); `snapshot()` becomes "take the most recent grid the
-  worker sent"; `resize`/`scroll`/`send_key` become messages. Keep the seam
-  (`TerminalBackend`) so the single-threaded path stays for tests/`dump`/`agent`.
-- Reason: rendering must never block on terminal work; the user explicitly wants
-  everything but rendering off the UI thread.
+- DONE: `ThreadedTerminal` runs each terminal's VT+PTY on a worker thread; the UI
+  only renders + sends input messages and reads published `Grid` snapshots. No VT
+  parsing or snapshotting on the UI thread. AppState.surfaces hold ThreadedTerminal.
+- Verify on a real display: heavy `eza --tree` should no longer beachball, and
+  workspace/pane switching should stay responsive mid-flood.
+- Follow-ups (optional): rate-limit the worker's grid builds under a sustained flood
+  (it currently builds per drained batch — fine, off the UI thread, but wasteful);
+  recycle the UI's consumed grids back to the worker; kill the child on drop.
 
 ---
 
