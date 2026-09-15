@@ -296,15 +296,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Per-workspace root directory (cwd), pinnable
+[2026-09-15@2e8e8c7] Per-workspace root directory — core done; picker + context menu remain
 
-- Requires: NO BLOCKERS (dir picker/arg-input helps for choosing the directory)
-- Detail: A context action on a workspace tab assigns it a root directory. New
-  terminal tabs AND editor surfaces created in that workspace start based in that
-  directory (spawn the shell with that cwd; the editor's open/save dialogs default
-  there). Scoped per workspace; changeable at any time (re-pin). Needs: store a
-  root dir on the workspace (tree model), thread it through `spawn_surface` (set
-  `CommandBuilder::cwd`), and a way to pick a directory.
+- Requires: NO BLOCKERS
+- Detail: DONE (1eccbec): Vtab.root_dir; new terminals spawn with the resolved cwd
+  (workspace root -> config default_directory -> shell default); `workspace.set_root`
+  command (path arg) pins the active workspace's root. REMAINING: (1) a context-menu
+  action to set it (currently only via the palette command's typed path); (2) a
+  directory picker instead of typing; (3) editor surfaces + the editor's open/save
+  dialogs should default to the workspace root too.
 - Reason: requested; "air traffic control" for workspaces (see IDEAS.md — autogroup
   new workspaces by directory later).
 
@@ -331,17 +331,6 @@
   watch the file (or reload when the editor saves that path) and reload+re-apply +
   request a redraw. Parse errors should surface non-fatally and keep the old config.
 - Reason: makes editing the config feel live; underpins the settings-in-editor flow.
-
----
-
-[2026-09-15@2e8e8c7] Config — default directory for new workspaces (default $HOME)
-
-- Requires: NO BLOCKERS (feeds the per-workspace root directory)
-- Detail: Add a config option (e.g. `[general] default_directory` or under a new
-  section) for the base directory new workspaces/terminals start in. Defaults to
-  `$HOME`; the user wants to override it to e.g. their Developer directory. A
-  workspace's own pinned root dir (context action) overrides this per workspace.
-- Reason: start new work where the user actually works, not always $HOME.
 
 ---
 
