@@ -301,6 +301,9 @@ struct State {
     dragging: bool,
     /// Physical-pixel position where the current press began.
     press_px: (f32, f32),
+    /// The cell the press landed on (selection anchor), if it was over a terminal.
+    /// A selection is only materialised once a drag actually starts.
+    press_cell: Option<(SurfaceId, u16, u16)>,
     /// System clipboard handle (None if unavailable).
     clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
@@ -528,6 +531,7 @@ impl State {
             mouse_down: false,
             dragging: false,
             press_px: (0.0, 0.0),
+            press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
             cursor: (0.0, 0.0),
             quad_pipeline,
@@ -972,24 +976,22 @@ impl State {
         None
     }
 
-    /// Begin a potential drag-selection at the current cursor (clears any prior
-    /// selection). No-op while an overlay owns input.
+    /// Record a potential drag-selection anchor at the current cursor and clear any
+    /// prior selection. A selection is materialised only once a drag starts, so a
+    /// plain click never highlights. No-op while an overlay owns input.
     fn begin_selection(&mut self) {
         if self.palette.is_some() || self.menu.is_some() {
             return;
         }
+        let had_selection = self.selection.is_some();
         self.selection = None;
         self.dragging = false;
         self.mouse_down = true;
         self.press_px = self.cursor;
-        if let Some((surface, col, row)) = self.cell_at(self.cursor.0, self.cursor.1) {
-            self.selection = Some(Selection {
-                surface,
-                anchor: (col, row),
-                head: (col, row),
-            });
+        self.press_cell = self.cell_at(self.cursor.0, self.cursor.1);
+        if had_selection {
+            self.dirty = true; // clear the old highlight
         }
-        self.dirty = true;
     }
 
     /// Extend the selection to the cursor during a drag. Returns whether it
@@ -1007,21 +1009,23 @@ impl State {
             }
             self.dragging = true;
         }
-        let Some(sel) = self.selection else {
+        let Some((surface, ac, ar)) = self.press_cell else {
             return false;
         };
-        let Some((surface, col, row)) = self.cell_at(x, y) else {
+        let Some((cur_surface, col, row)) = self.cell_at(x, y) else {
             return false;
         };
-        if surface != sel.surface {
+        if cur_surface != surface {
             return false; // don't select across panes
         }
-        if sel.head == (col, row) {
+        if self.selection.map(|s| s.head) == Some((col, row)) {
             return false;
         }
-        if let Some(s) = self.selection.as_mut() {
-            s.head = (col, row);
-        }
+        self.selection = Some(Selection {
+            surface,
+            anchor: (ac, ar),
+            head: (col, row),
+        });
         self.dirty = true;
         true
     }
@@ -1033,6 +1037,7 @@ impl State {
             self.copy_selection();
         }
         self.dragging = false;
+        self.press_cell = None;
     }
 
     /// Copy the current selection's text to the system clipboard.
