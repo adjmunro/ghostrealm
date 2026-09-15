@@ -58,8 +58,9 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 - [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
 - [~] Phase 5: inbox status — background output → unread, focus → read, sticky
-      needs_input (agent/palette settable). To do: busy detection (foreground
-      process-group / OSC 133) and the auto-read dwell timer.
+      needs_input (agent/palette settable), busy from the foreground process-group
+      (+ optimistic on Enter). To do: OSC 133 exit code for unread success/failure
+      and the auto-read dwell timer.
 - [~] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
       colours, autohide). To do: Ghostty palette inheritance, config-driven
       keybindings, sidebar `side = right`.

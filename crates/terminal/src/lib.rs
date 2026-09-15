@@ -240,6 +240,13 @@ pub trait TerminalBackend {
     /// The program-set title (OSC 0/2), if any.
     fn title(&self) -> Option<String>;
 
+    /// Whether a foreground command (a process group other than the shell's own)
+    /// is running on the terminal — i.e. the shell is not sitting at its prompt.
+    /// Backends that cannot tell return `false`.
+    fn is_busy(&self) -> bool {
+        false
+    }
+
     /// Current child lifecycle state.
     fn lifecycle(&mut self) -> Lifecycle;
 }

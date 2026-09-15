@@ -216,6 +216,56 @@ fn scrollback_viewport_reveals_history() {
 }
 
 #[test]
+fn is_busy_tracks_a_foreground_command() {
+    // An interactive shell does job control, so tcgetpgrp on the master reflects
+    // the foreground command's process group. `sh -i` reads commands from the PTY.
+    let mut c = CommandBuilder::new("/bin/sh");
+    c.arg("-i");
+    let mut term = GhosttyTerminal::spawn(80, 24, 8, 16, Some(c)).expect("spawn backend");
+
+    // Wait for the shell to settle at its prompt (not busy).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        term.pump();
+        if !term.is_busy() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!term.is_busy(), "shell at its prompt should not be busy");
+
+    // Run a foreground command; the shell puts it in its own process group.
+    term.write_bytes(b"sleep 1\n");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut went_busy = false;
+    while Instant::now() < deadline {
+        term.pump();
+        if term.is_busy() {
+            went_busy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        went_busy,
+        "a running foreground command should read as busy (needs a job-control shell)"
+    );
+
+    // When it finishes, the shell returns to the foreground and we go idle.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut went_idle = false;
+    while Instant::now() < deadline {
+        term.pump();
+        if !term.is_busy() {
+            went_idle = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(went_idle, "after the command finishes the shell should be idle again");
+}
+
+#[test]
 fn detects_child_exit() {
     let mut term = GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("exit 7"))).expect("spawn backend");
     pump_until_exit(&mut term, Duration::from_secs(5));

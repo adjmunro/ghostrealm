@@ -8,13 +8,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Registry, SurfaceId, TabStatus,
     Tree, VtabId,
 };
-use ghostrealm_terminal::{KeyPress, Lifecycle, Scroll, TerminalBackend};
+use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
+
+/// After Enter, a vtab is shown busy for at least this long even if the shell's
+/// foreground process group hasn't moved yet — the command may not have forked
+/// (or produced output) before the next pump. Bridges that race for silent jobs.
+const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
 use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, PtyWaker};
 
 /// Default grid size for a surface before the GUI assigns it a pane rect.
@@ -32,6 +38,9 @@ pub struct AppState {
     /// loop). Cloned into a fresh `PtyWaker` for each spawned terminal.
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
     next_tab_number: u32,
+    /// Per-vtab deadline until which an optimistic (post-Enter) busy status holds
+    /// even if the foreground process group hasn't moved yet.
+    optimistic_busy: HashMap<VtabId, Instant>,
 }
 
 impl AppState {
@@ -42,6 +51,7 @@ impl AppState {
             shell_line: None,
             waker: None,
             next_tab_number: 1,
+            optimistic_busy: HashMap::new(),
         }
     }
 
@@ -249,9 +259,11 @@ impl AppState {
     }
 
     /// Encode and send a key press to the focused surface. Input snaps the
-    /// viewport back to the live bottom, as terminals do.
+    /// viewport back to the live bottom, as terminals do. Enter optimistically
+    /// marks the active vtab busy so submitting a command reacts instantly, even
+    /// before its foreground process group appears.
     pub fn send_key_to_focused(&mut self, press: &KeyPress) -> bool {
-        match self
+        let sent = match self
             .focused_surface()
             .and_then(|id| self.surfaces.get_mut(&id))
         {
@@ -261,7 +273,22 @@ impl AppState {
                 true
             }
             None => false,
+        };
+        if sent && press.key == Key::Enter {
+            if let Some(vt) = self.active() {
+                let sticky = self
+                    .tree
+                    .vtab(vt)
+                    .map(|v| matches!(v.status, TabStatus::NeedsInput))
+                    .unwrap_or(false);
+                if !sticky {
+                    self.tree.set_status(vt, TabStatus::Busy);
+                    self.optimistic_busy
+                        .insert(vt, Instant::now() + OPTIMISTIC_BUSY_GRACE);
+                }
+            }
         }
+        sent
     }
 
     /// Scroll the focused surface's scrollback viewport.
@@ -340,7 +367,60 @@ impl AppState {
                     .set_status(vt, TabStatus::Unread { success: true });
             }
         }
+
+        // Authoritative busy/idle from each vtab's foreground process group. Busy
+        // overrides a fresh unread; finishing in the background surfaces as unread,
+        // finishing in the foreground clears to read. NeedsInput stays sticky.
+        let now = Instant::now();
+        let busy_flags: Vec<(VtabId, bool)> = self
+            .tree
+            .vtabs()
+            .iter()
+            .map(|v| (v.id, self.vtab_is_busy(v.id)))
+            .collect();
+        for (vt, busy) in busy_flags {
+            let optimistic = self
+                .optimistic_busy
+                .get(&vt)
+                .map(|&until| now < until)
+                .unwrap_or(false);
+            let status = self.tree.vtab(vt).map(|v| v.status);
+            match status {
+                Some(TabStatus::NeedsInput) => {}
+                _ if busy => self.tree.set_status(vt, TabStatus::Busy),
+                Some(TabStatus::Busy) if !optimistic => {
+                    // The command finished (and its optimistic grace has lapsed).
+                    let done = if Some(vt) == active {
+                        TabStatus::Read
+                    } else {
+                        TabStatus::Unread { success: true }
+                    };
+                    self.tree.set_status(vt, done);
+                    self.optimistic_busy.remove(&vt);
+                }
+                _ => {}
+            }
+        }
+
         (changed, more)
+    }
+
+    /// Whether any of a vtab's surfaces has a foreground command running.
+    fn vtab_is_busy(&self, vt: VtabId) -> bool {
+        self.tree
+            .vtab(vt)
+            .map(|v| {
+                v.panes()
+                    .iter()
+                    .flat_map(|p| p.surfaces.iter())
+                    .any(|s| {
+                        self.surfaces
+                            .get(&s.id)
+                            .map(|t| t.is_busy())
+                            .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(false)
     }
 
     /// Whether a live terminal exists for `id`.
@@ -651,6 +731,41 @@ mod tests {
         // Focusing b clears it.
         s.focus_vtab(b);
         assert_eq!(s.tree.vtab(b).unwrap().status, TabStatus::Read);
+    }
+
+    #[test]
+    fn enter_marks_active_busy_optimistically_then_clears() {
+        use ghostrealm_terminal::{Key, Mods};
+
+        // `sh -c cat` execs cat (no forked foreground group), so is_busy() stays
+        // false — this exercises the optimistic-busy grace, not the pgrp path.
+        let mut s = AppState::new().with_shell_line("cat");
+        let vt = s.new_vtab().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().status, TabStatus::Read);
+
+        s.send_key_to_focused(&KeyPress {
+            key: Key::Enter,
+            mods: Mods::default(),
+            text: None,
+        });
+        assert_eq!(
+            s.tree.vtab(vt).unwrap().status,
+            TabStatus::Busy,
+            "Enter should optimistically mark the active vtab busy"
+        );
+
+        // Within the grace window, an idle pump keeps it busy.
+        s.pump_all();
+        assert_eq!(s.tree.vtab(vt).unwrap().status, TabStatus::Busy);
+
+        // Once the grace lapses, the authoritative idle state clears it to read.
+        std::thread::sleep(OPTIMISTIC_BUSY_GRACE + Duration::from_millis(80));
+        s.pump_all();
+        assert_eq!(
+            s.tree.vtab(vt).unwrap().status,
+            TabStatus::Read,
+            "after the grace lapses and no command is running, busy clears to read"
+        );
     }
 
     #[test]

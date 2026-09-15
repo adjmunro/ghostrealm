@@ -470,6 +470,17 @@ impl TerminalBackend for GhosttyTerminal {
             .filter(|s| !s.is_empty())
     }
 
+    fn is_busy(&self) -> bool {
+        // The terminal's foreground process group (tcgetpgrp) differs from the
+        // shell's own pid/pgrp exactly when a foreground command is running. Job
+        // control (interactive shells) is what makes this authoritative; a shell
+        // that doesn't move the foreground group reads as never busy.
+        match (self.master.process_group_leader(), self.child.process_id()) {
+            (Some(fg), Some(shell)) => fg != shell as i32,
+            _ => false,
+        }
+    }
+
     fn lifecycle(&mut self) -> Lifecycle {
         if let Some(code) = self.exited {
             return Lifecycle::Exited(code);
