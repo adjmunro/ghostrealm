@@ -256,15 +256,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Sidebar/workspaces — scroll, wheel routing, inbox sections, +, reorder
+[2026-09-15@2e8e8c7] Sidebar/workspaces — inbox sections + drag-reorder (scroll/wheel/+ done)
 
 - Requires: NO BLOCKERS
-- Detail: (1) With many workspaces (~34) the sidebar can't scroll — make it
-  scrollable. (2) Mouse wheel over the sidebar should scroll the workspace list, not
-  the terminal under it. (3) Implement the inbox sections: an unread / needs-input
-  group at the top, then the rest by order. (4) Move the "+" new-workspace button to
-  the very top (above all workspaces). (5) Drag workspace tabs to reorder.
-- Reason: the email-inbox model + scale.
+- Detail: DONE (2d7c341): scrollable workspace list, wheel-over-sidebar scrolls it,
+  and the "+" button pinned at the very top. REMAINING: (3) inbox sections — group
+  unread / needs-input at the top, then the rest by order; (5) drag workspace rows
+  to reorder (the tree stores workspaces in an ordered Vec — reordering needs a move
+  op + drag handling in the sidebar).
+- Reason: the email-inbox model + reordering.
 
 ---
 
