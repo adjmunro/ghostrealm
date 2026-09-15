@@ -196,17 +196,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Command palette — scroll, MRU order, pinning, show keys, filter
+[2026-09-15@2e8e8c7] Command palette — MRU order + pinning (rest done)
 
-- Requires: NO BLOCKERS
-- Detail: (1) Results overflow the box (PALETTE_MAX) and aren't scrollable — you
-  can't reach commands below the fold (e.g. the split commands). Make results
-  scrollable (keep the current box size — it's liked). (2) Order by most-recently-
-  used. (3) Pinning: a clickable star on the right to keep favourites at the top,
-  with a pin icon (far right, keep the ▸ arrows). (4) Show a command's keybinding on
-  the right in a dimmer colour (discoverability — otherwise bindings are invisible).
-  (5) Filter/hide agent-only commands that make no sense for a human (e.g.
-  tab.needs_input).
+- Requires: persistent per-user state (MRU history, pins)
+- Detail: DONE (63124fc): scrollable results (10-row window over up to 100 ranked
+  matches), keybindings shown right-aligned in a dim colour, and agent-only commands
+  (CommandMeta::hidden()) excluded from the human palette. REMAINING: (1) order by
+  most-recently-used (needs a persisted usage history); (2) pinning — a clickable
+  star on the right to keep favourites at the top (needs persisted pins). Both want
+  a small persistent store (or a config section).
 - Reason: usability + discoverability.
 
 ---
