@@ -33,8 +33,11 @@ use crate::tap::TapDetector;
 const DIVIDER: f32 = 6.0;
 /// Focused-pane border thickness, in physical pixels.
 const BORDER: f32 = 2.0;
-/// Max command-palette results shown at once.
-const PALETTE_MAX: usize = 12;
+/// How many command-palette matches to rank (the visible window scrolls through
+/// them).
+const PALETTE_SEARCH_CAP: usize = 100;
+/// Max result rows shown at once in the palette (the rest scroll into view).
+const PALETTE_VISIBLE: usize = 10;
 /// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
 /// output wakes into at most one redraw per interval so input stays responsive.
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
@@ -280,9 +283,9 @@ struct State {
     palette: Option<Palette>,
     /// Last-rendered palette panel rect (physical px), for click-outside dismissal.
     palette_panel: Rect,
-    /// Last-rendered palette result rows: (row rect, command id), for click/hover
-    /// hit-testing. Rebuilt each frame the palette is open.
-    palette_rows: Vec<(Rect, String)>,
+    /// Last-rendered palette result rows: (row rect, result index, command id),
+    /// for click/hover hit-testing. Rebuilt each frame the palette is open.
+    palette_rows: Vec<(Rect, usize, String)>,
     /// Text buffers for the sidebar's vtab names (drawn in the main text pass).
     sidebar_buffers: Vec<Buffer>,
     /// Text buffers for pane tab-strip labels (drawn in the main text pass).
@@ -345,7 +348,10 @@ enum PaletteMode {
 /// Command-palette / run-anything overlay state.
 struct Palette {
     query: String,
+    /// Selected result index into the full (filtered) result list.
     selected: usize,
+    /// Index of the first visible result row (scroll offset).
+    scroll: usize,
     mode: PaletteMode,
 }
 
@@ -857,8 +863,8 @@ impl State {
         if let Some(id) = self
             .palette_rows
             .iter()
-            .find(|(r, _)| rect_contains(*r, x, y))
-            .map(|(_, id)| id.clone())
+            .find(|(r, _, _)| rect_contains(*r, x, y))
+            .map(|(_, _, id)| id.clone())
         {
             self.palette = None;
             let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
@@ -875,16 +881,17 @@ impl State {
     /// moved (so the caller can redraw only on change).
     fn palette_hover(&mut self) -> bool {
         let (x, y) = self.cursor;
-        let Some(idx) = self
+        let Some(sel) = self
             .palette_rows
             .iter()
-            .position(|(r, _)| rect_contains(*r, x, y))
+            .find(|(r, _, _)| rect_contains(*r, x, y))
+            .map(|(_, idx, _)| *idx)
         else {
             return false;
         };
         match self.palette.as_mut() {
-            Some(p) if p.selected != idx => {
-                p.selected = idx;
+            Some(p) if p.selected != sel => {
+                p.selected = sel;
                 self.dirty = true;
                 true
             }
@@ -1310,6 +1317,7 @@ impl State {
         self.palette = Some(Palette {
             query: String::new(),
             selected: 0,
+            scroll: 0,
             mode: PaletteMode::Commands,
         });
         self.dirty = true;
@@ -1325,6 +1333,7 @@ impl State {
                 self.palette = Some(Palette {
                     query: String::new(),
                     selected: 0,
+                    scroll: 0,
                     mode,
                 })
             }
@@ -1517,10 +1526,34 @@ impl State {
         self.dirty = true;
     }
 
+    /// Ranked, human-visible command results for `query`: `(id, title, chord)`.
+    /// Hidden (agent-only) commands are excluded.
+    fn palette_results(&self, query: &str) -> Vec<(String, String, Option<String>)> {
+        self.registry
+            .search(query, PALETTE_SEARCH_CAP)
+            .into_iter()
+            .filter(|h| !h.meta.hidden)
+            .map(|h| {
+                (
+                    h.meta.id.to_string(),
+                    h.meta.title.to_string(),
+                    self.cfg.binding_for(h.meta.id),
+                )
+            })
+            .collect()
+    }
+
     fn palette_key(&mut self, event: &winit::event::KeyEvent) {
         let (query, selected, mode) = match &self.palette {
             Some(p) => (p.query.clone(), p.selected, p.mode),
             None => return,
+        };
+        let result_count = || {
+            if mode == PaletteMode::Commands {
+                self.palette_results(&query).len()
+            } else {
+                0
+            }
         };
         match &event.logical_key {
             WKey::Named(NamedKey::Escape) => self.palette = None,
@@ -1529,10 +1562,9 @@ impl State {
                 match mode {
                     PaletteMode::Commands => {
                         let id = self
-                            .registry
-                            .search(&query, PALETTE_MAX)
+                            .palette_results(&query)
                             .get(selected)
-                            .map(|h| h.meta.id.to_string());
+                            .map(|(id, _, _)| id.clone());
                         if let Some(id) = id {
                             let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
                         }
@@ -1551,10 +1583,11 @@ impl State {
                 if let Some(p) = self.palette.as_mut() {
                     p.query.pop();
                     p.selected = 0;
+                    p.scroll = 0;
                 }
             }
             WKey::Named(NamedKey::ArrowDown) => {
-                let n = self.registry.search(&query, PALETTE_MAX).len();
+                let n = result_count();
                 if let Some(p) = self.palette.as_mut() {
                     if n > 0 {
                         p.selected = (selected + 1) % n;
@@ -1562,7 +1595,7 @@ impl State {
                 }
             }
             WKey::Named(NamedKey::ArrowUp) => {
-                let n = self.registry.search(&query, PALETTE_MAX).len();
+                let n = result_count();
                 if let Some(p) = self.palette.as_mut() {
                     if n > 0 {
                         p.selected = (selected + n - 1) % n;
@@ -1573,6 +1606,7 @@ impl State {
                 if let Some(p) = self.palette.as_mut() {
                     p.query.push(' ');
                     p.selected = 0;
+                    p.scroll = 0;
                 }
             }
             WKey::Character(s) => {
@@ -1580,6 +1614,7 @@ impl State {
                     if let Some(p) = self.palette.as_mut() {
                         p.query.push(c);
                         p.selected = 0;
+                        p.scroll = 0;
                     }
                 }
             }
@@ -1591,21 +1626,35 @@ impl State {
     /// Build the palette overlay: push its dim/panel/selection quads and shape
     /// its text lines, returning their placements (indices into palette_buffers).
     fn build_palette(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
-        let (query, selected, mode) = match &self.palette {
-            Some(p) => (p.query.clone(), p.selected, p.mode),
+        let (query, mode) = match &self.palette {
+            Some(p) => (p.query.clone(), p.mode),
             None => return Vec::new(),
         };
-        // Command mode fuzzy-searches the registry; run mode takes the raw line.
-        let results: Vec<(String, String)> = match mode {
-            PaletteMode::Commands => self
-                .registry
-                .search(&query, PALETTE_MAX)
-                .into_iter()
-                .map(|h| (h.meta.id.to_string(), h.meta.title.to_string()))
-                .collect(),
+        // Command mode fuzzy-searches the registry (hidden commands excluded); run
+        // mode takes the raw line.
+        let results: Vec<(String, String, Option<String>)> = match mode {
+            PaletteMode::Commands => self.palette_results(&query),
             PaletteMode::Run => Vec::new(),
         };
-        let hits: Vec<String> = results.iter().map(|(_, t)| t.clone()).collect();
+        let n = results.len();
+
+        // Clamp selection + scroll so the selected result stays visible.
+        let (sel, scroll) = {
+            let p = self.palette.as_mut().unwrap();
+            if n == 0 {
+                p.selected = 0;
+                p.scroll = 0;
+            } else {
+                p.selected = p.selected.min(n - 1);
+                if p.selected < p.scroll {
+                    p.scroll = p.selected;
+                } else if p.selected >= p.scroll + PALETTE_VISIBLE {
+                    p.scroll = p.selected + 1 - PALETTE_VISIBLE;
+                }
+                p.scroll = p.scroll.min(n.saturating_sub(PALETTE_VISIBLE));
+            }
+            (p.selected, p.scroll)
+        };
 
         let metrics = self.metrics();
         let line_h = self.cell_h;
@@ -1613,31 +1662,18 @@ impl State {
         let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
         let panel_x = ((sw - panel_w) / 2.0).max(0.0);
         let panel_y = sh * 0.12;
-        let line_count = 1 + hits.len().max(1); // query line + results (or "none")
-        let panel_h = line_count as f32 * line_h + pad * 2.0;
+        let body_rows = match mode {
+            PaletteMode::Commands if n > 0 => n.min(PALETTE_VISIBLE),
+            _ => 1, // a hint / "no matches" line
+        };
+        let panel_h = (1 + body_rows) as f32 * line_h + pad * 2.0;
 
-        // Record hit-test geometry for mouse click/hover.
         self.palette_panel = Rect {
             x: panel_x,
             y: panel_y,
             w: panel_w,
             h: panel_h,
         };
-        self.palette_rows = results
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| {
-                (
-                    Rect {
-                        x: panel_x,
-                        y: panel_y + pad + (1 + i) as f32 * line_h,
-                        w: panel_w,
-                        h: line_h,
-                    },
-                    id.clone(),
-                )
-            })
-            .collect();
 
         quads.push(rect_quad(
             Rect {
@@ -1663,13 +1699,13 @@ impl State {
             [28, 28, 36],
             0.98,
         ));
-        if !hits.is_empty() {
-            let sel = selected.min(hits.len() - 1);
-            let sel_y = panel_y + pad + (1 + sel) as f32 * line_h;
+        // Selection highlight at the selected result's visible row.
+        if mode == PaletteMode::Commands && n > 0 {
+            let vis = sel - scroll;
             quads.push(rect_quad(
                 Rect {
                     x: panel_x + pad * 0.5,
-                    y: sel_y,
+                    y: panel_y + pad + (1 + vis) as f32 * line_h,
                     w: panel_w - pad,
                     h: line_h,
                 },
@@ -1680,26 +1716,52 @@ impl State {
             ));
         }
 
-        let mut lines: Vec<(String, [u8; 3])> = Vec::new();
+        // Each line is a list of coloured spans (title bright + right-aligned chord
+        // dim). Record the visible rows for click/hover hit-testing.
+        let usable_cols = (((panel_w - pad * 2.0) / self.cell_w).floor() as usize).max(1);
+        self.palette_rows.clear();
+        let mut lines: Vec<Vec<(String, [u8; 3])>> = Vec::new();
         let prompt = match mode {
             PaletteMode::Commands => format!("\u{203a} {}", query),
             PaletteMode::Run => format!("\u{2b95} {}", query),
         };
-        lines.push((prompt, [235, 235, 245]));
-        if hits.is_empty() {
-            let hint = match mode {
-                PaletteMode::Commands => "  (no matching commands)",
-                PaletteMode::Run => "  (Enter to run in a new tab)",
-            };
-            lines.push((hint.to_string(), [150, 150, 160]));
-        } else {
-            for (i, title) in hits.iter().enumerate() {
-                let prefix = if i == selected.min(hits.len() - 1) {
-                    "\u{25b8} "
-                } else {
-                    "  "
-                };
-                lines.push((format!("{prefix}{title}"), [235, 235, 245]));
+        lines.push(vec![(prompt, [235, 235, 245])]);
+        match mode {
+            PaletteMode::Run => lines.push(vec![(
+                "  (Enter to run in a new tab)".to_string(),
+                [150, 150, 160],
+            )]),
+            PaletteMode::Commands if n == 0 => lines.push(vec![(
+                "  (no matching commands)".to_string(),
+                [150, 150, 160],
+            )]),
+            PaletteMode::Commands => {
+                let end = (scroll + PALETTE_VISIBLE).min(n);
+                for (offset, (id, title, chord)) in results[scroll..end].iter().enumerate() {
+                    let i = scroll + offset;
+                    let prefix = if i == sel { "\u{25b8} " } else { "  " };
+                    let chord = chord.clone().unwrap_or_default();
+                    let left = format!("{prefix}{title}");
+                    let used = left.chars().count() + chord.chars().count();
+                    let gap = usable_cols
+                        .saturating_sub(used)
+                        .max(if chord.is_empty() { 0 } else { 1 });
+                    let mut spans = vec![(format!("{left}{}", " ".repeat(gap)), [235, 235, 245])];
+                    if !chord.is_empty() {
+                        spans.push((chord, [140, 140, 155]));
+                    }
+                    lines.push(spans);
+                    self.palette_rows.push((
+                        Rect {
+                            x: panel_x,
+                            y: panel_y + pad + (1 + offset) as f32 * line_h,
+                            w: panel_w,
+                            h: line_h,
+                        },
+                        i,
+                        id.clone(),
+                    ));
+                }
             }
         }
 
@@ -1710,12 +1772,12 @@ impl State {
         let text_x = panel_x + pad;
         let text_w = (panel_w - pad * 2.0).max(1.0);
         let mut placements = Vec::with_capacity(lines.len());
-        for (i, (text, color)) in lines.iter().enumerate() {
+        for (i, spans) in lines.iter().enumerate() {
             let buf = &mut self.palette_buffers[i];
             buf.set_metrics(metrics);
             buf.set_size(Some(text_w), Some(line_h));
             buf.set_rich_text(
-                std::iter::once((text.as_str(), attrs_for(*color))),
+                spans.iter().map(|(t, c)| (t.as_str(), attrs_for(*c))),
                 &Attrs::new().family(Family::Monospace),
                 Shaping::Advanced,
                 None,
@@ -1731,7 +1793,7 @@ impl State {
                     right: (panel_x + panel_w) as i32,
                     bottom: (panel_y + panel_h) as i32,
                 },
-                color: *color,
+                color: [235, 235, 245],
             });
         }
         placements

@@ -791,7 +791,8 @@ pub fn build_registry() -> Registry<AppState> {
             "tab.needs_input",
             "Mark Workspace Needs Input",
             "Flag the active workspace as blocked awaiting the user (agent self-report)",
-        ),
+        )
+        .hidden(),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::NeedsInput);
             Ok(CmdOutcome::ok())

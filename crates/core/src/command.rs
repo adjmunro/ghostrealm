@@ -67,6 +67,9 @@ pub struct CommandMeta {
     pub title: &'static str,
     pub description: &'static str,
     pub args: Vec<ArgSpec>,
+    /// Agent-only: runnable via the registry (agent/keybinding) but hidden from the
+    /// human command palette (e.g. an agent self-report action).
+    pub hidden: bool,
 }
 
 impl CommandMeta {
@@ -76,10 +79,16 @@ impl CommandMeta {
             title,
             description,
             args: Vec::new(),
+            hidden: false,
         }
     }
     pub fn arg(mut self, spec: ArgSpec) -> Self {
         self.args.push(spec);
+        self
+    }
+    /// Hide this command from the human command palette (still agent-runnable).
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
         self
     }
 }

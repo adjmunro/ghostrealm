@@ -158,6 +158,20 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// The chord bound to a command id (for showing shortcuts in the palette): a
+    /// user override wins over the built-in default. Returns the canonical chord.
+    pub fn binding_for(&self, id: &str) -> Option<String> {
+        for (k, v) in &self.keybindings {
+            if v.as_str() == id {
+                return normalize_chord(k);
+            }
+        }
+        default_bindings()
+            .into_iter()
+            .find(|(_, v)| *v == id)
+            .map(|(k, _)| k.to_string())
+    }
+
     /// Resolve a chord (any modifier order/alias) to a command id: a user
     /// override wins, else the built-in default, else `None`.
     pub fn binding(&self, chord: &str) -> Option<String> {
