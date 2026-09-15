@@ -110,13 +110,13 @@
 [2026-09-15@<uncommitted>] Text-editor pane — follow-ups
 
 - Requires: NO BLOCKERS
-- Detail: A minimal editor surface now exists (`app::editor::EditorBuffer`): a
-  surface is a terminal OR an editor; `editor.scratch` / `editor.open <path>`
-  commands, typing/editing (arrows, Home/End, backspace/delete, newline), Cmd+S
-  save, rendered via the glyphon row path with a cursor bar. Follow-ups: selection
-  + copy/paste inside the editor, a modified/unsaved indicator + save-as prompt for
-  scratch buffers, mouse click-to-position, horizontal scroll for long lines, and
-  (later) the shell-LSP idea (IDEAS.md).
+- Detail: A minimal editor surface exists (`app::editor::EditorBuffer`): terminal OR
+  editor; editor.scratch / editor.open <path>; typing/editing; Cmd+S save; selection
+  (Shift+Arrow/Home/End) + copy/cut/paste (Cmd+C/X/V) + line/doc nav (Cmd+arrows),
+  rendered with a highlight + cursor bar. Follow-ups: a modified/unsaved indicator +
+  save-as prompt for scratch buffers; mouse click-to-position + drag-select in the
+  editor; word motion (Option+Arrow) in the editor; horizontal scroll for long
+  lines; and (later) the shell-LSP idea (IDEAS.md).
 - Reason: requested; expands the app beyond terminals.
 
 ---
@@ -154,20 +154,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Editing keys — TERMINAL done; editor selection + Shift+Enter + cut remain
+[2026-09-15@2e8e8c7] Editing keys — bracketed paste + editor word motion remain
 
 - Requires: NO BLOCKERS
-- Detail: DONE (785bf9a) for the terminal: our modified-arrow encoding was correct
-  xterm — the fix was to stop forwarding those keys to the shell and handle them
-  app-side. Shift+Arrow now extends a keyboard grid selection (word-wise with
-  Option), Option+Left/Right send readline word motion (ESC-b/ESC-f), Option+Up/Down
-  send a plain arrow, Cmd+Left/Up = line start (Ctrl-A), Cmd+Right/Down = line end
-  (Ctrl-E), Cmd+C copies, Cmd+V pastes. REMAINING: (1) the SAME keys in the editor
-  pane (editor has no selection yet — add selection/copy/cut/paste + word/line nav);
-  (2) Cmd+X cut (editor; terminal cut isn't well-defined); (3) Shift+Enter inserts a
-  newline without submitting and without triggering the busy dot (today it submits-
-  ish and optimistically busies); (4) bracketed-paste wrapping so multi-line paste
-  doesn't auto-execute.
+- Detail: DONE — terminal (785bf9a): Shift+Arrow grid selection (word with Option),
+  Option+Left/Right word motion (ESC-b/f), Cmd+Left/Right/Up/Down line motion, Cmd+C
+  copy, Cmd+V paste, Shift+Enter sends LF without a false busy dot (262af58). Editor
+  (f591f3d): Shift selection, Cmd+C/X/V, Cmd+arrow line/doc nav. REMAINING: (1)
+  bracketed-paste wrapping so a multi-line terminal paste doesn't auto-execute each
+  line; (2) Option+Arrow word motion IN the editor (currently char move).
 - Reason: expected editor behaviour; the muscle memory the user relies on.
 
 ---
