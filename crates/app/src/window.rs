@@ -43,6 +43,13 @@ const PALETTE_VISIBLE: usize = 10;
 /// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
 /// output wakes into at most one redraw per interval so input stays responsive.
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+/// Per-frame wall-clock budget for shaping cache-missed rows. Rows past it draw
+/// background-only for this frame and finish on following frames, so a fast
+/// scroll into fresh content never stalls a frame on a burst of shaping.
+const SHAPE_BUDGET: Duration = Duration::from_millis(5);
+/// Shape at least this many missed rows per frame regardless of the time budget,
+/// so a backlog always makes forward progress even on an already-slow frame.
+const MIN_SHAPES_PER_FRAME: usize = 8;
 /// Max child-output bytes drained per surface per frame. Bounds VT-parse work so
 /// one burst can't stall a frame; the remainder is pumped on following frames.
 const PUMP_BUDGET: usize = 512 * 1024;
@@ -2410,6 +2417,12 @@ impl State {
 
         self.row_cache.begin_frame(self.metrics_gen);
         let metrics = self.metrics();
+        // Bound shaping work per frame: cache hits are free, but cache misses
+        // (never-seen rows, e.g. a fast scroll into history) are shaped only
+        // while under budget. Overflow rows are deferred to later frames.
+        let shape_deadline = Instant::now() + SHAPE_BUDGET;
+        let mut shaped = 0usize;
+        let mut deferred = false;
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut overlay_quads: Vec<QuadInstance> = Vec::new();
         let mut row_placements: Vec<RowPlacement> = Vec::new();
@@ -2541,13 +2554,17 @@ impl State {
                     let key = self
                         .row_cache
                         .row_key(std::iter::once((line.as_str(), EDITOR_FG)));
-                    let spans = if self.row_cache.buffer(key).is_some() {
-                        Vec::new()
+                    if self.row_cache.buffer(key).is_some() {
+                        self.row_cache
+                            .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
+                    } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
+                        let spans = vec![(line.clone(), EDITOR_FG)];
+                        self.row_cache
+                            .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
+                        shaped += 1;
                     } else {
-                        vec![(line.clone(), EDITOR_FG)]
-                    };
-                    self.row_cache
-                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
+                        deferred = true;
+                    }
                     row_placements.push(RowPlacement {
                         key,
                         left: term.x,
@@ -2649,19 +2666,20 @@ impl State {
                         None => ("", grid.default_fg),
                     }
                 }));
-                let spans = if self.row_cache.buffer(key).is_some() {
-                    Vec::new()
+                if self.row_cache.buffer(key).is_some() {
+                    // Cache hit: no shaping, just refresh recency.
+                    self.row_cache
+                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
+                } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
+                    let spans = row_spans(grid, row);
+                    self.row_cache
+                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
+                    shaped += 1;
                 } else {
-                    row_spans(grid, row)
-                };
-                self.row_cache.ensure(
-                    key,
-                    &mut self.font_system,
-                    metrics,
-                    term.w,
-                    self.cell_h,
-                    &spans,
-                );
+                    // Over budget: leave this row unshaped (it draws background
+                    // only via the bg quads above) and finish it a frame later.
+                    deferred = true;
+                }
                 row_placements.push(RowPlacement {
                     key,
                     left: term.x,
@@ -2933,7 +2951,12 @@ impl State {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         self.atlas.trim();
-        self.dirty = false;
+        // Rows left unshaped by this frame's budget need another frame to finish;
+        // keep the surface dirty and paced so the shaping backlog drains.
+        self.dirty = deferred;
+        if deferred {
+            self.frame_pending = true;
+        }
         Ok(())
     }
 
