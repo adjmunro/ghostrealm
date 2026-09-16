@@ -54,6 +54,16 @@ const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
+/// Glyphs pre-rasterised into the atlas after a metrics change so the first
+/// scroll into fresh content doesn't stall rasterising them: printable ASCII
+/// plus the box-drawing/block set common in TUIs.
+const ATLAS_WARM_GLYPHS: &str = concat!(
+    " !\"#$%&'()*+,-./0123456789:;<=>?@",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`",
+    "abcdefghijklmnopqrstuvwxyz{|}~",
+    "─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬",
+    "█▀▄▌▐░▒▓▔▕■□▪▫●○◆◇•·…←↑→↓",
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -273,6 +283,11 @@ struct State {
     /// Bumped when font metrics change (scale/size); folded into row-cache keys so
     /// stale shaping never survives a metrics change.
     metrics_gen: u64,
+    /// Reusable buffer holding the common glyph set, shaped once per metrics
+    /// change to pre-warm the atlas (see [`ATLAS_WARM_GLYPHS`]).
+    warm_buffer: Buffer,
+    /// `metrics_gen` the atlas was last warmed for; `None` forces a warm pass.
+    atlas_warmed_gen: Option<u64>,
 
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
@@ -511,6 +526,12 @@ impl State {
         app.new_vtab().context("open initial tab")?;
         let registry = build_registry();
 
+        let warm_metrics = Metrics::new(
+            cfg.terminal.font_size * scale,
+            cfg.terminal.line_height * scale,
+        );
+        let warm_buffer = Buffer::new(&mut font_system, warm_metrics);
+
         let quad_pipeline = build_quad_pipeline(&device, format);
         let quad_capacity = 4096;
         let quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -536,6 +557,8 @@ impl State {
             grid_cache: HashMap::new(),
             surface_geom: HashMap::new(),
             metrics_gen: 0,
+            warm_buffer,
+            atlas_warmed_gen: None,
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
@@ -2705,6 +2728,41 @@ impl State {
             },
         );
 
+        // One-shot atlas warm after a metrics change: shape the common glyph set
+        // and hand it to `prepare` far off-screen (so it rasterises into the
+        // atlas but is clipped away by the GPU, never drawn). Unbounded text
+        // bounds keep `prepare` from culling the glyphs before they reach the
+        // atlas. Cheap: happens once per font-size/scale change, not per frame.
+        let warm_area = if self.atlas_warmed_gen != Some(self.metrics_gen) {
+            self.warm_buffer.set_metrics(metrics);
+            self.warm_buffer.set_size(Some(f32::MAX), Some(self.cell_h));
+            self.warm_buffer.set_rich_text(
+                std::iter::once((ATLAS_WARM_GLYPHS, attrs_for([220, 220, 230]))),
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            self.warm_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+            self.atlas_warmed_gen = Some(self.metrics_gen);
+            Some(TextArea {
+                buffer: &self.warm_buffer,
+                left: 0.0,
+                top: -1.0e6,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: i32::MIN,
+                    top: i32::MIN,
+                    right: i32::MAX,
+                    bottom: i32::MAX,
+                },
+                default_color: Color::rgb(220, 220, 230),
+                custom_glyphs: &[],
+            })
+        } else {
+            None
+        };
+
         let mut text_areas: Vec<TextArea> = row_placements
             .iter()
             .filter_map(|p| {
@@ -2737,6 +2795,7 @@ impl State {
             default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
             custom_glyphs: &[],
         }));
+        text_areas.extend(warm_area);
 
         self.text_renderer
             .prepare(
