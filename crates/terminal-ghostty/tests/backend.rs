@@ -328,3 +328,33 @@ fn encodes_basic_keys() {
          (map Char('c') -> Key::KeyC) rather than only unshifted_codepoint."
     );
 }
+
+#[test]
+fn fast_scroll_stress_does_not_panic() {
+    // Reproduce fast scrolling: build scrollback, then fire large + boundary
+    // scroll deltas in both directions, snapshotting between (as the UI does).
+    let mut term = GhosttyTerminal::spawn(80, 24, 8, 16, Some(sh(
+        "for i in $(seq 1 500); do echo line-$i; done; sleep 3",
+    )))
+    .expect("spawn");
+    // Let the child produce its scrollback.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        term.pump();
+        if row_text(&mut term, 23).contains("line-500") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let deltas = [-1, -3, -7, -30, -120, -1000, -100000, 3, 30, 1000, 100000, i32::MAX, i32::MIN];
+    for _ in 0..50 {
+        for d in deltas {
+            term.scroll(Scroll::Delta(d));
+            let _ = term.snapshot();
+        }
+        term.scroll(Scroll::Top);
+        let _ = term.snapshot();
+        term.scroll(Scroll::Bottom);
+        let _ = term.snapshot();
+    }
+}
