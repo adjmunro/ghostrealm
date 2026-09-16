@@ -2617,7 +2617,10 @@ impl State {
                 }
 
                 // Cheap content key (no span strings); shape only on a miss.
-                let key = self.row_cache.row_key((0..grid.size.cols).map(|col| {
+                // Keyed over the inked prefix only, so trailing blanks neither
+                // cost shaping nor split otherwise-identical rows in the cache.
+                let content_len = row_content_len(grid, row);
+                let key = self.row_cache.row_key((0..content_len).map(|col| {
                     match grid.cell(col, row) {
                         Some(c) => (c.text.as_str(), c.fg),
                         None => ("", grid.default_fg),
@@ -2923,7 +2926,9 @@ fn attrs_for<'a>(color: [u8; 3]) -> Attrs<'a> {
 /// Group a row's cells into (text, fg-colour) runs of consecutive same colour.
 fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
     let mut spans: Vec<(String, [u8; 3])> = Vec::new();
-    for col in 0..grid.size.cols {
+    // Stop at the last inked column: trailing blanks draw nothing in the text
+    // pass (their background is a separate quad), so shaping them is wasted work.
+    for col in 0..row_content_len(grid, row) {
         let (ch, fg) = match grid.cell(col, row) {
             Some(Cell { text, fg, .. }) if !text.is_empty() => (text.clone(), *fg),
             _ => (" ".to_string(), grid.default_fg),
@@ -2934,6 +2939,26 @@ fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
         }
     }
     spans
+}
+
+/// Columns up to and including the last cell with visible ink on `row`.
+///
+/// Trailing blank cells render nothing in the text pass (their background, if
+/// any, is drawn as a separate quad), so both the content key and the shaping
+/// can stop here. Besides shaping less, this lifts the cache hit rate: rows that
+/// differ only in how many trailing blanks they carry now share one shaped row.
+fn row_content_len(grid: &Grid, row: u16) -> u16 {
+    let mut len = 0u16;
+    for col in 0..grid.size.cols {
+        let inked = grid
+            .cell(col, row)
+            .map(|c| c.text.chars().any(|ch| !ch.is_whitespace()))
+            .unwrap_or(false);
+        if inked {
+            len = col + 1;
+        }
+    }
+    len
 }
 
 /// Whether point `(x, y)` lies inside `r` (half-open on the far edges).
