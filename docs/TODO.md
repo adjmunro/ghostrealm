@@ -331,3 +331,32 @@
   3. Hot-reload on EXTERNAL edits (a file watcher) — today only our editor's save
      triggers a reload. Also surface parse errors non-fatally (keep the old config).
 - Reason: the file is the settings UI; keep it discoverable and upgrade-safe.
+
+---
+
+[2026-09-16@8eae419]
+
+- Requires: NO BLOCKERS (but assess necessity first — see Reason)
+- Detail: Scroll-perf idea #4 — move terminal-row shaping AND glyphon `prepare`
+  off the UI thread onto a dedicated render thread, double-buffering the prepared
+  frame (build frame N+1's shaped rows + vertices while the GPU draws frame N,
+  then swap). Both `shape_until_scroll` and `TextRenderer::prepare` need
+  `&mut FontSystem`, so they must co-locate on one thread — don't split them, and
+  don't try per-thread FontSystems (a Buffer's cache keys are bound to the
+  FontSystem that shaped it). Real cost is that ALL text prep (sidebar, palette,
+  strip, editor, terminal) must migrate to that thread since FontSystem can live
+  in only one place, plus the swap/sync plumbing (double/triple-buffered vertex +
+  atlas buffers, fences). Keep swapchain acquire+present on the UI thread. This is
+  the convergence point for the other deferred perf ideas too: off-thread/parallel
+  shaping and a content-keyed, position-independent per-row GEOMETRY cache (idea
+  #8, which would extend partial-rerender wins to the editor, partial TUI updates,
+  AND scrolling). Treat #4 + #8 + parallel/custom-monospace-layout as one
+  "proper renderer" epic, not separate tasks.
+- Reason: Highest ceiling (UI frame never blocks on text work, complete frames
+  with no fill-in), but the biggest, riskiest change. FIRST re-measure after the
+  landed cheap wins (trailing-blank trim, ASCII Basic shaping, atlas pre-warm,
+  per-frame shaping budget — b474a25, 83ef4c5, 7dd6973, 8eae419): if scrolling is
+  already buttery and idle/typing/TUI/editor frames are cheap enough, #4 becomes
+  optional polish rather than a needed fix. Only invest if profiling shows
+  UI-thread shaping/prepare is still the bottleneck. Related IDEAS.md note: "Do
+  we re-render the whole screen when dirty? Or can we render only part of it?"
