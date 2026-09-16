@@ -324,6 +324,10 @@ struct State {
     sidebar_scroll: f32,
     /// Max sidebar scroll (content height beyond the visible area).
     sidebar_max_scroll: f32,
+    /// Sub-line remainder (physical px) carried between wheel/trackpad events so
+    /// slow scrolls accumulate instead of being rounded away, and no motion is
+    /// lost. The terminal viewport itself is still line-quantised.
+    scroll_accum: f32,
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Active terminal text selection, if any.
@@ -588,6 +592,7 @@ impl State {
             },
             sidebar_scroll: 0.0,
             sidebar_max_scroll: 0.0,
+            scroll_accum: 0.0,
             sidebar_rows: Vec::new(),
             selection: None,
             mouse_down: false,
@@ -1233,24 +1238,37 @@ impl State {
         if self.palette.is_some() {
             return;
         }
-        let lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => (y * SCROLL_LINES_PER_NOTCH).round() as i32,
-            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / self.cell_h).round() as i32,
+        // Normalise both event kinds to physical pixels. A line/notch wheel is
+        // worth SCROLL_LINES_PER_NOTCH cells; a trackpad reports pixels directly.
+        let px = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y * SCROLL_LINES_PER_NOTCH * self.cell_h,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32,
         };
-        if lines == 0 {
+        if px == 0.0 {
             return;
         }
-        // Over the sidebar, the wheel scrolls the workspace list, not the terminal.
+        // Over the sidebar, the wheel scrolls the workspace list, not the terminal
+        // — and pixel-precise, so it tracks the trackpad exactly.
         if self.in_sidebar(self.cursor.0) {
             let before = self.sidebar_scroll;
-            self.sidebar_scroll = (self.sidebar_scroll - lines as f32 * self.cell_h)
-                .clamp(0.0, self.sidebar_max_scroll);
+            self.sidebar_scroll = (self.sidebar_scroll - px).clamp(0.0, self.sidebar_max_scroll);
             if self.sidebar_scroll != before {
                 self.dirty = true;
                 self.frame_pending = true;
             }
             return;
         }
+        // Accumulate sub-line pixels and carry the remainder, so a slow drag isn't
+        // rounded to zero (the old behaviour: motion under half a cell vanished,
+        // which felt like a dead zone and a speed threshold) and momentum tails
+        // aren't dropped. The viewport moves by whole lines; the leftover fraction
+        // rides along to the next event.
+        self.scroll_accum += px;
+        let lines = (self.scroll_accum / self.cell_h).trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_accum -= lines as f32 * self.cell_h;
         // Wheel up (positive delta) reveals older history → negative viewport delta.
         let scroll = Scroll::Delta(-lines);
         let scrolled = match self.surface_under_cursor() {
