@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,9 @@ struct QuadInstance {
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
     PtyOutput,
+    /// The background font loader finished; the full system-font DB is waiting on
+    /// the channel and should be swapped in. Carries no data (the DB isn't `Copy`).
+    FontsLoaded,
 }
 
 pub fn run(command_line: Option<String>) -> Result<()> {
@@ -142,13 +146,18 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        // A terminal produced output. Let the waker send another wake now, and
-        // note that a frame is due; `about_to_wait` paces the actual redraw so a
-        // flood of output can't outrun input handling.
-        self.wake_pending.store(false, Ordering::Release);
-        if let Some(state) = &mut self.state {
-            state.frame_pending = true;
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        let Some(state) = &mut self.state else { return };
+        match event {
+            // A terminal produced output. Let the waker send another wake now, and
+            // note that a frame is due; `about_to_wait` paces the actual redraw so
+            // a flood of output can't outrun input handling.
+            UserEvent::PtyOutput => {
+                self.wake_pending.store(false, Ordering::Release);
+                state.frame_pending = true;
+            }
+            // The full font DB is ready: swap it in for complete glyph fallback.
+            UserEvent::FontsLoaded => state.upgrade_fonts(),
         }
     }
 
@@ -305,6 +314,15 @@ struct State {
     warm_buffer: Buffer,
     /// `metrics_gen` the atlas was last warmed for; `None` forces a warm pass.
     atlas_warmed_gen: Option<u64>,
+    /// Full system-font DB being loaded off-thread; taken and swapped in once the
+    /// `FontsLoaded` event arrives. `None` when booting on the full DB already, or
+    /// after the upgrade has happened.
+    pending_fonts: Option<Receiver<glyphon::cosmic_text::fontdb::Database>>,
+    /// Monospace family pinned at boot, re-applied to the full DB on upgrade so
+    /// normal text doesn't visibly change font when the swap happens.
+    mono_family: Option<String>,
+    /// Locale for font fallback ordering, reused when rebuilding the FontSystem.
+    font_locale: String,
 
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
@@ -506,7 +524,30 @@ impl State {
         surface.configure(&device, &config);
         let format = config.format;
 
-        let mut font_system = FontSystem::new();
+        // Fast boot: shape on a curated monospace-only DB loaded from disk, and
+        // pull in the full system-font DB (for emoji/CJK/rare-glyph fallback) on a
+        // background thread, swapping it in via `FontsLoaded`. Falls back to a
+        // synchronous full load if no monospace candidate is found on disk.
+        let locale = font_locale();
+        let (mut font_system, pending_fonts, mono_family) = match curated_font_db() {
+            Some((db, fam)) => {
+                let fs = FontSystem::new_with_locale_and_db(locale.clone(), db);
+                let (tx, rx) = mpsc::channel();
+                let bg_proxy = proxy.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("font-loader".into())
+                    .spawn(move || {
+                        let mut db = glyphon::cosmic_text::fontdb::Database::new();
+                        db.load_system_fonts();
+                        if tx.send(db).is_ok() {
+                            let _ = bg_proxy.send_event(UserEvent::FontsLoaded);
+                        }
+                    })
+                    .is_ok();
+                (fs, spawned.then_some(rx), Some(fam))
+            }
+            None => (FontSystem::new(), None, None),
+        };
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -580,6 +621,9 @@ impl State {
             metrics_gen: 0,
             warm_buffer,
             atlas_warmed_gen: None,
+            pending_fonts,
+            mono_family,
+            font_locale: locale,
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
@@ -714,6 +758,38 @@ impl State {
         // Metrics changed: existing shaping is stale.
         self.metrics_gen = self.metrics_gen.wrapping_add(1);
         self.dirty = true;
+    }
+
+    /// Swap the curated boot font DB for the full system DB once the background
+    /// loader delivers it, restoring complete glyph fallback (emoji, CJK, rare
+    /// symbols). Re-pins the same monospace family so normal text keeps its
+    /// appearance, then invalidates shaping and the warmed atlas so the next
+    /// frame reshapes against the fuller DB.
+    fn upgrade_fonts(&mut self) {
+        let Some(rx) = self.pending_fonts.take() else {
+            return;
+        };
+        let Ok(mut db) = rx.try_recv() else {
+            return;
+        };
+        if let Some(fam) = &self.mono_family {
+            db.set_monospace_family(fam.clone());
+        }
+        self.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
+        // Cell metrics should be unchanged (same pinned monospace); re-measure in
+        // case the fuller DB resolves the family to a different face.
+        let (cw, ch) = measure_cell(
+            &mut self.font_system,
+            self.scale,
+            self.cfg.terminal.font_size,
+            self.cfg.terminal.line_height,
+        );
+        self.cell_w = cw;
+        self.cell_h = ch;
+        self.metrics_gen = self.metrics_gen.wrapping_add(1);
+        self.atlas_warmed_gen = None;
+        self.dirty = true;
+        self.window.request_redraw();
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -3305,6 +3381,54 @@ fn srgb_to_linear(c: u8) -> f64 {
     }
 }
 
+/// Locale for cosmic-text font fallback, derived from `$LANG` (e.g.
+/// `en_US.UTF-8` → `en-US`), defaulting to `en-US`.
+fn font_locale() -> String {
+    std::env::var("LANG")
+        .ok()
+        .and_then(|l| l.split('.').next().map(|s| s.replace('_', "-")))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "en-US".to_string())
+}
+
+/// A minimal font DB holding just the system monospace (and a sans for chrome),
+/// loaded straight from known macOS paths so boot doesn't wait on the ~800ms
+/// full system-font scan. Returns the DB and the monospace family to pin, or
+/// `None` if no monospace candidate was found (caller falls back to a full load).
+fn curated_font_db() -> Option<(glyphon::cosmic_text::fontdb::Database, String)> {
+    use glyphon::cosmic_text::fontdb;
+    let mut db = fontdb::Database::new();
+    // Preference order: SF Mono (current macOS default), then long-standing
+    // fallbacks that are reliably present.
+    let mono_candidates = [
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/System/Library/Fonts/Courier.ttc",
+    ];
+    let mut mono_family = None;
+    for path in mono_candidates {
+        // The DB is empty until the first success, so the loaded face is first.
+        if db.load_font_file(path).is_ok() {
+            if let Some(face) = db.faces().next() {
+                if let Some((name, _)) = face.families.first() {
+                    mono_family = Some(name.clone());
+                    break;
+                }
+            }
+        }
+    }
+    let mono_family = mono_family?;
+    // A sans-serif for tab-strip titles; best-effort, ignored if absent.
+    for path in ["/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf"] {
+        if db.load_font_file(path).is_ok() {
+            break;
+        }
+    }
+    db.set_monospace_family(mono_family.clone());
+    Some((db, mono_family))
+}
+
 fn measure_cell(
     font_system: &mut FontSystem,
     scale: f32,
@@ -3547,6 +3671,14 @@ mod tests {
 
     const FONT_SIZE: f32 = 15.0;
     const LINE_HEIGHT: f32 = 18.0;
+
+    #[test]
+    fn curated_font_db_finds_a_monospace() {
+        // On macOS the curated fast-boot DB must resolve a monospace family from
+        // disk; otherwise boot silently falls back to the ~800ms full scan.
+        let (_, family) = super::curated_font_db().expect("a monospace candidate on macOS");
+        assert!(!family.is_empty(), "pinned monospace family must be named");
+    }
 
     #[test]
     fn full_screen_shaping_cost() {
