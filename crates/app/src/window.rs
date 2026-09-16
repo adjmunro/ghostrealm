@@ -59,6 +59,11 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+/// Max viewport lines advanced per frame while catching up to a pending scroll.
+/// Bounded so each frame reveals only as many fresh rows as shaping can finish
+/// within the frame budget — every frame stays coherent (no half-shaped, torn
+/// viewport) while a fast flick's momentum plays out smoothly over a few frames.
+const SCROLL_STEP: i32 = 8;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
@@ -361,6 +366,12 @@ struct State {
     /// slow scrolls accumulate instead of being rounded away, and no motion is
     /// lost. The terminal viewport itself is still line-quantised.
     scroll_accum: f32,
+    /// Whole viewport lines still to apply, metered out at `SCROLL_STEP`/frame so
+    /// the viewport never advances faster than shaping can keep up (sign matches
+    /// `Scroll::Delta`: negative reveals older history).
+    pending_scroll: i32,
+    /// Surface the pending scroll applies to; retargeting drops any leftover.
+    pending_scroll_target: Option<SurfaceId>,
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Active terminal text selection, if any.
@@ -653,6 +664,8 @@ impl State {
             sidebar_scroll: 0.0,
             sidebar_max_scroll: 0.0,
             scroll_accum: 0.0,
+            pending_scroll: 0,
+            pending_scroll_target: None,
             sidebar_rows: Vec::new(),
             selection: None,
             mouse_down: false,
@@ -1388,25 +1401,59 @@ impl State {
             return;
         }
         self.scroll_accum -= lines as f32 * self.cell_h;
-        // Wheel up (positive delta) reveals older history → negative viewport delta.
-        let scroll = Scroll::Delta(-lines);
-        let scrolled = match self.surface_under_cursor() {
-            Some(sid) => match self.app.terminal(sid) {
-                Some(t) => {
-                    t.scroll(scroll);
-                    true
-                }
-                None => false,
-            },
-            None => self.app.scroll_focused(scroll),
+        // Don't drive the viewport straight to the target: queue the motion and
+        // meter it out at SCROLL_STEP lines/frame (see `apply_pending_scroll`), so
+        // each frame reveals only what shaping can finish — smooth, coherent, and
+        // untorn even on a hard flick. Wheel up (positive delta) reveals older
+        // history → negative viewport delta.
+        let Some(target) = self.surface_under_cursor().or_else(|| self.app.focused_surface())
+        else {
+            return;
         };
-        if scrolled {
-            // The selection is viewport-relative; scrolling invalidates it.
-            self.selection = None;
-            self.dirty = true;
-            // Pace the redraw through the frame clock (coalesces wheel bursts).
+        if self.pending_scroll_target != Some(target) {
+            // New target: abandon any leftover momentum aimed at the old surface.
+            self.pending_scroll = 0;
+            self.pending_scroll_target = Some(target);
+        }
+        self.pending_scroll = self.pending_scroll.saturating_add(-lines);
+        // The selection is viewport-relative; scrolling invalidates it.
+        self.selection = None;
+        self.dirty = true;
+        // Pace the redraw through the frame clock (coalesces wheel bursts).
+        self.frame_pending = true;
+    }
+
+    /// Advance the viewport toward a queued scroll by at most `SCROLL_STEP` lines,
+    /// so a fast flick's momentum plays out over several coherent frames instead of
+    /// snapping the viewport somewhere shaping can't fill in one frame. Returns
+    /// whether a step was applied (the caller then treats the frame as dirty).
+    fn apply_pending_scroll(&mut self) -> bool {
+        if self.pending_scroll == 0 {
+            return false;
+        }
+        let Some(sid) = self.pending_scroll_target else {
+            self.pending_scroll = 0;
+            return false;
+        };
+        let step = self.pending_scroll.clamp(-SCROLL_STEP, SCROLL_STEP);
+        let applied = match self.app.terminal(sid) {
+            Some(t) => {
+                t.scroll(Scroll::Delta(step));
+                true
+            }
+            // Surface went away mid-catch-up: drop the remainder.
+            None => {
+                self.pending_scroll = 0;
+                self.pending_scroll_target = None;
+                return false;
+            }
+        };
+        self.pending_scroll -= step;
+        if self.pending_scroll != 0 {
+            // More to go: keep the frame clock ticking so we step again next frame.
             self.frame_pending = true;
         }
+        applied
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -2501,6 +2548,10 @@ impl State {
         }
         self.frame_pending = more;
         self.next_frame = Instant::now() + FRAME_INTERVAL;
+        // Meter out any queued scroll one bounded step, before deciding to render.
+        if self.apply_pending_scroll() {
+            self.dirty = true;
+        }
         // Advance the auto-read dwell; a status change needs a redraw.
         if self.app.tick_inbox() {
             self.dirty = true;
