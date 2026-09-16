@@ -323,6 +323,11 @@ struct State {
     mono_family: Option<String>,
     /// Locale for font fallback ordering, reused when rebuilding the FontSystem.
     font_locale: String,
+    /// Row content key drawn at each screen position `(left, top)` last frame.
+    /// When this frame's shaping budget defers a row, we redraw its previous
+    /// (now slightly stale) content instead of a blank gap, until the new row is
+    /// shaped a frame or two later. Rebuilt every frame.
+    prev_rows: HashMap<(i32, i32), u64>,
 
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
@@ -624,6 +629,7 @@ impl State {
             pending_fonts,
             mono_family,
             font_locale: locale,
+            prev_rows: HashMap::new(),
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
@@ -790,6 +796,33 @@ impl State {
         self.atlas_warmed_gen = None;
         self.dirty = true;
         self.window.request_redraw();
+    }
+
+    /// The row key to draw at screen position `pos` when this frame's own content
+    /// there was deferred by the shaping budget: reuse the previous frame's key if
+    /// its shaping is still cached (touching it to keep it warm), else fall back to
+    /// `fallback` — whose buffer is absent, so the row draws blank. The fallback
+    /// only bites on the first-ever reveal of a position, where there is no prior
+    /// content to hold. Takes fields explicitly (not `&mut self`) so it can be
+    /// called while a `grid` snapshot is borrowed elsewhere in the frame.
+    #[allow(clippy::too_many_arguments)]
+    fn stale_key(
+        prev_rows: &HashMap<(i32, i32), u64>,
+        row_cache: &mut RowCache,
+        font_system: &mut FontSystem,
+        pos: (i32, i32),
+        fallback: u64,
+        metrics: Metrics,
+        width: f32,
+        cell_h: f32,
+    ) -> u64 {
+        match prev_rows.get(&pos).copied() {
+            Some(prev) if row_cache.buffer(prev).is_some() => {
+                row_cache.ensure(prev, font_system, metrics, width, cell_h, &[]);
+                prev
+            }
+            _ => fallback,
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -2527,6 +2560,9 @@ impl State {
         let shape_deadline = Instant::now() + SHAPE_BUDGET;
         let mut shaped = 0usize;
         let mut deferred = false;
+        // Row content key drawn at each screen position this frame, so a deferred
+        // row can fall back to its previous content instead of a blank gap.
+        let mut cur_rows: HashMap<(i32, i32), u64> = HashMap::new();
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut overlay_quads: Vec<QuadInstance> = Vec::new();
         let mut row_placements: Vec<RowPlacement> = Vec::new();
@@ -2658,21 +2694,35 @@ impl State {
                     let key = self
                         .row_cache
                         .row_key(std::iter::once((line.as_str(), EDITOR_FG)));
-                    if self.row_cache.buffer(key).is_some() {
+                    let top = term.y + i as f32 * self.cell_h;
+                    let place_key = if self.row_cache.buffer(key).is_some() {
                         self.row_cache
                             .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
+                        key
                     } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
                         let spans = vec![(line.clone(), EDITOR_FG)];
                         self.row_cache
                             .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
                         shaped += 1;
+                        key
                     } else {
                         deferred = true;
-                    }
+                        Self::stale_key(
+                            &self.prev_rows,
+                            &mut self.row_cache,
+                            &mut self.font_system,
+                            (term.x as i32, top as i32),
+                            key,
+                            metrics,
+                            term.w,
+                            self.cell_h,
+                        )
+                    };
+                    cur_rows.insert((term.x as i32, top as i32), place_key);
                     row_placements.push(RowPlacement {
-                        key,
+                        key: place_key,
                         left: term.x,
-                        top: term.y + i as f32 * self.cell_h,
+                        top,
                         bounds: TextBounds {
                             left: term.x as i32,
                             top: term.y as i32,
@@ -2770,24 +2820,39 @@ impl State {
                         None => ("", grid.default_fg),
                     }
                 }));
-                if self.row_cache.buffer(key).is_some() {
+                let top = term.y + row as f32 * self.cell_h;
+                let place_key = if self.row_cache.buffer(key).is_some() {
                     // Cache hit: no shaping, just refresh recency.
                     self.row_cache
                         .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
+                    key
                 } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
                     let spans = row_spans(grid, row);
                     self.row_cache
                         .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
                     shaped += 1;
+                    key
                 } else {
-                    // Over budget: leave this row unshaped (it draws background
-                    // only via the bg quads above) and finish it a frame later.
+                    // Over budget: finish this row a frame later. Meanwhile redraw
+                    // the previous (stale) content at this position if it's still
+                    // cached, rather than a blank gap.
                     deferred = true;
-                }
+                    Self::stale_key(
+                        &self.prev_rows,
+                        &mut self.row_cache,
+                        &mut self.font_system,
+                        (term.x as i32, top as i32),
+                        key,
+                        metrics,
+                        term.w,
+                        self.cell_h,
+                    )
+                };
+                cur_rows.insert((term.x as i32, top as i32), place_key);
                 row_placements.push(RowPlacement {
-                    key,
+                    key: place_key,
                     left: term.x,
-                    top: term.y + row as f32 * self.cell_h,
+                    top,
                     bounds: TextBounds {
                         left: term.x as i32,
                         top: term.y as i32,
@@ -2821,6 +2886,9 @@ impl State {
                 push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);
             }
         }
+        // Remember what each position drew, so next frame's deferred rows can fall
+        // back to it instead of a blank gap.
+        self.prev_rows = cur_rows;
 
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
