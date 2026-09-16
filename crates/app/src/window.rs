@@ -176,10 +176,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Snappy quit: hide the window for instant visual feedback, then
+                // exit the process outright. Graceful teardown (joining VT-worker
+                // threads, wgpu/Metal device drop) is synchronous and can stall
+                // for seconds — sometimes long enough that macOS marks the app
+                // unresponsive. Exiting lets the OS reclaim threads and fds; the
+                // closing PTY masters SIGHUP the child shells, exactly as closing
+                // any terminal does. Nothing here needs flushing on quit.
+                state.window.set_visible(false);
+                std::process::exit(0);
+            }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
                 state.window.request_redraw();
