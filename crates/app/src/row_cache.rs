@@ -133,6 +133,16 @@ impl RowCache {
         let slot = &mut self.slab[idx];
         slot.key = key;
         slot.used = now;
+        // ASCII-only rows need no complex-script shaping: Basic skips rustybuzz
+        // and is markedly cheaper for the common monospace line. Anything
+        // non-ASCII (emoji, combining marks, wide/CJK, RTL) falls back to
+        // Advanced for correctness. The choice is a deterministic function of
+        // the row's content, so it never needs to enter the cache key.
+        let shaping = if spans.iter().all(|(t, _)| t.is_ascii()) {
+            Shaping::Basic
+        } else {
+            Shaping::Advanced
+        };
         let buf = &mut slot.buf;
         buf.set_metrics(metrics);
         buf.set_wrap(Wrap::None);
@@ -147,7 +157,7 @@ impl RowCache {
                 )
             }),
             &Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
+            shaping,
             None,
         );
         buf.shape_until_scroll(font_system, false);
