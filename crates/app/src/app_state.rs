@@ -19,6 +19,9 @@ use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
 use crate::editor::EditorBuffer;
 
+/// Name of the dedicated workspace the settings file opens in (shown italic).
+pub const SETTINGS_VTAB_NAME: &str = "settings";
+
 /// After Enter, a vtab is shown busy for at least this long even if the shell's
 /// foreground process group hasn't moved yet — the command may not have forked
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
@@ -228,6 +231,51 @@ impl AppState {
         if let Some(surf) = self.tree.add_surface(vt, pane) {
             self.tree.set_surface_title(surf, buffer.title(), true);
             self.editors.insert(surf, buffer);
+        }
+    }
+
+    /// Create a new workspace whose sole surface is an editor (no shell spawned),
+    /// named `name` (pinned). Returns the new vtab id.
+    pub fn new_editor_vtab(&mut self, name: impl Into<String>, buffer: EditorBuffer) -> VtabId {
+        let (vt, _pane, surf) = self.tree.add_vtab(name);
+        if let Some(v) = self.tree.vtab_mut(vt) {
+            v.user_named = true;
+        }
+        self.tree.set_surface_title(surf, buffer.title(), true);
+        self.editors.insert(surf, buffer);
+        vt
+    }
+
+    /// Open the settings file in a dedicated "settings" workspace: focus the
+    /// existing one (opening the editor there if it was closed), or create it.
+    pub fn open_settings(&mut self, path: std::path::PathBuf) {
+        let existing = self
+            .tree
+            .vtabs()
+            .iter()
+            .find(|v| v.name == SETTINGS_VTAB_NAME)
+            .map(|v| v.id);
+        match existing {
+            Some(vt) => {
+                self.focus_vtab(vt);
+                let has_editor = self
+                    .tree
+                    .vtab(vt)
+                    .map(|v| {
+                        v.panes()
+                            .into_iter()
+                            .flat_map(|p| p.surfaces.iter())
+                            .any(|s| self.editors.contains_key(&s.id))
+                    })
+                    .unwrap_or(false);
+                if !has_editor {
+                    self.open_editor_in_focused(EditorBuffer::open(path));
+                }
+            }
+            None => {
+                let vt = self.new_editor_vtab(SETTINGS_VTAB_NAME, EditorBuffer::open(path));
+                self.focus_vtab(vt);
+            }
         }
     }
 

@@ -18,8 +18,8 @@ use ghostrealm_core::{
 };
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -29,7 +29,7 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState};
-use crate::editor::{EditorBuffer, Motion};
+use crate::editor::Motion;
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
 
@@ -797,7 +797,8 @@ impl State {
             // Ensure it exists, seeded with the full keybindings block.
             let _ =
                 ghostrealm_core::config::load_or_create_with(&keybindable_commands(&self.registry));
-            self.app.open_editor_in_focused(EditorBuffer::open(path));
+            // Settings live in their own "settings" workspace, not the focused pane.
+            self.app.open_settings(path);
             self.dirty = true;
         }
     }
@@ -1829,12 +1830,19 @@ impl State {
             }
             let close_w = self.cell_h;
             let close_x = bar_x + bar_w - close_w - pad;
+            // The settings workspace shows its name in italics.
+            let mut name_attrs = Attrs::new()
+                .family(Family::SansSerif)
+                .color(Color::rgb(220, 220, 230));
+            if name == crate::app_state::SETTINGS_VTAB_NAME {
+                name_attrs = name_attrs.style(Style::Italic);
+            }
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
             // Leave room on the right for the close button.
             buf.set_size(Some((close_x - text_x).max(1.0)), Some(self.cell_h));
             buf.set_rich_text(
-                std::iter::once((name.as_str(), attrs_for([220, 220, 230]))),
+                std::iter::once((name.as_str(), name_attrs)),
                 &Attrs::new().family(Family::SansSerif),
                 Shaping::Advanced,
                 None,
