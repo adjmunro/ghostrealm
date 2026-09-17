@@ -11,7 +11,7 @@ pub mod ghostty;
 pub mod registry;
 pub mod tree;
 
-pub use config::{Chrome, Config, Inbox, Side};
+pub use config::{Chrome, Config, Inbox, LineNumbers, Side};
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};

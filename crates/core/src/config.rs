@@ -127,6 +127,39 @@ impl Default for Tabs {
     }
 }
 
+/// Line-number gutter mode for the text editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LineNumbers {
+    /// No gutter.
+    Off,
+    /// Every line shows its absolute number.
+    #[default]
+    Absolute,
+    /// Distance from the cursor's line; the cursor's own line shows its absolute
+    /// number (not 0).
+    Relative,
+}
+
+/// `[editor]`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Editor {
+    /// Line-number gutter mode.
+    pub line_numbers: LineNumbers,
+    /// Highlight the line the cursor is on.
+    pub cursor_line: bool,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Editor {
+            line_numbers: LineNumbers::Absolute,
+            cursor_line: true,
+        }
+    }
+}
+
 /// The whole config.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -141,6 +174,7 @@ pub struct Config {
     /// [`resolved_chrome`](Config::resolved_chrome).
     pub chrome: Option<Chrome>,
     pub tabs: Tabs,
+    pub editor: Editor,
     pub input: Input,
     pub inbox: Inbox,
     /// `[keybindings]`: chord -> command id, overlaying the built-in defaults.
@@ -292,6 +326,10 @@ line_height = 18.0  # number, points, > 0 (default 18.0)   — row height (>= fo
 
 [tabs]
 autohide_single_tab = true  # bool (default true) — hide a pane's tab strip when it has one terminal
+
+[editor]
+line_numbers = "absolute"  # "off" | "absolute" | "relative" (default absolute) — gutter line numbers; relative shows the absolute number on the cursor line
+cursor_line = true         # bool (default true) — highlight the line the cursor is on
 
 [input]
 focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it

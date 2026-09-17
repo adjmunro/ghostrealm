@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Chrome, Config, PaneId, Rect, Registry, Side, SurfaceId, TabStatus,
-    Value, VtabId,
+    ArgKind, ArgSpec, Args, Chrome, Config, LineNumbers, PaneId, Rect, Registry, Side, SurfaceId,
+    TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
@@ -76,6 +76,12 @@ const MAX_PENDING_SCROLL: i32 = 600;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
+/// Editor line-number gutter: dim, brighter on the cursor's line.
+const EDITOR_GUTTER: [u8; 3] = [110, 110, 125];
+const EDITOR_GUTTER_CUR: [u8; 3] = [190, 190, 205];
+/// Active-line highlight fill behind the cursor row.
+const EDITOR_CURSOR_LINE: [u8; 3] = [255, 255, 255];
+const EDITOR_CURSOR_LINE_ALPHA: f32 = 0.05;
 /// Close-button ('×') glyph colour — dim so it reads as a secondary affordance,
 /// brighter under the cursor.
 const CLOSE_GLYPH: [u8; 3] = [140, 140, 155];
@@ -1358,8 +1364,19 @@ impl State {
         None
     }
 
+    /// Width (physical px) of the editor's line-number gutter for a buffer of
+    /// `total_lines` lines. Zero when line numbers are off.
+    fn editor_gutter_w(&self, total_lines: usize) -> f32 {
+        if self.cfg.editor.line_numbers == LineNumbers::Off {
+            return 0.0;
+        }
+        let digits = ((total_lines.max(1) as f64).log10().floor() as usize + 1).max(2);
+        // one column of left pad + the number + one column of right pad.
+        (digits as f32 + 2.0) * self.cell_w
+    }
+
     /// The editor `(surface, row, col)` at point `(x, y)`, or `None` if the point
-    /// isn't in an editor body (accounts for scroll and the tab strip).
+    /// isn't in an editor body (accounts for scroll, the tab strip, and gutter).
     fn editor_pos_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, usize)> {
         if self.in_sidebar(x) {
             return None;
@@ -1383,8 +1400,9 @@ impl State {
             if y < body_y {
                 return None; // in the tab strip
             }
+            let body_x = r.x + self.editor_gutter_w(e.lines.len());
             let row_off = ((y - body_y) / self.cell_h).floor().max(0.0) as usize;
-            let col_off = ((x - r.x) / self.cell_w).round().max(0.0) as usize;
+            let col_off = ((x - body_x) / self.cell_w).round().max(0.0) as usize;
             let row = (e.scroll + row_off).min(e.lines.len().saturating_sub(1));
             let col = col_off.min(e.line_len(row));
             return Some((sid, row, col));
@@ -3109,23 +3127,43 @@ impl State {
                     e.clamp_scroll(rows_vis);
                 }
                 #[allow(clippy::type_complexity)]
-                let (scroll, cursor, sel, visible): (
+                let (scroll, cursor, sel, total_lines, visible): (
                     usize,
                     (usize, usize),
                     Option<((usize, usize), (usize, usize))>,
+                    usize,
                     Vec<String>,
                 ) = match self.app.editor(sid) {
                     Some(e) => (
                         e.scroll,
                         e.cursor,
                         e.selection(),
+                        e.lines.len(),
                         (0..rows_vis)
                             .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
                             .collect(),
                     ),
                     None => continue,
                 };
+                let gutter_w = self.editor_gutter_w(total_lines);
+                let body_x = term.x + gutter_w;
+                let body_w = (term.w - gutter_w).max(1.0);
                 bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
+                // Active-line highlight behind the cursor's row.
+                if self.cfg.editor.cursor_line && cursor.0 >= scroll && cursor.0 < scroll + rows_vis {
+                    bg_quads.push(rect_quad(
+                        Rect {
+                            x: term.x,
+                            y: term.y + (cursor.0 - scroll) as f32 * self.cell_h,
+                            w: term.w,
+                            h: self.cell_h,
+                        },
+                        sw,
+                        sh,
+                        EDITOR_CURSOR_LINE,
+                        EDITOR_CURSOR_LINE_ALPHA,
+                    ));
+                }
                 // Selection highlight (behind text).
                 if let Some(((sr, sc), (er, ec))) = sel {
                     for (i, line) in visible.iter().enumerate() {
@@ -3141,7 +3179,7 @@ impl State {
                         }
                         bg_quads.push(rect_quad(
                             Rect {
-                                x: term.x + first as f32 * self.cell_w,
+                                x: body_x + first as f32 * self.cell_w,
                                 y: term.y + i as f32 * self.cell_h,
                                 w: (last - first) as f32 * self.cell_w,
                                 h: self.cell_h,
@@ -3153,19 +3191,72 @@ impl State {
                         ));
                     }
                 }
+                // Line-number gutter (right-aligned in its column).
+                if gutter_w > 0.0 {
+                    for i in 0..visible.len() {
+                        let row = scroll + i;
+                        if row >= total_lines {
+                            break; // don't number past the last line
+                        }
+                        let is_cur = row == cursor.0;
+                        let num = match self.cfg.editor.line_numbers {
+                            LineNumbers::Relative if !is_cur => {
+                                (cursor.0 as isize - row as isize).unsigned_abs()
+                            }
+                            _ => row + 1, // absolute (and the cursor line in relative mode)
+                        };
+                        let s = num.to_string();
+                        let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
+                        let key = self.row_cache.row_key(std::iter::once((s.as_str(), color)));
+                        if self.row_cache.buffer(key).is_some() {
+                            self.row_cache.ensure(
+                                key,
+                                &mut self.font_system,
+                                metrics,
+                                gutter_w,
+                                self.cell_h,
+                                &[],
+                            );
+                        } else {
+                            let spans = vec![(s.clone(), color)];
+                            self.row_cache.ensure(
+                                key,
+                                &mut self.font_system,
+                                metrics,
+                                gutter_w,
+                                self.cell_h,
+                                &spans,
+                            );
+                        }
+                        let num_w = s.chars().count() as f32 * self.cell_w;
+                        row_placements.push(RowPlacement {
+                            key,
+                            left: body_x - self.cell_w - num_w, // one column of right pad
+                            top: term.y + i as f32 * self.cell_h,
+                            bounds: TextBounds {
+                                left: term.x as i32,
+                                top: term.y as i32,
+                                right: body_x as i32,
+                                bottom: (term.y + term.h) as i32,
+                            },
+                            color,
+                        });
+                    }
+                }
                 for (i, line) in visible.iter().enumerate() {
                     let key = self
                         .row_cache
                         .row_key(std::iter::once((line.as_str(), EDITOR_FG)));
                     let top = term.y + i as f32 * self.cell_h;
+                    let pos = (body_x as i32, top as i32);
                     let place_key = if self.row_cache.buffer(key).is_some() {
                         self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
+                            .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &[]);
                         key
                     } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
                         let spans = vec![(line.clone(), EDITOR_FG)];
                         self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
+                            .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &spans);
                         shaped += 1;
                         key
                     } else {
@@ -3174,20 +3265,20 @@ impl State {
                             &self.prev_rows,
                             &mut self.row_cache,
                             &mut self.font_system,
-                            (term.x as i32, top as i32),
+                            pos,
                             key,
                             metrics,
-                            term.w,
+                            body_w,
                             self.cell_h,
                         )
                     };
-                    cur_rows.insert((term.x as i32, top as i32), place_key);
+                    cur_rows.insert(pos, place_key);
                     row_placements.push(RowPlacement {
                         key: place_key,
-                        left: term.x,
+                        left: body_x,
                         top,
                         bounds: TextBounds {
-                            left: term.x as i32,
+                            left: body_x as i32,
                             top: term.y as i32,
                             right: (term.x + term.w) as i32,
                             bottom: (term.y + term.h) as i32,
@@ -3199,7 +3290,7 @@ impl State {
                 if cursor.0 >= scroll && cursor.0 < scroll + rows_vis {
                     overlay_quads.push(rect_quad(
                         Rect {
-                            x: term.x + cursor.1 as f32 * self.cell_w,
+                            x: body_x + cursor.1 as f32 * self.cell_w,
                             y: term.y + (cursor.0 - scroll) as f32 * self.cell_h,
                             w: 2.0 * self.scale,
                             h: self.cell_h,
