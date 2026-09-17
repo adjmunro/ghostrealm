@@ -360,3 +360,30 @@
   optional polish rather than a needed fix. Only invest if profiling shows
   UI-thread shaping/prepare is still the bottleneck. Related IDEAS.md note: "Do
   we re-render the whole screen when dirty? Or can we render only part of it?"
+
+---
+
+[2026-09-17@584a284]
+
+- Requires: NO BLOCKERS
+- Detail: Harden config loading against malformed/unexpected input. Today a parse
+  error falls back to Config::default() (non-fatal, good), but audit for: values
+  out of documented range (clamp rather than accept/crash), enum/string fields
+  with bad variants, negative/zero sizes, huge numbers, non-UTF8, partial tables,
+  and the authoritative [keybindings] block (bad chords, unknown command ids,
+  duplicate chords). Prefer clamp-and-warn over reject-whole-file where sensible.
+- Reason: the config is user-edited (and hot-reloaded); a bad edit should never
+  crash the app or silently wipe settings.
+
+---
+
+[2026-09-18@584a284]
+
+- Requires: NO BLOCKERS
+- Detail: Config colours should accept flexible inputs — hex ("#rrggbb",
+  "#rrggbbaa", short "#rgb") and rgb()/rgba() — and carry an alpha channel, so the
+  window/panes can be made semi-translucent. Needs: a colour parser + serde
+  for the config colour fields, threading alpha through Chrome/rect_quad (already
+  takes an alpha arg) and the wgpu surface (transparent framebuffer + composited
+  window; on macOS set the window/layer opaque=false and clear with alpha).
+- Reason: nicer theming and a translucent-terminal aesthetic.
