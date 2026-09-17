@@ -213,7 +213,8 @@ impl Config {
 /// Built-in chord -> command id defaults (canonical chord form).
 fn default_bindings() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        ("cmd+k", "palette.toggle"),
+        // The command palette opens on a double-tap of Shift (Run mode: double
+        // Ctrl); it needs no chord default. Bind "palette.toggle" in config to add one.
         ("cmd+t", "surface.new"),
         ("cmd+w", "pane.close"),
         ("cmd+d", "split.leftright"),
@@ -437,7 +438,8 @@ mod tests {
         let mut cfg = Config::default();
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
         assert_eq!(cfg.binding("cmd+n").as_deref(), Some("tab.new"));
-        assert_eq!(cfg.binding("cmd+k").as_deref(), Some("palette.toggle"));
+        // cmd+k is no longer a default (the palette opens on double-Shift).
+        assert_eq!(cfg.binding("cmd+k"), None);
         assert_eq!(cfg.binding("cmd+j"), None);
         // A user override wins, in any modifier order/alias.
         cfg.keybindings
