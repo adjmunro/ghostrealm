@@ -1396,9 +1396,15 @@ impl State {
             } else {
                 0.0
             };
-            let body_y = r.y + strip_h;
+            // A single-tab editor has a filename ribbon in place of the strip.
+            let ribbon_h = if strip_h == 0.0 {
+                self.strip_height()
+            } else {
+                0.0
+            };
+            let body_y = r.y + strip_h + ribbon_h;
             if y < body_y {
-                return None; // in the tab strip
+                return None; // in the tab strip / ribbon
             }
             let body_x = r.x + self.editor_gutter_w(e.lines.len());
             let row_off = ((y - body_y) / self.cell_h).floor().max(0.0) as usize;
@@ -2941,21 +2947,34 @@ impl State {
         let workspace = self.workspace_rect();
         let panes = self.active_panes(workspace);
 
-        // Resolve each pane's tab-strip height and terminal (below-strip) rect.
-        let mut resolved: Vec<(PaneRender, f32, Rect)> = Vec::with_capacity(panes.len());
+        // Resolve each pane's tab-strip height, editor ribbon height, and the body
+        // (below-chrome) rect. A single-tab editor shows a filename ribbon instead
+        // of a tab strip (multi-tab editors show the filename in their tab).
+        let mut resolved: Vec<(PaneRender, f32, f32, Rect)> = Vec::with_capacity(panes.len());
         for pr in panes {
             let strip_h = if self.strip_shown(pr.surfaces.len()) {
                 self.strip_height()
             } else {
                 0.0
             };
+            let active_is_editor = pr
+                .surfaces
+                .iter()
+                .find(|(_, _, a)| *a)
+                .is_some_and(|(s, _, _)| self.app.is_editor(*s));
+            let ribbon_h = if active_is_editor && strip_h == 0.0 {
+                self.strip_height()
+            } else {
+                0.0
+            };
+            let chrome_h = strip_h + ribbon_h;
             let term = Rect {
                 x: pr.rect.x,
-                y: pr.rect.y + strip_h,
+                y: pr.rect.y + chrome_h,
                 w: pr.rect.w,
-                h: (pr.rect.h - strip_h).max(1.0),
+                h: (pr.rect.h - chrome_h).max(1.0),
             };
-            resolved.push((pr, strip_h, term));
+            resolved.push((pr, strip_h, ribbon_h, term));
         }
 
         // Resize a pane's terminal only when its cell dimensions actually change;
@@ -2963,7 +2982,7 @@ impl State {
         // row cache is position-independent, so switching panes/vtabs or scrolling
         // never invalidates it.
         let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
-        for (pr, _, term) in &resolved {
+        for (pr, _, _, term) in &resolved {
             let Some(sid) = pr
                 .surfaces
                 .iter()
@@ -3015,7 +3034,7 @@ impl State {
         self.close_buffer
             .shape_until_scroll(&mut self.font_system, false);
 
-        for (pr, strip_h, term) in &resolved {
+        for (pr, strip_h, ribbon_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
                 let n = pr.surfaces.len().max(1);
@@ -3056,12 +3075,20 @@ impl State {
                         self.strip_buffers
                             .push(Buffer::new(&mut self.font_system, metrics));
                     }
+                    // Italic when the tab is an editor with unsaved edits.
+                    let unsaved = self.app.editor(*sid).is_some_and(|e| e.modified);
+                    let mut title_attrs = Attrs::new()
+                        .family(Family::SansSerif)
+                        .color(Color::rgb(220, 220, 230));
+                    if unsaved {
+                        title_attrs = title_attrs.style(Style::Italic);
+                    }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
                     // Leave room on the right for the close button.
                     buf.set_size(Some((close_x - (tab_x + pad)).max(1.0)), Some(self.cell_h));
                     buf.set_rich_text(
-                        std::iter::once((title.as_str(), attrs_for([220, 220, 230]))),
+                        std::iter::once((title.as_str(), title_attrs)),
                         &Attrs::new().family(Family::SansSerif),
                         Shaping::Advanced,
                         None,
@@ -3119,6 +3146,71 @@ impl State {
                 continue;
             };
             let sid = *active_sid;
+
+            // Editor filename ribbon (a single-tab editor's own line; multi-tab
+            // editors show their filename in the tab instead). Filename italic when
+            // there are unsaved edits, followed by dim size/line-count metrics.
+            if *ribbon_h > 0.0 {
+                let ry = pr.rect.y + *strip_h;
+                bg_quads.push(rect_quad(
+                    Rect {
+                        x: pr.rect.x,
+                        y: ry,
+                        w: pr.rect.w,
+                        h: *ribbon_h,
+                    },
+                    sw,
+                    sh,
+                    self.chrome.sidebar,
+                    1.0,
+                ));
+                let info = self.app.editor(sid).map(|e| {
+                    let bytes =
+                        e.lines.iter().map(|l| l.len()).sum::<usize>() + e.lines.len().saturating_sub(1);
+                    (e.title(), e.modified, bytes, e.lines.len())
+                });
+                if let Some((fname, modified, bytes, nlines)) = info {
+                    let pad = 8.0 * self.scale;
+                    if strip_idx >= self.strip_buffers.len() {
+                        self.strip_buffers
+                            .push(Buffer::new(&mut self.font_system, metrics));
+                    }
+                    let mut name_attrs = Attrs::new()
+                        .family(Family::SansSerif)
+                        .color(Color::rgb(220, 220, 230));
+                    if modified {
+                        name_attrs = name_attrs.style(Style::Italic);
+                    }
+                    let meta = format!("     {bytes} B   ·   {nlines} lines");
+                    let dim = Attrs::new()
+                        .family(Family::SansSerif)
+                        .color(Color::rgb(140, 140, 155));
+                    let buf = &mut self.strip_buffers[strip_idx];
+                    buf.set_metrics(metrics);
+                    buf.set_wrap(Wrap::None);
+                    buf.set_size(Some((pr.rect.w - pad * 2.0).max(1.0)), Some(self.cell_h));
+                    buf.set_rich_text(
+                        [(fname.as_str(), name_attrs), (meta.as_str(), dim)],
+                        &Attrs::new().family(Family::SansSerif),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    strip_placements.push(Placement {
+                        idx: strip_idx,
+                        left: pr.rect.x + pad,
+                        top: ry + (*ribbon_h - self.cell_h) * 0.5,
+                        bounds: TextBounds {
+                            left: pr.rect.x as i32,
+                            top: ry as i32,
+                            right: (pr.rect.x + pr.rect.w) as i32,
+                            bottom: (ry + *ribbon_h) as i32,
+                        },
+                        color: [220, 220, 230],
+                    });
+                    strip_idx += 1;
+                }
+            }
 
             // Editor surface: render its text buffer instead of a terminal grid.
             if self.app.is_editor(sid) {
