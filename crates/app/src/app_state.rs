@@ -303,13 +303,20 @@ impl AppState {
     }
 
     /// Save every editor with unsaved edits and a backing file (autosave on app
-    /// blur/quit). Pathless scratch buffers are left alone.
-    pub fn autosave_all_editors(&mut self) {
+    /// blur/quit). Pathless scratch buffers are left alone. Returns whether the
+    /// config file was among those saved (so the caller can hot-reload it).
+    pub fn autosave_all_editors(&mut self) -> bool {
+        let config_path = ghostrealm_core::config::config_path();
+        let mut saved_config = false;
         for e in self.editors.values_mut() {
             if e.modified && e.path.is_some() {
                 let _ = e.save();
+                if config_path.is_some() && e.path == config_path {
+                    saved_config = true;
+                }
             }
         }
+        saved_config
     }
 
     /// Whether the focused surface is an editor.
@@ -817,7 +824,9 @@ pub fn build_registry() -> Registry<AppState> {
             "the directory to pin",
         )),
         Box::new(|s: &mut AppState, a| {
-            s.set_active_root_dir(std::path::PathBuf::from(a.get_str("path")?));
+            if let Some(dir) = ghostrealm_core::config::expand_tilde(a.get_str("path")?) {
+                s.set_active_root_dir(dir);
+            }
             Ok(CmdOutcome::ok())
         }),
     );

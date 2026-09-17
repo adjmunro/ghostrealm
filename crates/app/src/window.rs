@@ -226,13 +226,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // unresponsive. Exiting lets the OS reclaim threads and fds; the
                 // closing PTY masters SIGHUP the child shells, exactly as closing
                 // any terminal does. Flush unsaved editors first (autosave).
-                state.app.autosave_all_editors();
+                let _ = state.app.autosave_all_editors();
                 state.window.set_visible(false);
                 std::process::exit(0);
             }
             WindowEvent::Focused(false) => {
-                // App lost focus: autosave editors (switching to another app).
-                state.app.autosave_all_editors();
+                // App lost focus: autosave editors (switching to another app), and
+                // hot-reload the config if it was one of them.
+                if state.app.autosave_all_editors() {
+                    state.reload_config();
+                }
             }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
@@ -1420,12 +1423,18 @@ impl State {
     }
 
     /// Save an editor surface if it has unsaved edits and a backing file (autosave
-    /// on focus loss). Terminals and pathless scratch buffers are ignored.
+    /// on focus loss). Terminals and pathless scratch buffers are ignored. Saving
+    /// the config file also hot-reloads it, like Cmd+S.
     fn autosave_editor(&mut self, sid: SurfaceId) {
-        if let Some(e) = self.app.editor_mut(sid) {
-            if e.modified && e.path.is_some() {
+        let saved = match self.app.editor_mut(sid) {
+            Some(e) if e.modified && e.path.is_some() => {
                 let _ = e.save();
+                e.path.clone()
             }
+            _ => None,
+        };
+        if saved.is_some() && saved == ghostrealm_core::config::config_path() {
+            self.reload_config();
         }
     }
 
@@ -1638,6 +1647,22 @@ impl State {
             return;
         }
         self.scroll_accum -= lines as f32 * self.cell_h;
+        // An editor under the cursor scrolls its own text buffer (by lines), not a
+        // VT viewport. Wheel up (positive lines) moves toward the top of the file.
+        let over = self.surface_under_cursor().or_else(|| self.app.focused_surface());
+        if let Some(sid) = over {
+            if self.app.is_editor(sid) {
+                if let Some(e) = self.app.editor_mut(sid) {
+                    let ns = (e.scroll as isize - lines as isize).max(0) as usize;
+                    if ns != e.scroll {
+                        e.scroll = ns;
+                        self.dirty = true;
+                        self.frame_pending = true;
+                    }
+                }
+                return;
+            }
+        }
         // Don't drive the viewport straight to the target: queue the motion and
         // meter it out at SCROLL_STEP lines/frame (see `apply_pending_scroll`), so
         // each frame reveals only what shaping can finish — smooth, coherent, and
@@ -1775,7 +1800,7 @@ impl State {
         let mut placements = Vec::new();
 
         // Pinned "+" new-workspace button at the very top.
-        let btn_y = pad;
+        let btn_y = 0.0; // flush against the top edge (no margin above the button)
         let btn = Rect {
             x: bar_x,
             y: btn_y,
@@ -1822,7 +1847,7 @@ impl State {
         // Scrollable workspace list below the pinned button. Rows are variable
         // height: an unnamed workspace shows just its (shortened) directory on one
         // line; a renamed one shows the name over a greyed directory on two lines.
-        let list_top = pad + row_h;
+        let list_top = btn_y + row_h;
         let visible_h = (sh - list_top).max(0.0);
         let vpad = 8.0 * self.scale;
         let close_w = self.cell_h;
@@ -3184,16 +3209,27 @@ impl State {
                     if modified {
                         name_attrs = name_attrs.style(Style::Italic);
                     }
-                    let meta = format!("     {bytes} B   ·   {nlines} lines");
+                    let meta = format!("{bytes} B   ·   {nlines} lines");
                     let dim = Attrs::new()
                         .family(Family::SansSerif)
                         .color(Color::rgb(140, 140, 155));
+                    let top = ry + (*ribbon_h - self.cell_h) * 0.5;
+                    let meta_w = meta.chars().count() as f32 * self.cell_w;
+                    let meta_left = pr.rect.x + pr.rect.w - pad - meta_w;
+                    // Filename, left-aligned.
+                    if strip_idx >= self.strip_buffers.len() {
+                        self.strip_buffers
+                            .push(Buffer::new(&mut self.font_system, metrics));
+                    }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
                     buf.set_wrap(Wrap::None);
-                    buf.set_size(Some((pr.rect.w - pad * 2.0).max(1.0)), Some(self.cell_h));
+                    buf.set_size(
+                        Some((meta_left - (pr.rect.x + pad)).max(1.0)),
+                        Some(self.cell_h),
+                    );
                     buf.set_rich_text(
-                        [(fname.as_str(), name_attrs), (meta.as_str(), dim)],
+                        std::iter::once((fname.as_str(), name_attrs)),
                         &Attrs::new().family(Family::SansSerif),
                         Shaping::Advanced,
                         None,
@@ -3202,14 +3238,43 @@ impl State {
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: pr.rect.x + pad,
-                        top: ry + (*ribbon_h - self.cell_h) * 0.5,
+                        top,
                         bounds: TextBounds {
                             left: pr.rect.x as i32,
+                            top: ry as i32,
+                            right: meta_left as i32,
+                            bottom: (ry + *ribbon_h) as i32,
+                        },
+                        color: [220, 220, 230],
+                    });
+                    strip_idx += 1;
+                    // Metrics, right-aligned.
+                    if strip_idx >= self.strip_buffers.len() {
+                        self.strip_buffers
+                            .push(Buffer::new(&mut self.font_system, metrics));
+                    }
+                    let buf = &mut self.strip_buffers[strip_idx];
+                    buf.set_metrics(metrics);
+                    buf.set_wrap(Wrap::None);
+                    buf.set_size(Some(meta_w + self.cell_w), Some(self.cell_h));
+                    buf.set_rich_text(
+                        std::iter::once((meta.as_str(), dim)),
+                        &Attrs::new().family(Family::SansSerif),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    strip_placements.push(Placement {
+                        idx: strip_idx,
+                        left: meta_left,
+                        top,
+                        bounds: TextBounds {
+                            left: meta_left as i32,
                             top: ry as i32,
                             right: (pr.rect.x + pr.rect.w) as i32,
                             bottom: (ry + *ribbon_h) as i32,
                         },
-                        color: [220, 220, 230],
+                        color: [140, 140, 155],
                     });
                     strip_idx += 1;
                 }
