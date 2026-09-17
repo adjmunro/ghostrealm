@@ -617,7 +617,10 @@ impl State {
         let palette_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
-        let cfg = ghostrealm_core::config::load_or_create();
+        // Build the registry first so a freshly created config can list every
+        // command in its `[keybindings]` block.
+        let registry = build_registry();
+        let cfg = ghostrealm_core::config::load_or_create_with(&keybindable_commands(&registry));
         let chrome = cfg.resolved_chrome();
         let double_tap_window = Duration::from_millis(cfg.input.double_tap_window_ms as u64);
         let (cell_w, cell_h) = measure_cell(
@@ -646,7 +649,6 @@ impl State {
         app.set_inbox_config(cfg.inbox);
         app.set_default_dir(cfg.default_dir());
         app.new_vtab().context("open initial tab")?;
-        let registry = build_registry();
 
         let warm_metrics = Metrics::new(
             cfg.terminal.font_size * scale,
@@ -771,7 +773,8 @@ impl State {
 
     /// Reload the config file from disk and apply it (config is the source of truth).
     fn reload_config(&mut self) {
-        let cfg = ghostrealm_core::config::load_or_create();
+        let cfg =
+            ghostrealm_core::config::load_or_create_with(&keybindable_commands(&self.registry));
         self.apply_config(cfg);
         self.window.request_redraw();
     }
@@ -780,7 +783,9 @@ impl State {
     /// Saving it (Cmd+S) hot-reloads the config.
     fn open_config_editor(&mut self) {
         if let Some(path) = ghostrealm_core::config::config_path() {
-            let _ = ghostrealm_core::config::load_or_create(); // ensure it exists
+            // Ensure it exists, seeded with the full keybindings block.
+            let _ =
+                ghostrealm_core::config::load_or_create_with(&keybindable_commands(&self.registry));
             self.app.open_editor_in_focused(EditorBuffer::open(path));
             self.dirty = true;
         }
@@ -3732,6 +3737,24 @@ fn srgb_to_linear(c: u8) -> f64 {
     }
 }
 
+/// UI actions that are keybindable but aren't registry commands (they act on
+/// window state, not `AppState`), so they must be listed for the config block
+/// alongside the registry's commands. Dispatched specially in [`State::on_key`].
+const SPECIAL_COMMANDS: &[(&str, &str)] = &[("palette.toggle", "Command Palette")];
+
+/// Every keybindable command as `(id, title)` — the non-hidden registry commands
+/// plus the special UI actions — used to seed the config's authoritative
+/// `[keybindings]` block so it always lists every available action.
+fn keybindable_commands(registry: &Registry<AppState>) -> Vec<(&'static str, &'static str)> {
+    let mut cmds: Vec<(&'static str, &'static str)> = registry
+        .metas()
+        .filter(|m| !m.hidden)
+        .map(|m| (m.id, m.title))
+        .collect();
+    cmds.extend_from_slice(SPECIAL_COMMANDS);
+    cmds
+}
+
 /// Locale for cosmic-text font fallback, derived from `$LANG` (e.g.
 /// `en_US.UTF-8` → `en-US`), defaulting to `en-US`.
 fn font_locale() -> String {
@@ -4029,6 +4052,24 @@ mod tests {
         // disk; otherwise boot silently falls back to the ~800ms full scan.
         let (_, family) = super::curated_font_db().expect("a monospace candidate on macOS");
         assert!(!family.is_empty(), "pinned monospace family must be named");
+    }
+
+    #[test]
+    fn every_default_binding_is_a_listed_command() {
+        // Deterministic guard: the generated keybindings block lists these
+        // commands, so a default binding must never point at one that's absent
+        // (registry command or special UI action).
+        let reg = crate::app_state::build_registry();
+        let listed: std::collections::HashSet<&str> = super::keybindable_commands(&reg)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for id in ghostrealm_core::config::default_binding_ids() {
+            assert!(
+                listed.contains(id),
+                "default binding for `{id}` is missing from keybindable_commands"
+            );
+        }
     }
 
     #[test]

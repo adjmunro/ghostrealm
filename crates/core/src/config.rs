@@ -179,29 +179,34 @@ impl Config {
     /// The chord bound to a command id (for showing shortcuts in the palette): a
     /// user override wins over the built-in default. Returns the canonical chord.
     pub fn binding_for(&self, id: &str) -> Option<String> {
-        for (k, v) in &self.keybindings {
-            if v.as_str() == id {
-                return normalize_chord(k);
-            }
+        // The config's `[keybindings]` is authoritative when present; the built-in
+        // defaults apply only when it's empty (fresh/unconfigured).
+        if self.keybindings.is_empty() {
+            return default_bindings()
+                .into_iter()
+                .find(|(_, v)| *v == id)
+                .map(|(k, _)| k.to_string());
         }
-        default_bindings()
-            .into_iter()
-            .find(|(_, v)| *v == id)
-            .map(|(k, _)| k.to_string())
+        self.keybindings
+            .iter()
+            .find(|(_, v)| v.as_str() == id)
+            .and_then(|(k, _)| normalize_chord(k))
     }
 
-    /// Resolve a chord (any modifier order/alias) to a command id: a user
-    /// override wins, else the built-in default, else `None`.
+    /// Resolve a chord (any modifier order/alias) to a command id. The config's
+    /// `[keybindings]` is authoritative when present; an empty section falls back
+    /// to the built-in defaults.
     pub fn binding(&self, chord: &str) -> Option<String> {
         let target = normalize_chord(chord)?;
-        for (k, v) in &self.keybindings {
-            if normalize_chord(k).as_deref() == Some(target.as_str()) {
-                return Some(v.clone());
-            }
+        if self.keybindings.is_empty() {
+            return default_bindings()
+                .get(target.as_str())
+                .map(|s| s.to_string());
         }
-        default_bindings()
-            .get(target.as_str())
-            .map(|s| s.to_string())
+        self.keybindings
+            .iter()
+            .find(|(k, _)| normalize_chord(k).as_deref() == Some(target.as_str()))
+            .map(|(_, v)| v.clone())
     }
 }
 
@@ -296,17 +301,12 @@ auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time befo
 auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an auto-read to re-mark unread on unfocus
 
 [keybindings]
-# table of "chord" = "command id". Cmd chords only (others go to the terminal);
-# any modifier order/alias works. Unset entries use the built-in defaults:
-#   "cmd+k" = "palette.toggle"
-#   "cmd+t" = "surface.new"
-#   "cmd+w" = "pane.close"
-#   "cmd+d" = "split.leftright"
-#   "cmd+shift+d" = "split.topbottom"
-#   "cmd+n" = "tab.new"
-#   "cmd+]" = "pane.focus_next"
-#   "cmd+[" = "pane.focus_prev"
-# Run any command by its id (see the palette). Example: "cmd+e" = "editor.scratch"
+# "chord" = "command id". Cmd chords only (other keys go to the terminal); any
+# modifier order/alias works (cmd/super/meta, opt/alt). This section is the
+# complete, authoritative set of bindings — every command is listed below, bound
+# ones as active lines and unbound ones commented out. Edit a chord to rebind,
+# delete or comment a line to unbind, or uncomment a line and add a chord to
+# bind it. If the whole section is empty, the built-in defaults apply.
 "#;
 
 /// The config file path: `$XDG_CONFIG_HOME/ghostrealm/config.toml`, falling back
@@ -321,7 +321,46 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Load the config, creating a documented default file if none exists. A parse
 /// error is reported and the built-in defaults are used (never fatal).
+/// Command ids that carry a built-in default binding. Callers building the
+/// keybindings list can assert every one is a listed command, so a default can
+/// never point at an action missing from the generated block.
+pub fn default_binding_ids() -> Vec<&'static str> {
+    default_bindings().into_values().collect()
+}
+
+/// The default config file text with a generated, authoritative `[keybindings]`
+/// block: every command listed (deterministically, sorted by id), bound ones as
+/// active lines and unbound ones commented out. `commands` is `(id, title)` for
+/// every keybindable command — pass the registry's, so the block can never drift
+/// out of sync with the available actions. An empty `commands` yields the bare
+/// template (empty section → built-in defaults apply).
+pub fn default_config_with_keybindings(commands: &[(&str, &str)]) -> String {
+    // Invert the built-in defaults to id -> chord for seeding the bound lines.
+    let defaults = default_bindings();
+    let chord_for = |id: &str| -> Option<&'static str> {
+        defaults.iter().find(|&(_, &v)| v == id).map(|(&k, _)| k)
+    };
+    let mut cmds: Vec<(&str, &str)> = commands.to_vec();
+    cmds.sort_by(|a, b| a.0.cmp(b.0));
+    cmds.dedup_by(|a, b| a.0 == b.0);
+
+    let mut out = String::from(DEFAULT_CONFIG_TOML);
+    for (id, title) in cmds {
+        match chord_for(id) {
+            Some(chord) => out.push_str(&format!("\"{chord}\" = \"{id}\"  # {title}\n")),
+            None => out.push_str(&format!("# \"cmd+?\" = \"{id}\"  # {title} (unbound)\n")),
+        }
+    }
+    out
+}
+
 pub fn load_or_create() -> Config {
+    load_or_create_with(&[])
+}
+
+/// Like [`load_or_create`], but seeds a freshly created config with a generated
+/// `[keybindings]` block covering every command in `commands`.
+pub fn load_or_create_with(commands: &[(&str, &str)]) -> Config {
     let Some(path) = config_path() else {
         return Config::default();
     };
@@ -340,7 +379,7 @@ pub fn load_or_create() -> Config {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&path, DEFAULT_CONFIG_TOML);
+            let _ = std::fs::write(&path, default_config_with_keybindings(commands));
             Config::default()
         }
     }
