@@ -440,6 +440,9 @@ struct State {
     /// The surface focused as of the last frame, so a focus change can autosave
     /// the editor that just lost focus.
     last_focused_surface: Option<SurfaceId>,
+    /// Per-editor soft-wrap override (absent = the config default). Toggled by the
+    /// ribbon's wrap button.
+    soft_wrap: HashMap<SurfaceId, bool>,
     /// System clipboard handle (None if unavailable).
     clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
@@ -572,6 +575,8 @@ enum ButtonAction {
     CloseVtab(VtabId),
     /// Close one tab (surface) in a pane's horizontal tab strip.
     CloseSurface(VtabId, PaneId, SurfaceId),
+    /// Toggle soft-wrap for an editor surface.
+    ToggleSoftWrap(SurfaceId),
 }
 
 impl State {
@@ -741,6 +746,7 @@ impl State {
             dragging: false,
             editor_drag: None,
             last_focused_surface: None,
+            soft_wrap: HashMap::new(),
             press_px: (0.0, 0.0),
             press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1044,9 +1050,22 @@ impl State {
             }
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
+            ButtonAction::ToggleSoftWrap(sid) => {
+                let now = self.soft_wrap_on(sid);
+                self.soft_wrap.insert(sid, !now);
+            }
         }
         self.dirty = true;
         true
+    }
+
+    /// Whether soft-wrap is on for editor `sid`: its per-pane override, else the
+    /// config default.
+    fn soft_wrap_on(&self, sid: SurfaceId) -> bool {
+        self.soft_wrap
+            .get(&sid)
+            .copied()
+            .unwrap_or(self.cfg.editor.soft_wrap)
     }
 
     /// Recompute which button is under the cursor; returns whether it changed, so
@@ -1412,11 +1431,48 @@ impl State {
             if y < body_y {
                 return None; // in the tab strip / ribbon
             }
-            let body_x = r.x + self.editor_gutter_w(e.lines.len());
+            let gutter_w = self.editor_gutter_w(e.lines.len());
+            let body_x = r.x + gutter_w;
+            let body_w = (r.w - gutter_w).max(1.0);
             let row_off = ((y - body_y) / self.cell_h).floor().max(0.0) as usize;
             let col_off = ((x - body_x) / self.cell_w).round().max(0.0) as usize;
-            let row = (e.scroll + row_off).min(e.lines.len().saturating_sub(1));
-            let col = col_off.min(e.line_len(row));
+            // Walk visual rows from the scroll top to the clicked one, matching the
+            // render's wrapping, so a click maps to the right (logical line, col).
+            let wrap = self.soft_wrap_on(sid);
+            let wrap_cols = if wrap {
+                ((body_w / self.cell_w).floor() as usize).max(1)
+            } else {
+                usize::MAX
+            };
+            let mut vidx = 0usize;
+            let mut found: Option<(usize, usize, usize)> = None; // (line, start, len)
+            let mut ln = e.scroll;
+            'walk: while ln < e.lines.len() {
+                if wrap {
+                    for (text, start) in wrap_line(&e.lines[ln], wrap_cols) {
+                        if vidx == row_off {
+                            found = Some((ln, start, text.chars().count()));
+                            break 'walk;
+                        }
+                        vidx += 1;
+                    }
+                } else {
+                    if vidx == row_off {
+                        found = Some((ln, 0, e.line_len(ln)));
+                        break 'walk;
+                    }
+                    vidx += 1;
+                }
+                ln += 1;
+            }
+            let (row, col) = match found {
+                Some((line, start, len)) => (line, (start + col_off).min(start + len)),
+                None => {
+                    // Below the last line: land at the end of the last line.
+                    let last = e.lines.len().saturating_sub(1);
+                    (last, e.line_len(last))
+                }
+            };
             return Some((sid, row, col));
         }
         None
@@ -3214,8 +3270,11 @@ impl State {
                         .family(Family::SansSerif)
                         .color(Color::rgb(140, 140, 155));
                     let top = ry + (*ribbon_h - self.cell_h) * 0.5;
+                    // Reserve the far-right for the sticky soft-wrap toggle.
+                    let wb_w = self.cell_h;
+                    let wb_x = pr.rect.x + pr.rect.w - wb_w - pad;
                     let meta_w = meta.chars().count() as f32 * self.cell_w;
-                    let meta_left = pr.rect.x + pr.rect.w - pad - meta_w;
+                    let meta_left = wb_x - pad - meta_w;
                     // Filename, left-aligned.
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
@@ -3277,6 +3336,54 @@ impl State {
                         color: [140, 140, 155],
                     });
                     strip_idx += 1;
+                    // Sticky soft-wrap toggle button (right end of the ribbon).
+                    let wb_on = self.soft_wrap_on(sid);
+                    let wb_hit = Rect {
+                        x: wb_x,
+                        y: ry,
+                        w: wb_w,
+                        h: *ribbon_h,
+                    };
+                    let wb_hovered = rect_contains(wb_hit, self.cursor.0, self.cursor.1);
+                    if wb_hovered {
+                        bg_quads.push(rect_quad(
+                            hover_box(wb_hit, wb_w),
+                            sw,
+                            sh,
+                            BUTTON_HOVER_BG,
+                            BUTTON_HOVER_ALPHA,
+                        ));
+                    }
+                    let wb_color = if wb_on { self.chrome.accent } else { CLOSE_GLYPH };
+                    if strip_idx >= self.strip_buffers.len() {
+                        self.strip_buffers
+                            .push(Buffer::new(&mut self.font_system, metrics));
+                    }
+                    let buf = &mut self.strip_buffers[strip_idx];
+                    buf.set_metrics(metrics);
+                    buf.set_wrap(Wrap::None);
+                    buf.set_size(Some(wb_w), Some(self.cell_h));
+                    buf.set_rich_text(
+                        std::iter::once(("\u{21a9}", attrs_for(wb_color))),
+                        &Attrs::new().family(Family::Monospace),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    strip_placements.push(Placement {
+                        idx: strip_idx,
+                        left: wb_x + (wb_w - self.cell_w) * 0.5,
+                        top,
+                        bounds: TextBounds {
+                            left: wb_x as i32,
+                            top: ry as i32,
+                            right: (wb_x + wb_w) as i32,
+                            bottom: (ry + *ribbon_h) as i32,
+                        },
+                        color: wb_color,
+                    });
+                    strip_idx += 1;
+                    self.buttons.push((wb_hit, ButtonAction::ToggleSoftWrap(sid)));
                 }
             }
 
@@ -3309,112 +3416,132 @@ impl State {
                 let body_x = term.x + gutter_w;
                 let body_w = (term.w - gutter_w).max(1.0);
                 bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
-                // Active-line highlight behind the cursor's row.
-                if self.cfg.editor.cursor_line && cursor.0 >= scroll && cursor.0 < scroll + rows_vis {
-                    bg_quads.push(rect_quad(
-                        Rect {
-                            x: term.x,
-                            y: term.y + (cursor.0 - scroll) as f32 * self.cell_h,
-                            w: term.w,
-                            h: self.cell_h,
-                        },
-                        sw,
-                        sh,
-                        EDITOR_CURSOR_LINE,
-                        EDITOR_CURSOR_LINE_ALPHA,
-                    ));
-                }
-                // Selection highlight (behind text).
-                if let Some(((sr, sc), (er, ec))) = sel {
-                    for (i, line) in visible.iter().enumerate() {
-                        let row = scroll + i;
-                        if row < sr || row > er {
-                            continue;
+
+                // Lay out the visible visual rows: (logical_line, text, start_col,
+                // y). Soft-wrap breaks long logical lines into several visual rows;
+                // otherwise each logical line is one row (clipped at the pane edge).
+                let wrap = self.soft_wrap_on(sid);
+                let wrap_cols = if wrap {
+                    ((body_w / self.cell_w).floor() as usize).max(1)
+                } else {
+                    usize::MAX
+                };
+                let bottom = term.y + term.h;
+                let mut vis: Vec<(usize, String, usize, f32)> = Vec::new();
+                let mut vy = term.y;
+                for (i, line) in visible.iter().enumerate() {
+                    if vy >= bottom {
+                        break;
+                    }
+                    let ln = scroll + i;
+                    if wrap {
+                        for (text, start) in wrap_line(line, wrap_cols) {
+                            if vy >= bottom {
+                                break;
+                            }
+                            vis.push((ln, text, start, vy));
+                            vy += self.cell_h;
                         }
-                        let len = line.chars().count();
-                        let first = if row == sr { sc } else { 0 };
-                        let last = if row == er { ec } else { len }; // selection past EOL
-                        if last <= first {
-                            continue;
-                        }
-                        bg_quads.push(rect_quad(
-                            Rect {
-                                x: body_x + first as f32 * self.cell_w,
-                                y: term.y + i as f32 * self.cell_h,
-                                w: (last - first) as f32 * self.cell_w,
-                                h: self.cell_h,
-                            },
-                            sw,
-                            sh,
-                            self.chrome.accent,
-                            0.35,
-                        ));
+                    } else {
+                        vis.push((ln, line.clone(), 0, vy));
+                        vy += self.cell_h;
                     }
                 }
-                // Line-number gutter (right-aligned in its column).
-                if gutter_w > 0.0 {
-                    for i in 0..visible.len() {
-                        let row = scroll + i;
-                        if row >= total_lines {
-                            break; // don't number past the last line
+
+                // Active-line highlight behind every visual row of the cursor line.
+                if self.cfg.editor.cursor_line {
+                    for (ln, _t, _s, y) in &vis {
+                        if *ln == cursor.0 {
+                            bg_quads.push(rect_quad(
+                                Rect { x: term.x, y: *y, w: term.w, h: self.cell_h },
+                                sw,
+                                sh,
+                                EDITOR_CURSOR_LINE,
+                                EDITOR_CURSOR_LINE_ALPHA,
+                            ));
                         }
-                        let is_cur = row == cursor.0;
+                    }
+                }
+                // Selection highlight (behind text), intersected with each row.
+                if let Some(((sr, sc), (er, ec))) = sel {
+                    for (ln, text, start, y) in &vis {
+                        let ln = *ln;
+                        if ln < sr || ln > er {
+                            continue;
+                        }
+                        let row_end = start + text.chars().count();
+                        let first_l = if ln == sr { sc } else { 0 };
+                        let last_l = if ln == er { ec } else { usize::MAX };
+                        let vfirst = first_l.max(*start);
+                        let vlast = last_l.min(row_end);
+                        if vlast > vfirst {
+                            bg_quads.push(rect_quad(
+                                Rect {
+                                    x: body_x + (vfirst - start) as f32 * self.cell_w,
+                                    y: *y,
+                                    w: (vlast - vfirst) as f32 * self.cell_w,
+                                    h: self.cell_h,
+                                },
+                                sw,
+                                sh,
+                                self.chrome.accent,
+                                0.35,
+                            ));
+                        }
+                    }
+                }
+                // Line-number gutter — only on each logical line's first visual row.
+                if gutter_w > 0.0 {
+                    for (ln, _text, start, y) in &vis {
+                        if *start != 0 || *ln >= total_lines {
+                            continue;
+                        }
+                        let is_cur = *ln == cursor.0;
                         let num = match self.cfg.editor.line_numbers {
                             LineNumbers::Relative if !is_cur => {
-                                (cursor.0 as isize - row as isize).unsigned_abs()
+                                (cursor.0 as isize - *ln as isize).unsigned_abs()
                             }
-                            _ => row + 1, // absolute (and the cursor line in relative mode)
+                            _ => ln + 1, // absolute (and the cursor line in relative mode)
                         };
                         let s = num.to_string();
                         let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
                         let key = self.row_cache.row_key(std::iter::once((s.as_str(), color)));
                         if self.row_cache.buffer(key).is_some() {
-                            self.row_cache.ensure(
-                                key,
-                                &mut self.font_system,
-                                metrics,
-                                gutter_w,
-                                self.cell_h,
-                                &[],
-                            );
+                            self.row_cache
+                                .ensure(key, &mut self.font_system, metrics, gutter_w, self.cell_h, &[]);
                         } else {
                             let spans = vec![(s.clone(), color)];
-                            self.row_cache.ensure(
-                                key,
-                                &mut self.font_system,
-                                metrics,
-                                gutter_w,
-                                self.cell_h,
-                                &spans,
-                            );
+                            self.row_cache
+                                .ensure(key, &mut self.font_system, metrics, gutter_w, self.cell_h, &spans);
                         }
                         let num_w = s.chars().count() as f32 * self.cell_w;
                         row_placements.push(RowPlacement {
                             key,
-                            left: body_x - self.cell_w - num_w, // one column of right pad
-                            top: term.y + i as f32 * self.cell_h,
+                            left: body_x - self.cell_w - num_w,
+                            top: *y,
                             bounds: TextBounds {
                                 left: term.x as i32,
                                 top: term.y as i32,
                                 right: body_x as i32,
-                                bottom: (term.y + term.h) as i32,
+                                bottom: bottom as i32,
                             },
                             color,
                         });
                     }
                 }
-                for (i, line) in visible.iter().enumerate() {
+                // Text for each visual row (keyed by its own content, so wrapped
+                // sub-rows are cache-friendly and width-independent).
+                for (_ln, text, _start, y) in &vis {
                     let key = self
                         .row_cache
-                        .row_key(std::iter::once((line.as_str(), EDITOR_FG)));
-                    let top = term.y + i as f32 * self.cell_h;
-                    let pos = (body_x as i32, top as i32);
+                        .row_key(std::iter::once((text.as_str(), EDITOR_FG)));
+                    let pos = (body_x as i32, *y as i32);
                     let place_key = if self.row_cache.buffer(key).is_some() {
                         self.row_cache
                             .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &[]);
                         key
                     } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
-                        let spans = vec![(line.clone(), EDITOR_FG)];
+                        let spans = vec![(text.clone(), EDITOR_FG)];
                         self.row_cache
                             .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &spans);
                         shaped += 1;
@@ -3436,22 +3563,27 @@ impl State {
                     row_placements.push(RowPlacement {
                         key: place_key,
                         left: body_x,
-                        top,
+                        top: *y,
                         bounds: TextBounds {
                             left: body_x as i32,
                             top: term.y as i32,
                             right: (term.x + term.w) as i32,
-                            bottom: (term.y + term.h) as i32,
+                            bottom: bottom as i32,
                         },
                         color: EDITOR_FG,
                     });
                 }
-                // Cursor (thin bar), when in view.
-                if cursor.0 >= scroll && cursor.0 < scroll + rows_vis {
+                // Cursor (thin bar): the cursor-line row with the largest start
+                // that the column still falls on.
+                if let Some((_, _t, start, y)) = vis
+                    .iter()
+                    .rev()
+                    .find(|(ln, _t, start, _y)| *ln == cursor.0 && *start <= cursor.1)
+                {
                     overlay_quads.push(rect_quad(
                         Rect {
-                            x: body_x + cursor.1 as f32 * self.cell_w,
-                            y: term.y + (cursor.0 - scroll) as f32 * self.cell_h,
+                            x: body_x + (cursor.1 - start) as f32 * self.cell_w,
+                            y: *y,
                             w: 2.0 * self.scale,
                             h: self.cell_h,
                         },
@@ -4203,6 +4335,37 @@ fn keybindable_commands(registry: &Registry<AppState>) -> Vec<(&'static str, &'s
     cmds
 }
 
+/// Soft-wrap `line` to `cols` columns, returning each visual row as
+/// `(text, start_char_index)`. Greedy word wrap (break at the last space that
+/// fits, keeping the space on the current row); a word longer than `cols` is
+/// hard-broken. A short line yields a single row.
+fn wrap_line(line: &str, cols: usize) -> Vec<(String, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    if cols == 0 || chars.len() <= cols {
+        return vec![(line.to_string(), 0)];
+    }
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let hard_end = (i + cols).min(chars.len());
+        let mut brk = hard_end;
+        if hard_end < chars.len() {
+            // Prefer breaking after the last space within the window.
+            if let Some(pos) = (i..hard_end).rev().find(|&k| chars[k] == ' ') {
+                if pos + 1 > i {
+                    brk = pos + 1;
+                }
+            }
+        }
+        rows.push((chars[i..brk].iter().collect(), i));
+        i = brk;
+    }
+    if rows.is_empty() {
+        rows.push((String::new(), 0));
+    }
+    rows
+}
+
 /// A compact directory label that fits in `max` characters, no wrap/overflow:
 /// prefer "parent/current", else "current", else "curr…" truncated with an
 /// ellipsis. `~` is substituted for the home directory's own segment.
@@ -4529,6 +4692,26 @@ mod tests {
 
     const FONT_SIZE: f32 = 15.0;
     const LINE_HEIGHT: f32 = 18.0;
+
+    #[test]
+    fn wrap_line_word_wraps_with_char_start_offsets() {
+        // A short line is a single row.
+        assert_eq!(super::wrap_line("hello", 10), vec![("hello".to_string(), 0)]);
+        // Greedy word wrap keeps the breaking space and reports char start offsets.
+        assert_eq!(
+            super::wrap_line("the quick brown", 9),
+            vec![
+                ("the ".to_string(), 0),
+                ("quick ".to_string(), 4),
+                ("brown".to_string(), 10),
+            ]
+        );
+        // A word longer than the width is hard-broken.
+        assert_eq!(
+            super::wrap_line("abcdef", 3),
+            vec![("abc".to_string(), 0), ("def".to_string(), 3)]
+        );
+    }
 
     #[test]
     fn curated_font_db_finds_a_monospace() {

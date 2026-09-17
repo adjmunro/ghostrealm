@@ -149,6 +149,9 @@ pub struct Editor {
     pub line_numbers: LineNumbers,
     /// Highlight the line the cursor is on.
     pub cursor_line: bool,
+    /// Default soft-wrap state for editor panes (toggle per-pane with the ribbon
+    /// button). When off, long lines are clipped at the pane edge.
+    pub soft_wrap: bool,
 }
 
 impl Default for Editor {
@@ -156,6 +159,7 @@ impl Default for Editor {
         Editor {
             line_numbers: LineNumbers::Absolute,
             cursor_line: true,
+            soft_wrap: true,
         }
     }
 }
@@ -319,6 +323,7 @@ autohide_single_tab = true  # bool (default true) — hide a pane's tab strip wh
 [editor]
 line_numbers = "absolute"  # "off" | "absolute" | "relative" (default absolute) — gutter line numbers; relative shows the absolute number on the cursor line
 cursor_line = true         # bool (default true) — highlight the line the cursor is on
+soft_wrap = true           # bool (default true) — wrap long lines (toggle per-pane with the ribbon button)
 
 [input]
 focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
