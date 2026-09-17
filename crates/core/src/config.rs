@@ -374,7 +374,12 @@ pub fn default_binding_ids() -> Vec<&'static str> {
 /// out of sync with the available actions. An empty `commands` yields the bare
 /// template (empty section → built-in defaults apply).
 pub fn default_config_with_keybindings(commands: &[(&str, &str)]) -> String {
-    // Invert the built-in defaults to id -> chord for seeding the bound lines.
+    format!("{DEFAULT_CONFIG_TOML}{}", keybindings_lines(commands))
+}
+
+/// Just the generated `[keybindings]` body — one line per command, sorted by id,
+/// bound ones active and unbound ones commented out.
+fn keybindings_lines(commands: &[(&str, &str)]) -> String {
     let defaults = default_bindings();
     let chord_for = |id: &str| -> Option<&'static str> {
         defaults.iter().find(|&(_, &v)| v == id).map(|(&k, _)| k)
@@ -382,8 +387,7 @@ pub fn default_config_with_keybindings(commands: &[(&str, &str)]) -> String {
     let mut cmds: Vec<(&str, &str)> = commands.to_vec();
     cmds.sort_by(|a, b| a.0.cmp(b.0));
     cmds.dedup_by(|a, b| a.0 == b.0);
-
-    let mut out = String::from(DEFAULT_CONFIG_TOML);
+    let mut out = String::new();
     for (id, title) in cmds {
         match chord_for(id) {
             Some(chord) => out.push_str(&format!("\"{chord}\" = \"{id}\"  # {title}\n")),
@@ -391,6 +395,141 @@ pub fn default_config_with_keybindings(commands: &[(&str, &str)]) -> String {
         }
     }
     out
+}
+
+/// Top-level `[section]` names that are active (uncommented) headers in `text`.
+fn active_section_headers(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            if t.starts_with('[') && !t.starts_with("[[") && t.ends_with(']') {
+                Some(t[1..t.len() - 1].trim().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Split [`DEFAULT_CONFIG_TOML`] into `(section_name, block_text)` per top-level
+/// `[section]`, in order. The preamble before the first section is dropped.
+fn template_sections() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in DEFAULT_CONFIG_TOML.lines() {
+        let t = line.trim();
+        let is_header =
+            t.starts_with('[') && !t.starts_with("[[") && t.ends_with(']') && !t.starts_with('#');
+        if is_header {
+            if let Some(sec) = cur.take() {
+                out.push(sec);
+            }
+            let name = t[1..t.len() - 1].trim().to_string();
+            cur = Some((name, format!("{line}\n")));
+        } else if let Some((_, block)) = cur.as_mut() {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    if let Some(sec) = cur.take() {
+        out.push(sec);
+    }
+    out
+}
+
+/// Whether the `[keybindings]` section of `text` has any active (uncommented)
+/// binding line (a quoted chord key).
+fn has_active_keybinding(text: &str) -> bool {
+    let mut in_kb = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[") {
+            in_kb = &t[1..t.len() - 1] == "keybindings";
+            continue;
+        }
+        if in_kb && t.starts_with('"') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bring existing config `text` up to date without disturbing any existing line:
+/// append every documented top-level section the file is missing, and if the
+/// `[keybindings]` section has no active bindings, add the generated block
+/// (inserted under an existing header, else appended as a new section). Returns
+/// the new text, or `None` if nothing needed adding.
+pub fn backfill_text(text: &str, commands: &[(&str, &str)]) -> Option<String> {
+    // Never rewrite a file that doesn't parse — a broken edit shouldn't be
+    // "fixed" by us clobbering it.
+    if toml::from_str::<Config>(text).is_err() {
+        return None;
+    }
+    let present = active_section_headers(text);
+    let sections = template_sections();
+    let mut result = text.to_string();
+    let mut changed = false;
+
+    for (name, block) in &sections {
+        if name == "keybindings" || present.contains(name) {
+            continue;
+        }
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+        result.push_str(block.trim_end());
+        result.push('\n');
+        changed = true;
+    }
+
+    if !has_active_keybinding(text) {
+        let lines = keybindings_lines(commands);
+        if present.contains("keybindings") {
+            // Insert the generated bindings right after the existing header so they
+            // fall under the [keybindings] table.
+            let mut rebuilt = String::new();
+            for line in result.lines() {
+                rebuilt.push_str(line);
+                rebuilt.push('\n');
+                if line.trim() == "[keybindings]" {
+                    rebuilt.push_str(&lines);
+                }
+            }
+            result = rebuilt;
+        } else {
+            let header = sections
+                .iter()
+                .find(|(n, _)| n == "keybindings")
+                .map(|(_, b)| b.clone())
+                .unwrap_or_else(|| "[keybindings]\n".to_string());
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push('\n');
+            result.push_str(header.trim_end());
+            result.push('\n');
+            result.push_str(&lines);
+        }
+        changed = true;
+    }
+
+    changed.then_some(result)
+}
+
+/// Backfill the on-disk config file in place (see [`backfill_text`]). Returns
+/// whether it changed anything.
+pub fn backfill_config(commands: &[(&str, &str)]) -> bool {
+    let Some(path) = config_path() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    match backfill_text(&text, commands) {
+        Some(updated) => std::fs::write(&path, updated).is_ok(),
+        None => false,
+    }
 }
 
 pub fn load_or_create() -> Config {
@@ -427,6 +566,47 @@ pub fn load_or_create_with(commands: &[(&str, &str)]) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backfill_adds_missing_sections_and_keybindings() {
+        // A sparse, out-of-date config: a customised [terminal] and an empty
+        // [keybindings]. Nothing else.
+        let old = "[terminal]\nfont_size = 20.0\n\n[keybindings]\n# (empty)\n";
+        let cmds = [
+            ("surface.new", "New Terminal Tab"),
+            ("tab.new", "New Workspace"),
+            ("editor.scratch", "New Editor"),
+        ];
+        let updated = backfill_text(old, &cmds).expect("backfill should add sections");
+        let cfg: Config = toml::from_str(&updated).expect("backfilled config parses");
+
+        // The user's value is preserved untouched.
+        assert!((cfg.terminal.font_size - 20.0).abs() < 1e-6);
+        // Missing sections were appended.
+        for sec in ["[sidebar]", "[editor]", "[input]", "[inbox]", "[tabs]"] {
+            assert!(updated.contains(sec), "backfill adds {sec}");
+        }
+        // The authoritative keybindings block was seeded (so bindings resolve).
+        assert!(!cfg.keybindings.is_empty());
+        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
+        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("tab.new"));
+        // An unbound command appears as a comment for reference.
+        assert!(updated.contains("editor.scratch"));
+        // Idempotent: a second pass changes nothing.
+        assert!(
+            backfill_text(&updated, &cmds).is_none(),
+            "backfill is idempotent"
+        );
+    }
+
+    #[test]
+    fn backfill_leaves_a_current_config_untouched() {
+        let full = default_config_with_keybindings(&[("surface.new", "New Terminal Tab")]);
+        assert!(
+            backfill_text(&full, &[("surface.new", "New Terminal Tab")]).is_none(),
+            "a freshly generated config needs no backfill"
+        );
+    }
 
     #[test]
     fn default_toml_matches_default_config() {
@@ -485,3 +665,4 @@ mod tests {
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.close"));
     }
 }
+

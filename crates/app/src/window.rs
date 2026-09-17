@@ -800,9 +800,12 @@ impl State {
     /// Saving it (Cmd+S) hot-reloads the config.
     fn open_config_editor(&mut self) {
         if let Some(path) = ghostrealm_core::config::config_path() {
-            // Ensure it exists, seeded with the full keybindings block.
-            let _ =
-                ghostrealm_core::config::load_or_create_with(&keybindable_commands(&self.registry));
+            let commands = keybindable_commands(&self.registry);
+            // Ensure it exists, seeded with the full keybindings block, then bring
+            // an out-of-date file up to date (append missing sections + the
+            // keybindings block) without disturbing the user's set values.
+            let _ = ghostrealm_core::config::load_or_create_with(&commands);
+            ghostrealm_core::config::backfill_config(&commands);
             // Settings live in their own "settings" workspace, not the focused pane.
             self.app.open_settings(path);
             self.dirty = true;
