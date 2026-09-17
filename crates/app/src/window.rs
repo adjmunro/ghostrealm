@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Chrome, Config, Rect, Registry, Side, SurfaceId, TabStatus, Value,
+    ArgKind, ArgSpec, Args, Chrome, Config, PaneId, Rect, Registry, Side, SurfaceId, TabStatus,
+    Value, VtabId,
 };
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
@@ -75,6 +76,8 @@ const MAX_PENDING_SCROLL: i32 = 600;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
+/// Close-button ('×') glyph colour — dim so it reads as a secondary affordance.
+const CLOSE_GLYPH: [u8; 3] = [140, 140, 155];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -382,6 +385,11 @@ struct State {
     pending_scroll_target: Option<SurfaceId>,
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
+    /// Close-button ('×') hit rects as last rendered, for tabs and workspaces.
+    close_hits: Vec<(Rect, CloseTarget)>,
+    /// Single shaped '×' glyph, placed at each close button (one buffer, many
+    /// placements). Reshaped on a metrics change like the other chrome buffers.
+    close_buffer: Buffer,
     /// Active terminal text selection, if any.
     selection: Option<Selection>,
     /// Left mouse button is held (for drag-selection).
@@ -509,9 +517,19 @@ struct Menu {
 /// A pane resolved for rendering: its rect, focus, and its surfaces
 /// (id, display title, is-active).
 struct PaneRender {
+    id: PaneId,
     rect: Rect,
     focused: bool,
     surfaces: Vec<(SurfaceId, String, bool)>,
+}
+
+/// What a close ('×') button removes when clicked.
+#[derive(Clone, Copy)]
+enum CloseTarget {
+    /// A workspace (vtab) in the sidebar.
+    Vtab(VtabId),
+    /// One tab (surface) within a pane's horizontal tab strip.
+    Surface(VtabId, PaneId, SurfaceId),
 }
 
 impl State {
@@ -617,6 +635,7 @@ impl State {
             cfg.terminal.line_height * scale,
         );
         let warm_buffer = Buffer::new(&mut font_system, warm_metrics);
+        let close_buffer = Buffer::new(&mut font_system, warm_metrics);
 
         let quad_pipeline = build_quad_pipeline(&device, format);
         let quad_capacity = 4096;
@@ -675,6 +694,8 @@ impl State {
             pending_scroll: 0,
             pending_scroll_target: None,
             sidebar_rows: Vec::new(),
+            close_hits: Vec::new(),
+            close_buffer,
             selection: None,
             mouse_down: false,
             dragging: false,
@@ -892,6 +913,7 @@ impl State {
                     })
                     .collect();
                 Some(PaneRender {
+                    id: pid,
                     rect,
                     focused: pid == vtab.focused_pane,
                     surfaces,
@@ -950,6 +972,15 @@ impl State {
             return;
         }
         let (x, y) = self.cursor;
+        // A click on a close ('×') button removes that tab or workspace.
+        if let Some(&(_, target)) = self.close_hits.iter().find(|(r, _)| rect_contains(*r, x, y)) {
+            match target {
+                CloseTarget::Vtab(id) => self.app.close_vtab(id),
+                CloseTarget::Surface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
+            }
+            self.dirty = true;
+            return;
+        }
         if self.in_sidebar(x) {
             if rect_contains(self.new_tab_button, x, y) {
                 let _ = self.app.new_vtab();
@@ -1483,7 +1514,13 @@ impl State {
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
     /// `sidebar_buffers`.
-    fn build_sidebar(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+    fn build_sidebar(
+        &mut self,
+        sw: f32,
+        sh: f32,
+        quads: &mut Vec<QuadInstance>,
+        close_placements: &mut Vec<Placement>,
+    ) -> Vec<Placement> {
         let bar_w = self.sidebar_width();
         let bar_x = self.sidebar_rect().x;
         let row_h = self.cell_h + 8.0 * self.scale;
@@ -1608,9 +1645,12 @@ impl State {
                     1.0,
                 ));
             }
+            let close_w = self.cell_h;
+            let close_x = bar_x + bar_w - close_w - pad;
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
-            buf.set_size(Some((bar_x + bar_w - text_x - pad).max(1.0)), Some(self.cell_h));
+            // Leave room on the right for the close button.
+            buf.set_size(Some((close_x - text_x).max(1.0)), Some(self.cell_h));
             buf.set_rich_text(
                 std::iter::once((name.as_str(), attrs_for([220, 220, 230]))),
                 &Attrs::new().family(Family::SansSerif),
@@ -1625,11 +1665,33 @@ impl State {
                 bounds: TextBounds {
                     left: bar_x as i32,
                     top: vis_top as i32,
-                    right: (bar_x + bar_w) as i32,
+                    right: close_x as i32,
                     bottom: vis_bot as i32,
                 },
                 color: [220, 220, 230],
             });
+            // Close ('×') button for this workspace.
+            close_placements.push(Placement {
+                idx: 0,
+                left: close_x + (close_w - self.cell_w) * 0.5,
+                top: y + (row_h - self.cell_h) * 0.5,
+                bounds: TextBounds {
+                    left: close_x as i32,
+                    top: vis_top as i32,
+                    right: (close_x + close_w) as i32,
+                    bottom: vis_bot as i32,
+                },
+                color: CLOSE_GLYPH,
+            });
+            self.close_hits.push((
+                Rect {
+                    x: close_x,
+                    y: vis_top,
+                    w: close_w,
+                    h: (vis_bot - vis_top).max(0.0),
+                },
+                CloseTarget::Vtab(*id),
+            ));
         }
 
         placements
@@ -2646,6 +2708,23 @@ impl State {
         let mut strip_idx = 0usize;
         let multi_pane = resolved.len() > 1;
 
+        // Close-button chrome: one shared '×' glyph placed at every tab/workspace
+        // close button, and the hit rects those buttons occupy (rebuilt each frame).
+        self.close_hits.clear();
+        let mut close_placements: Vec<Placement> = Vec::new();
+        let active_vt = self.app.tree.active_vtab();
+        self.close_buffer.set_metrics(metrics);
+        self.close_buffer
+            .set_size(Some(self.cell_w * 2.0), Some(self.cell_h));
+        self.close_buffer.set_rich_text(
+            std::iter::once(("\u{00d7}", attrs_for(CLOSE_GLYPH))),
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.close_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
         for (pr, strip_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
@@ -2663,7 +2742,10 @@ impl State {
                     self.chrome.sidebar,
                     1.0,
                 ));
-                for (i, (_sid, title, is_active)) in pr.surfaces.iter().enumerate() {
+                let pad = 6.0 * self.scale;
+                let close_w = self.cell_h;
+                let text_top = pr.rect.y + (*strip_h - self.cell_h) * 0.5;
+                for (i, (sid, title, is_active)) in pr.surfaces.iter().enumerate() {
                     let tab_x = pr.rect.x + i as f32 * tab_w;
                     if *is_active {
                         bg_quads.push(rect_quad(
@@ -2679,14 +2761,15 @@ impl State {
                             0.5,
                         ));
                     }
-                    let pad = 6.0 * self.scale;
+                    let close_x = tab_x + tab_w - close_w - pad;
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
                             .push(Buffer::new(&mut self.font_system, metrics));
                     }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
-                    buf.set_size(Some((tab_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+                    // Leave room on the right for the close button.
+                    buf.set_size(Some((close_x - (tab_x + pad)).max(1.0)), Some(self.cell_h));
                     buf.set_rich_text(
                         std::iter::once((title.as_str(), attrs_for([220, 220, 230]))),
                         &Attrs::new().family(Family::SansSerif),
@@ -2697,16 +2780,40 @@ impl State {
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: tab_x + pad,
-                        top: pr.rect.y + (*strip_h - self.cell_h) * 0.5,
+                        top: text_top,
                         bounds: TextBounds {
                             left: tab_x as i32,
                             top: pr.rect.y as i32,
-                            right: (tab_x + tab_w) as i32,
+                            right: close_x as i32,
                             bottom: (pr.rect.y + *strip_h) as i32,
                         },
                         color: [220, 220, 230],
                     });
                     strip_idx += 1;
+                    // Close ('×') button for this tab.
+                    if let Some(vt) = active_vt {
+                        close_placements.push(Placement {
+                            idx: 0,
+                            left: close_x + (close_w - self.cell_w) * 0.5,
+                            top: text_top,
+                            bounds: TextBounds {
+                                left: close_x as i32,
+                                top: pr.rect.y as i32,
+                                right: (close_x + close_w) as i32,
+                                bottom: (pr.rect.y + *strip_h) as i32,
+                            },
+                            color: CLOSE_GLYPH,
+                        });
+                        self.close_hits.push((
+                            Rect {
+                                x: close_x,
+                                y: pr.rect.y,
+                                w: close_w,
+                                h: *strip_h,
+                            },
+                            CloseTarget::Surface(vt, pr.id, *sid),
+                        ));
+                    }
                 }
             }
 
@@ -2969,7 +3076,7 @@ impl State {
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
         // Sidebar (bg quads before text; its names join the main text pass).
-        let sidebar_placements = self.build_sidebar(sw, sh, &mut bg_quads);
+        let sidebar_placements = self.build_sidebar(sw, sh, &mut bg_quads, &mut close_placements);
 
         let palette_placements = if self.palette.is_some() {
             self.build_palette(sw, sh, &mut overlay_quads)
@@ -3054,6 +3161,16 @@ impl State {
         }));
         text_areas.extend(strip_placements.iter().map(|p| TextArea {
             buffer: &self.strip_buffers[p.idx],
+            left: p.left,
+            top: p.top,
+            scale: 1.0,
+            bounds: p.bounds,
+            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+            custom_glyphs: &[],
+        }));
+        // Every close button shares the one shaped '×' buffer, placed per button.
+        text_areas.extend(close_placements.iter().map(|p| TextArea {
+            buffer: &self.close_buffer,
             left: p.left,
             top: p.top,
             scale: 1.0,

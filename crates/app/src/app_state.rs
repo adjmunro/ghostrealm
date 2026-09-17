@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, Registry, SurfaceId,
+    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
     TabStatus, Tree, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
@@ -300,6 +300,12 @@ impl AppState {
     /// Close a specific vtab by id (e.g. from the sidebar context menu).
     pub fn close_vtab(&mut self, id: VtabId) {
         self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(id));
+    }
+
+    /// Close one surface (htab) within a pane; the tree collapses the pane, and
+    /// then the vtab, if that was its last surface.
+    pub fn close_surface(&mut self, vtab: VtabId, pane: PaneId, surface: SurfaceId) {
+        self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vtab, pane, surface));
     }
 
     /// Run a tree mutation, then drop terminals whose surfaces no longer exist.
