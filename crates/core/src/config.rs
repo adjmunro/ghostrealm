@@ -209,11 +209,11 @@ impl Config {
 fn default_bindings() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("cmd+k", "palette.toggle"),
-        ("cmd+t", "tab.new"),
+        ("cmd+t", "surface.new"),
         ("cmd+w", "pane.close"),
         ("cmd+d", "split.leftright"),
         ("cmd+shift+d", "split.topbottom"),
-        ("cmd+n", "surface.new"),
+        ("cmd+n", "tab.new"),
         ("cmd+]", "pane.focus_next"),
         ("cmd+[", "pane.focus_prev"),
     ])
@@ -299,11 +299,11 @@ auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an 
 # table of "chord" = "command id". Cmd chords only (others go to the terminal);
 # any modifier order/alias works. Unset entries use the built-in defaults:
 #   "cmd+k" = "palette.toggle"
-#   "cmd+t" = "tab.new"
+#   "cmd+t" = "surface.new"
 #   "cmd+w" = "pane.close"
 #   "cmd+d" = "split.leftright"
 #   "cmd+shift+d" = "split.topbottom"
-#   "cmd+n" = "surface.new"
+#   "cmd+n" = "tab.new"
 #   "cmd+]" = "pane.focus_next"
 #   "cmd+[" = "pane.focus_prev"
 # Run any command by its id (see the palette). Example: "cmd+e" = "editor.scratch"
@@ -396,7 +396,8 @@ mod tests {
     #[test]
     fn binding_uses_defaults_then_overrides() {
         let mut cfg = Config::default();
-        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.new"));
+        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
+        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("tab.new"));
         assert_eq!(cfg.binding("cmd+k").as_deref(), Some("palette.toggle"));
         assert_eq!(cfg.binding("cmd+j"), None);
         // A user override wins, in any modifier order/alias.
