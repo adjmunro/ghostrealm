@@ -392,18 +392,16 @@
 
 [2026-09-18@6577576]
 
-- Requires: NO BLOCKERS (sizeable; own pass)
-- Detail: Soft-wrap toggle. A sticky icon button in the top-right of terminal AND
-  editor panes toggles per-surface soft-wrap; config default (e.g. `editor.soft_wrap`)
-  defaults ON. The button itself is easy (shared button system: hover + fire on
-  release). The hard part is RENDERING: wrapped lines take multiple visual rows
-  (variable row height), so the fixed 1-logical-row = 1-cell_h layout must become
-  visual-line aware — cursor placement, click→(line,col) mapping, and scrolling all
-  need visual-vs-logical translation, and the content-keyed row cache must fold the
-  wrap width into its key (wrap layout is width-dependent). Editor is the meaningful
-  case (long lines currently clip at the pane edge); terminal grid already wraps to
-  its column count, so the terminal button may be a near no-op or drive ghostty wrap.
-- Reason: readable long lines without horizontal scrolling.
+- Requires: NO BLOCKERS
+- Detail: Soft-wrap follow-ups. Editor soft-wrap + per-pane ribbon toggle are DONE
+  (d04ef0d): greedy word-wrap, gutter/cursor/selection/click all wrap-aware,
+  `[editor] soft_wrap` default on. REMAINING: (1) the toggle only shows on
+  single-tab editors (in the ribbon); add it for multi-tab editors and, if wanted,
+  terminals (terminals already wrap to their column count, so a terminal toggle
+  would need a ghostty reflow/no-wrap mode — likely skip). (2) Wrapped editors
+  re-shape visible rows via the row cache but char-substring keys mean many small
+  entries; fine for now, revisit if a huge wrapped file feels slow.
+- Reason: complete the toggle's reach; keep perf healthy.
 
 ---
 
