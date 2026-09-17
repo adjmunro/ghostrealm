@@ -80,9 +80,12 @@ const EDITOR_FG: [u8; 3] = [220, 220, 230];
 /// brighter under the cursor.
 const CLOSE_GLYPH: [u8; 3] = [140, 140, 155];
 const CLOSE_GLYPH_HOVER: [u8; 3] = [235, 235, 245];
-/// Highlight box drawn behind a close button on hover.
-const CLOSE_HOVER_BG: [u8; 3] = [255, 255, 255];
-const CLOSE_HOVER_ALPHA: f32 = 0.14;
+/// Highlight box drawn behind a clickable button on hover.
+const BUTTON_HOVER_BG: [u8; 3] = [255, 255, 255];
+const BUTTON_HOVER_ALPHA: f32 = 0.14;
+/// Sidebar "+ New workspace" label colour, brighter under the cursor.
+const NEW_VTAB_LABEL: [u8; 3] = [150, 150, 165];
+const NEW_VTAB_LABEL_HOVER: [u8; 3] = [210, 210, 220];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -250,7 +253,7 @@ impl ApplicationHandler<UserEvent> for App {
                     redraw = true;
                 }
                 // Close-button hover highlight tracks the cursor everywhere.
-                redraw |= state.update_close_hover();
+                redraw |= state.update_button_hover();
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -262,7 +265,7 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 // A close button arms on press and fires on release (so it can be
                 // cancelled); other clicks act on press as before.
-                if !state.arm_close() {
+                if !state.arm_button() {
                     state.on_click();
                     state.begin_selection();
                 }
@@ -273,7 +276,7 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                state.fire_close();
+                state.fire_button();
                 state.end_selection();
                 state.window.request_redraw();
             }
@@ -378,8 +381,6 @@ struct State {
     menu: Option<Menu>,
     /// Text buffers for the context-menu item labels (drawn via the overlay pass).
     menu_buffers: Vec<Buffer>,
-    /// The sidebar "+" new-workspace button rect (physical px), for hit-testing.
-    new_tab_button: Rect,
     /// Vertical scroll offset of the workspace list (physical px).
     sidebar_scroll: f32,
     /// Max sidebar scroll (content height beyond the visible area).
@@ -397,14 +398,14 @@ struct State {
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Close-button ('×') hit rects as last rendered, for tabs and workspaces.
-    close_hits: Vec<(Rect, CloseTarget)>,
-    /// Index into `close_hits` of the close button under the cursor, if any — used
+    buttons: Vec<(Rect, ButtonAction)>,
+    /// Index into `buttons` of the close button under the cursor, if any — used
     /// to redraw only when the hovered button changes.
-    close_hover: Option<usize>,
+    button_hover: Option<usize>,
     /// A close button pressed but not yet released. It fires on release only if
     /// the cursor is still over the same button, so a press can be cancelled by
     /// moving away before releasing.
-    armed_close: Option<CloseTarget>,
+    armed_button: Option<ButtonAction>,
     /// Single shaped '×' glyph, placed at each close button (one buffer, many
     /// placements). Reshaped on a metrics change like the other chrome buffers.
     close_buffer: Buffer,
@@ -541,13 +542,16 @@ struct PaneRender {
     surfaces: Vec<(SurfaceId, String, bool)>,
 }
 
-/// What a close ('×') button removes when clicked.
+/// What a clickable chrome button does. All buttons share hover-highlight and
+/// arm-on-press/fire-on-release behaviour (see `arm_button`/`fire_button`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CloseTarget {
-    /// A workspace (vtab) in the sidebar.
-    Vtab(VtabId),
-    /// One tab (surface) within a pane's horizontal tab strip.
-    Surface(VtabId, PaneId, SurfaceId),
+enum ButtonAction {
+    /// Open a new workspace (the sidebar's "+ New workspace").
+    NewVtab,
+    /// Close a workspace (vtab) from the sidebar.
+    CloseVtab(VtabId),
+    /// Close one tab (surface) in a pane's horizontal tab strip.
+    CloseSurface(VtabId, PaneId, SurfaceId),
 }
 
 impl State {
@@ -702,21 +706,15 @@ impl State {
             strip_buffers: Vec::new(),
             menu: None,
             menu_buffers: Vec::new(),
-            new_tab_button: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 0.0,
-                h: 0.0,
-            },
             sidebar_scroll: 0.0,
             sidebar_max_scroll: 0.0,
             scroll_accum: 0.0,
             pending_scroll: 0,
             pending_scroll_target: None,
             sidebar_rows: Vec::new(),
-            close_hits: Vec::new(),
-            close_hover: None,
-            armed_close: None,
+            buttons: Vec::new(),
+            button_hover: None,
+            armed_button: None,
             close_buffer,
             selection: None,
             mouse_down: false,
@@ -907,9 +905,11 @@ impl State {
         self.cell_h + 6.0 * self.scale
     }
 
-    /// Whether a pane with `n` surfaces shows a tab strip.
-    fn strip_shown(&self, n: usize) -> bool {
-        n > 1 || !self.cfg.tabs.autohide_single_tab
+    /// Whether a pane shows a tab strip: when it has multiple surfaces, when
+    /// autohide is off, or when the active surface is an editor (which always
+    /// shows a filename ribbon, even as the only tab).
+    fn strip_shown(&self, n: usize, active_is_editor: bool) -> bool {
+        n > 1 || !self.cfg.tabs.autohide_single_tab || active_is_editor
     }
 
     /// The active vtab's panes with full surface info, laid out in `workspace`.
@@ -986,51 +986,53 @@ impl State {
             .map(|(_, id)| *id)
     }
 
-    /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
-    /// The close button under the cursor, if any.
-    fn close_target_at_cursor(&self) -> Option<CloseTarget> {
+    /// The chrome button under the cursor, if any.
+    fn button_at_cursor(&self) -> Option<ButtonAction> {
         let (x, y) = self.cursor;
-        self.close_hits
+        self.buttons
             .iter()
             .find(|(r, _)| rect_contains(*r, x, y))
             .map(|&(_, t)| t)
     }
 
-    /// Mouse-down over a close button arms it (fires later on release), so a press
-    /// can be cancelled by moving away before releasing. Returns whether one was
-    /// armed (the caller then suppresses selection/focus for this press).
-    fn arm_close(&mut self) -> bool {
-        self.armed_close = self.close_target_at_cursor();
-        self.armed_close.is_some()
+    /// Mouse-down over a button arms it (fires later on release), so a press can
+    /// be cancelled by moving away before releasing. Returns whether one was armed
+    /// (the caller then suppresses selection/focus for this press).
+    fn arm_button(&mut self) -> bool {
+        self.armed_button = self.button_at_cursor();
+        self.armed_button.is_some()
     }
 
-    /// Mouse-up: fire the armed close only if the cursor is still over the same
-    /// button. Returns whether something was closed.
-    fn fire_close(&mut self) -> bool {
-        let Some(armed) = self.armed_close.take() else {
+    /// Mouse-up: run the armed button only if the cursor is still over the same
+    /// one. Returns whether it fired.
+    fn fire_button(&mut self) -> bool {
+        let Some(armed) = self.armed_button.take() else {
             return false;
         };
-        if self.close_target_at_cursor() != Some(armed) {
+        if self.button_at_cursor() != Some(armed) {
             return false; // released off the button — cancelled
         }
         match armed {
-            CloseTarget::Vtab(id) => self.app.close_vtab(id),
-            CloseTarget::Surface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
+            ButtonAction::NewVtab => {
+                let _ = self.app.new_vtab();
+            }
+            ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
+            ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
         }
         self.dirty = true;
         true
     }
 
-    /// Recompute which close button is under the cursor; returns whether it
-    /// changed, so the caller redraws only when the hover highlight must move.
-    fn update_close_hover(&mut self) -> bool {
+    /// Recompute which button is under the cursor; returns whether it changed, so
+    /// the caller redraws only when the hover highlight must move.
+    fn update_button_hover(&mut self) -> bool {
         let (x, y) = self.cursor;
         let now = self
-            .close_hits
+            .buttons
             .iter()
             .position(|(r, _)| rect_contains(*r, x, y));
-        if now != self.close_hover {
-            self.close_hover = now;
+        if now != self.button_hover {
+            self.button_hover = now;
             self.dirty = true;
             true
         } else {
@@ -1049,11 +1051,8 @@ impl State {
         }
         let (x, y) = self.cursor;
         if self.in_sidebar(x) {
-            if rect_contains(self.new_tab_button, x, y) {
-                let _ = self.app.new_vtab();
-                self.dirty = true;
-                return;
-            }
+            // The "+ New workspace" button is a chrome button (arm/fire on
+            // release); here we only handle selecting a workspace row.
             if let Some(id) = self.sidebar_vtab_at(x, y) {
                 self.app.focus_vtab(id);
                 self.dirty = true;
@@ -1083,8 +1082,16 @@ impl State {
         });
         let Some((pid, rect, n)) = hit else { return };
 
+        let active_sid = self
+            .app
+            .tree
+            .vtab(vt)
+            .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
+            .and_then(|p| p.active_surface().map(|s| s.id));
+        let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
+
         // A click in a visible tab strip switches the pane's active surface.
-        let strip_h = if self.strip_shown(n) {
+        let strip_h = if self.strip_shown(n, active_is_editor) {
             self.strip_height()
         } else {
             0.0
@@ -1094,6 +1101,19 @@ impl State {
             let idx = (((x - rect.x) / tab_w).floor() as usize).min(n - 1);
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
                 pane.active = idx;
+            }
+        } else if active_is_editor {
+            // A click in the editor body moves the text cursor to that position.
+            if let Some(sid) = active_sid {
+                let term_y = rect.y + strip_h;
+                let row_off = ((y - term_y) / self.cell_h).floor().max(0.0) as usize;
+                let col_off = ((x - rect.x) / self.cell_w).round().max(0.0) as usize;
+                if let Some(e) = self.app.editor_mut(sid) {
+                    let row = (e.scroll + row_off).min(e.lines.len().saturating_sub(1));
+                    let col = col_off.min(e.line_len(row));
+                    e.cursor = (row, col);
+                    e.clear_selection();
+                }
             }
         }
         if let Some(vtab) = self.app.tree.vtab_mut(vt) {
@@ -1303,7 +1323,7 @@ impl State {
             }
             let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
             let sid = pane.active_surface()?.id;
-            let strip_h = if self.strip_shown(pane.surfaces.len()) {
+            let strip_h = if self.strip_shown(pane.surfaces.len(), self.app.is_editor(sid)) {
                 self.strip_height()
             } else {
                 0.0
@@ -1628,18 +1648,33 @@ impl State {
 
         // Pinned "+" new-workspace button at the very top.
         let btn_y = pad;
-        self.new_tab_button = Rect {
+        let btn = Rect {
             x: bar_x,
             y: btn_y,
             w: bar_w,
             h: row_h,
+        };
+        let btn_hovered = rect_contains(btn, self.cursor.0, self.cursor.1);
+        if btn_hovered {
+            quads.push(rect_quad(
+                inset(btn, 4.0 * self.scale),
+                sw,
+                sh,
+                BUTTON_HOVER_BG,
+                BUTTON_HOVER_ALPHA,
+            ));
+        }
+        let btn_color = if btn_hovered {
+            NEW_VTAB_LABEL_HOVER
+        } else {
+            NEW_VTAB_LABEL
         };
         {
             let buf = &mut self.sidebar_buffers[n];
             buf.set_metrics(metrics);
             buf.set_size(Some((bar_w - pad * 2.0).max(1.0)), Some(self.cell_h));
             buf.set_rich_text(
-                std::iter::once(("+  New workspace", attrs_for([150, 150, 165]))),
+                std::iter::once(("+  New workspace", attrs_for(btn_color))),
                 &Attrs::new().family(Family::SansSerif),
                 Shaping::Advanced,
                 None,
@@ -1656,8 +1691,9 @@ impl State {
                 right: (bar_x + bar_w) as i32,
                 bottom: (btn_y + row_h) as i32,
             },
-            color: [150, 150, 165],
+            color: btn_color,
         });
+        self.buttons.push((btn, ButtonAction::NewVtab));
 
         // Scrollable workspace list below the pinned button.
         let list_top = pad + row_h;
@@ -1750,8 +1786,8 @@ impl State {
                     hover_box(hit, close_w),
                     sw,
                     sh,
-                    CLOSE_HOVER_BG,
-                    CLOSE_HOVER_ALPHA,
+                    BUTTON_HOVER_BG,
+                    BUTTON_HOVER_ALPHA,
                 ));
             }
             close_placements.push(Placement {
@@ -1766,7 +1802,7 @@ impl State {
                 },
                 color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
             });
-            self.close_hits.push((hit, CloseTarget::Vtab(*id)));
+            self.buttons.push((hit, ButtonAction::CloseVtab(*id)));
         }
 
         placements
@@ -2729,7 +2765,12 @@ impl State {
         // Resolve each pane's tab-strip height and terminal (below-strip) rect.
         let mut resolved: Vec<(PaneRender, f32, Rect)> = Vec::with_capacity(panes.len());
         for pr in panes {
-            let strip_h = if self.strip_shown(pr.surfaces.len()) {
+            let active_is_editor = pr
+                .surfaces
+                .iter()
+                .find(|(_, _, a)| *a)
+                .is_some_and(|(sid, _, _)| self.app.is_editor(*sid));
+            let strip_h = if self.strip_shown(pr.surfaces.len(), active_is_editor) {
                 self.strip_height()
             } else {
                 0.0
@@ -2785,7 +2826,7 @@ impl State {
 
         // Close-button chrome: one shared '×' glyph placed at every tab/workspace
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
-        self.close_hits.clear();
+        self.buttons.clear();
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
         self.close_buffer.set_metrics(metrics);
@@ -2879,8 +2920,8 @@ impl State {
                                 hover_box(hit, close_w),
                                 sw,
                                 sh,
-                                CLOSE_HOVER_BG,
-                                CLOSE_HOVER_ALPHA,
+                                BUTTON_HOVER_BG,
+                                BUTTON_HOVER_ALPHA,
                             ));
                         }
                         close_placements.push(Placement {
@@ -2895,7 +2936,7 @@ impl State {
                             },
                             color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
                         });
-                        self.close_hits.push((hit, CloseTarget::Surface(vt, pr.id, *sid)));
+                        self.buttons.push((hit, ButtonAction::CloseSurface(vt, pr.id, *sid)));
                     }
                 }
             }
@@ -3489,6 +3530,16 @@ fn row_content_len(grid: &Grid, row: u16) -> u16 {
         }
     }
     len
+}
+
+/// `r` shrunk by `by` on every side (for a full-area hover highlight).
+fn inset(r: Rect, by: f32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: (r.w - 2.0 * by).max(0.0),
+        h: (r.h - 2.0 * by).max(0.0),
+    }
 }
 
 /// A centred square inside `hit` of side `side` (inset a little), for the close

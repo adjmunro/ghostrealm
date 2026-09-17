@@ -73,7 +73,7 @@ impl EditorBuffer {
             .unwrap_or_else(|| "*scratch*".to_string())
     }
 
-    fn line_len(&self, row: usize) -> usize {
+    pub fn line_len(&self, row: usize) -> usize {
         self.lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
     }
 
