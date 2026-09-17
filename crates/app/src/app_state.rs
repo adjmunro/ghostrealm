@@ -86,6 +86,15 @@ impl AppState {
         self.default_dir = dir;
     }
 
+    /// The directory associated with `vt` for its sidebar label: the workspace's
+    /// pinned root, else the app default (else `None`).
+    pub fn vtab_dir(&self, vt: VtabId) -> Option<std::path::PathBuf> {
+        self.tree
+            .vtab(vt)
+            .and_then(|v| v.root_dir.clone())
+            .or_else(|| self.default_dir.clone())
+    }
+
     /// The directory a new surface in `vt` should start in: the workspace's pinned
     /// root, else the app default (else the shell's default when `None`).
     fn resolve_cwd(&self, vt: VtabId) -> Option<std::path::PathBuf> {

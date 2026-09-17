@@ -19,7 +19,7 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState};
+use crate::app_state::{build_registry, AppState, SETTINGS_VTAB_NAME};
 use crate::editor::Motion;
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
@@ -1700,12 +1700,29 @@ impl State {
         let text_x = bar_x + pad + dot + 6.0 * self.scale;
         let metrics = self.metrics();
         let active = self.app.tree.active_vtab();
-        let vtabs: Vec<(ghostrealm_core::VtabId, String, TabStatus, bool)> = self
+        #[allow(clippy::type_complexity)]
+        let vtabs: Vec<(
+            ghostrealm_core::VtabId,
+            String,
+            bool,
+            TabStatus,
+            bool,
+            Option<std::path::PathBuf>,
+        )> = self
             .app
             .tree
             .vtabs()
             .iter()
-            .map(|v| (v.id, v.name.clone(), v.status, Some(v.id) == active))
+            .map(|v| {
+                (
+                    v.id,
+                    v.name.clone(),
+                    v.user_named,
+                    v.status,
+                    Some(v.id) == active,
+                    self.app.vtab_dir(v.id),
+                )
+            })
             .collect();
         let n = vtabs.len();
 
@@ -1775,21 +1792,51 @@ impl State {
         });
         self.buttons.push((btn, ButtonAction::NewVtab));
 
-        // Scrollable workspace list below the pinned button.
+        // Scrollable workspace list below the pinned button. Rows are variable
+        // height: an unnamed workspace shows just its (shortened) directory on one
+        // line; a renamed one shows the name over a greyed directory on two lines.
         let list_top = pad + row_h;
         let visible_h = (sh - list_top).max(0.0);
-        self.sidebar_max_scroll = (n as f32 * row_h - visible_h).max(0.0);
+        let vpad = 8.0 * self.scale;
+        let close_w = self.cell_h;
+        let close_x = bar_x + bar_w - close_w - pad;
+        let text_w_chars = (((close_x - text_x) / self.cell_w).floor() as usize).max(3);
+
+        // Per-row display + height.
+        let dir_color = [140, 140, 155];
+        let name_color = [220, 220, 230];
+        let mut rows: Vec<(bool, Option<String>, String, bool)> = Vec::with_capacity(n);
+        let mut heights: Vec<f32> = Vec::with_capacity(n);
+        for (_id, name, user_named, _status, _active, dir) in &vtabs {
+            let dir_short = dir.as_ref().map(|d| shorten_dir(d, text_w_chars));
+            let two_line = *user_named && dir_short.is_some();
+            // Line 1 label: the name if named, else the directory shorthand
+            // (falling back to the stored name only when there's no directory).
+            let label = if *user_named {
+                name.clone()
+            } else {
+                dir_short.clone().unwrap_or_else(|| name.clone())
+            };
+            heights.push(if two_line { 2.0 } else { 1.0 } * self.cell_h + vpad);
+            rows.push((two_line, dir_short, label, name.as_str() == SETTINGS_VTAB_NAME));
+        }
+        let total: f32 = heights.iter().sum();
+        self.sidebar_max_scroll = (total - visible_h).max(0.0);
         self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, self.sidebar_max_scroll);
         let scroll = self.sidebar_scroll;
 
         self.sidebar_rows.clear();
-        for (i, (id, name, status, is_active)) in vtabs.iter().enumerate() {
-            let y = list_top + i as f32 * row_h - scroll;
-            if y + row_h <= list_top || y >= sh {
+        let mut y = list_top - scroll;
+        for (i, (id, _name, _user_named, status, is_active, _dir)) in vtabs.iter().enumerate() {
+            let (two_line, dir_short, label, is_settings) = &rows[i];
+            let text_h = if *two_line { 2.0 * self.cell_h } else { self.cell_h };
+            let rh = heights[i];
+            if y + rh <= list_top || y >= sh {
+                y += rh;
                 continue; // scrolled out of the list viewport
             }
             let vis_top = y.max(list_top);
-            let vis_bot = (y + row_h).min(sh);
+            let vis_bot = (y + rh).min(sh);
             self.sidebar_rows.push((
                 Rect {
                     x: bar_x,
@@ -1813,7 +1860,7 @@ impl State {
                     1.0,
                 ));
             }
-            let dot_y = y + (row_h - dot) * 0.5;
+            let dot_y = y + (rh - dot) * 0.5;
             if dot_y >= list_top && dot_y + dot <= sh {
                 quads.push(rect_quad(
                     Rect {
@@ -1828,39 +1875,57 @@ impl State {
                     1.0,
                 ));
             }
-            let close_w = self.cell_h;
-            let close_x = bar_x + bar_w - close_w - pad;
-            // The settings workspace shows its name in italics.
-            let mut name_attrs = Attrs::new()
+            let name_attrs = || {
+                let a = Attrs::new()
+                    .family(Family::SansSerif)
+                    .color(Color::rgb(name_color[0], name_color[1], name_color[2]));
+                if *is_settings {
+                    a.style(Style::Italic)
+                } else {
+                    a
+                }
+            };
+            let dir_attrs = Attrs::new()
                 .family(Family::SansSerif)
-                .color(Color::rgb(220, 220, 230));
-            if name == crate::app_state::SETTINGS_VTAB_NAME {
-                name_attrs = name_attrs.style(Style::Italic);
-            }
+                .color(Color::rgb(dir_color[0], dir_color[1], dir_color[2]));
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
-            // Leave room on the right for the close button.
-            buf.set_size(Some((close_x - text_x).max(1.0)), Some(self.cell_h));
-            buf.set_rich_text(
-                std::iter::once((name.as_str(), name_attrs)),
-                &Attrs::new().family(Family::SansSerif),
-                Shaping::Advanced,
-                None,
-            );
+            buf.set_wrap(Wrap::None);
+            buf.set_size(Some((close_x - text_x).max(1.0)), Some(text_h));
+            if *two_line {
+                let dir_s = dir_short.clone().unwrap_or_default();
+                buf.set_rich_text(
+                    [
+                        (label.as_str(), name_attrs()),
+                        ("\n", name_attrs()),
+                        (dir_s.as_str(), dir_attrs),
+                    ],
+                    &Attrs::new().family(Family::SansSerif),
+                    Shaping::Advanced,
+                    None,
+                );
+            } else {
+                buf.set_rich_text(
+                    std::iter::once((label.as_str(), name_attrs())),
+                    &Attrs::new().family(Family::SansSerif),
+                    Shaping::Advanced,
+                    None,
+                );
+            }
             buf.shape_until_scroll(&mut self.font_system, false);
             placements.push(Placement {
                 idx: i,
                 left: text_x,
-                top: y + (row_h - self.cell_h) * 0.5,
+                top: y + (rh - text_h) * 0.5,
                 bounds: TextBounds {
                     left: bar_x as i32,
                     top: vis_top as i32,
                     right: close_x as i32,
                     bottom: vis_bot as i32,
                 },
-                color: [220, 220, 230],
+                color: name_color,
             });
-            // Close ('×') button for this workspace.
+            // Close ('×') button for this workspace (centred vertically in the row).
             let hit = Rect {
                 x: close_x,
                 y: vis_top,
@@ -1880,7 +1945,7 @@ impl State {
             close_placements.push(Placement {
                 idx: 0,
                 left: close_x + (close_w - self.cell_w) * 0.5,
-                top: y + (row_h - self.cell_h) * 0.5,
+                top: y + (rh - self.cell_h) * 0.5,
                 bounds: TextBounds {
                     left: close_x as i32,
                     top: vis_top as i32,
@@ -1890,6 +1955,7 @@ impl State {
                 color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
             });
             self.buttons.push((hit, ButtonAction::CloseVtab(*id)));
+            y += rh;
         }
 
         placements
@@ -3884,6 +3950,42 @@ fn keybindable_commands(registry: &Registry<AppState>) -> Vec<(&'static str, &'s
         .collect();
     cmds.extend_from_slice(SPECIAL_COMMANDS);
     cmds
+}
+
+/// A compact directory label that fits in `max` characters, no wrap/overflow:
+/// prefer "parent/current", else "current", else "curr…" truncated with an
+/// ellipsis. `~` is substituted for the home directory's own segment.
+fn shorten_dir(path: &std::path::Path, max: usize) -> String {
+    let seg = |p: &std::path::Path| -> Option<String> {
+        p.file_name().and_then(|s| s.to_str()).map(str::to_string)
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let name = if Some(path) == home.as_deref() {
+        "~".to_string()
+    } else {
+        seg(path).unwrap_or_else(|| path.to_string_lossy().into_owned())
+    };
+    let parent = path.parent().and_then(|p| {
+        if Some(p) == home.as_deref() {
+            Some("~".to_string())
+        } else {
+            seg(p)
+        }
+    });
+    if let Some(par) = parent {
+        let combined = format!("{par}/{name}");
+        if combined.chars().count() <= max {
+            return combined;
+        }
+    }
+    if name.chars().count() <= max {
+        return name;
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let head: String = name.chars().take(max - 1).collect();
+    format!("{head}…")
 }
 
 /// Locale for cosmic-text font fallback, derived from `$LANG` (e.g.
