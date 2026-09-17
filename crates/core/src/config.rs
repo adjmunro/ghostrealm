@@ -177,7 +177,7 @@ pub struct Config {
     pub editor: Editor,
     pub input: Input,
     pub inbox: Inbox,
-    /// `[keybindings]`: chord -> command id, overlaying the built-in defaults.
+    /// `[keybindings]`: command id -> chord, overlaying the built-in defaults.
     /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
     /// app handles specially (open the command palette).
     pub keybindings: HashMap<String, String>,
@@ -187,16 +187,7 @@ impl Config {
     /// The resolved default directory for new workspaces (`~` expanded), or `None`
     /// (meaning `$HOME` / the shell's default).
     pub fn default_dir(&self) -> Option<PathBuf> {
-        let s = self.default_directory.as_ref()?.trim();
-        if s.is_empty() {
-            return None;
-        }
-        if let Some(rest) = s.strip_prefix('~') {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(rest.trim_start_matches('/')))
-        } else {
-            Some(PathBuf::from(s))
-        }
+        expand_tilde(self.default_directory.as_deref()?)
     }
 
     /// The chrome colours to use: an explicit `[chrome]` if set, else colours
@@ -212,6 +203,7 @@ impl Config {
 
     /// The chord bound to a command id (for showing shortcuts in the palette): a
     /// user override wins over the built-in default. Returns the canonical chord.
+    /// The config's `[keybindings]` maps `command id -> chord`.
     pub fn binding_for(&self, id: &str) -> Option<String> {
         // The config's `[keybindings]` is authoritative when present; the built-in
         // defaults apply only when it's empty (fresh/unconfigured).
@@ -221,15 +213,12 @@ impl Config {
                 .find(|(_, v)| *v == id)
                 .map(|(k, _)| k.to_string());
         }
-        self.keybindings
-            .iter()
-            .find(|(_, v)| v.as_str() == id)
-            .and_then(|(k, _)| normalize_chord(k))
+        self.keybindings.get(id).and_then(|c| normalize_chord(c))
     }
 
     /// Resolve a chord (any modifier order/alias) to a command id. The config's
-    /// `[keybindings]` is authoritative when present; an empty section falls back
-    /// to the built-in defaults.
+    /// `[keybindings]` (`command id -> chord`) is authoritative when present; an
+    /// empty section falls back to the built-in defaults.
     pub fn binding(&self, chord: &str) -> Option<String> {
         let target = normalize_chord(chord)?;
         if self.keybindings.is_empty() {
@@ -239,8 +228,8 @@ impl Config {
         }
         self.keybindings
             .iter()
-            .find(|(k, _)| normalize_chord(k).as_deref() == Some(target.as_str()))
-            .map(|(_, v)| v.clone())
+            .find(|(_, c)| normalize_chord(c).as_deref() == Some(target.as_str()))
+            .map(|(id, _)| id.clone())
     }
 }
 
@@ -340,13 +329,34 @@ auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time befo
 auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an auto-read to re-mark unread on unfocus
 
 [keybindings]
-# "chord" = "command id". Cmd chords only (other keys go to the terminal); any
+# "command id" = "chord". Cmd chords only (other keys go to the terminal); any
 # modifier order/alias works (cmd/super/meta, opt/alt). This section is the
 # complete, authoritative set of bindings — every command is listed below, bound
 # ones as active lines and unbound ones commented out. Edit a chord to rebind,
-# delete or comment a line to unbind, or uncomment a line and add a chord to
+# delete or comment a line to unbind, or uncomment a line and set its chord to
 # bind it. If the whole section is empty, the built-in defaults apply.
 "#;
+
+/// Documentation for the top-level `default_directory` key (backfilled into the
+/// preamble of an older config that lacks it).
+const DEFAULT_DIRECTORY_DOC: &str = "\
+# default_directory (string path | unset) — base directory new workspaces start in
+#   (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
+# default_directory = \"~/Developer\"";
+
+/// Expand a user-entered directory: trims whitespace, expands a leading `~` to
+/// `$HOME`; `None` for an empty string. Does not check existence.
+pub fn expand_tilde(s: &str) -> Option<PathBuf> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('~') {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest.trim_start_matches('/')))
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
 
 /// The config file path: `$XDG_CONFIG_HOME/ghostrealm/config.toml`, falling back
 /// to `~/.config/ghostrealm/config.toml`.
@@ -390,8 +400,8 @@ fn keybindings_lines(commands: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (id, title) in cmds {
         match chord_for(id) {
-            Some(chord) => out.push_str(&format!("\"{chord}\" = \"{id}\"  # {title}\n")),
-            None => out.push_str(&format!("# \"cmd+?\" = \"{id}\"  # {title} (unbound)\n")),
+            Some(chord) => out.push_str(&format!("\"{id}\" = \"{chord}\"  # {title}\n")),
+            None => out.push_str(&format!("# \"{id}\" = \"cmd+?\"  # {title} (unbound)\n")),
         }
     }
     out
@@ -469,6 +479,13 @@ pub fn backfill_text(text: &str, commands: &[(&str, &str)]) -> Option<String> {
     let sections = template_sections();
     let mut result = text.to_string();
     let mut changed = false;
+
+    // The top-level `default_directory` key is documented in the preamble (a bare
+    // key must precede all [section] headers), so prepend its doc block if absent.
+    if !result.contains("default_directory") {
+        result = format!("{DEFAULT_DIRECTORY_DOC}\n{result}");
+        changed = true;
+    }
 
     for (name, block) in &sections {
         if name == "keybindings" || present.contains(name) {
@@ -659,10 +676,13 @@ mod tests {
         // cmd+k is no longer a default (the palette opens on double-Shift).
         assert_eq!(cfg.binding("cmd+k"), None);
         assert_eq!(cfg.binding("cmd+j"), None);
-        // A user override wins, in any modifier order/alias.
+        // Authoritative once present: `command id = chord`. Any modifier
+        // order/alias resolves; ids not listed are unbound.
         cfg.keybindings
-            .insert("Super+T".to_string(), "tab.close".to_string());
+            .insert("tab.close".to_string(), "Super+T".to_string());
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.close"));
+        assert_eq!(cfg.binding_for("tab.close").as_deref(), Some("cmd+t"));
+        assert_eq!(cfg.binding("cmd+n"), None); // not in the authoritative set
     }
 }
 

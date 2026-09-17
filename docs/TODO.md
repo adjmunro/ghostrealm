@@ -404,3 +404,14 @@
   case (long lines currently clip at the pane edge); terminal grid already wraps to
   its column count, so the terminal button may be a near no-op or drive ghostty wrap.
 - Reason: readable long lines without horizontal scrolling.
+
+---
+
+[2026-09-18@09c015c]
+
+- Requires: NO BLOCKERS
+- Detail: Editor undo/redo (Cmd+Z / Cmd+Shift+Z). Needs an edit-history stack on
+  EditorBuffer (snapshots or a reversible op log with coalescing of consecutive
+  typing into one undo step), wired to the key handler. User has further ideas on
+  scope/behaviour — discuss before building.
+- Reason: basic editing expectation; currently edits can't be undone.
