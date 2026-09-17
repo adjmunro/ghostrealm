@@ -387,3 +387,20 @@
   takes an alpha arg) and the wgpu surface (transparent framebuffer + composited
   window; on macOS set the window/layer opaque=false and clear with alpha).
 - Reason: nicer theming and a translucent-terminal aesthetic.
+
+---
+
+[2026-09-18@6577576]
+
+- Requires: NO BLOCKERS (sizeable; own pass)
+- Detail: Soft-wrap toggle. A sticky icon button in the top-right of terminal AND
+  editor panes toggles per-surface soft-wrap; config default (e.g. `editor.soft_wrap`)
+  defaults ON. The button itself is easy (shared button system: hover + fire on
+  release). The hard part is RENDERING: wrapped lines take multiple visual rows
+  (variable row height), so the fixed 1-logical-row = 1-cell_h layout must become
+  visual-line aware — cursor placement, click→(line,col) mapping, and scrolling all
+  need visual-vs-logical translation, and the content-keyed row cache must fold the
+  wrap width into its key (wrap layout is width-dependent). Editor is the meaningful
+  case (long lines currently clip at the pane edge); terminal grid already wraps to
+  its column count, so the terminal button may be a near no-op or drive ghostty wrap.
+- Reason: readable long lines without horizontal scrolling.
