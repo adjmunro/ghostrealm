@@ -260,8 +260,12 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                state.on_click();
-                state.begin_selection();
+                // A close button arms on press and fires on release (so it can be
+                // cancelled); other clicks act on press as before.
+                if !state.arm_close() {
+                    state.on_click();
+                    state.begin_selection();
+                }
                 state.window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -269,7 +273,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                state.fire_close();
                 state.end_selection();
+                state.window.request_redraw();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -395,6 +401,10 @@ struct State {
     /// Index into `close_hits` of the close button under the cursor, if any — used
     /// to redraw only when the hovered button changes.
     close_hover: Option<usize>,
+    /// A close button pressed but not yet released. It fires on release only if
+    /// the cursor is still over the same button, so a press can be cancelled by
+    /// moving away before releasing.
+    armed_close: Option<CloseTarget>,
     /// Single shaped '×' glyph, placed at each close button (one buffer, many
     /// placements). Reshaped on a metrics change like the other chrome buffers.
     close_buffer: Buffer,
@@ -532,7 +542,7 @@ struct PaneRender {
 }
 
 /// What a close ('×') button removes when clicked.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseTarget {
     /// A workspace (vtab) in the sidebar.
     Vtab(VtabId),
@@ -704,6 +714,7 @@ impl State {
             sidebar_rows: Vec::new(),
             close_hits: Vec::new(),
             close_hover: None,
+            armed_close: None,
             close_buffer,
             selection: None,
             mouse_down: false,
@@ -971,6 +982,40 @@ impl State {
     }
 
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
+    /// The close button under the cursor, if any.
+    fn close_target_at_cursor(&self) -> Option<CloseTarget> {
+        let (x, y) = self.cursor;
+        self.close_hits
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|&(_, t)| t)
+    }
+
+    /// Mouse-down over a close button arms it (fires later on release), so a press
+    /// can be cancelled by moving away before releasing. Returns whether one was
+    /// armed (the caller then suppresses selection/focus for this press).
+    fn arm_close(&mut self) -> bool {
+        self.armed_close = self.close_target_at_cursor();
+        self.armed_close.is_some()
+    }
+
+    /// Mouse-up: fire the armed close only if the cursor is still over the same
+    /// button. Returns whether something was closed.
+    fn fire_close(&mut self) -> bool {
+        let Some(armed) = self.armed_close.take() else {
+            return false;
+        };
+        if self.close_target_at_cursor() != Some(armed) {
+            return false; // released off the button — cancelled
+        }
+        match armed {
+            CloseTarget::Vtab(id) => self.app.close_vtab(id),
+            CloseTarget::Surface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
+        }
+        self.dirty = true;
+        true
+    }
+
     /// Recompute which close button is under the cursor; returns whether it
     /// changed, so the caller redraws only when the hover highlight must move.
     fn update_close_hover(&mut self) -> bool {
@@ -981,6 +1026,7 @@ impl State {
             .position(|(r, _)| rect_contains(*r, x, y));
         if now != self.close_hover {
             self.close_hover = now;
+            self.dirty = true;
             true
         } else {
             false
@@ -997,15 +1043,6 @@ impl State {
             return;
         }
         let (x, y) = self.cursor;
-        // A click on a close ('×') button removes that tab or workspace.
-        if let Some(&(_, target)) = self.close_hits.iter().find(|(r, _)| rect_contains(*r, x, y)) {
-            match target {
-                CloseTarget::Vtab(id) => self.app.close_vtab(id),
-                CloseTarget::Surface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
-            }
-            self.dirty = true;
-            return;
-        }
         if self.in_sidebar(x) {
             if rect_contains(self.new_tab_button, x, y) {
                 let _ = self.app.new_vtab();
