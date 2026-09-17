@@ -76,8 +76,13 @@ const MAX_PENDING_SCROLL: i32 = 600;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
-/// Close-button ('×') glyph colour — dim so it reads as a secondary affordance.
+/// Close-button ('×') glyph colour — dim so it reads as a secondary affordance,
+/// brighter under the cursor.
 const CLOSE_GLYPH: [u8; 3] = [140, 140, 155];
+const CLOSE_GLYPH_HOVER: [u8; 3] = [235, 235, 245];
+/// Highlight box drawn behind a close button on hover.
+const CLOSE_HOVER_BG: [u8; 3] = [255, 255, 255];
+const CLOSE_HOVER_ALPHA: f32 = 0.14;
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -234,19 +239,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = (position.x as f32, position.y as f32);
+                let mut redraw = false;
                 if state.palette.is_some() {
-                    if state.palette_hover() {
-                        state.window.request_redraw();
-                    }
+                    redraw |= state.palette_hover();
                 } else if state.menu.is_some() {
-                    if state.menu_hover() {
-                        state.window.request_redraw();
-                    }
+                    redraw |= state.menu_hover();
                 } else if state.mouse_down {
-                    if state.update_selection() {
-                        state.window.request_redraw();
-                    }
+                    redraw |= state.update_selection();
                 } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
+                    redraw = true;
+                }
+                // Close-button hover highlight tracks the cursor everywhere.
+                redraw |= state.update_close_hover();
+                if redraw {
                     state.window.request_redraw();
                 }
             }
@@ -387,6 +392,9 @@ struct State {
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Close-button ('×') hit rects as last rendered, for tabs and workspaces.
     close_hits: Vec<(Rect, CloseTarget)>,
+    /// Index into `close_hits` of the close button under the cursor, if any — used
+    /// to redraw only when the hovered button changes.
+    close_hover: Option<usize>,
     /// Single shaped '×' glyph, placed at each close button (one buffer, many
     /// placements). Reshaped on a metrics change like the other chrome buffers.
     close_buffer: Buffer,
@@ -695,6 +703,7 @@ impl State {
             pending_scroll_target: None,
             sidebar_rows: Vec::new(),
             close_hits: Vec::new(),
+            close_hover: None,
             close_buffer,
             selection: None,
             mouse_down: false,
@@ -962,6 +971,22 @@ impl State {
     }
 
     /// Handle a left click: switch vtab (sidebar) or focus a pane (workspace).
+    /// Recompute which close button is under the cursor; returns whether it
+    /// changed, so the caller redraws only when the hover highlight must move.
+    fn update_close_hover(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        let now = self
+            .close_hits
+            .iter()
+            .position(|(r, _)| rect_contains(*r, x, y));
+        if now != self.close_hover {
+            self.close_hover = now;
+            true
+        } else {
+            false
+        }
+    }
+
     fn on_click(&mut self) {
         if self.palette.is_some() {
             self.palette_click();
@@ -1671,6 +1696,22 @@ impl State {
                 color: [220, 220, 230],
             });
             // Close ('×') button for this workspace.
+            let hit = Rect {
+                x: close_x,
+                y: vis_top,
+                w: close_w,
+                h: (vis_bot - vis_top).max(0.0),
+            };
+            let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
+            if hovered {
+                quads.push(rect_quad(
+                    hover_box(hit, close_w),
+                    sw,
+                    sh,
+                    CLOSE_HOVER_BG,
+                    CLOSE_HOVER_ALPHA,
+                ));
+            }
             close_placements.push(Placement {
                 idx: 0,
                 left: close_x + (close_w - self.cell_w) * 0.5,
@@ -1681,17 +1722,9 @@ impl State {
                     right: (close_x + close_w) as i32,
                     bottom: vis_bot as i32,
                 },
-                color: CLOSE_GLYPH,
+                color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
             });
-            self.close_hits.push((
-                Rect {
-                    x: close_x,
-                    y: vis_top,
-                    w: close_w,
-                    h: (vis_bot - vis_top).max(0.0),
-                },
-                CloseTarget::Vtab(*id),
-            ));
+            self.close_hits.push((hit, CloseTarget::Vtab(*id)));
         }
 
         placements
@@ -2792,6 +2825,22 @@ impl State {
                     strip_idx += 1;
                     // Close ('×') button for this tab.
                     if let Some(vt) = active_vt {
+                        let hit = Rect {
+                            x: close_x,
+                            y: pr.rect.y,
+                            w: close_w,
+                            h: *strip_h,
+                        };
+                        let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
+                        if hovered {
+                            bg_quads.push(rect_quad(
+                                hover_box(hit, close_w),
+                                sw,
+                                sh,
+                                CLOSE_HOVER_BG,
+                                CLOSE_HOVER_ALPHA,
+                            ));
+                        }
                         close_placements.push(Placement {
                             idx: 0,
                             left: close_x + (close_w - self.cell_w) * 0.5,
@@ -2802,17 +2851,9 @@ impl State {
                                 right: (close_x + close_w) as i32,
                                 bottom: (pr.rect.y + *strip_h) as i32,
                             },
-                            color: CLOSE_GLYPH,
+                            color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
                         });
-                        self.close_hits.push((
-                            Rect {
-                                x: close_x,
-                                y: pr.rect.y,
-                                w: close_w,
-                                h: *strip_h,
-                            },
-                            CloseTarget::Surface(vt, pr.id, *sid),
-                        ));
+                        self.close_hits.push((hit, CloseTarget::Surface(vt, pr.id, *sid)));
                     }
                 }
             }
@@ -3406,6 +3447,18 @@ fn row_content_len(grid: &Grid, row: u16) -> u16 {
         }
     }
     len
+}
+
+/// A centred square inside `hit` of side `side` (inset a little), for the close
+/// button's hover highlight.
+fn hover_box(hit: Rect, side: f32) -> Rect {
+    let s = (side - 4.0).max(1.0);
+    Rect {
+        x: hit.x + (hit.w - s) * 0.5,
+        y: hit.y + (hit.h - s) * 0.5,
+        w: s,
+        h: s,
+    }
 }
 
 /// Whether point `(x, y)` lies inside `r` (half-open on the far edges).
