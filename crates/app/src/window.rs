@@ -59,11 +59,19 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
-/// Max viewport lines advanced per frame while catching up to a pending scroll.
-/// Bounded so each frame reveals only as many fresh rows as shaping can finish
-/// within the frame budget — every frame stays coherent (no half-shaped, torn
-/// viewport) while a fast flick's momentum plays out smoothly over a few frames.
-const SCROLL_STEP: i32 = 8;
+/// Pending-scroll metering (see `apply_pending_scroll`). Each frame advances the
+/// viewport by `pending / EASE_DIVISOR`, clamped to `[MIN, MAX]` lines: small
+/// scrolls stay slow and coherent (no torn, half-shaped viewport), while a big
+/// flick eases out fast enough to cross a large scrollback in a beat. `MAX` is
+/// the one knob trading catch-up speed against how much a fast fling can outrun
+/// shaping.
+const SCROLL_STEP_MIN: i32 = 6;
+const SCROLL_STEP_MAX: i32 = 40;
+const SCROLL_EASE_DIVISOR: i32 = 3;
+/// Cap on queued scroll lines, so flicking hard against the scrollback boundary
+/// can't pile up a backlog that then has to unwind before a reverse flick takes
+/// effect (and so metering always drains in a bounded number of frames).
+const MAX_PENDING_SCROLL: i32 = 600;
 /// Editor surface background / foreground (slightly distinct from a terminal).
 const EDITOR_BG: [u8; 3] = [26, 26, 32];
 const EDITOR_FG: [u8; 3] = [220, 220, 230];
@@ -1410,12 +1418,22 @@ impl State {
         else {
             return;
         };
+        let delta = -lines;
         if self.pending_scroll_target != Some(target) {
             // New target: abandon any leftover momentum aimed at the old surface.
             self.pending_scroll = 0;
             self.pending_scroll_target = Some(target);
         }
-        self.pending_scroll = self.pending_scroll.saturating_add(-lines);
+        if self.pending_scroll != 0 && (self.pending_scroll > 0) != (delta > 0) {
+            // Reversal: drop the opposing backlog so the new direction responds at
+            // once instead of first unwinding stale momentum.
+            self.pending_scroll = delta;
+        } else {
+            self.pending_scroll = self.pending_scroll.saturating_add(delta);
+        }
+        self.pending_scroll = self
+            .pending_scroll
+            .clamp(-MAX_PENDING_SCROLL, MAX_PENDING_SCROLL);
         // The selection is viewport-relative; scrolling invalidates it.
         self.selection = None;
         self.dirty = true;
@@ -1435,7 +1453,14 @@ impl State {
             self.pending_scroll = 0;
             return false;
         };
-        let step = self.pending_scroll.clamp(-SCROLL_STEP, SCROLL_STEP);
+        // Ease-out: drain a fraction of the backlog, bounded to [MIN, MAX] lines
+        // and never past what remains. Small scrolls creep coherently; big flicks
+        // move fast and settle.
+        let mag = self.pending_scroll.abs();
+        let step_mag = (mag / SCROLL_EASE_DIVISOR)
+            .clamp(SCROLL_STEP_MIN, SCROLL_STEP_MAX)
+            .min(mag);
+        let step = step_mag * self.pending_scroll.signum();
         let applied = match self.app.terminal(sid) {
             Some(t) => {
                 t.scroll(Scroll::Delta(step));
