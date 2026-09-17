@@ -245,6 +245,16 @@ impl AppState {
         self.editors.get_mut(&id)
     }
 
+    /// Save every editor with unsaved edits and a backing file (autosave on app
+    /// blur/quit). Pathless scratch buffers are left alone.
+    pub fn autosave_all_editors(&mut self) {
+        for e in self.editors.values_mut() {
+            if e.modified && e.path.is_some() {
+                let _ = e.save();
+            }
+        }
+    }
+
     /// Whether the focused surface is an editor.
     pub fn focused_is_editor(&self) -> bool {
         self.focused_surface()

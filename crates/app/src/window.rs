@@ -219,9 +219,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // for seconds — sometimes long enough that macOS marks the app
                 // unresponsive. Exiting lets the OS reclaim threads and fds; the
                 // closing PTY masters SIGHUP the child shells, exactly as closing
-                // any terminal does. Nothing here needs flushing on quit.
+                // any terminal does. Flush unsaved editors first (autosave).
+                state.app.autosave_all_editors();
                 state.window.set_visible(false);
                 std::process::exit(0);
+            }
+            WindowEvent::Focused(false) => {
+                // App lost focus: autosave editors (switching to another app).
+                state.app.autosave_all_editors();
             }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
@@ -420,6 +425,12 @@ struct State {
     /// The cell the press landed on (selection anchor), if it was over a terminal.
     /// A selection is only materialised once a drag actually starts.
     press_cell: Option<(SurfaceId, u16, u16)>,
+    /// The editor surface a press landed on, if any — drives editor drag-select
+    /// (the anchor/cursor live on the `EditorBuffer`).
+    editor_drag: Option<SurfaceId>,
+    /// The surface focused as of the last frame, so a focus change can autosave
+    /// the editor that just lost focus.
+    last_focused_surface: Option<SurfaceId>,
     /// System clipboard handle (None if unavailable).
     clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
@@ -719,6 +730,8 @@ impl State {
             selection: None,
             mouse_down: false,
             dragging: false,
+            editor_drag: None,
+            last_focused_surface: None,
             press_px: (0.0, 0.0),
             press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
@@ -905,11 +918,11 @@ impl State {
         self.cell_h + 6.0 * self.scale
     }
 
-    /// Whether a pane shows a tab strip: when it has multiple surfaces, when
-    /// autohide is off, or when the active surface is an editor (which always
-    /// shows a filename ribbon, even as the only tab).
-    fn strip_shown(&self, n: usize, active_is_editor: bool) -> bool {
-        n > 1 || !self.cfg.tabs.autohide_single_tab || active_is_editor
+    /// Whether a pane shows a tab strip: multiple surfaces, or autohide disabled.
+    /// (A single-tab editor's filename goes in its own ribbon, not a tab, so it
+    /// doesn't carry a close button.)
+    fn strip_shown(&self, n: usize) -> bool {
+        n > 1 || !self.cfg.tabs.autohide_single_tab
     }
 
     /// The active vtab's panes with full surface info, laid out in `workspace`.
@@ -1050,6 +1063,7 @@ impl State {
             return;
         }
         let (x, y) = self.cursor;
+        self.editor_drag = None;
         if self.in_sidebar(x) {
             // The "+ New workspace" button is a chrome button (arm/fire on
             // release); here we only handle selecting a workspace row.
@@ -1091,7 +1105,7 @@ impl State {
         let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
 
         // A click in a visible tab strip switches the pane's active surface.
-        let strip_h = if self.strip_shown(n, active_is_editor) {
+        let strip_h = if self.strip_shown(n) {
             self.strip_height()
         } else {
             0.0
@@ -1103,17 +1117,15 @@ impl State {
                 pane.active = idx;
             }
         } else if active_is_editor {
-            // A click in the editor body moves the text cursor to that position.
-            if let Some(sid) = active_sid {
-                let term_y = rect.y + strip_h;
-                let row_off = ((y - term_y) / self.cell_h).floor().max(0.0) as usize;
-                let col_off = ((x - rect.x) / self.cell_w).round().max(0.0) as usize;
+            // A click in the editor body moves the text cursor there and starts a
+            // potential drag-selection (anchor at the click; a selection only
+            // materialises once the cursor is dragged away — see update_selection).
+            if let Some((sid, row, col)) = self.editor_pos_at(x, y) {
                 if let Some(e) = self.app.editor_mut(sid) {
-                    let row = (e.scroll + row_off).min(e.lines.len().saturating_sub(1));
-                    let col = col_off.min(e.line_len(row));
                     e.cursor = (row, col);
-                    e.clear_selection();
+                    e.anchor = Some((row, col));
                 }
+                self.editor_drag = Some(sid);
             }
         }
         if let Some(vtab) = self.app.tree.vtab_mut(vt) {
@@ -1323,7 +1335,7 @@ impl State {
             }
             let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
             let sid = pane.active_surface()?.id;
-            let strip_h = if self.strip_shown(pane.surfaces.len(), self.app.is_editor(sid)) {
+            let strip_h = if self.strip_shown(pane.surfaces.len()) {
                 self.strip_height()
             } else {
                 0.0
@@ -1343,6 +1355,50 @@ impl State {
             return Some((sid, col, row));
         }
         None
+    }
+
+    /// The editor `(surface, row, col)` at point `(x, y)`, or `None` if the point
+    /// isn't in an editor body (accounts for scroll and the tab strip).
+    fn editor_pos_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, usize)> {
+        if self.in_sidebar(x) {
+            return None;
+        }
+        let workspace = self.workspace_rect();
+        let vt = self.app.tree.active_vtab()?;
+        let vtab = self.app.tree.vtab(vt)?;
+        for (pid, r) in vtab.layout(workspace, DIVIDER) {
+            if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
+                continue;
+            }
+            let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
+            let sid = pane.active_surface()?.id;
+            let e = self.app.editor(sid)?;
+            let strip_h = if self.strip_shown(pane.surfaces.len()) {
+                self.strip_height()
+            } else {
+                0.0
+            };
+            let body_y = r.y + strip_h;
+            if y < body_y {
+                return None; // in the tab strip
+            }
+            let row_off = ((y - body_y) / self.cell_h).floor().max(0.0) as usize;
+            let col_off = ((x - r.x) / self.cell_w).round().max(0.0) as usize;
+            let row = (e.scroll + row_off).min(e.lines.len().saturating_sub(1));
+            let col = col_off.min(e.line_len(row));
+            return Some((sid, row, col));
+        }
+        None
+    }
+
+    /// Save an editor surface if it has unsaved edits and a backing file (autosave
+    /// on focus loss). Terminals and pathless scratch buffers are ignored.
+    fn autosave_editor(&mut self, sid: SurfaceId) {
+        if let Some(e) = self.app.editor_mut(sid) {
+            if e.modified && e.path.is_some() {
+                let _ = e.save();
+            }
+        }
     }
 
     /// Record a potential drag-selection anchor at the current cursor and clear any
@@ -1378,6 +1434,21 @@ impl State {
             }
             self.dragging = true;
         }
+        // Editor drag: move the text cursor, keeping the anchor set at the press.
+        if let Some(sid) = self.editor_drag {
+            if let Some((s, row, col)) = self.editor_pos_at(x, y) {
+                if s == sid {
+                    if let Some(e) = self.app.editor_mut(sid) {
+                        if e.cursor != (row, col) {
+                            e.cursor = (row, col);
+                            self.dirty = true;
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
         let Some((surface, ac, ar)) = self.press_cell else {
             return false;
         };
@@ -1399,9 +1470,21 @@ impl State {
         true
     }
 
-    /// Finish a drag: copy a non-empty selection to the clipboard.
+    /// Finish a drag: copy a non-empty terminal selection to the clipboard. For an
+    /// editor, a plain click (no drag) clears the anchor so nothing is selected;
+    /// a real drag leaves the selection for Cmd+C (editors don't auto-copy).
     fn end_selection(&mut self) {
         self.mouse_down = false;
+        if let Some(sid) = self.editor_drag.take() {
+            if !self.dragging {
+                if let Some(e) = self.app.editor_mut(sid) {
+                    e.anchor = None;
+                }
+            }
+            self.dragging = false;
+            self.dirty = true;
+            return;
+        }
         if self.dragging {
             self.copy_selection();
         }
@@ -1656,13 +1739,9 @@ impl State {
         };
         let btn_hovered = rect_contains(btn, self.cursor.0, self.cursor.1);
         if btn_hovered {
-            quads.push(rect_quad(
-                inset(btn, 4.0 * self.scale),
-                sw,
-                sh,
-                BUTTON_HOVER_BG,
-                BUTTON_HOVER_ALPHA,
-            ));
+            // Full-bleed row highlight (edge to edge, full height) — a row button,
+            // not a compact icon.
+            quads.push(rect_quad(btn, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
         }
         let btn_color = if btn_hovered {
             NEW_VTAB_LABEL_HOVER
@@ -2754,6 +2833,14 @@ impl State {
         if self.app.tick_inbox() {
             self.dirty = true;
         }
+        // Autosave an editor when focus moves off it (workspace/tab/pane switch).
+        let focused = self.app.focused_surface();
+        if focused != self.last_focused_surface {
+            if let Some(prev) = self.last_focused_surface {
+                self.autosave_editor(prev);
+            }
+            self.last_focused_surface = focused;
+        }
         if !self.dirty {
             return Ok(());
         }
@@ -2765,12 +2852,7 @@ impl State {
         // Resolve each pane's tab-strip height and terminal (below-strip) rect.
         let mut resolved: Vec<(PaneRender, f32, Rect)> = Vec::with_capacity(panes.len());
         for pr in panes {
-            let active_is_editor = pr
-                .surfaces
-                .iter()
-                .find(|(_, _, a)| *a)
-                .is_some_and(|(sid, _, _)| self.app.is_editor(*sid));
-            let strip_h = if self.strip_shown(pr.surfaces.len(), active_is_editor) {
+            let strip_h = if self.strip_shown(pr.surfaces.len()) {
                 self.strip_height()
             } else {
                 0.0
@@ -3530,16 +3612,6 @@ fn row_content_len(grid: &Grid, row: u16) -> u16 {
         }
     }
     len
-}
-
-/// `r` shrunk by `by` on every side (for a full-area hover highlight).
-fn inset(r: Rect, by: f32) -> Rect {
-    Rect {
-        x: r.x + by,
-        y: r.y + by,
-        w: (r.w - 2.0 * by).max(0.0),
-        h: (r.h - 2.0 * by).max(0.0),
-    }
 }
 
 /// A centred square inside `hit` of side `side` (inset a little), for the close
