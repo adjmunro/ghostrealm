@@ -1674,11 +1674,14 @@ impl State {
         }
         // Normalise both event kinds to physical pixels. A line/notch wheel is
         // worth SCROLL_LINES_PER_NOTCH cells; a trackpad reports pixels directly.
-        let px = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y * SCROLL_LINES_PER_NOTCH * self.cell_h,
-            MouseScrollDelta::PixelDelta(p) => p.y as f32,
+        let (px, px_x) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (
+                y * SCROLL_LINES_PER_NOTCH * self.cell_h,
+                x * SCROLL_LINES_PER_NOTCH * self.cell_w,
+            ),
+            MouseScrollDelta::PixelDelta(p) => (p.y as f32, p.x as f32),
         };
-        if px == 0.0 {
+        if px == 0.0 && px_x == 0.0 {
             return;
         }
         // Over the sidebar, the wheel scrolls the workspace list, not the terminal
@@ -1699,25 +1702,45 @@ impl State {
         // rides along to the next event.
         self.scroll_accum += px;
         let lines = (self.scroll_accum / self.cell_h).trunc() as i32;
-        if lines == 0 {
-            return;
-        }
         self.scroll_accum -= lines as f32 * self.cell_h;
-        // An editor under the cursor scrolls its own text buffer (by lines), not a
-        // VT viewport. Wheel up (positive lines) moves toward the top of the file.
+        // An editor under the cursor scrolls its own text buffer: vertically by
+        // lines, and (when soft-wrap is off) horizontally by columns.
         let over = self.surface_under_cursor().or_else(|| self.app.focused_surface());
         if let Some(sid) = over {
             if self.app.is_editor(sid) {
+                let wrap = self.soft_wrap_on(sid);
                 if let Some(e) = self.app.editor_mut(sid) {
-                    let ns = (e.scroll as isize - lines as isize).max(0) as usize;
-                    if ns != e.scroll {
-                        e.scroll = ns;
+                    let mut changed = false;
+                    if lines != 0 {
+                        let max = e.lines.len().saturating_sub(1);
+                        let ns = ((e.scroll as isize - lines as isize).max(0) as usize).min(max);
+                        if ns != e.scroll {
+                            e.scroll = ns;
+                            changed = true;
+                        }
+                    }
+                    if !wrap && px_x != 0.0 {
+                        let cols = (px_x / self.cell_w).round() as isize;
+                        if cols != 0 {
+                            let maxlen =
+                                e.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                            let nh = ((e.hscroll as isize - cols).max(0) as usize).min(maxlen);
+                            if nh != e.hscroll {
+                                e.hscroll = nh;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
                         self.dirty = true;
                         self.frame_pending = true;
                     }
                 }
                 return;
             }
+        }
+        if lines == 0 {
+            return;
         }
         // Don't drive the viewport straight to the target: queue the motion and
         // meter it out at SCROLL_STEP lines/frame (see `apply_pending_scroll`), so
@@ -3390,42 +3413,50 @@ impl State {
             // Editor surface: render its text buffer instead of a terminal grid.
             if self.app.is_editor(sid) {
                 let rows_vis = (term.h / self.cell_h).floor().max(1.0) as usize;
+                let wrap = self.soft_wrap_on(sid);
+                // Layout dims (the gutter width needs the line count).
+                let total_lines = match self.app.editor(sid) {
+                    Some(e) => e.lines.len(),
+                    None => continue,
+                };
+                let gutter_w = self.editor_gutter_w(total_lines);
+                let body_x = term.x + gutter_w;
+                let body_w = (term.w - gutter_w).max(1.0);
+                let body_cols = ((body_w / self.cell_w).floor() as usize).max(1);
+                // Follow the cursor only when it moved (so manual scrolling sticks);
+                // reset horizontal scroll under wrap; keep vertical scroll in bounds.
                 if let Some(e) = self.app.editor_mut(sid) {
-                    e.clamp_scroll(rows_vis);
+                    e.follow_cursor(rows_vis, if wrap { None } else { Some(body_cols) });
+                    if wrap {
+                        e.hscroll = 0;
+                    }
+                    e.clamp_scroll_bounds();
                 }
                 #[allow(clippy::type_complexity)]
-                let (scroll, cursor, sel, total_lines, visible): (
+                let (scroll, hscroll, cursor, sel, visible): (
+                    usize,
                     usize,
                     (usize, usize),
                     Option<((usize, usize), (usize, usize))>,
-                    usize,
                     Vec<String>,
                 ) = match self.app.editor(sid) {
                     Some(e) => (
                         e.scroll,
+                        e.hscroll,
                         e.cursor,
                         e.selection(),
-                        e.lines.len(),
                         (0..rows_vis)
                             .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
                             .collect(),
                     ),
                     None => continue,
                 };
-                let gutter_w = self.editor_gutter_w(total_lines);
-                let body_x = term.x + gutter_w;
-                let body_w = (term.w - gutter_w).max(1.0);
                 bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
 
                 // Lay out the visible visual rows: (logical_line, text, start_col,
                 // y). Soft-wrap breaks long logical lines into several visual rows;
-                // otherwise each logical line is one row (clipped at the pane edge).
-                let wrap = self.soft_wrap_on(sid);
-                let wrap_cols = if wrap {
-                    ((body_w / self.cell_w).floor() as usize).max(1)
-                } else {
-                    usize::MAX
-                };
+                // otherwise each line is one row, offset left by hscroll and clipped.
+                let wrap_cols = if wrap { body_cols } else { usize::MAX };
                 let bottom = term.y + term.h;
                 let mut vis: Vec<(usize, String, usize, f32)> = Vec::new();
                 let mut vy = term.y;
@@ -3443,7 +3474,8 @@ impl State {
                             vy += self.cell_h;
                         }
                     } else {
-                        vis.push((ln, line.clone(), 0, vy));
+                        let text: String = line.chars().skip(hscroll).collect();
+                        vis.push((ln, text, hscroll, vy));
                         vy += self.cell_h;
                     }
                 }
@@ -3580,18 +3612,23 @@ impl State {
                     .rev()
                     .find(|(ln, _t, start, _y)| *ln == cursor.0 && *start <= cursor.1)
                 {
-                    overlay_quads.push(rect_quad(
-                        Rect {
-                            x: body_x + (cursor.1 - start) as f32 * self.cell_w,
-                            y: *y,
-                            w: 2.0 * self.scale,
-                            h: self.cell_h,
-                        },
-                        sw,
-                        sh,
-                        self.chrome.accent,
-                        0.9,
-                    ));
+                    let cx = body_x + (cursor.1 - start) as f32 * self.cell_w;
+                    // Clip to the body so a scrolled-off cursor never draws over the
+                    // gutter or the neighbouring pane/sidebar.
+                    if cx >= body_x && cx < term.x + term.w {
+                        overlay_quads.push(rect_quad(
+                            Rect {
+                                x: cx,
+                                y: *y,
+                                w: 2.0 * self.scale,
+                                h: self.cell_h,
+                            },
+                            sw,
+                            sh,
+                            self.chrome.accent,
+                            0.9,
+                        ));
+                    }
                 }
                 if pr.focused && multi_pane {
                     push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);

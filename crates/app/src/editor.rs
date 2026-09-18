@@ -24,8 +24,13 @@ pub struct EditorBuffer {
     pub lines: Vec<String>,
     /// Cursor as (row, col); col counts chars into `lines[row]`.
     pub cursor: (usize, usize),
-    /// Top visible line, kept so the cursor stays on-screen.
+    /// Top visible line.
     pub scroll: usize,
+    /// Leftmost visible column when soft-wrap is off (horizontal scroll).
+    pub hscroll: usize,
+    /// Cursor position the last time the view followed it, so manual scrolling
+    /// (which doesn't move the cursor) isn't yanked back to the cursor each frame.
+    pub last_cursor: (usize, usize),
     /// Backing file, if any (a scratch buffer has none).
     pub path: Option<PathBuf>,
     /// Unsaved edits since the last load/save.
@@ -42,6 +47,8 @@ impl EditorBuffer {
             lines: vec![String::new()],
             cursor: (0, 0),
             scroll: 0,
+            hscroll: 0,
+            last_cursor: (0, 0),
             path: None,
             modified: false,
             anchor: None,
@@ -58,6 +65,8 @@ impl EditorBuffer {
             lines,
             cursor: (0, 0),
             scroll: 0,
+            hscroll: 0,
+            last_cursor: (0, 0),
             path: Some(path),
             modified: false,
             anchor: None,
@@ -277,13 +286,36 @@ impl EditorBuffer {
         };
     }
 
-    /// Keep the cursor visible within a window of `rows` lines.
-    pub fn clamp_scroll(&mut self, rows: usize) {
+    /// Scroll to keep the cursor visible — vertically within `rows` lines, and
+    /// (when `hcols` is `Some`, i.e. soft-wrap off) horizontally within `hcols`
+    /// columns — but only when the cursor actually moved since the last follow, so
+    /// manual scrolling (which leaves the cursor put) isn't yanked back each frame.
+    pub fn follow_cursor(&mut self, rows: usize, hcols: Option<usize>) {
+        if self.cursor == self.last_cursor {
+            return;
+        }
         let rows = rows.max(1);
         if self.cursor.0 < self.scroll {
             self.scroll = self.cursor.0;
         } else if self.cursor.0 >= self.scroll + rows {
             self.scroll = self.cursor.0 + 1 - rows;
+        }
+        if let Some(cols) = hcols {
+            let cols = cols.max(1);
+            if self.cursor.1 < self.hscroll {
+                self.hscroll = self.cursor.1;
+            } else if self.cursor.1 >= self.hscroll + cols {
+                self.hscroll = self.cursor.1 + 1 - cols;
+            }
+        }
+        self.last_cursor = self.cursor;
+    }
+
+    /// Clamp the vertical scroll so it can't run past the last line.
+    pub fn clamp_scroll_bounds(&mut self) {
+        let max = self.lines.len().saturating_sub(1);
+        if self.scroll > max {
+            self.scroll = max;
         }
     }
 
@@ -426,17 +458,26 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_follows_cursor() {
+    fn follow_cursor_tracks_and_only_on_move() {
         let mut e = EditorBuffer::scratch();
         for _ in 0..30 {
             e.insert_newline();
         }
         // cursor at row 30; a 10-row window scrolls to keep it visible.
-        e.clamp_scroll(10);
+        e.follow_cursor(10, None);
         assert!(e.scroll <= 30 && e.scroll + 10 > 30);
+        // Manual scroll away from the cursor is NOT yanked back (cursor unchanged).
+        e.scroll = 5;
+        e.follow_cursor(10, None);
+        assert_eq!(e.scroll, 5, "manual scroll sticks when the cursor hasn't moved");
+        // Moving the cursor makes the view follow again.
         e.cursor.0 = 0;
-        e.clamp_scroll(10);
+        e.follow_cursor(10, None);
         assert_eq!(e.scroll, 0, "moving to the top scrolls back up");
+        // Horizontal follow when soft-wrap is off (hcols = Some).
+        e.cursor = (0, 200);
+        e.follow_cursor(10, Some(20));
+        assert!(e.hscroll <= 200 && e.hscroll + 20 > 200);
     }
 
     #[test]
