@@ -209,9 +209,11 @@ impl Config {
     /// user override wins over the built-in default. Returns the canonical chord.
     /// The config's `[keybindings]` maps `command id -> chord`.
     pub fn binding_for(&self, id: &str) -> Option<String> {
-        // The config's `[keybindings]` is authoritative when present; the built-in
-        // defaults apply only when it's empty (fresh/unconfigured).
-        if self.keybindings.is_empty() {
+        // The config's `[keybindings]` is authoritative when it has any *valid*
+        // entry (a value that parses as a chord); otherwise — empty, or entirely
+        // malformed (e.g. an old-format file) — the built-in defaults apply. This
+        // keeps a bad edit from silently unbinding everything.
+        if !self.has_valid_bindings() {
             return default_bindings()
                 .into_iter()
                 .find(|(_, v)| *v == id)
@@ -221,11 +223,11 @@ impl Config {
     }
 
     /// Resolve a chord (any modifier order/alias) to a command id. The config's
-    /// `[keybindings]` (`command id -> chord`) is authoritative when present; an
-    /// empty section falls back to the built-in defaults.
+    /// `[keybindings]` (`command id -> chord`) is authoritative when it has any
+    /// valid entry; else the built-in defaults apply.
     pub fn binding(&self, chord: &str) -> Option<String> {
         let target = normalize_chord(chord)?;
-        if self.keybindings.is_empty() {
+        if !self.has_valid_bindings() {
             return default_bindings()
                 .get(target.as_str())
                 .map(|s| s.to_string());
@@ -234,6 +236,12 @@ impl Config {
             .iter()
             .find(|(_, c)| normalize_chord(c).as_deref() == Some(target.as_str()))
             .map(|(id, _)| id.clone())
+    }
+
+    /// Whether any keybinding entry has a value that parses as a chord. A file
+    /// with no valid entries (empty, or all malformed) uses the built-in defaults.
+    fn has_valid_bindings(&self) -> bool {
+        self.keybindings.values().any(|c| normalize_chord(c).is_some())
     }
 }
 
@@ -690,4 +698,5 @@ mod tests {
         assert_eq!(cfg.binding("cmd+n"), None); // not in the authoritative set
     }
 }
+
 
