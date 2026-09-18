@@ -199,10 +199,17 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        // Wake for whichever comes first: the next paced PTY frame or a pending
-        // inbox auto-read deadline.
+        // Fire the idle-autosave if its timer elapsed while the app sat idle.
+        if state.fire_idle_autosave_if_due() {
+            state.window.request_redraw();
+        }
+        // Wake for whichever comes first: the next paced PTY frame, a pending inbox
+        // auto-read deadline, or the idle-autosave deadline.
         let mut wake: Option<Instant> = state.frame_pending.then_some(state.next_frame);
         if let Some(d) = state.app.next_inbox_deadline() {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
+        if let Some(d) = state.idle_autosave_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
         match wake {
@@ -226,14 +233,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // unresponsive. Exiting lets the OS reclaim threads and fds; the
                 // closing PTY masters SIGHUP the child shells, exactly as closing
                 // any terminal does. Flush unsaved editors first (autosave).
-                let _ = state.app.autosave_all_editors();
+                if state.cfg.editor.autosave_on_unfocus {
+                    let _ = state.app.autosave_all_editors();
+                }
                 state.window.set_visible(false);
                 std::process::exit(0);
             }
             WindowEvent::Focused(false) => {
                 // App lost focus: autosave editors (switching to another app), and
                 // hot-reload the config if it was one of them.
-                if state.app.autosave_all_editors() {
+                if state.cfg.editor.autosave_on_unfocus && state.app.autosave_all_editors() {
                     state.reload_config();
                 }
             }
@@ -443,6 +452,10 @@ struct State {
     /// Per-editor soft-wrap override (absent = the config default). Toggled by the
     /// ribbon's wrap button.
     soft_wrap: HashMap<SurfaceId, bool>,
+    /// Focused editor + its edit count as last observed, to detect fresh edits.
+    edit_watch: Option<(SurfaceId, u64)>,
+    /// When the focused editor was last edited, for the idle-autosave timer.
+    last_edit_at: Option<Instant>,
     /// System clipboard handle (None if unavailable).
     clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
@@ -747,6 +760,8 @@ impl State {
             editor_drag: None,
             last_focused_surface: None,
             soft_wrap: HashMap::new(),
+            edit_watch: None,
+            last_edit_at: None,
             press_px: (0.0, 0.0),
             press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1492,6 +1507,57 @@ impl State {
         if saved.is_some() && saved == ghostrealm_core::config::config_path() {
             self.reload_config();
         }
+    }
+
+    /// Note when the focused editor was last edited (for the idle-autosave timer),
+    /// by watching its monotonic edit count. Cleared when focus isn't an editor.
+    fn track_focused_edits(&mut self) {
+        let focused = self
+            .app
+            .focused_surface()
+            .filter(|s| self.app.is_editor(*s));
+        match focused {
+            Some(sid) => {
+                let edits = self.app.editor(sid).map(|e| e.edits).unwrap_or(0);
+                if self.edit_watch != Some((sid, edits)) {
+                    self.edit_watch = Some((sid, edits));
+                    if self.app.editor(sid).map(|e| e.modified).unwrap_or(false) {
+                        self.last_edit_at = Some(Instant::now());
+                    }
+                }
+            }
+            None => {
+                self.edit_watch = None;
+                self.last_edit_at = None;
+            }
+        }
+    }
+
+    /// The instant the idle-autosave should fire, if armed (config `autosave_after`
+    /// > 0 and there's a pending edit).
+    fn idle_autosave_deadline(&self) -> Option<Instant> {
+        let after = self.cfg.editor.autosave_after;
+        if after == 0 {
+            return None;
+        }
+        self.last_edit_at
+            .map(|t| t + Duration::from_secs(after as u64))
+    }
+
+    /// Save the focused editor if the idle-autosave timer has elapsed. Returns
+    /// whether it fired (the caller then redraws so the unsaved marker updates).
+    fn fire_idle_autosave_if_due(&mut self) -> bool {
+        let Some(deadline) = self.idle_autosave_deadline() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.last_edit_at = None;
+        if let Some((sid, _)) = self.edit_watch {
+            self.autosave_editor(sid);
+        }
+        true
     }
 
     /// Record a potential drag-selection anchor at the current cursor and clear any
@@ -3042,10 +3108,15 @@ impl State {
         let focused = self.app.focused_surface();
         if focused != self.last_focused_surface {
             if let Some(prev) = self.last_focused_surface {
-                self.autosave_editor(prev);
+                if self.cfg.editor.autosave_on_unfocus {
+                    self.autosave_editor(prev);
+                }
             }
             self.last_focused_surface = focused;
         }
+        // Track edits for, and fire, the idle-autosave timer.
+        self.track_focused_edits();
+        self.fire_idle_autosave_if_due();
         if !self.dirty {
             return Ok(());
         }

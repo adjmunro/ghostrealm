@@ -35,6 +35,8 @@ pub struct EditorBuffer {
     pub path: Option<PathBuf>,
     /// Unsaved edits since the last load/save.
     pub modified: bool,
+    /// Monotonic count of text-changing edits, for the idle-autosave timer.
+    pub edits: u64,
     /// Selection anchor (row, col); `None` = no selection. The selection spans
     /// anchor..cursor.
     pub anchor: Option<(usize, usize)>,
@@ -51,6 +53,7 @@ impl EditorBuffer {
             last_cursor: (0, 0),
             path: None,
             modified: false,
+            edits: 0,
             anchor: None,
         }
     }
@@ -69,6 +72,7 @@ impl EditorBuffer {
             last_cursor: (0, 0),
             path: Some(path),
             modified: false,
+            edits: 0,
             anchor: None,
         }
     }
@@ -130,6 +134,13 @@ impl EditorBuffer {
         self.anchor = None;
     }
 
+    /// Mark a text-changing edit: sets the unsaved flag and bumps the edit count
+    /// (which the idle-autosave timer watches).
+    fn touch(&mut self) {
+        self.modified = true;
+        self.edits = self.edits.wrapping_add(1);
+    }
+
     /// Delete the selected text, placing the cursor at its start. Returns whether
     /// anything was deleted.
     pub fn delete_selection(&mut self) -> bool {
@@ -149,7 +160,7 @@ impl EditorBuffer {
         }
         self.cursor = (sr, sc);
         self.anchor = None;
-        self.modified = true;
+        self.touch();
         true
     }
 
@@ -171,7 +182,7 @@ impl EditorBuffer {
         let b = self.byte_of(row, col);
         self.lines[row].insert(b, c);
         self.cursor.1 = col + 1;
-        self.modified = true;
+        self.touch();
     }
 
     pub fn insert_newline(&mut self) {
@@ -181,7 +192,7 @@ impl EditorBuffer {
         let tail = self.lines[row].split_off(b);
         self.lines.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
-        self.modified = true;
+        self.touch();
     }
 
     /// Delete the char before the cursor, joining with the previous line at the
@@ -195,13 +206,13 @@ impl EditorBuffer {
             let b = self.byte_of(row, col - 1);
             self.lines[row].remove(b);
             self.cursor.1 = col - 1;
-            self.modified = true;
+            self.touch();
         } else if row > 0 {
             let prev_len = self.line_len(row - 1);
             let cur = self.lines.remove(row);
             self.lines[row - 1].push_str(&cur);
             self.cursor = (row - 1, prev_len);
-            self.modified = true;
+            self.touch();
         }
     }
 
@@ -215,11 +226,11 @@ impl EditorBuffer {
         if col < self.line_len(row) {
             let b = self.byte_of(row, col);
             self.lines[row].remove(b);
-            self.modified = true;
+            self.touch();
         } else if row + 1 < self.lines.len() {
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next);
-            self.modified = true;
+            self.touch();
         }
     }
 

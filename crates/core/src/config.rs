@@ -152,6 +152,10 @@ pub struct Editor {
     /// Default soft-wrap state for editor panes (toggle per-pane with the ribbon
     /// button). When off, long lines are clipped at the pane edge.
     pub soft_wrap: bool,
+    /// Save a modified file when its editor loses focus (tab/workspace/app switch).
+    pub autosave_on_unfocus: bool,
+    /// Save a modified file after this many seconds of no edits (0 = off).
+    pub autosave_after: u32,
 }
 
 impl Default for Editor {
@@ -160,17 +164,26 @@ impl Default for Editor {
             line_numbers: LineNumbers::Absolute,
             cursor_line: true,
             soft_wrap: true,
+            autosave_on_unfocus: true,
+            autosave_after: 15,
         }
     }
+}
+
+/// `[workspace]`
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    /// Base directory new workspaces/terminals start in when the workspace has no
+    /// pinned root. `None` (unset) means `$HOME`. `~` is expanded.
+    pub default_directory: Option<String>,
 }
 
 /// The whole config.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Base directory new workspaces/terminals start in when the workspace has no
-    /// pinned root. `None` (unset) means `$HOME`. `~` is expanded.
-    pub default_directory: Option<String>,
+    pub workspace: Workspace,
     pub sidebar: Sidebar,
     pub terminal: Terminal,
     /// Chrome colours for our own UI. Unset (`None`) means inherit from the user's
@@ -191,7 +204,7 @@ impl Config {
     /// The resolved default directory for new workspaces (`~` expanded), or `None`
     /// (meaning `$HOME` / the shell's default).
     pub fn default_dir(&self) -> Option<PathBuf> {
-        expand_tilde(self.default_directory.as_deref()?)
+        expand_tilde(self.workspace.default_directory.as_deref()?)
     }
 
     /// The chrome colours to use: an explicit `[chrome]` if set, else colours
@@ -304,8 +317,9 @@ pub fn normalize_chord(chord: &str) -> Option<String> {
 pub const DEFAULT_CONFIG_TOML: &str = r#"# ghostrealm config. Commit/sync this as a dotfile. Each option below lists its
 # type, allowed values/range, and default. Edit + save (Cmd+S) to hot-reload.
 
-# default_directory (string path | unset) — base directory new workspaces start in
-#   (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
+[workspace]
+# default_directory (string path | unset) — base directory new workspaces start
+#   in (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
 # default_directory = "~/Developer"
 
 [sidebar]
@@ -332,6 +346,8 @@ autohide_single_tab = true  # bool (default true) — hide a pane's tab strip wh
 line_numbers = "absolute"  # "off" | "absolute" | "relative" (default absolute) — gutter line numbers; relative shows the absolute number on the cursor line
 cursor_line = true         # bool (default true) — highlight the line the cursor is on
 soft_wrap = true           # bool (default true) — wrap long lines (toggle per-pane with the ribbon button)
+autosave_on_unfocus = true # bool (default true) — save a modified file when its editor loses focus
+autosave_after = 15        # integer seconds, >= 0 (default 15) — save a modified file after this idle time (0 = off)
 
 [input]
 focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
@@ -349,13 +365,6 @@ auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an 
 # delete or comment a line to unbind, or uncomment a line and set its chord to
 # bind it. If the whole section is empty, the built-in defaults apply.
 "#;
-
-/// Documentation for the top-level `default_directory` key (backfilled into the
-/// preamble of an older config that lacks it).
-const DEFAULT_DIRECTORY_DOC: &str = "\
-# default_directory (string path | unset) — base directory new workspaces start in
-#   (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
-# default_directory = \"~/Developer\"";
 
 /// Expand a user-entered directory: trims whitespace, expands a leading `~` to
 /// `$HOME`; `None` for an empty string. Does not check existence.
@@ -492,13 +501,6 @@ pub fn backfill_text(text: &str, commands: &[(&str, &str)]) -> Option<String> {
     let sections = template_sections();
     let mut result = text.to_string();
     let mut changed = false;
-
-    // The top-level `default_directory` key is documented in the preamble (a bare
-    // key must precede all [section] headers), so prepend its doc block if absent.
-    if !result.contains("default_directory") {
-        result = format!("{DEFAULT_DIRECTORY_DOC}\n{result}");
-        changed = true;
-    }
 
     for (name, block) in &sections {
         if name == "keybindings" || present.contains(name) {
