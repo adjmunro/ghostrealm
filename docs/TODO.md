@@ -425,13 +425,3 @@
   programs would still wrap to the reported cols. Evaluate whether a wider grid
   is coherent (and what to report) before committing.
 - Reason: view long unwrapped terminal output without the shell wrapping it.
-
----
-
-[2026-09-28@aaa6e17f]
-
-- Requires: NO BLOCKERS
-- Detail: Icon-only button (no label) to show/hide the workspace sidebar. Hidden
-  state expands the workspace area to full width; the toggle stays reachable at
-  the edge. Use the shared button system (hover highlight + fire on release).
-- Reason: reclaim horizontal space when the sidebar is cramped.

@@ -438,6 +438,12 @@ struct State {
     /// Single shaped '×' glyph, placed at each close button (one buffer, many
     /// placements). Reshaped on a metrics change like the other chrome buffers.
     close_buffer: Buffer,
+    /// Shaped chevron for the sidebar show/hide toggle, placed via `toggle_place`.
+    toggle_buffer: Buffer,
+    /// Where to draw the toggle chevron this frame (set by `build_sidebar`).
+    toggle_place: Option<Placement>,
+    /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
+    sidebar_hidden: bool,
     /// Active terminal text selection, if any.
     selection: Option<Selection>,
     /// Left mouse button is held (for drag-selection).
@@ -596,6 +602,8 @@ enum ButtonAction {
     CloseSurface(VtabId, PaneId, SurfaceId),
     /// Toggle soft-wrap for an editor surface.
     ToggleSoftWrap(SurfaceId),
+    /// Show/hide the workspace sidebar.
+    ToggleSidebar,
 }
 
 impl State {
@@ -704,6 +712,7 @@ impl State {
         );
         let warm_buffer = Buffer::new(&mut font_system, warm_metrics);
         let close_buffer = Buffer::new(&mut font_system, warm_metrics);
+        let toggle_buffer = Buffer::new(&mut font_system, warm_metrics);
 
         let quad_pipeline = build_quad_pipeline(&device, format);
         let quad_capacity = 4096;
@@ -760,6 +769,9 @@ impl State {
             button_hover: None,
             armed_button: None,
             close_buffer,
+            toggle_buffer,
+            toggle_place: None,
+            sidebar_hidden: false,
             selection: None,
             mouse_down: false,
             dragging: false,
@@ -1001,7 +1013,11 @@ impl State {
     }
 
     fn sidebar_width(&self) -> f32 {
-        self.cfg.sidebar.width * self.scale
+        if self.sidebar_hidden {
+            0.0
+        } else {
+            self.cfg.sidebar.width * self.scale
+        }
     }
 
     /// The sidebar's rect in physical pixels (honours `[sidebar] side`).
@@ -1039,13 +1055,21 @@ impl State {
             .map(|(_, id)| *id)
     }
 
-    /// The chrome button under the cursor, if any.
+    /// The chrome button under the cursor, if any. The sidebar toggle wins any
+    /// overlap (it can float over a pane's tab strip when the sidebar is hidden);
+    /// otherwise the first button in paint order takes the hit.
     fn button_at_cursor(&self) -> Option<ButtonAction> {
         let (x, y) = self.cursor;
-        self.buttons
-            .iter()
-            .find(|(r, _)| rect_contains(*r, x, y))
-            .map(|&(_, t)| t)
+        let mut hit = None;
+        for &(r, action) in &self.buttons {
+            if rect_contains(r, x, y) {
+                if action == ButtonAction::ToggleSidebar {
+                    return Some(action);
+                }
+                hit.get_or_insert(action);
+            }
+        }
+        hit
     }
 
     /// Mouse-down over a button arms it (fires later on release), so a press can
@@ -1075,6 +1099,7 @@ impl State {
                 let now = self.soft_wrap_on(sid);
                 self.soft_wrap.insert(sid, !now);
             }
+            ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
         }
         self.dirty = true;
         true
@@ -1891,6 +1916,73 @@ impl State {
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
     /// `sidebar_buffers`.
+    /// Draw the sidebar show/hide toggle: a square chevron button pinned at the
+    /// top of the sidebar/workspace boundary (or, when hidden, at the window edge
+    /// so it stays reachable). Shapes `self.toggle_buffer`, records `toggle_place`
+    /// for the text pass and the hit rect in `self.buttons`, and returns the rect
+    /// so the caller can keep the "+" row clear of it.
+    fn build_sidebar_toggle(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Rect {
+        let side = self.cfg.sidebar.side;
+        let hidden = self.sidebar_hidden;
+        let metrics = self.metrics();
+        let sz = self.cell_h + 8.0 * self.scale;
+        let x = if hidden {
+            match side {
+                Side::Left => 0.0,
+                Side::Right => (sw - sz).max(0.0),
+            }
+        } else {
+            let bar_x = self.sidebar_rect().x;
+            let bar_w = self.sidebar_width();
+            match side {
+                Side::Left => bar_x + bar_w - sz,
+                Side::Right => bar_x,
+            }
+        };
+        let rect = Rect { x, y: 0.0, w: sz, h: sz };
+        let hovered = rect_contains(rect, self.cursor.0, self.cursor.1);
+        // A collapsed sidebar has no backdrop, so give the floating toggle its own
+        // sidebar-coloured chip; when expanded it sits on the bar already.
+        if hidden {
+            quads.push(rect_quad(rect, sw, sh, self.chrome.sidebar, 1.0));
+        }
+        if hovered {
+            quads.push(rect_quad(rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+        }
+        // Chevron points toward the outer edge to collapse, toward the workspace
+        // to reveal.
+        let glyph = match (side, hidden) {
+            (Side::Left, false) | (Side::Right, true) => "\u{2039}", // ‹
+            (Side::Left, true) | (Side::Right, false) => "\u{203a}", // ›
+        };
+        let color = if hovered { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+        self.toggle_buffer.set_metrics(metrics);
+        self.toggle_buffer
+            .set_size(Some(self.cell_w * 2.0), Some(self.cell_h));
+        self.toggle_buffer.set_rich_text(
+            std::iter::once((glyph, attrs_for(color))),
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.toggle_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.toggle_place = Some(Placement {
+            idx: 0,
+            left: rect.x + (sz - self.cell_w) * 0.5,
+            top: (sz - self.cell_h) * 0.5,
+            bounds: TextBounds {
+                left: rect.x as i32,
+                top: 0,
+                right: (rect.x + sz) as i32,
+                bottom: sz as i32,
+            },
+            color,
+        });
+        self.buttons.push((rect, ButtonAction::ToggleSidebar));
+        rect
+    }
+
     fn build_sidebar(
         &mut self,
         sw: f32,
@@ -1898,6 +1990,10 @@ impl State {
         quads: &mut Vec<QuadInstance>,
         close_placements: &mut Vec<Placement>,
     ) -> Vec<Placement> {
+        let toggle = self.build_sidebar_toggle(sw, sh, quads);
+        if self.sidebar_hidden {
+            return Vec::new();
+        }
         let bar_w = self.sidebar_width();
         let bar_x = self.sidebar_rect().x;
         let row_h = self.cell_h + 8.0 * self.scale;
@@ -1953,12 +2049,18 @@ impl State {
 
         let mut placements = Vec::new();
 
-        // Pinned "+" new-workspace button at the very top.
+        // Pinned "+" new-workspace button at the very top, kept clear of the toggle
+        // chevron (which sits at the sidebar/workspace boundary corner).
         let btn_y = 0.0; // flush against the top edge (no margin above the button)
+        let (btn_x, label_x) = match self.cfg.sidebar.side {
+            Side::Left => (bar_x, bar_x + pad),
+            Side::Right => (bar_x + toggle.w, bar_x + toggle.w + pad),
+        };
+        let btn_w = (bar_w - toggle.w).max(1.0);
         let btn = Rect {
-            x: bar_x,
+            x: btn_x,
             y: btn_y,
-            w: bar_w,
+            w: btn_w,
             h: row_h,
         };
         let btn_hovered = rect_contains(btn, self.cursor.0, self.cursor.1);
@@ -1975,7 +2077,7 @@ impl State {
         {
             let buf = &mut self.sidebar_buffers[n];
             buf.set_metrics(metrics);
-            buf.set_size(Some((bar_w - pad * 2.0).max(1.0)), Some(self.cell_h));
+            buf.set_size(Some((btn_w - pad * 2.0).max(1.0)), Some(self.cell_h));
             buf.set_rich_text(
                 std::iter::once(("+  New workspace", attrs_for(btn_color))),
                 &Attrs::new().family(Family::SansSerif),
@@ -1986,12 +2088,12 @@ impl State {
         }
         placements.push(Placement {
             idx: n,
-            left: bar_x + pad,
+            left: label_x,
             top: btn_y + (row_h - self.cell_h) * 0.5,
             bounds: TextBounds {
-                left: bar_x as i32,
+                left: btn_x as i32,
                 top: btn_y as i32,
-                right: (bar_x + bar_w) as i32,
+                right: (btn_x + btn_w) as i32,
                 bottom: (btn_y + row_h) as i32,
             },
             color: btn_color,
@@ -3990,6 +4092,18 @@ impl State {
             default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
             custom_glyphs: &[],
         }));
+        // Sidebar show/hide toggle chevron.
+        if let Some(p) = &self.toggle_place {
+            text_areas.push(TextArea {
+                buffer: &self.toggle_buffer,
+                left: p.left,
+                top: p.top,
+                scale: 1.0,
+                bounds: p.bounds,
+                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                custom_glyphs: &[],
+            });
+        }
         text_areas.extend(warm_area);
 
         self.text_renderer
