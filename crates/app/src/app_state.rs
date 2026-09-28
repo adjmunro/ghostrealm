@@ -180,6 +180,15 @@ impl AppState {
         Ok(vt)
     }
 
+    /// Create a new empty vtab (no terminal) — it opens on the "nothing open"
+    /// screen where the user picks what to open. Becomes active.
+    pub fn new_empty_vtab(&mut self) -> VtabId {
+        let name = format!("tab {}", self.next_tab_number);
+        self.next_tab_number += 1;
+        let (vt, _pane) = self.tree.add_empty_vtab(name);
+        vt
+    }
+
     /// Create a new vtab and run `command_line` in it ("Run Anything"): a normal
     /// interactive shell (like a new terminal), with the command typed in and
     /// submitted — so the session stays live and interactive afterwards. The vtab
@@ -365,11 +374,18 @@ impl AppState {
         }
     }
 
-    /// Close the active surface of the focused pane. The tree cascades: the last
-    /// surface collapses the pane, the last pane closes the workspace.
+    /// Close the active surface of the focused pane. Closing the last surface of a
+    /// split collapses the pane; closing the last surface of the sole pane leaves
+    /// the workspace on its empty screen. Invoked on that empty screen, it closes
+    /// the workspace itself.
     pub fn close_focused_surface(&mut self) {
-        if let (Some((vt, pane)), Some(sid)) = (self.focused_pane(), self.focused_surface()) {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid));
+        let Some((vt, pane)) = self.focused_pane() else {
+            return;
+        };
+        match self.focused_surface() {
+            Some(sid) => self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid)),
+            // Empty pane (nothing open): close the workspace.
+            None => self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt)),
         }
     }
 
@@ -799,9 +815,9 @@ pub fn build_registry() -> Registry<AppState> {
     let mut r = Registry::new();
 
     r.register(
-        CommandMeta::new("tab.new", "New Workspace", "Open a new workspace"),
+        CommandMeta::new("tab.new", "New Workspace", "Open a new empty workspace"),
         Box::new(|s: &mut AppState, _| {
-            let id = s.new_vtab().map_err(failed)?;
+            let id = s.new_empty_vtab();
             Ok(CmdOutcome::msg(format!("opened workspace {}", id.0)))
         }),
     );
@@ -1007,6 +1023,19 @@ mod tests {
     }
 
     #[test]
+    fn new_empty_vtab_opens_with_no_surface() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        let vt = s.new_empty_vtab();
+        let v = s.tree.vtab(vt).unwrap();
+        assert_eq!(v.panes().len(), 1);
+        assert!(
+            v.panes()[0].surfaces.is_empty(),
+            "a new workspace opens empty (nothing open)"
+        );
+        assert_eq!(s.tree.active_vtab(), Some(vt));
+    }
+
+    #[test]
     fn new_vtab_running_types_its_command_into_a_live_shell() {
         // Run Anything spawns an interactive shell and feeds it the command (so the
         // session stays live). `sh` reads and runs commands from the PTY.
@@ -1072,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn close_focused_surface_cascades_htab_then_pane_then_workspace() {
+    fn close_focused_surface_cascades_htab_then_empty_then_workspace() {
         let mut s = AppState::new().with_shell_line("sleep 1");
         let vt = s.new_vtab().unwrap();
         // Two htabs in the focused pane.
@@ -1084,11 +1113,16 @@ mod tests {
         assert_eq!(s.tree.vtab(vt).unwrap().panes()[0].surfaces.len(), 1);
         assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 1);
 
-        // Second close removes the last htab, collapsing the pane and closing
-        // the workspace since it was the last pane.
+        // Second close removes the last htab; the sole pane stays as the empty
+        // "nothing open" state rather than closing the workspace.
         s.close_focused_surface();
-        assert!(s.tree.vtab(vt).is_none(), "workspace should close");
+        let v = s.tree.vtab(vt).expect("workspace survives as empty");
+        assert!(v.panes()[0].surfaces.is_empty());
         assert_eq!(s.surfaces.len(), s.tree.surface_count());
+
+        // Closing again on the empty screen closes the workspace itself.
+        s.close_focused_surface();
+        assert!(s.tree.vtab(vt).is_none(), "empty workspace closes on next close");
     }
 
     #[test]

@@ -325,6 +325,29 @@ impl Tree {
         (vtab_id, pane_id, surface_id)
     }
 
+    /// Create a new vtab with one empty pane (no surfaces) — the "nothing open"
+    /// state. The new vtab becomes active. Returns the vtab and pane ids.
+    pub fn add_empty_vtab(&mut self, name: impl Into<String>) -> (VtabId, PaneId) {
+        let vtab_id = VtabId(self.fresh());
+        let pane_id = PaneId(self.fresh());
+        let pane = Pane {
+            id: pane_id,
+            surfaces: Vec::new(),
+            active: 0,
+        };
+        self.vtabs.push(Vtab {
+            id: vtab_id,
+            name: name.into(),
+            user_named: false,
+            status: TabStatus::Read,
+            root: Node::Leaf(pane),
+            focused_pane: pane_id,
+            root_dir: None,
+        });
+        self.active = Some(vtab_id);
+        (vtab_id, pane_id)
+    }
+
     pub fn vtabs(&self) -> &[Vtab] {
         &self.vtabs
     }
@@ -387,9 +410,10 @@ impl Tree {
         Some(sid)
     }
 
-    /// Close a surface. If it was the pane's last surface, the pane is closed and
-    /// the split collapses; if that was the vtab's last pane, the vtab closes.
-    /// Returns true if something was removed.
+    /// Close a surface. If it was the pane's last surface and other panes remain,
+    /// the pane closes and the split collapses. If it was the *sole* pane's last
+    /// surface, the pane stays as the workspace's empty ("nothing open") state
+    /// rather than closing the workspace. Returns true if something was removed.
     pub fn close_surface(&mut self, vtab: VtabId, pane: PaneId, surface: SurfaceId) -> bool {
         let Some(v) = self.vtab_mut(vtab) else {
             return false;
@@ -405,7 +429,11 @@ impl Tree {
             p.active = p.surfaces.len().saturating_sub(1);
         }
         if p.surfaces.is_empty() {
-            self.close_pane(vtab, pane);
+            // Collapse into a sibling if there is one; the sole pane is kept empty.
+            let sole_pane = v.panes().len() == 1;
+            if !sole_pane {
+                self.close_pane(vtab, pane);
+            }
         }
         true
     }
@@ -582,6 +610,29 @@ mod tests {
         assert!(t.close_surface(vt, p2, s2));
         let v = t.vtab(vt).unwrap();
         assert_eq!(v.panes().len(), 1, "emptying a pane should collapse it");
+    }
+
+    #[test]
+    fn closing_last_surface_of_sole_pane_leaves_it_empty() {
+        let mut t = Tree::new();
+        let (vt, pane, s) = t.add_vtab("only");
+        assert!(t.close_surface(vt, pane, s));
+        let v = t.vtab(vt).expect("sole workspace survives as empty");
+        assert_eq!(v.panes().len(), 1, "the sole pane is kept");
+        assert!(v.panes()[0].surfaces.is_empty(), "kept pane is now empty");
+        assert_eq!(v.focused_pane, pane);
+        assert_eq!(t.active_vtab(), Some(vt));
+    }
+
+    #[test]
+    fn add_empty_vtab_has_a_surfaceless_pane() {
+        let mut t = Tree::new();
+        let (vt, pane) = t.add_empty_vtab("empty");
+        let v = t.vtab(vt).unwrap();
+        assert_eq!(v.panes().len(), 1);
+        assert_eq!(v.focused_pane, pane);
+        assert!(v.panes()[0].surfaces.is_empty());
+        assert_eq!(t.active_vtab(), Some(vt));
     }
 
     #[test]

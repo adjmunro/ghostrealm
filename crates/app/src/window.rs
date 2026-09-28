@@ -104,6 +104,9 @@ const TITLE_BAR_H: f32 = 28.0;
 const TRAFFIC_LIGHT_W: f32 = 76.0;
 /// Centred title-bar label colour.
 const TITLE_LABEL: [u8; 3] = [170, 170, 185];
+/// Empty-workspace screen: shortcut badge and dim hint colours.
+const EMPTY_SHORTCUT: [u8; 3] = [120, 120, 135];
+const EMPTY_HINT: [u8; 3] = [110, 110, 125];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -468,6 +471,9 @@ struct State {
     title_buffer: Buffer,
     /// Where to draw the title-bar label this frame (set by `build_titlebar`).
     title_place: Option<Placement>,
+    /// Text buffers + placements for the empty-workspace ("nothing open") screen.
+    empty_buffers: Vec<Buffer>,
+    empty_placements: Vec<Placement>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -630,6 +636,8 @@ enum ButtonAction {
     ToggleSoftWrap(SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
+    /// Run a registry command by id (e.g. the empty-workspace open buttons).
+    RunCommand(&'static str),
 }
 
 impl State {
@@ -724,13 +732,20 @@ impl State {
             })
         };
         let mut app = AppState::new();
+        let has_command = command_line.is_some();
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
         }
         app = app.with_waker(waker);
         app.set_inbox_config(cfg.inbox);
         app.set_default_dir(cfg.default_dir());
-        app.new_vtab().context("open initial tab")?;
+        // A CLI command spawns a terminal running it; a bare launch opens the empty
+        // "nothing open" workspace where the user picks what to open.
+        if has_command {
+            app.new_vtab().context("open initial tab")?;
+        } else {
+            app.new_empty_vtab();
+        }
 
         let warm_metrics = Metrics::new(
             cfg.terminal.font_size * scale,
@@ -800,6 +815,8 @@ impl State {
             toggle_place: None,
             title_buffer,
             title_place: None,
+            empty_buffers: Vec::new(),
+            empty_placements: Vec::new(),
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1140,7 +1157,7 @@ impl State {
         }
         match armed {
             ButtonAction::NewVtab => {
-                let _ = self.app.new_vtab();
+                self.app.new_empty_vtab();
             }
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
@@ -1149,6 +1166,9 @@ impl State {
                 self.soft_wrap.insert(sid, !now);
             }
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
+            ButtonAction::RunCommand(id) => {
+                let _ = self.registry.execute(id, &Args::new(), &mut self.app);
+            }
         }
         self.dirty = true;
         true
@@ -2099,6 +2119,133 @@ impl State {
                 bottom: h as i32,
             },
             color: TITLE_LABEL,
+        });
+    }
+
+    /// Shape `text` into `empty_buffers[idx]` (growing the pool) at the given box
+    /// width and return its shaped width, so the caller can centre it. Colour comes
+    /// from the placement's `default_color` in the text pass.
+    fn shape_empty(&mut self, idx: usize, text: &str, family: Family, width_box: f32) -> f32 {
+        let m = self.metrics();
+        while self.empty_buffers.len() <= idx {
+            let b = Buffer::new(&mut self.font_system, m);
+            self.empty_buffers.push(b);
+        }
+        let buf = &mut self.empty_buffers[idx];
+        buf.set_metrics(m);
+        buf.set_size(Some(width_box.max(1.0)), Some(self.cell_h));
+        buf.set_rich_text(
+            std::iter::once((text, Attrs::new().family(family))),
+            &Attrs::new().family(family),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(&mut self.font_system, false);
+        buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
+    }
+
+    /// Draw the empty-workspace ("nothing open") screen in `rect`: a heading, a
+    /// button per openable surface kind (with its shortcut), and a close hint.
+    /// Buttons run their registry command in the focused (empty) pane.
+    fn build_empty_pane(&mut self, rect: Rect, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) {
+        quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
+
+        let scale = self.scale;
+        let ch = self.cell_h;
+        let sans = Family::SansSerif;
+        // (command id, label). Extend as more openable surface kinds are added.
+        let options: [(&'static str, &str); 2] = [
+            ("surface.new", "New terminal"),
+            ("editor.scratch", "New editor"),
+        ];
+        let n = options.len() as f32;
+
+        let btn_w = (rect.w * 0.6)
+            .clamp(180.0 * scale, 380.0 * scale)
+            .min((rect.w - 24.0 * scale).max(1.0));
+        let btn_h = ch + 14.0 * scale;
+        let gap = 8.0 * scale;
+        let heading_gap = 18.0 * scale;
+        let hint_gap = 20.0 * scale;
+        let total = ch + heading_gap + n * btn_h + (n - 1.0) * gap + hint_gap + ch;
+        let cx = rect.x + rect.w * 0.5;
+        let bx = cx - btn_w * 0.5;
+        let pad = 12.0 * scale;
+        let full_bounds = TextBounds {
+            left: rect.x as i32,
+            top: rect.y as i32,
+            right: (rect.x + rect.w) as i32,
+            bottom: (rect.y + rect.h) as i32,
+        };
+
+        let mut y = rect.y + (rect.h - total).max(0.0) * 0.5;
+        let mut idx = 0usize;
+
+        // Heading.
+        let hw = self.shape_empty(idx, "Nothing open", sans, rect.w);
+        self.empty_placements.push(Placement {
+            idx,
+            left: cx - hw * 0.5,
+            top: y,
+            bounds: full_bounds,
+            color: TITLE_LABEL,
+        });
+        idx += 1;
+        y += ch + heading_gap;
+
+        // One button per openable kind.
+        for (cmd, label) in options {
+            let hit = Rect { x: bx, y, w: btn_w, h: btn_h };
+            let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
+            quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
+            if hovered {
+                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            }
+            let label_color = if hovered { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+            let btn_bounds = TextBounds {
+                left: bx as i32,
+                top: y as i32,
+                right: (bx + btn_w) as i32,
+                bottom: (y + btn_h) as i32,
+            };
+            let _ = self.shape_empty(idx, label, sans, btn_w - pad * 2.0);
+            self.empty_placements.push(Placement {
+                idx,
+                left: bx + pad,
+                top: y + (btn_h - ch) * 0.5,
+                bounds: btn_bounds,
+                color: label_color,
+            });
+            idx += 1;
+            if let Some(chord) = self.cfg.binding_for(cmd) {
+                let sc = pretty_chord(&chord);
+                let scw = self.shape_empty(idx, &sc, sans, btn_w);
+                self.empty_placements.push(Placement {
+                    idx,
+                    left: bx + btn_w - pad - scw,
+                    top: y + (btn_h - ch) * 0.5,
+                    bounds: btn_bounds,
+                    color: EMPTY_SHORTCUT,
+                });
+                idx += 1;
+            }
+            self.buttons.push((hit, ButtonAction::RunCommand(cmd)));
+            y += btn_h + gap;
+        }
+
+        // Close hint.
+        y += hint_gap - gap;
+        let hint = match self.cfg.binding_for("pane.close") {
+            Some(c) => format!("{}  closes this workspace", pretty_chord(&c)),
+            None => "Close this workspace from the palette".to_string(),
+        };
+        let hw2 = self.shape_empty(idx, &hint, sans, rect.w);
+        self.empty_placements.push(Placement {
+            idx,
+            left: cx - hw2 * 0.5,
+            top: y,
+            bounds: full_bounds,
+            color: EMPTY_HINT,
         });
     }
 
@@ -3438,6 +3585,7 @@ impl State {
         // Close-button chrome: one shared '×' glyph placed at every tab/workspace
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
         self.buttons.clear();
+        self.empty_placements.clear();
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
         self.close_buffer.set_metrics(metrics);
@@ -3561,6 +3709,8 @@ impl State {
             }
 
             let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
+                // No surface in this pane: draw the "nothing open" screen.
+                self.build_empty_pane(*term, sw, sh, &mut bg_quads);
                 continue;
             };
             let sid = *active_sid;
@@ -4249,6 +4399,16 @@ impl State {
                 custom_glyphs: &[],
             });
         }
+        // Empty-workspace screen text.
+        text_areas.extend(self.empty_placements.iter().map(|p| TextArea {
+            buffer: &self.empty_buffers[p.idx],
+            left: p.left,
+            top: p.top,
+            scale: 1.0,
+            bounds: p.bounds,
+            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+            custom_glyphs: &[],
+        }));
         text_areas.extend(warm_area);
 
         self.text_renderer
@@ -4439,6 +4599,27 @@ fn attrs_for<'a>(color: [u8; 3]) -> Attrs<'a> {
     Attrs::new()
         .family(Family::Monospace)
         .color(Color::rgb(color[0], color[1], color[2]))
+}
+
+/// Format a canonical chord ("cmd+shift+t") as macOS symbols ("⌘⇧T") for display.
+fn pretty_chord(chord: &str) -> String {
+    let mut mods = String::new();
+    let mut key = "";
+    for part in chord.split('+') {
+        match part {
+            "cmd" | "meta" | "win" => mods.push('\u{2318}'),      // ⌘
+            "shift" => mods.push('\u{21e7}'),                     // ⇧
+            "ctrl" => mods.push('\u{2303}'),                      // ⌃
+            "alt" | "opt" | "option" => mods.push('\u{2325}'),   // ⌥
+            k => key = k,
+        }
+    }
+    let key = if key.chars().count() == 1 {
+        key.to_uppercase()
+    } else {
+        key.to_string()
+    };
+    format!("{mods}{key}")
 }
 
 /// Group a row's cells into (text, fg-colour) runs of consecutive same colour.
