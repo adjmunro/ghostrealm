@@ -1963,14 +1963,15 @@ impl State {
         applied
     }
 
-    /// Shape the sidebar-toggle chevron into `rect`, record its placement + hit
-    /// rect, and draw its hover highlight. With `chip_bg`, first paint an opaque
-    /// sidebar-coloured backing (for a toggle that floats with nothing behind it).
-    /// The chevron points toward the sidebar's outer edge to collapse, toward the
-    /// workspace to reveal.
+    /// Shape the sidebar-toggle chevron (at `icon_px`) into `rect`, record its
+    /// placement + hit rect, and draw its hover highlight over the whole `rect`.
+    /// With `chip_bg`, first paint an opaque sidebar-coloured backing (for a toggle
+    /// that floats with nothing behind it). The chevron points toward the sidebar's
+    /// outer edge to collapse, toward the workspace to reveal.
     fn place_sidebar_toggle(
         &mut self,
         rect: Rect,
+        icon_px: f32,
         sw: f32,
         sh: f32,
         quads: &mut Vec<QuadInstance>,
@@ -1978,7 +1979,6 @@ impl State {
     ) {
         let side = self.cfg.sidebar.side;
         let hidden = self.sidebar_hidden;
-        let metrics = self.metrics();
         let hovered = rect_contains(rect, self.cursor.0, self.cursor.1);
         if chip_bg {
             quads.push(rect_quad(rect, sw, sh, self.chrome.sidebar, 1.0));
@@ -1991,9 +1991,12 @@ impl State {
             (Side::Left, true) | (Side::Right, false) => "\u{203a}", // ›
         };
         let color = if hovered { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
-        self.toggle_buffer.set_metrics(metrics);
+        // Tight line box (line height == font size) so centring the box centres the
+        // glyph — the terminal metrics' leading would otherwise ride it high.
         self.toggle_buffer
-            .set_size(Some(self.cell_w * 2.0), Some(self.cell_h));
+            .set_metrics(Metrics::new(icon_px, icon_px));
+        self.toggle_buffer
+            .set_size(Some(rect.w.max(1.0)), Some(rect.h.max(1.0)));
         self.toggle_buffer.set_rich_text(
             std::iter::once((glyph, attrs_for(color))),
             &Attrs::new().family(Family::SansSerif),
@@ -2002,10 +2005,15 @@ impl State {
         );
         self.toggle_buffer
             .shape_until_scroll(&mut self.font_system, false);
+        let glyph_w = self
+            .toggle_buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
         self.toggle_place = Some(Placement {
             idx: 0,
-            left: rect.x + (rect.w - self.cell_w) * 0.5,
-            top: rect.y + (rect.h - self.cell_h) * 0.5,
+            left: rect.x + (rect.w - glyph_w) * 0.5,
+            top: rect.y + (rect.h - icon_px) * 0.5,
             bounds: TextBounds {
                 left: rect.x as i32,
                 top: rect.y as i32,
@@ -2037,7 +2045,7 @@ impl State {
             }
         };
         let rect = Rect { x, y: self.title_bar_h(), w: sz, h: sz };
-        self.place_sidebar_toggle(rect, sw, sh, quads, hidden);
+        self.place_sidebar_toggle(rect, self.cell_h, sw, sh, quads, hidden);
         rect
     }
 
@@ -2049,35 +2057,23 @@ impl State {
         if h <= 0.0 {
             return;
         }
-        let metrics = self.metrics();
         quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h }, sw, sh, self.chrome.sidebar, 1.0));
 
-        // Toggle: a square on the sidebar's side, clear of the traffic lights.
-        let pad = 6.0 * self.scale;
-        let sz = (h - 2.0 * pad).max(1.0);
+        // Toggle: a full-height square on the sidebar's side (so its hover
+        // highlight spans the strip), clear of the traffic lights.
         let lights = TRAFFIC_LIGHT_W * self.scale;
         let tog_x = match self.cfg.sidebar.side {
-            Side::Left => lights + pad,
-            Side::Right => (sw - sz - pad).max(0.0),
+            Side::Left => lights,
+            Side::Right => (sw - h).max(0.0),
         };
-        let rect = Rect { x: tog_x, y: (h - sz) * 0.5, w: sz, h: sz };
-        self.place_sidebar_toggle(rect, sw, sh, quads, false);
+        let rect = Rect { x: tog_x, y: 0.0, w: h, h };
+        // A chevron large enough to read easily within the strip.
+        self.place_sidebar_toggle(rect, h * 0.66, sw, sh, quads, false);
 
-        // Centred title. Keep it clear of the traffic lights on the left and the
-        // toggle on whichever side it sits, centring within what's left.
-        let left_edge = lights.max(if matches!(self.cfg.sidebar.side, Side::Left) {
-            rect.x + rect.w
-        } else {
-            0.0
-        });
-        let right_edge = if matches!(self.cfg.sidebar.side, Side::Right) {
-            rect.x
-        } else {
-            sw
-        };
-        let avail = (right_edge - left_edge).max(1.0);
-        self.title_buffer.set_metrics(metrics);
-        self.title_buffer.set_size(Some(avail), Some(self.cell_h));
+        // Title, truly centred on the full window width (looks balanced even though
+        // the toggle/lights sit off to the sides). A short title never reaches them.
+        self.title_buffer.set_metrics(self.metrics());
+        self.title_buffer.set_size(Some(sw), Some(self.cell_h));
         self.title_buffer.set_rich_text(
             std::iter::once(("ghostrealm", attrs_for(TITLE_LABEL))),
             &Attrs::new().family(Family::SansSerif),
@@ -2094,12 +2090,12 @@ impl State {
             .fold(0.0_f32, f32::max);
         self.title_place = Some(Placement {
             idx: 0,
-            left: left_edge + (avail - title_w) * 0.5,
+            left: (sw - title_w) * 0.5,
             top: (h - self.cell_h) * 0.5,
             bounds: TextBounds {
-                left: left_edge as i32,
+                left: 0,
                 top: 0,
-                right: right_edge as i32,
+                right: sw as i32,
                 bottom: h as i32,
             },
             color: TITLE_LABEL,
