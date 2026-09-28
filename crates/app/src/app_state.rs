@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
-    TabStatus, Tree, VtabId,
+    fs_tree::FsTree, ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId,
+    Registry, SurfaceId, TabStatus, Tree, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
@@ -21,6 +21,14 @@ use crate::editor::EditorBuffer;
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
+
+/// The kinds of content a pane/tab can open (via the "nothing open" picker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenKind {
+    Terminal,
+    Editor,
+    Browser,
+}
 
 /// After Enter, a vtab is shown busy for at least this long even if the shell's
 /// foreground process group hasn't moved yet — the command may not have forked
@@ -39,6 +47,9 @@ pub struct AppState {
     surfaces: HashMap<SurfaceId, ThreadedTerminal>,
     /// Surfaces whose content is a text editor rather than a terminal.
     editors: HashMap<SurfaceId, EditorBuffer>,
+    /// Surfaces whose content is a file browser. A surface in none of the three
+    /// maps is "empty" — it shows the open-something picker.
+    browsers: HashMap<SurfaceId, FsTree>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
     shell_line: Option<String>,
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
@@ -65,6 +76,7 @@ impl AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
             editors: HashMap::new(),
+            browsers: HashMap::new(),
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -252,6 +264,84 @@ impl AppState {
         }
     }
 
+    /// Add an empty surface (a new tab with no content) to the focused pane and
+    /// make it active. It shows the open-something picker until a kind is chosen.
+    pub fn add_empty_surface_in_focused(&mut self) {
+        if let Some((vt, pane)) = self.focused_pane() {
+            self.tree.add_surface(vt, pane);
+        }
+    }
+
+    /// Open `kind` in the focused pane: fill the active empty slot in place when
+    /// there is one (the picker), otherwise add a new tab of that kind.
+    pub fn open_kind_in_focused(&mut self, kind: OpenKind) -> Result<()> {
+        let Some((vt, pane)) = self.focused_pane() else {
+            return Ok(());
+        };
+        let target = match self.focused_surface() {
+            Some(sid) if self.surface_is_empty(sid) => Some(sid),
+            _ => self.tree.add_surface(vt, pane),
+        };
+        if let Some(sid) = target {
+            self.materialize_surface(sid, vt, kind)?;
+        }
+        Ok(())
+    }
+
+    /// Give an existing (empty) surface content of `kind`.
+    fn materialize_surface(&mut self, sid: SurfaceId, vt: VtabId, kind: OpenKind) -> Result<()> {
+        match kind {
+            OpenKind::Terminal => self.spawn_surface(sid, vt)?,
+            OpenKind::Editor => {
+                let buf = EditorBuffer::scratch();
+                self.tree.set_surface_title(sid, buf.title(), true);
+                self.editors.insert(sid, buf);
+            }
+            OpenKind::Browser => {
+                let root = self
+                    .resolve_cwd(vt)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                self.tree.set_surface_title(sid, "Files", true);
+                self.browsers.insert(sid, FsTree::new(root));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is an empty surface (no terminal, editor, or browser yet).
+    pub fn surface_is_empty(&self, id: SurfaceId) -> bool {
+        !self.surfaces.contains_key(&id)
+            && !self.editors.contains_key(&id)
+            && !self.browsers.contains_key(&id)
+    }
+
+    /// Whether `id` is a file-browser surface.
+    pub fn is_browser(&self, id: SurfaceId) -> bool {
+        self.browsers.contains_key(&id)
+    }
+
+    /// The file-browser model for `id`, if it is a browser surface.
+    pub fn browser(&self, id: SurfaceId) -> Option<&FsTree> {
+        self.browsers.get(&id)
+    }
+
+    pub fn browser_mut(&mut self, id: SurfaceId) -> Option<&mut FsTree> {
+        self.browsers.get_mut(&id)
+    }
+
+    /// Whether the focused pane's active surface is a file browser.
+    pub fn focused_is_browser(&self) -> bool {
+        self.focused_surface()
+            .map(|s| self.is_browser(s))
+            .unwrap_or(false)
+    }
+
+    /// Open `path` in a new editor tab in the focused pane (from the browser).
+    pub fn open_file_in_focused(&mut self, path: std::path::PathBuf) {
+        self.open_editor_in_focused(EditorBuffer::open(path));
+    }
+
     /// Create a new workspace whose sole surface is an editor (no shell spawned),
     /// named `name` (pinned). Returns the new vtab id.
     pub fn new_editor_vtab(&mut self, name: impl Into<String>, buffer: EditorBuffer) -> VtabId {
@@ -418,6 +508,7 @@ impl AppState {
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
         self.editors.retain(|id, _| live.contains(id));
+        self.browsers.retain(|id, _| live.contains(id));
     }
 
     pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
@@ -923,11 +1014,22 @@ pub fn build_registry() -> Registry<AppState> {
     r.register(
         CommandMeta::new(
             "surface.new",
-            "New Terminal Tab",
-            "Add a terminal tab to the focused pane",
+            "New Tab",
+            "Add a new tab to the focused pane; pick what to open",
         ),
         Box::new(|s: &mut AppState, _| {
-            s.new_surface_in_focused().map_err(failed)?;
+            s.add_empty_surface_in_focused();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "terminal.new",
+            "New Terminal",
+            "Open a terminal in the focused pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.open_kind_in_focused(OpenKind::Terminal).map_err(failed)?;
             Ok(CmdOutcome::ok())
         }),
     );
@@ -938,7 +1040,18 @@ pub fn build_registry() -> Registry<AppState> {
             "Open an empty text editor in the focused pane",
         ),
         Box::new(|s: &mut AppState, _| {
-            s.open_editor_in_focused(EditorBuffer::scratch());
+            s.open_kind_in_focused(OpenKind::Editor).map_err(failed)?;
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "browser.new",
+            "New File Browser",
+            "Open a file browser in the focused pane",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.open_kind_in_focused(OpenKind::Browser).map_err(failed)?;
             Ok(CmdOutcome::ok())
         }),
     );

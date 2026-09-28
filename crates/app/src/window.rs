@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, AppState, OpenKind, SETTINGS_VTAB_NAME};
 use crate::editor::Motion;
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
@@ -474,6 +474,13 @@ struct State {
     /// Text buffers + placements for the empty-workspace ("nothing open") screen.
     empty_buffers: Vec<Buffer>,
     empty_placements: Vec<Placement>,
+    /// Text buffers + placements for file-browser panes.
+    browser_buffers: Vec<Buffer>,
+    browser_placements: Vec<Placement>,
+    /// Per-browser vertical scroll offset (physical px).
+    browser_scroll: HashMap<SurfaceId, f32>,
+    /// Hit-testing for the visible browser panes this frame (click → row).
+    browser_views: Vec<BrowserView>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -622,6 +629,17 @@ struct PaneRender {
     surfaces: Vec<(SurfaceId, String, bool)>,
 }
 
+/// A visible file-browser pane's list geometry, for mapping a click to a row.
+struct BrowserView {
+    sid: SurfaceId,
+    /// The scrollable list area (below the header).
+    list: Rect,
+    row_h: f32,
+    scroll: f32,
+    /// Visible rows in order: (path, is_dir).
+    rows: Vec<(std::path::PathBuf, bool)>,
+}
+
 /// What a clickable chrome button does. All buttons share hover-highlight and
 /// arm-on-press/fire-on-release behaviour (see `arm_button`/`fire_button`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -636,8 +654,13 @@ enum ButtonAction {
     ToggleSoftWrap(SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
-    /// Run a registry command by id (e.g. the empty-workspace open buttons).
-    RunCommand(&'static str),
+    /// Open a content kind in the focused pane (the "nothing open" picker).
+    OpenKind(OpenKind),
+    /// Toggle a file browser's show-hidden / show-gitignored filters.
+    BrowserToggleHidden(SurfaceId),
+    BrowserToggleIgnored(SurfaceId),
+    /// Move a file browser up to its parent directory.
+    BrowserParent(SurfaceId),
 }
 
 impl State {
@@ -817,6 +840,10 @@ impl State {
             title_place: None,
             empty_buffers: Vec::new(),
             empty_placements: Vec::new(),
+            browser_buffers: Vec::new(),
+            browser_placements: Vec::new(),
+            browser_scroll: HashMap::new(),
+            browser_views: Vec::new(),
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1040,10 +1067,12 @@ impl State {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        let title = if s.title.is_empty() {
-                            "sh".to_string()
-                        } else {
+                        let title = if !s.title.is_empty() {
                             s.title.clone()
+                        } else if self.app.surface_is_empty(s.id) {
+                            "New".to_string()
+                        } else {
+                            "sh".to_string()
                         };
                         (s.id, title, i == pane.active)
                     })
@@ -1166,8 +1195,25 @@ impl State {
                 self.soft_wrap.insert(sid, !now);
             }
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
-            ButtonAction::RunCommand(id) => {
-                let _ = self.registry.execute(id, &Args::new(), &mut self.app);
+            ButtonAction::OpenKind(kind) => {
+                let _ = self.app.open_kind_in_focused(kind);
+            }
+            ButtonAction::BrowserToggleHidden(sid) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    let v = b.show_hidden();
+                    b.set_show_hidden(!v);
+                }
+            }
+            ButtonAction::BrowserToggleIgnored(sid) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    let v = b.show_gitignored();
+                    b.set_show_gitignored(!v);
+                }
+            }
+            ButtonAction::BrowserParent(sid) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    b.go_to_parent();
+                }
             }
         }
         self.dirty = true;
@@ -1198,6 +1244,19 @@ impl State {
         } else {
             false
         }
+    }
+
+    /// The file-browser row under a point, as (surface, path, is_dir).
+    fn browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, std::path::PathBuf, bool)> {
+        for v in &self.browser_views {
+            if x >= v.list.x && x < v.list.x + v.list.w && y >= v.list.y && y < v.list.y + v.list.h {
+                let idx = ((y - v.list.y + v.scroll) / v.row_h).floor().max(0.0) as usize;
+                if let Some((path, is_dir)) = v.rows.get(idx) {
+                    return Some((v.sid, path.clone(), *is_dir));
+                }
+            }
+        }
+        None
     }
 
     fn on_click(&mut self) {
@@ -1250,6 +1309,7 @@ impl State {
             .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
             .and_then(|p| p.active_surface().map(|s| s.id));
         let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
+        let active_is_browser = active_sid.is_some_and(|s| self.app.is_browser(s));
 
         // A click in a visible tab strip switches the pane's active surface.
         let strip_h = if self.strip_shown(n) {
@@ -1263,6 +1323,23 @@ impl State {
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
                 pane.active = idx;
             }
+        } else if active_is_browser {
+            // Focus first so opening a file targets this pane, then act on the row:
+            // a directory expands/collapses, a file opens in an editor tab.
+            if let Some(vtab) = self.app.tree.vtab_mut(vt) {
+                vtab.focused_pane = pid;
+            }
+            if let Some((bsid, path, is_dir)) = self.browser_row_at(x, y) {
+                if is_dir {
+                    if let Some(b) = self.app.browser_mut(bsid) {
+                        b.toggle_dir(&path);
+                    }
+                } else {
+                    self.app.open_file_in_focused(path);
+                }
+            }
+            self.dirty = true;
+            return;
         } else if active_is_editor {
             // A click in the editor body moves the text cursor there and starts a
             // potential drag-selection (anchor at the click; a selection only
@@ -1864,6 +1941,20 @@ impl State {
             }
             return;
         }
+        // Over a file browser, the wheel scrolls its row list (pixel-precise; the
+        // upper bound is clamped to content height when the pane is rebuilt).
+        if let Some(sid) = self.surface_under_cursor() {
+            if self.app.is_browser(sid) {
+                let cur = self.browser_scroll.get(&sid).copied().unwrap_or(0.0);
+                let ns = (cur - px).max(0.0);
+                if ns != cur {
+                    self.browser_scroll.insert(sid, ns);
+                    self.dirty = true;
+                    self.frame_pending = true;
+                }
+                return;
+            }
+        }
         // Accumulate sub-line pixels and carry the remainder, so a slow drag isn't
         // rounded to zero (the old behaviour: motion under half a cell vanished,
         // which felt like a dead zone and a speed threshold) and momentum tails
@@ -2153,10 +2244,11 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let sans = Family::SansSerif;
-        // (command id, label). Extend as more openable surface kinds are added.
-        let options: [(&'static str, &str); 2] = [
-            ("surface.new", "New terminal"),
-            ("editor.scratch", "New editor"),
+        // (kind, label). Extend as more openable surface kinds are added.
+        let options: [(OpenKind, &str); 3] = [
+            (OpenKind::Terminal, "Terminal"),
+            (OpenKind::Editor, "Editor"),
+            (OpenKind::Browser, "File browser"),
         ];
         let n = options.len() as f32;
 
@@ -2194,7 +2286,7 @@ impl State {
         y += ch + heading_gap;
 
         // One button per openable kind.
-        for (cmd, label) in options {
+        for (kind, label) in options {
             let hit = Rect { x: bx, y, w: btn_w, h: btn_h };
             let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
             quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
@@ -2217,23 +2309,11 @@ impl State {
                 color: label_color,
             });
             idx += 1;
-            if let Some(chord) = self.cfg.binding_for(cmd) {
-                let sc = pretty_chord(&chord);
-                let scw = self.shape_empty(idx, &sc, sans, btn_w);
-                self.empty_placements.push(Placement {
-                    idx,
-                    left: bx + btn_w - pad - scw,
-                    top: y + (btn_h - ch) * 0.5,
-                    bounds: btn_bounds,
-                    color: EMPTY_SHORTCUT,
-                });
-                idx += 1;
-            }
-            self.buttons.push((hit, ButtonAction::RunCommand(cmd)));
+            self.buttons.push((hit, ButtonAction::OpenKind(kind)));
             y += btn_h + gap;
         }
 
-        // Close hint.
+        // Close hint (⌘T adds a tab like this; ⌘W closes the workspace).
         y += hint_gap - gap;
         let hint = match self.cfg.binding_for("pane.close") {
             Some(c) => format!("{}  closes this workspace", pretty_chord(&c)),
@@ -2246,6 +2326,223 @@ impl State {
             top: y,
             bounds: full_bounds,
             color: EMPTY_HINT,
+        });
+    }
+
+    /// Shape `text` into `browser_buffers[idx]` (growing the pool) and return its
+    /// shaped width. Colour comes from the placement in the text pass.
+    fn shape_browser(&mut self, idx: usize, text: &str, family: Family, width_box: f32) -> f32 {
+        let m = self.metrics();
+        while self.browser_buffers.len() <= idx {
+            let b = Buffer::new(&mut self.font_system, m);
+            self.browser_buffers.push(b);
+        }
+        let buf = &mut self.browser_buffers[idx];
+        buf.set_metrics(m);
+        buf.set_size(Some(width_box.max(1.0)), Some(self.cell_h));
+        buf.set_rich_text(
+            std::iter::once((text, Attrs::new().family(family))),
+            &Attrs::new().family(family),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(&mut self.font_system, false);
+        buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
+    }
+
+    /// Draw a file-browser pane in `rect`: a header (parent, path/filter, hidden &
+    /// gitignore toggles) and a scrollable row list. Records a [`BrowserView`] for
+    /// click hit-testing and the toggle/parent button rects.
+    fn build_file_browser(
+        &mut self,
+        sid: SurfaceId,
+        focus_border: bool,
+        rect: Rect,
+        sw: f32,
+        sh: f32,
+        quads: &mut Vec<QuadInstance>,
+    ) {
+        quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
+
+        let scale = self.scale;
+        let ch = self.cell_h;
+        let pad = 8.0 * scale;
+        let header_h = ch + 10.0 * scale;
+        let mono = Family::Monospace;
+        let sans = Family::SansSerif;
+
+        // Pull the current rows and header state from the model.
+        let rows: Vec<ghostrealm_core::fs_tree::FileRow> = self
+            .app
+            .browser_mut(sid)
+            .map(|b| b.rows().to_vec())
+            .unwrap_or_default();
+        let (root_disp, show_hidden, show_ignored, query) = match self.app.browser(sid) {
+            Some(b) => (
+                b.root().display().to_string(),
+                b.show_hidden(),
+                b.show_gitignored(),
+                b.query().to_string(),
+            ),
+            None => return,
+        };
+
+        // Header background.
+        quads.push(rect_quad(
+            Rect { x: rect.x, y: rect.y, w: rect.w, h: header_h },
+            sw,
+            sh,
+            self.chrome.sidebar,
+            1.0,
+        ));
+        let hy = rect.y + (header_h - ch) * 0.5;
+        let mut bidx = 0usize;
+
+        // Parent (..) button on the left.
+        let par_w = self.cell_w * 3.0;
+        let par_hit = Rect { x: rect.x, y: rect.y, w: par_w + pad, h: header_h };
+        let par_hov = rect_contains(par_hit, self.cursor.0, self.cursor.1);
+        if par_hov {
+            quads.push(rect_quad(par_hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+        }
+        let _ = self.shape_browser(bidx, "..", mono, par_w);
+        self.browser_placements.push(Placement {
+            idx: bidx,
+            left: rect.x + pad,
+            top: hy,
+            bounds: TextBounds {
+                left: rect.x as i32,
+                top: rect.y as i32,
+                right: (rect.x + par_w + pad) as i32,
+                bottom: (rect.y + header_h) as i32,
+            },
+            color: if par_hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
+        });
+        self.buttons.push((par_hit, ButtonAction::BrowserParent(sid)));
+        bidx += 1;
+
+        // Toggles on the right: [.gitignore] [hidden].
+        let toggle = |on: bool| if on { NEW_VTAB_LABEL_HOVER } else { EMPTY_SHORTCUT };
+        let mut right = rect.x + rect.w - pad;
+        for (label, on, action) in [
+            ("hidden", show_hidden, ButtonAction::BrowserToggleHidden(sid)),
+            (".gitignore", show_ignored, ButtonAction::BrowserToggleIgnored(sid)),
+        ] {
+            let w = label.chars().count() as f32 * self.cell_w;
+            let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
+            let hov = rect_contains(hit, self.cursor.0, self.cursor.1);
+            if hov {
+                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            }
+            let _ = self.shape_browser(bidx, label, sans, w + pad);
+            self.browser_placements.push(Placement {
+                idx: bidx,
+                left: right - w - pad + pad * 0.5,
+                top: hy,
+                bounds: TextBounds {
+                    left: (right - w - pad) as i32,
+                    top: rect.y as i32,
+                    right: (right + pad) as i32,
+                    bottom: (rect.y + header_h) as i32,
+                },
+                color: toggle(on),
+            });
+            self.buttons.push((hit, action));
+            bidx += 1;
+            right -= w + pad * 2.0;
+        }
+
+        // Path (or the active filter, in accent) between the parent button and the
+        // toggles.
+        let path_x = rect.x + par_w + pad * 2.0;
+        let path_w = (right - path_x - pad).max(1.0);
+        let (ptext, pcolor) = if query.is_empty() {
+            (shorten_start(&root_disp, (path_w / self.cell_w) as usize), TITLE_LABEL)
+        } else {
+            (format!("/{query}"), self.chrome.accent)
+        };
+        let _ = self.shape_browser(bidx, &ptext, sans, path_w);
+        self.browser_placements.push(Placement {
+            idx: bidx,
+            left: path_x,
+            top: hy,
+            bounds: TextBounds {
+                left: path_x as i32,
+                top: rect.y as i32,
+                right: (path_x + path_w) as i32,
+                bottom: (rect.y + header_h) as i32,
+            },
+            color: pcolor,
+        });
+        bidx += 1;
+
+        // Scrollable row list.
+        let list = Rect {
+            x: rect.x,
+            y: rect.y + header_h,
+            w: rect.w,
+            h: (rect.h - header_h).max(0.0),
+        };
+        let row_h = ch + 4.0 * scale;
+        let content_h = rows.len() as f32 * row_h;
+        let max_scroll = (content_h - list.h).max(0.0);
+        let scroll = self
+            .browser_scroll
+            .get(&sid)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, max_scroll);
+        self.browser_scroll.insert(sid, scroll);
+
+        let indent_w = self.cell_w * 2.0;
+        let mut view_rows: Vec<(std::path::PathBuf, bool)> = Vec::with_capacity(rows.len());
+        for (i, r) in rows.iter().enumerate() {
+            let ry = list.y + i as f32 * row_h - scroll;
+            view_rows.push((r.path.clone(), r.is_dir));
+            if ry + row_h < list.y || ry > list.y + list.h {
+                continue; // offscreen
+            }
+            let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
+            if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            }
+            let marker = if r.is_dir {
+                if r.expanded {
+                    "\u{25be} "
+                } else {
+                    "\u{25b8} "
+                }
+            } else {
+                "  "
+            };
+            let label = format!("{marker}{}", r.name);
+            let color = if r.is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+            let left = list.x + pad + r.depth as f32 * indent_w;
+            let _ = self.shape_browser(bidx, &label, mono, (list.x + list.w - left - pad).max(1.0));
+            self.browser_placements.push(Placement {
+                idx: bidx,
+                left,
+                top: ry + (row_h - ch) * 0.5,
+                bounds: TextBounds {
+                    left: list.x as i32,
+                    top: list.y as i32,
+                    right: (list.x + list.w) as i32,
+                    bottom: (list.y + list.h) as i32,
+                },
+                color,
+            });
+            bidx += 1;
+        }
+
+        if focus_border {
+            push_border(quads, rect, sw, sh, self.chrome.accent);
+        }
+        self.browser_views.push(BrowserView {
+            sid,
+            list,
+            row_h,
+            scroll,
+            rows: view_rows,
         });
     }
 
@@ -2737,6 +3034,57 @@ impl State {
         }
     }
 
+    /// Handle a key for the focused file browser: typing filters, Backspace edits
+    /// the filter, Escape clears it, Enter acts on the top match (open a file, or
+    /// expand a directory and clear the filter).
+    fn browser_key(&mut self, event: &winit::event::KeyEvent) {
+        let Some(sid) = self.app.focused_surface() else {
+            return;
+        };
+        match &event.logical_key {
+            WKey::Named(NamedKey::Escape) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    b.set_query("");
+                }
+            }
+            WKey::Named(NamedKey::Backspace) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    let mut q = b.query().to_string();
+                    q.pop();
+                    b.set_query(q);
+                }
+            }
+            WKey::Named(NamedKey::Enter) => {
+                let top = self
+                    .app
+                    .browser_mut(sid)
+                    .and_then(|b| b.rows().first().cloned());
+                if let Some(r) = top {
+                    if r.is_dir {
+                        if let Some(b) = self.app.browser_mut(sid) {
+                            b.toggle_dir(&r.path);
+                            b.set_query("");
+                        }
+                    } else {
+                        self.app.open_file_in_focused(r.path);
+                    }
+                }
+            }
+            WKey::Character(s) => {
+                let add: String = s.chars().filter(|c| !c.is_control()).collect();
+                if !add.is_empty() {
+                    if let Some(b) = self.app.browser_mut(sid) {
+                        let mut q = b.query().to_string();
+                        q.push_str(&add);
+                        b.set_query(q);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
         // The palette, when open, owns the keyboard.
         if self.palette.is_some() {
@@ -2819,6 +3167,13 @@ impl State {
                     self.dirty = true;
                 }
             }
+            return;
+        }
+
+        // A file browser owns all non-Cmd keys: typing filters, Enter opens the top
+        // match, Backspace edits the filter, Escape clears it.
+        if self.app.focused_is_browser() {
+            self.browser_key(event);
             return;
         }
 
@@ -3586,6 +3941,8 @@ impl State {
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
         self.buttons.clear();
         self.empty_placements.clear();
+        self.browser_placements.clear();
+        self.browser_views.clear();
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
         self.close_buffer.set_metrics(metrics);
@@ -3714,6 +4071,17 @@ impl State {
                 continue;
             };
             let sid = *active_sid;
+
+            // An empty tab shows the picker; a browser tab shows the file browser.
+            if self.app.surface_is_empty(sid) {
+                self.build_empty_pane(*term, sw, sh, &mut bg_quads);
+                continue;
+            }
+            if self.app.is_browser(sid) {
+                let focus_border = pr.focused && resolved.len() > 1;
+                self.build_file_browser(sid, focus_border, *term, sw, sh, &mut bg_quads);
+                continue;
+            }
 
             // Editor filename ribbon (a single-tab editor's own line; multi-tab
             // editors show their filename in the tab instead). Filename italic when
@@ -4409,6 +4777,16 @@ impl State {
             default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
             custom_glyphs: &[],
         }));
+        // File-browser text.
+        text_areas.extend(self.browser_placements.iter().map(|p| TextArea {
+            buffer: &self.browser_buffers[p.idx],
+            left: p.left,
+            top: p.top,
+            scale: 1.0,
+            bounds: p.bounds,
+            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+            custom_glyphs: &[],
+        }));
         text_areas.extend(warm_area);
 
         self.text_renderer
@@ -5072,6 +5450,18 @@ fn wrap_line(line: &str, cols: usize) -> Vec<(String, usize)> {
 /// A compact directory label that fits in `max` characters, no wrap/overflow:
 /// prefer "parent/current", else "current", else "curr…" truncated with an
 /// ellipsis. `~` is substituted for the home directory's own segment.
+/// Truncate `s` to at most `max` characters, keeping the tail (prefixed with an
+/// ellipsis) so the most specific part of a path stays visible.
+fn shorten_start(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if max == 0 || count <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = s.chars().skip(count - keep).collect();
+    format!("\u{2026}{tail}")
+}
+
 fn shorten_dir(path: &std::path::Path, max: usize) -> String {
     let seg = |p: &std::path::Path| -> Option<String> {
         p.file_name().and_then(|s| s.to_str()).map(str::to_string)
