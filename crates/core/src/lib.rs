@@ -6,6 +6,7 @@
 
 pub mod command;
 pub mod config;
+pub mod fs_tree;
 pub mod fuzzy;
 pub mod ghostty;
 pub mod registry;
