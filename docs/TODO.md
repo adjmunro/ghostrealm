@@ -413,3 +413,50 @@
   typing into one undo step), wired to the key handler. User has further ideas on
   scope/behaviour — discuss before building.
 - Reason: basic editing expectation; currently edits can't be undone.
+
+---
+
+[2026-09-28@aaa6e17f]
+
+- Requires: NO BLOCKERS
+- Detail: cmd+w closes the focused surface (htab); if it was the pane's last
+  surface the pane (split) collapses, and if that was the vtab's last pane the
+  workspace closes. `Tree::close_surface` already cascades this way, so route
+  cmd+w to close the focused pane's active surface instead of `pane.close`.
+- Reason: one shortcut that closes htabs, splits, and workspaces by scope.
+
+---
+
+[2026-09-28@aaa6e17f]
+
+- Requires: NO BLOCKERS
+- Detail: Editor horizontal scroll (soft-wrap off) tears and lines lag at
+  different offsets until warm. Cause: each row is shaped as a per-hscroll
+  substring, so every hscroll value is a fresh cache miss filled over frames.
+  Fix: shape the full logical line once (width-independent), place it at
+  `body_x - hscroll*cell_w` with the TextArea bounds clipped to the body — move
+  the viewport, not the content — so hscroll reuses the shaped buffer and never
+  re-shapes.
+- Reason: smooth horizontal scroll; removes the tearing.
+
+---
+
+[2026-09-28@aaa6e17f]
+
+- Requires: NO BLOCKERS (research spike)
+- Detail: Spike a terminal grid wider than the pane with horizontal scroll, vs
+  the current pane-width grid. Open question: the child queries terminal size
+  (ioctl/SIGWINCH); a grid wider than the visible pane would misreport width and
+  programs would still wrap to the reported cols. Evaluate whether a wider grid
+  is coherent (and what to report) before committing.
+- Reason: view long unwrapped terminal output without the shell wrapping it.
+
+---
+
+[2026-09-28@aaa6e17f]
+
+- Requires: NO BLOCKERS
+- Detail: Icon-only button (no label) to show/hide the workspace sidebar. Hidden
+  state expands the workspace area to full width; the toggle stays reachable at
+  the edge. Use the shared button system (hover highlight + fire on release).
+- Reason: reclaim horizontal space when the sidebar is cramped.
