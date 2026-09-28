@@ -418,20 +418,6 @@
 
 [2026-09-28@aaa6e17f]
 
-- Requires: NO BLOCKERS
-- Detail: Editor horizontal scroll (soft-wrap off) tears and lines lag at
-  different offsets until warm. Cause: each row is shaped as a per-hscroll
-  substring, so every hscroll value is a fresh cache miss filled over frames.
-  Fix: shape the full logical line once (width-independent), place it at
-  `body_x - hscroll*cell_w` with the TextArea bounds clipped to the body — move
-  the viewport, not the content — so hscroll reuses the shaped buffer and never
-  re-shapes.
-- Reason: smooth horizontal scroll; removes the tearing.
-
----
-
-[2026-09-28@aaa6e17f]
-
 - Requires: NO BLOCKERS (research spike)
 - Detail: Spike a terminal grid wider than the pane with horizontal scroll, vs
   the current pane-width grid. Open question: the child queries terminal size

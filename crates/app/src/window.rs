@@ -1479,7 +1479,10 @@ impl State {
                     }
                 } else {
                     if vidx == row_off {
-                        found = Some((ln, 0, e.line_len(ln)));
+                        // No-wrap: the row is scrolled left by hscroll, so a click
+                        // maps to column hscroll + col_off (clamped to the line).
+                        let hs = e.hscroll;
+                        found = Some((ln, hs, e.line_len(ln).saturating_sub(hs)));
                         break 'walk;
                     }
                     vidx += 1;
@@ -3544,6 +3547,12 @@ impl State {
                 // otherwise each line is one row, offset left by hscroll and clipped.
                 let wrap_cols = if wrap { body_cols } else { usize::MAX };
                 let bottom = term.y + term.h;
+                // Horizontal scroll offset in pixels. Under no-wrap, each row holds
+                // its whole logical line shaped once (start 0) and is drawn shifted
+                // left by this, with bounds clipped to the body — moving the
+                // viewport rather than re-shaping a per-hscroll substring. Under
+                // wrap, hscroll is forced to 0.
+                let hscroll_px = hscroll as f32 * self.cell_w;
                 let mut vis: Vec<(usize, String, usize, f32)> = Vec::new();
                 let mut vy = term.y;
                 for (i, line) in visible.iter().enumerate() {
@@ -3560,8 +3569,7 @@ impl State {
                             vy += self.cell_h;
                         }
                     } else {
-                        let text: String = line.chars().skip(hscroll).collect();
-                        vis.push((ln, text, hscroll, vy));
+                        vis.push((ln, line.clone(), 0, vy));
                         vy += self.cell_h;
                     }
                 }
@@ -3593,18 +3601,25 @@ impl State {
                         let vfirst = first_l.max(*start);
                         let vlast = last_l.min(row_end);
                         if vlast > vfirst {
-                            bg_quads.push(rect_quad(
-                                Rect {
-                                    x: body_x + (vfirst - start) as f32 * self.cell_w,
-                                    y: *y,
-                                    w: (vlast - vfirst) as f32 * self.cell_w,
-                                    h: self.cell_h,
-                                },
-                                sw,
-                                sh,
-                                self.chrome.accent,
-                                0.35,
-                            ));
+                            // Offset by hscroll and clip to the body so a selection
+                            // that runs off either edge doesn't paint the gutter or
+                            // the neighbouring pane.
+                            let right = term.x + term.w;
+                            let x0 = (body_x + (vfirst - start) as f32 * self.cell_w
+                                - hscroll_px)
+                                .max(body_x);
+                            let x1 = (body_x + (vlast - start) as f32 * self.cell_w
+                                - hscroll_px)
+                                .min(right);
+                            if x1 > x0 {
+                                bg_quads.push(rect_quad(
+                                    Rect { x: x0, y: *y, w: x1 - x0, h: self.cell_h },
+                                    sw,
+                                    sh,
+                                    self.chrome.accent,
+                                    0.35,
+                                ));
+                            }
                         }
                     }
                 }
@@ -3662,13 +3677,17 @@ impl State {
                         .row_cache
                         .row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
                     let pos = (body_x as i32, *y as i32);
+                    // Shape the whole row (full line under no-wrap) in a box wide
+                    // enough to hold it, so the layout is hscroll-independent.
+                    let shape_w =
+                        (text.chars().count() as f32 * self.cell_w).max(body_w);
                     let place_key = if self.row_cache.buffer(key).is_some() {
                         self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &[]);
+                            .ensure(key, &mut self.font_system, metrics, shape_w, self.cell_h, &[]);
                         key
                     } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
                         self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, body_w, self.cell_h, &spans);
+                            .ensure(key, &mut self.font_system, metrics, shape_w, self.cell_h, &spans);
                         shaped += 1;
                         key
                     } else {
@@ -3680,14 +3699,14 @@ impl State {
                             pos,
                             key,
                             metrics,
-                            body_w,
+                            shape_w,
                             self.cell_h,
                         )
                     };
                     cur_rows.insert(pos, place_key);
                     row_placements.push(RowPlacement {
                         key: place_key,
-                        left: body_x,
+                        left: body_x - hscroll_px,
                         top: *y,
                         bounds: TextBounds {
                             left: body_x as i32,
@@ -3705,7 +3724,7 @@ impl State {
                     .rev()
                     .find(|(ln, _t, start, _y)| *ln == cursor.0 && *start <= cursor.1)
                 {
-                    let cx = body_x + (cursor.1 - start) as f32 * self.cell_w;
+                    let cx = body_x + (cursor.1 - start) as f32 * self.cell_w - hscroll_px;
                     // Clip to the body so a scrolled-off cursor never draws over the
                     // gutter or the neighbouring pane/sidebar.
                     if cx >= body_x && cx < term.x + term.w {
