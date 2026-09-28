@@ -98,6 +98,12 @@ const BUTTON_HOVER_ALPHA: f32 = 0.14;
 /// Sidebar "+ New workspace" label colour, brighter under the cursor.
 const NEW_VTAB_LABEL: [u8; 3] = [150, 150, 165];
 const NEW_VTAB_LABEL_HOVER: [u8; 3] = [210, 210, 220];
+/// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
+const TITLE_BAR_H: f32 = 28.0;
+/// Logical width reserved at the top-left for the macOS traffic-light buttons.
+const TRAFFIC_LIGHT_W: f32 = 76.0;
+/// Centred title-bar label colour.
+const TITLE_LABEL: [u8; 3] = [170, 170, 185];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -164,6 +170,17 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("ghostrealm")
             .with_inner_size(LogicalSize::new(900.0, 560.0));
+        // On macOS, extend the content view under a transparent title bar and hide
+        // the native title so we render our own title-bar strip (title + sidebar
+        // toggle) while the traffic lights float over the top-left corner.
+        #[cfg(target_os = "macos")]
+        let attrs = {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs
+                .with_titlebar_transparent(true)
+                .with_fullsize_content_view(true)
+                .with_title_hidden(true)
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         match pollster::block_on(State::new(
             window,
@@ -293,8 +310,13 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 // A close button arms on press and fires on release (so it can be
-                // cancelled); other clicks act on press as before.
-                if !state.arm_button() {
+                // cancelled); a press on the empty title-bar strip drags the window;
+                // other clicks act on press as before.
+                if state.arm_button() {
+                    // armed; fires on release
+                } else if state.cursor.1 < state.title_bar_h() {
+                    let _ = state.window.drag_window();
+                } else {
                     state.on_click();
                     state.begin_selection();
                 }
@@ -442,6 +464,10 @@ struct State {
     toggle_buffer: Buffer,
     /// Where to draw the toggle chevron this frame (set by `build_sidebar`).
     toggle_place: Option<Placement>,
+    /// Shaped centred title for the custom macOS title-bar strip.
+    title_buffer: Buffer,
+    /// Where to draw the title-bar label this frame (set by `build_titlebar`).
+    title_place: Option<Placement>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -713,6 +739,7 @@ impl State {
         let warm_buffer = Buffer::new(&mut font_system, warm_metrics);
         let close_buffer = Buffer::new(&mut font_system, warm_metrics);
         let toggle_buffer = Buffer::new(&mut font_system, warm_metrics);
+        let title_buffer = Buffer::new(&mut font_system, warm_metrics);
 
         let quad_pipeline = build_quad_pipeline(&device, format);
         let quad_capacity = 4096;
@@ -771,6 +798,8 @@ impl State {
             close_buffer,
             toggle_buffer,
             toggle_place: None,
+            title_buffer,
+            title_place: None,
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1020,25 +1049,45 @@ impl State {
         }
     }
 
-    /// The sidebar's rect in physical pixels (honours `[sidebar] side`).
-    fn sidebar_rect(&self) -> Rect {
-        sidebar_rect_for(
-            self.cfg.sidebar.side,
-            self.sidebar_width(),
-            self.config.width as f32,
-            self.config.height as f32,
-        )
+    /// Height of the custom title-bar strip in physical pixels. macOS renders its
+    /// own strip (title + sidebar toggle) over a full-size content view; other
+    /// platforms keep the native title bar and reserve nothing.
+    fn title_bar_h(&self) -> f32 {
+        if cfg!(target_os = "macos") {
+            TITLE_BAR_H * self.scale
+        } else {
+            0.0
+        }
     }
 
-    /// The workspace (panes) rect in physical pixels — everything the sidebar
-    /// doesn't occupy.
-    fn workspace_rect(&self) -> Rect {
-        workspace_rect_for(
+    /// The sidebar's rect in physical pixels (honours `[sidebar] side`), below the
+    /// title-bar strip.
+    fn sidebar_rect(&self) -> Rect {
+        let top = self.title_bar_h();
+        let mut r = sidebar_rect_for(
             self.cfg.sidebar.side,
             self.sidebar_width(),
             self.config.width as f32,
             self.config.height as f32,
-        )
+        );
+        r.y = top;
+        r.h = (r.h - top).max(0.0);
+        r
+    }
+
+    /// The workspace (panes) rect in physical pixels — everything the sidebar and
+    /// the title-bar strip don't occupy.
+    fn workspace_rect(&self) -> Rect {
+        let top = self.title_bar_h();
+        let mut r = workspace_rect_for(
+            self.cfg.sidebar.side,
+            self.sidebar_width(),
+            self.config.width as f32,
+            self.config.height as f32,
+        );
+        r.y = top;
+        r.h = (r.h - top).max(0.0);
+        r
     }
 
     /// Whether physical x-coordinate `x` falls in the sidebar column.
@@ -1914,43 +1963,29 @@ impl State {
         applied
     }
 
-    /// Push sidebar quads and shape vtab-name text; returns placements into
-    /// `sidebar_buffers`.
-    /// Draw the sidebar show/hide toggle: a square chevron button pinned at the
-    /// top of the sidebar/workspace boundary (or, when hidden, at the window edge
-    /// so it stays reachable). Shapes `self.toggle_buffer`, records `toggle_place`
-    /// for the text pass and the hit rect in `self.buttons`, and returns the rect
-    /// so the caller can keep the "+" row clear of it.
-    fn build_sidebar_toggle(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Rect {
+    /// Shape the sidebar-toggle chevron into `rect`, record its placement + hit
+    /// rect, and draw its hover highlight. With `chip_bg`, first paint an opaque
+    /// sidebar-coloured backing (for a toggle that floats with nothing behind it).
+    /// The chevron points toward the sidebar's outer edge to collapse, toward the
+    /// workspace to reveal.
+    fn place_sidebar_toggle(
+        &mut self,
+        rect: Rect,
+        sw: f32,
+        sh: f32,
+        quads: &mut Vec<QuadInstance>,
+        chip_bg: bool,
+    ) {
         let side = self.cfg.sidebar.side;
         let hidden = self.sidebar_hidden;
         let metrics = self.metrics();
-        let sz = self.cell_h + 8.0 * self.scale;
-        let x = if hidden {
-            match side {
-                Side::Left => 0.0,
-                Side::Right => (sw - sz).max(0.0),
-            }
-        } else {
-            let bar_x = self.sidebar_rect().x;
-            let bar_w = self.sidebar_width();
-            match side {
-                Side::Left => bar_x + bar_w - sz,
-                Side::Right => bar_x,
-            }
-        };
-        let rect = Rect { x, y: 0.0, w: sz, h: sz };
         let hovered = rect_contains(rect, self.cursor.0, self.cursor.1);
-        // A collapsed sidebar has no backdrop, so give the floating toggle its own
-        // sidebar-coloured chip; when expanded it sits on the bar already.
-        if hidden {
+        if chip_bg {
             quads.push(rect_quad(rect, sw, sh, self.chrome.sidebar, 1.0));
         }
         if hovered {
             quads.push(rect_quad(rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
         }
-        // Chevron points toward the outer edge to collapse, toward the workspace
-        // to reveal.
         let glyph = match (side, hidden) {
             (Side::Left, false) | (Side::Right, true) => "\u{2039}", // ‹
             (Side::Left, true) | (Side::Right, false) => "\u{203a}", // ›
@@ -1969,20 +2004,110 @@ impl State {
             .shape_until_scroll(&mut self.font_system, false);
         self.toggle_place = Some(Placement {
             idx: 0,
-            left: rect.x + (sz - self.cell_w) * 0.5,
-            top: (sz - self.cell_h) * 0.5,
+            left: rect.x + (rect.w - self.cell_w) * 0.5,
+            top: rect.y + (rect.h - self.cell_h) * 0.5,
             bounds: TextBounds {
                 left: rect.x as i32,
-                top: 0,
-                right: (rect.x + sz) as i32,
-                bottom: sz as i32,
+                top: rect.y as i32,
+                right: (rect.x + rect.w) as i32,
+                bottom: (rect.y + rect.h) as i32,
             },
             color,
         });
         self.buttons.push((rect, ButtonAction::ToggleSidebar));
+    }
+
+    /// The sidebar-toggle rect at the sidebar/workspace boundary (or the window
+    /// edge when collapsed) — used only when there is no title-bar strip to host
+    /// the toggle. Returns the rect so the caller keeps the "+" row clear of it.
+    fn build_sidebar_edge_toggle(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Rect {
+        let hidden = self.sidebar_hidden;
+        let sz = self.cell_h + 8.0 * self.scale;
+        let x = if hidden {
+            match self.cfg.sidebar.side {
+                Side::Left => 0.0,
+                Side::Right => (sw - sz).max(0.0),
+            }
+        } else {
+            let bar_x = self.sidebar_rect().x;
+            let bar_w = self.sidebar_width();
+            match self.cfg.sidebar.side {
+                Side::Left => bar_x + bar_w - sz,
+                Side::Right => bar_x,
+            }
+        };
+        let rect = Rect { x, y: self.title_bar_h(), w: sz, h: sz };
+        self.place_sidebar_toggle(rect, sw, sh, quads, hidden);
         rect
     }
 
+    /// Draw the custom title-bar strip (macOS): a full-width bar holding the
+    /// centred app title and the sidebar toggle, with the top-left kept clear for
+    /// the traffic lights. The toggle follows `[sidebar] side`.
+    fn build_titlebar(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) {
+        let h = self.title_bar_h();
+        if h <= 0.0 {
+            return;
+        }
+        let metrics = self.metrics();
+        quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h }, sw, sh, self.chrome.sidebar, 1.0));
+
+        // Toggle: a square on the sidebar's side, clear of the traffic lights.
+        let pad = 6.0 * self.scale;
+        let sz = (h - 2.0 * pad).max(1.0);
+        let lights = TRAFFIC_LIGHT_W * self.scale;
+        let tog_x = match self.cfg.sidebar.side {
+            Side::Left => lights + pad,
+            Side::Right => (sw - sz - pad).max(0.0),
+        };
+        let rect = Rect { x: tog_x, y: (h - sz) * 0.5, w: sz, h: sz };
+        self.place_sidebar_toggle(rect, sw, sh, quads, false);
+
+        // Centred title. Keep it clear of the traffic lights on the left and the
+        // toggle on whichever side it sits, centring within what's left.
+        let left_edge = lights.max(if matches!(self.cfg.sidebar.side, Side::Left) {
+            rect.x + rect.w
+        } else {
+            0.0
+        });
+        let right_edge = if matches!(self.cfg.sidebar.side, Side::Right) {
+            rect.x
+        } else {
+            sw
+        };
+        let avail = (right_edge - left_edge).max(1.0);
+        self.title_buffer.set_metrics(metrics);
+        self.title_buffer.set_size(Some(avail), Some(self.cell_h));
+        self.title_buffer.set_rich_text(
+            std::iter::once(("ghostrealm", attrs_for(TITLE_LABEL))),
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.title_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        // Measure the shaped (proportional) width so the title is truly centred.
+        let title_w = self
+            .title_buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
+        self.title_place = Some(Placement {
+            idx: 0,
+            left: left_edge + (avail - title_w) * 0.5,
+            top: (h - self.cell_h) * 0.5,
+            bounds: TextBounds {
+                left: left_edge as i32,
+                top: 0,
+                right: right_edge as i32,
+                bottom: h as i32,
+            },
+            color: TITLE_LABEL,
+        });
+    }
+
+    /// Push sidebar quads and shape vtab-name text; returns placements into
+    /// `sidebar_buffers`.
     fn build_sidebar(
         &mut self,
         sw: f32,
@@ -1990,12 +2115,20 @@ impl State {
         quads: &mut Vec<QuadInstance>,
         close_placements: &mut Vec<Placement>,
     ) -> Vec<Placement> {
-        let toggle = self.build_sidebar_toggle(sw, sh, quads);
+        // With a title-bar strip the toggle lives there; otherwise it sits at the
+        // sidebar edge.
+        let toggle = if self.title_bar_h() > 0.0 {
+            Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }
+        } else {
+            self.build_sidebar_edge_toggle(sw, sh, quads)
+        };
         if self.sidebar_hidden {
             return Vec::new();
         }
+        let bar = self.sidebar_rect();
         let bar_w = self.sidebar_width();
-        let bar_x = self.sidebar_rect().x;
+        let bar_x = bar.x;
+        let bar_top = bar.y;
         let row_h = self.cell_h + 8.0 * self.scale;
         let pad = 8.0 * self.scale;
         let dot = 6.0 * self.scale;
@@ -2031,9 +2164,9 @@ impl State {
         quads.push(rect_quad(
             Rect {
                 x: bar_x,
-                y: 0.0,
+                y: bar_top,
                 w: bar_w,
-                h: sh,
+                h: bar.h,
             },
             sw,
             sh,
@@ -2049,9 +2182,9 @@ impl State {
 
         let mut placements = Vec::new();
 
-        // Pinned "+" new-workspace button at the very top, kept clear of the toggle
-        // chevron (which sits at the sidebar/workspace boundary corner).
-        let btn_y = 0.0; // flush against the top edge (no margin above the button)
+        // Pinned "+" new-workspace button at the top of the sidebar (below the
+        // title-bar strip), kept clear of the edge toggle when there is no strip.
+        let btn_y = bar_top;
         let (btn_x, label_x) = match self.cfg.sidebar.side {
             Side::Left => (bar_x, bar_x + pad),
             Side::Right => (bar_x + toggle.w, bar_x + toggle.w + pad),
@@ -3991,6 +4124,10 @@ impl State {
         // text), and its text (drawn last, via a second renderer).
         // Sidebar (bg quads before text; its names join the main text pass).
         let sidebar_placements = self.build_sidebar(sw, sh, &mut bg_quads, &mut close_placements);
+        // Custom title-bar strip (macOS); a no-op elsewhere. Drawn after the
+        // sidebar so its strip covers the sidebar's top edge cleanly.
+        self.title_place = None;
+        self.build_titlebar(sw, sh, &mut bg_quads);
 
         let palette_placements = if self.palette.is_some() {
             self.build_palette(sw, sh, &mut overlay_quads)
@@ -4096,6 +4233,18 @@ impl State {
         if let Some(p) = &self.toggle_place {
             text_areas.push(TextArea {
                 buffer: &self.toggle_buffer,
+                left: p.left,
+                top: p.top,
+                scale: 1.0,
+                bounds: p.bounds,
+                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                custom_glyphs: &[],
+            });
+        }
+        // Custom title-bar label (macOS strip).
+        if let Some(p) = &self.title_place {
+            text_areas.push(TextArea {
+                buffer: &self.title_buffer,
                 left: p.left,
                 top: p.top,
                 scale: 1.0,
