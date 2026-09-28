@@ -419,17 +419,6 @@
 [2026-09-28@aaa6e17f]
 
 - Requires: NO BLOCKERS
-- Detail: cmd+w closes the focused surface (htab); if it was the pane's last
-  surface the pane (split) collapses, and if that was the vtab's last pane the
-  workspace closes. `Tree::close_surface` already cascades this way, so route
-  cmd+w to close the focused pane's active surface instead of `pane.close`.
-- Reason: one shortcut that closes htabs, splits, and workspaces by scope.
-
----
-
-[2026-09-28@aaa6e17f]
-
-- Requires: NO BLOCKERS
 - Detail: Editor horizontal scroll (soft-wrap off) tears and lines lag at
   different offsets until warm. Cause: each row is shaped as a per-hscroll
   substring, so every hscroll value is a fresh cache miss filled over frames.

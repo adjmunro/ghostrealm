@@ -365,6 +365,14 @@ impl AppState {
         }
     }
 
+    /// Close the active surface of the focused pane. The tree cascades: the last
+    /// surface collapses the pane, the last pane closes the workspace.
+    pub fn close_focused_surface(&mut self) {
+        if let (Some((vt, pane)), Some(sid)) = (self.focused_pane(), self.focused_surface()) {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid));
+        }
+    }
+
     pub fn close_active_vtab(&mut self) {
         if let Some(vt) = self.active() {
             self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt));
@@ -853,7 +861,22 @@ pub fn build_registry() -> Registry<AppState> {
         }),
     );
     r.register(
-        CommandMeta::new("pane.close", "Close Pane", "Close the focused pane"),
+        CommandMeta::new(
+            "pane.close",
+            "Close",
+            "Close the focused tab; collapses the pane, then the workspace, when it was the last",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.close_focused_surface();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "pane.close_all",
+            "Close Pane",
+            "Close the focused pane and every tab in it",
+        ),
         Box::new(|s: &mut AppState, _| {
             s.close_focused_pane();
             Ok(CmdOutcome::ok())
@@ -1046,6 +1069,41 @@ mod tests {
             after,
             "orphaned terminals should be pruned"
         );
+    }
+
+    #[test]
+    fn close_focused_surface_cascades_htab_then_pane_then_workspace() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        let vt = s.new_vtab().unwrap();
+        // Two htabs in the focused pane.
+        s.new_surface_in_focused().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().panes()[0].surfaces.len(), 2);
+
+        // First close removes the active htab, leaving the pane and workspace.
+        s.close_focused_surface();
+        assert_eq!(s.tree.vtab(vt).unwrap().panes()[0].surfaces.len(), 1);
+        assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 1);
+
+        // Second close removes the last htab, collapsing the pane and closing
+        // the workspace since it was the last pane.
+        s.close_focused_surface();
+        assert!(s.tree.vtab(vt).is_none(), "workspace should close");
+        assert_eq!(s.surfaces.len(), s.tree.surface_count());
+    }
+
+    #[test]
+    fn close_focused_surface_collapses_only_the_split_when_other_panes_remain() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        let vt = s.new_vtab().unwrap();
+        s.split_focused(Axis::TopBottom).unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 2);
+
+        // The focused pane has one surface; closing it collapses the split back
+        // to a single pane without closing the workspace.
+        s.close_focused_surface();
+        assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 1);
+        assert!(s.tree.vtab(vt).is_some(), "workspace should survive");
+        assert_eq!(s.surfaces.len(), s.tree.surface_count());
     }
 
     #[test]
