@@ -8,36 +8,49 @@
 /// Score `candidate` against `query`, case-insensitively. Higher is better;
 /// `None` if `query` is not a subsequence of `candidate`. An empty query scores 0.
 pub fn score(query: &str, candidate: &str) -> Option<i32> {
-    score_cased(query, candidate, false)
+    score_cased(query, candidate, false).map(|(s, _)| s)
 }
 
 /// Smart-case scoring: case-sensitive when `query` contains any uppercase letter,
 /// otherwise case-insensitive (the common "type lowercase to match anything,
 /// add a capital to pin it" behaviour).
 pub fn score_smart(query: &str, candidate: &str) -> Option<i32> {
-    let case_sensitive = query.chars().any(|c| c.is_uppercase());
-    score_cased(query, candidate, case_sensitive)
+    match_smart(query, candidate).map(|(s, _)| s)
 }
 
-fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<i32> {
-    if query.is_empty() {
-        return Some(0);
+/// Smart-case match returning both a score and the candidate char indices that
+/// matched (for highlighting). A `*` in the query switches to wildcard matching:
+/// the segments between stars must appear in order as substrings.
+pub fn match_smart(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
+    let case_sensitive = query.chars().any(|c| c.is_uppercase());
+    if query.contains('*') {
+        wildcard_cased(query, candidate, case_sensitive)
+    } else {
+        score_cased(query, candidate, case_sensitive)
     }
-    let fold = |s: &str| -> Vec<char> {
-        if case_sensitive {
-            s.chars().collect()
-        } else {
-            s.chars().flat_map(char::to_lowercase).collect()
-        }
-    };
-    let q: Vec<char> = fold(query);
-    let c: Vec<char> = fold(candidate);
+}
+
+fn fold(s: &str, case_sensitive: bool) -> Vec<char> {
+    if case_sensitive {
+        s.chars().collect()
+    } else {
+        s.chars().flat_map(char::to_lowercase).collect()
+    }
+}
+
+fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i32, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let q = fold(query, case_sensitive);
+    let c = fold(candidate, case_sensitive);
     let craw: Vec<char> = candidate.chars().collect();
 
     let mut qi = 0usize;
     let mut total = 0i32;
     let mut prev_match: Option<usize> = None;
     let mut first_match: Option<usize> = None;
+    let mut indices: Vec<usize> = Vec::with_capacity(q.len());
 
     for (ci, &cc) in c.iter().enumerate() {
         if qi >= q.len() {
@@ -48,12 +61,9 @@ fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<i32
                 first_match = Some(ci);
             }
             let mut s = 1;
-            // Contiguous with the previous matched char.
             if prev_match == Some(ci.wrapping_sub(1)) {
                 s += 5;
             }
-            // Word-boundary start (index 0, or preceded by a separator, or a
-            // lower->upper camelCase hump in the original text).
             let boundary = ci == 0
                 || matches!(
                     c.get(ci - 1),
@@ -67,6 +77,7 @@ fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<i32
                 s += 10;
             }
             total += s;
+            indices.push(ci);
             prev_match = Some(ci);
             qi += 1;
         }
@@ -75,11 +86,71 @@ fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<i32
     if qi != q.len() {
         return None;
     }
-
-    // Prefer earlier first matches and shorter candidates, gently.
     total -= first_match.unwrap_or(0) as i32;
     total -= (c.len() as i32) / 20;
-    Some(total)
+    Some((total, indices))
+}
+
+/// Match a `*`-wildcard `query`: the segments between stars must appear, in order,
+/// as contiguous substrings. A query not starting with `*` anchors its first
+/// segment to the start; not ending with `*` anchors its last segment to the end
+/// (so `*.kt` matches `main.kt` but not `build.gradle.kts`). Returns a score and
+/// the matched char indices.
+fn wildcard_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i32, Vec<usize>)> {
+    let anchored_start = !query.starts_with('*');
+    let anchored_end = !query.ends_with('*');
+    let segs: Vec<Vec<char>> = query
+        .split('*')
+        .filter(|s| !s.is_empty())
+        .map(|s| fold(s, case_sensitive))
+        .collect();
+    let c = fold(candidate, case_sensitive);
+    if segs.is_empty() {
+        return Some((0, Vec::new())); // bare "*" matches everything
+    }
+    let n = segs.len();
+    let mut pos = 0usize;
+    let mut indices: Vec<usize> = Vec::new();
+    let mut first = None;
+    for (i, seg) in segs.iter().enumerate() {
+        let at = if i == 0 && anchored_start {
+            if c.len() >= seg.len() && c[..seg.len()] == seg[..] {
+                0
+            } else {
+                return None;
+            }
+        } else if i == n - 1 && anchored_end {
+            if c.len() < seg.len() {
+                return None;
+            }
+            let start = c.len() - seg.len();
+            if start >= pos && c[start..] == seg[..] {
+                start
+            } else {
+                return None;
+            }
+        } else {
+            find_sub(&c, seg, pos)?
+        };
+        if first.is_none() {
+            first = Some(at);
+        }
+        indices.extend(at..at + seg.len());
+        pos = at + seg.len();
+    }
+    let score = 50 - first.unwrap_or(0) as i32 - (c.len() as i32) / 20;
+    Some((score, indices))
+}
+
+/// Index of the first occurrence of `needle` in `hay` at or after `from`.
+fn find_sub(hay: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (from..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == needle[..])
 }
 
 #[cfg(test)]
@@ -121,6 +192,21 @@ mod tests {
     #[test]
     fn case_insensitive() {
         assert!(score("NEW", "new tab").is_some());
+    }
+
+    #[test]
+    fn wildcard_anchors_and_matches() {
+        use super::match_smart;
+        // *.kt ends with .kt, so it excludes .kts.
+        assert!(match_smart("*.kt", "main.kt").is_some());
+        assert!(match_smart("*.kt", "build.gradle.kts").is_none());
+        // *foo* matches anywhere; a*b needs a then b in order, contiguous segments.
+        assert!(match_smart("*out*", "checkout.rs").is_some());
+        assert!(match_smart("a*b", "axxb").is_some());
+        assert!(match_smart("a*b", "bxa").is_none());
+        // Leading anchor: "src*" must start with src.
+        assert!(match_smart("src*", "src/main.rs").is_some());
+        assert!(match_smart("src*", "my/src").is_none());
     }
 
     #[test]

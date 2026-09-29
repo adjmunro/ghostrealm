@@ -89,6 +89,9 @@ pub struct FileRow {
     pub expanded: bool,
     pub size: u64,
     pub mtime: Option<SystemTime>,
+    /// Char indices into `name` that the query matched (for highlighting). Empty in
+    /// browse mode.
+    pub match_indices: Vec<usize>,
 }
 
 /// Caps on the filter-mode walk so a huge tree never stalls a keystroke.
@@ -374,17 +377,49 @@ impl FsTree {
     }
 
     /// Whether the current input reads as a path (drives autocomplete/navigation)
-    /// rather than a fuzzy filter. A leading `~`, `/`, `.` or any `/` means path.
+    /// rather than a fuzzy/wildcard filter. Path if it starts with `~`, `/`, `./`,
+    /// `../`, is exactly `.`/`..`, or contains a `/`. A bare dotted name like
+    /// `.kt` stays a filter.
     pub fn input_is_path(&self) -> bool {
-        let q = self.query.trim_start();
-        q.starts_with('~') || q.starts_with('/') || q.starts_with('.') || q.contains('/')
+        let q = self.query.trim();
+        q.starts_with('~')
+            || q.starts_with('/')
+            || q.starts_with("./")
+            || q.starts_with("../")
+            || q == "."
+            || q == ".."
+            || q.contains('/')
+    }
+
+    /// Resolve a typed path against this tree's root: `~`/`/` are home/absolute,
+    /// everything else (including `.`, `..`, `foo`, `foo/bar`) is relative to the
+    /// current root — not the process's working directory.
+    pub fn resolve_path(&self, input: &str) -> PathBuf {
+        let t = input.trim();
+        if let Some(rest) = t.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+        if t == "~" {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home);
+            }
+        }
+        let p = Path::new(t);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(t)
+        }
     }
 
     /// Act on the current path-like input. If it names an existing file, return it
     /// (the caller opens it). Otherwise navigate to it (the input itself if it is a
-    /// directory, else its nearest existing parent) and return `None`.
+    /// directory, else its nearest existing parent) and return `None`. The new root
+    /// is canonicalised so `.`/`..` segments don't linger in the display.
     pub fn navigate_input(&mut self) -> Option<PathBuf> {
-        let p = expand_tilde(self.query.trim());
+        let p = self.resolve_path(&self.query);
         if p.is_file() {
             return Some(p);
         }
@@ -394,53 +429,53 @@ impl FsTree {
             p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf)
         };
         if let Some(d) = dir {
-            self.set_root(d);
+            let clean = std::fs::canonicalize(&d).unwrap_or(d);
+            self.set_root(clean);
         }
         None
     }
 
-    /// The first path completion for the current input (for Tab-complete), with a
-    /// trailing `/` when it is a directory.
-    pub fn first_completion(&self) -> Option<String> {
-        self.suggestions(&self.query).into_iter().next().map(|p| {
-            let mut s = p.to_string_lossy().into_owned();
-            if p.is_dir() {
-                s.push('/');
-            }
-            s
-        })
+    /// The full completions for the current input (for Tab / clicking), each with a
+    /// trailing `/` when it is a directory. Ordered directories first.
+    pub fn completions(&self) -> Vec<String> {
+        self.suggestions(&self.query)
+            .into_iter()
+            .map(|p| {
+                let mut s = p.to_string_lossy().into_owned();
+                if p.is_dir() {
+                    s.push('/');
+                }
+                s
+            })
+            .collect()
     }
 
-    /// Path completions for `input`: entries in the directory `input` names (or
-    /// its parent, for a partial final component), matching the partial prefix.
-    /// Directories come first. Used by the path box's autocomplete.
+    /// Path completions for `input`: entries in the directory `input` names (or its
+    /// parent, for a partial final component), matching the partial prefix. The
+    /// listed directory is resolved against the root. Directories come first.
     pub fn suggestions(&self, input: &str) -> Vec<PathBuf> {
-        let expanded = expand_tilde(input);
-        // Split into the directory to list and the partial final component.
-        let (dir, partial): (PathBuf, String) = if input.ends_with('/') || input.is_empty() {
-            (expanded.clone(), String::new())
+        let t = input.trim_end_matches(' ');
+        // Split the raw input into the directory part and the partial final name.
+        let (dir_part, partial): (String, String) = if t.ends_with('/') {
+            (t.to_string(), String::new())
+        } else if let Some(i) = t.rfind('/') {
+            (t[..=i].to_string(), t[i + 1..].to_string())
+        } else if t == "." || t == ".." || t == "~" {
+            (t.to_string(), String::new())
         } else {
-            match expanded.parent() {
-                Some(p) if !p.as_os_str().is_empty() => (
-                    p.to_path_buf(),
-                    expanded
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                ),
-                _ => (expanded.clone(), String::new()),
-            }
+            (String::new(), t.to_string())
         };
-        let base = if dir.as_os_str().is_empty() {
+        let base = if dir_part.is_empty() {
             self.root.clone()
         } else {
-            dir
+            self.resolve_path(&dir_part)
         };
+        let partial_lower = partial.to_lowercase();
         let mut out: Vec<(bool, PathBuf)> = Vec::new();
         if let Ok(read) = std::fs::read_dir(&base) {
             for e in read.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if !partial.is_empty() && !name.to_lowercase().starts_with(&partial.to_lowercase()) {
+                if !partial.is_empty() && !name.to_lowercase().starts_with(&partial_lower) {
                     continue;
                 }
                 if partial.is_empty() && name.starts_with('.') && !self.show_hidden {
@@ -452,8 +487,11 @@ impl FsTree {
         }
         // Directories first, then case-insensitive by name.
         out.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.to_string_lossy().to_lowercase().cmp(&b.1.to_string_lossy().to_lowercase()))
+            b.0.cmp(&a.0).then_with(|| {
+                a.1.to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&b.1.to_string_lossy().to_lowercase())
+            })
         });
         out.into_iter().map(|(_, p)| p).collect()
     }
@@ -481,6 +519,7 @@ impl FsTree {
                 expanded,
                 size: e.size,
                 mtime: e.mtime,
+                match_indices: Vec::new(),
             });
             if expanded {
                 let child = e.path.clone();
@@ -535,29 +574,38 @@ impl FsTree {
     /// is the path relative to the root, so which match it is stays clear.
     fn filter_rows(&self) -> Vec<FileRow> {
         let query = self.query.trim();
-        let entries = self.walk_cache.as_deref().unwrap_or(&[]);
-        let mut scored: Vec<(i32, &WalkEntry)> = entries
+        let mut scored: Vec<(i32, Vec<usize>, &WalkEntry)> = self
+            .walk_cache
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .filter(|e| e.is_dir || self.file_passes(&e.path, e.mtime))
-            .filter_map(|e| fuzzy::score_smart(query, &e.name).map(|s| (s, e)))
+            .filter_map(|e| fuzzy::match_smart(query, &e.name).map(|(s, idx)| (s, idx, e)))
             .collect();
         // Highest score first; ties broken by shorter path then name.
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| a.1.rel.len().cmp(&b.1.rel.len()))
-                .then_with(|| a.1.rel.cmp(&b.1.rel))
+                .then_with(|| a.2.rel.len().cmp(&b.2.rel.len()))
+                .then_with(|| a.2.rel.cmp(&b.2.rel))
         });
         scored.truncate(FILTER_RESULT_CAP);
         scored
             .into_iter()
-            .map(|(_, e)| FileRow {
-                name: e.rel.clone(),
-                path: e.path.clone(),
-                is_dir: e.is_dir,
-                depth: 0,
-                expanded: false,
-                size: e.size,
-                mtime: e.mtime,
+            .map(|(_, name_idx, e)| {
+                // Match indices are within the leaf name; shift onto the displayed
+                // relative path (name is its final component).
+                let offset = e.rel.chars().count().saturating_sub(e.name.chars().count());
+                let match_indices = name_idx.into_iter().map(|i| i + offset).collect();
+                FileRow {
+                    name: e.rel.clone(),
+                    path: e.path.clone(),
+                    is_dir: e.is_dir,
+                    depth: 0,
+                    expanded: false,
+                    size: e.size,
+                    mtime: e.mtime,
+                    match_indices,
+                }
             })
             .collect()
     }
@@ -615,20 +663,6 @@ impl FsTree {
             .follow_links(false);
         b
     }
-}
-
-/// Expand a leading `~` to the home directory.
-fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    } else if input == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from(input)
 }
 
 #[cfg(test)]
@@ -766,6 +800,46 @@ mod tests {
             t.rows().iter().any(|r| r.name == "new.txt"),
             "a 1h window shows a just-created file"
         );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn relative_input_resolves_against_root_not_cwd() {
+        let d = tmpdir();
+        fs::create_dir(d.join("sub")).unwrap();
+        let t = FsTree::new(&d);
+        // "." lists the root's own children (not the process working directory).
+        let names: Vec<String> = t
+            .suggestions(".")
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.contains(&"sub".to_string()));
+    }
+
+    #[test]
+    fn navigate_dotdot_goes_to_the_parent_of_root() {
+        let d = tmpdir();
+        fs::create_dir(d.join("child")).unwrap();
+        let mut t = FsTree::new(d.join("child"));
+        t.set_query("..");
+        assert!(t.navigate_input().is_none());
+        assert_eq!(t.root(), std::fs::canonicalize(&d).unwrap());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn wildcard_query_filters_by_extension() {
+        let d = tmpdir();
+        fs::write(d.join("main.kt"), "x").unwrap();
+        fs::write(d.join("build.gradle.kts"), "x").unwrap();
+        fs::write(d.join("readme.md"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_query("*.kt");
+        let names: Vec<String> = t.rows().iter().map(|r| r.name.clone()).collect();
+        assert!(names.iter().any(|n| n.ends_with("main.kt")));
+        assert!(names.iter().all(|n| !n.ends_with(".kts")), "excludes .kts");
+        assert!(names.iter().all(|n| !n.ends_with(".md")));
         fs::remove_dir_all(&d).ok();
     }
 
