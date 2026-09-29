@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState, OpenKind, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, AppState, OpenKind, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::editor::Motion;
 use crate::row_cache::RowCache;
 use crate::tap::TapDetector;
@@ -479,6 +479,9 @@ struct State {
     /// Text buffers + placements for file-browser panes.
     browser_buffers: Vec<Buffer>,
     browser_placements: Vec<Placement>,
+    /// Monotonic index into `browser_buffers` for the current frame, so several
+    /// browsers (panes + the floating picker) never clobber each other's buffers.
+    browser_buf_used: usize,
     /// Per-browser vertical scroll offset (physical px).
     browser_scroll: HashMap<SurfaceId, f32>,
     /// Hit-testing for the visible browser panes this frame (click → row).
@@ -487,6 +490,10 @@ struct State {
     browser_last_click: Option<(Instant, std::path::PathBuf)>,
     /// Path-autocomplete suggestion hit rects this frame: (rect, surface, path, is_dir).
     browser_suggest_hits: Vec<(Rect, SurfaceId, std::path::PathBuf, bool)>,
+    /// The floating directory picker's panel rect this frame (for click-outside),
+    /// and its shaped text placements (drawn in the overlay pass).
+    picker_panel: Option<Rect>,
+    picker_placements: Vec<Placement>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -670,6 +677,9 @@ enum ButtonAction {
     BrowserToggleRecent(SurfaceId),
     /// Move a file browser up to its parent directory.
     BrowserParent(SurfaceId),
+    /// Confirm / cancel the floating directory picker.
+    PickerConfirm,
+    PickerCancel,
 }
 
 impl State {
@@ -851,10 +861,13 @@ impl State {
             empty_placements: Vec::new(),
             browser_buffers: Vec::new(),
             browser_placements: Vec::new(),
+            browser_buf_used: 0,
             browser_scroll: HashMap::new(),
             browser_views: Vec::new(),
             browser_last_click: None,
             browser_suggest_hits: Vec::new(),
+            picker_panel: None,
+            picker_placements: Vec::new(),
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1236,6 +1249,8 @@ impl State {
                     b.go_to_parent();
                 }
             }
+            ButtonAction::PickerConfirm => self.app.confirm_dir_picker(),
+            ButtonAction::PickerCancel => self.app.close_dir_picker(),
         }
         self.dirty = true;
         true
@@ -1281,6 +1296,49 @@ impl State {
     }
 
     fn on_click(&mut self) {
+        // The directory picker is modal: handle its rows/suggestions, and a click
+        // outside the panel cancels. (Its header/footer buttons arm on press.)
+        if self.app.dir_picker_open() {
+            let (x, y) = self.cursor;
+            if let Some((_, _, spath, sdir)) = self
+                .browser_suggest_hits
+                .iter()
+                .find(|(r, _, _, _)| rect_contains(*r, x, y))
+                .cloned()
+            {
+                if sdir {
+                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                        b.set_root(spath);
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if let Some((_, path, is_dir)) = self.browser_row_at(x, y) {
+                if is_dir {
+                    let now = Instant::now();
+                    let dbl = self
+                        .browser_last_click
+                        .as_ref()
+                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < DOUBLE_CLICK);
+                    self.browser_last_click = Some((now, path.clone()));
+                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                        if dbl {
+                            b.set_root(path);
+                        } else {
+                            b.toggle_dir(&path);
+                        }
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if self.picker_panel.is_some_and(|panel| !rect_contains(panel, x, y)) {
+                self.app.close_dir_picker();
+            }
+            self.dirty = true;
+            return;
+        }
         if self.palette.is_some() {
             self.palette_click();
             return;
@@ -1969,6 +2027,20 @@ impl State {
         if self.palette.is_some() {
             return;
         }
+        // The directory picker is modal: the wheel scrolls its list.
+        if self.app.dir_picker_open() {
+            let px = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y * SCROLL_LINES_PER_NOTCH * self.cell_h,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32,
+            };
+            if px != 0.0 {
+                let cur = self.browser_scroll.get(&PICKER_SID).copied().unwrap_or(0.0);
+                self.browser_scroll.insert(PICKER_SID, (cur - px).max(0.0));
+                self.dirty = true;
+                self.frame_pending = true;
+            }
+            return;
+        }
         // Normalise both event kinds to physical pixels. A line/notch wheel is
         // worth SCROLL_LINES_PER_NOTCH cells; a trackpad reports pixels directly.
         let (px, px_x) = match delta {
@@ -2380,10 +2452,13 @@ impl State {
         });
     }
 
-    /// Shape `text` into `browser_buffers[idx]` (growing the pool) and return its
-    /// shaped width. Colour comes from the placement in the text pass.
-    fn shape_browser(&mut self, idx: usize, text: &str, family: Family, width_box: f32) -> f32 {
+    /// Shape `text` into the next free `browser_buffers` slot for this frame and
+    /// return `(idx, shaped_width)`. Colour comes from the placement in the text
+    /// pass. The per-frame counter keeps several browsers from clobbering slots.
+    fn shape_browser(&mut self, text: &str, family: Family, width_box: f32) -> (usize, f32) {
         let m = self.metrics();
+        let idx = self.browser_buf_used;
+        self.browser_buf_used += 1;
         while self.browser_buffers.len() <= idx {
             let b = Buffer::new(&mut self.font_system, m);
             self.browser_buffers.push(b);
@@ -2398,7 +2473,8 @@ impl State {
             None,
         );
         buf.shape_until_scroll(&mut self.font_system, false);
-        buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
+        let w = buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+        (idx, w)
     }
 
     /// Draw a file-browser pane in `rect`: a header (parent, path/filter, hidden &
@@ -2412,7 +2488,8 @@ impl State {
         sw: f32,
         sh: f32,
         quads: &mut Vec<QuadInstance>,
-    ) {
+    ) -> Vec<Placement> {
+        let mut placements: Vec<Placement> = Vec::new();
         quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
 
         let scale = self.scale;
@@ -2439,7 +2516,7 @@ impl State {
                     b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
                     b.recent_on(),
                 ),
-                None => return,
+                None => return placements,
             };
 
         // Header background.
@@ -2451,7 +2528,6 @@ impl State {
             1.0,
         ));
         let hy = rect.y + (header_h - ch) * 0.5;
-        let mut bidx = 0usize;
 
         // Parent (..) button on the left.
         let par_w = self.cell_w * 3.0;
@@ -2460,9 +2536,9 @@ impl State {
         if par_hov {
             quads.push(rect_quad(par_hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
         }
-        let _ = self.shape_browser(bidx, "..", mono, par_w);
-        self.browser_placements.push(Placement {
-            idx: bidx,
+        let (idx, _) = self.shape_browser("..", mono, par_w);
+        placements.push(Placement {
+            idx,
             left: rect.x + pad,
             top: hy,
             bounds: TextBounds {
@@ -2474,9 +2550,8 @@ impl State {
             color: if par_hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
         });
         self.buttons.push((par_hit, ButtonAction::BrowserParent(sid)));
-        bidx += 1;
 
-        // Toggles on the right: [.gitignore] [hidden].
+        // Toggles on the right: [recent] [git] [.gitignore] [hidden].
         let toggle = |on: bool| if on { NEW_VTAB_LABEL_HOVER } else { EMPTY_SHORTCUT };
         let mut right = rect.x + rect.w - pad;
         for (label, on, action) in [
@@ -2491,9 +2566,9 @@ impl State {
             if hov {
                 quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
             }
-            let _ = self.shape_browser(bidx, label, sans, w + pad);
-            self.browser_placements.push(Placement {
-                idx: bidx,
+            let (idx, _) = self.shape_browser(label, sans, w + pad);
+            placements.push(Placement {
+                idx,
                 left: right - w - pad + pad * 0.5,
                 top: hy,
                 bounds: TextBounds {
@@ -2505,7 +2580,6 @@ impl State {
                 color: toggle(on),
             });
             self.buttons.push((hit, action));
-            bidx += 1;
             right -= w + pad * 2.0;
         }
 
@@ -2518,9 +2592,9 @@ impl State {
         } else {
             (format!("/{query}"), self.chrome.accent)
         };
-        let _ = self.shape_browser(bidx, &ptext, sans, path_w);
-        self.browser_placements.push(Placement {
-            idx: bidx,
+        let (idx, _) = self.shape_browser(&ptext, sans, path_w);
+        placements.push(Placement {
+            idx,
             left: path_x,
             top: hy,
             bounds: TextBounds {
@@ -2531,7 +2605,6 @@ impl State {
             },
             color: pcolor,
         });
-        bidx += 1;
 
         // Scrollable row list.
         let list = Rect {
@@ -2575,9 +2648,9 @@ impl State {
             let label = format!("{marker}{}", r.name);
             let color = if r.is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
             let left = list.x + pad + r.depth as f32 * indent_w;
-            let _ = self.shape_browser(bidx, &label, mono, (list.x + list.w - left - pad).max(1.0));
-            self.browser_placements.push(Placement {
-                idx: bidx,
+            let (idx, _) = self.shape_browser(&label, mono, (list.x + list.w - left - pad).max(1.0));
+            placements.push(Placement {
+                idx,
                 left,
                 top: ry + (row_h - ch) * 0.5,
                 bounds: TextBounds {
@@ -2588,7 +2661,6 @@ impl State {
                 },
                 color,
             });
-            bidx += 1;
         }
 
         // Path autocomplete: when the input reads as a path, show a completion
@@ -2623,9 +2695,9 @@ impl State {
                     if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
                         quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
                     }
-                    let _ = self.shape_browser(bidx, &label, Family::Monospace, panel.w - pad * 2.0);
-                    self.browser_placements.push(Placement {
-                        idx: bidx,
+                    let (idx, _) = self.shape_browser(&label, Family::Monospace, panel.w - pad * 2.0);
+                    placements.push(Placement {
+                        idx,
                         left: panel.x + pad,
                         top: ry + (row_h - ch) * 0.5,
                         bounds: TextBounds {
@@ -2636,7 +2708,6 @@ impl State {
                         },
                         color: if is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
                     });
-                    bidx += 1;
                     self.browser_suggest_hits
                         .push((row_rect, sid, p.clone(), is_dir));
                 }
@@ -2653,6 +2724,99 @@ impl State {
             scroll,
             rows: view_rows,
         });
+        placements
+    }
+
+    /// Draw the floating directory picker overlay (a dim backdrop + a centred panel
+    /// hosting the reusable file browser and a confirm/cancel footer). Quads go to
+    /// the overlay layer; returns the panel's text placements for the overlay pass.
+    fn build_dir_picker(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+        if !self.app.dir_picker_open() {
+            return Vec::new();
+        }
+        let scale = self.scale;
+        let ch = self.cell_h;
+        let pad = 10.0 * scale;
+        // Dim backdrop over everything.
+        quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
+        // Centred panel.
+        let pw = (sw * 0.6).clamp(360.0 * scale, 760.0 * scale).min((sw - 40.0 * scale).max(1.0));
+        let ph = (sh * 0.7).min((sh - 40.0 * scale).max(1.0));
+        let px = (sw - pw) * 0.5;
+        let py = (sh - ph) * 0.5;
+        let panel = Rect { x: px, y: py, w: pw, h: ph };
+        self.picker_panel = Some(panel);
+        quads.push(rect_quad(panel, sw, sh, self.chrome.background, 1.0));
+        push_border(quads, panel, sw, sh, self.chrome.accent);
+
+        let title_h = ch + 12.0 * scale;
+        let footer_h = ch + 16.0 * scale;
+        let mut placements: Vec<Placement> = Vec::new();
+
+        // Title.
+        let (idx, tw) = self.shape_browser("Set workspace directory", Family::SansSerif, pw);
+        placements.push(Placement {
+            idx,
+            left: px + (pw - tw) * 0.5,
+            top: py + (title_h - ch) * 0.5,
+            bounds: TextBounds {
+                left: px as i32,
+                top: py as i32,
+                right: (px + pw) as i32,
+                bottom: (py + title_h) as i32,
+            },
+            color: TITLE_LABEL,
+        });
+
+        // Browser body between the title and the footer.
+        let body = Rect {
+            x: px,
+            y: py + title_h,
+            w: pw,
+            h: (ph - title_h - footer_h).max(1.0),
+        };
+        let ps = self.build_file_browser(PICKER_SID, false, body, sw, sh, quads);
+        placements.extend(ps);
+
+        // Footer: [Cancel] [Use this folder], right-aligned.
+        let fy = py + ph - footer_h;
+        let bh = ch + 8.0 * scale;
+        let by = fy + (footer_h - bh) * 0.5;
+        let mut right = px + pw - pad;
+        for (label, action, primary) in [
+            ("Use this folder", ButtonAction::PickerConfirm, true),
+            ("Cancel", ButtonAction::PickerCancel, false),
+        ] {
+            let w = label.chars().count() as f32 * self.cell_w;
+            let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
+            let hov = rect_contains(hit, self.cursor.0, self.cursor.1);
+            quads.push(rect_quad(
+                hit,
+                sw,
+                sh,
+                if primary { self.chrome.accent } else { self.chrome.sidebar },
+                if primary { 0.5 } else { 1.0 },
+            ));
+            if hov {
+                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            }
+            let (idx, lw) = self.shape_browser(label, Family::SansSerif, w + pad);
+            placements.push(Placement {
+                idx,
+                left: hit.x + (hit.w - lw) * 0.5,
+                top: by + (bh - ch) * 0.5,
+                bounds: TextBounds {
+                    left: hit.x as i32,
+                    top: by as i32,
+                    right: (hit.x + hit.w) as i32,
+                    bottom: (by + bh) as i32,
+                },
+                color: if primary || hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
+            });
+            self.buttons.push((hit, action));
+            right -= w + pad * 3.0;
+        }
+        placements
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -3143,13 +3307,12 @@ impl State {
         }
     }
 
-    /// Handle a key for the focused file browser: typing filters, Backspace edits
-    /// the filter, Escape clears it, Enter acts on the top match (open a file, or
-    /// expand a directory and clear the filter).
-    fn browser_key(&mut self, event: &winit::event::KeyEvent) {
-        let Some(sid) = self.app.focused_surface() else {
-            return;
-        };
+    /// Handle a key for file browser `sid`: typing filters, Backspace edits the
+    /// filter, Escape clears it, Tab completes a path, Enter acts on the top match
+    /// (navigate a directory, or open a file — except in the picker, which only
+    /// navigates directories).
+    fn browser_key(&mut self, sid: SurfaceId, event: &winit::event::KeyEvent) {
+        let is_picker = sid == PICKER_SID;
         match &event.logical_key {
             WKey::Named(NamedKey::Escape) => {
                 if let Some(b) = self.app.browser_mut(sid) {
@@ -3185,7 +3348,9 @@ impl State {
                 if path_mode {
                     let file = self.app.browser_mut(sid).and_then(|b| b.navigate_input());
                     if let Some(f) = file {
-                        self.app.open_file_in_focused(f);
+                        if !is_picker {
+                            self.app.open_file_in_focused(f);
+                        }
                     }
                 } else {
                     let top = self
@@ -3198,7 +3363,7 @@ impl State {
                                 b.toggle_dir(&r.path);
                                 b.set_query("");
                             }
-                        } else {
+                        } else if !is_picker {
                             self.app.open_file_in_focused(r.path);
                         }
                     }
@@ -3220,6 +3385,22 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
+        // The directory picker, when open, owns the keyboard: Escape cancels,
+        // Cmd+Enter confirms, everything else drives its file browser.
+        if self.app.dir_picker_open() {
+            match &event.logical_key {
+                WKey::Named(NamedKey::Escape) => {
+                    self.app.close_dir_picker();
+                    self.dirty = true;
+                }
+                WKey::Named(NamedKey::Enter) if self.mods.super_ => {
+                    self.app.confirm_dir_picker();
+                    self.dirty = true;
+                }
+                _ => self.browser_key(PICKER_SID, event),
+            }
+            return;
+        }
         // The palette, when open, owns the keyboard.
         if self.palette.is_some() {
             self.palette_key(event);
@@ -3307,7 +3488,9 @@ impl State {
         // A file browser owns all non-Cmd keys: typing filters, Enter opens the top
         // match, Backspace edits the filter, Escape clears it.
         if self.app.focused_is_browser() {
-            self.browser_key(event);
+            if let Some(sid) = self.app.focused_surface() {
+                self.browser_key(sid, event);
+            }
             return;
         }
 
@@ -4076,8 +4259,11 @@ impl State {
         self.buttons.clear();
         self.empty_placements.clear();
         self.browser_placements.clear();
+        self.browser_buf_used = 0;
         self.browser_views.clear();
         self.browser_suggest_hits.clear();
+        self.picker_placements.clear();
+        self.picker_panel = None;
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
         self.close_buffer.set_metrics(metrics);
@@ -4214,7 +4400,8 @@ impl State {
             }
             if self.app.is_browser(sid) {
                 let focus_border = pr.focused && resolved.len() > 1;
-                self.build_file_browser(sid, focus_border, *term, sw, sh, &mut bg_quads);
+                let ps = self.build_file_browser(sid, focus_border, *term, sw, sh, &mut bg_quads);
+                self.browser_placements.extend(ps);
                 continue;
             }
 
@@ -4788,6 +4975,8 @@ impl State {
         } else {
             Vec::new()
         };
+        // Floating directory picker (modal overlay). Its text joins the overlay pass.
+        self.picker_placements = self.build_dir_picker(sw, sh, &mut overlay_quads);
 
         let n_bg = bg_quads.len() as u32;
         bg_quads.extend_from_slice(&overlay_quads);
@@ -4941,8 +5130,8 @@ impl State {
         self.grid_cache.retain(|sid, _| self.app.has_surface(*sid));
         self.surface_geom.retain(|sid, _| self.app.has_surface(*sid));
 
-        // Palette and menu are mutually exclusive; both draw above everything via
-        // the overlay text renderer.
+        // Palette, menu and the directory picker are mutually exclusive; each draws
+        // above everything via the overlay text renderer (each from its own pool).
         let overlay_areas: Vec<TextArea> = if !palette_placements.is_empty() {
             palette_placements
                 .iter()
@@ -4956,11 +5145,24 @@ impl State {
                     custom_glyphs: &[],
                 })
                 .collect()
-        } else {
+        } else if !menu_placements.is_empty() {
             menu_placements
                 .iter()
                 .map(|p| TextArea {
                     buffer: &self.menu_buffers[p.idx],
+                    left: p.left,
+                    top: p.top,
+                    scale: 1.0,
+                    bounds: p.bounds,
+                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                    custom_glyphs: &[],
+                })
+                .collect()
+        } else {
+            self.picker_placements
+                .iter()
+                .map(|p| TextArea {
+                    buffer: &self.browser_buffers[p.idx],
                     left: p.left,
                     top: p.top,
                     scale: 1.0,
@@ -5051,7 +5253,10 @@ impl State {
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, n_bg..total);
             }
-            if !palette_placements.is_empty() || !menu_placements.is_empty() {
+            if !palette_placements.is_empty()
+                || !menu_placements.is_empty()
+                || !self.picker_placements.is_empty()
+            {
                 self.palette_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .context("overlay render")?;

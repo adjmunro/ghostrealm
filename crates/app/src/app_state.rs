@@ -22,6 +22,11 @@ use crate::editor::EditorBuffer;
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
 
+/// Reserved surface id for the floating directory picker's file browser. It lives
+/// in the `browsers` map like any browser (so all browser UI code applies) but is
+/// not a tree surface, so it never renders as a pane and is kept across prunes.
+pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
+
 /// The kinds of content a pane/tab can open (via the "nothing open" picker).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenKind {
@@ -342,6 +347,36 @@ impl AppState {
         self.open_editor_in_focused(EditorBuffer::open(path));
     }
 
+    /// Whether the floating directory picker is open.
+    pub fn dir_picker_open(&self) -> bool {
+        self.browsers.contains_key(&PICKER_SID)
+    }
+
+    /// Open the floating directory picker rooted at the active workspace's dir
+    /// (else the app default, else the current dir).
+    pub fn open_dir_picker(&mut self) {
+        let root = self
+            .active()
+            .and_then(|vt| self.resolve_cwd(vt))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.browsers.insert(PICKER_SID, FsTree::new(root));
+    }
+
+    /// Close the floating directory picker.
+    pub fn close_dir_picker(&mut self) {
+        self.browsers.remove(&PICKER_SID);
+    }
+
+    /// Confirm the picker: pin the active workspace's root to the picker's current
+    /// directory, then close it.
+    pub fn confirm_dir_picker(&mut self) {
+        if let Some(root) = self.browsers.get(&PICKER_SID).map(|b| b.root().to_path_buf()) {
+            self.set_active_root_dir(root);
+        }
+        self.close_dir_picker();
+    }
+
     /// Create a new workspace whose sole surface is an editor (no shell spawned),
     /// named `name` (pinned). Returns the new vtab id.
     pub fn new_editor_vtab(&mut self, name: impl Into<String>, buffer: EditorBuffer) -> VtabId {
@@ -508,7 +543,9 @@ impl AppState {
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
         self.editors.retain(|id, _| live.contains(id));
-        self.browsers.retain(|id, _| live.contains(id));
+        // The picker browser is not a tree surface; keep it while it is open.
+        self.browsers
+            .retain(|id, _| live.contains(id) || *id == PICKER_SID);
     }
 
     pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
@@ -942,6 +979,17 @@ pub fn build_registry() -> Registry<AppState> {
             if let Some(dir) = ghostrealm_core::config::expand_tilde(a.get_str("path")?) {
                 s.set_active_root_dir(dir);
             }
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
+        CommandMeta::new(
+            "workspace.pick_dir",
+            "Set Workspace Directory…",
+            "Choose the active workspace's directory in a floating file picker",
+        ),
+        Box::new(|s: &mut AppState, _| {
+            s.open_dir_picker();
             Ok(CmdOutcome::ok())
         }),
     );
