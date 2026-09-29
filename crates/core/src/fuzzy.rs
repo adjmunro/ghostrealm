@@ -93,12 +93,13 @@ fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i3
 
 /// Match a `*`-wildcard `query`: the segments between stars must appear, in order,
 /// as contiguous substrings. A query not starting with `*` anchors its first
-/// segment to the start; not ending with `*` anchors its last segment to the end
-/// (so `*.kt` matches `main.kt` but not `build.gradle.kts`). Returns a score and
-/// the matched char indices.
+/// segment to the start. The end is anchored only for a leading-`*` pattern with no
+/// trailing `*` (so `*.kt` matches `main.kt` but not `build.gradle.kts`); a pattern
+/// that starts with a literal (e.g. `foo*bar`) has an implied trailing `*`, so
+/// `bar` need not be at the end. Returns a score and the matched char indices.
 fn wildcard_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i32, Vec<usize>)> {
     let anchored_start = !query.starts_with('*');
-    let anchored_end = !query.ends_with('*');
+    let anchored_end = !query.ends_with('*') && !anchored_start;
     let segs: Vec<Vec<char>> = query
         .split('*')
         .filter(|s| !s.is_empty())
@@ -207,6 +208,10 @@ mod tests {
         // Leading anchor: "src*" must start with src.
         assert!(match_smart("src*", "src/main.rs").is_some());
         assert!(match_smart("src*", "my/src").is_none());
+        // A literal-led middle wildcard has an implied trailing wildcard, so the
+        // last segment need not be at the end.
+        assert!(match_smart("a*b", "axxbyy").is_some());
+        assert!(match_smart("foo*bar", "foobarbaz").is_some());
     }
 
     #[test]

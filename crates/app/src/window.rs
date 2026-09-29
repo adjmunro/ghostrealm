@@ -115,7 +115,7 @@ const INPUT_TEXT: [u8; 3] = [225, 225, 235];
 const FILE_FG: [u8; 3] = [230, 230, 235];
 const HIDDEN_FG: [u8; 3] = [130, 130, 140];
 const EXT_FG: [u8; 3] = [212, 170, 90];
-const MATCH_FG: [u8; 3] = [120, 205, 255];
+const MATCH_FG: [u8; 3] = [245, 225, 90];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -312,6 +312,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Close-button hover highlight tracks the cursor everywhere.
                 redraw |= state.update_button_hover();
+                // A file browser's highlight follows the mouse (single highlight,
+                // shared with the keyboard — most recent input wins).
+                redraw |= state.update_browser_hover();
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -499,8 +502,8 @@ struct State {
     browser_sel: HashMap<SurfaceId, usize>,
     /// Keyboard selection: highlighted completion (path mode) per browser.
     browser_completion: HashMap<SurfaceId, usize>,
-    /// Path-autocomplete suggestion hit rects this frame: (rect, surface, path, is_dir).
-    browser_suggest_hits: Vec<(Rect, SurfaceId, std::path::PathBuf, bool)>,
+    /// Path-autocomplete suggestion hits this frame: (rect, surface, index, path, is_dir).
+    browser_suggest_hits: Vec<(Rect, SurfaceId, usize, std::path::PathBuf, bool)>,
     /// The floating directory picker's panel rect this frame (for click-outside),
     /// and its shaped text placements (drawn in the overlay pass).
     picker_panel: Option<Rect>,
@@ -1300,6 +1303,34 @@ impl State {
         }
     }
 
+    /// Point the file-browser selection at the row/completion under the cursor, so a
+    /// mouse move takes over the single highlight from the keyboard. Returns whether
+    /// it changed (to redraw).
+    fn update_browser_hover(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        // Path-mode completion under the cursor?
+        if let Some((_, sid, idx, _, _)) = self
+            .browser_suggest_hits
+            .iter()
+            .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
+            .cloned()
+        {
+            if self.browser_completion.get(&sid) != Some(&idx) {
+                self.browser_completion.insert(sid, idx);
+                return true;
+            }
+            return false;
+        }
+        // Browse/filter row under the cursor?
+        if let Some((sid, idx, _, _)) = self.browser_row_at(x, y) {
+            if self.browser_sel.get(&sid) != Some(&idx) {
+                self.browser_sel.insert(sid, idx);
+                return true;
+            }
+        }
+        false
+    }
+
     /// The file-browser row under a point, as (surface, index, path, is_dir).
     fn browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, std::path::PathBuf, bool)> {
         for v in &self.browser_views {
@@ -1318,10 +1349,10 @@ impl State {
         // outside the panel cancels. (Its header/footer buttons arm on press.)
         if self.app.dir_picker_open() {
             let (x, y) = self.cursor;
-            if let Some((_, _, spath, sdir)) = self
+            if let Some((_, _, _, spath, sdir)) = self
                 .browser_suggest_hits
                 .iter()
-                .find(|(r, _, _, _)| rect_contains(*r, x, y))
+                .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
                 .cloned()
             {
                 if sdir {
@@ -1429,10 +1460,10 @@ impl State {
                 vtab.focused_pane = pid;
             }
             // A click on an autocomplete suggestion navigates (dir) or opens (file).
-            if let Some((_, ssid, spath, sdir)) = self
+            if let Some((_, ssid, _, spath, sdir)) = self
                 .browser_suggest_hits
                 .iter()
-                .find(|(r, _, _, _)| rect_contains(*r, x, y))
+                .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
                 .cloned()
             {
                 if sdir {
@@ -2572,6 +2603,7 @@ impl State {
     /// Draw a file-browser pane in `rect`: a header (parent, path/filter, hidden &
     /// gitignore toggles) and a scrollable row list. Records a [`BrowserView`] for
     /// click hit-testing and the toggle/parent button rects.
+    #[allow(clippy::too_many_arguments)]
     fn build_file_browser(
         &mut self,
         sid: SurfaceId,
@@ -2580,6 +2612,11 @@ impl State {
         sw: f32,
         sh: f32,
         quads: &mut Vec<QuadInstance>,
+        // When present, browse/filter body rows go through the shared content-keyed
+        // `row_cache` (so scrolling reuses shaped rows) as RowPlacements here, drawn
+        // in the main text pass. `None` (the picker overlay) shapes into the
+        // browser's own buffers instead.
+        mut row_out: Option<&mut Vec<RowPlacement>>,
     ) -> Vec<Placement> {
         let mut placements: Vec<Placement> = Vec::new();
         quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
@@ -2768,7 +2805,7 @@ impl State {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let label = if is_dir { format!("{name}/") } else { name };
                 let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-                if Some(i) == sel_comp || rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                if Some(i) == sel_comp {
                     quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
                 }
                 let color = if is_dir { self.chrome.accent } else { FILE_FG };
@@ -2785,7 +2822,7 @@ impl State {
                     },
                     color,
                 });
-                self.browser_suggest_hits.push((row_rect, sid, p.clone(), is_dir));
+                self.browser_suggest_hits.push((row_rect, sid, i, p.clone(), is_dir));
             }
         } else {
             // Browse/filter mode: the scrollable tree/results list.
@@ -2809,7 +2846,7 @@ impl State {
                     continue; // offscreen
                 }
                 let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-                if Some(i) == sel || rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                if Some(i) == sel {
                     quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
                 }
                 let marker = if r.is_dir {
@@ -2833,20 +2870,28 @@ impl State {
                     spans.extend(self.row_spans(&r.name, r.is_dir));
                 }
                 let left = list.x + pad + r.depth as f32 * indent_w;
-                let (idx, _) =
-                    self.shape_browser_spans(&spans, mono, (list.x + list.w - left - pad).max(1.0), true);
-                placements.push(Placement {
-                    idx,
-                    left,
-                    top: ry + (row_h - ch) * 0.5,
-                    bounds: TextBounds {
-                        left: list.x as i32,
-                        top: list.y as i32,
-                        right: (list.x + list.w) as i32,
-                        bottom: (list.y + list.h) as i32,
-                    },
-                    color: FILE_FG,
-                });
+                let width = (list.x + list.w - left - pad).max(1.0);
+                let bounds = TextBounds {
+                    left: list.x as i32,
+                    top: list.y as i32,
+                    right: (list.x + list.w) as i32,
+                    bottom: (list.y + list.h) as i32,
+                };
+                let top = ry + (row_h - ch) * 0.5;
+                if let Some(out) = row_out.as_deref_mut() {
+                    // Cache-backed: content-keyed shaping, reused across frames while
+                    // scrolling (drawn in the main text pass via `row_cache`).
+                    let key = self
+                        .row_cache
+                        .row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
+                    let m = self.metrics();
+                    self.row_cache
+                        .ensure(key, &mut self.font_system, m, width, self.cell_h, &spans);
+                    out.push(RowPlacement { key, left, top, bounds, color: FILE_FG });
+                } else {
+                    let (idx, _) = self.shape_browser_spans(&spans, mono, width, true);
+                    placements.push(Placement { idx, left, top, bounds, color: FILE_FG });
+                }
             }
             self.browser_views.push(BrowserView {
                 sid,
@@ -2911,7 +2956,7 @@ impl State {
             w: pw,
             h: (ph - title_h - footer_h).max(1.0),
         };
-        let ps = self.build_file_browser(PICKER_SID, false, body, sw, sh, quads);
+        let ps = self.build_file_browser(PICKER_SID, false, body, sw, sh, quads, None);
         placements.extend(ps);
 
         // Footer: [Cancel] [Use this folder], right-aligned.
@@ -4627,7 +4672,15 @@ impl State {
             }
             if self.app.is_browser(sid) {
                 let focus_border = pr.focused && resolved.len() > 1;
-                let ps = self.build_file_browser(sid, focus_border, *term, sw, sh, &mut bg_quads);
+                let ps = self.build_file_browser(
+                    sid,
+                    focus_border,
+                    *term,
+                    sw,
+                    sh,
+                    &mut bg_quads,
+                    Some(&mut row_placements),
+                );
                 self.browser_placements.extend(ps);
                 continue;
             }

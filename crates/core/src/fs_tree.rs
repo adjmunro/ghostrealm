@@ -455,11 +455,18 @@ impl FsTree {
     /// listed directory is resolved against the root. Directories come first.
     pub fn suggestions(&self, input: &str) -> Vec<PathBuf> {
         let t = input.trim_end_matches(' ');
-        // Split the raw input into the directory part and the partial final name.
+        // Split the raw input into the directory part and the partial final name. A
+        // final `.`/`..` component is a directory reference to list, not a prefix to
+        // complete (so `../..` lists the grandparent, not entries named `..`).
         let (dir_part, partial): (String, String) = if t.ends_with('/') {
             (t.to_string(), String::new())
         } else if let Some(i) = t.rfind('/') {
-            (t[..=i].to_string(), t[i + 1..].to_string())
+            let last = &t[i + 1..];
+            if last == "." || last == ".." {
+                (format!("{t}/"), String::new())
+            } else {
+                (t[..=i].to_string(), last.to_string())
+            }
         } else if t == "." || t == ".." || t == "~" {
             (t.to_string(), String::new())
         } else {
