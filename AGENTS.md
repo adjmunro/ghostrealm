@@ -11,6 +11,7 @@
 
 - Before high-level planning, read [`GOAL.md`](docs/GOAL.md), [`SPEC`](docs/SPEC.md), and [`DECISION`](docs/DECISION.md).
 - For agreed terminology, read [`GLOSSARY.md`](docs/GLOSSARY.md).
+- Before adding or changing a surface kind (terminal, editor, file browser, ...), read [`PLUGINS.md`](docs/PLUGINS.md).
 - Before mutating source control, read [`GIT.md`](docs/GIT.md)!
 
 ## Build & Toolchain
@@ -18,6 +19,7 @@
 - Zig is pinned in `mise.toml` and is **required** to build `libghostty-vt-sys` (it compiles Ghostty from source). Run cargo from the repo root so `mise` activates Zig, or prefix `mise exec --`. The scratchpad has no `mise.toml`, so Zig is NOT on PATH there — export it explicitly if building outside the repo.
 - Do not bump Zig blindly: its major.minor must equal the pinned Ghostty's `build.zig.zon` `minimum_zig_version`, and it must be new enough to link this host's macOS SDK. See [`docs/libghostty-findings.md`](docs/libghostty-findings.md) → "Build toolchain".
 - `libghostty-vt` comes from git (pinned `rev`), not crates.io — the published crate is stale.
+- `cargo` lives in `~/.cargo/bin`, which the agent shell's `PATH` lacks: `export PATH="$HOME/.cargo/bin:$PATH"` first. There is no `timeout` binary either.
 
 ## Verifying the app
 

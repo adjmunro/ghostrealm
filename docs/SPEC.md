@@ -15,8 +15,10 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 ## Crate layout (seams)
 
 ```
-crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input/resize
-crates/core        app spine: command registry, tab/split tree, inbox, config   [stub]
+crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input routing
+  src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
+  src/plugins/       first-party plugins: terminal, editor, file_browser
+crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
 ```
@@ -28,14 +30,20 @@ crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
   cells; the app draws it. So terminals, chrome, and the palette share one wgpu
   scene (unified compositing; no native subviews), which also keeps it
   cross-platform.
+- **App ↔ content seam:** every surface's content is a plugin `View` (terminal,
+  editor, file browser). The app owns layout, focus, chrome, and input routing;
+  views paint immediate-mode through `PaintCx` and take input through `EventCx`.
+  Contract: [PLUGINS.md](PLUGINS.md).
 
 ## Rendering model (current)
 
-Per frame: `pump()` drains PTY output into the VT engine; `snapshot()` builds a
-`Grid`. The app draws non-default cell backgrounds and the cursor via an instanced
-quad pipeline, then foreground text via glyphon (one rich-text buffer per row,
-coloured per cell run). Window resize recomputes cols/rows from the measured
-monospace cell size and reflows the PTY + VT.
+Per frame: every view is pumped (a terminal checks its VT worker's published
+grid); then each pane's active view paints into a `Frame`: quads under text, text
+items, quads over text, overlay text. The app draws the quads via an instanced
+quad pipeline and the text via glyphon. Text is either a content-keyed shaped row
+from the shared `RowCache` (shaped within a per-frame time budget) or a per-frame
+scratch buffer. A terminal snapshots only when its grid changed and resizes its
+PTY only when its cell grid changes.
 
 Status/`needs_input` sourcing (planned): Enter-submission = optimistic busy;
 PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
@@ -73,6 +81,7 @@ sidebar/inbox, palette, config, and the agent channel are all in and tested.
 
 The dev sandbox has no display, so `resumed` never fires there — the window,
 config-file creation, and interactive paths only run on a real desktop session.
-Automated coverage stands in: 44 tests (core logic, backend PTY/VT, agent
-protocol, inbox, config) plus a headless offscreen render test. Eyeball the
+Automated coverage stands in: the workspace test suite (core logic, backend
+PTY/VT, agent protocol, inbox, config, and every plugin view painted and driven
+through the headless `plugin::testing::Harness`) plus an offscreen render test. Eyeball the
 window by running `ghostrealm` on a real session.

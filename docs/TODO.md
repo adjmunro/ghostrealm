@@ -111,7 +111,7 @@
 
 - Requires: NO BLOCKERS
 - Detail: A minimal editor surface exists (`app::editor::EditorBuffer`): terminal OR
-  editor; editor.scratch / editor.open <path>; typing/editing; Cmd+S save; selection
+  editor; editor.new / editor.open <path>; typing/editing; Cmd+S save; selection
   (Shift+Arrow/Home/End) + copy/cut/paste (Cmd+C/X/V) + line/doc nav (Cmd+arrows),
   rendered with a highlight + cursor bar. Follow-ups: a modified/unsaved indicator +
   save-as prompt for scratch buffers; mouse click-to-position + drag-select in the
@@ -268,7 +268,7 @@
 [2026-09-15@2e8e8c7] Editor — save-as / open dialogs (file picker)
 
 - Requires: the arg-input flow
-- Detail: `editor.scratch` has no path, so Cmd+S can't save (no save-as dialog);
+- Detail: `editor.new` opens a pathless buffer, so Cmd+S can't save (no save-as dialog);
   `editor.open` needs a path with no picker, so it does nothing. Add a save-as
   dialog and a file picker — prefer a custom in-theme dialog (native acceptable as a
   fallback). Ties into the arg-collection entry. Also the editor follow-ups already
@@ -493,7 +493,7 @@
 
 - Requires: NO BLOCKERS
 - Detail: Today only TOML highlighting is hardcoded in the editor
-  (`toml_row_spans` in app). Extract a highlighter interface — a trait/registry
+  (`plugins::editor::toml`). Extract a highlighter interface — a trait/registry
   keyed by extension that turns a logical line (with some cross-line state, e.g.
   inside a fenced block) into coloured spans — so file types are added as small
   modules. Live in core (headless, testable) so the editor and the browser's
@@ -519,43 +519,36 @@
 
 ---
 
-[2026-09-29@6641e98] Plugin/panel architecture (major refactor)
+[2026-09-30@7d132a83] Plugin architecture — follow-ups
 
-- Requires: NO BLOCKERS (large; do a design spike first)
-- Detail: Generalise a *surface* into a panel plugin: the app owns the window,
-  GPU, font atlas, layout and input routing; a plugin is handed a panel to paint
-  (immediate-mode: it emits quads + shaped-text/spans via provided helpers each
-  frame) and receives callbacks — resize, focus, key, mouse (wheel/click/drag).
-  App keybindings are recognised first; unhandled input falls through to the
-  focused plugin. First-party plugins: terminal, editor, file browser (reimplement
-  on the same API so they obey identical rules). Expose reusable library helpers
-  (text shaping via the shared FontSystem, the row_cache, rect/quad, hit-testing,
-  the input box, fuzzy). Future plugins: a Git GUI; an embedded Chromium (CEF) —
-  prefer a Rust API for plugins, keep CEF as an option for heavy/third-party ones.
-  CONSTRAINTS to respect (answering "what can't fit"): the FontSystem + glyph atlas
-  must stay on the render thread, so plugins cannot own their own FontSystem —
-  they shape through provided helpers; a plugin doing heavy work (VT parse, media
-  decode) must run it off the UI thread and publish snapshots (as the terminal's
-  `ThreadedTerminal` already does), or it will stall the frame; an immediate-mode
-  paint API is fine for Rust in-process plugins, but a CEF/browser panel composits
-  its own surface (extra copy) — acceptable for non-hot panels, not for the
-  terminal. Nothing here fundamentally blocks the architecture; the perf rule is
-  "keep parsing/decoding off the render thread and shape through the shared atlas".
-- Reason: build features (Git GUI, browser, more) as uniform plugins over time.
-
+- Requires: NO BLOCKERS
+- Detail: DONE: `Plugin`/`View` API (`app::plugin`), immediate-mode `PaintCx`,
+  `EventCx` + request queue, headless test harness; terminal, editor, and file
+  browser are plugins; the picker and `<id>.new` commands come from the registry;
+  files open with the first plugin that claims the path (PLUGINS.md). Remaining:
+  (1) move the app's own chrome (sidebar, tab strips, palette, menu, empty-pane
+  picker) onto `PaintCx`, retiring its per-widget buffer pools; (2) extract the API
+  into its own crate for out-of-tree Rust plugins — needs commands registered
+  against a trait rather than `Registry<AppState>`; (3) per-plugin config sections
+  (today first-party plugins read typed fields on `core::Config`); (4) view-scoped
+  commands and keybindings (e.g. editor-only chords in `[keybindings]`, palette
+  entries that act on the focused view); (5) a web-browser plugin — a CEF/webview
+  composites its own surface, so `PaintCx` needs a textured-quad primitive fed by a
+  per-view texture (acceptable for non-hot panels, not the terminal); (6) dynamic
+  loading / WASM for third-party plugins, if ever.
+- Reason: finish the uniform-plugin model and open it to new kinds.
 ---
 
 [2026-09-29@6641e98] Extract one shared scroll/shape pipeline
 
 - Requires: NO BLOCKERS
-- Detail: The content-keyed `row_cache` is shared (terminal, editor, browser), but
-  the scroll pacing (frame-clock throttle, per-frame shaping budget, stale-key
-  fallback) is wired per surface in `window.rs`. Extract a single reusable
-  "scrollable shaped-row list" helper (viewport + row_cache + budget + placement
-  emission) that all row-based surfaces use, with surface-specific hooks only where
-  needed (e.g. the terminal's grid snapshot). Ties into the plugin library helpers.
-- Reason: one scroll-optimisation path; the browser proved the win, don't fork it.
-
+- Detail: DONE: the row cache, per-frame shaping budget, and stale-row fallback
+  are shared through `PaintCx::row` / `budgeted_row`. Remaining: scroll pacing is
+  still per view — the terminal eases wheel input over frames, the editor snaps by
+  lines, the file browser by pixels. Extract a reusable "scrollable shaped-row
+  list" (viewport + easing + budgeted placement) the row-based views share, with
+  view-specific hooks only where needed (e.g. the terminal's grid snapshot).
+- Reason: one scroll-optimisation path; the file browser proved the win, don't fork it.
 ---
 
 [2026-09-30@463e7cf] Settings — search/add from the full option list
