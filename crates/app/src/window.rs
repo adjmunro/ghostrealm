@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Axis, Chrome, Config, LineNumbers, PaneId, Rect, Registry, Side,
+    ArgKind, ArgSpec, Args, Axis, Chrome, Config, PaneId, Rect, Registry, Side,
     SurfaceId, TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
@@ -29,12 +29,9 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState, OpenKind, PICKER_SID, SETTINGS_VTAB_NAME};
-use crate::plugins::editor::toml::toml_row_spans;
-use crate::plugins::editor::wrap::wrap_line;
-use crate::plugins::editor::{Motion, EDITOR_FG};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::{
-    rect_contains, theme, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
+    hover_box, rect_contains, theme, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
     TextKit, TextSrc, UiMetrics, View,
 };
 use crate::tap::TapDetector;
@@ -74,14 +71,6 @@ const SCROLL_EASE_DIVISOR: i32 = 3;
 /// can't pile up a backlog that then has to unwind before a reverse flick takes
 /// effect (and so metering always drains in a bounded number of frames).
 const MAX_PENDING_SCROLL: i32 = 600;
-/// Editor surface background (slightly distinct from a terminal).
-const EDITOR_BG: [u8; 3] = [26, 26, 32];
-/// Editor line-number gutter: dim, brighter on the cursor's line.
-const EDITOR_GUTTER: [u8; 3] = [110, 110, 125];
-const EDITOR_GUTTER_CUR: [u8; 3] = [190, 190, 205];
-/// Active-line highlight fill behind the cursor row.
-const EDITOR_CURSOR_LINE: [u8; 3] = [255, 255, 255];
-const EDITOR_CURSOR_LINE_ALPHA: f32 = 0.05;
 /// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
 const TITLE_BAR_H: f32 = 28.0;
 /// Logical width reserved at the top-left for the macOS traffic-light buttons.
@@ -207,17 +196,18 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        // Fire the idle-autosave if its timer elapsed while the app sat idle.
-        if state.fire_idle_autosave_if_due() {
+        // Fire view timers (e.g. an editor's idle autosave) that came due while
+        // the app sat idle.
+        if state.fire_view_timers() {
             state.window.request_redraw();
         }
         // Wake for whichever comes first: the next paced PTY frame, a pending inbox
-        // auto-read deadline, or the idle-autosave deadline.
+        // auto-read deadline, or a view's timer.
         let mut wake: Option<Instant> = state.frame_pending.then_some(state.next_frame);
         if let Some(d) = state.app.next_inbox_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
-        if let Some(d) = state.idle_autosave_deadline() {
+        if let Some(d) = state.next_view_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
         match wake {
@@ -242,7 +232,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // closing PTY masters SIGHUP the child shells, exactly as closing
                 // any terminal does. Flush unsaved editors first (autosave).
                 if state.cfg.editor.autosave_on_unfocus {
-                    let _ = state.app.autosave_all_editors();
+                    let _ = state.app.autosave_all();
                 }
                 state.window.set_visible(false);
                 std::process::exit(0);
@@ -250,7 +240,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(false) => {
                 // App lost focus: autosave editors (switching to another app), and
                 // hot-reload the config if it was one of them.
-                if state.cfg.editor.autosave_on_unfocus && state.app.autosave_all_editors() {
+                if state.cfg.editor.autosave_on_unfocus && state.app.autosave_all() {
                     state.reload_config();
                 }
             }
@@ -474,19 +464,9 @@ struct State {
     /// The cell the press landed on (selection anchor), if it was over a terminal.
     /// A selection is only materialised once a drag actually starts.
     press_cell: Option<(SurfaceId, u16, u16)>,
-    /// The editor surface a press landed on, if any — drives editor drag-select
-    /// (the anchor/cursor live on the `EditorBuffer`).
-    editor_drag: Option<SurfaceId>,
-    /// The surface focused as of the last frame, so a focus change can autosave
-    /// the editor that just lost focus.
+    /// The surface focused as of the last frame, so a focus change reaches the
+    /// views that lost and gained it (e.g. an editor autosaves on blur).
     last_focused_surface: Option<SurfaceId>,
-    /// Per-editor soft-wrap override (absent = the config default). Toggled by the
-    /// ribbon's wrap button.
-    soft_wrap: HashMap<SurfaceId, bool>,
-    /// Focused editor + its edit count as last observed, to detect fresh edits.
-    edit_watch: Option<(SurfaceId, u64)>,
-    /// When the focused editor was last edited, for the idle-autosave timer.
-    last_edit_at: Option<Instant>,
     /// System clipboard handle (None if unavailable).
     clipboard: Option<arboard::Clipboard>,
     /// Last cursor position in physical pixels, for click hit-testing.
@@ -619,8 +599,6 @@ enum ButtonAction {
     CloseVtab(VtabId),
     /// Close one tab (surface) in a pane's horizontal tab strip.
     CloseSurface(VtabId, PaneId, SurfaceId),
-    /// Toggle soft-wrap for an editor surface.
-    ToggleSoftWrap(SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
     /// Open a content kind in the focused pane (the "nothing open" picker).
@@ -814,11 +792,7 @@ impl State {
             selection: None,
             mouse_down: false,
             dragging: false,
-            editor_drag: None,
             last_focused_surface: None,
-            soft_wrap: HashMap::new(),
-            edit_watch: None,
-            last_edit_at: None,
             press_px: (0.0, 0.0),
             press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1059,10 +1033,13 @@ impl State {
         use ghostrealm_core::config::OpenIn;
         let split = self.cfg.file_browser.open_in == OpenIn::Split
             && self.focused_pane_width() >= FILE_BROWSER_SPLIT_MIN_W * self.scale;
-        if split {
-            self.app.open_file_split(path, Axis::LeftRight);
+        let opened = if split {
+            self.app.open_path_split(&path, Axis::LeftRight)
         } else {
-            self.app.open_file_in_focused(path);
+            self.app.open_path_in_focused(&path)
+        };
+        if let Err(e) = opened {
+            eprintln!("ghostrealm: open {}: {e:#}", path.display());
         }
     }
 
@@ -1174,10 +1151,6 @@ impl State {
             }
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
-            ButtonAction::ToggleSoftWrap(sid) => {
-                let now = self.soft_wrap_on(sid);
-                self.soft_wrap.insert(sid, !now);
-            }
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
             ButtonAction::OpenKind(kind) => {
                 let _ = self.app.open_kind_in_focused(kind);
@@ -1190,15 +1163,6 @@ impl State {
         }
         self.dirty = true;
         true
-    }
-
-    /// Whether soft-wrap is on for editor `sid`: its per-pane override, else the
-    /// config default.
-    fn soft_wrap_on(&self, sid: SurfaceId) -> bool {
-        self.soft_wrap
-            .get(&sid)
-            .copied()
-            .unwrap_or(self.cfg.editor.soft_wrap)
     }
 
     /// Recompute which button is under the cursor; returns whether it changed, so
@@ -1340,7 +1304,6 @@ impl State {
             return;
         }
         let (x, y) = self.cursor;
-        self.editor_drag = None;
         if self.in_sidebar(x) {
             // The "+ New workspace" button is a chrome button (arm/fire on
             // release); here we only handle selecting a workspace row.
@@ -1379,7 +1342,6 @@ impl State {
             .vtab(vt)
             .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
             .and_then(|p| p.active_surface().map(|s| s.id));
-        let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
 
         // A click in a visible tab strip switches the pane's active surface.
         let strip_h = if self.strip_shown(n) {
@@ -1405,17 +1367,6 @@ impl State {
             self.mouse_capture = Some(sid);
             self.dirty = true;
             return;
-        } else if active_is_editor {
-            // A click in the editor body moves the text cursor there and starts a
-            // potential drag-selection (anchor at the click; a selection only
-            // materialises once the cursor is dragged away — see update_selection).
-            if let Some((sid, row, col)) = self.editor_pos_at(x, y) {
-                if let Some(e) = self.app.editor_mut(sid) {
-                    e.cursor = (row, col);
-                    e.anchor = Some((row, col));
-                }
-                self.editor_drag = Some(sid);
-            }
         }
         if let Some(vtab) = self.app.tree.vtab_mut(vt) {
             vtab.focused_pane = pid;
@@ -1647,163 +1598,28 @@ impl State {
         None
     }
 
-    /// Width (physical px) of the editor's line-number gutter for a buffer of
-    /// `total_lines` lines. Zero when line numbers are off.
-    fn editor_gutter_w(&self, total_lines: usize) -> f32 {
-        if self.cfg.editor.line_numbers == LineNumbers::Off {
-            return 0.0;
-        }
-        let digits = ((total_lines.max(1) as f64).log10().floor() as usize + 1).max(2);
-        // one column of left pad + the number + one column of right pad.
-        (digits as f32 + 2.0) * self.cell_w
+    /// The earliest timer any view has pending.
+    fn next_view_deadline(&self) -> Option<Instant> {
+        self.app
+            .views()
+            .filter_map(|(_, v)| v.deadline(&self.cfg))
+            .min()
     }
 
-    /// The editor `(surface, row, col)` at point `(x, y)`, or `None` if the point
-    /// isn't in an editor body (accounts for scroll, the tab strip, and gutter).
-    fn editor_pos_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, usize)> {
-        if self.in_sidebar(x) {
-            return None;
-        }
-        let workspace = self.workspace_rect();
-        let vt = self.app.tree.active_vtab()?;
-        let vtab = self.app.tree.vtab(vt)?;
-        for (pid, r) in vtab.layout(workspace, DIVIDER) {
-            if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
-                continue;
-            }
-            let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
-            let sid = pane.active_surface()?.id;
-            let e = self.app.editor(sid)?;
-            let strip_h = if self.strip_shown(pane.surfaces.len()) {
-                self.strip_height()
-            } else {
-                0.0
-            };
-            // A single-tab editor has a filename ribbon in place of the strip.
-            let ribbon_h = if strip_h == 0.0 {
-                self.strip_height()
-            } else {
-                0.0
-            };
-            let body_y = r.y + strip_h + ribbon_h;
-            if y < body_y {
-                return None; // in the tab strip / ribbon
-            }
-            let gutter_w = self.editor_gutter_w(e.lines.len());
-            let body_x = r.x + gutter_w;
-            let body_w = (r.w - gutter_w).max(1.0);
-            let row_off = ((y - body_y) / self.cell_h).floor().max(0.0) as usize;
-            let col_off = ((x - body_x) / self.cell_w).round().max(0.0) as usize;
-            // Walk visual rows from the scroll top to the clicked one, matching the
-            // render's wrapping, so a click maps to the right (logical line, col).
-            let wrap = self.soft_wrap_on(sid);
-            let wrap_cols = if wrap {
-                ((body_w / self.cell_w).floor() as usize).max(1)
-            } else {
-                usize::MAX
-            };
-            let mut vidx = 0usize;
-            let mut found: Option<(usize, usize, usize)> = None; // (line, start, len)
-            let mut ln = e.scroll;
-            'walk: while ln < e.lines.len() {
-                if wrap {
-                    for (text, start) in wrap_line(&e.lines[ln], wrap_cols) {
-                        if vidx == row_off {
-                            found = Some((ln, start, text.chars().count()));
-                            break 'walk;
-                        }
-                        vidx += 1;
-                    }
-                } else {
-                    if vidx == row_off {
-                        // No-wrap: the row is scrolled left by hscroll, so a click
-                        // maps to column hscroll + col_off (clamped to the line).
-                        let hs = e.hscroll;
-                        found = Some((ln, hs, e.line_len(ln).saturating_sub(hs)));
-                        break 'walk;
-                    }
-                    vidx += 1;
-                }
-                ln += 1;
-            }
-            let (row, col) = match found {
-                Some((line, start, len)) => (line, (start + col_off).min(start + len)),
-                None => {
-                    // Below the last line: land at the end of the last line.
-                    let last = e.lines.len().saturating_sub(1);
-                    (last, e.line_len(last))
-                }
-            };
-            return Some((sid, row, col));
-        }
-        None
-    }
-
-    /// Save an editor surface if it has unsaved edits and a backing file (autosave
-    /// on focus loss). Terminals and pathless scratch buffers are ignored. Saving
-    /// the config file also hot-reloads it, like Cmd+S.
-    fn autosave_editor(&mut self, sid: SurfaceId) {
-        let saved = match self.app.editor_mut(sid) {
-            Some(e) if e.modified && e.path.is_some() => {
-                let _ = e.save();
-                e.path.clone()
-            }
-            _ => None,
-        };
-        if saved.is_some() && saved == ghostrealm_core::config::config_path() {
-            self.reload_config();
-        }
-    }
-
-    /// Note when the focused editor was last edited (for the idle-autosave timer),
-    /// by watching its monotonic edit count. Cleared when focus isn't an editor.
-    fn track_focused_edits(&mut self) {
-        let focused = self
+    /// Run the timers of views whose deadline has passed. Returns whether any
+    /// fired (the caller redraws).
+    fn fire_view_timers(&mut self) -> bool {
+        let now = Instant::now();
+        let due: Vec<SurfaceId> = self
             .app
-            .focused_surface()
-            .filter(|s| self.app.is_editor(*s));
-        match focused {
-            Some(sid) => {
-                let edits = self.app.editor(sid).map(|e| e.edits).unwrap_or(0);
-                if self.edit_watch != Some((sid, edits)) {
-                    self.edit_watch = Some((sid, edits));
-                    if self.app.editor(sid).map(|e| e.modified).unwrap_or(false) {
-                        self.last_edit_at = Some(Instant::now());
-                    }
-                }
-            }
-            None => {
-                self.edit_watch = None;
-                self.last_edit_at = None;
-            }
+            .views()
+            .filter(|(_, v)| v.deadline(&self.cfg).is_some_and(|d| now >= d))
+            .map(|(sid, _)| sid)
+            .collect();
+        for sid in &due {
+            self.view_event(*sid, |v, cx| v.tick(cx, now));
         }
-    }
-
-    /// The instant the idle-autosave should fire, if armed (config `autosave_after`
-    /// > 0 and there's a pending edit).
-    fn idle_autosave_deadline(&self) -> Option<Instant> {
-        let after = self.cfg.editor.autosave_after;
-        if after == 0 {
-            return None;
-        }
-        self.last_edit_at
-            .map(|t| t + Duration::from_secs(after as u64))
-    }
-
-    /// Save the focused editor if the idle-autosave timer has elapsed. Returns
-    /// whether it fired (the caller then redraws so the unsaved marker updates).
-    fn fire_idle_autosave_if_due(&mut self) -> bool {
-        let Some(deadline) = self.idle_autosave_deadline() else {
-            return false;
-        };
-        if Instant::now() < deadline {
-            return false;
-        }
-        self.last_edit_at = None;
-        if let Some((sid, _)) = self.edit_watch {
-            self.autosave_editor(sid);
-        }
-        true
+        !due.is_empty()
     }
 
     /// Record a potential drag-selection anchor at the current cursor and clear any
@@ -1844,21 +1660,6 @@ impl State {
             let pos = (x, y);
             return self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos }));
         }
-        // Editor drag: move the text cursor, keeping the anchor set at the press.
-        if let Some(sid) = self.editor_drag {
-            if let Some((s, row, col)) = self.editor_pos_at(x, y) {
-                if s == sid {
-                    if let Some(e) = self.app.editor_mut(sid) {
-                        if e.cursor != (row, col) {
-                            e.cursor = (row, col);
-                            self.dirty = true;
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
-        }
         let Some((surface, ac, ar)) = self.press_cell else {
             return false;
         };
@@ -1880,25 +1681,14 @@ impl State {
         true
     }
 
-    /// Finish a drag: copy a non-empty terminal selection to the clipboard. For an
-    /// editor, a plain click (no drag) clears the anchor so nothing is selected;
-    /// a real drag leaves the selection for Cmd+C (editors don't auto-copy).
+    /// Finish a press: a view that took it gets the release; a terminal drag
+    /// copies its non-empty selection to the clipboard.
     fn end_selection(&mut self) {
         self.mouse_down = false;
         if let Some(sid) = self.mouse_capture.take() {
             let (pos, dragged) = (self.cursor, self.dragging);
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
             self.dragging = false;
-            return;
-        }
-        if let Some(sid) = self.editor_drag.take() {
-            if !self.dragging {
-                if let Some(e) = self.app.editor_mut(sid) {
-                    e.anchor = None;
-                }
-            }
-            self.dragging = false;
-            self.dirty = true;
             return;
         }
         if self.dragging {
@@ -1910,14 +1700,11 @@ impl State {
 
     /// Extend (or start) a keyboard selection over the focused terminal grid by
     /// one cell (or one word) in `dir`. The anchor is the current selection's, or
-    /// the terminal cursor if none. Not for editor surfaces.
+    /// the terminal cursor if none.
     fn extend_terminal_selection(&mut self, dir: ArrowDir, by_word: bool) {
         let Some(sid) = self.app.focused_surface() else {
             return;
         };
-        if self.app.is_editor(sid) {
-            return;
-        }
         let Some(grid) = self.grid_cache.get(&sid) else {
             return;
         };
@@ -2024,8 +1811,9 @@ impl State {
             }
             return;
         }
-        // A view under the cursor takes the wheel.
-        if let Some(sid) = self.surface_under_cursor().filter(|s| self.app.view(*s).is_some()) {
+        // A view takes the wheel: the one under the cursor, else the focused one.
+        let target = self.surface_under_cursor().or_else(|| self.app.focused_surface());
+        if let Some(sid) = target.filter(|s| self.app.view(*s).is_some()) {
             self.view_event(sid, |v, cx| v.scroll(cx, pos, px_x, px));
             return;
         }
@@ -2037,42 +1825,6 @@ impl State {
         self.scroll_accum += px;
         let lines = (self.scroll_accum / self.cell_h).trunc() as i32;
         self.scroll_accum -= lines as f32 * self.cell_h;
-        // An editor under the cursor scrolls its own text buffer: vertically by
-        // lines, and (when soft-wrap is off) horizontally by columns.
-        let over = self.surface_under_cursor().or_else(|| self.app.focused_surface());
-        if let Some(sid) = over {
-            if self.app.is_editor(sid) {
-                let wrap = self.soft_wrap_on(sid);
-                if let Some(e) = self.app.editor_mut(sid) {
-                    let mut changed = false;
-                    if lines != 0 {
-                        let max = e.lines.len().saturating_sub(1);
-                        let ns = ((e.scroll as isize - lines as isize).max(0) as usize).min(max);
-                        if ns != e.scroll {
-                            e.scroll = ns;
-                            changed = true;
-                        }
-                    }
-                    if !wrap && px_x != 0.0 {
-                        let cols = (px_x / self.cell_w).round() as isize;
-                        if cols != 0 {
-                            let maxlen =
-                                e.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-                            let nh = ((e.hscroll as isize - cols).max(0) as usize).min(maxlen);
-                            if nh != e.hscroll {
-                                e.hscroll = nh;
-                                changed = true;
-                            }
-                        }
-                    }
-                    if changed {
-                        self.dirty = true;
-                        self.frame_pending = true;
-                    }
-                }
-                return;
-            }
-        }
         if lines == 0 {
             return;
         }
@@ -3001,67 +2753,21 @@ impl State {
             self.dirty = true;
             return;
         }
-        // Cmd-chords drive the app via the registry; everything else goes to the
-        // focused terminal. (Cmd is reserved so app shortcuts never reach a shell.)
+        // Cmd chords: the app's own (settings, keybindings) match first; the rest
+        // go to the focused view (clipboard, save, navigation) or the terminal's
+        // Cmd handling. Cmd chords never reach a shell.
         if self.mods.super_ {
-            // Editor Cmd combos (clipboard + line/doc nav) take priority.
-            if self.app.focused_is_editor() && self.editor_cmd_key(event) {
-                return;
-            }
-            // Cmd+Arrow: line start/end in the focused terminal (Ctrl-A / Ctrl-E).
-            if !self.app.focused_is_editor() {
-                let bytes: Option<&[u8]> = match &event.logical_key {
-                    WKey::Named(NamedKey::ArrowLeft) | WKey::Named(NamedKey::ArrowUp) => {
-                        Some(&[0x01])
-                    }
-                    WKey::Named(NamedKey::ArrowRight) | WKey::Named(NamedKey::ArrowDown) => {
-                        Some(&[0x05])
-                    }
-                    _ => None,
-                };
-                if let Some(b) = bytes {
-                    self.selection = None;
-                    self.app.write_to_focused(b);
-                    self.dirty = true;
-                    return;
-                }
-            }
             // Use the base key (Shift's symbol transform undone), so a binding like
             // `cmd+shift+/` matches even though Shift+/ yields `?`.
-            let base_key = base_key(event);
-            if let Some(c) = match &base_key {
+            let base = base_key(event);
+            let c = match &base {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
-            } {
-                // Cmd+C copies an active selection (else it falls through as a
-                // reserved Cmd chord).
-                if c.eq_ignore_ascii_case(&'c') && self.selection.map(|s| !s.is_empty()).unwrap_or(false)
-                {
-                    self.copy_selection();
-                    return;
-                }
-                // Cmd+V pastes the clipboard into the focused terminal.
-                if c.eq_ignore_ascii_case(&'v') && !self.app.focused_is_editor() {
-                    self.paste_to_terminal();
-                    return;
-                }
+            };
+            if let Some(c) = c {
                 // Cmd+, opens the config file in an editor (settings live in the file).
                 if c == ',' {
                     self.open_config_editor();
-                    return;
-                }
-                // Cmd+S saves the focused editor; saving the config hot-reloads it.
-                if c.eq_ignore_ascii_case(&'s') && self.app.focused_is_editor() {
-                    let saved = self.app.focused_editor_mut().and_then(|e| {
-                        let _ = e.save();
-                        e.path.clone()
-                    });
-                    self.dirty = true;
-                    if saved.is_some()
-                        && saved == ghostrealm_core::config::config_path()
-                    {
-                        self.reload_config();
-                    }
                     return;
                 }
                 let chord = self.chord_string(c);
@@ -3072,7 +2778,37 @@ impl State {
                         let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
                     }
                     self.dirty = true;
+                    return;
                 }
+            }
+            if let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) {
+                if let Some(press) = winit_key_press(event, self.mods) {
+                    self.view_event(sid, |v, cx| {
+                        v.key(cx, &press);
+                    });
+                }
+                return;
+            }
+            // Cmd+Arrow: line start/end in the focused terminal (Ctrl-A / Ctrl-E).
+            let bytes: Option<&[u8]> = match &event.logical_key {
+                WKey::Named(NamedKey::ArrowLeft) | WKey::Named(NamedKey::ArrowUp) => Some(&[0x01]),
+                WKey::Named(NamedKey::ArrowRight) | WKey::Named(NamedKey::ArrowDown) => {
+                    Some(&[0x05])
+                }
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                self.selection = None;
+                self.app.write_to_focused(b);
+                self.dirty = true;
+                return;
+            }
+            match c.map(|c| c.to_ascii_lowercase()) {
+                // Cmd+C copies an active selection.
+                Some('c') if self.selection.is_some_and(|s| !s.is_empty()) => self.copy_selection(),
+                // Cmd+V pastes the clipboard into the focused terminal.
+                Some('v') => self.paste_to_terminal(),
+                _ => {}
             }
             return;
         }
@@ -3101,9 +2837,8 @@ impl State {
             return;
         }
 
-        // Shift + Page/Home/End drives scrollback (terminal only; the editor
-        // handles Shift itself for selection).
-        if self.mods.shift && !self.app.focused_is_editor() {
+        // Shift + Page/Home/End drives scrollback.
+        if self.mods.shift {
             let page = ((self.config.height as f32 / self.cell_h).floor() as i32 - 1).max(1);
             let scroll = match &event.logical_key {
                 WKey::Named(NamedKey::PageUp) => Some(Scroll::Delta(-page)),
@@ -3119,33 +2854,31 @@ impl State {
             }
             // Shift+Arrow extends a keyboard selection over the terminal grid
             // (word-wise with Alt) instead of corrupting the shell input.
-            if !self.app.focused_is_editor() {
-                let dir = match &event.logical_key {
-                    WKey::Named(NamedKey::ArrowLeft) => Some(ArrowDir::Left),
-                    WKey::Named(NamedKey::ArrowRight) => Some(ArrowDir::Right),
-                    WKey::Named(NamedKey::ArrowUp) => Some(ArrowDir::Up),
-                    WKey::Named(NamedKey::ArrowDown) => Some(ArrowDir::Down),
-                    _ => None,
-                };
-                if let Some(dir) = dir {
-                    self.extend_terminal_selection(dir, self.mods.alt);
-                    return;
-                }
-                // Shift+Enter sends a newline (LF) as a raw byte — it does NOT go
-                // through the Enter path, so it never triggers the optimistic busy
-                // dot. (Whether the shell treats LF as a continuation vs submit is
-                // the shell's line-editor config.)
-                if matches!(event.logical_key, WKey::Named(NamedKey::Enter)) {
-                    self.selection = None;
-                    self.app.write_to_focused(b"\n");
-                    return;
-                }
+            let dir = match &event.logical_key {
+                WKey::Named(NamedKey::ArrowLeft) => Some(ArrowDir::Left),
+                WKey::Named(NamedKey::ArrowRight) => Some(ArrowDir::Right),
+                WKey::Named(NamedKey::ArrowUp) => Some(ArrowDir::Up),
+                WKey::Named(NamedKey::ArrowDown) => Some(ArrowDir::Down),
+                _ => None,
+            };
+            if let Some(dir) = dir {
+                self.extend_terminal_selection(dir, self.mods.alt);
+                return;
+            }
+            // Shift+Enter sends a newline (LF) as a raw byte — it does NOT go
+            // through the Enter path, so it never triggers the optimistic busy
+            // dot. (Whether the shell treats LF as a continuation vs submit is
+            // the shell's line-editor config.)
+            if matches!(event.logical_key, WKey::Named(NamedKey::Enter)) {
+                self.selection = None;
+                self.app.write_to_focused(b"\n");
+                return;
             }
         }
 
         // Option+Left/Right = word motion in the terminal (readline ESC-b / ESC-f);
         // Option+Up/Down send a plain arrow (avoid the corrupting modified CSI).
-        if self.mods.alt && !self.app.focused_is_editor() {
+        if self.mods.alt {
             match &event.logical_key {
                 WKey::Named(NamedKey::ArrowLeft) => {
                     self.selection = None;
@@ -3171,131 +2904,11 @@ impl State {
             }
         }
 
-        // An editor surface consumes keys itself (no PTY).
-        if self.app.focused_is_editor() {
-            self.editor_key(event);
-            return;
-        }
-
         // Any key that reaches the shell clears a keyboard selection.
         self.selection = None;
         if let Some(press) = winit_key_press(event, self.mods) {
             self.app.send_key_to_focused(&press);
         }
-    }
-
-    /// Route a key to the focused editor buffer. Shift extends a selection.
-    fn editor_key(&mut self, event: &winit::event::KeyEvent) {
-        let selecting = self.mods.shift;
-        let Some(e) = self.app.focused_editor_mut() else {
-            return;
-        };
-        // Motions (Shift extends the selection, else it clears).
-        let motion = match &event.logical_key {
-            WKey::Named(NamedKey::ArrowLeft) => Some(Motion::Left),
-            WKey::Named(NamedKey::ArrowRight) => Some(Motion::Right),
-            WKey::Named(NamedKey::ArrowUp) => Some(Motion::Up),
-            WKey::Named(NamedKey::ArrowDown) => Some(Motion::Down),
-            WKey::Named(NamedKey::Home) => Some(Motion::Home),
-            WKey::Named(NamedKey::End) => Some(Motion::End),
-            _ => None,
-        };
-        if let Some(m) = motion {
-            if selecting {
-                e.move_cursor_selecting(m);
-            } else {
-                e.move_cursor(m);
-            }
-            self.dirty = true;
-            return;
-        }
-        match &event.logical_key {
-            WKey::Named(NamedKey::Enter) => e.insert_newline(),
-            WKey::Named(NamedKey::Backspace) => e.backspace(),
-            WKey::Named(NamedKey::Delete) => e.delete_forward(),
-            WKey::Named(NamedKey::Space) => e.insert_char(' '),
-            WKey::Named(NamedKey::Tab) => {
-                for _ in 0..4 {
-                    e.insert_char(' ');
-                }
-            }
-            WKey::Character(s) => {
-                for c in s.chars() {
-                    e.insert_char(c);
-                }
-            }
-            _ => {}
-        }
-        self.dirty = true;
-    }
-
-    /// Cmd combos while an editor is focused: clipboard (C/X/V) and line/document
-    /// navigation (arrows). Returns whether the key was consumed.
-    fn editor_cmd_key(&mut self, event: &winit::event::KeyEvent) -> bool {
-        let selecting = self.mods.shift;
-        if let WKey::Character(s) = &event.logical_key {
-            match s.chars().next().map(|c| c.to_ascii_lowercase()) {
-                Some('c') => {
-                    if let Some(t) = self.app.focused_editor_mut().and_then(|e| e.selected_text()) {
-                        if let Some(cb) = self.clipboard.as_mut() {
-                            let _ = cb.set_text(t);
-                        }
-                    }
-                    return true;
-                }
-                Some('x') => {
-                    let cut = self.app.focused_editor_mut().and_then(|e| {
-                        let t = e.selected_text();
-                        if t.is_some() {
-                            e.delete_selection();
-                        }
-                        t
-                    });
-                    if let Some(t) = cut {
-                        if let Some(cb) = self.clipboard.as_mut() {
-                            let _ = cb.set_text(t);
-                        }
-                        self.dirty = true;
-                    }
-                    return true;
-                }
-                Some('v') => {
-                    if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
-                        if let Some(e) = self.app.focused_editor_mut() {
-                            e.insert_str(&text);
-                            self.dirty = true;
-                        }
-                    }
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        // Cmd+Left/Right = line start/end; Cmd+Up/Down = document start/end.
-        let Some(e) = self.app.focused_editor_mut() else {
-            return false;
-        };
-        match &event.logical_key {
-            WKey::Named(NamedKey::ArrowLeft) => {
-                if selecting {
-                    e.move_cursor_selecting(Motion::Home);
-                } else {
-                    e.move_cursor(Motion::Home);
-                }
-            }
-            WKey::Named(NamedKey::ArrowRight) => {
-                if selecting {
-                    e.move_cursor_selecting(Motion::End);
-                } else {
-                    e.move_cursor(Motion::End);
-                }
-            }
-            WKey::Named(NamedKey::ArrowUp) => e.move_document(false, selecting),
-            WKey::Named(NamedKey::ArrowDown) => e.move_document(true, selecting),
-            _ => return false,
-        }
-        self.dirty = true;
-        true
     }
 
     /// Ranked, human-visible command results for `query`: `(id, title, chord)`.
@@ -3730,19 +3343,19 @@ impl State {
         if self.app.tick_inbox() {
             self.dirty = true;
         }
-        // Autosave an editor when focus moves off it (workspace/tab/pane switch).
+        // Tell views when keyboard focus moves between them (workspace/tab/pane
+        // switch), e.g. so an editor autosaves on blur.
         let focused = self.app.focused_surface();
         if focused != self.last_focused_surface {
             if let Some(prev) = self.last_focused_surface {
-                if self.cfg.editor.autosave_on_unfocus {
-                    self.autosave_editor(prev);
-                }
+                self.view_event(prev, |v, cx| v.focus_changed(cx, false));
+            }
+            if let Some(next) = focused {
+                self.view_event(next, |v, cx| v.focus_changed(cx, true));
             }
             self.last_focused_surface = focused;
         }
-        // Track edits for, and fire, the idle-autosave timer.
-        self.track_focused_edits();
-        self.fire_idle_autosave_if_due();
+        self.fire_view_timers();
         if !self.dirty {
             return Ok(());
         }
@@ -3751,34 +3364,21 @@ impl State {
         let workspace = self.workspace_rect();
         let panes = self.active_panes(workspace);
 
-        // Resolve each pane's tab-strip height, editor ribbon height, and the body
-        // (below-chrome) rect. A single-tab editor shows a filename ribbon instead
-        // of a tab strip (multi-tab editors show the filename in their tab).
-        let mut resolved: Vec<(PaneRender, f32, f32, Rect)> = Vec::with_capacity(panes.len());
+        // Resolve each pane's tab-strip height and its content rect below it.
+        let mut resolved: Vec<(PaneRender, f32, Rect)> = Vec::with_capacity(panes.len());
         for pr in panes {
             let strip_h = if self.strip_shown(pr.surfaces.len()) {
                 self.strip_height()
             } else {
                 0.0
             };
-            let active_is_editor = pr
-                .surfaces
-                .iter()
-                .find(|(_, _, a)| *a)
-                .is_some_and(|(s, _, _)| self.app.is_editor(*s));
-            let ribbon_h = if active_is_editor && strip_h == 0.0 {
-                self.strip_height()
-            } else {
-                0.0
-            };
-            let chrome_h = strip_h + ribbon_h;
             let term = Rect {
                 x: pr.rect.x,
-                y: pr.rect.y + chrome_h,
+                y: pr.rect.y + strip_h,
                 w: pr.rect.w,
-                h: (pr.rect.h - chrome_h).max(1.0),
+                h: (pr.rect.h - strip_h).max(1.0),
             };
-            resolved.push((pr, strip_h, ribbon_h, term));
+            resolved.push((pr, strip_h, term));
         }
 
         // Resize a pane's terminal only when its cell dimensions actually change;
@@ -3786,7 +3386,7 @@ impl State {
         // row cache is position-independent, so switching panes/vtabs or scrolling
         // never invalidates it.
         let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
-        for (pr, _, _, term) in &resolved {
+        for (pr, _, term) in &resolved {
             let Some(sid) = pr
                 .surfaces
                 .iter()
@@ -3833,7 +3433,7 @@ impl State {
         self.close_buffer
             .shape_until_scroll(&mut self.text.font_system, false);
 
-        for (pr, strip_h, ribbon_h, term) in &resolved {
+        for (pr, strip_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
                 let n = pr.surfaces.len().max(1);
@@ -3874,8 +3474,8 @@ impl State {
                         self.strip_buffers
                             .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
-                    // Italic when the tab is an editor with unsaved edits.
-                    let unsaved = self.app.editor(*sid).is_some_and(|e| e.modified);
+                    // Italic when the tab's view has unsaved changes.
+                    let unsaved = self.app.view(*sid).is_some_and(|v| v.modified());
                     let mut title_attrs = Attrs::new()
                         .family(Family::SansSerif)
                         .color(Color::rgb(220, 220, 230));
@@ -3972,398 +3572,6 @@ impl State {
                 }
                 let owned = frame.view_buttons.drain(..);
                 self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
-                continue;
-            }
-
-            // Editor filename ribbon (a single-tab editor's own line; multi-tab
-            // editors show their filename in the tab instead). Filename italic when
-            // there are unsaved edits, followed by dim size/line-count metrics.
-            if *ribbon_h > 0.0 {
-                let ry = pr.rect.y + *strip_h;
-                frame.bg.push(rect_quad(
-                    Rect {
-                        x: pr.rect.x,
-                        y: ry,
-                        w: pr.rect.w,
-                        h: *ribbon_h,
-                    },
-                    sw,
-                    sh,
-                    self.chrome.sidebar,
-                    1.0,
-                ));
-                let info = self.app.editor(sid).map(|e| {
-                    let bytes =
-                        e.lines.iter().map(|l| l.len()).sum::<usize>() + e.lines.len().saturating_sub(1);
-                    (e.title(), e.modified, bytes, e.lines.len())
-                });
-                if let Some((fname, modified, bytes, nlines)) = info {
-                    let pad = 8.0 * self.scale;
-                    if strip_idx >= self.strip_buffers.len() {
-                        self.strip_buffers
-                            .push(Buffer::new(&mut self.text.font_system, metrics));
-                    }
-                    let mut name_attrs = Attrs::new()
-                        .family(Family::SansSerif)
-                        .color(Color::rgb(220, 220, 230));
-                    if modified {
-                        name_attrs = name_attrs.style(Style::Italic);
-                    }
-                    let meta = format!("{bytes} B   ·   {nlines} lines");
-                    let dim = Attrs::new()
-                        .family(Family::SansSerif)
-                        .color(Color::rgb(140, 140, 155));
-                    let top = ry + (*ribbon_h - self.cell_h) * 0.5;
-                    // Reserve the far-right for the sticky soft-wrap toggle.
-                    let wb_w = self.cell_h;
-                    let wb_x = pr.rect.x + pr.rect.w - wb_w - pad;
-                    let meta_w = meta.chars().count() as f32 * self.cell_w;
-                    let meta_left = wb_x - pad - meta_w;
-                    // Filename, left-aligned.
-                    if strip_idx >= self.strip_buffers.len() {
-                        self.strip_buffers
-                            .push(Buffer::new(&mut self.text.font_system, metrics));
-                    }
-                    let buf = &mut self.strip_buffers[strip_idx];
-                    buf.set_metrics(metrics);
-                    buf.set_wrap(Wrap::None);
-                    buf.set_size(
-                        Some((meta_left - (pr.rect.x + pad)).max(1.0)),
-                        Some(self.cell_h),
-                    );
-                    buf.set_rich_text(
-                        std::iter::once((fname.as_str(), name_attrs)),
-                        &Attrs::new().family(Family::SansSerif),
-                        Shaping::Advanced,
-                        None,
-                    );
-                    buf.shape_until_scroll(&mut self.text.font_system, false);
-                    strip_placements.push(Placement {
-                        idx: strip_idx,
-                        left: pr.rect.x + pad,
-                        top,
-                        bounds: TextBounds {
-                            left: pr.rect.x as i32,
-                            top: ry as i32,
-                            right: meta_left as i32,
-                            bottom: (ry + *ribbon_h) as i32,
-                        },
-                        color: [220, 220, 230],
-                    });
-                    strip_idx += 1;
-                    // Metrics, right-aligned.
-                    if strip_idx >= self.strip_buffers.len() {
-                        self.strip_buffers
-                            .push(Buffer::new(&mut self.text.font_system, metrics));
-                    }
-                    let buf = &mut self.strip_buffers[strip_idx];
-                    buf.set_metrics(metrics);
-                    buf.set_wrap(Wrap::None);
-                    buf.set_size(Some(meta_w + self.cell_w), Some(self.cell_h));
-                    buf.set_rich_text(
-                        std::iter::once((meta.as_str(), dim)),
-                        &Attrs::new().family(Family::SansSerif),
-                        Shaping::Advanced,
-                        None,
-                    );
-                    buf.shape_until_scroll(&mut self.text.font_system, false);
-                    strip_placements.push(Placement {
-                        idx: strip_idx,
-                        left: meta_left,
-                        top,
-                        bounds: TextBounds {
-                            left: meta_left as i32,
-                            top: ry as i32,
-                            right: (pr.rect.x + pr.rect.w) as i32,
-                            bottom: (ry + *ribbon_h) as i32,
-                        },
-                        color: [140, 140, 155],
-                    });
-                    strip_idx += 1;
-                    // Sticky soft-wrap toggle button (right end of the ribbon).
-                    let wb_on = self.soft_wrap_on(sid);
-                    let wb_hit = Rect {
-                        x: wb_x,
-                        y: ry,
-                        w: wb_w,
-                        h: *ribbon_h,
-                    };
-                    let wb_hovered = rect_contains(wb_hit, self.cursor.0, self.cursor.1);
-                    if wb_hovered {
-                        frame.bg.push(rect_quad(
-                            hover_box(wb_hit, wb_w),
-                            sw,
-                            sh,
-                            theme::HOVER_BG,
-                            theme::HOVER_ALPHA,
-                        ));
-                    }
-                    let wb_color = if wb_on { self.chrome.accent } else { theme::GLYPH };
-                    if strip_idx >= self.strip_buffers.len() {
-                        self.strip_buffers
-                            .push(Buffer::new(&mut self.text.font_system, metrics));
-                    }
-                    let buf = &mut self.strip_buffers[strip_idx];
-                    buf.set_metrics(metrics);
-                    buf.set_wrap(Wrap::None);
-                    buf.set_size(Some(wb_w), Some(self.cell_h));
-                    buf.set_rich_text(
-                        std::iter::once(("\u{21a9}", attrs_for(wb_color))),
-                        &Attrs::new().family(Family::Monospace),
-                        Shaping::Advanced,
-                        None,
-                    );
-                    buf.shape_until_scroll(&mut self.text.font_system, false);
-                    strip_placements.push(Placement {
-                        idx: strip_idx,
-                        left: wb_x + (wb_w - self.cell_w) * 0.5,
-                        top,
-                        bounds: TextBounds {
-                            left: wb_x as i32,
-                            top: ry as i32,
-                            right: (wb_x + wb_w) as i32,
-                            bottom: (ry + *ribbon_h) as i32,
-                        },
-                        color: wb_color,
-                    });
-                    strip_idx += 1;
-                    self.buttons.push((wb_hit, ButtonAction::ToggleSoftWrap(sid)));
-                }
-            }
-
-            // Editor surface: render its text buffer instead of a terminal grid.
-            if self.app.is_editor(sid) {
-                let rows_vis = (term.h / self.cell_h).floor().max(1.0) as usize;
-                let wrap = self.soft_wrap_on(sid);
-                // Layout dims (the gutter width needs the line count).
-                let total_lines = match self.app.editor(sid) {
-                    Some(e) => e.lines.len(),
-                    None => continue,
-                };
-                let gutter_w = self.editor_gutter_w(total_lines);
-                let body_x = term.x + gutter_w;
-                let body_w = (term.w - gutter_w).max(1.0);
-                let body_cols = ((body_w / self.cell_w).floor() as usize).max(1);
-                // Follow the cursor only when it moved (so manual scrolling sticks);
-                // reset horizontal scroll under wrap; keep vertical scroll in bounds.
-                if let Some(e) = self.app.editor_mut(sid) {
-                    e.follow_cursor(rows_vis, if wrap { None } else { Some(body_cols) });
-                    if wrap {
-                        e.hscroll = 0;
-                    }
-                    e.clamp_scroll_bounds();
-                }
-                #[allow(clippy::type_complexity)]
-                let (scroll, hscroll, cursor, sel, visible): (
-                    usize,
-                    usize,
-                    (usize, usize),
-                    Option<((usize, usize), (usize, usize))>,
-                    Vec<String>,
-                ) = match self.app.editor(sid) {
-                    Some(e) => (
-                        e.scroll,
-                        e.hscroll,
-                        e.cursor,
-                        e.selection(),
-                        (0..rows_vis)
-                            .map(|i| e.lines.get(e.scroll + i).cloned().unwrap_or_default())
-                            .collect(),
-                    ),
-                    None => continue,
-                };
-                frame.bg.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
-                // Syntax-highlight .toml files.
-                let highlight_toml = self
-                    .app
-                    .editor(sid)
-                    .and_then(|e| e.path.as_ref())
-                    .and_then(|p| p.extension())
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("toml"))
-                    .unwrap_or(false);
-
-                // Lay out the visible visual rows: (logical_line, text, start_col,
-                // y). Soft-wrap breaks long logical lines into several visual rows;
-                // otherwise each line is one row, offset left by hscroll and clipped.
-                let wrap_cols = if wrap { body_cols } else { usize::MAX };
-                let bottom = term.y + term.h;
-                // Horizontal scroll offset in pixels. Under no-wrap, each row holds
-                // its whole logical line shaped once (start 0) and is drawn shifted
-                // left by this, with bounds clipped to the body — moving the
-                // viewport rather than re-shaping a per-hscroll substring. Under
-                // wrap, hscroll is forced to 0.
-                let hscroll_px = hscroll as f32 * self.cell_w;
-                let mut vis: Vec<(usize, String, usize, f32)> = Vec::new();
-                let mut vy = term.y;
-                for (i, line) in visible.iter().enumerate() {
-                    if vy >= bottom {
-                        break;
-                    }
-                    let ln = scroll + i;
-                    if wrap {
-                        for (text, start) in wrap_line(line, wrap_cols) {
-                            if vy >= bottom {
-                                break;
-                            }
-                            vis.push((ln, text, start, vy));
-                            vy += self.cell_h;
-                        }
-                    } else {
-                        vis.push((ln, line.clone(), 0, vy));
-                        vy += self.cell_h;
-                    }
-                }
-
-                // Active-line highlight behind every visual row of the cursor line.
-                if self.cfg.editor.cursor_line {
-                    for (ln, _t, _s, y) in &vis {
-                        if *ln == cursor.0 {
-                            frame.bg.push(rect_quad(
-                                Rect { x: term.x, y: *y, w: term.w, h: self.cell_h },
-                                sw,
-                                sh,
-                                EDITOR_CURSOR_LINE,
-                                EDITOR_CURSOR_LINE_ALPHA,
-                            ));
-                        }
-                    }
-                }
-                // Selection highlight (behind text), intersected with each row.
-                if let Some(((sr, sc), (er, ec))) = sel {
-                    for (ln, text, start, y) in &vis {
-                        let ln = *ln;
-                        if ln < sr || ln > er {
-                            continue;
-                        }
-                        let row_end = start + text.chars().count();
-                        let first_l = if ln == sr { sc } else { 0 };
-                        let last_l = if ln == er { ec } else { usize::MAX };
-                        let vfirst = first_l.max(*start);
-                        let vlast = last_l.min(row_end);
-                        if vlast > vfirst {
-                            // Offset by hscroll and clip to the body so a selection
-                            // that runs off either edge doesn't paint the gutter or
-                            // the neighbouring pane.
-                            let right = term.x + term.w;
-                            let x0 = (body_x + (vfirst - start) as f32 * self.cell_w
-                                - hscroll_px)
-                                .max(body_x);
-                            let x1 = (body_x + (vlast - start) as f32 * self.cell_w
-                                - hscroll_px)
-                                .min(right);
-                            if x1 > x0 {
-                                frame.bg.push(rect_quad(
-                                    Rect { x: x0, y: *y, w: x1 - x0, h: self.cell_h },
-                                    sw,
-                                    sh,
-                                    self.chrome.accent,
-                                    0.35,
-                                ));
-                            }
-                        }
-                    }
-                }
-                // Line-number gutter — only on each logical line's first visual row.
-                if gutter_w > 0.0 {
-                    for (ln, _text, start, y) in &vis {
-                        if *start != 0 || *ln >= total_lines {
-                            continue;
-                        }
-                        let is_cur = *ln == cursor.0;
-                        let num = match self.cfg.editor.line_numbers {
-                            LineNumbers::Relative if !is_cur => {
-                                (cursor.0 as isize - *ln as isize).unsigned_abs()
-                            }
-                            _ => ln + 1, // absolute (and the cursor line in relative mode)
-                        };
-                        let s = num.to_string();
-                        let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
-                        let key = self.text.row_cache.row_key(std::iter::once((s.as_str(), color)));
-                        if self.text.row_cache.buffer(key).is_some() {
-                            self.text.row_cache
-                                .ensure(key, &mut self.text.font_system, metrics, gutter_w, self.cell_h, &[]);
-                        } else {
-                            let spans = vec![(s.clone(), color)];
-                            self.text.row_cache
-                                .ensure(key, &mut self.text.font_system, metrics, gutter_w, self.cell_h, &spans);
-                        }
-                        let num_w = s.chars().count() as f32 * self.cell_w;
-                        frame.text.push(TextItem {
-                            src: TextSrc::Row(key),
-                            left: body_x - self.cell_w - num_w,
-                            top: *y,
-                            bounds: TextBounds {
-                                left: term.x as i32,
-                                top: term.y as i32,
-                                right: body_x as i32,
-                                bottom: bottom as i32,
-                            },
-                            color,
-                        });
-                    }
-                }
-                // Text for each visual row (keyed by its own coloured content, so
-                // wrapped sub-rows are cache-friendly and width-independent).
-                for (ln, text, start, y) in &vis {
-                    // Coloured spans: TOML syntax highlight for .toml files, else a
-                    // single default-fg span.
-                    let spans: Vec<(String, [u8; 3])> = if highlight_toml {
-                        let logical = visible.get(ln - scroll).map(String::as_str).unwrap_or("");
-                        toml_row_spans(logical, *start, text.chars().count())
-                    } else {
-                        vec![(text.clone(), EDITOR_FG)]
-                    };
-                    let key = self.text
-                        .row_cache
-                        .row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
-                    let pos = (body_x as i32, *y as i32);
-                    // Shape the whole row (full line under no-wrap) in a box wide
-                    // enough to hold it, so the layout is hscroll-independent.
-                    let shape_w =
-                        (text.chars().count() as f32 * self.cell_w).max(body_w);
-                    let place_key = self.text.budgeted_key(key, pos, shape_w, || spans);
-                    frame.text.push(TextItem {
-                        src: TextSrc::Row(place_key),
-                        left: body_x - hscroll_px,
-                        top: *y,
-                        bounds: TextBounds {
-                            left: body_x as i32,
-                            top: term.y as i32,
-                            right: (term.x + term.w) as i32,
-                            bottom: bottom as i32,
-                        },
-                        color: EDITOR_FG,
-                    });
-                }
-                // Cursor (thin bar): the cursor-line row with the largest start
-                // that the column still falls on.
-                if let Some((_, _t, start, y)) = vis
-                    .iter()
-                    .rev()
-                    .find(|(ln, _t, start, _y)| *ln == cursor.0 && *start <= cursor.1)
-                {
-                    let cx = body_x + (cursor.1 - start) as f32 * self.cell_w - hscroll_px;
-                    // Clip to the body so a scrolled-off cursor never draws over the
-                    // gutter or the neighbouring pane/sidebar.
-                    if cx >= body_x && cx < term.x + term.w {
-                        frame.top.push(rect_quad(
-                            Rect {
-                                x: cx,
-                                y: *y,
-                                w: 2.0 * self.scale,
-                                h: self.cell_h,
-                            },
-                            sw,
-                            sh,
-                            self.chrome.accent,
-                            0.9,
-                        ));
-                    }
-                }
-                if pr.focused && multi_pane {
-                    push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
-                }
                 continue;
             }
 
@@ -4949,18 +4157,6 @@ fn row_content_len(grid: &Grid, row: u16) -> u16 {
         }
     }
     len
-}
-
-/// A centred square inside `hit` of side `side` (inset a little), for the close
-/// button's hover highlight.
-fn hover_box(hit: Rect, side: f32) -> Rect {
-    let s = (side - 4.0).max(1.0);
-    Rect {
-        x: hit.x + (hit.w - s) * 0.5,
-        y: hit.y + (hit.h - s) * 0.5,
-        w: s,
-        h: s,
-    }
 }
 
 /// A cursor/selection direction.

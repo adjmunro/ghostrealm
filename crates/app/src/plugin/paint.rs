@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
-use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, TextBounds};
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, TextBounds, Weight};
 
 use super::{rect_contains, theme, UiMetrics};
 use crate::row_cache::RowCache;
@@ -79,6 +79,57 @@ pub fn bounds(r: Rect) -> TextBounds {
         top: r.y as i32,
         right: (r.x + r.w) as i32,
         bottom: (r.y + r.h) as i32,
+    }
+}
+
+/// A face to shape text in: a family plus italic/bold. `Family` converts, so
+/// `cx.shape(text, Family::SansSerif, w)` reads as plain sans.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Font {
+    pub family: Family<'static>,
+    pub italic: bool,
+    pub bold: bool,
+}
+
+impl Font {
+    pub const MONO: Font = Font {
+        family: Family::Monospace,
+        italic: false,
+        bold: false,
+    };
+    pub const SANS: Font = Font {
+        family: Family::SansSerif,
+        italic: false,
+        bold: false,
+    };
+
+    pub fn italic(self, on: bool) -> Self {
+        Font { italic: on, ..self }
+    }
+
+    pub fn bold(self, on: bool) -> Self {
+        Font { bold: on, ..self }
+    }
+
+    fn attrs(self) -> Attrs<'static> {
+        let mut a = Attrs::new().family(self.family);
+        if self.italic {
+            a = a.style(Style::Italic);
+        }
+        if self.bold {
+            a = a.weight(Weight::BOLD);
+        }
+        a
+    }
+}
+
+impl From<Family<'static>> for Font {
+    fn from(family: Family<'static>) -> Self {
+        Font {
+            family,
+            italic: false,
+            bold: false,
+        }
     }
 }
 
@@ -251,7 +302,7 @@ impl TextKit {
     fn shape_scratch(
         &mut self,
         spans: &[(&str, [u8; 3])],
-        family: Family,
+        font: Font,
         width: f32,
         bake_colors: bool,
     ) -> Shaped {
@@ -267,13 +318,13 @@ impl TextKit {
         buf.set_size(Some(width.max(1.0)), Some(self.line_h));
         buf.set_rich_text(
             spans.iter().map(|(t, c)| {
-                let mut a = Attrs::new().family(family);
+                let mut a = font.attrs();
                 if bake_colors {
                     a = a.color(Color::rgb(c[0], c[1], c[2]));
                 }
                 (*t, a)
             }),
-            &Attrs::new().family(family),
+            &font.attrs(),
             Shaping::Advanced,
             None,
         );
@@ -391,14 +442,19 @@ impl<'a> PaintCx<'a> {
     /// Shape `text` (one colour, set at placement) into a scratch slot `width`
     /// wide. Place it with [`place`](Self::place); the returned width lets the
     /// caller centre or right-align it first.
-    pub fn shape(&mut self, text: &str, family: Family, width: f32) -> Shaped {
-        self.text.shape_scratch(&[(text, [0, 0, 0])], family, width, false)
+    pub fn shape(&mut self, text: &str, font: impl Into<Font>, width: f32) -> Shaped {
+        self.text.shape_scratch(&[(text, [0, 0, 0])], font.into(), width, false)
     }
 
     /// Shape per-span coloured text into a scratch slot `width` wide.
-    pub fn shape_spans(&mut self, spans: &[(String, [u8; 3])], family: Family, width: f32) -> Shaped {
+    pub fn shape_spans(
+        &mut self,
+        spans: &[(String, [u8; 3])],
+        font: impl Into<Font>,
+        width: f32,
+    ) -> Shaped {
         let spans: Vec<(&str, [u8; 3])> = spans.iter().map(|(s, c)| (s.as_str(), *c)).collect();
-        self.text.shape_scratch(&spans, family, width, true)
+        self.text.shape_scratch(&spans, font.into(), width, true)
     }
 
     /// Draw shaped text with its top-left at `(left, top)`, clipped to `clip`.
@@ -417,14 +473,14 @@ impl<'a> PaintCx<'a> {
     pub fn label(
         &mut self,
         text: &str,
-        family: Family,
+        font: impl Into<Font>,
         left: f32,
         top: f32,
         clip: Rect,
         color: [u8; 3],
     ) -> f32 {
         let width = (clip.x + clip.w - left).max(1.0);
-        let s = self.shape(text, family, width);
+        let s = self.shape(text, font, width);
         self.place(s, left, top, clip, color);
         s.width
     }

@@ -7,6 +7,7 @@
 //! real per-pane sizes.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,8 @@ use ghostrealm_core::{
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
-use crate::plugins::editor::EditorBuffer;
 use crate::plugin::{OpenCx, Plugin, View};
+use crate::plugins::editor::{self, EditorBuffer, EditorView};
 use crate::plugins::file_browser::{self, FileBrowserView};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
@@ -52,8 +53,6 @@ const DEFAULT_CELL_H: u32 = 16;
 pub struct AppState {
     pub tree: Tree,
     surfaces: HashMap<SurfaceId, ThreadedTerminal>,
-    /// Surfaces whose content is a text editor rather than a terminal.
-    editors: HashMap<SurfaceId, EditorBuffer>,
     /// Surfaces whose content is a plugin view. A surface with no terminal,
     /// editor, or view is "empty" — it shows the open-something picker.
     views: HashMap<SurfaceId, Box<dyn View>>,
@@ -86,7 +85,6 @@ impl AppState {
         AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
-            editors: HashMap::new(),
             views: HashMap::new(),
             plugins: crate::plugins::builtin(),
             dir_picker: None,
@@ -264,15 +262,13 @@ impl AppState {
         Ok(())
     }
 
-    /// Add an editor surface (a text buffer, not a terminal) to the focused pane
-    /// and make it active. `buffer` is a scratch or file-backed [`EditorBuffer`].
-    pub fn open_editor_in_focused(&mut self, buffer: EditorBuffer) {
+    /// Add `view` as a new tab in the focused pane and make it active.
+    pub fn open_view_in_focused(&mut self, view: Box<dyn View>) {
         let Some((vt, pane)) = self.focused_pane() else {
             return;
         };
-        if let Some(surf) = self.tree.add_surface(vt, pane) {
-            self.tree.set_surface_title(surf, buffer.title(), true);
-            self.editors.insert(surf, buffer);
+        if let Some(sid) = self.tree.add_surface(vt, pane) {
+            self.insert_view(sid, view);
         }
     }
 
@@ -304,11 +300,7 @@ impl AppState {
     fn materialize_surface(&mut self, sid: SurfaceId, vt: VtabId, kind: OpenKind) -> Result<()> {
         match kind {
             OpenKind::Terminal => self.spawn_surface(sid, vt)?,
-            OpenKind::Editor => {
-                let buf = EditorBuffer::scratch();
-                self.tree.set_surface_title(sid, buf.title(), true);
-                self.editors.insert(sid, buf);
-            }
+            OpenKind::Editor => self.materialize_plugin(sid, vt, editor::ID)?,
             OpenKind::FileBrowser => self.materialize_plugin(sid, vt, file_browser::ID)?,
         }
         Ok(())
@@ -369,10 +361,14 @@ impl AppState {
         self.views.get_mut(&id).map(|v| v.as_mut())
     }
 
+    /// Every surface's view, in no particular order.
+    pub fn views(&self) -> impl Iterator<Item = (SurfaceId, &dyn View)> {
+        self.views.iter().map(|(sid, v)| (*sid, v.as_ref()))
+    }
+
     /// Whether `id` is an empty surface (no content chosen yet).
     pub fn surface_is_empty(&self, id: SurfaceId) -> bool {
         !self.surfaces.contains_key(&id)
-            && !self.editors.contains_key(&id)
             && !self.views.contains_key(&id)
     }
 
@@ -385,21 +381,49 @@ impl AppState {
         }
     }
 
-    /// Open `path` in a new editor tab in the focused pane (from the file browser).
-    pub fn open_file_in_focused(&mut self, path: std::path::PathBuf) {
-        self.open_editor_in_focused(EditorBuffer::open(path));
+    /// Open `path` in a new tab in the focused pane, with the first plugin that
+    /// claims it (the editor claims anything).
+    pub fn open_path_in_focused(&mut self, path: &Path) -> Result<()> {
+        let view = self.view_for_path(None, path)?;
+        self.open_view_in_focused(view);
+        Ok(())
     }
 
-    /// Open `path` in a new split beside the focused pane (e.g. beside the file browser),
-    /// falling back to a tab if the split can't be made.
-    pub fn open_file_split(&mut self, path: std::path::PathBuf, axis: Axis) {
+    /// Open `path` in a new tab in the focused pane with plugin `id`.
+    pub fn open_path_with_in_focused(&mut self, id: &str, path: &Path) -> Result<()> {
+        let view = self.view_for_path(Some(id), path)?;
+        self.open_view_in_focused(view);
+        Ok(())
+    }
+
+    /// A view of `path` from plugin `id`, or else from the first plugin that
+    /// claims the path.
+    fn view_for_path(&self, id: Option<&str>, path: &Path) -> Result<Box<dyn View>> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| match id {
+                Some(id) => p.id() == id,
+                None => p.opens_path(path),
+            })
+            .ok_or_else(|| anyhow::anyhow!("no plugin opens {}", path.display()))?;
+        let cx = OpenCx {
+            cwd: self.active().and_then(|vt| self.resolve_cwd(vt)),
+            command: None,
+            waker: self.waker.clone(),
+        };
+        plugin.open_path(path, &cx)
+    }
+
+    /// Open `path` in a new split beside the focused pane (e.g. beside the file
+    /// browser), falling back to a tab if the split can't be made.
+    pub fn open_path_split(&mut self, path: &Path, axis: Axis) -> Result<()> {
+        let view = self.view_for_path(None, path)?;
         if let Some((vt, pane)) = self.focused_pane() {
-            if self.tree.split_empty(vt, pane, axis).is_some() {
-                self.open_editor_in_focused(EditorBuffer::open(path));
-                return;
-            }
+            self.tree.split_empty(vt, pane, axis);
         }
-        self.open_file_in_focused(path);
+        self.open_view_in_focused(view);
+        Ok(())
     }
 
     /// Whether the floating directory picker is open.
@@ -437,15 +461,14 @@ impl AppState {
         self.close_dir_picker();
     }
 
-    /// Create a new workspace whose sole surface is an editor (no shell spawned),
-    /// named `name` (pinned). Returns the new vtab id.
-    pub fn new_editor_vtab(&mut self, name: impl Into<String>, buffer: EditorBuffer) -> VtabId {
+    /// Create a new workspace named `name` (pinned) whose sole surface is `view`
+    /// (no shell spawned). Returns the new vtab id.
+    pub fn new_view_vtab(&mut self, name: impl Into<String>, view: Box<dyn View>) -> VtabId {
         let (vt, _pane, surf) = self.tree.add_vtab(name);
         if let Some(v) = self.tree.vtab_mut(vt) {
             v.user_named = true;
         }
-        self.tree.set_surface_title(surf, buffer.title(), true);
-        self.editors.insert(surf, buffer);
+        self.insert_view(surf, view);
         vt
     }
 
@@ -468,62 +491,33 @@ impl AppState {
                         v.panes()
                             .into_iter()
                             .flat_map(|p| p.surfaces.iter())
-                            .any(|s| self.editors.contains_key(&s.id))
+                            .any(|s| self.view(s.id).is_some_and(|v| v.plugin() == editor::ID))
                     })
                     .unwrap_or(false);
                 if !has_editor {
-                    self.open_editor_in_focused(EditorBuffer::open(path));
+                    self.open_view_in_focused(Box::new(EditorView::new(EditorBuffer::open(path))));
                 }
             }
             None => {
-                let vt = self.new_editor_vtab(SETTINGS_VTAB_NAME, EditorBuffer::open(path));
+                let view = Box::new(EditorView::new(EditorBuffer::open(path)));
+                let vt = self.new_view_vtab(SETTINGS_VTAB_NAME, view);
                 self.focus_vtab(vt);
             }
         }
     }
 
-    /// Whether `id` is an editor surface.
-    pub fn is_editor(&self, id: SurfaceId) -> bool {
-        self.editors.contains_key(&id)
-    }
-
-    /// The editor buffer for `id`, if it is an editor surface.
-    pub fn editor(&self, id: SurfaceId) -> Option<&EditorBuffer> {
-        self.editors.get(&id)
-    }
-
-    pub fn editor_mut(&mut self, id: SurfaceId) -> Option<&mut EditorBuffer> {
-        self.editors.get_mut(&id)
-    }
-
-    /// Save every editor with unsaved edits and a backing file (autosave on app
-    /// blur/quit). Pathless scratch buffers are left alone. Returns whether the
-    /// config file was among those saved (so the caller can hot-reload it).
-    pub fn autosave_all_editors(&mut self) -> bool {
+    /// Persist every view's unsaved state that has a home (autosave on app
+    /// blur/quit). Returns whether the config file was among what was saved (so
+    /// the caller can hot-reload it).
+    pub fn autosave_all(&mut self) -> bool {
         let config_path = ghostrealm_core::config::config_path();
         let mut saved_config = false;
-        for e in self.editors.values_mut() {
-            if e.modified && e.path.is_some() {
-                let _ = e.save();
-                if config_path.is_some() && e.path == config_path {
-                    saved_config = true;
-                }
+        for view in self.views.values_mut() {
+            if let Some(path) = view.autosave() {
+                saved_config |= Some(path) == config_path;
             }
         }
         saved_config
-    }
-
-    /// Whether the focused surface is an editor.
-    pub fn focused_is_editor(&self) -> bool {
-        self.focused_surface()
-            .map(|id| self.is_editor(id))
-            .unwrap_or(false)
-    }
-
-    /// The focused surface's editor buffer, if it is an editor.
-    pub fn focused_editor_mut(&mut self) -> Option<&mut EditorBuffer> {
-        let id = self.focused_surface()?;
-        self.editors.get_mut(&id)
     }
 
     /// Cycle focus to the next (`+1`) or previous (`-1`) pane in the active vtab.
@@ -609,7 +603,6 @@ impl AppState {
             .flat_map(|p| p.surfaces.iter().map(|s| s.id))
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
-        self.editors.retain(|id, _| live.contains(id));
         self.views.retain(|id, _| live.contains(id));
     }
 
@@ -1155,25 +1148,14 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
-            "editor.scratch",
-            "New Editor",
-            "Open an empty text editor in the focused pane",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.open_kind_in_focused(OpenKind::Editor).map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
-            "editor.open",
-            "Open File in Editor",
-            "Open a file in a text editor in the focused pane",
+            "file.open",
+            "Open File",
+            "Open a file in the focused pane with the plugin that handles it",
         )
         .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open")),
         Box::new(|s: &mut AppState, a| {
             let path = std::path::PathBuf::from(a.get_str("path")?);
-            s.open_editor_in_focused(EditorBuffer::open(path));
+            s.open_path_in_focused(&path).map_err(failed)?;
             Ok(CmdOutcome::ok())
         }),
     );
@@ -1464,20 +1446,36 @@ mod tests {
     fn open_editor_creates_a_focused_editor_surface() {
         let mut s = AppState::new().with_shell_line("sleep 2");
         s.new_vtab().unwrap();
-        s.open_editor_in_focused(EditorBuffer::scratch());
+        s.open_plugin_in_focused(editor::ID).unwrap();
 
-        assert!(s.focused_is_editor(), "the opened editor becomes focused");
         let surf = s.focused_surface().unwrap();
-        assert!(s.is_editor(surf));
-        assert!(s.editor(surf).is_some());
+        let view = s.view_mut(surf).expect("the opened editor becomes focused");
+        assert_eq!(view.plugin(), editor::ID);
+        let ed = view.downcast_mut::<EditorView>().expect("an EditorView");
+        ed.buffer_mut().insert_char('x');
+        assert_eq!(s.surface_text(surf).as_deref(), Some("x"));
         assert!(
             s.terminal(surf).is_none(),
             "an editor surface has no terminal"
         );
+    }
 
-        // Typing routes into the buffer.
-        s.focused_editor_mut().unwrap().insert_char('x');
-        assert_eq!(s.editor(surf).unwrap().lines, vec!["x".to_string()]);
+    #[test]
+    fn opening_a_path_picks_the_claiming_plugin() {
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        let dir = crate::plugin::testing::tmpdir("app-open");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let mut r = build_registry();
+        let mut args = ghostrealm_core::Args::new();
+        args.insert("path", ghostrealm_core::Value::Str(file.display().to_string()));
+        r.execute("file.open", &args, &mut s).expect("file.open runs");
+        let sid = s.focused_surface().unwrap();
+        assert_eq!(s.view(sid).map(|v| v.plugin()), Some(editor::ID));
+        assert_eq!(s.surface_text(sid).as_deref(), Some("hello"));
+        let title = s.tree.vtabs()[0].panes()[0].surfaces.last().unwrap().title.clone();
+        assert_eq!(title, "notes.txt", "the view titles its tab");
     }
 
     #[test]

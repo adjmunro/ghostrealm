@@ -45,7 +45,7 @@ use ghostrealm_terminal::{KeyPress, Pumped};
 use crate::app_state::AppState;
 
 pub use event::{EventCx, MouseEvent, Outcome, Request};
-pub use paint::{Frame, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc};
+pub use paint::{Font, Frame, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc};
 
 /// Called from any thread to wake the UI (it schedules a paced redraw).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -198,6 +198,18 @@ impl dyn View {
     /// The concrete view, if it is a `T`.
     pub fn downcast_mut<T: View>(&mut self) -> Option<&mut T> {
         self.as_any_mut().downcast_mut()
+    }
+}
+
+/// A centred square of side `side` (inset a little) inside `hit`: the hover
+/// highlight of an icon button, smaller than its full hit rect.
+pub fn hover_box(hit: Rect, side: f32) -> Rect {
+    let s = (side - 4.0).max(1.0);
+    Rect {
+        x: hit.x + (hit.w - s) * 0.5,
+        y: hit.y + (hit.h - s) * 0.5,
+        w: s,
+        h: s,
     }
 }
 

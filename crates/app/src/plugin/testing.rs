@@ -19,6 +19,14 @@ pub struct Harness {
     pub text: TextKit,
     pub frame: Frame,
     pub cursor: (f32, f32),
+    /// Paint as if the pane shows a tab strip above the view.
+    pub tab_strip: bool,
+}
+
+impl Default for Harness {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Harness {
@@ -43,11 +51,11 @@ impl Harness {
             text: TextKit::new(fs, 256),
             frame: Frame::new((800.0, 600.0)),
             cursor: (-1.0, -1.0),
+            tab_strip: false,
         }
     }
 
-    /// Paint `view` into `rect` as a focused pane with no tab strip, into a
-    /// fresh frame.
+    /// Paint `view` into `rect` as a focused pane, into a fresh frame.
     pub fn paint(&mut self, view: &mut dyn View, rect: Rect) -> &Frame {
         self.frame = Frame::new((800.0, 600.0));
         let m = glyphon::Metrics::new(14.0, UI.cell_h);
@@ -64,6 +72,7 @@ impl Harness {
             SurfaceId(1),
         );
         cx.focused = true;
+        cx.tab_strip = self.tab_strip;
         view.paint(&mut cx, rect);
         self.text.finish_paint();
         &self.frame
@@ -91,6 +100,25 @@ impl Harness {
 
     pub fn button(&self, view: &mut dyn View, id: u32) -> Outcome {
         self.event(Mods::default(), |cx| view.button(cx, id))
+    }
+
+    pub fn focus(&self, view: &mut dyn View, focused: bool) -> Outcome {
+        self.event(Mods::default(), |cx| view.focus_changed(cx, focused))
+    }
+
+    pub fn tick(&self, view: &mut dyn View, now: std::time::Instant) -> Outcome {
+        self.event(Mods::default(), |cx| view.tick(cx, now))
+    }
+}
+
+/// A key press with Cmd held.
+pub fn cmd(key: Key) -> KeyPress {
+    KeyPress {
+        mods: Mods {
+            super_: true,
+            ..Mods::default()
+        },
+        ..press(key)
     }
 }
 
