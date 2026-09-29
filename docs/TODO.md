@@ -428,22 +428,48 @@
 
 ---
 
-[2026-09-29@fddd044] File browser — "by type" view
+[2026-09-29@19e0239] File browser — alternate views (grouped)
 
 - Requires: NO BLOCKERS (extends `core::fs_tree::FsTree`, already headless)
-- Detail: A second view mode alongside the ancestor hierarchy (tree): a
-  "by file type" view. From the current root, show fake collapsible categories
-  (rendered like directories, but not real) — one per file extension found in the
-  recursive subtree (e.g. `.kt`, `.gradle.kts`, `.jpg`). Expanding a category
-  lists every file of that type below the root, for fast "jump to a kind of file".
-  DISAMBIGUATION: when two files in a category share a name, prefix each with the
-  minimal distinguishing ancestor (grayed): walk up from the leaf while the
-  candidate ancestor segment is shared by another shown file, stopping at the
-  first segment that differs (e.g. Kotlin `util` packages that share a/b/c climb
-  to the module — `source` vs `network`). Show that segment (or the run up to it)
-  as dim text before the file name. Add a view toggle in the header (tree vs type)
-  and a `view` field on `FsTree` (drives `rows()`).
-- Reason: navigate by kind, not just by folder; requested.
+- Detail: A `view` field on `FsTree` selects how `rows()` groups the recursive
+  subtree into fake collapsible categories (rendered like directories, not real),
+  with a header toggle to switch. Views to build:
+  - **by extension** (requested): one category per extension (`.kt`,
+    `.gradle.kts`, `.jpg`); expand to list every file of that type.
+  - **by kind** (higher level): group extensions into Images / Video / Audio /
+    Documents / Code / Archives / Data / Other — great for a Downloads folder.
+  - **by git status**: Modified / Untracked / Staged / Clean categories.
+  - **by modified date**: Today / This week / This month / Older buckets.
+  - **by size**: tiny / small / large / huge buckets; plus a flat "largest files".
+  - **recent**: flat, newest-first across the tree.
+  DISAMBIGUATION for any flat/grouped view: when two shown files share a name,
+  prefix each with the minimal distinguishing ancestor (grayed) — walk up from the
+  leaf while the candidate segment is shared by another shown file, stop at the
+  first that differs (Kotlin `util` packages sharing a/b/c climb to the module:
+  `source` vs `network`). Show that segment before the file name in dim text.
+- Reason: navigate by kind/status/date, not just by folder; requested + brainstorm.
+
+---
+
+[2026-09-29@19e0239] File browser — preview pane
+
+- Requires: NO BLOCKERS (image first; media is a large follow-up)
+- Detail: When the browser pane is wide enough (a minimum pixel width; below it,
+  hide the preview rather than repositioning it to the bottom), split off a
+  right-hand preview of the hovered/selected file:
+  - **details** always: name, size, mtime/ctime, kind, and for a dir its entry
+    count.
+  - **text files**: a scrollable head of the contents (reuse the editor's read +
+    row rendering).
+  - **images**: decode and show the image (wgpu texture upload; new render path).
+  - **video/audio**: play with an autoplay setting (`[preview] autoplay`, default
+    true) — a UI toggle button flips it and writes it back to config + hot-reloads
+    (like the existing editor soft-wrap toggle pattern). Media decode/playback is a
+    big dependency decision (e.g. an ffmpeg/symphonia route) — spike separately.
+  Build order: details + text preview → images → media. Keep the min-width gate so
+  a narrow pane just shows the tree.
+- Reason: Finder-style at-a-glance preview; explicitly requested (autoplay wanted
+  on by default).
 
 ---
 
