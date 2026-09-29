@@ -23,6 +23,18 @@ struct RawEntry {
     mtime: Option<SystemTime>,
 }
 
+/// One entry from the recursive filter-mode walk (cached across keystrokes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WalkEntry {
+    name: String,
+    /// Path relative to the root — the display label in filter mode.
+    rel: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+    mtime: Option<SystemTime>,
+}
+
 /// A row in the flattened visible tree, ready to render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRow {
@@ -53,6 +65,9 @@ pub struct FsTree {
     /// Per-directory listings, filtered by the current toggles. Cleared when a
     /// toggle or the root changes; a single dir can be dropped to force a re-read.
     cache: HashMap<PathBuf, Vec<RawEntry>>,
+    /// The recursive walk for filter mode, built once and re-scored per keystroke;
+    /// cleared when the root or a toggle changes.
+    walk_cache: Option<Vec<WalkEntry>>,
     /// Memoised flattened rows; recomputed only when `dirty`.
     rows_cache: Vec<FileRow>,
     dirty: bool,
@@ -67,6 +82,7 @@ impl FsTree {
             query: String::new(),
             expanded: BTreeSet::new(),
             cache: HashMap::new(),
+            walk_cache: None,
             rows_cache: Vec::new(),
             dirty: true,
         }
@@ -81,6 +97,7 @@ impl FsTree {
         self.root = root.into();
         self.expanded.clear();
         self.cache.clear();
+        self.walk_cache = None;
         self.query.clear();
         self.dirty = true;
     }
@@ -103,6 +120,7 @@ impl FsTree {
         if self.show_hidden != v {
             self.show_hidden = v;
             self.cache.clear();
+            self.walk_cache = None;
             self.dirty = true;
         }
     }
@@ -115,6 +133,7 @@ impl FsTree {
         if self.show_gitignored != v {
             self.show_gitignored = v;
             self.cache.clear();
+            self.walk_cache = None;
             self.dirty = true;
         }
     }
@@ -146,6 +165,7 @@ impl FsTree {
     /// Drop cached listings so the next `rows` re-reads from disk.
     pub fn refresh(&mut self) {
         self.cache.clear();
+        self.walk_cache = None;
         self.dirty = true;
     }
 
@@ -157,6 +177,7 @@ impl FsTree {
             self.rows_cache = if self.query.trim().is_empty() {
                 self.browse_rows()
             } else {
+                self.ensure_walk();
                 self.filter_rows()
             };
             self.dirty = false;
@@ -239,17 +260,15 @@ impl FsTree {
         }
     }
 
-    /// Filter-mode rows: walk the root (respecting toggles), fuzzy-rank names,
-    /// return the top matches as a flat list keyed by path relative to the root.
-    fn filter_rows(&self) -> Vec<FileRow> {
-        let query = self.query.trim();
-        let mut scored: Vec<(i32, FileRow)> = Vec::new();
+    /// Populate the recursive filter walk once (respecting toggles). Bounded by
+    /// [`FILTER_WALK_CAP`] so a huge tree can't stall.
+    fn ensure_walk(&mut self) {
+        if self.walk_cache.is_some() {
+            return;
+        }
+        let mut entries: Vec<WalkEntry> = Vec::new();
         let mut seen = 0usize;
-        for dent in self
-            .walk_builder(&self.root)
-            .build()
-            .flatten()
-        {
+        for dent in self.walk_builder(&self.root).build().flatten() {
             if dent.depth() == 0 {
                 continue; // the root itself
             }
@@ -263,40 +282,54 @@ impl FsTree {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            let file_name = dent
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
-            let Some(score) = fuzzy::score(query, &file_name).or_else(|| fuzzy::score(query, &rel))
-            else {
-                continue;
-            };
+            let name = dent.file_name().to_string_lossy().into_owned();
             let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let (size, mtime) = dent
                 .metadata()
                 .map(|m| (m.len(), m.modified().ok()))
                 .unwrap_or((0, None));
-            scored.push((
-                score,
-                FileRow {
-                    name: rel,
-                    path,
-                    is_dir,
-                    depth: 0,
-                    expanded: false,
-                    size,
-                    mtime,
-                },
-            ));
+            entries.push(WalkEntry {
+                name,
+                rel,
+                path,
+                is_dir,
+                size,
+                mtime,
+            });
         }
+        self.walk_cache = Some(entries);
+    }
+
+    /// Filter-mode rows: fuzzy-rank the cached walk by each entry's **file name**
+    /// (not its full path), so a directory that matches doesn't drag in all of its
+    /// descendants — a deep entry matches only on its own name. The display label
+    /// is the path relative to the root, so which match it is stays clear.
+    fn filter_rows(&self) -> Vec<FileRow> {
+        let query = self.query.trim();
+        let entries = self.walk_cache.as_deref().unwrap_or(&[]);
+        let mut scored: Vec<(i32, &WalkEntry)> = entries
+            .iter()
+            .filter_map(|e| fuzzy::score(query, &e.name).map(|s| (s, e)))
+            .collect();
         // Highest score first; ties broken by shorter path then name.
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| a.1.name.len().cmp(&b.1.name.len()))
-                .then_with(|| a.1.name.cmp(&b.1.name))
+                .then_with(|| a.1.rel.len().cmp(&b.1.rel.len()))
+                .then_with(|| a.1.rel.cmp(&b.1.rel))
         });
         scored.truncate(FILTER_RESULT_CAP);
-        scored.into_iter().map(|(_, r)| r).collect()
+        scored
+            .into_iter()
+            .map(|(_, e)| FileRow {
+                name: e.rel.clone(),
+                path: e.path.clone(),
+                is_dir: e.is_dir,
+                depth: 0,
+                expanded: false,
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect()
     }
 
     /// Read one directory level, filtered by the toggles and sorted (dirs first,
@@ -439,6 +472,33 @@ mod tests {
         let rows = t.rows();
         assert!(rows.iter().any(|r| r.name.ends_with("main.rs")), "match found without expanding");
         assert!(rows.iter().all(|r| !r.name.contains("readme")), "non-matches excluded");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn filter_matches_names_not_ancestor_paths() {
+        // A matching directory must not drag in every descendant just because its
+        // name is in their path; a deep entry matches only on its own name.
+        let d = tmpdir();
+        fs::create_dir_all(d.join("Developer").join("xx").join("yy").join("Dev")).unwrap();
+        fs::write(d.join("Developer").join("ghostrealm"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_query("Dev");
+        let names: Vec<String> = t.rows().iter().map(|r| r.name.clone()).collect();
+        assert!(names.iter().any(|n| n == "Developer"), "top-level Developer matches");
+        assert!(
+            names.iter().any(|n| n.ends_with("yy/Dev")),
+            "the deep Dev matches on its own name"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("ghostrealm")),
+            "a non-matching descendant of a matched dir is excluded"
+        );
+        // "Developer/xx" (name xx) should not appear despite Developer in its path.
+        assert!(
+            !names.iter().any(|n| n == "Developer/xx"),
+            "intermediate dirs don't match on the ancestor's name"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

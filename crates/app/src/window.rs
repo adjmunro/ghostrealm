@@ -107,6 +107,8 @@ const TITLE_LABEL: [u8; 3] = [170, 170, 185];
 /// Empty-workspace screen: shortcut badge and dim hint colours.
 const EMPTY_SHORTCUT: [u8; 3] = [120, 120, 135];
 const EMPTY_HINT: [u8; 3] = [110, 110, 125];
+/// Window within which a second click counts as a double-click (file browser).
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -481,6 +483,8 @@ struct State {
     browser_scroll: HashMap<SurfaceId, f32>,
     /// Hit-testing for the visible browser panes this frame (click → row).
     browser_views: Vec<BrowserView>,
+    /// Last browser row click (time + path), for double-click detection.
+    browser_last_click: Option<(Instant, std::path::PathBuf)>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -844,6 +848,7 @@ impl State {
             browser_placements: Vec::new(),
             browser_scroll: HashMap::new(),
             browser_views: Vec::new(),
+            browser_last_click: None,
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1331,10 +1336,23 @@ impl State {
             }
             if let Some((bsid, path, is_dir)) = self.browser_row_at(x, y) {
                 if is_dir {
+                    // Single click expands/collapses in place; a quick second click
+                    // on the same directory navigates into it (makes it the root).
+                    let now = Instant::now();
+                    let dbl = self
+                        .browser_last_click
+                        .as_ref()
+                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < DOUBLE_CLICK);
+                    self.browser_last_click = Some((now, path.clone()));
                     if let Some(b) = self.app.browser_mut(bsid) {
-                        b.toggle_dir(&path);
+                        if dbl {
+                            b.set_root(path);
+                        } else {
+                            b.toggle_dir(&path);
+                        }
                     }
                 } else {
+                    self.browser_last_click = None;
                     self.app.open_file_in_focused(path);
                 }
             }
