@@ -96,25 +96,25 @@ impl Default for Inbox {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenIn {
-    /// Add a tab in the browser's own pane.
+    /// Add a tab in the file browser's own pane.
     Tab,
-    /// Open beside the browser in a new horizontal split (when the pane is wide
+    /// Open beside the file browser in a new horizontal split (when the pane is wide
     /// enough; otherwise falls back to a tab).
     #[default]
     Split,
 }
 
-/// `[browser]`
+/// `[file_browser]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Browser {
+pub struct FileBrowser {
     /// Where opening a file puts it.
     pub open_in: OpenIn,
 }
 
-impl Default for Browser {
+impl Default for FileBrowser {
     fn default() -> Self {
-        Browser { open_in: OpenIn::Split }
+        FileBrowser { open_in: OpenIn::Split }
     }
 }
 
@@ -127,7 +127,7 @@ pub struct Input {
     /// Max gap (ms) between the two taps of a double-tap trigger (palette / run).
     pub double_tap_window_ms: u32,
     /// Max gap (ms) between the two clicks of a mouse double-click (e.g. the file
-    /// browser's double-click-to-enter-a-directory).
+    /// file browser's double-click-to-enter-a-directory).
     pub double_click_ms: u32,
 }
 
@@ -223,7 +223,7 @@ pub struct Config {
     pub tabs: Tabs,
     pub editor: Editor,
     pub input: Input,
-    pub browser: Browser,
+    pub file_browser: FileBrowser,
     pub inbox: Inbox,
     /// `[keybindings]`: command id -> chord, overlaying the built-in defaults.
     /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
@@ -385,11 +385,11 @@ focus_follows_mouse = false  # bool (default false)          — hovering a pane
 double_tap_window_ms = 300   # integer ms, >= 0 (default 300) — max gap between a double-tap's two taps
 double_click_ms = 200        # integer ms, >= 0 (default 200) — max gap between a mouse double-click's two clicks
 
-[browser]
+[file_browser]
 open_in = "split"            # "split" | "tab" (default "split") — where opening a file
                              #   in the file browser puts it: a horizontal split beside
-                             #   the browser (falls back to a tab when the pane is narrow),
-                             #   or a tab in the browser's own pane
+                             #   the file browser (falls back to a tab when the pane is narrow),
+                             #   or a tab in the file browser's own pane
 
 [inbox]
 auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time before unread -> read (0 = manual only)

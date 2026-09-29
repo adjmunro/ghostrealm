@@ -591,7 +591,7 @@
   palette (fold the one-shot "Run Anything" terminal into it somehow), and
   double-Shift opens a floating fuzzy FILE search over the current workspace/root
   directory group — reuse the FsTree fuzzy filter and the floating picker overlay,
-  Enter opens the file (respecting `[browser] open_in`). Make the triggers
+  Enter opens the file (respecting `[file_browser] open_in`). Make the triggers
   configurable (the existing `[input] double_tap_window_ms` + remappable actions).
   Later: if the root is a code repo, index code SYMBOLS (via the LSP) and search
   those instead of/along files.

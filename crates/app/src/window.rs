@@ -116,16 +116,16 @@ const FILE_FG: [u8; 3] = [230, 230, 235];
 const HIDDEN_FG: [u8; 3] = [130, 130, 140];
 const EXT_FG: [u8; 3] = [212, 170, 90];
 const MATCH_FG: [u8; 3] = [245, 225, 90];
-/// Below this focused-pane width (logical px), the browser opens files as tabs even
-/// when `[browser] open_in = "split"` (a split would be too cramped).
-const BROWSER_SPLIT_MIN_W: f32 = 560.0;
+/// Below this focused-pane width (logical px), the file browser opens files as tabs even
+/// when `[file_browser] open_in = "split"` (a split would be too cramped).
+const FILE_BROWSER_SPLIT_MIN_W: f32 = 560.0;
 
 /// The "nothing open" picker's options, in order (their 1-based index is the key
 /// that opens them).
 const PICKER_KINDS: [(OpenKind, &str); 3] = [
     (OpenKind::Terminal, "Terminal"),
     (OpenKind::Editor, "Editor"),
-    (OpenKind::Browser, "File browser"),
+    (OpenKind::FileBrowser, "File browser"),
 ];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
@@ -325,7 +325,7 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw |= state.update_button_hover();
                 // A file browser's highlight follows the mouse (single highlight,
                 // shared with the keyboard — most recent input wins).
-                redraw |= state.update_browser_hover();
+                redraw |= state.update_file_browser_hover();
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -498,23 +498,23 @@ struct State {
     empty_buffers: Vec<Buffer>,
     empty_placements: Vec<Placement>,
     /// Text buffers + placements for file-browser panes.
-    browser_buffers: Vec<Buffer>,
-    browser_placements: Vec<Placement>,
-    /// Monotonic index into `browser_buffers` for the current frame, so several
-    /// browsers (panes + the floating picker) never clobber each other's buffers.
-    browser_buf_used: usize,
-    /// Per-browser vertical scroll offset (physical px).
-    browser_scroll: HashMap<SurfaceId, f32>,
-    /// Hit-testing for the visible browser panes this frame (click → row).
-    browser_views: Vec<BrowserView>,
-    /// Last browser row click (time + path), for double-click detection.
-    browser_last_click: Option<(Instant, std::path::PathBuf)>,
-    /// Keyboard selection: highlighted row (browse/filter) per browser.
-    browser_sel: HashMap<SurfaceId, usize>,
-    /// Keyboard selection: highlighted completion (path mode) per browser.
-    browser_completion: HashMap<SurfaceId, usize>,
+    file_browser_buffers: Vec<Buffer>,
+    file_browser_placements: Vec<Placement>,
+    /// Monotonic index into `file_browser_buffers` for the current frame, so several
+    /// file browsers (panes + the floating picker) never clobber each other's buffers.
+    file_browser_buf_used: usize,
+    /// Per-file-browser vertical scroll offset (physical px).
+    file_browser_scroll: HashMap<SurfaceId, f32>,
+    /// Hit-testing for the visible file browser panes this frame (click → row).
+    file_browser_views: Vec<FileBrowserView>,
+    /// Last file browser row click (time + path), for double-click detection.
+    file_browser_last_click: Option<(Instant, std::path::PathBuf)>,
+    /// Keyboard selection: highlighted row (browse/filter) per file browser.
+    file_browser_sel: HashMap<SurfaceId, usize>,
+    /// Keyboard selection: highlighted completion (path mode) per file browser.
+    file_browser_completion: HashMap<SurfaceId, usize>,
     /// Path-autocomplete suggestion hits this frame: (rect, surface, index, path, is_dir).
-    browser_suggest_hits: Vec<(Rect, SurfaceId, usize, std::path::PathBuf, bool)>,
+    file_browser_suggest_hits: Vec<(Rect, SurfaceId, usize, std::path::PathBuf, bool)>,
     /// The floating directory picker's panel rect this frame (for click-outside),
     /// and its shaped text placements (drawn in the overlay pass).
     picker_panel: Option<Rect>,
@@ -668,7 +668,7 @@ struct PaneRender {
 }
 
 /// A visible file-browser pane's list geometry, for mapping a click to a row.
-struct BrowserView {
+struct FileBrowserView {
     sid: SurfaceId,
     /// The scrollable list area (below the header).
     list: Rect,
@@ -678,7 +678,7 @@ struct BrowserView {
     rows: Vec<RowRef>,
 }
 
-/// A browser row's click target: a real entry (path) or a synthetic category (key).
+/// A file browser row's click target: a real entry (path) or a synthetic category (key).
 #[derive(Clone)]
 struct RowRef {
     path: std::path::PathBuf,
@@ -704,14 +704,14 @@ enum ButtonAction {
     /// Open a content kind in the focused pane (the "nothing open" picker).
     OpenKind(OpenKind),
     /// Toggle a file browser's show-hidden / show-gitignored filters.
-    BrowserToggleHidden(SurfaceId),
-    BrowserToggleIgnored(SurfaceId),
+    FileBrowserToggleHidden(SurfaceId),
+    FileBrowserToggleIgnored(SurfaceId),
     /// Cycle the git-status filter.
-    BrowserCycleGit(SurfaceId),
+    FileBrowserCycleGit(SurfaceId),
     /// Cycle the view mode (tree / by extension / kind / git / date / size).
-    BrowserCycleView(SurfaceId),
+    FileBrowserCycleView(SurfaceId),
     /// Move a file browser up to its parent directory.
-    BrowserParent(SurfaceId),
+    FileBrowserParent(SurfaceId),
     /// Confirm / cancel the floating directory picker.
     PickerConfirm,
     PickerCancel,
@@ -894,15 +894,15 @@ impl State {
             title_place: None,
             empty_buffers: Vec::new(),
             empty_placements: Vec::new(),
-            browser_buffers: Vec::new(),
-            browser_placements: Vec::new(),
-            browser_buf_used: 0,
-            browser_scroll: HashMap::new(),
-            browser_views: Vec::new(),
-            browser_last_click: None,
-            browser_sel: HashMap::new(),
-            browser_completion: HashMap::new(),
-            browser_suggest_hits: Vec::new(),
+            file_browser_buffers: Vec::new(),
+            file_browser_placements: Vec::new(),
+            file_browser_buf_used: 0,
+            file_browser_scroll: HashMap::new(),
+            file_browser_views: Vec::new(),
+            file_browser_last_click: None,
+            file_browser_sel: HashMap::new(),
+            file_browser_completion: HashMap::new(),
+            file_browser_suggest_hits: Vec::new(),
             picker_panel: None,
             picker_placements: Vec::new(),
             sidebar_hidden: false,
@@ -1175,12 +1175,12 @@ impl State {
             .unwrap_or(ws.w)
     }
 
-    /// Open a file the browser selected: a horizontal split beside the browser when
-    /// `[browser] open_in = "split"` and the pane is wide enough, else a tab.
-    fn open_browser_file(&mut self, path: std::path::PathBuf) {
+    /// Open a file the file browser selected: a horizontal split beside the file browser when
+    /// `[file_browser] open_in = "split"` and the pane is wide enough, else a tab.
+    fn open_from_file_browser(&mut self, path: std::path::PathBuf) {
         use ghostrealm_core::config::OpenIn;
-        let split = self.cfg.browser.open_in == OpenIn::Split
-            && self.focused_pane_width() >= BROWSER_SPLIT_MIN_W * self.scale;
+        let split = self.cfg.file_browser.open_in == OpenIn::Split
+            && self.focused_pane_width() >= FILE_BROWSER_SPLIT_MIN_W * self.scale;
         if split {
             self.app.open_file_split(path, Axis::LeftRight);
         } else {
@@ -1291,30 +1291,30 @@ impl State {
             ButtonAction::OpenKind(kind) => {
                 let _ = self.app.open_kind_in_focused(kind);
             }
-            ButtonAction::BrowserToggleHidden(sid) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+            ButtonAction::FileBrowserToggleHidden(sid) => {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     let v = b.show_hidden();
                     b.set_show_hidden(!v);
                 }
             }
-            ButtonAction::BrowserToggleIgnored(sid) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+            ButtonAction::FileBrowserToggleIgnored(sid) => {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     let v = b.show_gitignored();
                     b.set_show_gitignored(!v);
                 }
             }
-            ButtonAction::BrowserCycleGit(sid) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+            ButtonAction::FileBrowserCycleGit(sid) => {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     b.cycle_git_filter();
                 }
             }
-            ButtonAction::BrowserCycleView(sid) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+            ButtonAction::FileBrowserCycleView(sid) => {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     b.cycle_view();
                 }
             }
-            ButtonAction::BrowserParent(sid) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+            ButtonAction::FileBrowserParent(sid) => {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     b.go_to_parent();
                 }
             }
@@ -1354,26 +1354,26 @@ impl State {
     /// Point the file-browser selection at the row/completion under the cursor, so a
     /// mouse move takes over the single highlight from the keyboard. Returns whether
     /// it changed (to redraw).
-    fn update_browser_hover(&mut self) -> bool {
+    fn update_file_browser_hover(&mut self) -> bool {
         let (x, y) = self.cursor;
         // Path-mode completion under the cursor?
         if let Some((_, sid, idx, _, _)) = self
-            .browser_suggest_hits
+            .file_browser_suggest_hits
             .iter()
             .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
             .cloned()
         {
-            if self.browser_completion.get(&sid) != Some(&idx) {
-                self.browser_completion.insert(sid, idx);
+            if self.file_browser_completion.get(&sid) != Some(&idx) {
+                self.file_browser_completion.insert(sid, idx);
                 self.dirty = true;
                 return true;
             }
             return false;
         }
         // Browse/filter row under the cursor?
-        if let Some((sid, idx, _)) = self.browser_row_at(x, y) {
-            if self.browser_sel.get(&sid) != Some(&idx) {
-                self.browser_sel.insert(sid, idx);
+        if let Some((sid, idx, _)) = self.file_browser_row_at(x, y) {
+            if self.file_browser_sel.get(&sid) != Some(&idx) {
+                self.file_browser_sel.insert(sid, idx);
                 self.dirty = true;
                 return true;
             }
@@ -1382,8 +1382,8 @@ impl State {
     }
 
     /// The file-browser row under a point, as (surface, index, row).
-    fn browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, RowRef)> {
-        for v in &self.browser_views {
+    fn file_browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, RowRef)> {
+        for v in &self.file_browser_views {
             if x >= v.list.x && x < v.list.x + v.list.w && y >= v.list.y && y < v.list.y + v.list.h {
                 let idx = ((y - v.list.y + v.scroll) / v.row_h).floor().max(0.0) as usize;
                 if let Some(row) = v.rows.get(idx) {
@@ -1400,34 +1400,34 @@ impl State {
         if self.app.dir_picker_open() {
             let (x, y) = self.cursor;
             if let Some((_, _, _, spath, sdir)) = self
-                .browser_suggest_hits
+                .file_browser_suggest_hits
                 .iter()
                 .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
                 .cloned()
             {
                 if sdir {
-                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
                         b.set_root(spath);
                     }
                 }
                 self.dirty = true;
                 return;
             }
-            if let Some((_, idx, row)) = self.browser_row_at(x, y) {
-                self.browser_sel.insert(PICKER_SID, idx);
+            if let Some((_, idx, row)) = self.file_browser_row_at(x, y) {
+                self.file_browser_sel.insert(PICKER_SID, idx);
                 if row.is_category {
-                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
                         b.toggle_category(&row.key);
                     }
                 } else if row.is_dir {
                     let now = Instant::now();
                     let dcw = self.double_click_window();
                     let dbl = self
-                        .browser_last_click
+                        .file_browser_last_click
                         .as_ref()
                         .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
-                    self.browser_last_click = Some((now, row.path.clone()));
-                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                    self.file_browser_last_click = Some((now, row.path.clone()));
+                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
                         if dbl {
                             b.set_root(row.path);
                         } else {
@@ -1493,7 +1493,7 @@ impl State {
             .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
             .and_then(|p| p.active_surface().map(|s| s.id));
         let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
-        let active_is_browser = active_sid.is_some_and(|s| self.app.is_browser(s));
+        let active_is_file_browser = active_sid.is_some_and(|s| self.app.is_file_browser(s));
 
         // A click in a visible tab strip switches the pane's active surface.
         let strip_h = if self.strip_shown(n) {
@@ -1507,7 +1507,7 @@ impl State {
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
                 pane.active = idx;
             }
-        } else if active_is_browser {
+        } else if active_is_file_browser {
             // Focus first so opening a file targets this pane, then act on the row:
             // a directory expands/collapses, a file opens in an editor tab.
             if let Some(vtab) = self.app.tree.vtab_mut(vt) {
@@ -1515,25 +1515,25 @@ impl State {
             }
             // A click on an autocomplete suggestion navigates (dir) or opens (file).
             if let Some((_, ssid, _, spath, sdir)) = self
-                .browser_suggest_hits
+                .file_browser_suggest_hits
                 .iter()
                 .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
                 .cloned()
             {
                 if sdir {
-                    if let Some(b) = self.app.browser_mut(ssid) {
+                    if let Some(b) = self.app.file_browser_mut(ssid) {
                         b.set_root(spath);
                     }
                 } else {
-                    self.open_browser_file(spath);
+                    self.open_from_file_browser(spath);
                 }
                 self.dirty = true;
                 return;
             }
-            if let Some((bsid, idx, row)) = self.browser_row_at(x, y) {
-                self.browser_sel.insert(bsid, idx);
+            if let Some((bsid, idx, row)) = self.file_browser_row_at(x, y) {
+                self.file_browser_sel.insert(bsid, idx);
                 if row.is_category {
-                    if let Some(b) = self.app.browser_mut(bsid) {
+                    if let Some(b) = self.app.file_browser_mut(bsid) {
                         b.toggle_category(&row.key);
                     }
                 } else if row.is_dir {
@@ -1542,11 +1542,11 @@ impl State {
                     let now = Instant::now();
                     let dcw = self.double_click_window();
                     let dbl = self
-                        .browser_last_click
+                        .file_browser_last_click
                         .as_ref()
                         .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
-                    self.browser_last_click = Some((now, row.path.clone()));
-                    if let Some(b) = self.app.browser_mut(bsid) {
+                    self.file_browser_last_click = Some((now, row.path.clone()));
+                    if let Some(b) = self.app.file_browser_mut(bsid) {
                         if dbl {
                             b.set_root(row.path);
                         } else {
@@ -1554,8 +1554,8 @@ impl State {
                         }
                     }
                 } else {
-                    self.browser_last_click = None;
-                    self.open_browser_file(row.path);
+                    self.file_browser_last_click = None;
+                    self.open_from_file_browser(row.path);
                 }
             }
             self.dirty = true;
@@ -2146,8 +2146,8 @@ impl State {
                 MouseScrollDelta::PixelDelta(p) => p.y as f32,
             };
             if px != 0.0 {
-                let cur = self.browser_scroll.get(&PICKER_SID).copied().unwrap_or(0.0);
-                self.browser_scroll.insert(PICKER_SID, (cur - px).max(0.0));
+                let cur = self.file_browser_scroll.get(&PICKER_SID).copied().unwrap_or(0.0);
+                self.file_browser_scroll.insert(PICKER_SID, (cur - px).max(0.0));
                 self.dirty = true;
                 self.frame_pending = true;
             }
@@ -2179,11 +2179,11 @@ impl State {
         // Over a file browser, the wheel scrolls its row list (pixel-precise; the
         // upper bound is clamped to content height when the pane is rebuilt).
         if let Some(sid) = self.surface_under_cursor() {
-            if self.app.is_browser(sid) {
-                let cur = self.browser_scroll.get(&sid).copied().unwrap_or(0.0);
+            if self.app.is_file_browser(sid) {
+                let cur = self.file_browser_scroll.get(&sid).copied().unwrap_or(0.0);
                 let ns = (cur - px).max(0.0);
                 if ns != cur {
-                    self.browser_scroll.insert(sid, ns);
+                    self.file_browser_scroll.insert(sid, ns);
                     self.dirty = true;
                     self.frame_pending = true;
                 }
@@ -2561,18 +2561,18 @@ impl State {
         });
     }
 
-    /// Shape `text` into the next free `browser_buffers` slot for this frame and
+    /// Shape `text` into the next free `file_browser_buffers` slot for this frame and
     /// return `(idx, shaped_width)`. Colour comes from the placement in the text
-    /// pass. The per-frame counter keeps several browsers from clobbering slots.
-    fn shape_browser(&mut self, text: &str, family: Family, width_box: f32) -> (usize, f32) {
-        self.shape_browser_spans(&[(text.to_string(), [0, 0, 0])], family, width_box, false)
+    /// pass. The per-frame counter keeps several file browsers from clobbering slots.
+    fn shape_file_browser(&mut self, text: &str, family: Family, width_box: f32) -> (usize, f32) {
+        self.shape_file_browser_spans(&[(text.to_string(), [0, 0, 0])], family, width_box, false)
     }
 
-    /// Shape coloured `spans` into the next free `browser_buffers` slot. With
+    /// Shape coloured `spans` into the next free `file_browser_buffers` slot. With
     /// `bake_colors`, each span's colour is baked into the glyphs (for per-character
     /// colouring like file-type or match highlighting); otherwise the placement's
     /// colour applies uniformly. Returns `(idx, shaped_width)`.
-    fn shape_browser_spans(
+    fn shape_file_browser_spans(
         &mut self,
         spans: &[(String, [u8; 3])],
         family: Family,
@@ -2580,13 +2580,13 @@ impl State {
         bake_colors: bool,
     ) -> (usize, f32) {
         let m = self.metrics();
-        let idx = self.browser_buf_used;
-        self.browser_buf_used += 1;
-        while self.browser_buffers.len() <= idx {
+        let idx = self.file_browser_buf_used;
+        self.file_browser_buf_used += 1;
+        while self.file_browser_buffers.len() <= idx {
             let b = Buffer::new(&mut self.font_system, m);
-            self.browser_buffers.push(b);
+            self.file_browser_buffers.push(b);
         }
-        let buf = &mut self.browser_buffers[idx];
+        let buf = &mut self.file_browser_buffers[idx];
         buf.set_metrics(m);
         buf.set_size(Some(width_box.max(1.0)), Some(self.cell_h));
         buf.set_rich_text(
@@ -2656,7 +2656,7 @@ impl State {
     }
 
     /// Draw a file-browser pane in `rect`: a header (parent, path/filter, hidden &
-    /// gitignore toggles) and a scrollable row list. Records a [`BrowserView`] for
+    /// gitignore toggles) and a scrollable row list. Records a [`FileBrowserView`] for
     /// click hit-testing and the toggle/parent button rects.
     #[allow(clippy::too_many_arguments)]
     fn build_file_browser(
@@ -2670,7 +2670,7 @@ impl State {
         // When present, browse/filter body rows go through the shared content-keyed
         // `row_cache` (so scrolling reuses shaped rows) as RowPlacements here, drawn
         // in the main text pass. `None` (the picker overlay) shapes into the
-        // browser's own buffers instead.
+        // file browser's own buffers instead.
         mut row_out: Option<&mut Vec<RowPlacement>>,
     ) -> Vec<Placement> {
         let mut placements: Vec<Placement> = Vec::new();
@@ -2686,7 +2686,7 @@ impl State {
         // Pull the current rows and header state from the model.
         let rows: Vec<ghostrealm_core::fs_tree::FileRow> = self
             .app
-            .browser_mut(sid)
+            .file_browser_mut(sid)
             .map(|b| b.rows().to_vec())
             .unwrap_or_default();
         #[allow(clippy::type_complexity)]
@@ -2700,7 +2700,7 @@ impl State {
             bool,
             &str,
             bool,
-        ) = match self.app.browser(sid) {
+        ) = match self.app.file_browser(sid) {
             Some(b) => (
                 b.root().display().to_string(),
                 b.show_hidden(),
@@ -2732,7 +2732,7 @@ impl State {
         if par_hov {
             quads.push(rect_quad(par_hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
         }
-        let (idx, _) = self.shape_browser("..", mono, par_w);
+        let (idx, _) = self.shape_file_browser("..", mono, par_w);
         placements.push(Placement {
             idx,
             left: rect.x + pad,
@@ -2745,16 +2745,16 @@ impl State {
             },
             color: if par_hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
         });
-        self.buttons.push((par_hit, ButtonAction::BrowserParent(sid)));
+        self.buttons.push((par_hit, ButtonAction::FileBrowserParent(sid)));
 
         // Toggles on the right: [recent] [git] [.gitignore] [hidden].
         let toggle = |on: bool| if on { NEW_VTAB_LABEL_HOVER } else { EMPTY_SHORTCUT };
         let mut right = rect.x + rect.w - pad;
         for (label, on, action) in [
-            ("hidden", show_hidden, ButtonAction::BrowserToggleHidden(sid)),
-            (".gitignore", show_ignored, ButtonAction::BrowserToggleIgnored(sid)),
-            (git_label, git_on, ButtonAction::BrowserCycleGit(sid)),
-            (view_label, view_on, ButtonAction::BrowserCycleView(sid)),
+            ("hidden", show_hidden, ButtonAction::FileBrowserToggleHidden(sid)),
+            (".gitignore", show_ignored, ButtonAction::FileBrowserToggleIgnored(sid)),
+            (git_label, git_on, ButtonAction::FileBrowserCycleGit(sid)),
+            (view_label, view_on, ButtonAction::FileBrowserCycleView(sid)),
         ] {
             let w = label.chars().count() as f32 * self.cell_w;
             let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
@@ -2762,7 +2762,7 @@ impl State {
             if hov {
                 quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
             }
-            let (idx, _) = self.shape_browser(label, sans, w + pad);
+            let (idx, _) = self.shape_file_browser(label, sans, w + pad);
             placements.push(Placement {
                 idx,
                 left: right - w - pad + pad * 0.5,
@@ -2781,12 +2781,12 @@ impl State {
 
         // Path-mode completions + the selected one (for the preview + highlight).
         let sel_comp: Option<usize> = if is_path {
-            self.browser_completion.get(&sid).copied()
+            self.file_browser_completion.get(&sid).copied()
         } else {
             None
         };
         let path_sugg: Vec<std::path::PathBuf> = if is_path {
-            self.app.browser(sid).map(|b| b.suggestions(&query)).unwrap_or_default()
+            self.app.file_browser(sid).map(|b| b.suggestions(&query)).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -2815,7 +2815,7 @@ impl State {
             None if query.is_empty() => (shorten_start(&root_disp, cols), EMPTY_SHORTCUT, true),
             None => (query.clone(), INPUT_TEXT, false),
         };
-        let (idx, iw) = self.shape_browser(&itext, mono, inner_w);
+        let (idx, iw) = self.shape_file_browser(&itext, mono, inner_w);
         placements.push(Placement {
             idx,
             left: box_rect.x + pad * 0.5,
@@ -2852,7 +2852,7 @@ impl State {
 
         if is_path {
             // Path mode: the body is the completion list (replacing the tree, so
-            // nothing shows through). Clicks route via `browser_suggest_hits`.
+            // nothing shows through). Clicks route via `file_browser_suggest_hits`.
             for (i, p) in path_sugg.iter().enumerate() {
                 let ry = list.y + i as f32 * row_h;
                 if ry + row_h > list.y + list.h {
@@ -2866,7 +2866,7 @@ impl State {
                     quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
                 }
                 let color = if is_dir { self.chrome.accent } else { FILE_FG };
-                let (idx, _) = self.shape_browser(&label, mono, list.w - pad * 2.0);
+                let (idx, _) = self.shape_file_browser(&label, mono, list.w - pad * 2.0);
                 placements.push(Placement {
                     idx,
                     left: list.x + pad,
@@ -2879,20 +2879,20 @@ impl State {
                     },
                     color,
                 });
-                self.browser_suggest_hits.push((row_rect, sid, i, p.clone(), is_dir));
+                self.file_browser_suggest_hits.push((row_rect, sid, i, p.clone(), is_dir));
             }
         } else {
             // Browse/filter mode: the scrollable tree/results list.
             let content_h = rows.len() as f32 * row_h;
             let max_scroll = (content_h - list.h).max(0.0);
             let scroll = self
-                .browser_scroll
+                .file_browser_scroll
                 .get(&sid)
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, max_scroll);
-            self.browser_scroll.insert(sid, scroll);
-            let sel = self.browser_sel.get(&sid).copied();
+            self.file_browser_scroll.insert(sid, scroll);
+            let sel = self.file_browser_sel.get(&sid).copied();
             let filtering = !query.is_empty();
 
             let mut view_rows: Vec<RowRef> = Vec::with_capacity(rows.len());
@@ -2955,11 +2955,11 @@ impl State {
                         .ensure(key, &mut self.font_system, m, width, self.cell_h, &spans);
                     out.push(RowPlacement { key, left, top, bounds, color: FILE_FG });
                 } else {
-                    let (idx, _) = self.shape_browser_spans(&spans, mono, width, true);
+                    let (idx, _) = self.shape_file_browser_spans(&spans, mono, width, true);
                     placements.push(Placement { idx, left, top, bounds, color: FILE_FG });
                 }
             }
-            self.browser_views.push(BrowserView {
+            self.file_browser_views.push(FileBrowserView {
                 sid,
                 list,
                 row_h,
@@ -3001,7 +3001,7 @@ impl State {
         let mut placements: Vec<Placement> = Vec::new();
 
         // Title.
-        let (idx, tw) = self.shape_browser("Set workspace directory", Family::SansSerif, pw);
+        let (idx, tw) = self.shape_file_browser("Set workspace directory", Family::SansSerif, pw);
         placements.push(Placement {
             idx,
             left: px + (pw - tw) * 0.5,
@@ -3015,7 +3015,7 @@ impl State {
             color: TITLE_LABEL,
         });
 
-        // Browser body between the title and the footer.
+        // File browser body between the title and the footer.
         let body = Rect {
             x: px,
             y: py + title_h,
@@ -3047,7 +3047,7 @@ impl State {
             if hov {
                 quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
             }
-            let (idx, lw) = self.shape_browser(label, Family::SansSerif, w + pad);
+            let (idx, lw) = self.shape_file_browser(label, Family::SansSerif, w + pad);
             placements.push(Placement {
                 idx,
                 left: hit.x + (hit.w - lw) * 0.5,
@@ -3554,9 +3554,9 @@ impl State {
         }
     }
 
-    /// Move a per-browser selection index in `map` for `sid` by `delta`, clamped to
+    /// Move a per-file-browser selection index in `map` for `sid` by `delta`, clamped to
     /// `[0, count)`. An unset selection starts at 0 on the first move.
-    fn move_browser_sel(map: &mut HashMap<SurfaceId, usize>, sid: SurfaceId, count: usize, delta: i32) {
+    fn move_file_browser_sel(map: &mut HashMap<SurfaceId, usize>, sid: SurfaceId, count: usize, delta: i32) {
         if count == 0 {
             map.remove(&sid);
             return;
@@ -3574,50 +3574,50 @@ impl State {
     /// cycle completions and Enter/Right accept-then-navigate; in browse/filter mode
     /// Right expands a directory, Left collapses, Enter navigates into a directory
     /// (or opens a file, except in the picker).
-    fn browser_key(&mut self, sid: SurfaceId, event: &winit::event::KeyEvent) {
+    fn file_browser_key(&mut self, sid: SurfaceId, event: &winit::event::KeyEvent) {
         let is_picker = sid == PICKER_SID;
-        let path_mode = self.app.browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
+        let path_mode = self.app.file_browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
         match &event.logical_key {
             WKey::Named(NamedKey::Escape) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     b.set_query("");
                 }
-                self.browser_sel.remove(&sid);
-                self.browser_completion.remove(&sid);
+                self.file_browser_sel.remove(&sid);
+                self.file_browser_completion.remove(&sid);
             }
             WKey::Named(NamedKey::Backspace) => {
-                if let Some(b) = self.app.browser_mut(sid) {
+                if let Some(b) = self.app.file_browser_mut(sid) {
                     let mut q = b.query().to_string();
                     q.pop();
                     b.set_query(q);
                 }
-                self.browser_sel.remove(&sid);
-                self.browser_completion.remove(&sid);
+                self.file_browser_sel.remove(&sid);
+                self.file_browser_completion.remove(&sid);
             }
             WKey::Named(NamedKey::ArrowDown) => {
                 if path_mode {
-                    let n = self.app.browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_browser_sel(&mut self.browser_completion, sid, n, 1);
+                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
+                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, 1);
                 } else {
-                    let n = self.app.browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
-                    Self::move_browser_sel(&mut self.browser_sel, sid, n, 1);
+                    let n = self.app.file_browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
+                    Self::move_file_browser_sel(&mut self.file_browser_sel, sid, n, 1);
                     self.ensure_sel_visible(sid);
                 }
             }
             WKey::Named(NamedKey::ArrowUp) => {
                 if path_mode {
-                    let n = self.app.browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_browser_sel(&mut self.browser_completion, sid, n, -1);
+                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
+                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, -1);
                 } else {
-                    let n = self.app.browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
-                    Self::move_browser_sel(&mut self.browser_sel, sid, n, -1);
+                    let n = self.app.file_browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
+                    Self::move_file_browser_sel(&mut self.file_browser_sel, sid, n, -1);
                     self.ensure_sel_visible(sid);
                 }
             }
             WKey::Named(NamedKey::Tab) => {
                 if path_mode {
-                    let n = self.app.browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_browser_sel(&mut self.browser_completion, sid, n, 1);
+                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
+                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, 1);
                 }
             }
             WKey::Named(NamedKey::ArrowRight) => {
@@ -3626,11 +3626,11 @@ impl State {
                     self.accept_completion(sid);
                 } else if let Some(r) = self.selected_row(sid) {
                     if r.is_category && !r.expanded {
-                        if let Some(b) = self.app.browser_mut(sid) {
+                        if let Some(b) = self.app.file_browser_mut(sid) {
                             b.toggle_category(&r.key);
                         }
                     } else if r.is_dir && !r.is_category && !r.expanded {
-                        if let Some(b) = self.app.browser_mut(sid) {
+                        if let Some(b) = self.app.file_browser_mut(sid) {
                             b.toggle_dir(&r.path);
                         }
                     }
@@ -3640,11 +3640,11 @@ impl State {
                 if !path_mode {
                     if let Some(r) = self.selected_row(sid) {
                         if r.is_category && r.expanded {
-                            if let Some(b) = self.app.browser_mut(sid) {
+                            if let Some(b) = self.app.file_browser_mut(sid) {
                                 b.toggle_category(&r.key);
                             }
                         } else if r.is_dir && !r.is_category && r.expanded {
-                            if let Some(b) = self.app.browser_mut(sid) {
+                            if let Some(b) = self.app.file_browser_mut(sid) {
                                 b.toggle_dir(&r.path);
                             }
                         }
@@ -3654,38 +3654,38 @@ impl State {
             WKey::Named(NamedKey::Enter) => {
                 if path_mode {
                     self.accept_completion(sid);
-                    let file = self.app.browser_mut(sid).and_then(|b| b.navigate_input());
+                    let file = self.app.file_browser_mut(sid).and_then(|b| b.navigate_input());
                     if let Some(f) = file {
                         if !is_picker {
-                            self.open_browser_file(f);
+                            self.open_from_file_browser(f);
                         }
                     }
-                    self.browser_completion.remove(&sid);
+                    self.file_browser_completion.remove(&sid);
                 } else if let Some(r) = self.selected_row(sid) {
                     if r.is_category {
-                        if let Some(b) = self.app.browser_mut(sid) {
+                        if let Some(b) = self.app.file_browser_mut(sid) {
                             b.toggle_category(&r.key);
                         }
                     } else if r.is_dir {
-                        if let Some(b) = self.app.browser_mut(sid) {
+                        if let Some(b) = self.app.file_browser_mut(sid) {
                             b.set_root(r.path);
                         }
-                        self.browser_sel.remove(&sid);
+                        self.file_browser_sel.remove(&sid);
                     } else if !is_picker {
-                        self.open_browser_file(r.path);
+                        self.open_from_file_browser(r.path);
                     }
                 }
             }
             WKey::Character(s) => {
                 let add: String = s.chars().filter(|c| !c.is_control()).collect();
                 if !add.is_empty() {
-                    if let Some(b) = self.app.browser_mut(sid) {
+                    if let Some(b) = self.app.file_browser_mut(sid) {
                         let mut q = b.query().to_string();
                         q.push_str(&add);
                         b.set_query(q);
                     }
-                    self.browser_sel.remove(&sid);
-                    self.browser_completion.remove(&sid);
+                    self.file_browser_sel.remove(&sid);
+                    self.file_browser_completion.remove(&sid);
                 }
             }
             _ => {}
@@ -3693,18 +3693,18 @@ impl State {
         self.dirty = true;
     }
 
-    /// Scroll a browser so its keyboard-selected row is visible (uses the last
+    /// Scroll a file browser so its keyboard-selected row is visible (uses the last
     /// frame's list geometry).
     fn ensure_sel_visible(&mut self, sid: SurfaceId) {
-        let Some(sel) = self.browser_sel.get(&sid).copied() else {
+        let Some(sel) = self.file_browser_sel.get(&sid).copied() else {
             return;
         };
-        let Some(v) = self.browser_views.iter().find(|v| v.sid == sid) else {
+        let Some(v) = self.file_browser_views.iter().find(|v| v.sid == sid) else {
             return;
         };
         let (row_h, list_h) = (v.row_h, v.list.h);
         let row_top = sel as f32 * row_h;
-        let cur = self.browser_scroll.get(&sid).copied().unwrap_or(0.0);
+        let cur = self.file_browser_scroll.get(&sid).copied().unwrap_or(0.0);
         let new = if row_top < cur {
             row_top
         } else if row_top + row_h > cur + list_h {
@@ -3712,24 +3712,24 @@ impl State {
         } else {
             cur
         };
-        self.browser_scroll.insert(sid, new.max(0.0));
+        self.file_browser_scroll.insert(sid, new.max(0.0));
     }
 
     /// The currently selected browse/filter row for `sid`, if any.
     fn selected_row(&mut self, sid: SurfaceId) -> Option<ghostrealm_core::fs_tree::FileRow> {
-        let idx = self.browser_sel.get(&sid).copied()?;
-        self.app.browser_mut(sid).and_then(|b| b.rows().get(idx).cloned())
+        let idx = self.file_browser_sel.get(&sid).copied()?;
+        self.app.file_browser_mut(sid).and_then(|b| b.rows().get(idx).cloned())
     }
 
     /// Apply the selected path completion (or the first, if none selected) to the
     /// input, so a subsequent navigate/type continues from it.
     fn accept_completion(&mut self, sid: SurfaceId) {
-        let comps = self.app.browser(sid).map(|b| b.completions()).unwrap_or_default();
+        let comps = self.app.file_browser(sid).map(|b| b.completions()).unwrap_or_default();
         if comps.is_empty() {
             return;
         }
-        let idx = self.browser_completion.get(&sid).copied().unwrap_or(0).min(comps.len() - 1);
-        if let Some(b) = self.app.browser_mut(sid) {
+        let idx = self.file_browser_completion.get(&sid).copied().unwrap_or(0).min(comps.len() - 1);
+        if let Some(b) = self.app.file_browser_mut(sid) {
             b.set_query(comps[idx].clone());
         }
     }
@@ -3747,7 +3747,7 @@ impl State {
                     self.app.confirm_dir_picker();
                     self.dirty = true;
                 }
-                _ => self.browser_key(PICKER_SID, event),
+                _ => self.file_browser_key(PICKER_SID, event),
             }
             return;
         }
@@ -3858,9 +3858,9 @@ impl State {
 
         // A file browser owns all non-Cmd keys: typing filters, Enter opens the top
         // match, Backspace edits the filter, Escape clears it.
-        if self.app.focused_is_browser() {
+        if self.app.focused_is_file_browser() {
             if let Some(sid) = self.app.focused_surface() {
-                self.browser_key(sid, event);
+                self.file_browser_key(sid, event);
             }
             return;
         }
@@ -4643,10 +4643,10 @@ impl State {
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
         self.buttons.clear();
         self.empty_placements.clear();
-        self.browser_placements.clear();
-        self.browser_buf_used = 0;
-        self.browser_views.clear();
-        self.browser_suggest_hits.clear();
+        self.file_browser_placements.clear();
+        self.file_browser_buf_used = 0;
+        self.file_browser_views.clear();
+        self.file_browser_suggest_hits.clear();
         self.picker_placements.clear();
         self.picker_panel = None;
         let mut close_placements: Vec<Placement> = Vec::new();
@@ -4778,12 +4778,12 @@ impl State {
             };
             let sid = *active_sid;
 
-            // An empty tab shows the picker; a browser tab shows the file browser.
+            // An empty tab shows the picker; a file browser tab shows the file browser.
             if self.app.surface_is_empty(sid) {
                 self.build_empty_pane(*term, sw, sh, &mut bg_quads);
                 continue;
             }
-            if self.app.is_browser(sid) {
+            if self.app.is_file_browser(sid) {
                 let focus_border = pr.focused && resolved.len() > 1;
                 let ps = self.build_file_browser(
                     sid,
@@ -4794,7 +4794,7 @@ impl State {
                     &mut bg_quads,
                     Some(&mut row_placements),
                 );
-                self.browser_placements.extend(ps);
+                self.file_browser_placements.extend(ps);
                 continue;
             }
 
@@ -5495,8 +5495,8 @@ impl State {
             custom_glyphs: &[],
         }));
         // File-browser text.
-        text_areas.extend(self.browser_placements.iter().map(|p| TextArea {
-            buffer: &self.browser_buffers[p.idx],
+        text_areas.extend(self.file_browser_placements.iter().map(|p| TextArea {
+            buffer: &self.file_browser_buffers[p.idx],
             left: p.left,
             top: p.top,
             scale: 1.0,
@@ -5555,7 +5555,7 @@ impl State {
             self.picker_placements
                 .iter()
                 .map(|p| TextArea {
-                    buffer: &self.browser_buffers[p.idx],
+                    buffer: &self.file_browser_buffers[p.idx],
                     left: p.left,
                     top: p.top,
                     scale: 1.0,

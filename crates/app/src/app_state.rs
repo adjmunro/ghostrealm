@@ -23,7 +23,7 @@ use crate::editor::EditorBuffer;
 pub const SETTINGS_VTAB_NAME: &str = "settings";
 
 /// Reserved surface id for the floating directory picker's file browser. It lives
-/// in the `browsers` map like any browser (so all browser UI code applies) but is
+/// in the `file_browsers` map like any file browser (so all file browser UI code applies) but is
 /// not a tree surface, so it never renders as a pane and is kept across prunes.
 pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 
@@ -32,7 +32,7 @@ pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 pub enum OpenKind {
     Terminal,
     Editor,
-    Browser,
+    FileBrowser,
 }
 
 /// After Enter, a vtab is shown busy for at least this long even if the shell's
@@ -54,7 +54,7 @@ pub struct AppState {
     editors: HashMap<SurfaceId, EditorBuffer>,
     /// Surfaces whose content is a file browser. A surface in none of the three
     /// maps is "empty" — it shows the open-something picker.
-    browsers: HashMap<SurfaceId, FsTree>,
+    file_browsers: HashMap<SurfaceId, FsTree>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
     shell_line: Option<String>,
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
@@ -81,7 +81,7 @@ impl AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
             editors: HashMap::new(),
-            browsers: HashMap::new(),
+            file_browsers: HashMap::new(),
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -301,37 +301,37 @@ impl AppState {
                 self.tree.set_surface_title(sid, buf.title(), true);
                 self.editors.insert(sid, buf);
             }
-            OpenKind::Browser => {
+            OpenKind::FileBrowser => {
                 let root = self
                     .resolve_cwd(vt)
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("."));
                 self.tree.set_surface_title(sid, "Files", true);
-                self.browsers.insert(sid, FsTree::new(root));
+                self.file_browsers.insert(sid, FsTree::new(root));
             }
         }
         Ok(())
     }
 
-    /// Whether `id` is an empty surface (no terminal, editor, or browser yet).
+    /// Whether `id` is an empty surface (no terminal, editor, or file browser yet).
     pub fn surface_is_empty(&self, id: SurfaceId) -> bool {
         !self.surfaces.contains_key(&id)
             && !self.editors.contains_key(&id)
-            && !self.browsers.contains_key(&id)
+            && !self.file_browsers.contains_key(&id)
     }
 
     /// Whether `id` is a file-browser surface.
-    pub fn is_browser(&self, id: SurfaceId) -> bool {
-        self.browsers.contains_key(&id)
+    pub fn is_file_browser(&self, id: SurfaceId) -> bool {
+        self.file_browsers.contains_key(&id)
     }
 
-    /// The file-browser model for `id`, if it is a browser surface.
-    pub fn browser(&self, id: SurfaceId) -> Option<&FsTree> {
-        self.browsers.get(&id)
+    /// The file-browser model for `id`, if it is a file browser surface.
+    pub fn file_browser(&self, id: SurfaceId) -> Option<&FsTree> {
+        self.file_browsers.get(&id)
     }
 
-    pub fn browser_mut(&mut self, id: SurfaceId) -> Option<&mut FsTree> {
-        self.browsers.get_mut(&id)
+    pub fn file_browser_mut(&mut self, id: SurfaceId) -> Option<&mut FsTree> {
+        self.file_browsers.get_mut(&id)
     }
 
     /// Whether the focused pane shows the "nothing open" picker (an empty pane, or
@@ -344,18 +344,18 @@ impl AppState {
     }
 
     /// Whether the focused pane's active surface is a file browser.
-    pub fn focused_is_browser(&self) -> bool {
+    pub fn focused_is_file_browser(&self) -> bool {
         self.focused_surface()
-            .map(|s| self.is_browser(s))
+            .map(|s| self.is_file_browser(s))
             .unwrap_or(false)
     }
 
-    /// Open `path` in a new editor tab in the focused pane (from the browser).
+    /// Open `path` in a new editor tab in the focused pane (from the file browser).
     pub fn open_file_in_focused(&mut self, path: std::path::PathBuf) {
         self.open_editor_in_focused(EditorBuffer::open(path));
     }
 
-    /// Open `path` in a new split beside the focused pane (e.g. beside the browser),
+    /// Open `path` in a new split beside the focused pane (e.g. beside the file browser),
     /// falling back to a tab if the split can't be made.
     pub fn open_file_split(&mut self, path: std::path::PathBuf, axis: Axis) {
         if let Some((vt, pane)) = self.focused_pane() {
@@ -369,7 +369,7 @@ impl AppState {
 
     /// Whether the floating directory picker is open.
     pub fn dir_picker_open(&self) -> bool {
-        self.browsers.contains_key(&PICKER_SID)
+        self.file_browsers.contains_key(&PICKER_SID)
     }
 
     /// Open the floating directory picker rooted at the active workspace's dir
@@ -380,18 +380,18 @@ impl AppState {
             .and_then(|vt| self.resolve_cwd(vt))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.browsers.insert(PICKER_SID, FsTree::new(root));
+        self.file_browsers.insert(PICKER_SID, FsTree::new(root));
     }
 
     /// Close the floating directory picker.
     pub fn close_dir_picker(&mut self) {
-        self.browsers.remove(&PICKER_SID);
+        self.file_browsers.remove(&PICKER_SID);
     }
 
     /// Confirm the picker: pin the active workspace's root to the picker's current
     /// directory, then close it.
     pub fn confirm_dir_picker(&mut self) {
-        if let Some(root) = self.browsers.get(&PICKER_SID).map(|b| b.root().to_path_buf()) {
+        if let Some(root) = self.file_browsers.get(&PICKER_SID).map(|b| b.root().to_path_buf()) {
             self.set_active_root_dir(root);
         }
         self.close_dir_picker();
@@ -570,8 +570,8 @@ impl AppState {
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
         self.editors.retain(|id, _| live.contains(id));
-        // The picker browser is not a tree surface; keep it while it is open.
-        self.browsers
+        // The picker file browser is not a tree surface; keep it while it is open.
+        self.file_browsers
             .retain(|id, _| live.contains(id) || *id == PICKER_SID);
     }
 
@@ -1103,12 +1103,12 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
-            "browser.new",
+            "file_browser.new",
             "New File Browser",
             "Open a file browser in the focused pane",
         ),
         Box::new(|s: &mut AppState, _| {
-            s.open_kind_in_focused(OpenKind::Browser).map_err(failed)?;
+            s.open_kind_in_focused(OpenKind::FileBrowser).map_err(failed)?;
             Ok(CmdOutcome::ok())
         }),
     );

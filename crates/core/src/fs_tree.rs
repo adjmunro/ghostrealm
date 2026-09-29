@@ -4,7 +4,7 @@
 //! toggles via the `ignore` crate), track which directories are expanded, flatten
 //! the visible hierarchy into rows for rendering, fuzzy-filter across the tree,
 //! and suggest path completions. It does no rendering and touches no GUI types,
-//! so it is shared by the in-pane browser and the floating directory picker and
+//! so it is shared by the in-pane file browser and the floating directory picker and
 //! is tested headless.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,7 +44,7 @@ struct GitState {
     untracked: bool,
 }
 
-/// The git-status filter for a browser view.
+/// The git-status filter for a file browser view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitFilter {
     /// No git filtering.
