@@ -1665,7 +1665,7 @@ impl State {
             // target first, then open the argument prompt for the command.
             MenuAction::Rename => {
                 self.app.focus_vtab(target);
-                self.begin_command("tab.rename");
+                self.begin_command("workspace.rename");
             }
             MenuAction::SetDir => {
                 self.app.focus_vtab(target);

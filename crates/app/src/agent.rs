@@ -186,12 +186,12 @@ mod tests {
             ids.contains(&"split.leftright"),
             "help should list commands, got {ids:?}"
         );
-        // tab.rename should advertise its required `name` arg.
+        // workspace.rename should advertise its required `name` arg.
         let rename = r["commands"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|c| c["id"] == "tab.rename")
+            .find(|c| c["id"] == "workspace.rename")
             .unwrap();
         assert_eq!(rename["args"][0]["name"], json!("name"));
         assert_eq!(rename["args"][0]["required"], json!(true));
@@ -215,14 +215,14 @@ mod tests {
     #[test]
     fn set_splits_and_get_tree_reflects_it() {
         let resps = drive(&[
-            r#"{"op":"set","id":"tab.new"}"#,
+            r#"{"op":"set","id":"workspace.new"}"#,
             r#"{"op":"set","id":"split.leftright"}"#,
             r#"{"op":"get","what":"tree"}"#,
         ]);
         assert_eq!(
             resps[0]["ok"],
             json!(true),
-            "tab.new failed: {:?}",
+            "workspace.new failed: {:?}",
             resps[0]
         );
         assert_eq!(resps[1]["ok"], json!(true), "split failed: {:?}", resps[1]);
@@ -237,8 +237,8 @@ mod tests {
     #[test]
     fn set_validates_missing_args() {
         let resps = drive(&[
-            r#"{"op":"set","id":"tab.new"}"#,
-            r#"{"op":"set","id":"tab.rename"}"#,
+            r#"{"op":"set","id":"workspace.new"}"#,
+            r#"{"op":"set","id":"workspace.rename"}"#,
         ]);
         assert_eq!(resps[1]["ok"], json!(false));
         assert!(

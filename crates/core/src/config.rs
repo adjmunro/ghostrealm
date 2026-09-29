@@ -298,7 +298,7 @@ fn default_bindings() -> HashMap<&'static str, &'static str> {
         ("cmd+w", "pane.close"),
         ("cmd+d", "split.leftright"),
         ("cmd+shift+d", "split.topbottom"),
-        ("cmd+n", "tab.new"),
+        ("cmd+n", "workspace.new"),
         ("cmd+]", "pane.focus_next"),
         ("cmd+[", "pane.focus_prev"),
     ])
@@ -644,7 +644,7 @@ mod tests {
         let old = "[terminal]\nfont_size = 20.0\n\n[keybindings]\n# (empty)\n";
         let cmds = [
             ("surface.new", "New Terminal Tab"),
-            ("tab.new", "New Workspace"),
+            ("workspace.new", "New Workspace"),
             ("editor.scratch", "New Editor"),
         ];
         let updated = backfill_text(old, &cmds).expect("backfill should add sections");
@@ -659,7 +659,7 @@ mod tests {
         // The authoritative keybindings block was seeded (so bindings resolve).
         assert!(!cfg.keybindings.is_empty());
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
-        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("tab.new"));
+        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("workspace.new"));
         // An unbound command appears as a comment for reference.
         assert!(updated.contains("editor.scratch"));
         // Idempotent: a second pass changes nothing.
@@ -725,16 +725,16 @@ mod tests {
     fn binding_uses_defaults_then_overrides() {
         let mut cfg = Config::default();
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
-        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("tab.new"));
+        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("workspace.new"));
         // cmd+k is no longer a default (the palette opens on double-Shift).
         assert_eq!(cfg.binding("cmd+k"), None);
         assert_eq!(cfg.binding("cmd+j"), None);
         // Authoritative once present: `command id = chord`. Any modifier
         // order/alias resolves; ids not listed are unbound.
         cfg.keybindings
-            .insert("tab.close".to_string(), "Super+T".to_string());
-        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("tab.close"));
-        assert_eq!(cfg.binding_for("tab.close").as_deref(), Some("cmd+t"));
+            .insert("workspace.close".to_string(), "Super+T".to_string());
+        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("workspace.close"));
+        assert_eq!(cfg.binding_for("workspace.close").as_deref(), Some("cmd+t"));
         assert_eq!(cfg.binding("cmd+n"), None); // not in the authoritative set
     }
 }
