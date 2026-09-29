@@ -100,6 +100,9 @@ pub struct Input {
     pub focus_follows_mouse: bool,
     /// Max gap (ms) between the two taps of a double-tap trigger (palette / run).
     pub double_tap_window_ms: u32,
+    /// Max gap (ms) between the two clicks of a mouse double-click (e.g. the file
+    /// browser's double-click-to-enter-a-directory).
+    pub double_click_ms: u32,
 }
 
 impl Default for Input {
@@ -107,6 +110,7 @@ impl Default for Input {
         Input {
             focus_follows_mouse: false,
             double_tap_window_ms: 300,
+            double_click_ms: 200,
         }
     }
 }
@@ -352,6 +356,7 @@ autosave_after = 15        # integer seconds, >= 0 (default 15) — save a modif
 [input]
 focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
 double_tap_window_ms = 300   # integer ms, >= 0 (default 300) — max gap between a double-tap's two taps
+double_click_ms = 200        # integer ms, >= 0 (default 200) — max gap between a mouse double-click's two clicks
 
 [inbox]
 auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time before unread -> read (0 = manual only)

@@ -966,26 +966,8 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
-            "workspace.set_root",
-            "Set Workspace Directory",
-            "Pin the active workspace's root directory (new terminals start here)",
-        )
-        .arg(ArgSpec::required(
-            "path",
-            ArgKind::Str,
-            "the directory to pin",
-        )),
-        Box::new(|s: &mut AppState, a| {
-            if let Some(dir) = ghostrealm_core::config::expand_tilde(a.get_str("path")?) {
-                s.set_active_root_dir(dir);
-            }
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
             "workspace.pick_dir",
-            "Set Workspace Directory…",
+            "Set Workspace Directory",
             "Choose the active workspace's directory in a floating file picker",
         ),
         Box::new(|s: &mut AppState, _| {

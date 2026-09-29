@@ -539,7 +539,7 @@ impl FsTree {
         let mut scored: Vec<(i32, &WalkEntry)> = entries
             .iter()
             .filter(|e| e.is_dir || self.file_passes(&e.path, e.mtime))
-            .filter_map(|e| fuzzy::score(query, &e.name).map(|s| (s, e)))
+            .filter_map(|e| fuzzy::score_smart(query, &e.name).map(|s| (s, e)))
             .collect();
         // Highest score first; ties broken by shorter path then name.
         scored.sort_by(|a, b| {

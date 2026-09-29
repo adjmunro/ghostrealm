@@ -107,8 +107,9 @@ const TITLE_LABEL: [u8; 3] = [170, 170, 185];
 /// Empty-workspace screen: shortcut badge and dim hint colours.
 const EMPTY_SHORTCUT: [u8; 3] = [120, 120, 135];
 const EMPTY_HINT: [u8; 3] = [110, 110, 125];
-/// Window within which a second click counts as a double-click (file browser).
-const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// File-browser input box: border and typed-text colours.
+const INPUT_BORDER: [u8; 3] = [80, 80, 95];
+const INPUT_TEXT: [u8; 3] = [225, 225, 235];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -1119,6 +1120,11 @@ impl State {
         }
     }
 
+    /// Max gap between two clicks for a double-click (from `[input] double_click_ms`).
+    fn double_click_window(&self) -> Duration {
+        Duration::from_millis(self.cfg.input.double_click_ms as u64)
+    }
+
     /// Height of the custom title-bar strip in physical pixels. macOS renders its
     /// own strip (title + sidebar toggle) over a full-size content view; other
     /// platforms keep the native title bar and reserve nothing.
@@ -1317,10 +1323,11 @@ impl State {
             if let Some((_, path, is_dir)) = self.browser_row_at(x, y) {
                 if is_dir {
                     let now = Instant::now();
+                    let dcw = self.double_click_window();
                     let dbl = self
                         .browser_last_click
                         .as_ref()
-                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < DOUBLE_CLICK);
+                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < dcw);
                     self.browser_last_click = Some((now, path.clone()));
                     if let Some(b) = self.app.browser_mut(PICKER_SID) {
                         if dbl {
@@ -1430,10 +1437,11 @@ impl State {
                     // Single click expands/collapses in place; a quick second click
                     // on the same directory navigates into it (makes it the root).
                     let now = Instant::now();
+                    let dcw = self.double_click_window();
                     let dbl = self
                         .browser_last_click
                         .as_ref()
-                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < DOUBLE_CLICK);
+                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < dcw);
                     self.browser_last_click = Some((now, path.clone()));
                     if let Some(b) = self.app.browser_mut(bsid) {
                         if dbl {
@@ -1558,7 +1566,8 @@ impl State {
             }
             MenuAction::SetDir => {
                 self.app.focus_vtab(target);
-                self.begin_command("workspace.set_root");
+                self.app.open_dir_picker();
+                self.dirty = true;
             }
         }
     }
@@ -2505,19 +2514,29 @@ impl State {
             .browser_mut(sid)
             .map(|b| b.rows().to_vec())
             .unwrap_or_default();
-        let (root_disp, show_hidden, show_ignored, query, git_label, git_on, recent_on) =
-            match self.app.browser(sid) {
-                Some(b) => (
-                    b.root().display().to_string(),
-                    b.show_hidden(),
-                    b.show_gitignored(),
-                    b.query().to_string(),
-                    b.git_filter().label(),
-                    b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
-                    b.recent_on(),
-                ),
-                None => return placements,
-            };
+        #[allow(clippy::type_complexity)]
+        let (root_disp, show_hidden, show_ignored, query, is_path, git_label, git_on, recent_on): (
+            String,
+            bool,
+            bool,
+            String,
+            bool,
+            &str,
+            bool,
+            bool,
+        ) = match self.app.browser(sid) {
+            Some(b) => (
+                b.root().display().to_string(),
+                b.show_hidden(),
+                b.show_gitignored(),
+                b.query().to_string(),
+                !b.query().is_empty() && b.input_is_path(),
+                b.git_filter().label(),
+                b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
+                b.recent_on(),
+            ),
+            None => return placements,
+        };
 
         // Header background.
         quads.push(rect_quad(
@@ -2583,30 +2602,54 @@ impl State {
             right -= w + pad * 2.0;
         }
 
-        // Path (or the active filter, in accent) between the parent button and the
-        // toggles.
-        let path_x = rect.x + par_w + pad * 2.0;
-        let path_w = (right - path_x - pad).max(1.0);
-        let (ptext, pcolor) = if query.is_empty() {
-            (shorten_start(&root_disp, (path_w / self.cell_w) as usize), TITLE_LABEL)
-        } else {
-            (format!("/{query}"), self.chrome.accent)
+        // Input box between the parent button and the toggles: a bordered field
+        // showing the typed query, or the current root path (dim) as a placeholder
+        // when empty, so it always reads as an input.
+        let box_x = rect.x + par_w + pad * 2.0;
+        let box_w = (right - box_x - pad).max(1.0);
+        let inset = 4.0 * scale;
+        let box_rect = Rect {
+            x: box_x,
+            y: rect.y + inset,
+            w: box_w,
+            h: header_h - inset * 2.0,
         };
-        let (idx, _) = self.shape_browser(&ptext, sans, path_w);
+        quads.push(rect_quad(box_rect, sw, sh, self.chrome.background, 1.0));
+        push_border(quads, box_rect, sw, sh, INPUT_BORDER);
+        let inner_w = (box_w - pad).max(1.0);
+        let (itext, icolor) = if query.is_empty() {
+            (shorten_start(&root_disp, (inner_w / self.cell_w) as usize), EMPTY_SHORTCUT)
+        } else {
+            (query.clone(), INPUT_TEXT)
+        };
+        let (idx, iw) = self.shape_browser(&itext, mono, inner_w);
         placements.push(Placement {
             idx,
-            left: path_x,
+            left: box_rect.x + pad * 0.5,
             top: hy,
             bounds: TextBounds {
-                left: path_x as i32,
+                left: box_rect.x as i32,
                 top: rect.y as i32,
-                right: (path_x + path_w) as i32,
+                right: (box_rect.x + box_rect.w) as i32,
                 bottom: (rect.y + header_h) as i32,
             },
-            color: pcolor,
+            color: icolor,
         });
+        // A caret after the typed text marks it as the focused input.
+        if !query.is_empty() {
+            let cx = box_rect.x + pad * 0.5 + iw + 1.0 * scale;
+            if cx < box_rect.x + box_rect.w {
+                quads.push(rect_quad(
+                    Rect { x: cx, y: rect.y + inset + 2.0 * scale, w: 2.0 * scale, h: box_rect.h - 4.0 * scale },
+                    sw,
+                    sh,
+                    self.chrome.accent,
+                    0.9,
+                ));
+            }
+        }
 
-        // Scrollable row list.
+        // Body below the header.
         let list = Rect {
             x: rect.x,
             y: rect.y + header_h,
@@ -2614,116 +2657,108 @@ impl State {
             h: (rect.h - header_h).max(0.0),
         };
         let row_h = ch + 4.0 * scale;
-        let content_h = rows.len() as f32 * row_h;
-        let max_scroll = (content_h - list.h).max(0.0);
-        let scroll = self
-            .browser_scroll
-            .get(&sid)
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, max_scroll);
-        self.browser_scroll.insert(sid, scroll);
-
         let indent_w = self.cell_w * 2.0;
-        let mut view_rows: Vec<(std::path::PathBuf, bool)> = Vec::with_capacity(rows.len());
-        for (i, r) in rows.iter().enumerate() {
-            let ry = list.y + i as f32 * row_h - scroll;
-            view_rows.push((r.path.clone(), r.is_dir));
-            if ry + row_h < list.y || ry > list.y + list.h {
-                continue; // offscreen
-            }
-            let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-            if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
-                quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-            }
-            let marker = if r.is_dir {
-                if r.expanded {
-                    "\u{25be} "
-                } else {
-                    "\u{25b8} "
-                }
-            } else {
-                "  "
-            };
-            let label = format!("{marker}{}", r.name);
-            let color = if r.is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
-            let left = list.x + pad + r.depth as f32 * indent_w;
-            let (idx, _) = self.shape_browser(&label, mono, (list.x + list.w - left - pad).max(1.0));
-            placements.push(Placement {
-                idx,
-                left,
-                top: ry + (row_h - ch) * 0.5,
-                bounds: TextBounds {
-                    left: list.x as i32,
-                    top: list.y as i32,
-                    right: (list.x + list.w) as i32,
-                    bottom: (list.y + list.h) as i32,
-                },
-                color,
-            });
-        }
 
-        // Path autocomplete: when the input reads as a path, show a completion
-        // dropdown over the top of the list.
-        let is_path = !query.is_empty()
-            && self.app.browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
         if is_path {
+            // Path mode: the body is the completion list (replacing the tree, so
+            // nothing shows through). No BrowserView is recorded — clicks route via
+            // `browser_suggest_hits`.
             let sugg: Vec<std::path::PathBuf> = self
                 .app
                 .browser(sid)
                 .map(|b| b.suggestions(&query))
                 .unwrap_or_default();
-            let shown = sugg.len().min(8);
-            if shown > 0 {
-                let panel = Rect {
-                    x: list.x,
-                    y: list.y,
-                    w: list.w,
-                    h: shown as f32 * row_h + 2.0 * scale,
-                };
-                quads.push(rect_quad(panel, sw, sh, self.chrome.sidebar, 1.0));
-                push_border(quads, panel, sw, sh, self.chrome.accent);
-                for (i, p) in sugg.iter().take(shown).enumerate() {
-                    let ry = list.y + i as f32 * row_h;
-                    let is_dir = p.is_dir();
-                    let name = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let label = if is_dir { format!("{name}/") } else { name };
-                    let row_rect = Rect { x: panel.x, y: ry, w: panel.w, h: row_h };
-                    if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
-                        quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-                    }
-                    let (idx, _) = self.shape_browser(&label, Family::Monospace, panel.w - pad * 2.0);
-                    placements.push(Placement {
-                        idx,
-                        left: panel.x + pad,
-                        top: ry + (row_h - ch) * 0.5,
-                        bounds: TextBounds {
-                            left: panel.x as i32,
-                            top: panel.y as i32,
-                            right: (panel.x + panel.w) as i32,
-                            bottom: (panel.y + panel.h) as i32,
-                        },
-                        color: if is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
-                    });
-                    self.browser_suggest_hits
-                        .push((row_rect, sid, p.clone(), is_dir));
+            for (i, p) in sugg.iter().enumerate() {
+                let ry = list.y + i as f32 * row_h;
+                if ry + row_h > list.y + list.h {
+                    break; // fills the body; no scroll needed for completions
                 }
+                let is_dir = p.is_dir();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let label = if is_dir { format!("{name}/") } else { name };
+                let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
+                if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                    quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+                }
+                let (idx, _) = self.shape_browser(&label, mono, list.w - pad * 2.0);
+                placements.push(Placement {
+                    idx,
+                    left: list.x + pad,
+                    top: ry + (row_h - ch) * 0.5,
+                    bounds: TextBounds {
+                        left: list.x as i32,
+                        top: list.y as i32,
+                        right: (list.x + list.w) as i32,
+                        bottom: (list.y + list.h) as i32,
+                    },
+                    color: if is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
+                });
+                self.browser_suggest_hits.push((row_rect, sid, p.clone(), is_dir));
             }
+        } else {
+            // Browse/filter mode: the scrollable tree/results list.
+            let content_h = rows.len() as f32 * row_h;
+            let max_scroll = (content_h - list.h).max(0.0);
+            let scroll = self
+                .browser_scroll
+                .get(&sid)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, max_scroll);
+            self.browser_scroll.insert(sid, scroll);
+
+            let mut view_rows: Vec<(std::path::PathBuf, bool)> = Vec::with_capacity(rows.len());
+            for (i, r) in rows.iter().enumerate() {
+                let ry = list.y + i as f32 * row_h - scroll;
+                view_rows.push((r.path.clone(), r.is_dir));
+                if ry + row_h < list.y || ry > list.y + list.h {
+                    continue; // offscreen
+                }
+                let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
+                if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                    quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+                }
+                let marker = if r.is_dir {
+                    if r.expanded {
+                        "\u{25be} "
+                    } else {
+                        "\u{25b8} "
+                    }
+                } else {
+                    "  "
+                };
+                let label = format!("{marker}{}", r.name);
+                let color = if r.is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+                let left = list.x + pad + r.depth as f32 * indent_w;
+                let (idx, _) = self.shape_browser(&label, mono, (list.x + list.w - left - pad).max(1.0));
+                placements.push(Placement {
+                    idx,
+                    left,
+                    top: ry + (row_h - ch) * 0.5,
+                    bounds: TextBounds {
+                        left: list.x as i32,
+                        top: list.y as i32,
+                        right: (list.x + list.w) as i32,
+                        bottom: (list.y + list.h) as i32,
+                    },
+                    color,
+                });
+            }
+            self.browser_views.push(BrowserView {
+                sid,
+                list,
+                row_h,
+                scroll,
+                rows: view_rows,
+            });
         }
 
         if focus_border {
             push_border(quads, rect, sw, sh, self.chrome.accent);
         }
-        self.browser_views.push(BrowserView {
-            sid,
-            list,
-            row_h,
-            scroll,
-            rows: view_rows,
-        });
         placements
     }
 

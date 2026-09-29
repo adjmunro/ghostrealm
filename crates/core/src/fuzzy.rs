@@ -5,14 +5,33 @@
 //! registry calls it behind [`crate::Registry::search`], so it can be swapped
 //! for a heavier matcher (nucleo, fzf-style) later without touching callers.
 
-/// Score `candidate` against `query`. Higher is better. `None` if `query` is
-/// not a subsequence of `candidate` (case-insensitive). An empty query scores 0.
+/// Score `candidate` against `query`, case-insensitively. Higher is better;
+/// `None` if `query` is not a subsequence of `candidate`. An empty query scores 0.
 pub fn score(query: &str, candidate: &str) -> Option<i32> {
+    score_cased(query, candidate, false)
+}
+
+/// Smart-case scoring: case-sensitive when `query` contains any uppercase letter,
+/// otherwise case-insensitive (the common "type lowercase to match anything,
+/// add a capital to pin it" behaviour).
+pub fn score_smart(query: &str, candidate: &str) -> Option<i32> {
+    let case_sensitive = query.chars().any(|c| c.is_uppercase());
+    score_cased(query, candidate, case_sensitive)
+}
+
+fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    let c: Vec<char> = candidate.chars().flat_map(char::to_lowercase).collect();
+    let fold = |s: &str| -> Vec<char> {
+        if case_sensitive {
+            s.chars().collect()
+        } else {
+            s.chars().flat_map(char::to_lowercase).collect()
+        }
+    };
+    let q: Vec<char> = fold(query);
+    let c: Vec<char> = fold(candidate);
     let craw: Vec<char> = candidate.chars().collect();
 
     let mut qi = 0usize;
@@ -102,5 +121,16 @@ mod tests {
     #[test]
     fn case_insensitive() {
         assert!(score("NEW", "new tab").is_some());
+    }
+
+    #[test]
+    fn smart_case_is_sensitive_only_with_an_uppercase() {
+        use super::score_smart;
+        // All-lowercase query: case-insensitive, matches either case.
+        assert!(score_smart("read", "README").is_some());
+        assert!(score_smart("read", "readme").is_some());
+        // An uppercase in the query pins case: "RE" matches README, not readme.
+        assert!(score_smart("RE", "README").is_some());
+        assert!(score_smart("RE", "readme").is_none());
     }
 }
