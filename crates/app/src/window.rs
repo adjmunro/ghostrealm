@@ -663,8 +663,17 @@ struct BrowserView {
     list: Rect,
     row_h: f32,
     scroll: f32,
-    /// Visible rows in order: (path, is_dir).
-    rows: Vec<(std::path::PathBuf, bool)>,
+    /// Visible rows in order.
+    rows: Vec<RowRef>,
+}
+
+/// A browser row's click target: a real entry (path) or a synthetic category (key).
+#[derive(Clone)]
+struct RowRef {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    is_category: bool,
+    key: String,
 }
 
 /// What a clickable chrome button does. All buttons share hover-highlight and
@@ -686,9 +695,10 @@ enum ButtonAction {
     /// Toggle a file browser's show-hidden / show-gitignored filters.
     BrowserToggleHidden(SurfaceId),
     BrowserToggleIgnored(SurfaceId),
-    /// Cycle the git-status filter / toggle the recently-modified filter.
+    /// Cycle the git-status filter.
     BrowserCycleGit(SurfaceId),
-    BrowserToggleRecent(SurfaceId),
+    /// Cycle the view mode (tree / by extension / kind / git / date / size).
+    BrowserCycleView(SurfaceId),
     /// Move a file browser up to its parent directory.
     BrowserParent(SurfaceId),
     /// Confirm / cancel the floating directory picker.
@@ -1260,9 +1270,9 @@ impl State {
                     b.cycle_git_filter();
                 }
             }
-            ButtonAction::BrowserToggleRecent(sid) => {
+            ButtonAction::BrowserCycleView(sid) => {
                 if let Some(b) = self.app.browser_mut(sid) {
-                    b.toggle_recent(std::time::Duration::from_secs(7 * 24 * 3600));
+                    b.cycle_view();
                 }
             }
             ButtonAction::BrowserParent(sid) => {
@@ -1323,7 +1333,7 @@ impl State {
             return false;
         }
         // Browse/filter row under the cursor?
-        if let Some((sid, idx, _, _)) = self.browser_row_at(x, y) {
+        if let Some((sid, idx, _)) = self.browser_row_at(x, y) {
             if self.browser_sel.get(&sid) != Some(&idx) {
                 self.browser_sel.insert(sid, idx);
                 self.dirty = true;
@@ -1333,13 +1343,13 @@ impl State {
         false
     }
 
-    /// The file-browser row under a point, as (surface, index, path, is_dir).
-    fn browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, std::path::PathBuf, bool)> {
+    /// The file-browser row under a point, as (surface, index, row).
+    fn browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, RowRef)> {
         for v in &self.browser_views {
             if x >= v.list.x && x < v.list.x + v.list.w && y >= v.list.y && y < v.list.y + v.list.h {
                 let idx = ((y - v.list.y + v.scroll) / v.row_h).floor().max(0.0) as usize;
-                if let Some((path, is_dir)) = v.rows.get(idx) {
-                    return Some((v.sid, idx, path.clone(), *is_dir));
+                if let Some(row) = v.rows.get(idx) {
+                    return Some((v.sid, idx, row.clone()));
                 }
             }
         }
@@ -1365,21 +1375,25 @@ impl State {
                 self.dirty = true;
                 return;
             }
-            if let Some((_, idx, path, is_dir)) = self.browser_row_at(x, y) {
+            if let Some((_, idx, row)) = self.browser_row_at(x, y) {
                 self.browser_sel.insert(PICKER_SID, idx);
-                if is_dir {
+                if row.is_category {
+                    if let Some(b) = self.app.browser_mut(PICKER_SID) {
+                        b.toggle_category(&row.key);
+                    }
+                } else if row.is_dir {
                     let now = Instant::now();
                     let dcw = self.double_click_window();
                     let dbl = self
                         .browser_last_click
                         .as_ref()
-                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < dcw);
-                    self.browser_last_click = Some((now, path.clone()));
+                        .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
+                    self.browser_last_click = Some((now, row.path.clone()));
                     if let Some(b) = self.app.browser_mut(PICKER_SID) {
                         if dbl {
-                            b.set_root(path);
+                            b.set_root(row.path);
                         } else {
-                            b.toggle_dir(&path);
+                            b.toggle_dir(&row.path);
                         }
                     }
                 }
@@ -1478,9 +1492,13 @@ impl State {
                 self.dirty = true;
                 return;
             }
-            if let Some((bsid, idx, path, is_dir)) = self.browser_row_at(x, y) {
+            if let Some((bsid, idx, row)) = self.browser_row_at(x, y) {
                 self.browser_sel.insert(bsid, idx);
-                if is_dir {
+                if row.is_category {
+                    if let Some(b) = self.app.browser_mut(bsid) {
+                        b.toggle_category(&row.key);
+                    }
+                } else if row.is_dir {
                     // Single click expands/collapses in place; a quick second click
                     // on the same directory navigates into it (makes it the root).
                     let now = Instant::now();
@@ -1488,18 +1506,18 @@ impl State {
                     let dbl = self
                         .browser_last_click
                         .as_ref()
-                        .is_some_and(|(t, p)| *p == path && now.duration_since(*t) < dcw);
-                    self.browser_last_click = Some((now, path.clone()));
+                        .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
+                    self.browser_last_click = Some((now, row.path.clone()));
                     if let Some(b) = self.app.browser_mut(bsid) {
                         if dbl {
-                            b.set_root(path);
+                            b.set_root(row.path);
                         } else {
-                            b.toggle_dir(&path);
+                            b.toggle_dir(&row.path);
                         }
                     }
                 } else {
                     self.browser_last_click = None;
-                    self.app.open_file_in_focused(path);
+                    self.app.open_file_in_focused(row.path);
                 }
             }
             self.dirty = true;
@@ -2637,7 +2655,7 @@ impl State {
             .map(|b| b.rows().to_vec())
             .unwrap_or_default();
         #[allow(clippy::type_complexity)]
-        let (root_disp, show_hidden, show_ignored, query, is_path, git_label, git_on, recent_on): (
+        let (root_disp, show_hidden, show_ignored, query, is_path, git_label, git_on, view_label, view_on): (
             String,
             bool,
             bool,
@@ -2645,6 +2663,7 @@ impl State {
             bool,
             &str,
             bool,
+            &str,
             bool,
         ) = match self.app.browser(sid) {
             Some(b) => (
@@ -2655,7 +2674,8 @@ impl State {
                 !b.query().is_empty() && b.input_is_path(),
                 b.git_filter().label(),
                 b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
-                b.recent_on(),
+                b.view().label(),
+                b.view() != ghostrealm_core::fs_tree::FsView::Tree,
             ),
             None => return placements,
         };
@@ -2699,7 +2719,7 @@ impl State {
             ("hidden", show_hidden, ButtonAction::BrowserToggleHidden(sid)),
             (".gitignore", show_ignored, ButtonAction::BrowserToggleIgnored(sid)),
             (git_label, git_on, ButtonAction::BrowserCycleGit(sid)),
-            ("recent", recent_on, ButtonAction::BrowserToggleRecent(sid)),
+            (view_label, view_on, ButtonAction::BrowserCycleView(sid)),
         ] {
             let w = label.chars().count() as f32 * self.cell_w;
             let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
@@ -2840,10 +2860,15 @@ impl State {
             let sel = self.browser_sel.get(&sid).copied();
             let filtering = !query.is_empty();
 
-            let mut view_rows: Vec<(std::path::PathBuf, bool)> = Vec::with_capacity(rows.len());
+            let mut view_rows: Vec<RowRef> = Vec::with_capacity(rows.len());
             for (i, r) in rows.iter().enumerate() {
                 let ry = list.y + i as f32 * row_h - scroll;
-                view_rows.push((r.path.clone(), r.is_dir));
+                view_rows.push(RowRef {
+                    path: r.path.clone(),
+                    is_dir: r.is_dir,
+                    is_category: r.is_category,
+                    key: r.key.clone(),
+                });
                 if ry + row_h < list.y || ry > list.y + list.h {
                     continue; // offscreen
                 }
@@ -2860,12 +2885,16 @@ impl State {
                 } else {
                     "  "
                 };
-                // Marker in the kind colour, then the name coloured by kind/extension
-                // (browse) or with matched characters highlighted (filter).
+                // Marker in the kind colour; an optional dim disambiguation prefix;
+                // then the name coloured by kind/extension (browse) or with matched
+                // characters highlighted (filter).
                 let mut spans: Vec<(String, [u8; 3])> = vec![(
                     marker.to_string(),
                     if r.is_dir { self.chrome.accent } else { FILE_FG },
                 )];
+                if !r.prefix.is_empty() {
+                    spans.push((format!("{}/", r.prefix), EMPTY_SHORTCUT));
+                }
                 if filtering {
                     spans.extend(self.match_spans(&r.name, r.is_dir, &r.match_indices));
                 } else {
@@ -3561,7 +3590,11 @@ impl State {
                     // Accept the selected completion into the input.
                     self.accept_completion(sid);
                 } else if let Some(r) = self.selected_row(sid) {
-                    if r.is_dir && !r.expanded {
+                    if r.is_category && !r.expanded {
+                        if let Some(b) = self.app.browser_mut(sid) {
+                            b.toggle_category(&r.key);
+                        }
+                    } else if r.is_dir && !r.is_category && !r.expanded {
                         if let Some(b) = self.app.browser_mut(sid) {
                             b.toggle_dir(&r.path);
                         }
@@ -3571,7 +3604,11 @@ impl State {
             WKey::Named(NamedKey::ArrowLeft) => {
                 if !path_mode {
                     if let Some(r) = self.selected_row(sid) {
-                        if r.is_dir && r.expanded {
+                        if r.is_category && r.expanded {
+                            if let Some(b) = self.app.browser_mut(sid) {
+                                b.toggle_category(&r.key);
+                            }
+                        } else if r.is_dir && !r.is_category && r.expanded {
                             if let Some(b) = self.app.browser_mut(sid) {
                                 b.toggle_dir(&r.path);
                             }
@@ -3590,7 +3627,11 @@ impl State {
                     }
                     self.browser_completion.remove(&sid);
                 } else if let Some(r) = self.selected_row(sid) {
-                    if r.is_dir {
+                    if r.is_category {
+                        if let Some(b) = self.app.browser_mut(sid) {
+                            b.toggle_category(&r.key);
+                        }
+                    } else if r.is_dir {
                         if let Some(b) = self.app.browser_mut(sid) {
                             b.set_root(r.path);
                         }

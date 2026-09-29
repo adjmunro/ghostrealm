@@ -7,7 +7,7 @@
 //! so it is shared by the in-pane browser and the floating directory picker and
 //! is tested headless.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -75,6 +75,49 @@ impl GitFilter {
     }
 }
 
+/// How `rows()` presents the subtree: the real ancestor hierarchy, or a flat set of
+/// synthetic collapsible categories grouping files by one facet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsView {
+    /// The real directory hierarchy (expand/collapse real folders).
+    Tree,
+    /// Group files by extension.
+    Extension,
+    /// Group files by high-level kind (Images/Video/Audio/Documents/Code/…).
+    Kind,
+    /// Group files by git status (Modified/Untracked/Unchanged).
+    GitStatus,
+    /// Group files by modified-date bucket (Today/This week/…).
+    Date,
+    /// Group files by size bucket.
+    Size,
+}
+
+impl FsView {
+    pub fn next(self) -> Self {
+        match self {
+            FsView::Tree => FsView::Extension,
+            FsView::Extension => FsView::Kind,
+            FsView::Kind => FsView::GitStatus,
+            FsView::GitStatus => FsView::Date,
+            FsView::Date => FsView::Size,
+            FsView::Size => FsView::Tree,
+        }
+    }
+
+    /// Short header label.
+    pub fn label(self) -> &'static str {
+        match self {
+            FsView::Tree => "tree",
+            FsView::Extension => "type",
+            FsView::Kind => "kind",
+            FsView::GitStatus => "git",
+            FsView::Date => "date",
+            FsView::Size => "size",
+        }
+    }
+}
+
 /// A row in the flattened visible tree, ready to render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRow {
@@ -92,6 +135,14 @@ pub struct FileRow {
     /// Char indices into `name` that the query matched (for highlighting). Empty in
     /// browse mode.
     pub match_indices: Vec<usize>,
+    /// A synthetic collapsible category (grouped views), not a real filesystem
+    /// entry. Rendered like a directory but toggled by `key`, not `path`.
+    pub is_category: bool,
+    /// The toggle key for a category row (empty for real entries).
+    pub key: String,
+    /// A dim ancestor prefix shown before the name to disambiguate same-named files
+    /// in a grouped view (empty otherwise).
+    pub prefix: String,
 }
 
 /// Caps on the filter-mode walk so a huge tree never stalls a keystroke.
@@ -104,7 +155,10 @@ pub struct FsTree {
     show_hidden: bool,
     show_gitignored: bool,
     query: String,
+    view: FsView,
     expanded: BTreeSet<PathBuf>,
+    /// Expanded synthetic categories (grouped views), keyed by category id.
+    expanded_cats: BTreeSet<String>,
     /// Per-directory listings, filtered by the current toggles. Cleared when a
     /// toggle or the root changes; a single dir can be dropped to force a re-read.
     cache: HashMap<PathBuf, Vec<RawEntry>>,
@@ -132,7 +186,9 @@ impl FsTree {
             show_hidden: false,
             show_gitignored: false,
             query: String::new(),
+            view: FsView::Tree,
             expanded: BTreeSet::new(),
+            expanded_cats: BTreeSet::new(),
             cache: HashMap::new(),
             walk_cache: None,
             git_filter: GitFilter::All,
@@ -227,6 +283,31 @@ impl FsTree {
         self.dirty = true;
     }
 
+    pub fn view(&self) -> FsView {
+        self.view
+    }
+
+    pub fn set_view(&mut self, view: FsView) {
+        if self.view != view {
+            self.view = view;
+            self.dirty = true;
+        }
+    }
+
+    /// Advance to the next view mode (tree → type → kind → git → date → size → …).
+    pub fn cycle_view(&mut self) {
+        self.view = self.view.next();
+        self.dirty = true;
+    }
+
+    /// Expand/collapse a synthetic category in a grouped view.
+    pub fn toggle_category(&mut self, key: &str) {
+        if !self.expanded_cats.remove(key) {
+            self.expanded_cats.insert(key.to_string());
+        }
+        self.dirty = true;
+    }
+
     pub fn git_filter(&self) -> GitFilter {
         self.git_filter
     }
@@ -263,10 +344,14 @@ impl FsTree {
     /// score-ranked list of matches walked from the root.
     pub fn rows(&mut self) -> &[FileRow] {
         if self.dirty {
-            if self.git_filter != GitFilter::All {
+            if self.git_filter != GitFilter::All || self.view == FsView::GitStatus {
                 self.ensure_git_status();
             }
-            self.rows_cache = if self.query.trim().is_empty() || self.input_is_path() {
+            self.rows_cache = if self.view != FsView::Tree {
+                // Grouped views ignore the query; the view IS the navigation.
+                self.ensure_walk();
+                self.grouped_rows(self.view)
+            } else if self.query.trim().is_empty() || self.input_is_path() {
                 // A path-like input drives the completion dropdown, not a filter, so
                 // the tree keeps showing the current root while the user types.
                 self.browse_rows()
@@ -527,6 +612,9 @@ impl FsTree {
                 size: e.size,
                 mtime: e.mtime,
                 match_indices: Vec::new(),
+                is_category: false,
+                key: String::new(),
+                prefix: String::new(),
             });
             if expanded {
                 let child = e.path.clone();
@@ -612,9 +700,110 @@ impl FsTree {
                     size: e.size,
                     mtime: e.mtime,
                     match_indices,
+                    is_category: false,
+                    key: String::new(),
+                    prefix: String::new(),
                 }
             })
             .collect()
+    }
+
+    /// Grouped-view rows: synthetic collapsible categories over the recursive walk.
+    /// Only files are grouped (that's the point — jump to files by facet), honouring
+    /// the file filters. Expanded categories list their files, with same-named files
+    /// disambiguated by a dim ancestor prefix.
+    fn grouped_rows(&self, view: FsView) -> Vec<FileRow> {
+        let files: Vec<&WalkEntry> = self
+            .walk_cache
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|e| !e.is_dir && self.file_passes(&e.path, e.mtime))
+            .collect();
+        let mut groups: BTreeMap<(i64, String), Vec<&WalkEntry>> = BTreeMap::new();
+        for e in files {
+            let (order, id) = self.category_of(view, e);
+            groups.entry((order, id)).or_default().push(e);
+        }
+        let mut out = Vec::new();
+        for ((_, id), mut group) in groups {
+            let expanded = self.expanded_cats.contains(&id);
+            out.push(FileRow {
+                name: format!("{id}  ({})", group.len()),
+                path: self.root.clone(),
+                is_dir: true,
+                depth: 0,
+                expanded,
+                size: 0,
+                mtime: None,
+                match_indices: Vec::new(),
+                is_category: true,
+                key: id.clone(),
+                prefix: String::new(),
+            });
+            if !expanded {
+                continue;
+            }
+            group.sort_by(|a, b| {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.rel.cmp(&b.rel))
+            });
+            let prefixes = disambiguate(&group);
+            for (e, prefix) in group.into_iter().zip(prefixes) {
+                out.push(FileRow {
+                    name: e.name.clone(),
+                    path: e.path.clone(),
+                    is_dir: false,
+                    depth: 1,
+                    expanded: false,
+                    size: e.size,
+                    mtime: e.mtime,
+                    match_indices: Vec::new(),
+                    is_category: false,
+                    key: String::new(),
+                    prefix,
+                });
+            }
+        }
+        out
+    }
+
+    /// The (sort-order, category-label) a file falls into for `view`.
+    fn category_of(&self, view: FsView, e: &WalkEntry) -> (i64, String) {
+        match view {
+            FsView::Extension => {
+                let ext = Path::new(&e.name)
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.to_lowercase());
+                (0, ext.map(|x| format!(".{x}")).unwrap_or_else(|| "(no extension)".into()))
+            }
+            FsView::Kind => {
+                let (o, k) = kind_of(&e.name);
+                (o, k.to_string())
+            }
+            FsView::GitStatus => {
+                let st = self.git_state(&e.path);
+                if st.modified {
+                    (0, "Modified".into())
+                } else if st.untracked {
+                    (1, "Untracked".into())
+                } else {
+                    (2, "Unchanged".into())
+                }
+            }
+            FsView::Date => {
+                let (o, l) = date_bucket(e.mtime);
+                (o, l.into())
+            }
+            FsView::Size => {
+                let (o, l) = size_bucket(e.size);
+                (o, l.into())
+            }
+            FsView::Tree => (0, String::new()),
+        }
     }
 
     /// Read one directory level, filtered by the toggles and sorted (dirs first,
@@ -669,6 +858,112 @@ impl FsTree {
             .parents(true)
             .follow_links(false);
         b
+    }
+}
+
+/// For each file in a group, the dim ancestor segment that disambiguates same-named
+/// files (empty when the name is already unique in the group). Uses the first depth,
+/// counting up from the leaf, at which the same-named files' ancestor segments differ
+/// (e.g. two `Foo.kt` sharing `a/b/c` climb to the module: `source` vs `network`).
+fn disambiguate(group: &[&WalkEntry]) -> Vec<String> {
+    let mut prefixes = vec![String::new(); group.len()];
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in group.iter().enumerate() {
+        by_name.entry(e.name.as_str()).or_default().push(i);
+    }
+    for (_, idxs) in by_name {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Ancestor components (root→parent), leaf dropped, per clashing file.
+        let comps: Vec<Vec<&str>> = idxs
+            .iter()
+            .map(|&i| {
+                let mut c: Vec<&str> = group[i].rel.split('/').collect();
+                c.pop();
+                c
+            })
+            .collect();
+        let maxd = comps.iter().map(|c| c.len()).max().unwrap_or(0);
+        let mut chosen = None;
+        for d in 1..=maxd {
+            let first = comps[0].len().checked_sub(d).map(|i| comps[0][i]);
+            let differs = comps
+                .iter()
+                .any(|c| c.len().checked_sub(d).map(|i| c[i]) != first);
+            if differs {
+                chosen = Some(d);
+                break;
+            }
+        }
+        if let Some(d) = chosen {
+            for (k, &gi) in idxs.iter().enumerate() {
+                let c = &comps[k];
+                if let Some(seg) = c.len().checked_sub(d).map(|i| c[i]) {
+                    prefixes[gi] = seg.to_string();
+                }
+            }
+        }
+    }
+    prefixes
+}
+
+/// A file's high-level kind (sort order, label) from its extension.
+fn kind_of(name: &str) -> (i64, &'static str) {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tiff" | "heic" => {
+            (0, "Images")
+        }
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "wmv" | "flv" => (1, "Video"),
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "opus" | "aiff" => (2, "Audio"),
+        "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "tex" | "pages" => (3, "Documents"),
+        "rs" | "kt" | "kts" | "java" | "c" | "h" | "cpp" | "hpp" | "py" | "js" | "ts" | "tsx"
+        | "jsx" | "go" | "rb" | "swift" | "sh" | "zsh" | "lua" | "zig" | "cs" | "php" | "html"
+        | "css" | "scss" => (4, "Code"),
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" => (5, "Archives"),
+        "json" | "toml" | "yaml" | "yml" | "xml" | "csv" | "tsv" | "sqlite" | "db" | "ini"
+        | "lock" => (6, "Data"),
+        _ => (7, "Other"),
+    }
+}
+
+/// A modified-time bucket (sort order, label).
+fn date_bucket(mtime: Option<SystemTime>) -> (i64, &'static str) {
+    let Some(elapsed) = mtime.and_then(|t| t.elapsed().ok()) else {
+        return (5, "Unknown");
+    };
+    let secs = elapsed.as_secs();
+    const DAY: u64 = 86_400;
+    if secs < DAY {
+        (0, "Today")
+    } else if secs < 7 * DAY {
+        (1, "This week")
+    } else if secs < 30 * DAY {
+        (2, "This month")
+    } else if secs < 365 * DAY {
+        (3, "This year")
+    } else {
+        (4, "Older")
+    }
+}
+
+/// A size bucket (sort order, label).
+fn size_bucket(size: u64) -> (i64, &'static str) {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if size < 10 * KB {
+        (0, "Tiny (<10 KB)")
+    } else if size < MB {
+        (1, "Small (<1 MB)")
+    } else if size < 100 * MB {
+        (2, "Large (<100 MB)")
+    } else {
+        (3, "Huge (≥100 MB)")
     }
 }
 
@@ -849,6 +1144,48 @@ mod tests {
         // `*.k` is unanchored, so it matches .kt (contains ".k").
         t.set_query("*.k");
         assert!(t.rows().iter().any(|r| r.name.ends_with("main.kt")));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn extension_view_groups_and_expands() {
+        let d = tmpdir();
+        fs::create_dir(d.join("a")).unwrap();
+        fs::write(d.join("a").join("main.rs"), "x").unwrap();
+        fs::write(d.join("lib.rs"), "x").unwrap();
+        fs::write(d.join("readme.md"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_view(FsView::Extension);
+        let rows = t.rows().to_vec();
+        assert!(rows.iter().any(|r| r.is_category && r.name.starts_with(".rs")));
+        assert!(rows.iter().any(|r| r.is_category && r.name.starts_with(".md")));
+        assert!(rows.iter().all(|r| r.is_category), "collapsed: only categories");
+        t.toggle_category(".rs");
+        let rows = t.rows().to_vec();
+        assert!(rows.iter().any(|r| !r.is_category && r.name == "main.rs"));
+        assert!(rows.iter().any(|r| !r.is_category && r.name == "lib.rs"));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn grouped_view_disambiguates_same_named_files() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("source").join("a").join("b")).unwrap();
+        fs::create_dir_all(d.join("network").join("a").join("b")).unwrap();
+        fs::write(d.join("source").join("a").join("b").join("Foo.kt"), "x").unwrap();
+        fs::write(d.join("network").join("a").join("b").join("Foo.kt"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_view(FsView::Extension);
+        t.toggle_category(".kt");
+        let rows = t.rows().to_vec();
+        let prefixes: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.name == "Foo.kt")
+            .map(|r| r.prefix.as_str())
+            .collect();
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains(&"source"), "got {prefixes:?}");
+        assert!(prefixes.contains(&"network"), "got {prefixes:?}");
         fs::remove_dir_all(&d).ok();
     }
 
