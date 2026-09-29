@@ -428,22 +428,35 @@
 
 ---
 
-[2026-09-29@c259de1] File browser — remaining refinements
+[2026-09-29@fddd044] File browser — "by type" view
+
+- Requires: NO BLOCKERS (extends `core::fs_tree::FsTree`, already headless)
+- Detail: A second view mode alongside the ancestor hierarchy (tree): a
+  "by file type" view. From the current root, show fake collapsible categories
+  (rendered like directories, but not real) — one per file extension found in the
+  recursive subtree (e.g. `.kt`, `.gradle.kts`, `.jpg`). Expanding a category
+  lists every file of that type below the root, for fast "jump to a kind of file".
+  DISAMBIGUATION: when two files in a category share a name, prefix each with the
+  minimal distinguishing ancestor (grayed): walk up from the leaf while the
+  candidate ancestor segment is shared by another shown file, stopping at the
+  first segment that differs (e.g. Kotlin `util` packages that share a/b/c climb
+  to the module — `source` vs `network`). Show that segment (or the run up to it)
+  as dim text before the file name. Add a view toggle in the header (tree vs type)
+  and a `view` field on `FsTree` (drives `rows()`).
+- Reason: navigate by kind, not just by folder; requested.
+
+---
+
+[2026-09-29@fddd044] File browser — remaining polish
 
 - Requires: NO BLOCKERS
-- Detail: DONE: headless `FsTree`; in-pane browser (browse/expand, hidden &
-  .gitignore toggles, wheel scroll, fuzzy filter that matches names not ancestor
-  paths, single-click expands / double-click enters a dir / click a file opens an
-  editor); ⌘T picker (Terminal/Editor/File browser); path box with
-  `FsTree::suggestions` autocomplete (Tab completes, Enter navigates, click a
-  suggestion); git-status + recently-modified + file-type(ext) filters in the
-  core (git via `git status --porcelain`); the FLOATING directory picker
-  (`workspace.pick_dir`) reusing the browser, wired to the active workspace root.
-  REMAINING: (1) no header UI to SET the ext filter — `set_ext_filter` exists but
-  only git & recent have header buttons; add an ext control (or a `ext:rs` query
-  token). (2) show git status per row (a colour/badge), not just filter by it.
-  (3) date filter is a single "recent (7 days)" toggle — add an explicit range
-  and a created-vs-modified choice. (4) recursive fuzzy walk is capped at 20k
-  entries; revisit for very large roots. (5) nested `.gitignore` relies on the
-  `ignore` crate's parent lookup — confirm on a real repo.
+- Detail: (1) gitignored files should render in a grayed red (and ignored folders
+  bold) — needs a per-entry "ignored" flag surfaced from the walk (currently
+  `ignore` skips them unless the toggle is on; when shown, mark them). (2)
+  directories could be BOLD as well as accent-coloured — needs a weight on the
+  shaped span (glyphon `Attrs::weight`). (3) no header UI to SET the ext filter
+  (`set_ext_filter` exists; git & recent have buttons) — add a control or an
+  `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
+  explicit range + created-vs-modified. (5) recursive fuzzy walk caps at 20k
+  entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
