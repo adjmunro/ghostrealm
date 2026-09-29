@@ -486,3 +486,72 @@
   explicit range + created-vs-modified. (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
+
+---
+
+[2026-09-29@6641e98] Plug-and-play syntax highlighting (+ Markdown)
+
+- Requires: NO BLOCKERS
+- Detail: Today only TOML highlighting is hardcoded in the editor
+  (`toml_row_spans` in app). Extract a highlighter interface — a trait/registry
+  keyed by extension that turns a logical line (with some cross-line state, e.g.
+  inside a fenced block) into coloured spans — so file types are added as small
+  modules. Live in core (headless, testable) so the editor and the browser's
+  text-preview share it. Add **Markdown**; use the theme palette for colours (see
+  the Markdown-formatting entry). Later: consider LSP-backed semantic highlight,
+  but keep the simple rule-based path for the common case.
+- Reason: expand language support over time as little modules; requested.
+
+---
+
+[2026-09-29@6641e98] Markdown formatting in the editor
+
+- Requires: the syntax-highlighter interface above
+- Detail: Render Markdown with style while keeping it editable. Default to a
+  **mixed** style: `*italic*` shows italic AND keeps the asterisks; `**bold**`
+  shows bold AND keeps both markers; headers styled but the `#` still shown (a
+  green-ish `#` from the palette). A toggle button switches mixed ↔ fully-formatted
+  (markers hidden). Highlight links; a Markdown feature checks whether a link/image
+  target exists (local file on disk, or a reachable URL) and flags broken ones with
+  error feedback. Needs glyphon `Attrs::style(Italic)`/`weight(Bold)` per span and
+  inline error markers.
+- Reason: nicer Markdown editing; requested.
+
+---
+
+[2026-09-29@6641e98] Plugin/panel architecture (major refactor)
+
+- Requires: NO BLOCKERS (large; do a design spike first)
+- Detail: Generalise a *surface* into a panel plugin: the app owns the window,
+  GPU, font atlas, layout and input routing; a plugin is handed a panel to paint
+  (immediate-mode: it emits quads + shaped-text/spans via provided helpers each
+  frame) and receives callbacks — resize, focus, key, mouse (wheel/click/drag).
+  App keybindings are recognised first; unhandled input falls through to the
+  focused plugin. First-party plugins: terminal, editor, file browser (reimplement
+  on the same API so they obey identical rules). Expose reusable library helpers
+  (text shaping via the shared FontSystem, the row_cache, rect/quad, hit-testing,
+  the input box, fuzzy). Future plugins: a Git GUI; an embedded Chromium (CEF) —
+  prefer a Rust API for plugins, keep CEF as an option for heavy/third-party ones.
+  CONSTRAINTS to respect (answering "what can't fit"): the FontSystem + glyph atlas
+  must stay on the render thread, so plugins cannot own their own FontSystem —
+  they shape through provided helpers; a plugin doing heavy work (VT parse, media
+  decode) must run it off the UI thread and publish snapshots (as the terminal's
+  `ThreadedTerminal` already does), or it will stall the frame; an immediate-mode
+  paint API is fine for Rust in-process plugins, but a CEF/browser panel composits
+  its own surface (extra copy) — acceptable for non-hot panels, not for the
+  terminal. Nothing here fundamentally blocks the architecture; the perf rule is
+  "keep parsing/decoding off the render thread and shape through the shared atlas".
+- Reason: build features (Git GUI, browser, more) as uniform plugins over time.
+
+---
+
+[2026-09-29@6641e98] Extract one shared scroll/shape pipeline
+
+- Requires: NO BLOCKERS
+- Detail: The content-keyed `row_cache` is shared (terminal, editor, browser), but
+  the scroll pacing (frame-clock throttle, per-frame shaping budget, stale-key
+  fallback) is wired per surface in `window.rs`. Extract a single reusable
+  "scrollable shaped-row list" helper (viewport + row_cache + budget + placement
+  emission) that all row-based surfaces use, with surface-specific hooks only where
+  needed (e.g. the terminal's grid snapshot). Ties into the plugin library helpers.
+- Reason: one scroll-optimisation path; the browser proved the win, don't fork it.
