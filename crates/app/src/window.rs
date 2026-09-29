@@ -485,6 +485,8 @@ struct State {
     browser_views: Vec<BrowserView>,
     /// Last browser row click (time + path), for double-click detection.
     browser_last_click: Option<(Instant, std::path::PathBuf)>,
+    /// Path-autocomplete suggestion hit rects this frame: (rect, surface, path, is_dir).
+    browser_suggest_hits: Vec<(Rect, SurfaceId, std::path::PathBuf, bool)>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -663,6 +665,9 @@ enum ButtonAction {
     /// Toggle a file browser's show-hidden / show-gitignored filters.
     BrowserToggleHidden(SurfaceId),
     BrowserToggleIgnored(SurfaceId),
+    /// Cycle the git-status filter / toggle the recently-modified filter.
+    BrowserCycleGit(SurfaceId),
+    BrowserToggleRecent(SurfaceId),
     /// Move a file browser up to its parent directory.
     BrowserParent(SurfaceId),
 }
@@ -849,6 +854,7 @@ impl State {
             browser_scroll: HashMap::new(),
             browser_views: Vec::new(),
             browser_last_click: None,
+            browser_suggest_hits: Vec::new(),
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -1215,6 +1221,16 @@ impl State {
                     b.set_show_gitignored(!v);
                 }
             }
+            ButtonAction::BrowserCycleGit(sid) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    b.cycle_git_filter();
+                }
+            }
+            ButtonAction::BrowserToggleRecent(sid) => {
+                if let Some(b) = self.app.browser_mut(sid) {
+                    b.toggle_recent(std::time::Duration::from_secs(7 * 24 * 3600));
+                }
+            }
             ButtonAction::BrowserParent(sid) => {
                 if let Some(b) = self.app.browser_mut(sid) {
                     b.go_to_parent();
@@ -1333,6 +1349,23 @@ impl State {
             // a directory expands/collapses, a file opens in an editor tab.
             if let Some(vtab) = self.app.tree.vtab_mut(vt) {
                 vtab.focused_pane = pid;
+            }
+            // A click on an autocomplete suggestion navigates (dir) or opens (file).
+            if let Some((_, ssid, spath, sdir)) = self
+                .browser_suggest_hits
+                .iter()
+                .find(|(r, _, _, _)| rect_contains(*r, x, y))
+                .cloned()
+            {
+                if sdir {
+                    if let Some(b) = self.app.browser_mut(ssid) {
+                        b.set_root(spath);
+                    }
+                } else {
+                    self.app.open_file_in_focused(spath);
+                }
+                self.dirty = true;
+                return;
             }
             if let Some((bsid, path, is_dir)) = self.browser_row_at(x, y) {
                 if is_dir {
@@ -2395,15 +2428,19 @@ impl State {
             .browser_mut(sid)
             .map(|b| b.rows().to_vec())
             .unwrap_or_default();
-        let (root_disp, show_hidden, show_ignored, query) = match self.app.browser(sid) {
-            Some(b) => (
-                b.root().display().to_string(),
-                b.show_hidden(),
-                b.show_gitignored(),
-                b.query().to_string(),
-            ),
-            None => return,
-        };
+        let (root_disp, show_hidden, show_ignored, query, git_label, git_on, recent_on) =
+            match self.app.browser(sid) {
+                Some(b) => (
+                    b.root().display().to_string(),
+                    b.show_hidden(),
+                    b.show_gitignored(),
+                    b.query().to_string(),
+                    b.git_filter().label(),
+                    b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
+                    b.recent_on(),
+                ),
+                None => return,
+            };
 
         // Header background.
         quads.push(rect_quad(
@@ -2445,6 +2482,8 @@ impl State {
         for (label, on, action) in [
             ("hidden", show_hidden, ButtonAction::BrowserToggleHidden(sid)),
             (".gitignore", show_ignored, ButtonAction::BrowserToggleIgnored(sid)),
+            (git_label, git_on, ButtonAction::BrowserCycleGit(sid)),
+            ("recent", recent_on, ButtonAction::BrowserToggleRecent(sid)),
         ] {
             let w = label.chars().count() as f32 * self.cell_w;
             let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
@@ -2550,6 +2589,58 @@ impl State {
                 color,
             });
             bidx += 1;
+        }
+
+        // Path autocomplete: when the input reads as a path, show a completion
+        // dropdown over the top of the list.
+        let is_path = !query.is_empty()
+            && self.app.browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
+        if is_path {
+            let sugg: Vec<std::path::PathBuf> = self
+                .app
+                .browser(sid)
+                .map(|b| b.suggestions(&query))
+                .unwrap_or_default();
+            let shown = sugg.len().min(8);
+            if shown > 0 {
+                let panel = Rect {
+                    x: list.x,
+                    y: list.y,
+                    w: list.w,
+                    h: shown as f32 * row_h + 2.0 * scale,
+                };
+                quads.push(rect_quad(panel, sw, sh, self.chrome.sidebar, 1.0));
+                push_border(quads, panel, sw, sh, self.chrome.accent);
+                for (i, p) in sugg.iter().take(shown).enumerate() {
+                    let ry = list.y + i as f32 * row_h;
+                    let is_dir = p.is_dir();
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let label = if is_dir { format!("{name}/") } else { name };
+                    let row_rect = Rect { x: panel.x, y: ry, w: panel.w, h: row_h };
+                    if rect_contains(row_rect, self.cursor.0, self.cursor.1) {
+                        quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+                    }
+                    let _ = self.shape_browser(bidx, &label, Family::Monospace, panel.w - pad * 2.0);
+                    self.browser_placements.push(Placement {
+                        idx: bidx,
+                        left: panel.x + pad,
+                        top: ry + (row_h - ch) * 0.5,
+                        bounds: TextBounds {
+                            left: panel.x as i32,
+                            top: panel.y as i32,
+                            right: (panel.x + panel.w) as i32,
+                            bottom: (panel.y + panel.h) as i32,
+                        },
+                        color: if is_dir { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
+                    });
+                    bidx += 1;
+                    self.browser_suggest_hits
+                        .push((row_rect, sid, p.clone(), is_dir));
+                }
+            }
         }
 
         if focus_border {
@@ -3072,19 +3163,44 @@ impl State {
                     b.set_query(q);
                 }
             }
-            WKey::Named(NamedKey::Enter) => {
-                let top = self
-                    .app
-                    .browser_mut(sid)
-                    .and_then(|b| b.rows().first().cloned());
-                if let Some(r) = top {
-                    if r.is_dir {
-                        if let Some(b) = self.app.browser_mut(sid) {
-                            b.toggle_dir(&r.path);
-                            b.set_query("");
-                        }
+            WKey::Named(NamedKey::Tab) => {
+                // Path mode: complete the input to the first suggestion.
+                let comp = self.app.browser(sid).and_then(|b| {
+                    if b.input_is_path() {
+                        b.first_completion()
                     } else {
-                        self.app.open_file_in_focused(r.path);
+                        None
+                    }
+                });
+                if let Some(c) = comp {
+                    if let Some(b) = self.app.browser_mut(sid) {
+                        b.set_query(c);
+                    }
+                }
+            }
+            WKey::Named(NamedKey::Enter) => {
+                // Path mode navigates (or opens a typed file); filter mode opens the
+                // top match.
+                let path_mode = self.app.browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
+                if path_mode {
+                    let file = self.app.browser_mut(sid).and_then(|b| b.navigate_input());
+                    if let Some(f) = file {
+                        self.app.open_file_in_focused(f);
+                    }
+                } else {
+                    let top = self
+                        .app
+                        .browser_mut(sid)
+                        .and_then(|b| b.rows().first().cloned());
+                    if let Some(r) = top {
+                        if r.is_dir {
+                            if let Some(b) = self.app.browser_mut(sid) {
+                                b.toggle_dir(&r.path);
+                                b.set_query("");
+                            }
+                        } else {
+                            self.app.open_file_in_focused(r.path);
+                        }
                     }
                 }
             }
@@ -3961,6 +4077,7 @@ impl State {
         self.empty_placements.clear();
         self.browser_placements.clear();
         self.browser_views.clear();
+        self.browser_suggest_hits.clear();
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
         self.close_buffer.set_metrics(metrics);

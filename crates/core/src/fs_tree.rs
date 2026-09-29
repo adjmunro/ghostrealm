@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::fuzzy;
 
@@ -33,6 +33,46 @@ struct WalkEntry {
     is_dir: bool,
     size: u64,
     mtime: Option<SystemTime>,
+}
+
+/// Git working-tree state of a file, for the git filter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GitState {
+    /// Tracked and changed (staged and/or in the worktree).
+    modified: bool,
+    /// Not tracked by git.
+    untracked: bool,
+}
+
+/// The git-status filter for a browser view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitFilter {
+    /// No git filtering.
+    All,
+    /// Only tracked files with staged/worktree changes.
+    Modified,
+    /// Only untracked files.
+    Untracked,
+}
+
+impl GitFilter {
+    /// Cycle All → Modified → Untracked → All.
+    pub fn next(self) -> Self {
+        match self {
+            GitFilter::All => GitFilter::Modified,
+            GitFilter::Modified => GitFilter::Untracked,
+            GitFilter::Untracked => GitFilter::All,
+        }
+    }
+
+    /// A short label for a header control.
+    pub fn label(self) -> &'static str {
+        match self {
+            GitFilter::All => "git: all",
+            GitFilter::Modified => "git: modified",
+            GitFilter::Untracked => "git: untracked",
+        }
+    }
 }
 
 /// A row in the flattened visible tree, ready to render.
@@ -68,6 +108,15 @@ pub struct FsTree {
     /// The recursive walk for filter mode, built once and re-scored per keystroke;
     /// cleared when the root or a toggle changes.
     walk_cache: Option<Vec<WalkEntry>>,
+    /// Show only files whose git status matches (directories always pass).
+    git_filter: GitFilter,
+    /// Show only files modified within this window (directories always pass).
+    recent: Option<Duration>,
+    /// Show only files with this extension (lowercase, no dot); directories pass.
+    ext: Option<String>,
+    /// Git status per absolute path, built lazily when a git filter is active;
+    /// cleared when the root changes or on refresh.
+    git_status: Option<HashMap<PathBuf, GitState>>,
     /// Memoised flattened rows; recomputed only when `dirty`.
     rows_cache: Vec<FileRow>,
     dirty: bool,
@@ -83,6 +132,10 @@ impl FsTree {
             expanded: BTreeSet::new(),
             cache: HashMap::new(),
             walk_cache: None,
+            git_filter: GitFilter::All,
+            recent: None,
+            ext: None,
+            git_status: None,
             rows_cache: Vec::new(),
             dirty: true,
         }
@@ -98,6 +151,7 @@ impl FsTree {
         self.expanded.clear();
         self.cache.clear();
         self.walk_cache = None;
+        self.git_status = None;
         self.query.clear();
         self.dirty = true;
     }
@@ -166,6 +220,38 @@ impl FsTree {
     pub fn refresh(&mut self) {
         self.cache.clear();
         self.walk_cache = None;
+        self.git_status = None;
+        self.dirty = true;
+    }
+
+    pub fn git_filter(&self) -> GitFilter {
+        self.git_filter
+    }
+
+    /// Advance the git-status filter (All → Modified → Untracked → All).
+    pub fn cycle_git_filter(&mut self) {
+        self.git_filter = self.git_filter.next();
+        self.dirty = true;
+    }
+
+    /// Whether the "recently modified" filter is on.
+    pub fn recent_on(&self) -> bool {
+        self.recent.is_some()
+    }
+
+    /// Toggle the "modified within `dur`" filter.
+    pub fn toggle_recent(&mut self, dur: Duration) {
+        self.recent = if self.recent.is_some() { None } else { Some(dur) };
+        self.dirty = true;
+    }
+
+    pub fn ext_filter(&self) -> Option<&str> {
+        self.ext.as_deref()
+    }
+
+    /// Restrict to files with `ext` (no dot); `None`/empty clears it.
+    pub fn set_ext_filter(&mut self, ext: Option<String>) {
+        self.ext = ext.filter(|e| !e.is_empty()).map(|e| e.trim_start_matches('.').to_lowercase());
         self.dirty = true;
     }
 
@@ -174,7 +260,12 @@ impl FsTree {
     /// score-ranked list of matches walked from the root.
     pub fn rows(&mut self) -> &[FileRow] {
         if self.dirty {
-            self.rows_cache = if self.query.trim().is_empty() {
+            if self.git_filter != GitFilter::All {
+                self.ensure_git_status();
+            }
+            self.rows_cache = if self.query.trim().is_empty() || self.input_is_path() {
+                // A path-like input drives the completion dropdown, not a filter, so
+                // the tree keeps showing the current root while the user types.
                 self.browse_rows()
             } else {
                 self.ensure_walk();
@@ -183,6 +274,141 @@ impl FsTree {
             self.dirty = false;
         }
         &self.rows_cache
+    }
+
+    /// Whether the git/recent/type filters are all off.
+    pub fn filters_active(&self) -> bool {
+        self.git_filter != GitFilter::All || self.recent.is_some() || self.ext.is_some()
+    }
+
+    /// Whether a file (not a directory) passes the git/recent/type filters.
+    /// Directories always pass so the tree stays navigable.
+    fn file_passes(&self, path: &Path, mtime: Option<SystemTime>) -> bool {
+        if let Some(dur) = self.recent {
+            let recent = mtime
+                .and_then(|t| t.elapsed().ok())
+                .map(|e| e <= dur)
+                .unwrap_or(false);
+            if !recent {
+                return false;
+            }
+        }
+        if let Some(ext) = &self.ext {
+            let matches = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case(ext))
+                .unwrap_or(false);
+            if !matches {
+                return false;
+            }
+        }
+        match self.git_filter {
+            GitFilter::All => {}
+            GitFilter::Modified => {
+                if !self.git_state(path).modified {
+                    return false;
+                }
+            }
+            GitFilter::Untracked => {
+                if !self.git_state(path).untracked {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn git_state(&self, path: &Path) -> GitState {
+        self.git_status
+            .as_ref()
+            .and_then(|m| m.get(path))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Run `git status --porcelain` for the repo containing the root and record a
+    /// per-path state. A non-repo (or git failure) yields an empty map.
+    fn ensure_git_status(&mut self) {
+        if self.git_status.is_some() {
+            return;
+        }
+        let mut map: HashMap<PathBuf, GitState> = HashMap::new();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["status", "--porcelain", "--no-renames"])
+            .output();
+        if let Ok(out) = out {
+            if out.status.success() {
+                // Resolve the repo top-level so porcelain paths (repo-relative) map
+                // to absolute paths.
+                let top = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(["rev-parse", "--show-toplevel"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                    .unwrap_or_else(|| self.root.clone());
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if line.len() < 4 {
+                        continue;
+                    }
+                    let code = &line[..2];
+                    let rel = line[3..].trim();
+                    let abs = top.join(rel);
+                    let untracked = code == "??";
+                    map.insert(
+                        abs,
+                        GitState {
+                            modified: !untracked,
+                            untracked,
+                        },
+                    );
+                }
+            }
+        }
+        self.git_status = Some(map);
+    }
+
+    /// Whether the current input reads as a path (drives autocomplete/navigation)
+    /// rather than a fuzzy filter. A leading `~`, `/`, `.` or any `/` means path.
+    pub fn input_is_path(&self) -> bool {
+        let q = self.query.trim_start();
+        q.starts_with('~') || q.starts_with('/') || q.starts_with('.') || q.contains('/')
+    }
+
+    /// Act on the current path-like input. If it names an existing file, return it
+    /// (the caller opens it). Otherwise navigate to it (the input itself if it is a
+    /// directory, else its nearest existing parent) and return `None`.
+    pub fn navigate_input(&mut self) -> Option<PathBuf> {
+        let p = expand_tilde(self.query.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+        let dir = if p.is_dir() {
+            Some(p.clone())
+        } else {
+            p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf)
+        };
+        if let Some(d) = dir {
+            self.set_root(d);
+        }
+        None
+    }
+
+    /// The first path completion for the current input (for Tab-complete), with a
+    /// trailing `/` when it is a directory.
+    pub fn first_completion(&self) -> Option<String> {
+        self.suggestions(&self.query).into_iter().next().map(|p| {
+            let mut s = p.to_string_lossy().into_owned();
+            if p.is_dir() {
+                s.push('/');
+            }
+            s
+        })
     }
 
     /// Path completions for `input`: entries in the directory `input` names (or
@@ -243,6 +469,9 @@ impl FsTree {
     fn append_dir_rows(&mut self, dir: &Path, depth: usize, out: &mut Vec<FileRow>) {
         let entries = self.list_dir(dir);
         for e in entries {
+            if !e.is_dir && !self.file_passes(&e.path, e.mtime) {
+                continue;
+            }
             let expanded = e.is_dir && self.expanded.contains(&e.path);
             out.push(FileRow {
                 name: e.name.clone(),
@@ -309,6 +538,7 @@ impl FsTree {
         let entries = self.walk_cache.as_deref().unwrap_or(&[]);
         let mut scored: Vec<(i32, &WalkEntry)> = entries
             .iter()
+            .filter(|e| e.is_dir || self.file_passes(&e.path, e.mtime))
             .filter_map(|e| fuzzy::score(query, &e.name).map(|s| (s, e)))
             .collect();
         // Highest score first; ties broken by shorter path then name.
@@ -407,13 +637,16 @@ mod tests {
     use std::fs;
 
     fn tmpdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "ghostrealm-fstree-{}-{}",
+            "ghostrealm-fstree-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&base).unwrap();
         base
@@ -498,6 +731,40 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "Developer/xx"),
             "intermediate dirs don't match on the ancestor's name"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn ext_filter_limits_to_one_type_but_keeps_dirs() {
+        let d = tmpdir();
+        fs::write(d.join("a.rs"), "x").unwrap();
+        fs::write(d.join("b.txt"), "x").unwrap();
+        fs::create_dir(d.join("sub")).unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_ext_filter(Some("rs".into()));
+        let rows = t.rows();
+        assert!(rows.iter().any(|r| r.name == "a.rs"));
+        assert!(rows.iter().all(|r| r.name != "b.txt"), "other types hidden");
+        assert!(rows.iter().any(|r| r.name == "sub"), "directories stay visible");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn recent_filter_gates_by_mtime() {
+        let d = tmpdir();
+        fs::write(d.join("new.txt"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.toggle_recent(Duration::from_secs(0));
+        assert!(
+            t.rows().iter().all(|r| r.name != "new.txt"),
+            "a 0s window hides everything"
+        );
+        t.toggle_recent(Duration::from_secs(0)); // off
+        t.toggle_recent(Duration::from_secs(3600));
+        assert!(
+            t.rows().iter().any(|r| r.name == "new.txt"),
+            "a 1h window shows a just-created file"
         );
         fs::remove_dir_all(&d).ok();
     }
