@@ -1317,6 +1317,7 @@ impl State {
         {
             if self.browser_completion.get(&sid) != Some(&idx) {
                 self.browser_completion.insert(sid, idx);
+                self.dirty = true;
                 return true;
             }
             return false;
@@ -1325,6 +1326,7 @@ impl State {
         if let Some((sid, idx, _, _)) = self.browser_row_at(x, y) {
             if self.browser_sel.get(&sid) != Some(&idx) {
                 self.browser_sel.insert(sid, idx);
+                self.dirty = true;
                 return true;
             }
         }

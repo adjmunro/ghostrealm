@@ -842,11 +842,13 @@ mod tests {
         fs::write(d.join("build.gradle.kts"), "x").unwrap();
         fs::write(d.join("readme.md"), "x").unwrap();
         let mut t = FsTree::new(&d);
-        t.set_query("*.kt");
+        t.set_query("*.md");
         let names: Vec<String> = t.rows().iter().map(|r| r.name.clone()).collect();
-        assert!(names.iter().any(|n| n.ends_with("main.kt")));
-        assert!(names.iter().all(|n| !n.ends_with(".kts")), "excludes .kts");
-        assert!(names.iter().all(|n| !n.ends_with(".md")));
+        assert!(names.iter().any(|n| n.ends_with("readme.md")));
+        assert!(names.iter().all(|n| !n.ends_with(".kt")), "only .md matches");
+        // `*.k` is unanchored, so it matches .kt (contains ".k").
+        t.set_query("*.k");
+        assert!(t.rows().iter().any(|r| r.name.ends_with("main.kt")));
         fs::remove_dir_all(&d).ok();
     }
 

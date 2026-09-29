@@ -92,14 +92,10 @@ fn score_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i3
 }
 
 /// Match a `*`-wildcard `query`: the segments between stars must appear, in order,
-/// as contiguous substrings. A query not starting with `*` anchors its first
-/// segment to the start. The end is anchored only for a leading-`*` pattern with no
-/// trailing `*` (so `*.kt` matches `main.kt` but not `build.gradle.kts`); a pattern
-/// that starts with a literal (e.g. `foo*bar`) has an implied trailing `*`, so
-/// `bar` need not be at the end. Returns a score and the matched char indices.
+/// as contiguous substrings anywhere in the candidate — an implied wildcard at both
+/// ends. So `*.k` matches `main.kt` (contains `.k`), `foo*bar` matches `foobarbaz`,
+/// and a bare `*` matches everything. Returns a score and the matched char indices.
 fn wildcard_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<(i32, Vec<usize>)> {
-    let anchored_start = !query.starts_with('*');
-    let anchored_end = !query.ends_with('*') && !anchored_start;
     let segs: Vec<Vec<char>> = query
         .split('*')
         .filter(|s| !s.is_empty())
@@ -107,32 +103,13 @@ fn wildcard_cased(query: &str, candidate: &str, case_sensitive: bool) -> Option<
         .collect();
     let c = fold(candidate, case_sensitive);
     if segs.is_empty() {
-        return Some((0, Vec::new())); // bare "*" matches everything
+        return Some((0, Vec::new()));
     }
-    let n = segs.len();
     let mut pos = 0usize;
     let mut indices: Vec<usize> = Vec::new();
     let mut first = None;
-    for (i, seg) in segs.iter().enumerate() {
-        let at = if i == 0 && anchored_start {
-            if c.len() >= seg.len() && c[..seg.len()] == seg[..] {
-                0
-            } else {
-                return None;
-            }
-        } else if i == n - 1 && anchored_end {
-            if c.len() < seg.len() {
-                return None;
-            }
-            let start = c.len() - seg.len();
-            if start >= pos && c[start..] == seg[..] {
-                start
-            } else {
-                return None;
-            }
-        } else {
-            find_sub(&c, seg, pos)?
-        };
+    for seg in &segs {
+        let at = find_sub(&c, seg, pos)?;
         if first.is_none() {
             first = Some(at);
         }
@@ -196,22 +173,17 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_anchors_and_matches() {
+    fn wildcard_is_unanchored_contains_in_order() {
         use super::match_smart;
-        // *.kt ends with .kt, so it excludes .kts.
+        // Implied wildcard at both ends: segments just need to appear in order.
+        assert!(match_smart("*.k", "main.kt").is_some(), "*.k matches .kt files");
         assert!(match_smart("*.kt", "main.kt").is_some());
-        assert!(match_smart("*.kt", "build.gradle.kts").is_none());
-        // *foo* matches anywhere; a*b needs a then b in order, contiguous segments.
         assert!(match_smart("*out*", "checkout.rs").is_some());
         assert!(match_smart("a*b", "axxb").is_some());
-        assert!(match_smart("a*b", "bxa").is_none());
-        // Leading anchor: "src*" must start with src.
-        assert!(match_smart("src*", "src/main.rs").is_some());
-        assert!(match_smart("src*", "my/src").is_none());
-        // A literal-led middle wildcard has an implied trailing wildcard, so the
-        // last segment need not be at the end.
-        assert!(match_smart("a*b", "axxbyy").is_some());
+        assert!(match_smart("a*b", "bxa").is_none(), "order matters");
         assert!(match_smart("foo*bar", "foobarbaz").is_some());
+        assert!(match_smart("src*", "my/src").is_some(), "no start anchor");
+        assert!(match_smart("*.md", "main.kt").is_none());
     }
 
     #[test]
