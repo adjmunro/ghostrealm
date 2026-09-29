@@ -17,7 +17,7 @@ use ghostrealm_core::{
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
-use crate::editor::EditorBuffer;
+use crate::plugins::editor::EditorBuffer;
 use crate::plugin::{OpenCx, Plugin, View};
 use crate::plugins::file_browser::{self, FileBrowserView};
 

@@ -1,6 +1,7 @@
 //! The first-party plugins, built on the same [`crate::plugin`] API any other
 //! plugin uses.
 
+pub mod editor;
 pub mod file_browser;
 
 use crate::plugin::Plugin;

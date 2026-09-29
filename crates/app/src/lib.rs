@@ -5,7 +5,6 @@
 
 pub mod agent;
 pub mod app_state;
-pub mod editor;
 pub mod plugin;
 pub mod plugins;
 pub mod row_cache;
