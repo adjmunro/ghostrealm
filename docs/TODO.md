@@ -526,8 +526,9 @@
   `EventCx` + request queue, headless test harness; terminal, editor, and file
   browser are plugins; the picker and `<id>.new` commands come from the registry;
   files open with the first plugin that claims the path (PLUGINS.md). Remaining:
-  (1) move the app's own chrome (sidebar, tab strips, palette, menu, empty-pane
-  picker) onto `PaintCx`, retiring its per-widget buffer pools; (2) extract the API
+  (1) move the rest of the app's own chrome (sidebar, tab strips, palette,
+  menu) onto `PaintCx` as the empty-pane picker and dir picker already are,
+  retiring their per-widget buffer pools; (2) extract the API
   into its own crate for out-of-tree Rust plugins — needs commands registered
   against a trait rather than `Registry<AppState>`; (3) per-plugin config sections
   (today first-party plugins read typed fields on `core::Config`); (4) view-scoped

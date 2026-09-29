@@ -30,7 +30,7 @@ use winit::window::{Window, WindowId};
 use crate::app_state::{build_registry, AppState, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
+    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
     TextKit, TextSrc, UiMetrics, View,
 };
 use crate::tap::TapDetector;
@@ -403,9 +403,6 @@ struct State {
     title_buffer: Buffer,
     /// Where to draw the title-bar label this frame (set by `build_titlebar`).
     title_place: Option<Placement>,
-    /// Text buffers + placements for the empty-workspace ("nothing open") screen.
-    empty_buffers: Vec<Buffer>,
-    empty_placements: Vec<Placement>,
     /// The floating directory picker's panel rect this frame (for click-outside).
     picker_panel: Option<Rect>,
     /// The last left press (time, position, click count), for counting
@@ -709,8 +706,6 @@ impl State {
             toggle_place: None,
             title_buffer,
             title_place: None,
-            empty_buffers: Vec::new(),
-            empty_placements: Vec::new(),
             picker_panel: None,
             last_press: None,
             mouse_capture: None,
@@ -1732,28 +1727,6 @@ impl State {
         });
     }
 
-    /// Shape `text` into `empty_buffers[idx]` (growing the pool) at the given box
-    /// width and return its shaped width, so the caller can centre it. Colour comes
-    /// from the placement's `default_color` in the text pass.
-    fn shape_empty(&mut self, idx: usize, text: &str, family: Family, width_box: f32) -> f32 {
-        let m = self.metrics();
-        while self.empty_buffers.len() <= idx {
-            let b = Buffer::new(&mut self.text.font_system, m);
-            self.empty_buffers.push(b);
-        }
-        let buf = &mut self.empty_buffers[idx];
-        buf.set_metrics(m);
-        buf.set_size(Some(width_box.max(1.0)), Some(self.cell_h));
-        buf.set_rich_text(
-            std::iter::once((text, Attrs::new().family(family))),
-            &Attrs::new().family(family),
-            Shaping::Advanced,
-            None,
-        );
-        buf.shape_until_scroll(&mut self.text.font_system, false);
-        buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
-    }
-
     /// The "nothing open" picker's options as `(plugin id, title)`, in order
     /// (their 1-based index is the key that opens them).
     fn pickable_plugins(&self) -> Vec<(&'static str, &'static str)> {
@@ -1766,17 +1739,31 @@ impl State {
     }
 
     /// Draw the empty-workspace ("nothing open") screen in `rect`: a heading, a
-    /// button per openable surface kind (with its shortcut), and a close hint.
-    /// Buttons run their registry command in the focused (empty) pane.
-    fn build_empty_pane(&mut self, rect: Rect, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) {
-        quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
-
-        let scale = self.scale;
-        let ch = self.cell_h;
-        let sans = Family::SansSerif;
+    /// numbered button per pickable plugin, and a close hint. Buttons open that
+    /// plugin in the focused (empty) pane.
+    fn build_empty_pane(&mut self, frame: &mut Frame, rect: Rect) {
         let options = self.pickable_plugins();
-        let n = options.len() as f32;
+        let hint = match self.cfg.binding_for("pane.close") {
+            Some(c) => format!("{}  closes this workspace", pretty_chord(&c)),
+            None => "Close this workspace from the palette".to_string(),
+        };
+        let ui = self.ui();
+        let (scale, ch) = (ui.scale, ui.cell_h);
+        // The buttons here are the app's (pushed to `self.buttons`), so the
+        // context's view-button owner is never used.
+        let mut cx = PaintCx::new(
+            &self.cfg,
+            &self.chrome,
+            ui,
+            self.cursor,
+            &mut self.text,
+            frame,
+            Layer::Base,
+            PICKER_SID,
+        );
+        cx.fill(rect, cx.chrome.background);
 
+        let n = options.len() as f32;
         let btn_w = (rect.w * 0.6)
             .clamp(180.0 * scale, 380.0 * scale)
             .min((rect.w - 24.0 * scale).max(1.0));
@@ -1785,75 +1772,33 @@ impl State {
         let heading_gap = 18.0 * scale;
         let hint_gap = 20.0 * scale;
         let total = ch + heading_gap + n * btn_h + (n - 1.0) * gap + hint_gap + ch;
-        let cx = rect.x + rect.w * 0.5;
-        let bx = cx - btn_w * 0.5;
+        let centre = rect.x + rect.w * 0.5;
+        let bx = centre - btn_w * 0.5;
         let pad = 12.0 * scale;
-        let full_bounds = TextBounds {
-            left: rect.x as i32,
-            top: rect.y as i32,
-            right: (rect.x + rect.w) as i32,
-            bottom: (rect.y + rect.h) as i32,
-        };
-
         let mut y = rect.y + (rect.h - total).max(0.0) * 0.5;
-        let mut idx = 0usize;
 
-        // Heading.
-        let hw = self.shape_empty(idx, "Nothing open", sans, rect.w);
-        self.empty_placements.push(Placement {
-            idx,
-            left: cx - hw * 0.5,
-            top: y,
-            bounds: full_bounds,
-            color: theme::TITLE,
-        });
-        idx += 1;
+        let heading = cx.shape("Nothing open", Font::SANS, rect.w);
+        cx.place(heading, centre - heading.width * 0.5, y, rect, theme::TITLE);
         y += ch + heading_gap;
 
-        // One button per openable kind, numbered so the matching key opens it.
+        // One button per plugin, numbered (0 for the tenth) so that key opens it.
         for (i, (id, label)) in options.into_iter().enumerate() {
             let hit = Rect { x: bx, y, w: btn_w, h: btn_h };
-            let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
-            quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
+            let hovered = cx.hovered(hit);
+            cx.fill(hit, cx.chrome.sidebar);
             if hovered {
-                quads.push(rect_quad(hit, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
+                cx.highlight(hit);
             }
-            let label_color = if hovered { theme::LABEL_HOVER } else { theme::LABEL };
-            let btn_bounds = TextBounds {
-                left: bx as i32,
-                top: y as i32,
-                right: (bx + btn_w) as i32,
-                bottom: (y + btn_h) as i32,
-            };
-            // Leading number (1-based, 0 for the tenth) so the matching key opens it.
-            let num = (i + 1) % 10;
-            let _ = self.shape_empty(idx, &format!("{num}   {label}"), sans, btn_w - pad * 2.0);
-            self.empty_placements.push(Placement {
-                idx,
-                left: bx + pad,
-                top: y + (btn_h - ch) * 0.5,
-                bounds: btn_bounds,
-                color: label_color,
-            });
-            idx += 1;
+            let color = if hovered { theme::LABEL_HOVER } else { theme::LABEL };
+            let text = format!("{}   {label}", (i + 1) % 10);
+            cx.label(&text, Font::SANS, bx + pad, y + (btn_h - ch) * 0.5, hit, color);
             self.buttons.push((hit, ButtonAction::OpenPlugin(id)));
             y += btn_h + gap;
         }
 
-        // Close hint (⌘T adds a tab like this; ⌘W closes the workspace).
         y += hint_gap - gap;
-        let hint = match self.cfg.binding_for("pane.close") {
-            Some(c) => format!("{}  closes this workspace", pretty_chord(&c)),
-            None => "Close this workspace from the palette".to_string(),
-        };
-        let hw2 = self.shape_empty(idx, &hint, sans, rect.w);
-        self.empty_placements.push(Placement {
-            idx,
-            left: cx - hw2 * 0.5,
-            top: y,
-            bounds: full_bounds,
-            color: EMPTY_HINT,
-        });
+        let hint = cx.shape(&hint, Font::SANS, rect.w);
+        cx.place(hint, centre - hint.width * 0.5, y, rect, EMPTY_HINT);
     }
 
     /// Draw the floating directory picker overlay: a dim backdrop and a centred
@@ -2991,7 +2936,6 @@ impl State {
         // Close-button chrome: one shared '×' glyph placed at every tab/workspace
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
         self.buttons.clear();
-        self.empty_placements.clear();
         self.picker_panel = None;
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
@@ -3117,14 +3061,14 @@ impl State {
 
             let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
                 // No surface in this pane: draw the "nothing open" screen.
-                self.build_empty_pane(*term, sw, sh, &mut frame.bg);
+                self.build_empty_pane(&mut frame, *term);
                 continue;
             };
             let sid = *active_sid;
 
             // An empty tab shows the picker; a file browser tab shows the file browser.
             if self.app.surface_is_empty(sid) {
-                self.build_empty_pane(*term, sw, sh, &mut frame.bg);
+                self.build_empty_pane(&mut frame, *term);
                 continue;
             }
             if let Some(view) = self.app.view_mut(sid) {
@@ -3295,16 +3239,6 @@ impl State {
                 custom_glyphs: &[],
             });
         }
-        // Empty-workspace screen text.
-        text_areas.extend(self.empty_placements.iter().map(|p| TextArea {
-            buffer: &self.empty_buffers[p.idx],
-            left: p.left,
-            top: p.top,
-            scale: 1.0,
-            bounds: p.bounds,
-            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-            custom_glyphs: &[],
-        }));
         text_areas.extend(warm_area);
 
         self.text_renderer
