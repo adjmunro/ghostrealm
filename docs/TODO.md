@@ -428,31 +428,22 @@
 
 ---
 
-[2026-09-29@473f78a] File browser — floating directory picker + path box
+[2026-09-29@c259de1] File browser — remaining refinements
 
-- Requires: NO BLOCKERS (builds on `core::fs_tree::FsTree` + `build_file_browser`)
-- Detail: DONE: headless `FsTree`, an in-pane file browser (browse/expand,
-  hidden & .gitignore toggles, wheel scroll, fuzzy filter, click a dir to
-  expand / a file to open in an editor), and the ⌘T picker (Terminal / Editor /
-  File browser). REMAINING: (1) a FLOATING directory-picker overlay (like the
-  palette/menu) reusing the browser widget, wired to `workspace.set_root` so a
-  workspace's directory is chosen visually instead of typed. (2) A path text box
-  in the browser/picker header: type an explicit path (distinct from the fuzzy
-  filter) with `FsTree::suggestions` autocomplete + Tab/Enter to accept; Enter on
-  a dir navigates (`set_root`). Today the header input only fuzzy-filters.
-- Reason: the approved milestone-1 picker; typing full paths without completion
-  is the pain point the user called out.
-
----
-
-[2026-09-29@473f78a] File browser — advanced filters
-
-- Requires: NO BLOCKERS (FileRow already carries size + mtime)
-- Detail: Filter the browser by (a) git status (untracked / modified / staged /
-  clean), (b) date range on created and/or edited time (default last day/week,
-  with an explicit range), and (c) file type/extension. Surface as header
-  controls or filter tokens in the query box. Git status needs a per-entry
-  status source (git2 or `git status --porcelain` parsed once per root). Also
-  consider recursive fuzzy already walks the tree — extend ranking with these
-  facets.
-- Reason: the user's requested browsing power tools, deferred from milestone 1.
+- Requires: NO BLOCKERS
+- Detail: DONE: headless `FsTree`; in-pane browser (browse/expand, hidden &
+  .gitignore toggles, wheel scroll, fuzzy filter that matches names not ancestor
+  paths, single-click expands / double-click enters a dir / click a file opens an
+  editor); ⌘T picker (Terminal/Editor/File browser); path box with
+  `FsTree::suggestions` autocomplete (Tab completes, Enter navigates, click a
+  suggestion); git-status + recently-modified + file-type(ext) filters in the
+  core (git via `git status --porcelain`); the FLOATING directory picker
+  (`workspace.pick_dir`) reusing the browser, wired to the active workspace root.
+  REMAINING: (1) no header UI to SET the ext filter — `set_ext_filter` exists but
+  only git & recent have header buttons; add an ext control (or a `ext:rs` query
+  token). (2) show git status per row (a colour/badge), not just filter by it.
+  (3) date filter is a single "recent (7 days)" toggle — add an explicit range
+  and a created-vs-modified choice. (4) recursive fuzzy walk is capped at 20k
+  entries; revisit for very large roots. (5) nested `.gitignore` relies on the
+  `ignore` crate's parent lookup — confirm on a real repo.
+- Reason: the file-browser power tools; polish beyond the delivered basics.
