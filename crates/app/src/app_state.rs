@@ -12,19 +12,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
-    fs_tree::FsTree, ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId,
-    Registry, SurfaceId, TabStatus, Tree, VtabId,
+    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
+    TabStatus, Tree, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
 
 use crate::editor::EditorBuffer;
+use crate::plugin::{OpenCx, Plugin, View};
+use crate::plugins::file_browser::{self, FileBrowserView};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
 
-/// Reserved surface id for the floating directory picker's file browser. It lives
-/// in the `file_browsers` map like any file browser (so all file browser UI code applies) but is
-/// not a tree surface, so it never renders as a pane and is kept across prunes.
+/// Reserved surface id addressing the floating directory picker's file browser
+/// (e.g. as a button owner). The picker is not a tree surface, so it never
+/// renders as a pane and survives prunes.
 pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 
 /// The kinds of content a pane/tab can open (via the "nothing open" picker).
@@ -52,9 +54,13 @@ pub struct AppState {
     surfaces: HashMap<SurfaceId, ThreadedTerminal>,
     /// Surfaces whose content is a text editor rather than a terminal.
     editors: HashMap<SurfaceId, EditorBuffer>,
-    /// Surfaces whose content is a file browser. A surface in none of the three
-    /// maps is "empty" — it shows the open-something picker.
-    file_browsers: HashMap<SurfaceId, FsTree>,
+    /// Surfaces whose content is a plugin view. A surface with no terminal,
+    /// editor, or view is "empty" — it shows the open-something picker.
+    views: HashMap<SurfaceId, Box<dyn View>>,
+    /// Registered content kinds, in picker order.
+    plugins: Vec<Box<dyn Plugin>>,
+    /// The floating directory picker, while open.
+    dir_picker: Option<FileBrowserView>,
     /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
     shell_line: Option<String>,
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
@@ -81,7 +87,9 @@ impl AppState {
             tree: Tree::new(),
             surfaces: HashMap::new(),
             editors: HashMap::new(),
-            file_browsers: HashMap::new(),
+            views: HashMap::new(),
+            plugins: crate::plugins::builtin(),
+            dir_picker: None,
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -301,37 +309,71 @@ impl AppState {
                 self.tree.set_surface_title(sid, buf.title(), true);
                 self.editors.insert(sid, buf);
             }
-            OpenKind::FileBrowser => {
-                let root = self
-                    .resolve_cwd(vt)
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                self.tree.set_surface_title(sid, "Files", true);
-                self.file_browsers.insert(sid, FsTree::new(root));
-            }
+            OpenKind::FileBrowser => self.materialize_plugin(sid, vt, file_browser::ID)?,
         }
         Ok(())
     }
 
-    /// Whether `id` is an empty surface (no terminal, editor, or file browser yet).
+    /// Give an existing (empty) surface a fresh view from plugin `id`.
+    fn materialize_plugin(&mut self, sid: SurfaceId, vt: VtabId, id: &str) -> Result<()> {
+        let cx = OpenCx {
+            cwd: self.resolve_cwd(vt),
+            command: self.shell_line.clone(),
+            waker: self.waker.clone(),
+        };
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.id() == id)
+            .ok_or_else(|| anyhow::anyhow!("no plugin `{id}`"))?;
+        let view = plugin.open(&cx)?;
+        self.insert_view(sid, view);
+        Ok(())
+    }
+
+    /// Install `view` as surface `sid`'s content, titling its tab.
+    fn insert_view(&mut self, sid: SurfaceId, view: Box<dyn View>) {
+        if let Some(t) = view.title() {
+            self.tree.set_surface_title(sid, t, false);
+        }
+        self.views.insert(sid, view);
+    }
+
+    /// Open plugin `id` in the focused pane: fill the active empty slot in place
+    /// when there is one (the picker), otherwise add a new tab.
+    pub fn open_plugin_in_focused(&mut self, id: &str) -> Result<()> {
+        let Some((vt, pane)) = self.focused_pane() else {
+            return Ok(());
+        };
+        let target = match self.focused_surface() {
+            Some(sid) if self.surface_is_empty(sid) => Some(sid),
+            _ => self.tree.add_surface(vt, pane),
+        };
+        if let Some(sid) = target {
+            self.materialize_plugin(sid, vt, id)?;
+        }
+        Ok(())
+    }
+
+    /// Registered plugins, in picker order.
+    pub fn plugins(&self) -> &[Box<dyn Plugin>] {
+        &self.plugins
+    }
+
+    /// Surface `id`'s plugin view, if it has one.
+    pub fn view(&self, id: SurfaceId) -> Option<&dyn View> {
+        self.views.get(&id).map(|v| v.as_ref())
+    }
+
+    pub fn view_mut(&mut self, id: SurfaceId) -> Option<&mut (dyn View + 'static)> {
+        self.views.get_mut(&id).map(|v| v.as_mut())
+    }
+
+    /// Whether `id` is an empty surface (no content chosen yet).
     pub fn surface_is_empty(&self, id: SurfaceId) -> bool {
         !self.surfaces.contains_key(&id)
             && !self.editors.contains_key(&id)
-            && !self.file_browsers.contains_key(&id)
-    }
-
-    /// Whether `id` is a file-browser surface.
-    pub fn is_file_browser(&self, id: SurfaceId) -> bool {
-        self.file_browsers.contains_key(&id)
-    }
-
-    /// The file-browser model for `id`, if it is a file browser surface.
-    pub fn file_browser(&self, id: SurfaceId) -> Option<&FsTree> {
-        self.file_browsers.get(&id)
-    }
-
-    pub fn file_browser_mut(&mut self, id: SurfaceId) -> Option<&mut FsTree> {
-        self.file_browsers.get_mut(&id)
+            && !self.views.contains_key(&id)
     }
 
     /// Whether the focused pane shows the "nothing open" picker (an empty pane, or
@@ -341,13 +383,6 @@ impl AppState {
             None => self.focused_pane().is_some(),
             Some(sid) => self.surface_is_empty(sid),
         }
-    }
-
-    /// Whether the focused pane's active surface is a file browser.
-    pub fn focused_is_file_browser(&self) -> bool {
-        self.focused_surface()
-            .map(|s| self.is_file_browser(s))
-            .unwrap_or(false)
     }
 
     /// Open `path` in a new editor tab in the focused pane (from the file browser).
@@ -369,7 +404,12 @@ impl AppState {
 
     /// Whether the floating directory picker is open.
     pub fn dir_picker_open(&self) -> bool {
-        self.file_browsers.contains_key(&PICKER_SID)
+        self.dir_picker.is_some()
+    }
+
+    /// The floating directory picker's file browser, while open.
+    pub fn dir_picker_mut(&mut self) -> Option<&mut FileBrowserView> {
+        self.dir_picker.as_mut()
     }
 
     /// Open the floating directory picker rooted at the active workspace's dir
@@ -380,18 +420,18 @@ impl AppState {
             .and_then(|vt| self.resolve_cwd(vt))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.file_browsers.insert(PICKER_SID, FsTree::new(root));
+        self.dir_picker = Some(FileBrowserView::picker(root));
     }
 
     /// Close the floating directory picker.
     pub fn close_dir_picker(&mut self) {
-        self.file_browsers.remove(&PICKER_SID);
+        self.dir_picker = None;
     }
 
     /// Confirm the picker: pin the active workspace's root to the picker's current
     /// directory, then close it.
     pub fn confirm_dir_picker(&mut self) {
-        if let Some(root) = self.file_browsers.get(&PICKER_SID).map(|b| b.root().to_path_buf()) {
+        if let Some(root) = self.dir_picker.as_ref().map(|b| b.tree().root().to_path_buf()) {
             self.set_active_root_dir(root);
         }
         self.close_dir_picker();
@@ -570,9 +610,7 @@ impl AppState {
             .collect();
         self.surfaces.retain(|id, _| live.contains(id));
         self.editors.retain(|id, _| live.contains(id));
-        // The picker file browser is not a tree surface; keep it while it is open.
-        self.file_browsers
-            .retain(|id, _| live.contains(id) || *id == PICKER_SID);
+        self.views.retain(|id, _| live.contains(id));
     }
 
     pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
@@ -688,8 +726,11 @@ impl AppState {
         pane.active_surface().map(|s| s.id)
     }
 
-    /// Write raw bytes to a surface's terminal (agent-driven input).
+    /// Write raw bytes to a surface (agent-driven input).
     pub fn write_input(&mut self, id: SurfaceId, bytes: &[u8]) -> bool {
+        if let Some(v) = self.views.get_mut(&id) {
+            return v.write_input(bytes);
+        }
         match self.surfaces.get_mut(&id) {
             Some(t) => {
                 t.write_bytes(bytes);
@@ -716,20 +757,30 @@ impl AppState {
             None => false,
         };
         if sent && press.key == Key::Enter {
-            if let Some(vt) = self.active() {
-                let sticky = self
-                    .tree
-                    .vtab(vt)
-                    .map(|v| matches!(v.status, TabStatus::NeedsInput))
-                    .unwrap_or(false);
-                if !sticky {
-                    self.tree.set_status(vt, TabStatus::Busy);
-                    self.optimistic_busy
-                        .insert(vt, Instant::now() + OPTIMISTIC_BUSY_GRACE);
-                }
+            if let Some(sid) = self.focused_surface() {
+                self.mark_busy(sid);
             }
         }
         sent
+    }
+
+    /// Show surface `sid`'s workspace busy right away (work was just submitted),
+    /// holding it for a short grace until the real busy signal catches up. A
+    /// sticky needs-input status is left alone.
+    pub fn mark_busy(&mut self, sid: SurfaceId) {
+        let Some(vt) = self.vtab_of_surface(sid) else {
+            return;
+        };
+        let sticky = self
+            .tree
+            .vtab(vt)
+            .map(|v| matches!(v.status, TabStatus::NeedsInput))
+            .unwrap_or(false);
+        if !sticky {
+            self.tree.set_status(vt, TabStatus::Busy);
+            self.optimistic_busy
+                .insert(vt, Instant::now() + OPTIMISTIC_BUSY_GRACE);
+        }
     }
 
     /// Write raw bytes to the focused surface (e.g. a paste or a line-editing
@@ -803,6 +854,17 @@ impl AppState {
                 titles.push((*id, t));
             }
         }
+        for (id, view) in self.views.iter_mut() {
+            let pumped = view.pump(budget);
+            if pumped.changed {
+                changed = true;
+                changed_surfaces.push(*id);
+            }
+            more |= pumped.more;
+            if let Some(t) = view.title() {
+                titles.push((*id, t));
+            }
+        }
         for (id, title) in titles {
             self.tree.set_surface_title(id, title, false);
         }
@@ -871,18 +933,16 @@ impl AppState {
                     .iter()
                     .flat_map(|p| p.surfaces.iter())
                     .any(|s| {
-                        self.surfaces
-                            .get(&s.id)
-                            .map(|t| t.is_busy())
-                            .unwrap_or(false)
+                        self.surfaces.get(&s.id).map(|t| t.is_busy()).unwrap_or(false)
+                            || self.views.get(&s.id).is_some_and(|v| v.is_busy())
                     })
             })
             .unwrap_or(false)
     }
 
-    /// Whether a live surface (terminal or editor) exists for `id`.
+    /// Whether `id` has live content (not an empty surface).
     pub fn has_surface(&self, id: SurfaceId) -> bool {
-        self.surfaces.contains_key(&id) || self.editors.contains_key(&id)
+        !self.surface_is_empty(id)
     }
 
     /// Whether a surface's grid changed since it was last snapshotted.
@@ -929,8 +989,11 @@ impl AppState {
         out
     }
 
-    /// A text rendering of one surface's grid (pumps it first).
+    /// A text rendering of one surface's content (a terminal is pumped first).
     pub fn surface_text(&mut self, id: SurfaceId) -> Option<String> {
+        if let Some(v) = self.views.get_mut(&id) {
+            return v.text();
+        }
         let term = self.surfaces.get_mut(&id)?;
         term.pump();
         let grid = term.snapshot();
@@ -1103,17 +1166,6 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
-            "file_browser.new",
-            "New File Browser",
-            "Open a file browser in the focused pane",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.open_kind_in_focused(OpenKind::FileBrowser).map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
             "editor.open",
             "Open File in Editor",
             "Open a file in a text editor in the focused pane",
@@ -1171,6 +1223,9 @@ pub fn build_registry() -> Registry<AppState> {
         }),
     );
 
+    for plugin in crate::plugins::builtin() {
+        plugin.register_commands(&mut r);
+    }
     r
 }
 
@@ -1457,6 +1512,43 @@ mod tests {
             matches!(s.tree.vtab(vt).unwrap().status, TabStatus::Unread { .. }),
             "workspace.mark_unread should set the active tab unread"
         );
+    }
+
+    #[test]
+    fn file_browser_opens_as_a_plugin_view_in_the_empty_slot() {
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-fb");
+        std::fs::write(dir.join("hello.txt"), "x").unwrap();
+        s.set_default_dir(Some(dir.clone()));
+        s.new_empty_vtab();
+        let mut r = build_registry();
+        r.execute("file_browser.new", &ghostrealm_core::Args::new(), &mut s)
+            .expect("file_browser.new runs");
+        let sid = s.focused_surface().expect("the empty pane got a surface");
+        assert_eq!(s.view(sid).map(|v| v.plugin()), Some("file_browser"));
+        assert!(!s.surface_is_empty(sid));
+        let text = s.surface_text(sid).expect("a view reports its text");
+        assert!(text.contains("hello.txt"), "rooted at the workspace dir: {text}");
+        // A second open adds a tab rather than replacing the browser.
+        r.execute("file_browser.new", &ghostrealm_core::Args::new(), &mut s)
+            .unwrap();
+        assert_ne!(s.focused_surface(), Some(sid));
+    }
+
+    #[test]
+    fn dir_picker_confirm_pins_the_workspace_root() {
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-picker");
+        s.set_default_dir(Some(dir.clone()));
+        let vt = s.new_empty_vtab();
+        s.open_dir_picker();
+        assert!(s.dir_picker_open());
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        s.dir_picker_mut().unwrap().tree_mut().set_root(&sub);
+        s.confirm_dir_picker();
+        assert!(!s.dir_picker_open());
+        assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(sub.as_path()));
     }
 
     #[test]

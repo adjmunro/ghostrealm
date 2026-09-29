@@ -30,13 +30,15 @@ use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState, OpenKind, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::editor::Motion;
-use crate::row_cache::RowCache;
+use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
+use crate::plugin::{
+    rect_contains, theme, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
+    TextKit, TextSrc, UiMetrics, View,
+};
 use crate::tap::TapDetector;
 
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
-/// Focused-pane border thickness, in physical pixels.
-const BORDER: f32 = 2.0;
 /// How many command-palette matches to rank (the visible window scrolls through
 /// them).
 const PALETTE_SEARCH_CAP: usize = 100;
@@ -49,9 +51,6 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 /// background-only for this frame and finish on following frames, so a fast
 /// scroll into fresh content never stalls a frame on a burst of shaping.
 const SHAPE_BUDGET: Duration = Duration::from_millis(5);
-/// Shape at least this many missed rows per frame regardless of the time budget,
-/// so a backlog always makes forward progress even on an already-slow frame.
-const MIN_SHAPES_PER_FRAME: usize = 8;
 /// Max child-output bytes drained per surface per frame. Bounds VT-parse work so
 /// one burst can't stall a frame; the remainder is pumped on following frames.
 const PUMP_BUDGET: usize = 512 * 1024;
@@ -88,34 +87,12 @@ const TOML_HEADER: [u8; 3] = [220, 180, 120];
 const TOML_KEY: [u8; 3] = [130, 170, 225];
 const TOML_STRING: [u8; 3] = [170, 200, 140];
 const TOML_NUMBER: [u8; 3] = [200, 160, 220];
-/// Close-button ('×') glyph colour — dim so it reads as a secondary affordance,
-/// brighter under the cursor.
-const CLOSE_GLYPH: [u8; 3] = [140, 140, 155];
-const CLOSE_GLYPH_HOVER: [u8; 3] = [235, 235, 245];
-/// Highlight box drawn behind a clickable button on hover.
-const BUTTON_HOVER_BG: [u8; 3] = [255, 255, 255];
-const BUTTON_HOVER_ALPHA: f32 = 0.14;
-/// Sidebar "+ New workspace" label colour, brighter under the cursor.
-const NEW_VTAB_LABEL: [u8; 3] = [150, 150, 165];
-const NEW_VTAB_LABEL_HOVER: [u8; 3] = [210, 210, 220];
 /// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
 const TITLE_BAR_H: f32 = 28.0;
 /// Logical width reserved at the top-left for the macOS traffic-light buttons.
 const TRAFFIC_LIGHT_W: f32 = 76.0;
-/// Centred title-bar label colour.
-const TITLE_LABEL: [u8; 3] = [170, 170, 185];
-/// Empty-workspace screen: shortcut badge and dim hint colours.
-const EMPTY_SHORTCUT: [u8; 3] = [120, 120, 135];
+/// Empty-workspace screen: dim hint colour.
 const EMPTY_HINT: [u8; 3] = [110, 110, 125];
-/// File-browser input box: border and typed-text colours.
-const INPUT_BORDER: [u8; 3] = [80, 80, 95];
-const INPUT_TEXT: [u8; 3] = [225, 225, 235];
-/// File-browser row colours: normal file, dim (hidden), gold extension, and the
-/// fuzzy-match highlight. Directories use the theme accent token.
-const FILE_FG: [u8; 3] = [230, 230, 235];
-const HIDDEN_FG: [u8; 3] = [130, 130, 140];
-const EXT_FG: [u8; 3] = [212, 170, 90];
-const MATCH_FG: [u8; 3] = [245, 225, 90];
 /// Below this focused-pane width (logical px), the file browser opens files as tabs even
 /// when `[file_browser] open_in = "split"` (a split would be too cramped).
 const FILE_BROWSER_SPLIT_MIN_W: f32 = 560.0;
@@ -137,16 +114,6 @@ const ATLAS_WARM_GLYPHS: &str = concat!(
     "─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬",
     "█▀▄▌▐░▒▓▔▕■□▪▫●○◆◇•·…←↑→↓",
 );
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct QuadInstance {
-    /// Top-left in NDC.
-    pos: [f32; 2],
-    /// Width/height in NDC (height negative to grow downward).
-    size: [f32; 2],
-    color: [f32; 4],
-}
 
 /// Wakes the event loop when a terminal produces output, so we redraw on demand
 /// instead of polling (and reshaping) every frame.
@@ -323,9 +290,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Close-button hover highlight tracks the cursor everywhere.
                 redraw |= state.update_button_hover();
-                // A file browser's highlight follows the mouse (single highlight,
-                // shared with the keyboard — most recent input wins).
-                redraw |= state.update_file_browser_hover();
+                // Hover reaches the view under the cursor (e.g. the file browser's
+                // highlight follows the mouse).
+                redraw |= state.hover_view();
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -399,14 +366,13 @@ struct State {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
 
-    font_system: FontSystem,
+    /// The shared font system, content-keyed row cache, and per-frame scratch
+    /// text shared by the chrome and every view.
+    text: TextKit,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// Shaped terminal rows keyed by content, so scrolling and vtab/pane switching
-    /// reuse shaping instead of reshaping from scratch.
-    row_cache: RowCache,
     /// Last snapshot per surface, reused for idle surfaces so a still pane costs
     /// no snapshot; refreshed when the surface reports it changed or was resized.
     grid_cache: HashMap<SurfaceId, Grid>,
@@ -430,11 +396,6 @@ struct State {
     mono_family: Option<String>,
     /// Locale for font fallback ordering, reused when rebuilding the FontSystem.
     font_locale: String,
-    /// Row content key drawn at each screen position `(left, top)` last frame.
-    /// When this frame's shaping budget defers a row, we redraw its previous
-    /// (now slightly stale) content instead of a blank gap, until the new row is
-    /// shaped a frame or two later. Rebuilt every frame.
-    prev_rows: HashMap<(i32, i32), u64>,
 
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
@@ -497,28 +458,14 @@ struct State {
     /// Text buffers + placements for the empty-workspace ("nothing open") screen.
     empty_buffers: Vec<Buffer>,
     empty_placements: Vec<Placement>,
-    /// Text buffers + placements for file-browser panes.
-    file_browser_buffers: Vec<Buffer>,
-    file_browser_placements: Vec<Placement>,
-    /// Monotonic index into `file_browser_buffers` for the current frame, so several
-    /// file browsers (panes + the floating picker) never clobber each other's buffers.
-    file_browser_buf_used: usize,
-    /// Per-file-browser vertical scroll offset (physical px).
-    file_browser_scroll: HashMap<SurfaceId, f32>,
-    /// Hit-testing for the visible file browser panes this frame (click → row).
-    file_browser_views: Vec<FileBrowserView>,
-    /// Last file browser row click (time + path), for double-click detection.
-    file_browser_last_click: Option<(Instant, std::path::PathBuf)>,
-    /// Keyboard selection: highlighted row (browse/filter) per file browser.
-    file_browser_sel: HashMap<SurfaceId, usize>,
-    /// Keyboard selection: highlighted completion (path mode) per file browser.
-    file_browser_completion: HashMap<SurfaceId, usize>,
-    /// Path-autocomplete suggestion hits this frame: (rect, surface, index, path, is_dir).
-    file_browser_suggest_hits: Vec<(Rect, SurfaceId, usize, std::path::PathBuf, bool)>,
-    /// The floating directory picker's panel rect this frame (for click-outside),
-    /// and its shaped text placements (drawn in the overlay pass).
+    /// The floating directory picker's panel rect this frame (for click-outside).
     picker_panel: Option<Rect>,
-    picker_placements: Vec<Placement>,
+    /// The last left press (time, position, click count), for counting
+    /// double-clicks.
+    last_press: Option<(Instant, (f32, f32), u32)>,
+    /// The view the current left press landed on; it gets the press's drag and
+    /// release wherever the cursor goes.
+    mouse_capture: Option<SurfaceId>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
     /// Active terminal text selection, if any.
@@ -667,26 +614,6 @@ struct PaneRender {
     surfaces: Vec<(SurfaceId, String, bool)>,
 }
 
-/// A visible file-browser pane's list geometry, for mapping a click to a row.
-struct FileBrowserView {
-    sid: SurfaceId,
-    /// The scrollable list area (below the header).
-    list: Rect,
-    row_h: f32,
-    scroll: f32,
-    /// Visible rows in order.
-    rows: Vec<RowRef>,
-}
-
-/// A file browser row's click target: a real entry (path) or a synthetic category (key).
-#[derive(Clone)]
-struct RowRef {
-    path: std::path::PathBuf,
-    is_dir: bool,
-    is_category: bool,
-    key: String,
-}
-
 /// What a clickable chrome button does. All buttons share hover-highlight and
 /// arm-on-press/fire-on-release behaviour (see `arm_button`/`fire_button`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -703,15 +630,8 @@ enum ButtonAction {
     ToggleSidebar,
     /// Open a content kind in the focused pane (the "nothing open" picker).
     OpenKind(OpenKind),
-    /// Toggle a file browser's show-hidden / show-gitignored filters.
-    FileBrowserToggleHidden(SurfaceId),
-    FileBrowserToggleIgnored(SurfaceId),
-    /// Cycle the git-status filter.
-    FileBrowserCycleGit(SurfaceId),
-    /// Cycle the view mode (tree / by extension / kind / git / date / size).
-    FileBrowserCycleView(SurfaceId),
-    /// Move a file browser up to its parent directory.
-    FileBrowserParent(SurfaceId),
+    /// A button a view registered while painting: (owning surface, view-local id).
+    View(SurfaceId, u32),
     /// Confirm / cancel the floating directory picker.
     PickerConfirm,
     PickerCancel,
@@ -849,12 +769,11 @@ impl State {
             queue,
             surface,
             config,
-            font_system,
+            text: TextKit::new(font_system, ROW_CACHE_CAP),
             swash_cache,
             viewport,
             atlas,
             text_renderer,
-            row_cache: RowCache::new(ROW_CACHE_CAP),
             grid_cache: HashMap::new(),
             surface_geom: HashMap::new(),
             metrics_gen: 0,
@@ -863,7 +782,6 @@ impl State {
             pending_fonts,
             mono_family,
             font_locale: locale,
-            prev_rows: HashMap::new(),
             palette_renderer,
             palette_buffers: Vec::new(),
             palette: None,
@@ -894,17 +812,9 @@ impl State {
             title_place: None,
             empty_buffers: Vec::new(),
             empty_placements: Vec::new(),
-            file_browser_buffers: Vec::new(),
-            file_browser_placements: Vec::new(),
-            file_browser_buf_used: 0,
-            file_browser_scroll: HashMap::new(),
-            file_browser_views: Vec::new(),
-            file_browser_last_click: None,
-            file_browser_sel: HashMap::new(),
-            file_browser_completion: HashMap::new(),
-            file_browser_suggest_hits: Vec::new(),
             picker_panel: None,
-            picker_placements: Vec::new(),
+            last_press: None,
+            mouse_capture: None,
             sidebar_hidden: false,
             selection: None,
             mouse_down: false,
@@ -946,7 +856,7 @@ impl State {
     /// (invalidating the shaping cache and forcing a reflow).
     fn apply_config(&mut self, cfg: Config) {
         let (cw, ch) = measure_cell(
-            &mut self.font_system,
+            &mut self.text.font_system,
             self.scale,
             cfg.terminal.font_size,
             cfg.terminal.line_height,
@@ -1018,7 +928,7 @@ impl State {
     fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
         let (cw, ch) = measure_cell(
-            &mut self.font_system,
+            &mut self.text.font_system,
             scale,
             self.cfg.terminal.font_size,
             self.cfg.terminal.line_height,
@@ -1045,11 +955,11 @@ impl State {
         if let Some(fam) = &self.mono_family {
             db.set_monospace_family(fam.clone());
         }
-        self.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
+        self.text.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
         // Cell metrics should be unchanged (same pinned monospace); re-measure in
         // case the fuller DB resolves the family to a different face.
         let (cw, ch) = measure_cell(
-            &mut self.font_system,
+            &mut self.text.font_system,
             self.scale,
             self.cfg.terminal.font_size,
             self.cfg.terminal.line_height,
@@ -1060,33 +970,6 @@ impl State {
         self.atlas_warmed_gen = None;
         self.dirty = true;
         self.window.request_redraw();
-    }
-
-    /// The row key to draw at screen position `pos` when this frame's own content
-    /// there was deferred by the shaping budget: reuse the previous frame's key if
-    /// its shaping is still cached (touching it to keep it warm), else fall back to
-    /// `fallback` — whose buffer is absent, so the row draws blank. The fallback
-    /// only bites on the first-ever reveal of a position, where there is no prior
-    /// content to hold. Takes fields explicitly (not `&mut self`) so it can be
-    /// called while a `grid` snapshot is borrowed elsewhere in the frame.
-    #[allow(clippy::too_many_arguments)]
-    fn stale_key(
-        prev_rows: &HashMap<(i32, i32), u64>,
-        row_cache: &mut RowCache,
-        font_system: &mut FontSystem,
-        pos: (i32, i32),
-        fallback: u64,
-        metrics: Metrics,
-        width: f32,
-        cell_h: f32,
-    ) -> u64 {
-        match prev_rows.get(&pos).copied() {
-            Some(prev) if row_cache.buffer(prev).is_some() => {
-                row_cache.ensure(prev, font_system, metrics, width, cell_h, &[]);
-                prev
-            }
-            _ => fallback,
-        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -1175,9 +1058,9 @@ impl State {
             .unwrap_or(ws.w)
     }
 
-    /// Open a file the file browser selected: a horizontal split beside the file browser when
+    /// Open a file a view asked for: a horizontal split beside it when
     /// `[file_browser] open_in = "split"` and the pane is wide enough, else a tab.
-    fn open_from_file_browser(&mut self, path: std::path::PathBuf) {
+    fn open_requested_file(&mut self, path: std::path::PathBuf) {
         use ghostrealm_core::config::OpenIn;
         let split = self.cfg.file_browser.open_in == OpenIn::Split
             && self.focused_pane_width() >= FILE_BROWSER_SPLIT_MIN_W * self.scale;
@@ -1248,8 +1131,21 @@ impl State {
     /// otherwise the first button in paint order takes the hit.
     fn button_at_cursor(&self) -> Option<ButtonAction> {
         let (x, y) = self.cursor;
+        // Overlays are modal: the palette and menu own the pointer, and while the
+        // directory picker is open only its own buttons are live.
+        if self.palette.is_some() || self.menu.is_some() {
+            return None;
+        }
+        let picker = self.app.dir_picker_open();
         let mut hit = None;
         for &(r, action) in &self.buttons {
+            let modal = matches!(
+                action,
+                ButtonAction::PickerConfirm | ButtonAction::PickerCancel | ButtonAction::View(PICKER_SID, _)
+            );
+            if picker && !modal {
+                continue;
+            }
             if rect_contains(r, x, y) {
                 if action == ButtonAction::ToggleSidebar {
                     return Some(action);
@@ -1291,32 +1187,8 @@ impl State {
             ButtonAction::OpenKind(kind) => {
                 let _ = self.app.open_kind_in_focused(kind);
             }
-            ButtonAction::FileBrowserToggleHidden(sid) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    let v = b.show_hidden();
-                    b.set_show_hidden(!v);
-                }
-            }
-            ButtonAction::FileBrowserToggleIgnored(sid) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    let v = b.show_gitignored();
-                    b.set_show_gitignored(!v);
-                }
-            }
-            ButtonAction::FileBrowserCycleGit(sid) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    b.cycle_git_filter();
-                }
-            }
-            ButtonAction::FileBrowserCycleView(sid) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    b.cycle_view();
-                }
-            }
-            ButtonAction::FileBrowserParent(sid) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    b.go_to_parent();
-                }
+            ButtonAction::View(sid, id) => {
+                self.view_event(sid, |v, cx| v.button(cx, id));
             }
             ButtonAction::PickerConfirm => self.app.confirm_dir_picker(),
             ButtonAction::PickerCancel => self.app.close_dir_picker(),
@@ -1351,95 +1223,115 @@ impl State {
         }
     }
 
-    /// Point the file-browser selection at the row/completion under the cursor, so a
-    /// mouse move takes over the single highlight from the keyboard. Returns whether
-    /// it changed (to redraw).
-    fn update_file_browser_hover(&mut self) -> bool {
-        let (x, y) = self.cursor;
-        // Path-mode completion under the cursor?
-        if let Some((_, sid, idx, _, _)) = self
-            .file_browser_suggest_hits
-            .iter()
-            .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
-            .cloned()
-        {
-            if self.file_browser_completion.get(&sid) != Some(&idx) {
-                self.file_browser_completion.insert(sid, idx);
-                self.dirty = true;
-                return true;
-            }
+    /// Deliver hover to the view under the cursor (the picker's, while it is
+    /// open). Returns whether it asked for a redraw.
+    fn hover_view(&mut self) -> bool {
+        if self.mouse_down || self.palette.is_some() || self.menu.is_some() {
             return false;
         }
-        // Browse/filter row under the cursor?
-        if let Some((sid, idx, _)) = self.file_browser_row_at(x, y) {
-            if self.file_browser_sel.get(&sid) != Some(&idx) {
-                self.file_browser_sel.insert(sid, idx);
-                self.dirty = true;
-                return true;
-            }
+        let pos = self.cursor;
+        let target = if self.app.dir_picker_open() {
+            Some(PICKER_SID)
+        } else {
+            self.surface_under_cursor()
+                .filter(|s| self.app.view(*s).is_some())
+        };
+        match target {
+            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Move { pos })),
+            None => false,
         }
-        false
     }
 
-    /// The file-browser row under a point, as (surface, index, row).
-    fn file_browser_row_at(&self, x: f32, y: f32) -> Option<(SurfaceId, usize, RowRef)> {
-        for v in &self.file_browser_views {
-            if x >= v.list.x && x < v.list.x + v.list.w && y >= v.list.y && y < v.list.y + v.list.h {
-                let idx = ((y - v.list.y + v.scroll) / v.row_h).floor().max(0.0) as usize;
-                if let Some(row) = v.rows.get(idx) {
-                    return Some((v.sid, idx, row.clone()));
+    /// Cell geometry and scale for view contexts.
+    fn ui(&self) -> UiMetrics {
+        UiMetrics {
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            scale: self.scale,
+        }
+    }
+
+    /// Call `f` on surface `sid`'s view (the picker's for [`PICKER_SID`]) with an
+    /// event context, then apply what it asked for. Returns whether it asked for
+    /// a redraw (`false` when there is no such view).
+    fn view_event(&mut self, sid: SurfaceId, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
+        let ui = self.ui();
+        let view: &mut dyn View = if sid == PICKER_SID {
+            match self.app.dir_picker_mut() {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            match self.app.view_mut(sid) {
+                Some(v) => v,
+                None => return false,
+            }
+        };
+        let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
+        f(view, &mut cx);
+        let out = cx.finish();
+        let redraw = out.redraw;
+        self.apply_outcome(sid, out);
+        redraw
+    }
+
+    /// Apply a view's repaint flags and requests.
+    fn apply_outcome(&mut self, sid: SurfaceId, out: Outcome) {
+        if out.redraw {
+            self.dirty = true;
+        }
+        if out.frame {
+            self.frame_pending = true;
+        }
+        for req in out.requests {
+            match req {
+                Request::OpenFile(path) => self.open_requested_file(path),
+                Request::Saved(path) => {
+                    if Some(path) == ghostrealm_core::config::config_path() {
+                        self.reload_config();
+                    }
                 }
+                Request::Busy => self.app.mark_busy(sid),
             }
         }
-        None
+    }
+
+    /// Count this left press as the next of a multi-click when it follows the
+    /// last one quickly (`[input] double_click_ms`) at about the same spot.
+    fn count_click(&mut self) -> u32 {
+        let now = Instant::now();
+        let (x, y) = self.cursor;
+        let slop = 4.0 * self.scale;
+        let clicks = match self.last_press {
+            Some((t, (px, py), n))
+                if now.duration_since(t) < self.double_click_window()
+                    && (x - px).abs() <= slop
+                    && (y - py).abs() <= slop =>
+            {
+                n + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, (x, y), clicks));
+        clicks
     }
 
     fn on_click(&mut self) {
-        // The directory picker is modal: handle its rows/suggestions, and a click
-        // outside the panel cancels. (Its header/footer buttons arm on press.)
+        self.mouse_capture = None;
+        // The directory picker is modal: a click in its panel goes to its file
+        // browser, a click outside cancels. (Its buttons arm on press.)
         if self.app.dir_picker_open() {
-            let (x, y) = self.cursor;
-            if let Some((_, _, _, spath, sdir)) = self
-                .file_browser_suggest_hits
-                .iter()
-                .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
-                .cloned()
-            {
-                if sdir {
-                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
-                        b.set_root(spath);
-                    }
+            let pos = self.cursor;
+            match self.picker_panel {
+                Some(panel) if rect_contains(panel, pos.0, pos.1) => {
+                    let clicks = self.count_click();
+                    self.view_event(PICKER_SID, |v, cx| {
+                        v.mouse(cx, &MouseEvent::Down { pos, clicks })
+                    });
+                    self.mouse_capture = Some(PICKER_SID);
                 }
-                self.dirty = true;
-                return;
-            }
-            if let Some((_, idx, row)) = self.file_browser_row_at(x, y) {
-                self.file_browser_sel.insert(PICKER_SID, idx);
-                if row.is_category {
-                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
-                        b.toggle_category(&row.key);
-                    }
-                } else if row.is_dir {
-                    let now = Instant::now();
-                    let dcw = self.double_click_window();
-                    let dbl = self
-                        .file_browser_last_click
-                        .as_ref()
-                        .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
-                    self.file_browser_last_click = Some((now, row.path.clone()));
-                    if let Some(b) = self.app.file_browser_mut(PICKER_SID) {
-                        if dbl {
-                            b.set_root(row.path);
-                        } else {
-                            b.toggle_dir(&row.path);
-                        }
-                    }
-                }
-                self.dirty = true;
-                return;
-            }
-            if self.picker_panel.is_some_and(|panel| !rect_contains(panel, x, y)) {
-                self.app.close_dir_picker();
+                Some(_) => self.app.close_dir_picker(),
+                None => {}
             }
             self.dirty = true;
             return;
@@ -1493,7 +1385,6 @@ impl State {
             .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
             .and_then(|p| p.active_surface().map(|s| s.id));
         let active_is_editor = active_sid.is_some_and(|s| self.app.is_editor(s));
-        let active_is_file_browser = active_sid.is_some_and(|s| self.app.is_file_browser(s));
 
         // A click in a visible tab strip switches the pane's active surface.
         let strip_h = if self.strip_shown(n) {
@@ -1507,57 +1398,16 @@ impl State {
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
                 pane.active = idx;
             }
-        } else if active_is_file_browser {
-            // Focus first so opening a file targets this pane, then act on the row:
-            // a directory expands/collapses, a file opens in an editor tab.
+        } else if let Some(sid) = active_sid.filter(|s| self.app.view(*s).is_some()) {
+            // Focus first (so anything the click opens targets this pane), then
+            // hand the press to the view; it owns the rest of the press.
             if let Some(vtab) = self.app.tree.vtab_mut(vt) {
                 vtab.focused_pane = pid;
             }
-            // A click on an autocomplete suggestion navigates (dir) or opens (file).
-            if let Some((_, ssid, _, spath, sdir)) = self
-                .file_browser_suggest_hits
-                .iter()
-                .find(|(r, _, _, _, _)| rect_contains(*r, x, y))
-                .cloned()
-            {
-                if sdir {
-                    if let Some(b) = self.app.file_browser_mut(ssid) {
-                        b.set_root(spath);
-                    }
-                } else {
-                    self.open_from_file_browser(spath);
-                }
-                self.dirty = true;
-                return;
-            }
-            if let Some((bsid, idx, row)) = self.file_browser_row_at(x, y) {
-                self.file_browser_sel.insert(bsid, idx);
-                if row.is_category {
-                    if let Some(b) = self.app.file_browser_mut(bsid) {
-                        b.toggle_category(&row.key);
-                    }
-                } else if row.is_dir {
-                    // Single click expands/collapses in place; a quick second click
-                    // on the same directory navigates into it (makes it the root).
-                    let now = Instant::now();
-                    let dcw = self.double_click_window();
-                    let dbl = self
-                        .file_browser_last_click
-                        .as_ref()
-                        .is_some_and(|(t, p)| *p == row.path && now.duration_since(*t) < dcw);
-                    self.file_browser_last_click = Some((now, row.path.clone()));
-                    if let Some(b) = self.app.file_browser_mut(bsid) {
-                        if dbl {
-                            b.set_root(row.path);
-                        } else {
-                            b.toggle_dir(&row.path);
-                        }
-                    }
-                } else {
-                    self.file_browser_last_click = None;
-                    self.open_from_file_browser(row.path);
-                }
-            }
+            let clicks = self.count_click();
+            let pos = (x, y);
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Down { pos, clicks }));
+            self.mouse_capture = Some(sid);
             self.dirty = true;
             return;
         } else if active_is_editor {
@@ -1994,6 +1844,11 @@ impl State {
             }
             self.dragging = true;
         }
+        // A view that took the press gets its drag.
+        if let Some(sid) = self.mouse_capture {
+            let pos = (x, y);
+            return self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos }));
+        }
         // Editor drag: move the text cursor, keeping the anchor set at the press.
         if let Some(sid) = self.editor_drag {
             if let Some((s, row, col)) = self.editor_pos_at(x, y) {
@@ -2035,6 +1890,12 @@ impl State {
     /// a real drag leaves the selection for Cmd+C (editors don't auto-copy).
     fn end_selection(&mut self) {
         self.mouse_down = false;
+        if let Some(sid) = self.mouse_capture.take() {
+            let (pos, dragged) = (self.cursor, self.dragging);
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
+            self.dragging = false;
+            return;
+        }
         if let Some(sid) = self.editor_drag.take() {
             if !self.dragging {
                 if let Some(e) = self.app.editor_mut(sid) {
@@ -2139,20 +2000,6 @@ impl State {
         if self.palette.is_some() {
             return;
         }
-        // The directory picker is modal: the wheel scrolls its list.
-        if self.app.dir_picker_open() {
-            let px = match delta {
-                MouseScrollDelta::LineDelta(_, y) => y * SCROLL_LINES_PER_NOTCH * self.cell_h,
-                MouseScrollDelta::PixelDelta(p) => p.y as f32,
-            };
-            if px != 0.0 {
-                let cur = self.file_browser_scroll.get(&PICKER_SID).copied().unwrap_or(0.0);
-                self.file_browser_scroll.insert(PICKER_SID, (cur - px).max(0.0));
-                self.dirty = true;
-                self.frame_pending = true;
-            }
-            return;
-        }
         // Normalise both event kinds to physical pixels. A line/notch wheel is
         // worth SCROLL_LINES_PER_NOTCH cells; a trackpad reports pixels directly.
         let (px, px_x) = match delta {
@@ -2163,6 +2010,12 @@ impl State {
             MouseScrollDelta::PixelDelta(p) => (p.y as f32, p.x as f32),
         };
         if px == 0.0 && px_x == 0.0 {
+            return;
+        }
+        let pos = self.cursor;
+        // The directory picker is modal: the wheel scrolls its list.
+        if self.app.dir_picker_open() {
+            self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
             return;
         }
         // Over the sidebar, the wheel scrolls the workspace list, not the terminal
@@ -2176,19 +2029,10 @@ impl State {
             }
             return;
         }
-        // Over a file browser, the wheel scrolls its row list (pixel-precise; the
-        // upper bound is clamped to content height when the pane is rebuilt).
-        if let Some(sid) = self.surface_under_cursor() {
-            if self.app.is_file_browser(sid) {
-                let cur = self.file_browser_scroll.get(&sid).copied().unwrap_or(0.0);
-                let ns = (cur - px).max(0.0);
-                if ns != cur {
-                    self.file_browser_scroll.insert(sid, ns);
-                    self.dirty = true;
-                    self.frame_pending = true;
-                }
-                return;
-            }
+        // A view under the cursor takes the wheel.
+        if let Some(sid) = self.surface_under_cursor().filter(|s| self.app.view(*s).is_some()) {
+            self.view_event(sid, |v, cx| v.scroll(cx, pos, px_x, px));
+            return;
         }
         // Accumulate sub-line pixels and carry the remainder, so a slow drag isn't
         // rounded to zero (the old behaviour: motion under half a cell vanished,
@@ -2330,13 +2174,13 @@ impl State {
             quads.push(rect_quad(rect, sw, sh, self.chrome.sidebar, 1.0));
         }
         if hovered {
-            quads.push(rect_quad(rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            quads.push(rect_quad(rect, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
         }
         let glyph = match (side, hidden) {
             (Side::Left, false) | (Side::Right, true) => "\u{2039}", // ‹
             (Side::Left, true) | (Side::Right, false) => "\u{203a}", // ›
         };
-        let color = if hovered { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+        let color = if hovered { theme::LABEL_HOVER } else { theme::LABEL };
         // Tight line box (line height == font size) so centring the box centres the
         // glyph — the terminal metrics' leading would otherwise ride it high.
         self.toggle_buffer
@@ -2350,7 +2194,7 @@ impl State {
             None,
         );
         self.toggle_buffer
-            .shape_until_scroll(&mut self.font_system, false);
+            .shape_until_scroll(&mut self.text.font_system, false);
         let glyph_w = self
             .toggle_buffer
             .layout_runs()
@@ -2421,13 +2265,13 @@ impl State {
         self.title_buffer.set_metrics(self.metrics());
         self.title_buffer.set_size(Some(sw), Some(self.cell_h));
         self.title_buffer.set_rich_text(
-            std::iter::once(("ghostrealm", attrs_for(TITLE_LABEL))),
+            std::iter::once(("ghostrealm", attrs_for(theme::TITLE))),
             &Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
             None,
         );
         self.title_buffer
-            .shape_until_scroll(&mut self.font_system, false);
+            .shape_until_scroll(&mut self.text.font_system, false);
         // Measure the shaped (proportional) width so the title is truly centred.
         let title_w = self
             .title_buffer
@@ -2444,7 +2288,7 @@ impl State {
                 right: sw as i32,
                 bottom: h as i32,
             },
-            color: TITLE_LABEL,
+            color: theme::TITLE,
         });
     }
 
@@ -2454,7 +2298,7 @@ impl State {
     fn shape_empty(&mut self, idx: usize, text: &str, family: Family, width_box: f32) -> f32 {
         let m = self.metrics();
         while self.empty_buffers.len() <= idx {
-            let b = Buffer::new(&mut self.font_system, m);
+            let b = Buffer::new(&mut self.text.font_system, m);
             self.empty_buffers.push(b);
         }
         let buf = &mut self.empty_buffers[idx];
@@ -2466,7 +2310,7 @@ impl State {
             Shaping::Advanced,
             None,
         );
-        buf.shape_until_scroll(&mut self.font_system, false);
+        buf.shape_until_scroll(&mut self.text.font_system, false);
         buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
     }
 
@@ -2510,7 +2354,7 @@ impl State {
             left: cx - hw * 0.5,
             top: y,
             bounds: full_bounds,
-            color: TITLE_LABEL,
+            color: theme::TITLE,
         });
         idx += 1;
         y += ch + heading_gap;
@@ -2521,9 +2365,9 @@ impl State {
             let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
             quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
             if hovered {
-                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+                quads.push(rect_quad(hit, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
             }
-            let label_color = if hovered { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL };
+            let label_color = if hovered { theme::LABEL_HOVER } else { theme::LABEL };
             let btn_bounds = TextBounds {
                 left: bx as i32,
                 top: y as i32,
@@ -2561,509 +2405,83 @@ impl State {
         });
     }
 
-    /// Shape `text` into the next free `file_browser_buffers` slot for this frame and
-    /// return `(idx, shaped_width)`. Colour comes from the placement in the text
-    /// pass. The per-frame counter keeps several file browsers from clobbering slots.
-    fn shape_file_browser(&mut self, text: &str, family: Family, width_box: f32) -> (usize, f32) {
-        self.shape_file_browser_spans(&[(text.to_string(), [0, 0, 0])], family, width_box, false)
-    }
-
-    /// Shape coloured `spans` into the next free `file_browser_buffers` slot. With
-    /// `bake_colors`, each span's colour is baked into the glyphs (for per-character
-    /// colouring like file-type or match highlighting); otherwise the placement's
-    /// colour applies uniformly. Returns `(idx, shaped_width)`.
-    fn shape_file_browser_spans(
-        &mut self,
-        spans: &[(String, [u8; 3])],
-        family: Family,
-        width_box: f32,
-        bake_colors: bool,
-    ) -> (usize, f32) {
-        let m = self.metrics();
-        let idx = self.file_browser_buf_used;
-        self.file_browser_buf_used += 1;
-        while self.file_browser_buffers.len() <= idx {
-            let b = Buffer::new(&mut self.font_system, m);
-            self.file_browser_buffers.push(b);
-        }
-        let buf = &mut self.file_browser_buffers[idx];
-        buf.set_metrics(m);
-        buf.set_size(Some(width_box.max(1.0)), Some(self.cell_h));
-        buf.set_rich_text(
-            spans.iter().map(|(t, c)| {
-                let mut a = Attrs::new().family(family);
-                if bake_colors {
-                    a = a.color(Color::rgb(c[0], c[1], c[2]));
-                }
-                (t.as_str(), a)
-            }),
-            &Attrs::new().family(family),
-            Shaping::Advanced,
-            None,
-        );
-        buf.shape_until_scroll(&mut self.font_system, false);
-        let w = buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
-        (idx, w)
-    }
-
-    /// Build coloured spans for a browse-mode row: the leaf name in the kind colour
-    /// (directory = accent, hidden = dim, file = normal), with the extension in gold.
-    fn row_spans(&self, name: &str, is_dir: bool) -> Vec<(String, [u8; 3])> {
-        let hidden = name.starts_with('.');
-        let base = if is_dir {
-            self.chrome.accent
-        } else if hidden {
-            HIDDEN_FG
-        } else {
-            FILE_FG
-        };
-        if is_dir || hidden {
-            return vec![(name.to_string(), base)];
-        }
-        // Colour a file's extension gold (the last dot that isn't the first char).
-        match name.rfind('.').filter(|&i| i > 0) {
-            Some(i) => vec![
-                (name[..i].to_string(), base),
-                (name[i..].to_string(), EXT_FG),
-            ],
-            None => vec![(name.to_string(), base)],
-        }
-    }
-
-    /// Build coloured spans for a filter-mode row: matched characters (by char
-    /// index into `name`) in the accent colour, the rest in the kind colour.
-    fn match_spans(&self, name: &str, is_dir: bool, matches: &[usize]) -> Vec<(String, [u8; 3])> {
-        let base = if is_dir { self.chrome.accent } else { FILE_FG };
-        if matches.is_empty() {
-            return vec![(name.to_string(), base)];
-        }
-        let hit: std::collections::HashSet<usize> = matches.iter().copied().collect();
-        let mut spans: Vec<(String, [u8; 3])> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_hit = false;
-        for (i, ch) in name.chars().enumerate() {
-            let h = hit.contains(&i);
-            if !cur.is_empty() && h != cur_hit {
-                spans.push((std::mem::take(&mut cur), if cur_hit { MATCH_FG } else { base }));
-            }
-            cur_hit = h;
-            cur.push(ch);
-        }
-        if !cur.is_empty() {
-            spans.push((cur, if cur_hit { MATCH_FG } else { base }));
-        }
-        spans
-    }
-
-    /// Draw a file-browser pane in `rect`: a header (parent, path/filter, hidden &
-    /// gitignore toggles) and a scrollable row list. Records a [`FileBrowserView`] for
-    /// click hit-testing and the toggle/parent button rects.
-    #[allow(clippy::too_many_arguments)]
-    fn build_file_browser(
-        &mut self,
-        sid: SurfaceId,
-        focus_border: bool,
-        rect: Rect,
-        sw: f32,
-        sh: f32,
-        quads: &mut Vec<QuadInstance>,
-        // When present, browse/filter body rows go through the shared content-keyed
-        // `row_cache` (so scrolling reuses shaped rows) as RowPlacements here, drawn
-        // in the main text pass. `None` (the picker overlay) shapes into the
-        // file browser's own buffers instead.
-        mut row_out: Option<&mut Vec<RowPlacement>>,
-    ) -> Vec<Placement> {
-        let mut placements: Vec<Placement> = Vec::new();
-        quads.push(rect_quad(rect, sw, sh, self.chrome.background, 1.0));
-
-        let scale = self.scale;
-        let ch = self.cell_h;
-        let pad = 8.0 * scale;
-        let header_h = ch + 10.0 * scale;
-        let mono = Family::Monospace;
-        let sans = Family::SansSerif;
-
-        // Pull the current rows and header state from the model.
-        let rows: Vec<ghostrealm_core::fs_tree::FileRow> = self
-            .app
-            .file_browser_mut(sid)
-            .map(|b| b.rows().to_vec())
-            .unwrap_or_default();
-        #[allow(clippy::type_complexity)]
-        let (root_disp, show_hidden, show_ignored, query, is_path, git_label, git_on, view_label, view_on): (
-            String,
-            bool,
-            bool,
-            String,
-            bool,
-            &str,
-            bool,
-            &str,
-            bool,
-        ) = match self.app.file_browser(sid) {
-            Some(b) => (
-                b.root().display().to_string(),
-                b.show_hidden(),
-                b.show_gitignored(),
-                b.query().to_string(),
-                !b.query().is_empty() && b.input_is_path(),
-                b.git_filter().label(),
-                b.git_filter() != ghostrealm_core::fs_tree::GitFilter::All,
-                b.view().label(),
-                b.view() != ghostrealm_core::fs_tree::FsView::Tree,
-            ),
-            None => return placements,
-        };
-
-        // Header background.
-        quads.push(rect_quad(
-            Rect { x: rect.x, y: rect.y, w: rect.w, h: header_h },
-            sw,
-            sh,
-            self.chrome.sidebar,
-            1.0,
-        ));
-        let hy = rect.y + (header_h - ch) * 0.5;
-
-        // Parent (..) button on the left.
-        let par_w = self.cell_w * 3.0;
-        let par_hit = Rect { x: rect.x, y: rect.y, w: par_w + pad, h: header_h };
-        let par_hov = rect_contains(par_hit, self.cursor.0, self.cursor.1);
-        if par_hov {
-            quads.push(rect_quad(par_hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-        }
-        let (idx, _) = self.shape_file_browser("..", mono, par_w);
-        placements.push(Placement {
-            idx,
-            left: rect.x + pad,
-            top: hy,
-            bounds: TextBounds {
-                left: rect.x as i32,
-                top: rect.y as i32,
-                right: (rect.x + par_w + pad) as i32,
-                bottom: (rect.y + header_h) as i32,
-            },
-            color: if par_hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
-        });
-        self.buttons.push((par_hit, ButtonAction::FileBrowserParent(sid)));
-
-        // Toggles on the right: [recent] [git] [.gitignore] [hidden].
-        let toggle = |on: bool| if on { NEW_VTAB_LABEL_HOVER } else { EMPTY_SHORTCUT };
-        let mut right = rect.x + rect.w - pad;
-        for (label, on, action) in [
-            ("hidden", show_hidden, ButtonAction::FileBrowserToggleHidden(sid)),
-            (".gitignore", show_ignored, ButtonAction::FileBrowserToggleIgnored(sid)),
-            (git_label, git_on, ButtonAction::FileBrowserCycleGit(sid)),
-            (view_label, view_on, ButtonAction::FileBrowserCycleView(sid)),
-        ] {
-            let w = label.chars().count() as f32 * self.cell_w;
-            let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
-            let hov = rect_contains(hit, self.cursor.0, self.cursor.1);
-            if hov {
-                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-            }
-            let (idx, _) = self.shape_file_browser(label, sans, w + pad);
-            placements.push(Placement {
-                idx,
-                left: right - w - pad + pad * 0.5,
-                top: hy,
-                bounds: TextBounds {
-                    left: (right - w - pad) as i32,
-                    top: rect.y as i32,
-                    right: (right + pad) as i32,
-                    bottom: (rect.y + header_h) as i32,
-                },
-                color: toggle(on),
-            });
-            self.buttons.push((hit, action));
-            right -= w + pad * 2.0;
-        }
-
-        // Path-mode completions + the selected one (for the preview + highlight).
-        let sel_comp: Option<usize> = if is_path {
-            self.file_browser_completion.get(&sid).copied()
-        } else {
-            None
-        };
-        let path_sugg: Vec<std::path::PathBuf> = if is_path {
-            self.app.file_browser(sid).map(|b| b.suggestions(&query)).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let comp_str = |p: &std::path::Path| -> String {
-            let mut s = p.to_string_lossy().into_owned();
-            if p.is_dir() {
-                s.push('/');
-            }
-            s
-        };
-
-        // Input box between the parent button and the toggles: a bordered field
-        // showing the typed query (or the Tab-selected completion), with the current
-        // root path (dim) as a placeholder when empty. Always shows a caret.
-        let box_x = rect.x + par_w + pad * 2.0;
-        let box_w = (right - box_x - pad).max(1.0);
-        let inset = 4.0 * scale;
-        let box_rect = Rect { x: box_x, y: rect.y + inset, w: box_w, h: header_h - inset * 2.0 };
-        quads.push(rect_quad(box_rect, sw, sh, self.chrome.background, 1.0));
-        push_border(quads, box_rect, sw, sh, INPUT_BORDER);
-        let inner_w = (box_w - pad).max(1.0);
-        let cols = (inner_w / self.cell_w) as usize;
-        let preview = sel_comp.and_then(|i| path_sugg.get(i)).map(|p| comp_str(p));
-        let (itext, icolor, is_placeholder) = match preview {
-            Some(pv) => (shorten_start(&pv, cols), INPUT_TEXT, false),
-            None if query.is_empty() => (shorten_start(&root_disp, cols), EMPTY_SHORTCUT, true),
-            None => (query.clone(), INPUT_TEXT, false),
-        };
-        let (idx, iw) = self.shape_file_browser(&itext, mono, inner_w);
-        placements.push(Placement {
-            idx,
-            left: box_rect.x + pad * 0.5,
-            top: hy,
-            bounds: TextBounds {
-                left: box_rect.x as i32,
-                top: rect.y as i32,
-                right: (box_rect.x + box_rect.w) as i32,
-                bottom: (rect.y + header_h) as i32,
-            },
-            color: icolor,
-        });
-        // Caret: after the text (start when empty), so the field always reads focused.
-        let caret_x = box_rect.x + pad * 0.5 + if is_placeholder { 0.0 } else { iw } + 1.0 * scale;
-        if caret_x < box_rect.x + box_rect.w {
-            quads.push(rect_quad(
-                Rect { x: caret_x, y: rect.y + inset + 2.0 * scale, w: 2.0 * scale, h: box_rect.h - 4.0 * scale },
-                sw,
-                sh,
-                self.chrome.accent,
-                0.9,
-            ));
-        }
-
-        // Body below the header.
-        let list = Rect {
-            x: rect.x,
-            y: rect.y + header_h,
-            w: rect.w,
-            h: (rect.h - header_h).max(0.0),
-        };
-        let row_h = ch + 4.0 * scale;
-        let indent_w = self.cell_w * 2.0;
-
-        if is_path {
-            // Path mode: the body is the completion list (replacing the tree, so
-            // nothing shows through). Clicks route via `file_browser_suggest_hits`.
-            for (i, p) in path_sugg.iter().enumerate() {
-                let ry = list.y + i as f32 * row_h;
-                if ry + row_h > list.y + list.h {
-                    break;
-                }
-                let is_dir = p.is_dir();
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let label = if is_dir { format!("{name}/") } else { name };
-                let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-                if Some(i) == sel_comp {
-                    quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-                }
-                let color = if is_dir { self.chrome.accent } else { FILE_FG };
-                let (idx, _) = self.shape_file_browser(&label, mono, list.w - pad * 2.0);
-                placements.push(Placement {
-                    idx,
-                    left: list.x + pad,
-                    top: ry + (row_h - ch) * 0.5,
-                    bounds: TextBounds {
-                        left: list.x as i32,
-                        top: list.y as i32,
-                        right: (list.x + list.w) as i32,
-                        bottom: (list.y + list.h) as i32,
-                    },
-                    color,
-                });
-                self.file_browser_suggest_hits.push((row_rect, sid, i, p.clone(), is_dir));
-            }
-        } else {
-            // Browse/filter mode: the scrollable tree/results list.
-            let content_h = rows.len() as f32 * row_h;
-            let max_scroll = (content_h - list.h).max(0.0);
-            let scroll = self
-                .file_browser_scroll
-                .get(&sid)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, max_scroll);
-            self.file_browser_scroll.insert(sid, scroll);
-            let sel = self.file_browser_sel.get(&sid).copied();
-            let filtering = !query.is_empty();
-
-            let mut view_rows: Vec<RowRef> = Vec::with_capacity(rows.len());
-            for (i, r) in rows.iter().enumerate() {
-                let ry = list.y + i as f32 * row_h - scroll;
-                view_rows.push(RowRef {
-                    path: r.path.clone(),
-                    is_dir: r.is_dir,
-                    is_category: r.is_category,
-                    key: r.key.clone(),
-                });
-                if ry + row_h < list.y || ry > list.y + list.h {
-                    continue; // offscreen
-                }
-                let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-                if Some(i) == sel {
-                    quads.push(rect_quad(row_rect, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
-                }
-                let marker = if r.is_dir {
-                    if r.expanded {
-                        "\u{25be} "
-                    } else {
-                        "\u{25b8} "
-                    }
-                } else {
-                    "  "
-                };
-                // Marker in the kind colour; an optional dim disambiguation prefix;
-                // then the name coloured by kind/extension (browse) or with matched
-                // characters highlighted (filter).
-                let mut spans: Vec<(String, [u8; 3])> = vec![(
-                    marker.to_string(),
-                    if r.is_dir { self.chrome.accent } else { FILE_FG },
-                )];
-                if !r.prefix.is_empty() {
-                    spans.push((format!("{}/", r.prefix), EMPTY_SHORTCUT));
-                }
-                if filtering {
-                    spans.extend(self.match_spans(&r.name, r.is_dir, &r.match_indices));
-                } else {
-                    spans.extend(self.row_spans(&r.name, r.is_dir));
-                }
-                let left = list.x + pad + r.depth as f32 * indent_w;
-                let width = (list.x + list.w - left - pad).max(1.0);
-                let bounds = TextBounds {
-                    left: list.x as i32,
-                    top: list.y as i32,
-                    right: (list.x + list.w) as i32,
-                    bottom: (list.y + list.h) as i32,
-                };
-                let top = ry + (row_h - ch) * 0.5;
-                if let Some(out) = row_out.as_deref_mut() {
-                    // Cache-backed: content-keyed shaping, reused across frames while
-                    // scrolling (drawn in the main text pass via `row_cache`).
-                    let key = self
-                        .row_cache
-                        .row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
-                    let m = self.metrics();
-                    self.row_cache
-                        .ensure(key, &mut self.font_system, m, width, self.cell_h, &spans);
-                    out.push(RowPlacement { key, left, top, bounds, color: FILE_FG });
-                } else {
-                    let (idx, _) = self.shape_file_browser_spans(&spans, mono, width, true);
-                    placements.push(Placement { idx, left, top, bounds, color: FILE_FG });
-                }
-            }
-            self.file_browser_views.push(FileBrowserView {
-                sid,
-                list,
-                row_h,
-                scroll,
-                rows: view_rows,
-            });
-        }
-
-        if focus_border {
-            push_border(quads, rect, sw, sh, self.chrome.accent);
-        }
-        placements
-    }
-
-    /// Draw the floating directory picker overlay (a dim backdrop + a centred panel
-    /// hosting the reusable file browser and a confirm/cancel footer). Quads go to
-    /// the overlay layer; returns the panel's text placements for the overlay pass.
-    fn build_dir_picker(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
+    /// Draw the floating directory picker overlay: a dim backdrop and a centred
+    /// panel hosting a file-browser view (on the overlay layer) above a
+    /// confirm/cancel footer.
+    fn build_dir_picker(&mut self, frame: &mut Frame) {
         if !self.app.dir_picker_open() {
-            return Vec::new();
+            return;
         }
+        let (sw, sh) = frame.screen;
         let scale = self.scale;
         let ch = self.cell_h;
         let pad = 10.0 * scale;
-        // Dim backdrop over everything.
-        quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
-        // Centred panel.
+        frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let pw = (sw * 0.6).clamp(360.0 * scale, 760.0 * scale).min((sw - 40.0 * scale).max(1.0));
         let ph = (sh * 0.7).min((sh - 40.0 * scale).max(1.0));
-        let px = (sw - pw) * 0.5;
-        let py = (sh - ph) * 0.5;
+        let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
         let panel = Rect { x: px, y: py, w: pw, h: ph };
         self.picker_panel = Some(panel);
-        quads.push(rect_quad(panel, sw, sh, self.chrome.background, 1.0));
-        push_border(quads, panel, sw, sh, self.chrome.accent);
-
         let title_h = ch + 12.0 * scale;
         let footer_h = ch + 16.0 * scale;
-        let mut placements: Vec<Placement> = Vec::new();
 
-        // Title.
-        let (idx, tw) = self.shape_file_browser("Set workspace directory", Family::SansSerif, pw);
-        placements.push(Placement {
-            idx,
-            left: px + (pw - tw) * 0.5,
-            top: py + (title_h - ch) * 0.5,
-            bounds: TextBounds {
-                left: px as i32,
-                top: py as i32,
-                right: (px + pw) as i32,
-                bottom: (py + title_h) as i32,
-            },
-            color: TITLE_LABEL,
-        });
+        let ui = self.ui();
+        let Some(view) = self.app.dir_picker_mut() else {
+            return;
+        };
+        let mut cx = PaintCx::new(
+            &self.cfg,
+            &self.chrome,
+            ui,
+            self.cursor,
+            &mut self.text,
+            frame,
+            Layer::Overlay,
+            PICKER_SID,
+        );
+        cx.focused = true;
+        cx.fill(panel, cx.chrome.background);
+        cx.border(panel, cx.chrome.accent);
 
-        // File browser body between the title and the footer.
+        let title_rect = Rect { x: px, y: py, w: pw, h: title_h };
+        let title = cx.shape("Set workspace directory", Family::SansSerif, pw);
+        cx.place(title, px + (pw - title.width) * 0.5, py + (title_h - ch) * 0.5, title_rect, theme::TITLE);
+
         let body = Rect {
             x: px,
             y: py + title_h,
             w: pw,
             h: (ph - title_h - footer_h).max(1.0),
         };
-        let ps = self.build_file_browser(PICKER_SID, false, body, sw, sh, quads, None);
-        placements.extend(ps);
+        view.paint(&mut cx, body);
 
         // Footer: [Cancel] [Use this folder], right-aligned.
-        let fy = py + ph - footer_h;
         let bh = ch + 8.0 * scale;
-        let by = fy + (footer_h - bh) * 0.5;
+        let by = py + ph - footer_h + (footer_h - bh) * 0.5;
         let mut right = px + pw - pad;
         for (label, action, primary) in [
             ("Use this folder", ButtonAction::PickerConfirm, true),
             ("Cancel", ButtonAction::PickerCancel, false),
         ] {
-            let w = label.chars().count() as f32 * self.cell_w;
+            let w = label.chars().count() as f32 * ui.cell_w;
             let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
-            let hov = rect_contains(hit, self.cursor.0, self.cursor.1);
-            quads.push(rect_quad(
-                hit,
-                sw,
-                sh,
-                if primary { self.chrome.accent } else { self.chrome.sidebar },
-                if primary { 0.5 } else { 1.0 },
-            ));
-            if hov {
-                quads.push(rect_quad(hit, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            let hov = cx.hovered(hit);
+            if primary {
+                cx.fill_alpha(hit, cx.chrome.accent, 0.5);
+            } else {
+                cx.fill(hit, cx.chrome.sidebar);
             }
-            let (idx, lw) = self.shape_file_browser(label, Family::SansSerif, w + pad);
-            placements.push(Placement {
-                idx,
-                left: hit.x + (hit.w - lw) * 0.5,
-                top: by + (bh - ch) * 0.5,
-                bounds: TextBounds {
-                    left: hit.x as i32,
-                    top: by as i32,
-                    right: (hit.x + hit.w) as i32,
-                    bottom: (by + bh) as i32,
-                },
-                color: if primary || hov { NEW_VTAB_LABEL_HOVER } else { NEW_VTAB_LABEL },
-            });
+            if hov {
+                cx.highlight(hit);
+            }
+            let s = cx.shape(label, Family::SansSerif, w + pad);
+            let color = if primary || hov { theme::LABEL_HOVER } else { theme::LABEL };
+            cx.place(s, hit.x + (hit.w - s.width) * 0.5, by + (bh - ch) * 0.5, hit, color);
             self.buttons.push((hit, action));
             right -= w + pad * 3.0;
         }
-        placements
+        let owned = frame.view_buttons.drain(..);
+        self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -3136,7 +2554,7 @@ impl State {
 
         // One buffer per workspace plus one for the pinned "+" button.
         while self.sidebar_buffers.len() < n + 1 {
-            let b = Buffer::new(&mut self.font_system, metrics);
+            let b = Buffer::new(&mut self.text.font_system, metrics);
             self.sidebar_buffers.push(b);
         }
 
@@ -3160,12 +2578,12 @@ impl State {
         if btn_hovered {
             // Full-bleed row highlight (edge to edge, full height) — a row button,
             // not a compact icon.
-            quads.push(rect_quad(btn, sw, sh, BUTTON_HOVER_BG, BUTTON_HOVER_ALPHA));
+            quads.push(rect_quad(btn, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
         }
         let btn_color = if btn_hovered {
-            NEW_VTAB_LABEL_HOVER
+            theme::LABEL_HOVER
         } else {
-            NEW_VTAB_LABEL
+            theme::LABEL
         };
         {
             let buf = &mut self.sidebar_buffers[n];
@@ -3177,7 +2595,7 @@ impl State {
                 Shaping::Advanced,
                 None,
             );
-            buf.shape_until_scroll(&mut self.font_system, false);
+            buf.shape_until_scroll(&mut self.text.font_system, false);
         }
         placements.push(Placement {
             idx: n,
@@ -3313,7 +2731,7 @@ impl State {
                     None,
                 );
             }
-            buf.shape_until_scroll(&mut self.font_system, false);
+            buf.shape_until_scroll(&mut self.text.font_system, false);
             placements.push(Placement {
                 idx: i,
                 left: text_x,
@@ -3339,8 +2757,8 @@ impl State {
                     hover_box(hit, close_w),
                     sw,
                     sh,
-                    BUTTON_HOVER_BG,
-                    BUTTON_HOVER_ALPHA,
+                    theme::HOVER_BG,
+                    theme::HOVER_ALPHA,
                 ));
             }
             close_placements.push(Placement {
@@ -3353,7 +2771,7 @@ impl State {
                     right: (close_x + close_w) as i32,
                     bottom: vis_bot as i32,
                 },
-                color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
+                color: if hovered { theme::GLYPH_HOVER } else { theme::GLYPH },
             });
             self.buttons.push((hit, ButtonAction::CloseVtab(*id)));
             y += rh;
@@ -3396,7 +2814,7 @@ impl State {
         ));
 
         while self.menu_buffers.len() < items.len() {
-            let b = Buffer::new(&mut self.font_system, metrics);
+            let b = Buffer::new(&mut self.text.font_system, metrics);
             self.menu_buffers.push(b);
         }
 
@@ -3422,7 +2840,7 @@ impl State {
                 Shaping::Advanced,
                 None,
             );
-            buf.shape_until_scroll(&mut self.font_system, false);
+            buf.shape_until_scroll(&mut self.text.font_system, false);
             placements.push(Placement {
                 idx: i,
                 left: px + pad,
@@ -3554,186 +2972,6 @@ impl State {
         }
     }
 
-    /// Move a per-file-browser selection index in `map` for `sid` by `delta`, clamped to
-    /// `[0, count)`. An unset selection starts at 0 on the first move.
-    fn move_file_browser_sel(map: &mut HashMap<SurfaceId, usize>, sid: SurfaceId, count: usize, delta: i32) {
-        if count == 0 {
-            map.remove(&sid);
-            return;
-        }
-        let cur = map.get(&sid).copied();
-        let next = match cur {
-            None => 0,
-            Some(c) => (c as i32 + delta).clamp(0, count as i32 - 1) as usize,
-        };
-        map.insert(sid, next);
-    }
-
-    /// Handle a key for file browser `sid`. Typing filters; Backspace edits it;
-    /// Escape clears it; Up/Down move the selection; in path mode Tab and Up/Down
-    /// cycle completions and Enter/Right accept-then-navigate; in browse/filter mode
-    /// Right expands a directory, Left collapses, Enter navigates into a directory
-    /// (or opens a file, except in the picker).
-    fn file_browser_key(&mut self, sid: SurfaceId, event: &winit::event::KeyEvent) {
-        let is_picker = sid == PICKER_SID;
-        let path_mode = self.app.file_browser(sid).map(|b| b.input_is_path()).unwrap_or(false);
-        match &event.logical_key {
-            WKey::Named(NamedKey::Escape) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    b.set_query("");
-                }
-                self.file_browser_sel.remove(&sid);
-                self.file_browser_completion.remove(&sid);
-            }
-            WKey::Named(NamedKey::Backspace) => {
-                if let Some(b) = self.app.file_browser_mut(sid) {
-                    let mut q = b.query().to_string();
-                    q.pop();
-                    b.set_query(q);
-                }
-                self.file_browser_sel.remove(&sid);
-                self.file_browser_completion.remove(&sid);
-            }
-            WKey::Named(NamedKey::ArrowDown) => {
-                if path_mode {
-                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, 1);
-                } else {
-                    let n = self.app.file_browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
-                    Self::move_file_browser_sel(&mut self.file_browser_sel, sid, n, 1);
-                    self.ensure_sel_visible(sid);
-                }
-            }
-            WKey::Named(NamedKey::ArrowUp) => {
-                if path_mode {
-                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, -1);
-                } else {
-                    let n = self.app.file_browser_mut(sid).map(|b| b.rows().len()).unwrap_or(0);
-                    Self::move_file_browser_sel(&mut self.file_browser_sel, sid, n, -1);
-                    self.ensure_sel_visible(sid);
-                }
-            }
-            WKey::Named(NamedKey::Tab) => {
-                if path_mode {
-                    let n = self.app.file_browser(sid).map(|b| b.completions().len()).unwrap_or(0);
-                    Self::move_file_browser_sel(&mut self.file_browser_completion, sid, n, 1);
-                }
-            }
-            WKey::Named(NamedKey::ArrowRight) => {
-                if path_mode {
-                    // Accept the selected completion into the input.
-                    self.accept_completion(sid);
-                } else if let Some(r) = self.selected_row(sid) {
-                    if r.is_category && !r.expanded {
-                        if let Some(b) = self.app.file_browser_mut(sid) {
-                            b.toggle_category(&r.key);
-                        }
-                    } else if r.is_dir && !r.is_category && !r.expanded {
-                        if let Some(b) = self.app.file_browser_mut(sid) {
-                            b.toggle_dir(&r.path);
-                        }
-                    }
-                }
-            }
-            WKey::Named(NamedKey::ArrowLeft) => {
-                if !path_mode {
-                    if let Some(r) = self.selected_row(sid) {
-                        if r.is_category && r.expanded {
-                            if let Some(b) = self.app.file_browser_mut(sid) {
-                                b.toggle_category(&r.key);
-                            }
-                        } else if r.is_dir && !r.is_category && r.expanded {
-                            if let Some(b) = self.app.file_browser_mut(sid) {
-                                b.toggle_dir(&r.path);
-                            }
-                        }
-                    }
-                }
-            }
-            WKey::Named(NamedKey::Enter) => {
-                if path_mode {
-                    self.accept_completion(sid);
-                    let file = self.app.file_browser_mut(sid).and_then(|b| b.navigate_input());
-                    if let Some(f) = file {
-                        if !is_picker {
-                            self.open_from_file_browser(f);
-                        }
-                    }
-                    self.file_browser_completion.remove(&sid);
-                } else if let Some(r) = self.selected_row(sid) {
-                    if r.is_category {
-                        if let Some(b) = self.app.file_browser_mut(sid) {
-                            b.toggle_category(&r.key);
-                        }
-                    } else if r.is_dir {
-                        if let Some(b) = self.app.file_browser_mut(sid) {
-                            b.set_root(r.path);
-                        }
-                        self.file_browser_sel.remove(&sid);
-                    } else if !is_picker {
-                        self.open_from_file_browser(r.path);
-                    }
-                }
-            }
-            WKey::Character(s) => {
-                let add: String = s.chars().filter(|c| !c.is_control()).collect();
-                if !add.is_empty() {
-                    if let Some(b) = self.app.file_browser_mut(sid) {
-                        let mut q = b.query().to_string();
-                        q.push_str(&add);
-                        b.set_query(q);
-                    }
-                    self.file_browser_sel.remove(&sid);
-                    self.file_browser_completion.remove(&sid);
-                }
-            }
-            _ => {}
-        }
-        self.dirty = true;
-    }
-
-    /// Scroll a file browser so its keyboard-selected row is visible (uses the last
-    /// frame's list geometry).
-    fn ensure_sel_visible(&mut self, sid: SurfaceId) {
-        let Some(sel) = self.file_browser_sel.get(&sid).copied() else {
-            return;
-        };
-        let Some(v) = self.file_browser_views.iter().find(|v| v.sid == sid) else {
-            return;
-        };
-        let (row_h, list_h) = (v.row_h, v.list.h);
-        let row_top = sel as f32 * row_h;
-        let cur = self.file_browser_scroll.get(&sid).copied().unwrap_or(0.0);
-        let new = if row_top < cur {
-            row_top
-        } else if row_top + row_h > cur + list_h {
-            row_top + row_h - list_h
-        } else {
-            cur
-        };
-        self.file_browser_scroll.insert(sid, new.max(0.0));
-    }
-
-    /// The currently selected browse/filter row for `sid`, if any.
-    fn selected_row(&mut self, sid: SurfaceId) -> Option<ghostrealm_core::fs_tree::FileRow> {
-        let idx = self.file_browser_sel.get(&sid).copied()?;
-        self.app.file_browser_mut(sid).and_then(|b| b.rows().get(idx).cloned())
-    }
-
-    /// Apply the selected path completion (or the first, if none selected) to the
-    /// input, so a subsequent navigate/type continues from it.
-    fn accept_completion(&mut self, sid: SurfaceId) {
-        let comps = self.app.file_browser(sid).map(|b| b.completions()).unwrap_or_default();
-        if comps.is_empty() {
-            return;
-        }
-        let idx = self.file_browser_completion.get(&sid).copied().unwrap_or(0).min(comps.len() - 1);
-        if let Some(b) = self.app.file_browser_mut(sid) {
-            b.set_query(comps[idx].clone());
-        }
-    }
-
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
         // The directory picker, when open, owns the keyboard: Escape cancels,
         // Cmd+Enter confirms, everything else drives its file browser.
@@ -3747,7 +2985,13 @@ impl State {
                     self.app.confirm_dir_picker();
                     self.dirty = true;
                 }
-                _ => self.file_browser_key(PICKER_SID, event),
+                _ => {
+                    if let Some(press) = winit_key_press(event, self.mods) {
+                        self.view_event(PICKER_SID, |v, cx| {
+                            v.key(cx, &press);
+                        });
+                    }
+                }
             }
             return;
         }
@@ -3789,25 +3033,7 @@ impl State {
             }
             // Use the base key (Shift's symbol transform undone), so a binding like
             // `cmd+shift+/` matches even though Shift+/ yields `?`.
-            let base_key = {
-                #[cfg(any(
-                    target_os = "macos",
-                    target_os = "windows",
-                    all(unix, not(target_os = "macos"))
-                ))]
-                {
-                    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-                    event.key_without_modifiers()
-                }
-                #[cfg(not(any(
-                    target_os = "macos",
-                    target_os = "windows",
-                    all(unix, not(target_os = "macos"))
-                )))]
-                {
-                    event.logical_key.clone()
-                }
-            };
+            let base_key = base_key(event);
             if let Some(c) = match &base_key {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
@@ -3856,11 +3082,12 @@ impl State {
             return;
         }
 
-        // A file browser owns all non-Cmd keys: typing filters, Enter opens the top
-        // match, Backspace edits the filter, Escape clears it.
-        if self.app.focused_is_file_browser() {
-            if let Some(sid) = self.app.focused_surface() {
-                self.file_browser_key(sid, event);
+        // A focused view takes every non-Cmd key.
+        if let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) {
+            if let Some(press) = winit_key_press(event, self.mods) {
+                self.view_event(sid, |v, cx| {
+                    v.key(cx, &press);
+                });
             }
             return;
         }
@@ -3957,49 +3184,9 @@ impl State {
 
         // Any key that reaches the shell clears a keyboard selection.
         self.selection = None;
-        let text = event.text.as_ref().map(|s| s.to_string());
-        let key = match &event.logical_key {
-            WKey::Named(named) => match named {
-                NamedKey::Enter => Key::Enter,
-                NamedKey::Tab => Key::Tab,
-                NamedKey::Backspace => Key::Backspace,
-                NamedKey::Escape => Key::Escape,
-                NamedKey::Delete => Key::Delete,
-                NamedKey::Insert => Key::Insert,
-                NamedKey::ArrowUp => Key::Up,
-                NamedKey::ArrowDown => Key::Down,
-                NamedKey::ArrowLeft => Key::Left,
-                NamedKey::ArrowRight => Key::Right,
-                NamedKey::Home => Key::Home,
-                NamedKey::End => Key::End,
-                NamedKey::PageUp => Key::PageUp,
-                NamedKey::PageDown => Key::PageDown,
-                NamedKey::Space => Key::Char(' '),
-                NamedKey::F1 => Key::Function(1),
-                NamedKey::F2 => Key::Function(2),
-                NamedKey::F3 => Key::Function(3),
-                NamedKey::F4 => Key::Function(4),
-                NamedKey::F5 => Key::Function(5),
-                NamedKey::F6 => Key::Function(6),
-                NamedKey::F7 => Key::Function(7),
-                NamedKey::F8 => Key::Function(8),
-                NamedKey::F9 => Key::Function(9),
-                NamedKey::F10 => Key::Function(10),
-                NamedKey::F11 => Key::Function(11),
-                NamedKey::F12 => Key::Function(12),
-                _ => return,
-            },
-            WKey::Character(s) => match s.chars().next() {
-                Some(c) => Key::Char(c),
-                None => return,
-            },
-            _ => return,
-        };
-        self.app.send_key_to_focused(&KeyPress {
-            key,
-            mods: self.mods,
-            text,
-        });
+        if let Some(press) = winit_key_press(event, self.mods) {
+            self.app.send_key_to_focused(&press);
+        }
     }
 
     /// Route a key to the focused editor buffer. Shift extends a selection.
@@ -4420,7 +3607,7 @@ impl State {
             lines.push(vec![(format!("  {desc} · {more}"), [150, 150, 160])]);
 
             while self.palette_buffers.len() < lines.len() {
-                let b = Buffer::new(&mut self.font_system, metrics);
+                let b = Buffer::new(&mut self.text.font_system, metrics);
                 self.palette_buffers.push(b);
             }
             let text_x = panel_x + pad;
@@ -4436,7 +3623,7 @@ impl State {
                     Shaping::Advanced,
                     None,
                 );
-                buf.shape_until_scroll(&mut self.font_system, false);
+                buf.shape_until_scroll(&mut self.text.font_system, false);
                 placements.push(Placement {
                     idx: i,
                     left: text_x,
@@ -4498,7 +3685,7 @@ impl State {
         }
 
         while self.palette_buffers.len() < lines.len() {
-            let b = Buffer::new(&mut self.font_system, metrics);
+            let b = Buffer::new(&mut self.text.font_system, metrics);
             self.palette_buffers.push(b);
         }
         let text_x = panel_x + pad;
@@ -4514,7 +3701,7 @@ impl State {
                 Shaping::Advanced,
                 None,
             );
-            buf.shape_until_scroll(&mut self.font_system, false);
+            buf.shape_until_scroll(&mut self.text.font_system, false);
             placements.push(Placement {
                 idx: i,
                 left: text_x,
@@ -4621,20 +3808,13 @@ impl State {
             }
         }
 
-        self.row_cache.begin_frame(self.metrics_gen);
         let metrics = self.metrics();
         // Bound shaping work per frame: cache hits are free, but cache misses
         // (never-seen rows, e.g. a fast scroll into history) are shaped only
         // while under budget. Overflow rows are deferred to later frames.
-        let shape_deadline = Instant::now() + SHAPE_BUDGET;
-        let mut shaped = 0usize;
-        let mut deferred = false;
-        // Row content key drawn at each screen position this frame, so a deferred
-        // row can fall back to its previous content instead of a blank gap.
-        let mut cur_rows: HashMap<(i32, i32), u64> = HashMap::new();
-        let mut bg_quads: Vec<QuadInstance> = Vec::new();
-        let mut overlay_quads: Vec<QuadInstance> = Vec::new();
-        let mut row_placements: Vec<RowPlacement> = Vec::new();
+        self.text.begin_frame(self.metrics_gen, metrics, self.cell_h, SHAPE_BUDGET);
+        let mut frame = Frame::new((sw, sh));
+        let ui = self.ui();
         let mut strip_placements: Vec<Placement> = Vec::new();
         let mut strip_idx = 0usize;
         let multi_pane = resolved.len() > 1;
@@ -4643,11 +3823,6 @@ impl State {
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
         self.buttons.clear();
         self.empty_placements.clear();
-        self.file_browser_placements.clear();
-        self.file_browser_buf_used = 0;
-        self.file_browser_views.clear();
-        self.file_browser_suggest_hits.clear();
-        self.picker_placements.clear();
         self.picker_panel = None;
         let mut close_placements: Vec<Placement> = Vec::new();
         let active_vt = self.app.tree.active_vtab();
@@ -4655,20 +3830,20 @@ impl State {
         self.close_buffer
             .set_size(Some(self.cell_w * 2.0), Some(self.cell_h));
         self.close_buffer.set_rich_text(
-            std::iter::once(("\u{00d7}", attrs_for(CLOSE_GLYPH))),
+            std::iter::once(("\u{00d7}", attrs_for(theme::GLYPH))),
             &Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
             None,
         );
         self.close_buffer
-            .shape_until_scroll(&mut self.font_system, false);
+            .shape_until_scroll(&mut self.text.font_system, false);
 
         for (pr, strip_h, ribbon_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
                 let n = pr.surfaces.len().max(1);
                 let tab_w = pr.rect.w / n as f32;
-                bg_quads.push(rect_quad(
+                frame.bg.push(rect_quad(
                     Rect {
                         x: pr.rect.x,
                         y: pr.rect.y,
@@ -4686,7 +3861,7 @@ impl State {
                 for (i, (sid, title, is_active)) in pr.surfaces.iter().enumerate() {
                     let tab_x = pr.rect.x + i as f32 * tab_w;
                     if *is_active {
-                        bg_quads.push(rect_quad(
+                        frame.bg.push(rect_quad(
                             Rect {
                                 x: tab_x,
                                 y: pr.rect.y,
@@ -4702,7 +3877,7 @@ impl State {
                     let close_x = tab_x + tab_w - close_w - pad;
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
-                            .push(Buffer::new(&mut self.font_system, metrics));
+                            .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
                     // Italic when the tab is an editor with unsaved edits.
                     let unsaved = self.app.editor(*sid).is_some_and(|e| e.modified);
@@ -4722,7 +3897,7 @@ impl State {
                         Shaping::Advanced,
                         None,
                     );
-                    buf.shape_until_scroll(&mut self.font_system, false);
+                    buf.shape_until_scroll(&mut self.text.font_system, false);
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: tab_x + pad,
@@ -4746,12 +3921,12 @@ impl State {
                         };
                         let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
                         if hovered {
-                            bg_quads.push(rect_quad(
+                            frame.bg.push(rect_quad(
                                 hover_box(hit, close_w),
                                 sw,
                                 sh,
-                                BUTTON_HOVER_BG,
-                                BUTTON_HOVER_ALPHA,
+                                theme::HOVER_BG,
+                                theme::HOVER_ALPHA,
                             ));
                         }
                         close_placements.push(Placement {
@@ -4764,7 +3939,7 @@ impl State {
                                 right: (close_x + close_w) as i32,
                                 bottom: (pr.rect.y + *strip_h) as i32,
                             },
-                            color: if hovered { CLOSE_GLYPH_HOVER } else { CLOSE_GLYPH },
+                            color: if hovered { theme::GLYPH_HOVER } else { theme::GLYPH },
                         });
                         self.buttons.push((hit, ButtonAction::CloseSurface(vt, pr.id, *sid)));
                     }
@@ -4773,28 +3948,35 @@ impl State {
 
             let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
                 // No surface in this pane: draw the "nothing open" screen.
-                self.build_empty_pane(*term, sw, sh, &mut bg_quads);
+                self.build_empty_pane(*term, sw, sh, &mut frame.bg);
                 continue;
             };
             let sid = *active_sid;
 
             // An empty tab shows the picker; a file browser tab shows the file browser.
             if self.app.surface_is_empty(sid) {
-                self.build_empty_pane(*term, sw, sh, &mut bg_quads);
+                self.build_empty_pane(*term, sw, sh, &mut frame.bg);
                 continue;
             }
-            if self.app.is_file_browser(sid) {
-                let focus_border = pr.focused && resolved.len() > 1;
-                let ps = self.build_file_browser(
+            if let Some(view) = self.app.view_mut(sid) {
+                let mut cx = PaintCx::new(
+                    &self.cfg,
+                    &self.chrome,
+                    ui,
+                    self.cursor,
+                    &mut self.text,
+                    &mut frame,
+                    Layer::Base,
                     sid,
-                    focus_border,
-                    *term,
-                    sw,
-                    sh,
-                    &mut bg_quads,
-                    Some(&mut row_placements),
                 );
-                self.file_browser_placements.extend(ps);
+                cx.focused = pr.focused;
+                cx.tab_strip = *strip_h > 0.0;
+                view.paint(&mut cx, *term);
+                if pr.focused && multi_pane {
+                    push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
+                }
+                let owned = frame.view_buttons.drain(..);
+                self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
                 continue;
             }
 
@@ -4803,7 +3985,7 @@ impl State {
             // there are unsaved edits, followed by dim size/line-count metrics.
             if *ribbon_h > 0.0 {
                 let ry = pr.rect.y + *strip_h;
-                bg_quads.push(rect_quad(
+                frame.bg.push(rect_quad(
                     Rect {
                         x: pr.rect.x,
                         y: ry,
@@ -4824,7 +4006,7 @@ impl State {
                     let pad = 8.0 * self.scale;
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
-                            .push(Buffer::new(&mut self.font_system, metrics));
+                            .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
                     let mut name_attrs = Attrs::new()
                         .family(Family::SansSerif)
@@ -4845,7 +4027,7 @@ impl State {
                     // Filename, left-aligned.
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
-                            .push(Buffer::new(&mut self.font_system, metrics));
+                            .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
@@ -4860,7 +4042,7 @@ impl State {
                         Shaping::Advanced,
                         None,
                     );
-                    buf.shape_until_scroll(&mut self.font_system, false);
+                    buf.shape_until_scroll(&mut self.text.font_system, false);
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: pr.rect.x + pad,
@@ -4877,7 +4059,7 @@ impl State {
                     // Metrics, right-aligned.
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
-                            .push(Buffer::new(&mut self.font_system, metrics));
+                            .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
@@ -4889,7 +4071,7 @@ impl State {
                         Shaping::Advanced,
                         None,
                     );
-                    buf.shape_until_scroll(&mut self.font_system, false);
+                    buf.shape_until_scroll(&mut self.text.font_system, false);
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: meta_left,
@@ -4913,18 +4095,18 @@ impl State {
                     };
                     let wb_hovered = rect_contains(wb_hit, self.cursor.0, self.cursor.1);
                     if wb_hovered {
-                        bg_quads.push(rect_quad(
+                        frame.bg.push(rect_quad(
                             hover_box(wb_hit, wb_w),
                             sw,
                             sh,
-                            BUTTON_HOVER_BG,
-                            BUTTON_HOVER_ALPHA,
+                            theme::HOVER_BG,
+                            theme::HOVER_ALPHA,
                         ));
                     }
-                    let wb_color = if wb_on { self.chrome.accent } else { CLOSE_GLYPH };
+                    let wb_color = if wb_on { self.chrome.accent } else { theme::GLYPH };
                     if strip_idx >= self.strip_buffers.len() {
                         self.strip_buffers
-                            .push(Buffer::new(&mut self.font_system, metrics));
+                            .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
@@ -4936,7 +4118,7 @@ impl State {
                         Shaping::Advanced,
                         None,
                     );
-                    buf.shape_until_scroll(&mut self.font_system, false);
+                    buf.shape_until_scroll(&mut self.text.font_system, false);
                     strip_placements.push(Placement {
                         idx: strip_idx,
                         left: wb_x + (wb_w - self.cell_w) * 0.5,
@@ -4995,7 +4177,7 @@ impl State {
                     ),
                     None => continue,
                 };
-                bg_quads.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
+                frame.bg.push(rect_quad(*term, sw, sh, EDITOR_BG, 1.0));
                 // Syntax-highlight .toml files.
                 let highlight_toml = self
                     .app
@@ -5042,7 +4224,7 @@ impl State {
                 if self.cfg.editor.cursor_line {
                     for (ln, _t, _s, y) in &vis {
                         if *ln == cursor.0 {
-                            bg_quads.push(rect_quad(
+                            frame.bg.push(rect_quad(
                                 Rect { x: term.x, y: *y, w: term.w, h: self.cell_h },
                                 sw,
                                 sh,
@@ -5076,7 +4258,7 @@ impl State {
                                 - hscroll_px)
                                 .min(right);
                             if x1 > x0 {
-                                bg_quads.push(rect_quad(
+                                frame.bg.push(rect_quad(
                                     Rect { x: x0, y: *y, w: x1 - x0, h: self.cell_h },
                                     sw,
                                     sh,
@@ -5102,18 +4284,18 @@ impl State {
                         };
                         let s = num.to_string();
                         let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
-                        let key = self.row_cache.row_key(std::iter::once((s.as_str(), color)));
-                        if self.row_cache.buffer(key).is_some() {
-                            self.row_cache
-                                .ensure(key, &mut self.font_system, metrics, gutter_w, self.cell_h, &[]);
+                        let key = self.text.row_cache.row_key(std::iter::once((s.as_str(), color)));
+                        if self.text.row_cache.buffer(key).is_some() {
+                            self.text.row_cache
+                                .ensure(key, &mut self.text.font_system, metrics, gutter_w, self.cell_h, &[]);
                         } else {
                             let spans = vec![(s.clone(), color)];
-                            self.row_cache
-                                .ensure(key, &mut self.font_system, metrics, gutter_w, self.cell_h, &spans);
+                            self.text.row_cache
+                                .ensure(key, &mut self.text.font_system, metrics, gutter_w, self.cell_h, &spans);
                         }
                         let num_w = s.chars().count() as f32 * self.cell_w;
-                        row_placements.push(RowPlacement {
-                            key,
+                        frame.text.push(TextItem {
+                            src: TextSrc::Row(key),
                             left: body_x - self.cell_w - num_w,
                             top: *y,
                             bounds: TextBounds {
@@ -5137,7 +4319,7 @@ impl State {
                     } else {
                         vec![(text.clone(), EDITOR_FG)]
                     };
-                    let key = self
+                    let key = self.text
                         .row_cache
                         .row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
                     let pos = (body_x as i32, *y as i32);
@@ -5145,31 +4327,9 @@ impl State {
                     // enough to hold it, so the layout is hscroll-independent.
                     let shape_w =
                         (text.chars().count() as f32 * self.cell_w).max(body_w);
-                    let place_key = if self.row_cache.buffer(key).is_some() {
-                        self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, shape_w, self.cell_h, &[]);
-                        key
-                    } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
-                        self.row_cache
-                            .ensure(key, &mut self.font_system, metrics, shape_w, self.cell_h, &spans);
-                        shaped += 1;
-                        key
-                    } else {
-                        deferred = true;
-                        Self::stale_key(
-                            &self.prev_rows,
-                            &mut self.row_cache,
-                            &mut self.font_system,
-                            pos,
-                            key,
-                            metrics,
-                            shape_w,
-                            self.cell_h,
-                        )
-                    };
-                    cur_rows.insert(pos, place_key);
-                    row_placements.push(RowPlacement {
-                        key: place_key,
+                    let place_key = self.text.budgeted_key(key, pos, shape_w, || spans);
+                    frame.text.push(TextItem {
+                        src: TextSrc::Row(place_key),
                         left: body_x - hscroll_px,
                         top: *y,
                         bounds: TextBounds {
@@ -5192,7 +4352,7 @@ impl State {
                     // Clip to the body so a scrolled-off cursor never draws over the
                     // gutter or the neighbouring pane/sidebar.
                     if cx >= body_x && cx < term.x + term.w {
-                        overlay_quads.push(rect_quad(
+                        frame.top.push(rect_quad(
                             Rect {
                                 x: cx,
                                 y: *y,
@@ -5207,7 +4367,7 @@ impl State {
                     }
                 }
                 if pr.focused && multi_pane {
-                    push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);
+                    push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
                 }
                 continue;
             }
@@ -5228,7 +4388,7 @@ impl State {
                 continue;
             };
             // Pane background fills its terminal rect.
-            bg_quads.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
+            frame.bg.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
 
             // Selection highlight (behind text) for this surface.
             if let Some(sel) = self.selection {
@@ -5237,7 +4397,7 @@ impl State {
                         if let Some((first, last)) = selection_row_span(sel, row, grid.size.cols) {
                             let x = term.x + first as f32 * self.cell_w;
                             let w = (last - first + 1) as f32 * self.cell_w;
-                            bg_quads.push(rect_quad(
+                            frame.bg.push(rect_quad(
                                 Rect {
                                     x,
                                     y: term.y + row as f32 * self.cell_h,
@@ -5258,7 +4418,7 @@ impl State {
                 for col in 0..grid.size.cols {
                     if let Some(c) = grid.cell(col, row) {
                         if c.bg != grid.default_bg {
-                            bg_quads.push(rect_quad(
+                            frame.bg.push(rect_quad(
                                 cell_rect(*term, col, row, self.cell_w, self.cell_h),
                                 sw,
                                 sh,
@@ -5273,43 +4433,23 @@ impl State {
                 // Keyed over the inked prefix only, so trailing blanks neither
                 // cost shaping nor split otherwise-identical rows in the cache.
                 let content_len = row_content_len(grid, row);
-                let key = self.row_cache.row_key((0..content_len).map(|col| {
+                let key = self.text.row_cache.row_key((0..content_len).map(|col| {
                     match grid.cell(col, row) {
                         Some(c) => (c.text.as_str(), c.fg),
                         None => ("", grid.default_fg),
                     }
                 }));
                 let top = term.y + row as f32 * self.cell_h;
-                let place_key = if self.row_cache.buffer(key).is_some() {
-                    // Cache hit: no shaping, just refresh recency.
-                    self.row_cache
-                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &[]);
-                    key
-                } else if shaped < MIN_SHAPES_PER_FRAME || Instant::now() < shape_deadline {
-                    let spans = row_spans(grid, row);
-                    self.row_cache
-                        .ensure(key, &mut self.font_system, metrics, term.w, self.cell_h, &spans);
-                    shaped += 1;
-                    key
-                } else {
-                    // Over budget: finish this row a frame later. Meanwhile redraw
-                    // the previous (stale) content at this position if it's still
-                    // cached, rather than a blank gap.
-                    deferred = true;
-                    Self::stale_key(
-                        &self.prev_rows,
-                        &mut self.row_cache,
-                        &mut self.font_system,
-                        (term.x as i32, top as i32),
-                        key,
-                        metrics,
-                        term.w,
-                        self.cell_h,
-                    )
-                };
-                cur_rows.insert((term.x as i32, top as i32), place_key);
-                row_placements.push(RowPlacement {
-                    key: place_key,
+                // Shape on a miss only while the frame's budget lasts; past it the
+                // position redraws its previous content until a later frame.
+                let place_key = self.text.budgeted_key(
+                    key,
+                    (term.x as i32, top as i32),
+                    term.w,
+                    || row_spans(grid, row),
+                );
+                frame.text.push(TextItem {
+                    src: TextSrc::Row(place_key),
                     left: term.x,
                     top,
                     bounds: TextBounds {
@@ -5327,7 +4467,7 @@ impl State {
                     .cell(grid.cursor.col, grid.cursor.row)
                     .map(|c| c.fg)
                     .unwrap_or(grid.default_fg);
-                overlay_quads.push(rect_quad(
+                frame.top.push(rect_quad(
                     cell_rect(
                         *term,
                         grid.cursor.col,
@@ -5342,38 +4482,39 @@ impl State {
                 ));
             }
             if pr.focused && multi_pane {
-                push_border(&mut overlay_quads, pr.rect, sw, sh, self.chrome.accent);
+                push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
             }
         }
-        // Remember what each position drew, so next frame's deferred rows can fall
-        // back to it instead of a blank gap.
-        self.prev_rows = cur_rows;
+        // Rows the shaping budget deferred need a follow-up frame.
+        let deferred = self.text.finish_paint();
 
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
         // Sidebar (bg quads before text; its names join the main text pass).
-        let sidebar_placements = self.build_sidebar(sw, sh, &mut bg_quads, &mut close_placements);
+        let sidebar_placements = self.build_sidebar(sw, sh, &mut frame.bg, &mut close_placements);
         // Custom title-bar strip (macOS); a no-op elsewhere. Drawn after the
         // sidebar so its strip covers the sidebar's top edge cleanly.
         self.title_place = None;
-        self.build_titlebar(sw, sh, &mut bg_quads);
+        self.build_titlebar(sw, sh, &mut frame.bg);
 
         let palette_placements = if self.palette.is_some() {
-            self.build_palette(sw, sh, &mut overlay_quads)
+            self.build_palette(sw, sh, &mut frame.top)
         } else {
             Vec::new()
         };
         let menu_placements = if self.menu.is_some() {
-            self.build_menu(sw, sh, &mut overlay_quads)
+            self.build_menu(sw, sh, &mut frame.top)
         } else {
             Vec::new()
         };
         // Floating directory picker (modal overlay). Its text joins the overlay pass.
-        self.picker_placements = self.build_dir_picker(sw, sh, &mut overlay_quads);
+        self.build_dir_picker(&mut frame);
 
-        let n_bg = bg_quads.len() as u32;
-        bg_quads.extend_from_slice(&overlay_quads);
-        self.upload_quads(&bg_quads);
+        let n_bg = frame.bg.len() as u32;
+        let n_top = frame.top.len();
+        let mut quads = std::mem::take(&mut frame.bg);
+        quads.extend_from_slice(&frame.top);
+        self.upload_quads(&quads);
 
         self.viewport.update(
             &self.queue,
@@ -5398,7 +4539,7 @@ impl State {
                 None,
             );
             self.warm_buffer
-                .shape_until_scroll(&mut self.font_system, false);
+                .shape_until_scroll(&mut self.text.font_system, false);
             self.atlas_warmed_gen = Some(self.metrics_gen);
             Some(TextArea {
                 buffer: &self.warm_buffer,
@@ -5418,20 +4559,25 @@ impl State {
             None
         };
 
-        let mut text_areas: Vec<TextArea> = row_placements
-            .iter()
-            .filter_map(|p| {
-                self.row_cache.buffer(p.key).map(|buffer| TextArea {
-                    buffer,
-                    left: p.left,
-                    top: p.top,
-                    scale: 1.0,
-                    bounds: p.bounds,
-                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                    custom_glyphs: &[],
-                })
+        // Frame text references the row cache or the scratch pool; borrow those
+        // fields alone so the font system stays free for `prepare`.
+        let (row_cache, scratch) = (&self.text.row_cache, &self.text.scratch);
+        let area = |p: &TextItem| {
+            let buffer = match p.src {
+                TextSrc::Row(key) => row_cache.buffer(key),
+                TextSrc::Scratch(idx) => scratch.get(idx),
+            }?;
+            Some(TextArea {
+                buffer,
+                left: p.left,
+                top: p.top,
+                scale: 1.0,
+                bounds: p.bounds,
+                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                custom_glyphs: &[],
             })
-            .collect();
+        };
+        let mut text_areas: Vec<TextArea> = frame.text.iter().filter_map(area).collect();
         text_areas.extend(sidebar_placements.iter().map(|p| TextArea {
             buffer: &self.sidebar_buffers[p.idx],
             left: p.left,
@@ -5494,32 +4640,19 @@ impl State {
             default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
             custom_glyphs: &[],
         }));
-        // File-browser text.
-        text_areas.extend(self.file_browser_placements.iter().map(|p| TextArea {
-            buffer: &self.file_browser_buffers[p.idx],
-            left: p.left,
-            top: p.top,
-            scale: 1.0,
-            bounds: p.bounds,
-            default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-            custom_glyphs: &[],
-        }));
         text_areas.extend(warm_area);
 
         self.text_renderer
             .prepare(
                 &self.device,
                 &self.queue,
-                &mut self.font_system,
+                &mut self.text.font_system,
                 &mut self.atlas,
                 &self.viewport,
                 text_areas,
                 &mut self.swash_cache,
             )
             .context("text prepare")?;
-        // The row buffers are no longer borrowed; trim the cache to its cap and
-        // drop grids/geometry for surfaces that have closed.
-        self.row_cache.end_frame();
         self.grid_cache.retain(|sid, _| self.app.has_surface(*sid));
         self.surface_geom.retain(|sid, _| self.app.has_surface(*sid));
 
@@ -5552,25 +4685,14 @@ impl State {
                 })
                 .collect()
         } else {
-            self.picker_placements
-                .iter()
-                .map(|p| TextArea {
-                    buffer: &self.file_browser_buffers[p.idx],
-                    left: p.left,
-                    top: p.top,
-                    scale: 1.0,
-                    bounds: p.bounds,
-                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                    custom_glyphs: &[],
-                })
-                .collect()
+            frame.overlay_text.iter().filter_map(area).collect()
         };
         if !overlay_areas.is_empty() {
             self.palette_renderer
                 .prepare(
                     &self.device,
                     &self.queue,
-                    &mut self.font_system,
+                    &mut self.text.font_system,
                     &mut self.atlas,
                     &self.viewport,
                     overlay_areas,
@@ -5578,8 +4700,10 @@ impl State {
                 )
                 .context("overlay prepare")?;
         }
+        // No text pass references the row cache any more: trim it to its cap.
+        self.text.row_cache.end_frame();
 
-        let frame = match self.surface.get_current_texture() {
+        let target = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -5599,7 +4723,7 @@ impl State {
             }
             other => return Err(anyhow::anyhow!("surface acquire failed: {other:?}")),
         };
-        let view = frame
+        let view = target
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
@@ -5640,7 +4764,7 @@ impl State {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .context("text render")?;
-            let total = (n_bg as usize + overlay_quads.len()) as u32;
+            let total = (n_bg as usize + n_top) as u32;
             if total > n_bg {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
@@ -5648,7 +4772,7 @@ impl State {
             }
             if !palette_placements.is_empty()
                 || !menu_placements.is_empty()
-                || !self.picker_placements.is_empty()
+                || !frame.overlay_text.is_empty()
             {
                 self.palette_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
@@ -5656,12 +4780,13 @@ impl State {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
+        self.queue.present(target);
         self.atlas.trim();
         // Rows left unshaped by this frame's budget need another frame to finish;
         // keep the surface dirty and paced so the shaping backlog drains.
-        self.dirty = deferred;
-        if deferred {
+        let again = deferred || frame.wants_frame;
+        self.dirty = again;
+        if again {
             self.frame_pending = true;
         }
         Ok(())
@@ -5696,20 +4821,80 @@ struct Placement {
     color: [u8; 3],
 }
 
-/// A terminal row's placement this frame, referring to its shaped buffer in the
-/// content-keyed [`RowCache`] rather than a positional pool slot.
-struct RowPlacement {
-    key: u64,
-    left: f32,
-    top: f32,
-    bounds: TextBounds,
-    color: [u8; 3],
-}
-
 fn attrs_for<'a>(color: [u8; 3]) -> Attrs<'a> {
     Attrs::new()
         .family(Family::Monospace)
         .color(Color::rgb(color[0], color[1], color[2]))
+}
+
+/// Translate a winit key event into the backend-neutral [`KeyPress`] views and
+/// terminals take. With Cmd held, a character key is its unshifted base key
+/// (so `cmd+shift+/` reads as `/`). `None` for keys with no mapping (a lone
+/// modifier, media keys, ...).
+fn winit_key_press(event: &winit::event::KeyEvent, mods: Mods) -> Option<KeyPress> {
+    let text = event.text.as_ref().map(|s| s.to_string());
+    let logical = if mods.super_ {
+        base_key(event)
+    } else {
+        event.logical_key.clone()
+    };
+    let key = match &logical {
+        WKey::Named(named) => match named {
+            NamedKey::Enter => Key::Enter,
+            NamedKey::Tab => Key::Tab,
+            NamedKey::Backspace => Key::Backspace,
+            NamedKey::Escape => Key::Escape,
+            NamedKey::Delete => Key::Delete,
+            NamedKey::Insert => Key::Insert,
+            NamedKey::ArrowUp => Key::Up,
+            NamedKey::ArrowDown => Key::Down,
+            NamedKey::ArrowLeft => Key::Left,
+            NamedKey::ArrowRight => Key::Right,
+            NamedKey::Home => Key::Home,
+            NamedKey::End => Key::End,
+            NamedKey::PageUp => Key::PageUp,
+            NamedKey::PageDown => Key::PageDown,
+            NamedKey::Space => Key::Char(' '),
+            NamedKey::F1 => Key::Function(1),
+            NamedKey::F2 => Key::Function(2),
+            NamedKey::F3 => Key::Function(3),
+            NamedKey::F4 => Key::Function(4),
+            NamedKey::F5 => Key::Function(5),
+            NamedKey::F6 => Key::Function(6),
+            NamedKey::F7 => Key::Function(7),
+            NamedKey::F8 => Key::Function(8),
+            NamedKey::F9 => Key::Function(9),
+            NamedKey::F10 => Key::Function(10),
+            NamedKey::F11 => Key::Function(11),
+            NamedKey::F12 => Key::Function(12),
+            _ => return None,
+        },
+        WKey::Character(s) => Key::Char(s.chars().next()?),
+        _ => return None,
+    };
+    Some(KeyPress { key, mods, text })
+}
+
+/// The key with Shift's symbol transform undone (Shift+/ is `/`, not `?`), so
+/// chords match what is printed on the key.
+fn base_key(event: &winit::event::KeyEvent) -> WKey {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    ))]
+    {
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        event.key_without_modifiers()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    )))]
+    {
+        event.logical_key.clone()
+    }
 }
 
 /// Format a canonical chord ("cmd+shift+t") as macOS symbols ("⌘⇧T") for display.
@@ -5781,11 +4966,6 @@ fn hover_box(hit: Rect, side: f32) -> Rect {
         w: s,
         h: s,
     }
-}
-
-/// Whether point `(x, y)` lies inside `r` (half-open on the far edges).
-fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
-    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
 /// A cursor/selection direction.
@@ -5928,76 +5108,6 @@ fn cell_rect(pane: Rect, col: u16, row: u16, cell_w: f32, cell_h: f32) -> Rect {
     }
 }
 
-fn rect_quad(r: Rect, sw: f32, sh: f32, color: [u8; 3], alpha: f32) -> QuadInstance {
-    let ndc_x = r.x / sw * 2.0 - 1.0;
-    let ndc_y = 1.0 - r.y / sh * 2.0;
-    let ndc_w = r.w / sw * 2.0;
-    let ndc_h = -(r.h / sh * 2.0);
-    QuadInstance {
-        pos: [ndc_x, ndc_y],
-        size: [ndc_w, ndc_h],
-        color: [
-            srgb_to_linear(color[0]) as f32,
-            srgb_to_linear(color[1]) as f32,
-            srgb_to_linear(color[2]) as f32,
-            alpha,
-        ],
-    }
-}
-
-/// Push four thin quads forming a border just inside `r`.
-fn push_border(out: &mut Vec<QuadInstance>, r: Rect, sw: f32, sh: f32, color: [u8; 3]) {
-    let t = BORDER;
-    out.push(rect_quad(
-        Rect {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: t,
-        },
-        sw,
-        sh,
-        color,
-        1.0,
-    ));
-    out.push(rect_quad(
-        Rect {
-            x: r.x,
-            y: r.y + r.h - t,
-            w: r.w,
-            h: t,
-        },
-        sw,
-        sh,
-        color,
-        1.0,
-    ));
-    out.push(rect_quad(
-        Rect {
-            x: r.x,
-            y: r.y,
-            w: t,
-            h: r.h,
-        },
-        sw,
-        sh,
-        color,
-        1.0,
-    ));
-    out.push(rect_quad(
-        Rect {
-            x: r.x + r.w - t,
-            y: r.y,
-            w: t,
-            h: r.h,
-        },
-        sw,
-        sh,
-        color,
-        1.0,
-    ));
-}
-
 fn status_color(status: TabStatus) -> [u8; 3] {
     match status {
         TabStatus::Read => [90, 90, 100],
@@ -6005,15 +5115,6 @@ fn status_color(status: TabStatus) -> [u8; 3] {
         TabStatus::Unread { success: true } => [80, 180, 90],
         TabStatus::Unread { success: false } => [200, 80, 80],
         TabStatus::NeedsInput => [210, 120, 40],
-    }
-}
-
-fn srgb_to_linear(c: u8) -> f64 {
-    let s = c as f64 / 255.0;
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -6183,18 +5284,6 @@ fn wrap_line(line: &str, cols: usize) -> Vec<(String, usize)> {
 /// A compact directory label that fits in `max` characters, no wrap/overflow:
 /// prefer "parent/current", else "current", else "curr…" truncated with an
 /// ellipsis. `~` is substituted for the home directory's own segment.
-/// Truncate `s` to at most `max` characters, keeping the tail (prefixed with an
-/// ellipsis) so the most specific part of a path stays visible.
-fn shorten_start(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if max == 0 || count <= max {
-        return s.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let tail: String = s.chars().skip(count - keep).collect();
-    format!("\u{2026}{tail}")
-}
-
 fn shorten_dir(path: &std::path::Path, max: usize) -> String {
     let seg = |p: &std::path::Path| -> Option<String> {
         p.file_name().and_then(|s| s.to_str()).map(str::to_string)
