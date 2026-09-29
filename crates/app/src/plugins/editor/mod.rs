@@ -491,6 +491,13 @@ impl View for EditorView {
         self.buf.path.clone()
     }
 
+    /// Agent input is typed at the cursor.
+    fn write_input(&mut self, bytes: &[u8]) -> bool {
+        self.buf.insert_str(&String::from_utf8_lossy(bytes));
+        self.note_edits();
+        true
+    }
+
     fn text(&mut self) -> Option<String> {
         Some(self.buf.lines.join("\n"))
     }

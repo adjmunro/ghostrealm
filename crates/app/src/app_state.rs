@@ -1,10 +1,11 @@
-//! The live application state: the workspace [`Tree`] plus the terminals that
-//! back its surfaces, and the command registry built over it.
+//! The live application state: the workspace [`Tree`] plus the plugin views
+//! (terminals, editors, file browsers, ...) that fill its surfaces, and the
+//! command registry built over it.
 //!
 //! This is the single source of truth the GUI, the palette, and the agent
-//! channel all act on. It is `!Send` (it owns VT engines) and lives on the UI
-//! thread. Terminal grid sizes default to a headless size until the GUI drives
-//! real per-pane sizes.
+//! channel all act on. It is `!Send` (views own VT engines) and lives on the UI
+//! thread. Views size themselves when the GUI paints them; headless, a terminal
+//! keeps its default grid.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,11 +17,13 @@ use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
     TabStatus, Tree, VtabId,
 };
-use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Scroll, TerminalBackend};
+use ghostrealm_core::Config;
+use ghostrealm_terminal::{KeyPress, Lifecycle};
 
-use crate::plugin::{OpenCx, Plugin, View};
+use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor::{self, EditorBuffer, EditorView};
-use crate::plugins::file_browser::{self, FileBrowserView};
+use crate::plugins::file_browser::FileBrowserView;
+use crate::plugins::terminal::{self, TerminalView};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
@@ -30,37 +33,22 @@ pub const SETTINGS_VTAB_NAME: &str = "settings";
 /// renders as a pane and survives prunes.
 pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 
-/// The kinds of content a pane/tab can open (via the "nothing open" picker).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpenKind {
-    Terminal,
-    Editor,
-    FileBrowser,
-}
-
 /// After Enter, a vtab is shown busy for at least this long even if the shell's
 /// foreground process group hasn't moved yet — the command may not have forked
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
-use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
-
-/// Default grid size for a surface before the GUI assigns it a pane rect.
-const DEFAULT_COLS: u16 = 80;
-const DEFAULT_ROWS: u16 = 24;
-const DEFAULT_CELL_W: u32 = 8;
-const DEFAULT_CELL_H: u32 = 16;
 
 pub struct AppState {
     pub tree: Tree,
-    surfaces: HashMap<SurfaceId, ThreadedTerminal>,
-    /// Surfaces whose content is a plugin view. A surface with no terminal,
-    /// editor, or view is "empty" — it shows the open-something picker.
+    /// Each surface's content. A surface without a view is "empty" — it shows
+    /// the open-something picker.
     views: HashMap<SurfaceId, Box<dyn View>>,
     /// Registered content kinds, in picker order.
     plugins: Vec<Box<dyn Plugin>>,
     /// The floating directory picker, while open.
     dir_picker: Option<FileBrowserView>,
-    /// Optional shell command line (`sh -c <line>`); `None` = the user's shell.
+    /// Optional command line new terminals run (`sh -c <line>`); `None` = the
+    /// user's shell.
     shell_line: Option<String>,
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
     /// loop). Cloned into a fresh `PtyWaker` for each spawned terminal.
@@ -84,7 +72,6 @@ impl AppState {
     pub fn new() -> Self {
         AppState {
             tree: Tree::new(),
-            surfaces: HashMap::new(),
             views: HashMap::new(),
             plugins: crate::plugins::builtin(),
             dir_picker: None,
@@ -149,57 +136,12 @@ impl AppState {
         self
     }
 
-    /// Spawn a surface's terminal in workspace `vt`'s resolved cwd.
-    fn spawn_surface(&mut self, id: SurfaceId, vt: VtabId) -> Result<()> {
-        let cwd = self.resolve_cwd(vt);
-        self.spawn_surface_cmd(id, None, cwd)
-    }
-
-    /// Spawn a surface's terminal. `cmd_line`, when given, runs `sh -c <cmd_line>`
-    /// for this surface only; otherwise the configured shell line (or login shell)
-    /// is used. `cwd`, when it exists, is the working directory.
-    fn spawn_surface_cmd(
-        &mut self,
-        id: SurfaceId,
-        cmd_line: Option<&str>,
-        cwd: Option<std::path::PathBuf>,
-    ) -> Result<()> {
-        let mut cmd = match cmd_line.or(self.shell_line.as_deref()) {
-            Some(line) => {
-                let mut c = CommandBuilder::new("/bin/sh");
-                c.arg("-c");
-                c.arg(line);
-                c
-            }
-            None => CommandBuilder::new_default_prog(),
-        };
-        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
-            cmd.cwd(dir);
-        }
-        // The VT runs on a worker thread; the UI waker pokes the event loop when
-        // the worker publishes a new grid.
-        let term = ThreadedTerminal::spawn(
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            DEFAULT_CELL_W,
-            DEFAULT_CELL_H,
-            Some(cmd),
-            self.waker.clone(),
-        )?;
-        self.surfaces.insert(id, term);
-        Ok(())
-    }
-
-    pub fn terminal(&mut self, id: SurfaceId) -> Option<&mut ThreadedTerminal> {
-        self.surfaces.get_mut(&id)
-    }
-
     /// Create a new vtab with a spawned terminal; it becomes active.
     pub fn new_vtab(&mut self) -> Result<VtabId> {
         let name = format!("tab {}", self.next_tab_number);
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
-        self.spawn_surface(surf, vt)?;
+        self.materialize_plugin(surf, vt, terminal::ID)?;
         Ok(vt)
     }
 
@@ -222,14 +164,12 @@ impl AppState {
         let name = line.split_whitespace().next().unwrap_or("run").to_string();
         self.next_tab_number += 1;
         let (vt, _pane, surf) = self.tree.add_vtab(name);
-        self.spawn_surface(surf, vt)?; // the user's interactive shell, not `sh -c`
+        self.materialize_plugin(surf, vt, terminal::ID)?; // an interactive shell, not `sh -c`
         // Feed the command to the live shell (it echoes + runs it, then stays
         // interactive). The PTY buffers this until the shell is ready to read.
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
-        if let Some(t) = self.surfaces.get_mut(&surf) {
-            t.write_bytes(&bytes);
-        }
+        self.write_input(surf, &bytes);
         Ok(vt)
     }
 
@@ -257,7 +197,7 @@ impl AppState {
             return Ok(());
         };
         if let Some(surf) = self.tree.add_surface(vt, pane) {
-            self.spawn_surface(surf, vt)?;
+            self.materialize_plugin(surf, vt, terminal::ID)?;
         }
         Ok(())
     }
@@ -278,32 +218,6 @@ impl AppState {
         if let Some((vt, pane)) = self.focused_pane() {
             self.tree.add_surface(vt, pane);
         }
-    }
-
-    /// Open `kind` in the focused pane: fill the active empty slot in place when
-    /// there is one (the picker), otherwise add a new tab of that kind.
-    pub fn open_kind_in_focused(&mut self, kind: OpenKind) -> Result<()> {
-        let Some((vt, pane)) = self.focused_pane() else {
-            return Ok(());
-        };
-        let target = match self.focused_surface() {
-            Some(sid) if self.surface_is_empty(sid) => Some(sid),
-            _ => self.tree.add_surface(vt, pane),
-        };
-        if let Some(sid) = target {
-            self.materialize_surface(sid, vt, kind)?;
-        }
-        Ok(())
-    }
-
-    /// Give an existing (empty) surface content of `kind`.
-    fn materialize_surface(&mut self, sid: SurfaceId, vt: VtabId, kind: OpenKind) -> Result<()> {
-        match kind {
-            OpenKind::Terminal => self.spawn_surface(sid, vt)?,
-            OpenKind::Editor => self.materialize_plugin(sid, vt, editor::ID)?,
-            OpenKind::FileBrowser => self.materialize_plugin(sid, vt, file_browser::ID)?,
-        }
-        Ok(())
     }
 
     /// Give an existing (empty) surface a fresh view from plugin `id`.
@@ -368,8 +282,7 @@ impl AppState {
 
     /// Whether `id` is an empty surface (no content chosen yet).
     pub fn surface_is_empty(&self, id: SurfaceId) -> bool {
-        !self.surfaces.contains_key(&id)
-            && !self.views.contains_key(&id)
+        !self.views.contains_key(&id)
     }
 
     /// Whether the focused pane shows the "nothing open" picker (an empty pane, or
@@ -602,7 +515,6 @@ impl AppState {
             .flat_map(|v| v.panes())
             .flat_map(|p| p.surfaces.iter().map(|s| s.id))
             .collect();
-        self.surfaces.retain(|id, _| live.contains(id));
         self.views.retain(|id, _| live.contains(id));
     }
 
@@ -719,42 +631,31 @@ impl AppState {
         pane.active_surface().map(|s| s.id)
     }
 
-    /// Write raw bytes to a surface (agent-driven input).
+    /// Write raw bytes to a surface (agent-driven input). `false` if the
+    /// surface's view takes no raw input (or there is no such surface).
     pub fn write_input(&mut self, id: SurfaceId, bytes: &[u8]) -> bool {
-        if let Some(v) = self.views.get_mut(&id) {
-            return v.write_input(bytes);
-        }
-        match self.surfaces.get_mut(&id) {
-            Some(t) => {
-                t.write_bytes(bytes);
-                true
-            }
-            None => false,
-        }
+        self.views.get_mut(&id).is_some_and(|v| v.write_input(bytes))
     }
 
-    /// Encode and send a key press to the focused surface. Input snaps the
-    /// viewport back to the live bottom, as terminals do. Enter optimistically
-    /// marks the active vtab busy so submitting a command reacts instantly, even
-    /// before its foreground process group appears.
+    /// Deliver a key press to the focused view, as the GUI does but without a
+    /// window (no clipboard; default config and cell size), applying the
+    /// workspace-level requests it makes. Returns whether the view used it.
     pub fn send_key_to_focused(&mut self, press: &KeyPress) -> bool {
-        let sent = match self
-            .focused_surface()
-            .and_then(|id| self.surfaces.get_mut(&id))
-        {
-            Some(t) => {
-                t.scroll(Scroll::Bottom);
-                t.send_key(press);
-                true
-            }
-            None => false,
+        let Some(sid) = self.focused_surface() else {
+            return false;
         };
-        if sent && press.key == Key::Enter {
-            if let Some(sid) = self.focused_surface() {
+        let Some(view) = self.views.get_mut(&sid) else {
+            return false;
+        };
+        let cfg = Config::default();
+        let mut cx = EventCx::new(&cfg, UiMetrics::default(), press.mods, None);
+        let used = view.key(&mut cx, press);
+        for req in cx.finish().requests {
+            if req == Request::Busy {
                 self.mark_busy(sid);
             }
         }
-        sent
+        used
     }
 
     /// Show surface `sid`'s workspace busy right away (work was just submitted),
@@ -776,57 +677,13 @@ impl AppState {
         }
     }
 
-    /// Write raw bytes to the focused surface (e.g. a paste or a line-editing
-    /// escape sequence), snapping the viewport to the bottom first.
-    pub fn write_to_focused(&mut self, bytes: &[u8]) -> bool {
-        match self
-            .focused_surface()
-            .and_then(|id| self.surfaces.get_mut(&id))
-        {
-            Some(t) => {
-                t.scroll(Scroll::Bottom);
-                t.write_bytes(bytes);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Scroll the focused surface's scrollback viewport.
-    pub fn scroll_focused(&mut self, scroll: Scroll) -> bool {
-        match self
-            .focused_surface()
-            .and_then(|id| self.surfaces.get_mut(&id))
-        {
-            Some(t) => {
-                t.scroll(scroll);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Resize a surface's terminal to a pane's grid dimensions.
-    pub fn resize_surface(
-        &mut self,
-        id: SurfaceId,
-        cols: u16,
-        rows: u16,
-        cell_w: u32,
-        cell_h: u32,
-    ) {
-        if let Some(t) = self.surfaces.get_mut(&id) {
-            t.resize(cols, rows, cell_w, cell_h);
-        }
-    }
-
-    /// Pump all terminals and sync program-set surface titles into the tree.
-    /// Returns true if any terminal produced output (the grid may have changed).
+    /// Pump every view's background output and sync view titles into the tree.
+    /// Returns true if any view changed (e.g. a terminal produced output).
     pub fn pump_all(&mut self) -> bool {
         self.pump_all_budgeted(usize::MAX).0
     }
 
-    /// Pump all terminals, bounding each to roughly `budget` bytes of output so a
+    /// Pump every view, bounding each to roughly `budget` bytes of output so a
     /// flood in one surface cannot monopolise a frame. Returns
     /// `(changed, more_pending)`: `more_pending` means at least one surface still
     /// has queued output and should be pumped again promptly.
@@ -836,17 +693,6 @@ impl AppState {
         let mut more = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
         let mut changed_surfaces: Vec<SurfaceId> = Vec::new();
-        for (id, term) in self.surfaces.iter_mut() {
-            let pumped = term.pump_budgeted(budget);
-            if pumped.changed {
-                changed = true;
-                changed_surfaces.push(*id);
-            }
-            more |= pumped.more;
-            if let Some(t) = term.title() {
-                titles.push((*id, t));
-            }
-        }
         for (id, view) in self.views.iter_mut() {
             let pumped = view.pump(budget);
             if pumped.changed {
@@ -926,8 +772,7 @@ impl AppState {
                     .iter()
                     .flat_map(|p| p.surfaces.iter())
                     .any(|s| {
-                        self.surfaces.get(&s.id).map(|t| t.is_busy()).unwrap_or(false)
-                            || self.views.get(&s.id).is_some_and(|v| v.is_busy())
+                        self.views.get(&s.id).is_some_and(|v| v.is_busy())
                     })
             })
             .unwrap_or(false)
@@ -936,14 +781,6 @@ impl AppState {
     /// Whether `id` has live content (not an empty surface).
     pub fn has_surface(&self, id: SurfaceId) -> bool {
         !self.surface_is_empty(id)
-    }
-
-    /// Whether a surface's grid changed since it was last snapshotted.
-    pub fn surface_needs_snapshot(&self, id: SurfaceId) -> bool {
-        self.surfaces
-            .get(&id)
-            .map(|t| t.needs_snapshot())
-            .unwrap_or(false)
     }
 
     /// A human/agent-readable dump of the workspace structure.
@@ -984,29 +821,13 @@ impl AppState {
 
     /// A text rendering of one surface's content (a terminal is pumped first).
     pub fn surface_text(&mut self, id: SurfaceId) -> Option<String> {
-        if let Some(v) = self.views.get_mut(&id) {
-            return v.text();
-        }
-        let term = self.surfaces.get_mut(&id)?;
-        term.pump();
-        let grid = term.snapshot();
-        let mut out = String::new();
-        for row in 0..grid.size.rows {
-            let mut line = String::new();
-            for col in 0..grid.size.cols {
-                match grid.cell(col, row) {
-                    Some(c) if !c.text.is_empty() => line.push_str(&c.text),
-                    _ => line.push(' '),
-                }
-            }
-            out.push_str(line.trim_end());
-            out.push('\n');
-        }
-        Some(out)
+        self.views.get_mut(&id)?.text()
     }
 
+    /// A terminal surface's child state.
     pub fn surface_lifecycle(&mut self, id: SurfaceId) -> Option<Lifecycle> {
-        self.surfaces.get_mut(&id).map(|t| t.lifecycle())
+        let view = self.views.get_mut(&id)?;
+        view.downcast_mut::<TerminalView>().map(|t| t.lifecycle())
     }
 }
 
@@ -1137,17 +958,6 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new(
-            "terminal.new",
-            "New Terminal",
-            "Open a terminal in the focused pane",
-        ),
-        Box::new(|s: &mut AppState, _| {
-            s.open_kind_in_focused(OpenKind::Terminal).map_err(failed)?;
-            Ok(CmdOutcome::ok())
-        }),
-    );
-    r.register(
-        CommandMeta::new(
             "file.open",
             "Open File",
             "Open a file in the focused pane with the plugin that handles it",
@@ -1224,7 +1034,7 @@ mod tests {
         assert_eq!(v.panes().len(), 1);
         let surf = v.panes()[0].surfaces[0].id;
         assert!(
-            s.terminal(surf).is_some(),
+            s.view(surf).is_some_and(|v| v.plugin() == terminal::ID),
             "new_vtab should spawn a terminal for its surface"
         );
     }
@@ -1285,13 +1095,13 @@ mod tests {
         s.new_vtab().unwrap();
         // Split opens empty; materialise a terminal in it so there is one to drop.
         s.split_focused(Axis::TopBottom).unwrap();
-        s.open_kind_in_focused(OpenKind::Terminal).unwrap();
+        s.open_plugin_in_focused(terminal::ID).unwrap();
         let before = s.tree.surface_count();
         s.close_focused_pane();
         let after = s.tree.surface_count();
         assert_eq!(after, before - 1, "closing a pane should drop one surface");
         assert_eq!(
-            s.surfaces.len(),
+            s.views.len(),
             after,
             "orphaned terminals should be pruned"
         );
@@ -1315,7 +1125,7 @@ mod tests {
         s.close_focused_surface();
         let v = s.tree.vtab(vt).expect("workspace survives as empty");
         assert!(v.panes()[0].surfaces.is_empty());
-        assert_eq!(s.surfaces.len(), s.tree.surface_count());
+        assert_eq!(s.views.len(), s.tree.surface_count());
 
         // Closing again on the empty screen closes the workspace itself.
         s.close_focused_surface();
@@ -1334,7 +1144,7 @@ mod tests {
         s.close_focused_surface();
         assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 1);
         assert!(s.tree.vtab(vt).is_some(), "workspace should survive");
-        assert_eq!(s.surfaces.len(), s.tree.surface_count());
+        assert_eq!(s.views.len(), s.tree.surface_count());
     }
 
     #[test]
@@ -1455,7 +1265,7 @@ mod tests {
         ed.buffer_mut().insert_char('x');
         assert_eq!(s.surface_text(surf).as_deref(), Some("x"));
         assert!(
-            s.terminal(surf).is_none(),
+            s.surface_lifecycle(surf).is_none(),
             "an editor surface has no terminal"
         );
     }
@@ -1484,7 +1294,7 @@ mod tests {
         let a = s.new_vtab().unwrap();
         let b = s.new_vtab().unwrap();
         let before = s.tree.vtabs().len();
-        let surfaces_before = s.surfaces.len();
+        let surfaces_before = s.views.len();
 
         s.close_vtab(a);
 
@@ -1492,7 +1302,7 @@ mod tests {
         assert!(s.tree.vtab(a).is_none(), "the closed vtab is gone");
         assert!(s.tree.vtab(b).is_some(), "other vtabs remain");
         assert_eq!(
-            s.surfaces.len(),
+            s.views.len(),
             surfaces_before - 1,
             "the closed vtab's terminal is pruned"
         );

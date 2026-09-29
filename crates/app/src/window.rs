@@ -5,7 +5,6 @@
 //! foreground text via glyphon), all in one wgpu scene. Cmd-chords run app
 //! commands through the registry; other keys go to the focused surface.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use ghostrealm_core::{
     ArgKind, ArgSpec, Args, Axis, Chrome, Config, PaneId, Rect, Registry, Side,
     SurfaceId, TabStatus, Value, VtabId,
 };
-use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
+use ghostrealm_terminal::{Key, KeyPress, Mods};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
@@ -28,7 +27,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState, OpenKind, PICKER_SID, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, AppState, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
@@ -58,19 +57,6 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
-/// Pending-scroll metering (see `apply_pending_scroll`). Each frame advances the
-/// viewport by `pending / EASE_DIVISOR`, clamped to `[MIN, MAX]` lines: small
-/// scrolls stay slow and coherent (no torn, half-shaped viewport), while a big
-/// flick eases out fast enough to cross a large scrollback in a beat. `MAX` is
-/// the one knob trading catch-up speed against how much a fast fling can outrun
-/// shaping.
-const SCROLL_STEP_MIN: i32 = 6;
-const SCROLL_STEP_MAX: i32 = 40;
-const SCROLL_EASE_DIVISOR: i32 = 3;
-/// Cap on queued scroll lines, so flicking hard against the scrollback boundary
-/// can't pile up a backlog that then has to unwind before a reverse flick takes
-/// effect (and so metering always drains in a bounded number of frames).
-const MAX_PENDING_SCROLL: i32 = 600;
 /// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
 const TITLE_BAR_H: f32 = 28.0;
 /// Logical width reserved at the top-left for the macOS traffic-light buttons.
@@ -81,13 +67,6 @@ const EMPTY_HINT: [u8; 3] = [110, 110, 125];
 /// when `[file_browser] open_in = "split"` (a split would be too cramped).
 const FILE_BROWSER_SPLIT_MIN_W: f32 = 560.0;
 
-/// The "nothing open" picker's options, in order (their 1-based index is the key
-/// that opens them).
-const PICKER_KINDS: [(OpenKind, &str); 3] = [
-    (OpenKind::Terminal, "Terminal"),
-    (OpenKind::Editor, "Editor"),
-    (OpenKind::FileBrowser, "File browser"),
-];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -269,7 +248,7 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if state.menu.is_some() {
                     redraw |= state.menu_hover();
                 } else if state.mouse_down {
-                    redraw |= state.update_selection();
+                    redraw |= state.update_drag();
                 } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
                     redraw = true;
                 }
@@ -296,7 +275,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = state.window.drag_window();
                 } else {
                     state.on_click();
-                    state.begin_selection();
+                    state.begin_press();
                 }
                 state.window.request_redraw();
             }
@@ -306,7 +285,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 state.fire_button();
-                state.end_selection();
+                state.end_press();
                 state.window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -358,12 +337,6 @@ struct State {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// Last snapshot per surface, reused for idle surfaces so a still pane costs
-    /// no snapshot; refreshed when the surface reports it changed or was resized.
-    grid_cache: HashMap<SurfaceId, Grid>,
-    /// Grid size we last resized each surface to, so a layout pass resizes a
-    /// surface's terminal only when its cell dimensions actually change.
-    surface_geom: HashMap<SurfaceId, (u16, u16)>,
     /// Bumped when font metrics change (scale/size); folded into row-cache keys so
     /// stale shaping never survives a metrics change.
     metrics_gen: u64,
@@ -408,16 +381,6 @@ struct State {
     sidebar_scroll: f32,
     /// Max sidebar scroll (content height beyond the visible area).
     sidebar_max_scroll: f32,
-    /// Sub-line remainder (physical px) carried between wheel/trackpad events so
-    /// slow scrolls accumulate instead of being rounded away, and no motion is
-    /// lost. The terminal viewport itself is still line-quantised.
-    scroll_accum: f32,
-    /// Whole viewport lines still to apply, metered out at `SCROLL_STEP`/frame so
-    /// the viewport never advances faster than shaping can keep up (sign matches
-    /// `Scroll::Delta`: negative reveals older history).
-    pending_scroll: i32,
-    /// Surface the pending scroll applies to; retargeting drops any leftover.
-    pending_scroll_target: Option<SurfaceId>,
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
     /// Close-button ('×') hit rects as last rendered, for tabs and workspaces.
@@ -453,17 +416,12 @@ struct State {
     mouse_capture: Option<SurfaceId>,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
-    /// Active terminal text selection, if any.
-    selection: Option<Selection>,
-    /// Left mouse button is held (for drag-selection).
+    /// Left mouse button is held (a press in progress).
     mouse_down: bool,
     /// Whether the current press has moved enough to count as a drag.
     dragging: bool,
     /// Physical-pixel position where the current press began.
     press_px: (f32, f32),
-    /// The cell the press landed on (selection anchor), if it was over a terminal.
-    /// A selection is only materialised once a drag actually starts.
-    press_cell: Option<(SurfaceId, u16, u16)>,
     /// The surface focused as of the last frame, so a focus change reaches the
     /// views that lost and gained it (e.g. an editor autosaves on blur).
     last_focused_surface: Option<SurfaceId>,
@@ -538,33 +496,6 @@ enum MenuAction {
     Close,
 }
 
-/// An active text selection within one surface's viewport (cell coordinates).
-#[derive(Clone, Copy)]
-struct Selection {
-    surface: SurfaceId,
-    /// Where the drag began.
-    anchor: (u16, u16),
-    /// Where it currently ends.
-    head: (u16, u16),
-}
-
-impl Selection {
-    /// (start, end) ordered row-major (start <= end).
-    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
-        let a = (self.anchor.1, self.anchor.0);
-        let h = (self.head.1, self.head.0);
-        if a <= h {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.anchor == self.head
-    }
-}
-
 /// A right-click context menu over a sidebar vtab.
 struct Menu {
     /// The vtab the actions apply to.
@@ -601,8 +532,8 @@ enum ButtonAction {
     CloseSurface(VtabId, PaneId, SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
-    /// Open a content kind in the focused pane (the "nothing open" picker).
-    OpenKind(OpenKind),
+    /// Open a plugin's content in the focused pane (the "nothing open" picker).
+    OpenPlugin(&'static str),
     /// A button a view registered while painting: (owning surface, view-local id).
     View(SurfaceId, u32),
     /// Confirm / cancel the floating directory picker.
@@ -747,8 +678,6 @@ impl State {
             viewport,
             atlas,
             text_renderer,
-            grid_cache: HashMap::new(),
-            surface_geom: HashMap::new(),
             metrics_gen: 0,
             warm_buffer,
             atlas_warmed_gen: None,
@@ -771,9 +700,6 @@ impl State {
             menu_buffers: Vec::new(),
             sidebar_scroll: 0.0,
             sidebar_max_scroll: 0.0,
-            scroll_accum: 0.0,
-            pending_scroll: 0,
-            pending_scroll_target: None,
             sidebar_rows: Vec::new(),
             buttons: Vec::new(),
             button_hover: None,
@@ -789,12 +715,10 @@ impl State {
             last_press: None,
             mouse_capture: None,
             sidebar_hidden: false,
-            selection: None,
             mouse_down: false,
             dragging: false,
             last_focused_surface: None,
             press_px: (0.0, 0.0),
-            press_cell: None,
             clipboard: arboard::Clipboard::new().ok(),
             cursor: (0.0, 0.0),
             quad_pipeline,
@@ -822,7 +746,7 @@ impl State {
 
     /// Re-apply a (possibly changed) config: re-resolve chrome, inbox timings, and
     /// the default directory, and re-measure cell metrics if the font changed
-    /// (invalidating the shaping cache and forcing a reflow).
+    /// (invalidating the shaping cache; views reflow to the new cell size).
     fn apply_config(&mut self, cfg: Config) {
         let (cw, ch) = measure_cell(
             &mut self.text.font_system,
@@ -834,7 +758,6 @@ impl State {
             self.cell_w = cw;
             self.cell_h = ch;
             self.metrics_gen = self.metrics_gen.wrapping_add(1);
-            self.surface_geom.clear(); // reflow terminals to the new cell size
         }
         self.chrome = cfg.resolved_chrome();
         self.app.set_inbox_config(cfg.inbox);
@@ -1152,8 +1075,10 @@ impl State {
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
-            ButtonAction::OpenKind(kind) => {
-                let _ = self.app.open_kind_in_focused(kind);
+            ButtonAction::OpenPlugin(id) => {
+                if let Err(e) = self.app.open_plugin_in_focused(id) {
+                    eprintln!("ghostrealm: open {id}: {e:#}");
+                }
             }
             ButtonAction::View(sid, id) => {
                 self.view_event(sid, |v, cx| v.button(cx, id));
@@ -1561,43 +1486,6 @@ impl State {
         }
     }
 
-    /// The (surface, col, row) under a physical point, if it's over a terminal
-    /// cell (not the sidebar, a tab strip, or outside any pane).
-    fn cell_at(&self, x: f32, y: f32) -> Option<(SurfaceId, u16, u16)> {
-        if self.in_sidebar(x) {
-            return None;
-        }
-        let workspace = self.workspace_rect();
-        let vt = self.app.tree.active_vtab()?;
-        let vtab = self.app.tree.vtab(vt)?;
-        for (pid, r) in vtab.layout(workspace, DIVIDER) {
-            if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
-                continue;
-            }
-            let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
-            let sid = pane.active_surface()?.id;
-            let strip_h = if self.strip_shown(pane.surfaces.len()) {
-                self.strip_height()
-            } else {
-                0.0
-            };
-            let term_y = r.y + strip_h;
-            if y < term_y {
-                return None; // in the tab strip
-            }
-            let grid = self.grid_cache.get(&sid)?;
-            if grid.size.cols == 0 || grid.size.rows == 0 {
-                return None;
-            }
-            let col = (((x - r.x) / self.cell_w).floor().max(0.0) as u16)
-                .min(grid.size.cols - 1);
-            let row = (((y - term_y) / self.cell_h).floor().max(0.0) as u16)
-                .min(grid.size.rows - 1);
-            return Some((sid, col, row));
-        }
-        None
-    }
-
     /// The earliest timer any view has pending.
     fn next_view_deadline(&self) -> Option<Instant> {
         self.app
@@ -1622,158 +1510,45 @@ impl State {
         !due.is_empty()
     }
 
-    /// Record a potential drag-selection anchor at the current cursor and clear any
-    /// prior selection. A selection is materialised only once a drag starts, so a
-    /// plain click never highlights. No-op while an overlay owns input.
-    fn begin_selection(&mut self) {
+    /// Start tracking a left press (for the drag threshold and release). No-op
+    /// while an overlay owns input.
+    fn begin_press(&mut self) {
         if self.palette.is_some() || self.menu.is_some() {
             return;
         }
-        let had_selection = self.selection.is_some();
-        self.selection = None;
         self.dragging = false;
         self.mouse_down = true;
         self.press_px = self.cursor;
-        self.press_cell = self.cell_at(self.cursor.0, self.cursor.1);
-        if had_selection {
-            self.dirty = true; // clear the old highlight
-        }
     }
 
-    /// Extend the selection to the cursor during a drag. Returns whether it
-    /// changed (so the caller can redraw).
-    fn update_selection(&mut self) -> bool {
+    /// The cursor moved with the button held: once past the drag threshold, the
+    /// view that took the press gets the drag. Returns whether to redraw.
+    fn update_drag(&mut self) -> bool {
         if !self.mouse_down {
             return false;
         }
-        let (x, y) = self.cursor;
+        let pos = self.cursor;
         // Ignore sub-pixel jitter until it's clearly a drag.
         if !self.dragging {
-            let (dx, dy) = (x - self.press_px.0, y - self.press_px.1);
+            let (dx, dy) = (pos.0 - self.press_px.0, pos.1 - self.press_px.1);
             if dx * dx + dy * dy < 9.0 {
                 return false;
             }
             self.dragging = true;
         }
-        // A view that took the press gets its drag.
-        if let Some(sid) = self.mouse_capture {
-            let pos = (x, y);
-            return self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos }));
+        match self.mouse_capture {
+            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos })),
+            None => false,
         }
-        let Some((surface, ac, ar)) = self.press_cell else {
-            return false;
-        };
-        let Some((cur_surface, col, row)) = self.cell_at(x, y) else {
-            return false;
-        };
-        if cur_surface != surface {
-            return false; // don't select across panes
-        }
-        if self.selection.map(|s| s.head) == Some((col, row)) {
-            return false;
-        }
-        self.selection = Some(Selection {
-            surface,
-            anchor: (ac, ar),
-            head: (col, row),
-        });
-        self.dirty = true;
-        true
     }
 
-    /// Finish a press: a view that took it gets the release; a terminal drag
-    /// copies its non-empty selection to the clipboard.
-    fn end_selection(&mut self) {
+    /// Finish a press: the view that took it gets the release.
+    fn end_press(&mut self) {
         self.mouse_down = false;
+        let dragged = std::mem::take(&mut self.dragging);
         if let Some(sid) = self.mouse_capture.take() {
-            let (pos, dragged) = (self.cursor, self.dragging);
+            let pos = self.cursor;
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
-            self.dragging = false;
-            return;
-        }
-        if self.dragging {
-            self.copy_selection();
-        }
-        self.dragging = false;
-        self.press_cell = None;
-    }
-
-    /// Extend (or start) a keyboard selection over the focused terminal grid by
-    /// one cell (or one word) in `dir`. The anchor is the current selection's, or
-    /// the terminal cursor if none.
-    fn extend_terminal_selection(&mut self, dir: ArrowDir, by_word: bool) {
-        let Some(sid) = self.app.focused_surface() else {
-            return;
-        };
-        let Some(grid) = self.grid_cache.get(&sid) else {
-            return;
-        };
-        let (cols, rows) = (grid.size.cols, grid.size.rows);
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        let (anchor, mut head) = match self.selection {
-            Some(s) if s.surface == sid => (s.anchor, s.head),
-            _ => {
-                let c = (
-                    grid.cursor.col.min(cols - 1),
-                    grid.cursor.row.min(rows - 1),
-                );
-                (c, c)
-            }
-        };
-        match dir {
-            ArrowDir::Left => {
-                head.0 = if by_word {
-                    word_col(grid, head.1, head.0, false)
-                } else {
-                    head.0.saturating_sub(1)
-                };
-            }
-            ArrowDir::Right => {
-                head.0 = if by_word {
-                    word_col(grid, head.1, head.0, true)
-                } else {
-                    (head.0 + 1).min(cols - 1)
-                };
-            }
-            ArrowDir::Up => head.1 = head.1.saturating_sub(1),
-            ArrowDir::Down => head.1 = (head.1 + 1).min(rows - 1),
-        }
-        self.selection = Some(Selection {
-            surface: sid,
-            anchor,
-            head,
-        });
-        self.dirty = true;
-    }
-
-    /// Paste the clipboard into the focused terminal.
-    fn paste_to_terminal(&mut self) {
-        if let Some(cb) = self.clipboard.as_mut() {
-            if let Ok(text) = cb.get_text() {
-                if !text.is_empty() {
-                    self.app.write_to_focused(text.as_bytes());
-                    self.dirty = true;
-                }
-            }
-        }
-    }
-
-    /// Copy the current selection's text to the system clipboard.
-    fn copy_selection(&mut self) {
-        let Some(sel) = self.selection else { return };
-        if sel.is_empty() {
-            return;
-        }
-        let Some(grid) = self.grid_cache.get(&sel.surface) else {
-            return;
-        };
-        let text = selection_text(grid, sel);
-        if !text.is_empty() {
-            if let Some(cb) = self.clipboard.as_mut() {
-                let _ = cb.set_text(text);
-            }
         }
     }
 
@@ -1800,8 +1575,8 @@ impl State {
             self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
             return;
         }
-        // Over the sidebar, the wheel scrolls the workspace list, not the terminal
-        // — and pixel-precise, so it tracks the trackpad exactly.
+        // Over the sidebar, the wheel scrolls the workspace list (pixel-precise, so
+        // it tracks the trackpad exactly).
         if self.in_sidebar(self.cursor.0) {
             let before = self.sidebar_scroll;
             self.sidebar_scroll = (self.sidebar_scroll - px).clamp(0.0, self.sidebar_max_scroll);
@@ -1813,91 +1588,9 @@ impl State {
         }
         // A view takes the wheel: the one under the cursor, else the focused one.
         let target = self.surface_under_cursor().or_else(|| self.app.focused_surface());
-        if let Some(sid) = target.filter(|s| self.app.view(*s).is_some()) {
+        if let Some(sid) = target {
             self.view_event(sid, |v, cx| v.scroll(cx, pos, px_x, px));
-            return;
         }
-        // Accumulate sub-line pixels and carry the remainder, so a slow drag isn't
-        // rounded to zero (the old behaviour: motion under half a cell vanished,
-        // which felt like a dead zone and a speed threshold) and momentum tails
-        // aren't dropped. The viewport moves by whole lines; the leftover fraction
-        // rides along to the next event.
-        self.scroll_accum += px;
-        let lines = (self.scroll_accum / self.cell_h).trunc() as i32;
-        self.scroll_accum -= lines as f32 * self.cell_h;
-        if lines == 0 {
-            return;
-        }
-        // Don't drive the viewport straight to the target: queue the motion and
-        // meter it out at SCROLL_STEP lines/frame (see `apply_pending_scroll`), so
-        // each frame reveals only what shaping can finish — smooth, coherent, and
-        // untorn even on a hard flick. Wheel up (positive delta) reveals older
-        // history → negative viewport delta.
-        let Some(target) = self.surface_under_cursor().or_else(|| self.app.focused_surface())
-        else {
-            return;
-        };
-        let delta = -lines;
-        if self.pending_scroll_target != Some(target) {
-            // New target: abandon any leftover momentum aimed at the old surface.
-            self.pending_scroll = 0;
-            self.pending_scroll_target = Some(target);
-        }
-        if self.pending_scroll != 0 && (self.pending_scroll > 0) != (delta > 0) {
-            // Reversal: drop the opposing backlog so the new direction responds at
-            // once instead of first unwinding stale momentum.
-            self.pending_scroll = delta;
-        } else {
-            self.pending_scroll = self.pending_scroll.saturating_add(delta);
-        }
-        self.pending_scroll = self
-            .pending_scroll
-            .clamp(-MAX_PENDING_SCROLL, MAX_PENDING_SCROLL);
-        // The selection is viewport-relative; scrolling invalidates it.
-        self.selection = None;
-        self.dirty = true;
-        // Pace the redraw through the frame clock (coalesces wheel bursts).
-        self.frame_pending = true;
-    }
-
-    /// Advance the viewport toward a queued scroll by at most `SCROLL_STEP` lines,
-    /// so a fast flick's momentum plays out over several coherent frames instead of
-    /// snapping the viewport somewhere shaping can't fill in one frame. Returns
-    /// whether a step was applied (the caller then treats the frame as dirty).
-    fn apply_pending_scroll(&mut self) -> bool {
-        if self.pending_scroll == 0 {
-            return false;
-        }
-        let Some(sid) = self.pending_scroll_target else {
-            self.pending_scroll = 0;
-            return false;
-        };
-        // Ease-out: drain a fraction of the backlog, bounded to [MIN, MAX] lines
-        // and never past what remains. Small scrolls creep coherently; big flicks
-        // move fast and settle.
-        let mag = self.pending_scroll.abs();
-        let step_mag = (mag / SCROLL_EASE_DIVISOR)
-            .clamp(SCROLL_STEP_MIN, SCROLL_STEP_MAX)
-            .min(mag);
-        let step = step_mag * self.pending_scroll.signum();
-        let applied = match self.app.terminal(sid) {
-            Some(t) => {
-                t.scroll(Scroll::Delta(step));
-                true
-            }
-            // Surface went away mid-catch-up: drop the remainder.
-            None => {
-                self.pending_scroll = 0;
-                self.pending_scroll_target = None;
-                return false;
-            }
-        };
-        self.pending_scroll -= step;
-        if self.pending_scroll != 0 {
-            // More to go: keep the frame clock ticking so we step again next frame.
-            self.frame_pending = true;
-        }
-        applied
     }
 
     /// Shape the sidebar-toggle chevron (at `icon_px`) into `rect`, record its
@@ -2061,6 +1754,17 @@ impl State {
         buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
     }
 
+    /// The "nothing open" picker's options as `(plugin id, title)`, in order
+    /// (their 1-based index is the key that opens them).
+    fn pickable_plugins(&self) -> Vec<(&'static str, &'static str)> {
+        self.app
+            .plugins()
+            .iter()
+            .filter(|p| p.pickable())
+            .map(|p| (p.id(), p.title()))
+            .collect()
+    }
+
     /// Draw the empty-workspace ("nothing open") screen in `rect`: a heading, a
     /// button per openable surface kind (with its shortcut), and a close hint.
     /// Buttons run their registry command in the focused (empty) pane.
@@ -2070,7 +1774,7 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let sans = Family::SansSerif;
-        let options = PICKER_KINDS;
+        let options = self.pickable_plugins();
         let n = options.len() as f32;
 
         let btn_w = (rect.w * 0.6)
@@ -2107,7 +1811,7 @@ impl State {
         y += ch + heading_gap;
 
         // One button per openable kind, numbered so the matching key opens it.
-        for (i, (kind, label)) in options.into_iter().enumerate() {
+        for (i, (id, label)) in options.into_iter().enumerate() {
             let hit = Rect { x: bx, y, w: btn_w, h: btn_h };
             let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
             quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
@@ -2132,7 +1836,7 @@ impl State {
                 color: label_color,
             });
             idx += 1;
-            self.buttons.push((hit, ButtonAction::OpenKind(kind)));
+            self.buttons.push((hit, ButtonAction::OpenPlugin(id)));
             y += btn_h + gap;
         }
 
@@ -2753,67 +2457,35 @@ impl State {
             self.dirty = true;
             return;
         }
-        // Cmd chords: the app's own (settings, keybindings) match first; the rest
-        // go to the focused view (clipboard, save, navigation) or the terminal's
-        // Cmd handling. Cmd chords never reach a shell.
+        // Cmd chords: the app's own (settings, keybindings) match first; unbound
+        // ones fall to the focused view (clipboard, save, navigation). A view
+        // never forwards a Cmd chord to a shell.
         if self.mods.super_ {
             // Use the base key (Shift's symbol transform undone), so a binding like
             // `cmd+shift+/` matches even though Shift+/ yields `?`.
-            let base = base_key(event);
-            let c = match &base {
-                WKey::Character(s) => s.chars().next(),
-                _ => None,
-            };
-            if let Some(c) = c {
-                // Cmd+, opens the config file in an editor (settings live in the file).
-                if c == ',' {
-                    self.open_config_editor();
-                    return;
-                }
-                let chord = self.chord_string(c);
-                if let Some(id) = self.cfg.binding(&chord) {
-                    if id == "palette.toggle" {
-                        self.open_palette();
-                    } else {
-                        let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+            if let WKey::Character(s) = base_key(event) {
+                if let Some(c) = s.chars().next() {
+                    // Cmd+, opens the config file in an editor (settings live in
+                    // the file).
+                    if c == ',' {
+                        self.open_config_editor();
+                        return;
                     }
-                    self.dirty = true;
-                    return;
+                    let chord = self.chord_string(c);
+                    if let Some(id) = self.cfg.binding(&chord) {
+                        if id == "palette.toggle" {
+                            self.open_palette();
+                        } else {
+                            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                        }
+                        self.dirty = true;
+                        return;
+                    }
                 }
             }
-            if let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) {
-                if let Some(press) = winit_key_press(event, self.mods) {
-                    self.view_event(sid, |v, cx| {
-                        v.key(cx, &press);
-                    });
-                }
-                return;
-            }
-            // Cmd+Arrow: line start/end in the focused terminal (Ctrl-A / Ctrl-E).
-            let bytes: Option<&[u8]> = match &event.logical_key {
-                WKey::Named(NamedKey::ArrowLeft) | WKey::Named(NamedKey::ArrowUp) => Some(&[0x01]),
-                WKey::Named(NamedKey::ArrowRight) | WKey::Named(NamedKey::ArrowDown) => {
-                    Some(&[0x05])
-                }
-                _ => None,
-            };
-            if let Some(b) = bytes {
-                self.selection = None;
-                self.app.write_to_focused(b);
-                self.dirty = true;
-                return;
-            }
-            match c.map(|c| c.to_ascii_lowercase()) {
-                // Cmd+C copies an active selection.
-                Some('c') if self.selection.is_some_and(|s| !s.is_empty()) => self.copy_selection(),
-                // Cmd+V pastes the clipboard into the focused terminal.
-                Some('v') => self.paste_to_terminal(),
-                _ => {}
-            }
-            return;
         }
 
-        // A focused view takes every non-Cmd key.
+        // The focused view takes the key.
         if let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) {
             if let Some(press) = winit_key_press(event, self.mods) {
                 self.view_event(sid, |v, cx| {
@@ -2824,90 +2496,18 @@ impl State {
         }
 
         // The "nothing open" picker: a number key opens that option.
-        if self.app.focused_shows_picker() {
+        if !self.mods.super_ && self.app.focused_shows_picker() {
             if let WKey::Character(s) = &event.logical_key {
                 if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
                     let i = if d == 0 { 9 } else { d as usize - 1 };
-                    if let Some((kind, _)) = PICKER_KINDS.get(i) {
-                        let _ = self.app.open_kind_in_focused(*kind);
+                    if let Some(id) = self.pickable_plugins().get(i).map(|(id, _)| *id) {
+                        if let Err(e) = self.app.open_plugin_in_focused(id) {
+                            eprintln!("ghostrealm: open {id}: {e:#}");
+                        }
                         self.dirty = true;
                     }
                 }
             }
-            return;
-        }
-
-        // Shift + Page/Home/End drives scrollback.
-        if self.mods.shift {
-            let page = ((self.config.height as f32 / self.cell_h).floor() as i32 - 1).max(1);
-            let scroll = match &event.logical_key {
-                WKey::Named(NamedKey::PageUp) => Some(Scroll::Delta(-page)),
-                WKey::Named(NamedKey::PageDown) => Some(Scroll::Delta(page)),
-                WKey::Named(NamedKey::Home) => Some(Scroll::Top),
-                WKey::Named(NamedKey::End) => Some(Scroll::Bottom),
-                _ => None,
-            };
-            if let Some(scroll) = scroll {
-                self.app.scroll_focused(scroll);
-                self.dirty = true;
-                return;
-            }
-            // Shift+Arrow extends a keyboard selection over the terminal grid
-            // (word-wise with Alt) instead of corrupting the shell input.
-            let dir = match &event.logical_key {
-                WKey::Named(NamedKey::ArrowLeft) => Some(ArrowDir::Left),
-                WKey::Named(NamedKey::ArrowRight) => Some(ArrowDir::Right),
-                WKey::Named(NamedKey::ArrowUp) => Some(ArrowDir::Up),
-                WKey::Named(NamedKey::ArrowDown) => Some(ArrowDir::Down),
-                _ => None,
-            };
-            if let Some(dir) = dir {
-                self.extend_terminal_selection(dir, self.mods.alt);
-                return;
-            }
-            // Shift+Enter sends a newline (LF) as a raw byte — it does NOT go
-            // through the Enter path, so it never triggers the optimistic busy
-            // dot. (Whether the shell treats LF as a continuation vs submit is
-            // the shell's line-editor config.)
-            if matches!(event.logical_key, WKey::Named(NamedKey::Enter)) {
-                self.selection = None;
-                self.app.write_to_focused(b"\n");
-                return;
-            }
-        }
-
-        // Option+Left/Right = word motion in the terminal (readline ESC-b / ESC-f);
-        // Option+Up/Down send a plain arrow (avoid the corrupting modified CSI).
-        if self.mods.alt {
-            match &event.logical_key {
-                WKey::Named(NamedKey::ArrowLeft) => {
-                    self.selection = None;
-                    self.app.write_to_focused(b"\x1bb");
-                    return;
-                }
-                WKey::Named(NamedKey::ArrowRight) => {
-                    self.selection = None;
-                    self.app.write_to_focused(b"\x1bf");
-                    return;
-                }
-                WKey::Named(NamedKey::ArrowUp) | WKey::Named(NamedKey::ArrowDown) => {
-                    let up = matches!(event.logical_key, WKey::Named(NamedKey::ArrowUp));
-                    self.selection = None;
-                    self.app.send_key_to_focused(&KeyPress {
-                        key: if up { Key::Up } else { Key::Down },
-                        mods: Mods::default(),
-                        text: None,
-                    });
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // Any key that reaches the shell clears a keyboard selection.
-        self.selection = None;
-        if let Some(press) = winit_key_press(event, self.mods) {
-            self.app.send_key_to_focused(&press);
         }
     }
 
@@ -3335,10 +2935,6 @@ impl State {
         }
         self.frame_pending = more;
         self.next_frame = Instant::now() + FRAME_INTERVAL;
-        // Meter out any queued scroll one bounded step, before deciding to render.
-        if self.apply_pending_scroll() {
-            self.dirty = true;
-        }
         // Advance the auto-read dwell; a status change needs a redraw.
         if self.app.tick_inbox() {
             self.dirty = true;
@@ -3379,28 +2975,6 @@ impl State {
                 h: (pr.rect.h - strip_h).max(1.0),
             };
             resolved.push((pr, strip_h, term));
-        }
-
-        // Resize a pane's terminal only when its cell dimensions actually change;
-        // a focus-only change or new content costs no resize. The content-keyed
-        // row cache is position-independent, so switching panes/vtabs or scrolling
-        // never invalidates it.
-        let (cw, ch) = (self.cell_w.round() as u32, self.cell_h.round() as u32);
-        for (pr, _, term) in &resolved {
-            let Some(sid) = pr
-                .surfaces
-                .iter()
-                .find(|(_, _, a)| *a)
-                .map(|(id, _, _)| *id)
-            else {
-                continue;
-            };
-            let cols = ((term.w / self.cell_w).floor() as u16).max(1);
-            let rows = ((term.h / self.cell_h).floor() as u16).max(1);
-            if self.surface_geom.get(&sid) != Some(&(cols, rows)) {
-                self.app.resize_surface(sid, cols, rows, cw, ch);
-                self.surface_geom.insert(sid, (cols, rows));
-            }
         }
 
         let metrics = self.metrics();
@@ -3554,6 +3128,8 @@ impl State {
                 continue;
             }
             if let Some(view) = self.app.view_mut(sid) {
+                // The view paints everything below the strip; it sizes itself
+                // (e.g. resizes its PTY) from the rect it gets.
                 let mut cx = PaintCx::new(
                     &self.cfg,
                     &self.chrome,
@@ -3572,120 +3148,6 @@ impl State {
                 }
                 let owned = frame.view_buttons.drain(..);
                 self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
-                continue;
-            }
-
-            // Snapshot only when the surface actually changed since we last did;
-            // an idle pane reuses its cached grid.
-            if self.app.surface_needs_snapshot(sid) || !self.grid_cache.contains_key(&sid) {
-                // Reuse the surface's previous grid (its cell strings/vector) as
-                // the snapshot target so a steady stream of frames doesn't
-                // re-allocate every cell.
-                let mut g = self.grid_cache.remove(&sid).unwrap_or_else(Grid::empty);
-                if let Some(t) = self.app.terminal(sid) {
-                    t.snapshot_into(&mut g);
-                }
-                self.grid_cache.insert(sid, g);
-            }
-            let Some(grid) = self.grid_cache.get(&sid) else {
-                continue;
-            };
-            // Pane background fills its terminal rect.
-            frame.bg.push(rect_quad(*term, sw, sh, grid.default_bg, 1.0));
-
-            // Selection highlight (behind text) for this surface.
-            if let Some(sel) = self.selection {
-                if sel.surface == sid {
-                    for row in 0..grid.size.rows {
-                        if let Some((first, last)) = selection_row_span(sel, row, grid.size.cols) {
-                            let x = term.x + first as f32 * self.cell_w;
-                            let w = (last - first + 1) as f32 * self.cell_w;
-                            frame.bg.push(rect_quad(
-                                Rect {
-                                    x,
-                                    y: term.y + row as f32 * self.cell_h,
-                                    w,
-                                    h: self.cell_h,
-                                },
-                                sw,
-                                sh,
-                                self.chrome.accent,
-                                0.35,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            for row in 0..grid.size.rows {
-                for col in 0..grid.size.cols {
-                    if let Some(c) = grid.cell(col, row) {
-                        if c.bg != grid.default_bg {
-                            frame.bg.push(rect_quad(
-                                cell_rect(*term, col, row, self.cell_w, self.cell_h),
-                                sw,
-                                sh,
-                                c.bg,
-                                1.0,
-                            ));
-                        }
-                    }
-                }
-
-                // Cheap content key (no span strings); shape only on a miss.
-                // Keyed over the inked prefix only, so trailing blanks neither
-                // cost shaping nor split otherwise-identical rows in the cache.
-                let content_len = row_content_len(grid, row);
-                let key = self.text.row_cache.row_key((0..content_len).map(|col| {
-                    match grid.cell(col, row) {
-                        Some(c) => (c.text.as_str(), c.fg),
-                        None => ("", grid.default_fg),
-                    }
-                }));
-                let top = term.y + row as f32 * self.cell_h;
-                // Shape on a miss only while the frame's budget lasts; past it the
-                // position redraws its previous content until a later frame.
-                let place_key = self.text.budgeted_key(
-                    key,
-                    (term.x as i32, top as i32),
-                    term.w,
-                    || row_spans(grid, row),
-                );
-                frame.text.push(TextItem {
-                    src: TextSrc::Row(place_key),
-                    left: term.x,
-                    top,
-                    bounds: TextBounds {
-                        left: term.x as i32,
-                        top: term.y as i32,
-                        right: (term.x + term.w) as i32,
-                        bottom: (term.y + term.h) as i32,
-                    },
-                    color: grid.default_fg,
-                });
-            }
-
-            if grid.cursor.visible {
-                let cur = grid
-                    .cell(grid.cursor.col, grid.cursor.row)
-                    .map(|c| c.fg)
-                    .unwrap_or(grid.default_fg);
-                frame.top.push(rect_quad(
-                    cell_rect(
-                        *term,
-                        grid.cursor.col,
-                        grid.cursor.row,
-                        self.cell_w,
-                        self.cell_h,
-                    ),
-                    sw,
-                    sh,
-                    cur,
-                    0.6,
-                ));
-            }
-            if pr.focused && multi_pane {
-                push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
             }
         }
         // Rows the shaping budget deferred need a follow-up frame.
@@ -3856,8 +3318,6 @@ impl State {
                 &mut self.swash_cache,
             )
             .context("text prepare")?;
-        self.grid_cache.retain(|sid, _| self.app.has_surface(*sid));
-        self.surface_geom.retain(|sid, _| self.app.has_surface(*sid));
 
         // Palette, menu and the directory picker are mutually exclusive; each draws
         // above everything via the overlay text renderer (each from its own pool).
@@ -4121,87 +3581,6 @@ fn pretty_chord(chord: &str) -> String {
     format!("{mods}{key}")
 }
 
-/// Group a row's cells into (text, fg-colour) runs of consecutive same colour.
-fn row_spans(grid: &Grid, row: u16) -> Vec<(String, [u8; 3])> {
-    let mut spans: Vec<(String, [u8; 3])> = Vec::new();
-    // Stop at the last inked column: trailing blanks draw nothing in the text
-    // pass (their background is a separate quad), so shaping them is wasted work.
-    for col in 0..row_content_len(grid, row) {
-        let (ch, fg) = match grid.cell(col, row) {
-            Some(Cell { text, fg, .. }) if !text.is_empty() => (text.clone(), *fg),
-            _ => (" ".to_string(), grid.default_fg),
-        };
-        match spans.last_mut() {
-            Some((s, c)) if *c == fg => s.push_str(&ch),
-            _ => spans.push((ch, fg)),
-        }
-    }
-    spans
-}
-
-/// Columns up to and including the last cell with visible ink on `row`.
-///
-/// Trailing blank cells render nothing in the text pass (their background, if
-/// any, is drawn as a separate quad), so both the content key and the shaping
-/// can stop here. Besides shaping less, this lifts the cache hit rate: rows that
-/// differ only in how many trailing blanks they carry now share one shaped row.
-fn row_content_len(grid: &Grid, row: u16) -> u16 {
-    let mut len = 0u16;
-    for col in 0..grid.size.cols {
-        let inked = grid
-            .cell(col, row)
-            .map(|c| c.text.chars().any(|ch| !ch.is_whitespace()))
-            .unwrap_or(false);
-        if inked {
-            len = col + 1;
-        }
-    }
-    len
-}
-
-/// A cursor/selection direction.
-#[derive(Clone, Copy)]
-enum ArrowDir {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-/// The next word boundary column on `row` from `col`, moving right (`forward`) or
-/// left. A word is a run of non-blank cells.
-fn word_col(grid: &Grid, row: u16, col: u16, forward: bool) -> u16 {
-    let cols = grid.size.cols;
-    if cols == 0 {
-        return 0;
-    }
-    let blank = |c: u16| {
-        grid.cell(c, row)
-            .map(|cell| cell.text.trim().is_empty())
-            .unwrap_or(true)
-    };
-    if forward {
-        let mut c = col;
-        // Skip the current word, then the gap, landing on the next word's start.
-        while c < cols - 1 && !blank(c) {
-            c += 1;
-        }
-        while c < cols - 1 && blank(c) {
-            c += 1;
-        }
-        c
-    } else {
-        let mut c = col;
-        while c > 0 && blank(c - 1) {
-            c -= 1;
-        }
-        while c > 0 && !blank(c - 1) {
-            c -= 1;
-        }
-        c
-    }
-}
-
 /// Parse a palette-entered argument string into a typed [`Value`] per its kind.
 /// Returns `None` when the input doesn't fit the kind (the palette re-prompts).
 fn parse_arg_value(kind: &ArgKind, s: &str) -> Option<Value> {
@@ -4220,45 +3599,6 @@ fn parse_arg_value(kind: &ArgKind, s: &str) -> Option<Value> {
                 .then(|| Value::Str(s.to_string()))
         }
     }
-}
-
-/// The text of a selection over `grid`, row-major, trailing spaces trimmed per
-/// line and rows joined with newlines.
-fn selection_text(grid: &Grid, sel: Selection) -> String {
-    let ((sc, sr), (ec, er)) = sel.ordered();
-    let mut out = String::new();
-    for row in sr..=er.min(grid.size.rows.saturating_sub(1)) {
-        let first = if row == sr { sc } else { 0 };
-        let last = if row == er {
-            ec
-        } else {
-            grid.size.cols.saturating_sub(1)
-        };
-        let mut line = String::new();
-        for col in first..=last.min(grid.size.cols.saturating_sub(1)) {
-            match grid.cell(col, row) {
-                Some(c) if !c.text.is_empty() => line.push_str(&c.text),
-                _ => line.push(' '),
-            }
-        }
-        out.push_str(line.trim_end());
-        if row != er {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// The inclusive column span `[first, last]` of a selection on `row`, if the row
-/// is within the selection; used to draw the highlight.
-fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
-    let ((sc, sr), (ec, er)) = sel.ordered();
-    if row < sr || row > er || cols == 0 {
-        return None;
-    }
-    let first = if row == sr { sc } else { 0 };
-    let last = if row == er { ec } else { cols - 1 };
-    Some((first.min(cols - 1), last.min(cols - 1)))
 }
 
 /// The sidebar rect for `side` given its width and the surface size (physical px).
@@ -4286,16 +3626,6 @@ fn workspace_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
         y: 0.0,
         w: (sw - width).max(1.0),
         h: sh,
-    }
-}
-
-/// Absolute pixel rect of cell (col,row) inside pane `pane`.
-fn cell_rect(pane: Rect, col: u16, row: u16, cell_w: f32, cell_h: f32) -> Rect {
-    Rect {
-        x: pane.x + col as f32 * cell_w,
-        y: pane.y + row as f32 * cell_h,
-        w: cell_w,
-        h: cell_h,
     }
 }
 
@@ -4538,102 +3868,6 @@ mod tests {
             assert!((sb.w + ws.w - sw).abs() < 0.001, "regions tile the full width");
             assert!(sb.x >= ws.x + ws.w - 0.001 || ws.x >= sb.x + sb.w - 0.001, "no overlap");
         }
-    }
-
-    #[test]
-    fn selection_text_spans_and_trims() {
-        use super::{selection_text, Selection};
-        use ghostrealm_core::SurfaceId;
-        use ghostrealm_terminal::{Cell, CellAttrs, Cursor, Grid, GridSize};
-
-        // A 4x3 grid: "abc "/"def "/"ghi " (trailing blank column).
-        let rows = ["abc ", "def ", "ghi "];
-        let mut cells = Vec::new();
-        for r in rows {
-            for ch in r.chars() {
-                let text = if ch == ' ' { String::new() } else { ch.to_string() };
-                cells.push(Cell {
-                    text,
-                    fg: [200, 200, 200],
-                    bg: [0, 0, 0],
-                    attrs: CellAttrs::default(),
-                    wide: false,
-                });
-            }
-        }
-        let grid = Grid {
-            size: GridSize { cols: 4, rows: 3 },
-            cells,
-            cursor: Cursor {
-                col: 0,
-                row: 0,
-                visible: false,
-            },
-            default_fg: [200, 200, 200],
-            default_bg: [0, 0, 0],
-        };
-
-        // Multi-row selection from (1,0) to (1,2): "bc" + full "def" + "gh".
-        let sel = Selection {
-            surface: SurfaceId(1),
-            anchor: (1, 0),
-            head: (1, 2),
-        };
-        assert_eq!(selection_text(&grid, sel), "bc\ndef\ngh");
-
-        // Anchor/head order doesn't matter.
-        let rev = Selection {
-            surface: SurfaceId(1),
-            anchor: (1, 2),
-            head: (1, 0),
-        };
-        assert_eq!(selection_text(&grid, rev), "bc\ndef\ngh");
-
-        // Single-row selection trims trailing blanks.
-        let one = Selection {
-            surface: SurfaceId(1),
-            anchor: (0, 0),
-            head: (3, 0),
-        };
-        assert_eq!(selection_text(&grid, one), "abc");
-    }
-
-    #[test]
-    fn word_col_finds_word_boundaries() {
-        use super::word_col;
-        use ghostrealm_terminal::{Cell, CellAttrs, Cursor, Grid, GridSize};
-
-        // Row 0: "ab cd ef" (cols 0..8).
-        let text = "ab cd ef";
-        let cells: Vec<Cell> = text
-            .chars()
-            .map(|ch| Cell {
-                text: if ch == ' ' { String::new() } else { ch.to_string() },
-                fg: [0, 0, 0],
-                bg: [0, 0, 0],
-                attrs: CellAttrs::default(),
-                wide: false,
-            })
-            .collect();
-        let grid = Grid {
-            size: GridSize {
-                cols: text.len() as u16,
-                rows: 1,
-            },
-            cells,
-            cursor: Cursor {
-                col: 0,
-                row: 0,
-                visible: false,
-            },
-            default_fg: [0, 0, 0],
-            default_bg: [0, 0, 0],
-        };
-
-        assert_eq!(word_col(&grid, 0, 0, true), 3, "forward from a -> start of cd");
-        assert_eq!(word_col(&grid, 0, 3, true), 6, "forward from cd -> start of ef");
-        assert_eq!(word_col(&grid, 0, 4, false), 3, "backward from d -> start of cd");
-        assert_eq!(word_col(&grid, 0, 7, false), 6, "backward from f -> start of ef");
     }
 
     #[test]

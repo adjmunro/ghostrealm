@@ -62,6 +62,17 @@ pub struct UiMetrics {
     pub scale: f32,
 }
 
+impl Default for UiMetrics {
+    /// A nominal 8x16 cell at 1x, for views driven without a window.
+    fn default() -> Self {
+        UiMetrics {
+            cell_w: 8.0,
+            cell_h: 16.0,
+            scale: 1.0,
+        }
+    }
+}
+
 /// What a plugin gets when opening a new view.
 #[derive(Clone, Default)]
 pub struct OpenCx {

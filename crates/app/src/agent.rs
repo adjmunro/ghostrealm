@@ -5,10 +5,10 @@
 //! - `{"op":"search","query":"split"}`       → matching command ids + scores
 //! - `{"op":"set","id":"...","args":{...}}`  → run a command
 //! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces
-//! - `{"op":"get","what":"surface","id":N}`  → a surface's grid as text
+//! - `{"op":"get","what":"surface","id":N}`  → a surface's content as text
 //! - `{"op":"input","text":"ls\r","id":N}`   → type into a surface (id optional,
 //!   defaulting to the focused surface)
-//! - `{"op":"pump"}`                         → drain terminal output
+//! - `{"op":"pump"}`                         → drain background output
 //!
 //! One JSON object per request line, one JSON object per response line. Being
 //! generic over `BufRead`/`Write` keeps it testable with in-memory buffers and
@@ -100,6 +100,9 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
             match id {
                 Some(id) if state.write_input(id, text.as_bytes()) => {
                     json!({ "ok": true, "surface": id.0 })
+                }
+                Some(id) if state.has_surface(id) => {
+                    json!({ "ok": false, "error": format!("surface {} takes no raw input", id.0) })
                 }
                 Some(id) => json!({ "ok": false, "error": format!("unknown surface {}", id.0) }),
                 None => json!({ "ok": false, "error": "no focused surface" }),

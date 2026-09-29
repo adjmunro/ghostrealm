@@ -3,6 +3,7 @@
 
 pub mod editor;
 pub mod file_browser;
+pub mod terminal;
 
 use crate::plugin::Plugin;
 
@@ -10,6 +11,7 @@ use crate::plugin::Plugin;
 /// the first plugin that claims its path wins, so catch-alls go last.
 pub fn builtin() -> Vec<Box<dyn Plugin>> {
     vec![
+        Box::new(terminal::TerminalPlugin),
         Box::new(file_browser::FileBrowserPlugin),
         Box::new(editor::EditorPlugin),
     ]
