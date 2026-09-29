@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Chrome, Config, LineNumbers, PaneId, Rect, Registry, Side, SurfaceId,
-    TabStatus, Value, VtabId,
+    ArgKind, ArgSpec, Args, Axis, Chrome, Config, LineNumbers, PaneId, Rect, Registry, Side,
+    SurfaceId, TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Mods, Scroll, TerminalBackend};
 use glyphon::{
@@ -116,6 +116,17 @@ const FILE_FG: [u8; 3] = [230, 230, 235];
 const HIDDEN_FG: [u8; 3] = [130, 130, 140];
 const EXT_FG: [u8; 3] = [212, 170, 90];
 const MATCH_FG: [u8; 3] = [245, 225, 90];
+/// Below this focused-pane width (logical px), the browser opens files as tabs even
+/// when `[browser] open_in = "split"` (a split would be too cramped).
+const BROWSER_SPLIT_MIN_W: f32 = 560.0;
+
+/// The "nothing open" picker's options, in order (their 1-based index is the key
+/// that opens them).
+const PICKER_KINDS: [(OpenKind, &str); 3] = [
+    (OpenKind::Terminal, "Terminal"),
+    (OpenKind::Editor, "Editor"),
+    (OpenKind::Browser, "File browser"),
+];
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
 /// plus the box-drawing/block set common in TUIs.
@@ -1150,6 +1161,33 @@ impl State {
         Duration::from_millis(self.cfg.input.double_click_ms as u64)
     }
 
+    /// The focused pane's width in physical pixels (for the split-vs-tab decision).
+    fn focused_pane_width(&self) -> f32 {
+        let ws = self.workspace_rect();
+        self.app
+            .tree
+            .active_vtab()
+            .and_then(|vt| self.app.tree.vtab(vt))
+            .and_then(|v| {
+                let fp = v.focused_pane;
+                v.layout(ws, DIVIDER).into_iter().find(|(id, _)| *id == fp).map(|(_, r)| r.w)
+            })
+            .unwrap_or(ws.w)
+    }
+
+    /// Open a file the browser selected: a horizontal split beside the browser when
+    /// `[browser] open_in = "split"` and the pane is wide enough, else a tab.
+    fn open_browser_file(&mut self, path: std::path::PathBuf) {
+        use ghostrealm_core::config::OpenIn;
+        let split = self.cfg.browser.open_in == OpenIn::Split
+            && self.focused_pane_width() >= BROWSER_SPLIT_MIN_W * self.scale;
+        if split {
+            self.app.open_file_split(path, Axis::LeftRight);
+        } else {
+            self.app.open_file_in_focused(path);
+        }
+    }
+
     /// Height of the custom title-bar strip in physical pixels. macOS renders its
     /// own strip (title + sidebar toggle) over a full-size content view; other
     /// platforms keep the native title bar and reserve nothing.
@@ -1487,7 +1525,7 @@ impl State {
                         b.set_root(spath);
                     }
                 } else {
-                    self.app.open_file_in_focused(spath);
+                    self.open_browser_file(spath);
                 }
                 self.dirty = true;
                 return;
@@ -1517,7 +1555,7 @@ impl State {
                     }
                 } else {
                     self.browser_last_click = None;
-                    self.app.open_file_in_focused(row.path);
+                    self.open_browser_file(row.path);
                 }
             }
             self.dirty = true;
@@ -2441,12 +2479,7 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let sans = Family::SansSerif;
-        // (kind, label). Extend as more openable surface kinds are added.
-        let options: [(OpenKind, &str); 3] = [
-            (OpenKind::Terminal, "Terminal"),
-            (OpenKind::Editor, "Editor"),
-            (OpenKind::Browser, "File browser"),
-        ];
+        let options = PICKER_KINDS;
         let n = options.len() as f32;
 
         let btn_w = (rect.w * 0.6)
@@ -2482,8 +2515,8 @@ impl State {
         idx += 1;
         y += ch + heading_gap;
 
-        // One button per openable kind.
-        for (kind, label) in options {
+        // One button per openable kind, numbered so the matching key opens it.
+        for (i, (kind, label)) in options.into_iter().enumerate() {
             let hit = Rect { x: bx, y, w: btn_w, h: btn_h };
             let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
             quads.push(rect_quad(hit, sw, sh, self.chrome.sidebar, 1.0));
@@ -2497,7 +2530,9 @@ impl State {
                 right: (bx + btn_w) as i32,
                 bottom: (y + btn_h) as i32,
             };
-            let _ = self.shape_empty(idx, label, sans, btn_w - pad * 2.0);
+            // Leading number (1-based, 0 for the tenth) so the matching key opens it.
+            let num = (i + 1) % 10;
+            let _ = self.shape_empty(idx, &format!("{num}   {label}"), sans, btn_w - pad * 2.0);
             self.empty_placements.push(Placement {
                 idx,
                 left: bx + pad,
@@ -3622,7 +3657,7 @@ impl State {
                     let file = self.app.browser_mut(sid).and_then(|b| b.navigate_input());
                     if let Some(f) = file {
                         if !is_picker {
-                            self.app.open_file_in_focused(f);
+                            self.open_browser_file(f);
                         }
                     }
                     self.browser_completion.remove(&sid);
@@ -3637,7 +3672,7 @@ impl State {
                         }
                         self.browser_sel.remove(&sid);
                     } else if !is_picker {
-                        self.app.open_file_in_focused(r.path);
+                        self.open_browser_file(r.path);
                     }
                 }
             }
@@ -3752,7 +3787,28 @@ impl State {
                     return;
                 }
             }
-            if let Some(c) = match &event.logical_key {
+            // Use the base key (Shift's symbol transform undone), so a binding like
+            // `cmd+shift+/` matches even though Shift+/ yields `?`.
+            let base_key = {
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "windows",
+                    all(unix, not(target_os = "macos"))
+                ))]
+                {
+                    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                    event.key_without_modifiers()
+                }
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "windows",
+                    all(unix, not(target_os = "macos"))
+                )))]
+                {
+                    event.logical_key.clone()
+                }
+            };
+            if let Some(c) = match &base_key {
                 WKey::Character(s) => s.chars().next(),
                 _ => None,
             } {
@@ -3805,6 +3861,20 @@ impl State {
         if self.app.focused_is_browser() {
             if let Some(sid) = self.app.focused_surface() {
                 self.browser_key(sid, event);
+            }
+            return;
+        }
+
+        // The "nothing open" picker: a number key opens that option.
+        if self.app.focused_shows_picker() {
+            if let WKey::Character(s) = &event.logical_key {
+                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                    let i = if d == 0 { 9 } else { d as usize - 1 };
+                    if let Some((kind, _)) = PICKER_KINDS.get(i) {
+                        let _ = self.app.open_kind_in_focused(*kind);
+                        self.dirty = true;
+                    }
+                }
             }
             return;
         }

@@ -92,6 +92,32 @@ impl Default for Inbox {
     }
 }
 
+/// How the file browser opens a file when you click/Enter it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenIn {
+    /// Add a tab in the browser's own pane.
+    Tab,
+    /// Open beside the browser in a new horizontal split (when the pane is wide
+    /// enough; otherwise falls back to a tab).
+    #[default]
+    Split,
+}
+
+/// `[browser]`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Browser {
+    /// Where opening a file puts it.
+    pub open_in: OpenIn,
+}
+
+impl Default for Browser {
+    fn default() -> Self {
+        Browser { open_in: OpenIn::Split }
+    }
+}
+
 /// `[input]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -197,6 +223,7 @@ pub struct Config {
     pub tabs: Tabs,
     pub editor: Editor,
     pub input: Input,
+    pub browser: Browser,
     pub inbox: Inbox,
     /// `[keybindings]`: command id -> chord, overlaying the built-in defaults.
     /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
@@ -357,6 +384,12 @@ autosave_after = 15        # integer seconds, >= 0 (default 15) — save a modif
 focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
 double_tap_window_ms = 300   # integer ms, >= 0 (default 300) — max gap between a double-tap's two taps
 double_click_ms = 200        # integer ms, >= 0 (default 200) — max gap between a mouse double-click's two clicks
+
+[browser]
+open_in = "split"            # "split" | "tab" (default "split") — where opening a file
+                             #   in the file browser puts it: a horizontal split beside
+                             #   the browser (falls back to a tab when the pane is narrow),
+                             #   or a tab in the browser's own pane
 
 [inbox]
 auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time before unread -> read (0 = manual only)

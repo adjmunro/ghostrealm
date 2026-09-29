@@ -396,6 +396,24 @@ impl Tree {
         }
     }
 
+    /// Split `pane` in `vtab`, adding a new *empty* pane (no surface) — it opens on
+    /// the "nothing open" picker. The new pane becomes focused. Returns its id.
+    pub fn split_empty(&mut self, vtab: VtabId, pane: PaneId, axis: Axis) -> Option<PaneId> {
+        let new_pane_id = PaneId(self.fresh());
+        let new_pane = Pane {
+            id: new_pane_id,
+            surfaces: Vec::new(),
+            active: 0,
+        };
+        let v = self.vtab_mut(vtab)?;
+        if v.root.split_leaf(pane, axis, new_pane) {
+            v.focused_pane = new_pane_id;
+            Some(new_pane_id)
+        } else {
+            None
+        }
+    }
+
     /// Add a surface (horizontal tab) to a pane; it becomes active. Returns its id.
     pub fn add_surface(&mut self, vtab: VtabId, pane: PaneId) -> Option<SurfaceId> {
         let sid = SurfaceId(self.fresh());

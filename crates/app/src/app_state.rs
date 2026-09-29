@@ -241,9 +241,8 @@ impl AppState {
         let Some((vt, pane)) = self.focused_pane() else {
             return Ok(());
         };
-        if let Some((_new_pane, surf)) = self.tree.split(vt, pane, axis) {
-            self.spawn_surface(surf, vt)?;
-        }
+        // A new split opens empty (the "nothing open" picker), not a terminal.
+        self.tree.split_empty(vt, pane, axis);
         Ok(())
     }
 
@@ -335,6 +334,15 @@ impl AppState {
         self.browsers.get_mut(&id)
     }
 
+    /// Whether the focused pane shows the "nothing open" picker (an empty pane, or
+    /// an empty-kind surface tab).
+    pub fn focused_shows_picker(&self) -> bool {
+        match self.focused_surface() {
+            None => self.focused_pane().is_some(),
+            Some(sid) => self.surface_is_empty(sid),
+        }
+    }
+
     /// Whether the focused pane's active surface is a file browser.
     pub fn focused_is_browser(&self) -> bool {
         self.focused_surface()
@@ -345,6 +353,18 @@ impl AppState {
     /// Open `path` in a new editor tab in the focused pane (from the browser).
     pub fn open_file_in_focused(&mut self, path: std::path::PathBuf) {
         self.open_editor_in_focused(EditorBuffer::open(path));
+    }
+
+    /// Open `path` in a new split beside the focused pane (e.g. beside the browser),
+    /// falling back to a tab if the split can't be made.
+    pub fn open_file_split(&mut self, path: std::path::PathBuf, axis: Axis) {
+        if let Some((vt, pane)) = self.focused_pane() {
+            if self.tree.split_empty(vt, pane, axis).is_some() {
+                self.open_editor_in_focused(EditorBuffer::open(path));
+                return;
+            }
+        }
+        self.open_file_in_focused(path);
     }
 
     /// Whether the floating directory picker is open.
@@ -501,16 +521,23 @@ impl AppState {
 
     /// Close the active surface of the focused pane. Closing the last surface of a
     /// split collapses the pane; closing the last surface of the sole pane leaves
-    /// the workspace on its empty screen. Invoked on that empty screen, it closes
-    /// the workspace itself.
+    /// the workspace on its empty screen. On an empty pane, closing collapses the
+    /// split (when it's one of several) or, if it's the sole pane, closes the
+    /// workspace.
     pub fn close_focused_surface(&mut self) {
         let Some((vt, pane)) = self.focused_pane() else {
             return;
         };
-        match self.focused_surface() {
-            Some(sid) => self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid)),
-            // Empty pane (nothing open): close the workspace.
-            None => self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt)),
+        if let Some(sid) = self.focused_surface() {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid));
+            return;
+        }
+        // Empty pane: collapse the split if there are siblings, else close the vtab.
+        let sole = self.tree.vtab(vt).map(|v| v.panes().len() <= 1).unwrap_or(true);
+        if sole {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt));
+        } else {
+            self.prune_orphan_surfaces_after(|s| s.tree.close_pane(vt, pane));
         }
     }
 
@@ -1204,34 +1231,24 @@ mod tests {
     }
 
     #[test]
-    fn split_spawns_a_second_terminal() {
+    fn split_opens_an_empty_pane() {
         let mut s = AppState::new().with_shell_line("sleep 1");
-        s.new_vtab().unwrap();
+        let vt = s.new_vtab().unwrap();
         s.split_focused(Axis::LeftRight).unwrap();
-        let vt = s.tree.active_vtab().unwrap();
-        assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 2);
-        // Both surfaces should have live terminals.
-        let ids: Vec<_> = s
-            .tree
-            .vtab(vt)
-            .unwrap()
-            .panes()
-            .iter()
-            .map(|p| p.surfaces[0].id)
-            .collect();
-        for id in ids {
-            assert!(
-                s.terminal(id).is_some(),
-                "each split pane should have a terminal"
-            );
-        }
+        let v = s.tree.vtab(vt).unwrap();
+        assert_eq!(v.panes().len(), 2);
+        // The new (focused) pane is empty — it opens on the picker, no terminal.
+        let focused = v.panes().into_iter().find(|p| p.id == v.focused_pane).unwrap();
+        assert!(focused.surfaces.is_empty(), "a new split opens empty");
     }
 
     #[test]
     fn closing_focused_pane_drops_its_terminal() {
         let mut s = AppState::new().with_shell_line("sleep 1");
         s.new_vtab().unwrap();
+        // Split opens empty; materialise a terminal in it so there is one to drop.
         s.split_focused(Axis::TopBottom).unwrap();
+        s.open_kind_in_focused(OpenKind::Terminal).unwrap();
         let before = s.tree.surface_count();
         s.close_focused_pane();
         let after = s.tree.surface_count();
@@ -1275,8 +1292,8 @@ mod tests {
         s.split_focused(Axis::TopBottom).unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 2);
 
-        // The focused pane has one surface; closing it collapses the split back
-        // to a single pane without closing the workspace.
+        // The focused pane is the new empty split; closing it collapses the split
+        // back to a single pane without closing the workspace.
         s.close_focused_surface();
         assert_eq!(s.tree.vtab(vt).unwrap().panes().len(), 1);
         assert!(s.tree.vtab(vt).is_some(), "workspace should survive");
