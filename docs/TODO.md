@@ -555,3 +555,44 @@
   emission) that all row-based surfaces use, with surface-specific hooks only where
   needed (e.g. the terminal's grid snapshot). Ties into the plugin library helpers.
 - Reason: one scroll-optimisation path; the browser proved the win, don't fork it.
+
+---
+
+[2026-09-30@463e7cf] Settings — search/add from the full option list
+
+- Requires: NO BLOCKERS
+- Detail: The config no longer needs to dump every option. Instead, when the
+  config file is open in the editor, offer a way to search the full option catalogue
+  and insert a chosen option (with its documented comment + default) at the cursor —
+  a palette-like picker over all known settings. Pairs with the backfill/doctor
+  idea. Keeps the file lean while staying discoverable.
+- Reason: a complete but un-cluttered settings surface.
+
+---
+
+[2026-09-30@463e7cf] A ghostrealm LSP (config first)
+
+- Requires: LSP plumbing (see the plugin/syntax entries)
+- Detail: Once we have LSP support, ship our own LSP that understands the config
+  file: validate keys (flag unknown/misspelled options), report out-of-range or
+  wrong-type values and basic TOML syntax errors non-fatally, and provide on-hover
+  docs for each option (reuse the same catalogue as the settings search). Later,
+  extend to command ids in `[keybindings]` (unknown id / duplicate chord) and to
+  other ghostrealm file types.
+- Reason: make the file-as-settings-UI safe and self-explaining.
+
+---
+
+[2026-09-30@463e7cf] Double-tap rework + fuzzy file-search popup
+
+- Requires: NO BLOCKERS (reuses the FsTree browser + the picker overlay)
+- Detail: Rework the double-tap triggers (currently double-Shift = palette,
+  double-Ctrl = Run) toward an Android-Studio feel: double-Ctrl opens the command
+  palette (fold the one-shot "Run Anything" terminal into it somehow), and
+  double-Shift opens a floating fuzzy FILE search over the current workspace/root
+  directory group — reuse the FsTree fuzzy filter and the floating picker overlay,
+  Enter opens the file (respecting `[browser] open_in`). Make the triggers
+  configurable (the existing `[input] double_tap_window_ms` + remappable actions).
+  Later: if the root is a code repo, index code SYMBOLS (via the LSP) and search
+  those instead of/along files.
+- Reason: fast keyboard-only navigation; requested.
