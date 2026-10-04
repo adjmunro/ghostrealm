@@ -34,6 +34,11 @@ pub use portable_pty::CommandBuilder;
 /// can wake and redraw instead of polling. `Send` only (it lives on the thread).
 pub type PtyWaker = Box<dyn FnMut() + Send + 'static>;
 
+/// Scrollback cap in bytes — Ghostty's own `scrollback-limit` default. The
+/// library default is 10 KB, which (pruned at ~400 KB page granularity) keeps
+/// only about one page of history.
+const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
+
 fn rgb(c: RgbColor) -> Rgb {
     [c.r, c.g, c.b]
 }
@@ -154,6 +159,8 @@ impl GhosttyTerminal {
 
         let pty_out: Rc<RefCell<VecDeque<u8>>> = Rc::new(RefCell::new(VecDeque::new()));
         let mut term = Terminal::new(cols, rows).context("create vt terminal")?;
+        term.set_scrollback_max_bytes(Some(SCROLLBACK_MAX_BYTES))
+            .context("set scrollback limit")?;
         {
             let sink = Rc::clone(&pty_out);
             term.on_pty_write(move |_term, data| {

@@ -216,6 +216,22 @@ fn scrollback_viewport_reveals_history() {
 }
 
 #[test]
+fn scrollback_keeps_thousands_of_lines() {
+    // At 80 columns, 10k lines is several ~400 KB grid pages (one page is what
+    // a tiny byte limit keeps) and inside the 10 MB cap (~14k lines here).
+    let mut term = GhosttyTerminal::spawn(80, 10, 8, 16, Some(sh("seq -f 'line-%g' 1 10000")))
+        .expect("spawn backend");
+    pump_until_exit(&mut term, Duration::from_secs(10));
+    term.scroll(Scroll::Top);
+    let top = row_text(&mut term, 0);
+    assert_eq!(
+        top, "line-1",
+        "Scroll::Top should reach the first of 10000 lines, got {top:?}.\n\
+         Next steps: check the scrollback limit set on the VT terminal in GhosttyTerminal::spawn."
+    );
+}
+
+#[test]
 fn is_busy_tracks_a_foreground_command() {
     // An interactive shell does job control, so tcgetpgrp on the master reflects
     // the foreground command's process group. `sh -i` reads commands from the PTY.
