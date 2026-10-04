@@ -4,7 +4,9 @@
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
 //! completes it; Up/Down move the single highlight, which the mouse also takes
-//! over on hover.
+//! over on hover. A click also *selects* the row: a separate, sticky highlight
+//! that hover and arrows leave alone. In the picker, the selected directory is
+//! the one confirming chooses.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -29,6 +31,8 @@ const FILE_FG: [u8; 3] = [230, 230, 235];
 const HIDDEN_FG: [u8; 3] = [130, 130, 140];
 const EXT_FG: [u8; 3] = [212, 170, 90];
 const MATCH_FG: [u8; 3] = [245, 225, 90];
+/// Opacity of the accent fill behind the selected (clicked) row.
+const SELECTED_ALPHA: f32 = 0.3;
 
 /// Header button ids (see [`View::button`]).
 const BTN_PARENT: u32 = 0;
@@ -92,6 +96,8 @@ pub struct FileBrowserView {
     sel: Option<usize>,
     /// The highlighted completion (path mode).
     completion: Option<usize>,
+    /// The clicked (selected) entry; cleared once it is no longer listed.
+    chosen: Option<PathBuf>,
     /// The directory the previous click landed on, for double-click-to-enter.
     last_click: Option<PathBuf>,
     // Geometry from the last paint, for mapping input to rows.
@@ -110,6 +116,7 @@ impl FileBrowserView {
             scroll: 0.0,
             sel: None,
             completion: None,
+            chosen: None,
             last_click: None,
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
@@ -132,6 +139,15 @@ impl FileBrowserView {
 
     pub fn tree_mut(&mut self) -> &mut FsTree {
         &mut self.tree
+    }
+
+    /// The directory a picker confirms: the selected directory, else the one
+    /// being shown.
+    pub fn choice(&self) -> PathBuf {
+        self.chosen
+            .clone()
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.tree.root().to_path_buf())
     }
 
     fn open_file(&self, cx: &mut EventCx, path: PathBuf) {
@@ -348,6 +364,11 @@ impl View for FileBrowserView {
 
         // Browse/filter mode: the scrollable tree (or results) list.
         let rows: Vec<FileRow> = self.tree.rows().to_vec();
+        if let Some(c) = &self.chosen {
+            if !rows.iter().any(|r| !r.is_category && &r.path == c) {
+                self.chosen = None;
+            }
+        }
         let max_scroll = (rows.len() as f32 * row_h - list.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let filtering = !query.is_empty();
@@ -363,8 +384,12 @@ impl View for FileBrowserView {
             if ry + row_h < list.y || ry > list.y + list.h {
                 continue;
             }
+            let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
+            if !r.is_category && self.chosen.as_ref() == Some(&r.path) {
+                cx.fill_alpha(row_rect, accent, SELECTED_ALPHA);
+            }
             if Some(i) == self.sel {
-                cx.highlight(Rect { x: list.x, y: ry, w: list.w, h: row_h });
+                cx.highlight(row_rect);
             }
             let marker = match (r.is_dir, r.expanded) {
                 (true, true) => "\u{25be} ",
@@ -495,15 +520,21 @@ impl View for FileBrowserView {
                 if row.is_category {
                     self.tree.toggle_category(&row.key);
                 } else if row.is_dir {
-                    // A click expands/collapses in place; a double-click on the same
-                    // directory enters it (makes it the root).
+                    // A click selects it and expands/collapses in place; a
+                    // double-click on the same directory enters it (makes it the root).
                     if clicks >= 2 && self.last_click.as_ref() == Some(&row.path) {
                         self.tree.set_root(row.path.clone());
+                        self.chosen = None;
                     } else {
                         self.tree.toggle_dir(&row.path);
+                        self.chosen = Some(row.path.clone());
                     }
                     self.last_click = Some(row.path);
                 } else {
+                    // A picker chooses directories only.
+                    if !self.picker {
+                        self.chosen = Some(row.path.clone());
+                    }
                     self.last_click = None;
                     self.open_file(cx, row.path);
                 }
@@ -697,6 +728,40 @@ mod tests {
         assert!(v.tree().is_expanded(&d.join("adir")), "a click expands in place");
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2 });
         assert_eq!(v.tree().root(), d.join("adir"), "a double-click enters");
+        assert_eq!(v.chosen, None, "the entered directory is shown, not selected");
+    }
+
+    #[test]
+    fn picker_confirms_the_clicked_directory_not_the_shown_one() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone());
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        assert_eq!(v.choice(), d, "with nothing selected, the shown directory");
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        assert_eq!(v.choice(), d.join("adir"), "a click selects without entering");
+        assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
+        // Rows are now adir, adir/inner.txt, b.txt. Hover, arrows, and clicking a
+        // file leave the selection alone.
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
+        h.key(&mut v, press(Key::Up));
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1 });
+        h.paint(&mut v, RECT);
+        assert_eq!(v.choice(), d.join("adir"));
+    }
+
+    #[test]
+    fn selection_is_dropped_once_no_longer_listed() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        assert_eq!(v.chosen, Some(d.join("b.txt")), "a browser selects files too");
+        assert_eq!(v.choice(), d, "a file is never the chosen directory");
+        v.tree_mut().set_root(d.join("adir"));
+        h.paint(&mut v, RECT);
+        assert_eq!(v.chosen, None);
     }
 
     #[test]

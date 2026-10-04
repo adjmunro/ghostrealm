@@ -57,6 +57,8 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+/// Longest directory name the picker's confirm button shows before eliding.
+const DIR_LABEL_MAX: usize = 32;
 /// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
 const TITLE_BAR_H: f32 = 28.0;
 /// Logical width reserved at the top-left for the macOS traffic-light buttons.
@@ -1852,13 +1854,15 @@ impl State {
             h: (ph - title_h - footer_h).max(1.0),
         };
         view.paint(&mut cx, body);
+        // Read after painting: a paint drops a selection that is no longer listed.
+        let confirm = format!("Use {}", dir_label(&view.choice()));
 
-        // Footer: [Cancel] [Use this folder], right-aligned.
+        // Footer: [Cancel] [Use <dir>], right-aligned.
         let bh = ch + 8.0 * scale;
         let by = py + ph - footer_h + (footer_h - bh) * 0.5;
         let mut right = px + pw - pad;
         for (label, action, primary) in [
-            ("Use this folder", ButtonAction::PickerConfirm, true),
+            (confirm.as_str(), ButtonAction::PickerConfirm, true),
             ("Cancel", ButtonAction::PickerCancel, false),
         ] {
             let w = label.chars().count() as f32 * ui.cell_w;
@@ -3472,6 +3476,21 @@ fn winit_key_press(event: &winit::event::KeyEvent, mods: Mods) -> Option<KeyPres
         _ => return None,
     };
     Some(KeyPress { key, mods, text })
+}
+
+/// A directory's name for a button label (the full path for a root like `/`),
+/// shortened with an ellipsis past [`DIR_LABEL_MAX`] characters.
+fn dir_label(dir: &std::path::Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+    if name.chars().count() <= DIR_LABEL_MAX {
+        return name;
+    }
+    let mut short: String = name.chars().take(DIR_LABEL_MAX - 1).collect();
+    short.push('…');
+    short
 }
 
 /// The key with Shift's symbol transform undone (Shift+/ is `/`, not `?`), so

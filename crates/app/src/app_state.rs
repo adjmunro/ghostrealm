@@ -365,11 +365,11 @@ impl AppState {
         self.dir_picker = None;
     }
 
-    /// Confirm the picker: pin the active workspace's root to the picker's current
+    /// Confirm the picker: pin the active workspace's root to its chosen
     /// directory, then close it.
     pub fn confirm_dir_picker(&mut self) {
-        if let Some(root) = self.dir_picker.as_ref().map(|b| b.tree().root().to_path_buf()) {
-            self.set_active_root_dir(root);
+        if let Some(dir) = self.dir_picker.as_ref().map(|b| b.choice()) {
+            self.set_active_root_dir(dir);
         }
         self.close_dir_picker();
     }
