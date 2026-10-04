@@ -32,6 +32,7 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+D / Cmd+Shift+D | split left-right / top-bottom |
 | Cmd+] / Cmd+[ | focus next / previous pane |
 | Cmd+, | open the config file |
+| Cmd+S / Cmd+Shift+S | save / save as (editor; an unsaved buffer asks where) |
 
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
 Click a sidebar row to switch vtab, a pane to focus it, a tab to switch it.

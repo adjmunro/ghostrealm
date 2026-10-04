@@ -6,10 +6,10 @@ use glyphon::Family;
 use super::{theme, PaintCx};
 
 /// A single-line text field in `r`: background, border, the value (or a dim
-/// placeholder when the value is empty), and a caret after the value. Text is
-/// monospace and keeps its tail when it doesn't fit (the most specific part of a
-/// path stays visible). The field always shows its caret: it reads as focused.
-pub fn text_field(cx: &mut PaintCx, r: Rect, value: &str, placeholder: &str) {
+/// placeholder when the value is empty), and, when `focused`, a caret after the
+/// value. Text is monospace and keeps its tail when it doesn't fit (the most
+/// specific part of a path stays visible).
+pub fn text_field(cx: &mut PaintCx, r: Rect, value: &str, placeholder: &str, focused: bool) {
     let scale = cx.ui.scale;
     let pad = 8.0 * scale;
     cx.fill(r, cx.chrome.background);
@@ -26,7 +26,7 @@ pub fn text_field(cx: &mut PaintCx, r: Rect, value: &str, placeholder: &str) {
     let shaped = cx.shape(&text, Family::Monospace, inner_w);
     cx.place(shaped, left, top, r, color);
     let caret_x = left + if is_placeholder { 0.0 } else { shaped.width } + scale;
-    if caret_x < r.x + r.w {
+    if focused && caret_x < r.x + r.w {
         let caret = Rect {
             x: caret_x,
             y: r.y + 2.0 * scale,

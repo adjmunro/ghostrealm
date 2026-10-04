@@ -33,6 +33,10 @@ pub enum Request {
     /// A view hosted in the floating picker chose this path: the picker confirms
     /// with it.
     Pick(PathBuf),
+    /// Ask where to save the view (the picker), then call [`View::save_as`].
+    ///
+    /// [`View::save_as`]: super::View::save_as
+    SaveAs,
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,

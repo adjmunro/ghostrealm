@@ -47,6 +47,8 @@ pub enum Pick {
     NewWorkspace,
     /// Open a file in the focused pane with this plugin.
     OpenWith(&'static str),
+    /// Save this surface's view to a file ([`View::save_as`]).
+    SaveAs(SurfaceId),
 }
 
 impl Pick {
@@ -55,6 +57,7 @@ impl Pick {
         match self {
             Pick::ActiveRoot | Pick::NewWorkspace => Mode::PickDir,
             Pick::OpenWith(_) => Mode::PickFile,
+            Pick::SaveAs(_) => Mode::Save,
         }
     }
 }
@@ -378,13 +381,34 @@ impl AppState {
     /// Open the floating picker for `purpose`, rooted at the active
     /// workspace's dir (else the app default, else the current dir).
     pub fn open_picker(&mut self, purpose: Pick) {
-        let root = self
-            .active()
+        let root = self.picker_root();
+        self.picker = Some((FileBrowserView::picker(root, purpose.mode()), purpose));
+    }
+
+    /// Where the picker starts: the active workspace's dir, else the app
+    /// default, else the current dir.
+    fn picker_root(&self) -> std::path::PathBuf {
+        self.active()
             .and_then(|vt| self.resolve_cwd(vt))
             .or_else(|| self.default_dir.clone())
             .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.picker = Some((FileBrowserView::picker(root, purpose.mode()), purpose));
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// Ask where to save surface `sid`'s view: the picker, beside the view's
+    /// file and named after it when it has one.
+    pub fn open_save_as(&mut self, sid: SurfaceId) {
+        let file = self.view(sid).and_then(|v| v.path());
+        let root = file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.picker_root());
+        let mut browser = FileBrowserView::picker(root, Mode::Save);
+        if let Some(name) = file.as_deref().and_then(Path::file_name) {
+            browser.set_name(name.to_string_lossy());
+        }
+        self.picker = Some((browser, Pick::SaveAs(sid)));
     }
 
     /// Close the floating picker.
@@ -394,17 +418,22 @@ impl AppState {
 
     /// Confirm the picker with its browser's choice, then close it. With no
     /// choice yet (a file picker with nothing selected), it stays open.
-    pub fn confirm_picker(&mut self) -> Result<()> {
+    /// Returns the file written, if any.
+    pub fn confirm_picker(&mut self) -> Result<Option<std::path::PathBuf>> {
         match self.picker.as_ref().and_then(|(b, _)| b.choice()) {
             Some(path) => self.confirm_picker_with(path),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 
-    /// Close the picker and act on `path` per its purpose.
-    pub fn confirm_picker_with(&mut self, path: std::path::PathBuf) -> Result<()> {
+    /// Close the picker and act on `path` per its purpose. Returns the file
+    /// written, if any.
+    pub fn confirm_picker_with(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> Result<Option<std::path::PathBuf>> {
         let Some((_, purpose)) = self.picker.take() else {
-            return Ok(());
+            return Ok(None);
         };
         match purpose {
             Pick::ActiveRoot => self.set_active_root_dir(path),
@@ -412,8 +441,19 @@ impl AppState {
                 self.new_workspace_in(path);
             }
             Pick::OpenWith(id) => self.open_path_with_in_focused(id, &path)?,
+            Pick::SaveAs(sid) => {
+                let view = self
+                    .views
+                    .get_mut(&sid)
+                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+                view.save_as(path.clone())?;
+                if let Some(t) = view.title() {
+                    self.tree.set_surface_title(sid, t, false);
+                }
+                return Ok(Some(path));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Create a new empty workspace rooted at `dir`; it becomes active.
@@ -1438,6 +1478,33 @@ mod tests {
         let sid = s.focused_surface().unwrap();
         let ed = s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap();
         assert_eq!(ed.buffer().path.as_deref(), Some(file.as_path()));
+    }
+
+    #[test]
+    fn save_as_picks_beside_the_file_and_retitles_the_tab() {
+        use ghostrealm_core::Args;
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-save-as");
+        let file = dir.join("old.txt");
+        std::fs::write(&file, "x").unwrap();
+        s.new_empty_vtab();
+        s.open_path_with_in_focused(editor::ID, &file).unwrap();
+        let sid = s.focused_surface().unwrap();
+
+        r.execute("editor.save_as", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(sid)));
+        let target = dir.join("old.txt");
+        assert_eq!(s.picker_mut().unwrap().choice(), Some(target), "beside it, same name");
+
+        let new = dir.join("new.txt");
+        assert_eq!(s.confirm_picker_with(new.clone()).unwrap(), Some(new.clone()));
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "x\n");
+        let vt = s.active().unwrap();
+        let title = s.tree.vtab(vt).unwrap().panes().into_iter().find_map(|p| {
+            p.surfaces.iter().find(|x| x.id == sid).map(|x| x.title.clone())
+        });
+        assert_eq!(title.as_deref(), Some("new.txt"));
     }
 
     #[test]

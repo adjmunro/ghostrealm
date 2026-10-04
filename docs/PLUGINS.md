@@ -59,11 +59,13 @@ into the overlay layer; it doesn't need to know.
   cursor goes; `Move` is hover.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
 - `focus_changed`, `deadline`/`tick` (timers), `pump`/`is_busy` (background work
-  and the inbox), `autosave`, `write_input`/`text` (agent channel).
+  and the inbox), `autosave`, `path`/`save_as` (Save As), `write_input`/`text`
+  (agent channel).
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
-  (a view in the floating picker chose a path; the picker confirms with it).
+  (a view in the floating picker chose a path; the picker confirms with it),
+  `SaveAs` (the picker asks where, then calls `save_as`).
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules

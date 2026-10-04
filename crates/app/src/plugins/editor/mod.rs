@@ -93,6 +93,21 @@ impl Plugin for EditorPlugin {
                 Ok(CmdOutcome::ok())
             }),
         );
+        r.register(
+            CommandMeta::new(
+                "editor.save_as",
+                "Save As…",
+                "Save the focused editor to a file chosen in a picker",
+            ),
+            Box::new(move |s: &mut AppState, _| {
+                let sid = s
+                    .focused_surface()
+                    .filter(|sid| s.view(*sid).is_some_and(|v| v.plugin() == ID))
+                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                s.open_save_as(sid);
+                Ok(CmdOutcome::ok())
+            }),
+        );
     }
 }
 
@@ -159,9 +174,14 @@ impl EditorView {
         }
     }
 
-    /// Save to the backing file, reporting it to the app.
+    /// Save to the backing file, reporting it to the app; without one, ask
+    /// where to save.
     fn save(&mut self, cx: &mut EventCx) {
-        if let (Ok(true), Some(path)) = (self.buf.save(), self.buf.path.clone()) {
+        let Some(path) = self.buf.path.clone() else {
+            cx.request(Request::SaveAs);
+            return;
+        };
+        if let Ok(true) = self.buf.save() {
             cx.request(Request::Saved(path));
         }
         self.last_edit_at = None;
@@ -495,6 +515,21 @@ impl View for EditorView {
         self.buf.path.clone()
     }
 
+    fn path(&self) -> Option<PathBuf> {
+        self.buf.path.clone()
+    }
+
+    /// Creates missing parent directories, so a typed `sub/name` works.
+    fn save_as(&mut self, path: PathBuf) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        self.buf.path = Some(path);
+        self.buf.save()?;
+        self.last_edit_at = None;
+        Ok(())
+    }
+
     /// Agent input is typed at the cursor.
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         self.buf.insert_str(&String::from_utf8_lossy(bytes));
@@ -556,8 +591,8 @@ impl EditorView {
         true
     }
 
-    /// Cmd chords the app didn't bind: clipboard (C/X/V), save (S), and line /
-    /// document navigation (arrows; Shift extends the selection).
+    /// Cmd chords the app didn't bind: clipboard (C/X/V), save (S; Shift+S saves
+    /// as), and line / document navigation (arrows; Shift extends the selection).
     fn cmd_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let selecting = k.mods.shift;
         let e = &mut self.buf;
@@ -579,6 +614,7 @@ impl EditorView {
                         e.insert_str(&t);
                     }
                 }
+                's' if selecting => cx.request(Request::SaveAs),
                 's' => self.save(cx),
                 _ => return false,
             },
@@ -686,6 +722,37 @@ mod tests {
         assert_eq!(out.requests, vec![Request::Saved(path.clone())]);
         assert!(!v.modified());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\n");
+    }
+
+    #[test]
+    fn saving_a_scratch_buffer_asks_where() {
+        let mut v = view_with("draft");
+        let h = Harness::new();
+        let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
+        assert!(used);
+        assert_eq!(out.requests, vec![Request::SaveAs]);
+    }
+
+    #[test]
+    fn cmd_shift_s_asks_where_even_with_a_file() {
+        let path = tmpdir("editor-save-as").join("f.txt");
+        let mut v = EditorView::new(EditorBuffer::open(path));
+        let h = Harness::new();
+        let mut k = cmd(Key::Char('S'));
+        k.mods.shift = true;
+        let (_, out) = h.key(&mut v, k);
+        assert_eq!(out.requests, vec![Request::SaveAs]);
+    }
+
+    #[test]
+    fn save_as_writes_and_adopts_the_file() {
+        let path = tmpdir("editor-save-as").join("sub").join("new.txt");
+        let mut v = view_with("hello");
+        v.save_as(path.clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        assert_eq!(v.path(), Some(path));
+        assert!(!v.modified());
+        assert_eq!(v.title().as_deref(), Some("new.txt"));
     }
 
     #[test]

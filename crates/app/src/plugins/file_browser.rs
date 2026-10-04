@@ -1,6 +1,7 @@
 //! The file browser plugin: a navigable, filterable tree over
 //! [`FsTree`](ghostrealm_core::fs_tree::FsTree). The same view backs the
-//! floating picker, which chooses a directory or a file (see [`Mode`]).
+//! floating picker, which chooses a directory, a file, or where to save (see
+//! [`Mode`]).
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
 //! completes it; Up/Down move the single highlight, which the mouse also takes
@@ -10,7 +11,7 @@
 
 use std::any::Any;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ghostrealm_core::fs_tree::{FileRow, FsTree, FsView, GitFilter};
@@ -86,6 +87,10 @@ pub enum Mode {
     PickDir,
     /// Choosing a file: a click selects it; a double-click or Enter picks it.
     PickFile,
+    /// Choosing where to save: typing edits the file name (in a field below the
+    /// list), a click on a file takes its name, and the selected directory (else
+    /// the shown one) holds it. Enter or a double-click on a file picks it.
+    Save,
 }
 
 /// A row's click target: a real entry (path) or a synthetic category (key).
@@ -108,6 +113,8 @@ pub struct FileBrowserView {
     completion: Option<usize>,
     /// The clicked (selected) entry; cleared once it is no longer listed.
     chosen: Option<PathBuf>,
+    /// The file name [`Mode::Save`] saves under (may hold a relative path).
+    name: String,
     /// The entry the previous click landed on, for double-click.
     last_click: Option<PathBuf>,
     // Geometry from the last paint, for mapping input to rows.
@@ -127,6 +134,7 @@ impl FileBrowserView {
             sel: None,
             completion: None,
             chosen: None,
+            name: String::new(),
             last_click: None,
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
@@ -149,6 +157,11 @@ impl FileBrowserView {
         self.mode
     }
 
+    /// Set the file name [`Mode::Save`] saves under.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
     pub fn tree(&self) -> &FsTree {
         &self.tree
     }
@@ -158,7 +171,8 @@ impl FileBrowserView {
     }
 
     /// What a picker confirms: the selected directory, else the one being
-    /// shown ([`Mode::PickDir`]); the selected file ([`Mode::PickFile`]).
+    /// shown ([`Mode::PickDir`]); the selected file ([`Mode::PickFile`]); the
+    /// file name joined to the directory holding it ([`Mode::Save`]).
     pub fn choice(&self) -> Option<PathBuf> {
         match self.mode {
             Mode::Browse => None,
@@ -169,16 +183,78 @@ impl FileBrowserView {
                     .unwrap_or_else(|| self.tree.root().to_path_buf()),
             ),
             Mode::PickFile => self.chosen.clone().filter(|p| !p.is_dir()),
+            Mode::Save => {
+                let name = self.name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let root = self.tree.root();
+                let dir = match &self.chosen {
+                    Some(p) if p.is_dir() => p.as_path(),
+                    Some(p) => p.parent().unwrap_or(root),
+                    None => root,
+                };
+                Some(dir.join(name))
+            }
         }
     }
 
-    /// Open (browse) or pick (file picker) `path`.
+    /// Open (browse) or pick (file picker) `path`; saving picks the choice.
     fn open_file(&self, cx: &mut EventCx, path: PathBuf) {
         match self.mode {
             Mode::Browse => cx.request(Request::OpenFile(path)),
             Mode::PickFile => cx.request(Request::Pick(path)),
+            Mode::Save => {
+                if let Some(target) = self.choice() {
+                    cx.request(Request::Pick(target));
+                }
+            }
             Mode::PickDir => {}
         }
+    }
+
+    /// [`Mode::Save`]'s keys: typing and Backspace edit the file name, Enter
+    /// picks. Returns `None` for keys the list handles (arrows).
+    fn save_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> Option<bool> {
+        match k.key {
+            Key::Backspace => {
+                self.name.pop();
+            }
+            Key::Enter => match self.choice() {
+                Some(target) => cx.request(Request::Pick(target)),
+                None => return Some(false),
+            },
+            Key::Char(c) => {
+                let typed = k.text.clone().unwrap_or_else(|| c.to_string());
+                let add: String = typed.chars().filter(|c| !c.is_control()).collect();
+                if add.is_empty() {
+                    return Some(false);
+                }
+                self.name.push_str(&add);
+            }
+            _ => return None,
+        }
+        cx.redraw();
+        Some(true)
+    }
+
+    /// [`Mode::Save`]'s file-name row, at the bottom of `rect`. Returns its
+    /// height.
+    fn paint_name_field(&self, cx: &mut PaintCx, rect: Rect) -> f32 {
+        let scale = cx.ui.scale;
+        let ch = cx.ui.cell_h;
+        let pad = 8.0 * scale;
+        let h = ch + 10.0 * scale;
+        let row = Rect { x: rect.x, y: rect.y + rect.h - h, w: rect.w, h };
+        cx.fill(row, cx.chrome.sidebar);
+        let label = "Name";
+        let label_w = label.chars().count() as f32 * cx.ui.cell_w;
+        cx.label(label, Family::SansSerif, row.x + pad, row.y + (h - ch) * 0.5, row, theme::LABEL);
+        let inset = 4.0 * scale;
+        let x = row.x + label_w + pad * 2.0;
+        let field = Rect { x, y: row.y + inset, w: (row.x + row.w - pad - x).max(1.0), h: h - inset * 2.0 };
+        widgets::text_field(cx, field, &self.name, "file name", true);
+        h
     }
 
     fn clear_highlight(&mut self) {
@@ -313,7 +389,8 @@ impl FileBrowserView {
             h: header_h - inset * 2.0,
         };
         let root = self.tree.root().display().to_string();
-        widgets::text_field(cx, field, value, &root);
+        // Saving types into the name field instead.
+        widgets::text_field(cx, field, value, &root, self.mode != Mode::Save);
         header_h
     }
 }
@@ -354,12 +431,17 @@ impl View for FileBrowserView {
                 s
             });
         let header_h = self.paint_header(cx, rect, preview.as_deref().unwrap_or(&query));
+        let footer_h = if self.mode == Mode::Save {
+            self.paint_name_field(cx, rect)
+        } else {
+            0.0
+        };
 
         let list = Rect {
             x: rect.x,
             y: rect.y + header_h,
             w: rect.w,
-            h: (rect.h - header_h).max(0.0),
+            h: (rect.h - header_h - footer_h).max(0.0),
         };
         let row_h = ch + 4.0 * scale;
         self.list = list;
@@ -446,6 +528,11 @@ impl View for FileBrowserView {
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         if k.mods.super_ {
             return false;
+        }
+        if self.mode == Mode::Save {
+            if let Some(used) = self.save_key(cx, k) {
+                return used;
+            }
         }
         let path_mode = self.tree.input_is_path();
         match k.key {
@@ -560,11 +647,14 @@ impl View for FileBrowserView {
                     }
                     self.last_click = Some(row.path);
                 } else {
-                    // A file picker picks on a double-click; a browser opens at once.
+                    // A browser opens at once; pickers pick on a double-click.
                     let again = clicks >= 2 && self.last_click.as_ref() == Some(&row.path);
                     self.chosen = Some(row.path.clone());
                     self.last_click = Some(row.path.clone());
-                    if self.mode != Mode::PickFile || again {
+                    if self.mode == Mode::Save {
+                        self.name = file_name(&row.path);
+                    }
+                    if self.mode == Mode::Browse || again {
                         self.open_file(cx, row.path);
                     }
                 }
@@ -656,6 +746,11 @@ impl FileBrowserView {
         let idx = ((y - self.list.y + self.scroll) / self.row_h).floor().max(0.0) as usize;
         self.rows.get(idx).map(|r| (idx, r.clone()))
     }
+}
+
+/// `path`'s last component as text.
+fn file_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Move a highlight index by `delta` within `[0, count)`; an unset highlight
@@ -804,6 +899,39 @@ mod tests {
         h.key(&mut v, press(Key::Down));
         h.key(&mut v, press(Key::Down));
         let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
+    }
+
+    #[test]
+    fn save_types_the_name_into_the_shown_or_selected_directory() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        assert_eq!(v.choice(), None, "no name yet");
+        for c in "new.md".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        assert_eq!(v.tree().query(), "", "typing edits the name, not the filter");
+        assert_eq!(v.choice(), Some(d.join("new.md")), "into the shown directory");
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        assert_eq!(v.choice(), Some(d.join("adir").join("new.md")), "into the selected one");
+        h.key(&mut v, press(Key::Backspace));
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(out.requests, vec![Request::Pick(d.join("adir").join("new.m"))]);
+    }
+
+    #[test]
+    fn save_takes_a_clicked_files_name() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        v.set_name("draft.txt");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        assert!(out.requests.is_empty(), "a click only takes the name");
+        assert_eq!(v.choice(), Some(d.join("b.txt")));
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 2 });
         assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
     }
 

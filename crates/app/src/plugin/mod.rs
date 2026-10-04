@@ -186,6 +186,16 @@ pub trait View: Any {
         None
     }
 
+    /// The file the view shows, if any (Save As starts beside it).
+    fn path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Write the view to `path` and make it the view's file (Save As).
+    fn save_as(&mut self, _path: PathBuf) -> Result<()> {
+        anyhow::bail!("{} views can't be saved", self.plugin())
+    }
+
     /// Raw input from the agent channel. Returns whether the view accepts it.
     fn write_input(&mut self, _bytes: &[u8]) -> bool {
         false

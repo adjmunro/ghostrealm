@@ -1167,15 +1167,19 @@ impl State {
         for req in out.requests {
             match req {
                 Request::OpenFile(path) => self.open_requested_file(path),
-                Request::Saved(path) => {
-                    if Some(path) == ghostrealm_core::config::config_path() {
-                        self.reload_config();
-                    }
-                }
+                Request::Saved(path) => self.saved(path),
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}
+                Request::SaveAs => self.app.open_save_as(sid),
                 Request::Busy => self.app.mark_busy(sid),
             }
+        }
+    }
+
+    /// A view wrote `path`: hot-reload it if it is the config.
+    fn saved(&mut self, path: std::path::PathBuf) {
+        if Some(path) == ghostrealm_core::config::config_path() {
+            self.reload_config();
         }
     }
 
@@ -1185,8 +1189,10 @@ impl State {
             Some(p) => self.app.confirm_picker_with(p),
             None => self.app.confirm_picker(),
         };
-        if let Err(e) = done {
-            eprintln!("ghostrealm: picker: {e:#}");
+        match done {
+            Ok(Some(written)) => self.saved(written),
+            Ok(None) => {}
+            Err(e) => eprintln!("ghostrealm: picker: {e:#}"),
         }
         self.dirty = true;
     }
@@ -1845,6 +1851,7 @@ impl State {
             Pick::NewWorkspace => "New workspace directory",
             Pick::ActiveRoot => "Set workspace directory",
             Pick::OpenWith(_) => "Open file",
+            Pick::SaveAs(_) => "Save as",
         };
         let Some(view) = self.app.picker_mut() else {
             return;
@@ -1879,6 +1886,8 @@ impl State {
         let choice = view.choice();
         let verb = match purpose {
             Pick::OpenWith(_) => "Open",
+            Pick::SaveAs(_) if choice.as_ref().is_some_and(|p| p.exists()) => "Replace",
+            Pick::SaveAs(_) => "Save",
             Pick::NewWorkspace | Pick::ActiveRoot => "Use",
         };
         let confirm = match &choice {
