@@ -5,6 +5,8 @@
 
 pub mod agent;
 pub mod app_state;
+#[cfg(target_os = "macos")]
+mod macos_keys;
 pub mod plugin;
 pub mod plugins;
 pub mod row_cache;
