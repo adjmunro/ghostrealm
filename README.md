@@ -25,11 +25,13 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 
 | Chord | Action |
 |---|---|
-| Cmd+K | command palette (type to filter, ↑/↓, Enter, Esc) |
-| Cmd+T / Cmd+W | new / close vertical tab |
+| Shift, Shift (double-tap) | command palette (type to filter, ↑/↓, Enter, Esc) |
+| Ctrl, Ctrl (double-tap) | run a command in a new workspace |
+| Cmd+N | new workspace (pick its directory first) |
+| Cmd+T / Cmd+W | new / close tab in the focused pane |
 | Cmd+D / Cmd+Shift+D | split left-right / top-bottom |
-| Cmd+N | new terminal tab in the focused pane |
-| Cmd+] | focus next pane |
+| Cmd+] / Cmd+[ | focus next / previous pane |
+| Cmd+, | open the config file |
 
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
 Click a sidebar row to switch vtab, a pane to focus it, a tab to switch it.
