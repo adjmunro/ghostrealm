@@ -22,7 +22,7 @@ use ghostrealm_terminal::{KeyPress, Lifecycle};
 
 use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor::{self, EditorBuffer, EditorView};
-use crate::plugins::file_browser::FileBrowserView;
+use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
@@ -38,13 +38,25 @@ pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
 
-/// What confirming the floating picker does with its directory.
+/// What confirming the floating picker does with its choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
-    /// Pin the active workspace's root.
+    /// Pin the active workspace's root to a directory.
     ActiveRoot,
-    /// Create a new workspace rooted there.
+    /// Create a new workspace rooted at a directory.
     NewWorkspace,
+    /// Open a file in the focused pane with this plugin.
+    OpenWith(&'static str),
+}
+
+impl Pick {
+    /// What the picker's browser lists and lets the user choose.
+    fn mode(self) -> Mode {
+        match self {
+            Pick::ActiveRoot | Pick::NewWorkspace => Mode::PickDir,
+            Pick::OpenWith(_) => Mode::PickFile,
+        }
+    }
 }
 
 pub struct AppState {
@@ -372,7 +384,7 @@ impl AppState {
             .or_else(|| self.default_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.picker = Some((FileBrowserView::picker(root), purpose));
+        self.picker = Some((FileBrowserView::picker(root, purpose.mode()), purpose));
     }
 
     /// Close the floating picker.
@@ -380,17 +392,28 @@ impl AppState {
         self.picker = None;
     }
 
-    /// Confirm the picker with its chosen directory, then close it.
-    pub fn confirm_picker(&mut self) {
-        if let Some((browser, purpose)) = self.picker.take() {
-            let dir = browser.choice();
-            match purpose {
-                Pick::ActiveRoot => self.set_active_root_dir(dir),
-                Pick::NewWorkspace => {
-                    self.new_workspace_in(dir);
-                }
-            }
+    /// Confirm the picker with its browser's choice, then close it. With no
+    /// choice yet (a file picker with nothing selected), it stays open.
+    pub fn confirm_picker(&mut self) -> Result<()> {
+        match self.picker.as_ref().and_then(|(b, _)| b.choice()) {
+            Some(path) => self.confirm_picker_with(path),
+            None => Ok(()),
         }
+    }
+
+    /// Close the picker and act on `path` per its purpose.
+    pub fn confirm_picker_with(&mut self, path: std::path::PathBuf) -> Result<()> {
+        let Some((_, purpose)) = self.picker.take() else {
+            return Ok(());
+        };
+        match purpose {
+            Pick::ActiveRoot => self.set_active_root_dir(path),
+            Pick::NewWorkspace => {
+                self.new_workspace_in(path);
+            }
+            Pick::OpenWith(id) => self.open_path_with_in_focused(id, &path)?,
+        }
+        Ok(())
     }
 
     /// Create a new empty workspace rooted at `dir`; it becomes active.
@@ -1389,9 +1412,32 @@ mod tests {
         let sub = dir.join("sub");
         std::fs::create_dir(&sub).unwrap();
         s.picker_mut().unwrap().tree_mut().set_root(&sub);
-        s.confirm_picker();
+        s.confirm_picker().unwrap();
         assert!(!s.picker_open());
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(sub.as_path()));
+    }
+
+    #[test]
+    fn editor_open_without_a_path_picks_the_file() {
+        use ghostrealm_core::Args;
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-open-pick");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "hi").unwrap();
+        s.set_default_dir(Some(dir));
+        s.new_empty_vtab();
+
+        r.execute("editor.open", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.picker_purpose(), Some(Pick::OpenWith(editor::ID)));
+        s.confirm_picker().unwrap();
+        assert!(s.picker_open(), "nothing chosen: the picker stays open");
+
+        s.confirm_picker_with(file.clone()).unwrap();
+        assert!(!s.picker_open());
+        let sid = s.focused_surface().unwrap();
+        let ed = s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap();
+        assert_eq!(ed.buffer().path.as_deref(), Some(file.as_path()));
     }
 
     #[test]
@@ -1413,7 +1459,7 @@ mod tests {
         let proj = dir.join("proj");
         std::fs::create_dir(&proj).unwrap();
         s.picker_mut().unwrap().tree_mut().set_root(&proj);
-        s.confirm_picker();
+        s.confirm_picker().unwrap();
         assert_eq!(count(&s), 1);
         let vt = s.active().unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(proj.as_path()));

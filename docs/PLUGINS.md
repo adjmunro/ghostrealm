@@ -45,7 +45,7 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
 
-A view hosted in a modal (the directory picker's file browser) paints the same way
+A view hosted in a modal (the floating picker's file browser) paints the same way
 into the overlay layer; it doesn't need to know.
 
 ## Input (`EventCx`)
@@ -62,7 +62,8 @@ into the overlay layer; it doesn't need to know.
   and the inbox), `autosave`, `write_input`/`text` (agent channel).
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),
-  `Saved` (hot-reloads the config), `Busy` (optimistic busy status).
+  `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
+  (a view in the floating picker chose a path; the picker confirms with it).
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules

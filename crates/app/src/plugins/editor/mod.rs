@@ -16,7 +16,7 @@ use ghostrealm_core::{
 };
 use ghostrealm_terminal::{Key, KeyPress};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, Pick};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
     View,
@@ -82,8 +82,12 @@ impl Plugin for EditorPlugin {
                 "Open File in Editor",
                 "Open a file in a text editor in the focused pane",
             )
-            .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open")),
+            .arg(ArgSpec::optional("path", ArgKind::Str, "the file to open (chosen in a picker unless given)")),
             Box::new(move |s: &mut AppState, a| {
+                if a.get("path").is_none() {
+                    s.open_picker(Pick::OpenWith(ID));
+                    return Ok(CmdOutcome::ok());
+                }
                 let path = PathBuf::from(a.get_str("path")?);
                 s.open_path_with_in_focused(ID, &path).map_err(failed)?;
                 Ok(CmdOutcome::ok())

@@ -57,8 +57,8 @@ const PUMP_BUDGET: usize = 512 * 1024;
 const ROW_CACHE_CAP: usize = 4096;
 /// Scrollback lines per mouse-wheel notch.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
-/// Longest directory name the picker's confirm button shows before eliding.
-const DIR_LABEL_MAX: usize = 32;
+/// Longest entry name the picker's confirm button shows before eliding.
+const PATH_LABEL_MAX: usize = 32;
 /// Logical height of the custom macOS title-bar strip (points; scaled per-DPI).
 const TITLE_BAR_H: f32 = 28.0;
 /// Logical width reserved at the top-left for the macOS traffic-light buttons.
@@ -1080,7 +1080,7 @@ impl State {
             ButtonAction::View(sid, id) => {
                 self.view_event(sid, |v, cx| v.button(cx, id));
             }
-            ButtonAction::PickerConfirm => self.app.confirm_picker(),
+            ButtonAction::PickerConfirm => self.confirm_picker(None),
             ButtonAction::PickerCancel => self.app.close_picker(),
         }
         self.dirty = true;
@@ -1172,9 +1172,23 @@ impl State {
                         self.reload_config();
                     }
                 }
+                Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
+                Request::Pick(_) => {}
                 Request::Busy => self.app.mark_busy(sid),
             }
         }
+    }
+
+    /// Confirm the picker with `path`, else with its browser's choice.
+    fn confirm_picker(&mut self, path: Option<std::path::PathBuf>) {
+        let done = match path {
+            Some(p) => self.app.confirm_picker_with(p),
+            None => self.app.confirm_picker(),
+        };
+        if let Err(e) = done {
+            eprintln!("ghostrealm: picker: {e:#}");
+        }
+        self.dirty = true;
     }
 
     /// Count this left press as the next of a multi-click when it follows the
@@ -1824,9 +1838,13 @@ impl State {
         let footer_h = ch + 16.0 * scale;
 
         let ui = self.ui();
-        let title_text = match self.app.picker_purpose() {
-            Some(Pick::NewWorkspace) => "New workspace directory",
-            _ => "Set workspace directory",
+        let Some(purpose) = self.app.picker_purpose() else {
+            return;
+        };
+        let title_text = match purpose {
+            Pick::NewWorkspace => "New workspace directory",
+            Pick::ActiveRoot => "Set workspace directory",
+            Pick::OpenWith(_) => "Open file",
         };
         let Some(view) = self.app.picker_mut() else {
             return;
@@ -1857,7 +1875,16 @@ impl State {
         };
         view.paint(&mut cx, body);
         // Read after painting: a paint drops a selection that is no longer listed.
-        let confirm = format!("Use {}", dir_label(&view.choice()));
+        // With nothing chosen yet, the confirm button shows but is inert.
+        let choice = view.choice();
+        let verb = match purpose {
+            Pick::OpenWith(_) => "Open",
+            Pick::NewWorkspace | Pick::ActiveRoot => "Use",
+        };
+        let confirm = match &choice {
+            Some(p) => format!("{verb} {}", path_label(p)),
+            None => verb.to_string(),
+        };
 
         // Footer: [Cancel] [Use <dir>], right-aligned.
         let bh = ch + 8.0 * scale;
@@ -1869,9 +1896,10 @@ impl State {
         ] {
             let w = label.chars().count() as f32 * ui.cell_w;
             let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
-            let hov = cx.hovered(hit);
+            let live = !primary || choice.is_some();
+            let hov = live && cx.hovered(hit);
             if primary {
-                cx.fill_alpha(hit, cx.chrome.accent, 0.5);
+                cx.fill_alpha(hit, cx.chrome.accent, if live { 0.5 } else { 0.15 });
             } else {
                 cx.fill(hit, cx.chrome.sidebar);
             }
@@ -1879,9 +1907,15 @@ impl State {
                 cx.highlight(hit);
             }
             let s = cx.shape(label, Family::SansSerif, w + pad);
-            let color = if primary || hov { theme::LABEL_HOVER } else { theme::LABEL };
+            let color = match (live, primary || hov) {
+                (false, _) => theme::DIM,
+                (true, true) => theme::LABEL_HOVER,
+                (true, false) => theme::LABEL,
+            };
             cx.place(s, hit.x + (hit.w - s.width) * 0.5, by + (bh - ch) * 0.5, hit, color);
-            self.buttons.push((hit, action));
+            if live {
+                self.buttons.push((hit, action));
+            }
             right -= w + pad * 3.0;
         }
         let owned = frame.view_buttons.drain(..);
@@ -2386,8 +2420,7 @@ impl State {
                     self.dirty = true;
                 }
                 WKey::Named(NamedKey::Enter) if self.mods.super_ => {
-                    self.app.confirm_picker();
-                    self.dirty = true;
+                    self.confirm_picker(None);
                 }
                 _ => {
                     if let Some(press) = winit_key_press(event, self.mods) {
@@ -3480,17 +3513,17 @@ fn winit_key_press(event: &winit::event::KeyEvent, mods: Mods) -> Option<KeyPres
     Some(KeyPress { key, mods, text })
 }
 
-/// A directory's name for a button label (the full path for a root like `/`),
-/// shortened with an ellipsis past [`DIR_LABEL_MAX`] characters.
-fn dir_label(dir: &std::path::Path) -> String {
-    let name = dir
+/// A path's last component for a button label (the full path for a root like `/`),
+/// shortened with an ellipsis past [`PATH_LABEL_MAX`] characters.
+fn path_label(path: &std::path::Path) -> String {
+    let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.display().to_string());
-    if name.chars().count() <= DIR_LABEL_MAX {
+        .unwrap_or_else(|| path.display().to_string());
+    if name.chars().count() <= PATH_LABEL_MAX {
         return name;
     }
-    let mut short: String = name.chars().take(DIR_LABEL_MAX - 1).collect();
+    let mut short: String = name.chars().take(PATH_LABEL_MAX - 1).collect();
     short.push('…');
     short
 }

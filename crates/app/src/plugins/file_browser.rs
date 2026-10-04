@@ -1,12 +1,12 @@
 //! The file browser plugin: a navigable, filterable tree over
 //! [`FsTree`](ghostrealm_core::fs_tree::FsTree). The same view backs the
-//! floating directory picker, which lists directories only.
+//! floating picker, which chooses a directory or a file (see [`Mode`]).
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
 //! completes it; Up/Down move the single highlight, which the mouse also takes
 //! over on hover. A click also *selects* the row: a separate, sticky highlight
-//! that hover and arrows leave alone. In the picker, the selected directory is
-//! the one confirming chooses.
+//! that hover and arrows leave alone. In the picker, the selected entry is the
+//! one confirming chooses.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -77,6 +77,17 @@ impl Plugin for FileBrowserPlugin {
     }
 }
 
+/// What the browser is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The file browser pane: opening a file requests it.
+    Browse,
+    /// Choosing a directory: only directories are listed, and files never open.
+    PickDir,
+    /// Choosing a file: a click selects it; a double-click or Enter picks it.
+    PickFile,
+}
+
 /// A row's click target: a real entry (path) or a synthetic category (key).
 #[derive(Clone)]
 struct RowRef {
@@ -88,9 +99,7 @@ struct RowRef {
 
 pub struct FileBrowserView {
     tree: FsTree,
-    /// Choosing a directory (the floating picker): only directories are listed,
-    /// and files never open.
-    picker: bool,
+    mode: Mode,
     /// Vertical scroll of the row list (physical px).
     scroll: f32,
     /// The highlighted row (browse/filter), shared by keyboard and hover.
@@ -99,7 +108,7 @@ pub struct FileBrowserView {
     completion: Option<usize>,
     /// The clicked (selected) entry; cleared once it is no longer listed.
     chosen: Option<PathBuf>,
-    /// The directory the previous click landed on, for double-click-to-enter.
+    /// The entry the previous click landed on, for double-click.
     last_click: Option<PathBuf>,
     // Geometry from the last paint, for mapping input to rows.
     list: Rect,
@@ -113,7 +122,7 @@ impl FileBrowserView {
     pub fn new(root: PathBuf) -> Self {
         FileBrowserView {
             tree: FsTree::new(root),
-            picker: false,
+            mode: Mode::Browse,
             scroll: 0.0,
             sel: None,
             completion: None,
@@ -126,14 +135,18 @@ impl FileBrowserView {
         }
     }
 
-    /// A browser for choosing a directory: it lists directories only.
-    pub fn picker(root: PathBuf) -> Self {
+    /// A browser for the floating picker, choosing per `mode`.
+    pub fn picker(root: PathBuf, mode: Mode) -> Self {
         let mut v = FileBrowserView {
-            picker: true,
+            mode,
             ..Self::new(root)
         };
-        v.tree.set_dirs_only(true);
+        v.tree.set_dirs_only(mode == Mode::PickDir);
         v
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     pub fn tree(&self) -> &FsTree {
@@ -144,18 +157,27 @@ impl FileBrowserView {
         &mut self.tree
     }
 
-    /// The directory a picker confirms: the selected directory, else the one
-    /// being shown.
-    pub fn choice(&self) -> PathBuf {
-        self.chosen
-            .clone()
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(|| self.tree.root().to_path_buf())
+    /// What a picker confirms: the selected directory, else the one being
+    /// shown ([`Mode::PickDir`]); the selected file ([`Mode::PickFile`]).
+    pub fn choice(&self) -> Option<PathBuf> {
+        match self.mode {
+            Mode::Browse => None,
+            Mode::PickDir => Some(
+                self.chosen
+                    .clone()
+                    .filter(|p| p.is_dir())
+                    .unwrap_or_else(|| self.tree.root().to_path_buf()),
+            ),
+            Mode::PickFile => self.chosen.clone().filter(|p| !p.is_dir()),
+        }
     }
 
+    /// Open (browse) or pick (file picker) `path`.
     fn open_file(&self, cx: &mut EventCx, path: PathBuf) {
-        if !self.picker {
-            cx.request(Request::OpenFile(path));
+        match self.mode {
+            Mode::Browse => cx.request(Request::OpenFile(path)),
+            Mode::PickFile => cx.request(Request::Pick(path)),
+            Mode::PickDir => {}
         }
     }
 
@@ -265,10 +287,12 @@ impl FileBrowserView {
             (t.git_filter().label(), t.git_filter() != GitFilter::All, BTN_GIT),
             (t.view().label(), t.view() != FsView::Tree, BTN_VIEW),
         ];
-        // The git filter and grouped views act on files, which a picker never lists.
+        // The git filter and grouped views act on files, which a directory
+        // picker never lists.
         let file_only = |id: u32| id == BTN_GIT || id == BTN_VIEW;
+        let dirs_only = self.mode == Mode::PickDir;
         let mut right = rect.x + rect.w - pad;
-        for (label, on, id) in toggles.into_iter().filter(|t| !(self.picker && file_only(t.2))) {
+        for (label, on, id) in toggles.into_iter().filter(|t| !(dirs_only && file_only(t.2))) {
             let w = label.chars().count() as f32 * cx.ui.cell_w;
             let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
             if cx.button(hit, id) {
@@ -536,9 +560,13 @@ impl View for FileBrowserView {
                     }
                     self.last_click = Some(row.path);
                 } else {
+                    // A file picker picks on a double-click; a browser opens at once.
+                    let again = clicks >= 2 && self.last_click.as_ref() == Some(&row.path);
                     self.chosen = Some(row.path.clone());
-                    self.last_click = None;
-                    self.open_file(cx, row.path);
+                    self.last_click = Some(row.path.clone());
+                    if self.mode != Mode::PickFile || again {
+                        self.open_file(cx, row.path);
+                    }
                 }
                 cx.redraw();
             }
@@ -709,7 +737,7 @@ mod tests {
     #[test]
     fn picker_lists_directories_only() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone());
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
         let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
@@ -735,19 +763,48 @@ mod tests {
     #[test]
     fn picker_confirms_the_clicked_directory_not_the_shown_one() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone());
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        assert_eq!(v.choice(), d, "with nothing selected, the shown directory");
+        assert_eq!(v.choice(), Some(d.clone()), "with nothing selected, the shown directory");
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
-        assert_eq!(v.choice(), d.join("adir"), "a click selects without entering");
+        assert_eq!(v.choice(), Some(d.join("adir")), "a click selects without entering");
         assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
         // Hover and arrows leave the selection alone.
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
         h.key(&mut v, press(Key::Down));
         h.paint(&mut v, RECT);
-        assert_eq!(v.choice(), d.join("adir"));
+        assert_eq!(v.choice(), Some(d.join("adir")));
+    }
+
+    #[test]
+    fn file_picker_selects_on_click_and_picks_on_double_click() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        assert_eq!(v.choice(), None, "nothing selected yet");
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        assert_eq!(v.choice(), None, "a directory is never the chosen file");
+        h.paint(&mut v, RECT); // adir expanded: b.txt moves to row 2
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1 });
+        assert!(out.requests.is_empty(), "a click only selects");
+        assert_eq!(v.choice(), Some(d.join("b.txt")));
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 2 });
+        assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
+    }
+
+    #[test]
+    fn file_picker_picks_on_enter() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.key(&mut v, press(Key::Down));
+        h.key(&mut v, press(Key::Down));
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
     }
 
     #[test]
@@ -757,7 +814,7 @@ mod tests {
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
         assert_eq!(v.chosen, Some(d.join("b.txt")), "a browser selects files too");
-        assert_eq!(v.choice(), d, "a file is never the chosen directory");
+        assert_eq!(v.choice(), None, "a browser picks nothing");
         v.tree_mut().set_root(d.join("adir"));
         h.paint(&mut v, RECT);
         assert_eq!(v.chosen, None);

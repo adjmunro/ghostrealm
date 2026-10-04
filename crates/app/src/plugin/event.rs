@@ -30,6 +30,9 @@ pub enum Request {
     OpenFile(PathBuf),
     /// The view wrote this file (the app hot-reloads it if it is the config).
     Saved(PathBuf),
+    /// A view hosted in the floating picker chose this path: the picker confirms
+    /// with it.
+    Pick(PathBuf),
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,
