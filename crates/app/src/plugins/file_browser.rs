@@ -1,6 +1,6 @@
 //! The file browser plugin: a navigable, filterable tree over
 //! [`FsTree`](ghostrealm_core::fs_tree::FsTree). The same view backs the
-//! floating directory picker (in picker mode files don't open).
+//! floating directory picker, which lists directories only.
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
 //! completes it; Up/Down move the single highlight, which the mouse also takes
@@ -88,7 +88,8 @@ struct RowRef {
 
 pub struct FileBrowserView {
     tree: FsTree,
-    /// Choosing a directory (the floating picker): files never open.
+    /// Choosing a directory (the floating picker): only directories are listed,
+    /// and files never open.
     picker: bool,
     /// Vertical scroll of the row list (physical px).
     scroll: f32,
@@ -125,12 +126,14 @@ impl FileBrowserView {
         }
     }
 
-    /// A browser for choosing a directory: opening a file does nothing.
+    /// A browser for choosing a directory: it lists directories only.
     pub fn picker(root: PathBuf) -> Self {
-        FileBrowserView {
+        let mut v = FileBrowserView {
             picker: true,
             ..Self::new(root)
-        }
+        };
+        v.tree.set_dirs_only(true);
+        v
     }
 
     pub fn tree(&self) -> &FsTree {
@@ -262,8 +265,10 @@ impl FileBrowserView {
             (t.git_filter().label(), t.git_filter() != GitFilter::All, BTN_GIT),
             (t.view().label(), t.view() != FsView::Tree, BTN_VIEW),
         ];
+        // The git filter and grouped views act on files, which a picker never lists.
+        let file_only = |id: u32| id == BTN_GIT || id == BTN_VIEW;
         let mut right = rect.x + rect.w - pad;
-        for (label, on, id) in toggles {
+        for (label, on, id) in toggles.into_iter().filter(|t| !(self.picker && file_only(t.2))) {
             let w = label.chars().count() as f32 * cx.ui.cell_w;
             let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
             if cx.button(hit, id) {
@@ -531,10 +536,7 @@ impl View for FileBrowserView {
                     }
                     self.last_click = Some(row.path);
                 } else {
-                    // A picker chooses directories only.
-                    if !self.picker {
-                        self.chosen = Some(row.path.clone());
-                    }
+                    self.chosen = Some(row.path.clone());
                     self.last_click = None;
                     self.open_file(cx, row.path);
                 }
@@ -705,17 +707,16 @@ mod tests {
     }
 
     #[test]
-    fn picker_never_opens_files() {
-        let d = tmpdir("fb-picker");
-        std::fs::write(d.join("f.txt"), "x").unwrap();
-        let mut v = FileBrowserView::picker(d);
+    fn picker_lists_directories_only() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone());
         let mut h = Harness::new();
-        h.paint(&mut v, RECT);
-        h.key(&mut v, press(Key::Down));
-        let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert!(out.requests.is_empty(), "the picker only chooses directories");
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
-        assert!(out.requests.is_empty());
+        let frame = h.paint(&mut v, RECT);
+        let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
+        assert!(!ids.contains(&BTN_GIT) && !ids.contains(&BTN_VIEW), "no file-only toggles");
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        let rows: Vec<PathBuf> = v.tree_mut().rows().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(rows, vec![d.join("adir")], "expanded adir shows no inner.txt; no b.txt");
     }
 
     #[test]
@@ -741,12 +742,10 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
         assert_eq!(v.choice(), d.join("adir"), "a click selects without entering");
         assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
-        // Rows are now adir, adir/inner.txt, b.txt. Hover, arrows, and clicking a
-        // file leave the selection alone.
+        // Hover and arrows leave the selection alone.
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
-        h.key(&mut v, press(Key::Up));
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
+        h.key(&mut v, press(Key::Down));
         h.paint(&mut v, RECT);
         assert_eq!(v.choice(), d.join("adir"));
     }

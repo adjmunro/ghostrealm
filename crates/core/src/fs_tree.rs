@@ -154,6 +154,8 @@ pub struct FsTree {
     root: PathBuf,
     show_hidden: bool,
     show_gitignored: bool,
+    /// List directories only (files never appear, in any mode).
+    dirs_only: bool,
     query: String,
     view: FsView,
     expanded: BTreeSet<PathBuf>,
@@ -185,6 +187,7 @@ impl FsTree {
             root: root.into(),
             show_hidden: false,
             show_gitignored: false,
+            dirs_only: false,
             query: String::new(),
             view: FsView::Tree,
             expanded: BTreeSet::new(),
@@ -247,6 +250,17 @@ impl FsTree {
             self.show_gitignored = v;
             self.cache.clear();
             self.walk_cache = None;
+            self.dirty = true;
+        }
+    }
+
+    pub fn dirs_only(&self) -> bool {
+        self.dirs_only
+    }
+
+    pub fn set_dirs_only(&mut self, v: bool) {
+        if self.dirs_only != v {
+            self.dirs_only = v;
             self.dirty = true;
         }
     }
@@ -369,9 +383,13 @@ impl FsTree {
         self.git_filter != GitFilter::All || self.recent.is_some() || self.ext.is_some()
     }
 
-    /// Whether a file (not a directory) passes the git/recent/type filters.
-    /// Directories always pass so the tree stays navigable.
+    /// Whether a file (not a directory) passes the git/recent/type filters (none
+    /// does when listing directories only). Directories always pass so the tree
+    /// stays navigable.
     fn file_passes(&self, path: &Path, mtime: Option<SystemTime>) -> bool {
+        if self.dirs_only {
+            return false;
+        }
         if let Some(dur) = self.recent {
             let recent = mtime
                 .and_then(|t| t.elapsed().ok())
@@ -574,6 +592,9 @@ impl FsTree {
                     continue;
                 }
                 let is_dir = is_dir_following_links(e.file_type().ok(), &e.path());
+                if self.dirs_only && !is_dir {
+                    continue;
+                }
                 out.push((is_dir, e.path()));
             }
         }
@@ -1016,6 +1037,25 @@ mod tests {
         assert_eq!(t.suggestions("li"), vec![d.join("link")]);
         t.set_query("lin");
         assert_eq!(kind(&mut t, "link"), Some(true), "filter results agree");
+    }
+
+    #[test]
+    fn dirs_only_hides_files_everywhere() {
+        let d = tmpdir();
+        fs::create_dir(d.join("adir")).unwrap();
+        fs::write(d.join("adir").join("afile.txt"), "x").unwrap();
+        fs::write(d.join("alpha.txt"), "x").unwrap();
+        let mut t = FsTree::new(&d);
+        t.set_dirs_only(true);
+        t.toggle_dir(&d.join("adir"));
+        let names = |t: &mut FsTree| t.rows().iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&mut t), vec!["adir"], "browse: the expanded dir lists no files");
+        t.set_query("a");
+        assert_eq!(names(&mut t), vec!["adir"], "filter: only directories match");
+        assert_eq!(t.suggestions("a"), vec![d.join("adir")], "completions: directories only");
+        t.set_query("");
+        t.set_view(FsView::Extension);
+        assert!(names(&mut t).is_empty(), "grouped views group files, so none");
     }
 
     #[test]
