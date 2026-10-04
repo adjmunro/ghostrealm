@@ -206,15 +206,17 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Commands with arguments — arg prompt done; file picker remains
+[2026-09-15@2e8e8c7] Commands with arguments — arg prompt done; generic path args remain
 
 - Requires: NO BLOCKERS
-- Detail: DONE (ace4f7c): choosing a command with required args (Rename Workspace,
-  Open File in Editor) now prompts for each arg in the palette (name + description +
-  kind, enum options listed), validated per kind, then runs it. REMAINING: for a
-  path arg, a proper file picker instead of typing the path (ties to the editor
-  save-as/open dialog entry).
-- Reason: rename / open now work; path entry is still raw typing.
+- Detail: DONE (ace4f7c): choosing a command with required args (Rename Workspace)
+  prompts for each arg in the palette (name + description + kind, enum options
+  listed), validated per kind, then runs it. DONE: commands whose only arg is a
+  path make it optional and open the floating picker without it
+  (`workspace.new`, `editor.open`); `workspace.pick_dir` always picks.
+  REMAINING: a `Path` arg kind (dir or file) the palette's arg prompt fills from
+  the picker itself, so a command needn't special-case its missing arg.
+- Reason: path entry should never be raw typing.
 
 ---
 
@@ -265,19 +267,6 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Editor — save-as / open dialogs (file picker)
-
-- Requires: the arg-input flow
-- Detail: `editor.new` opens a pathless buffer, so Cmd+S can't save (no save-as dialog);
-  `editor.open` needs a path with no picker, so it does nothing. Add a save-as
-  dialog and a file picker — prefer a custom in-theme dialog (native acceptable as a
-  fallback). Ties into the arg-collection entry. Also the editor follow-ups already
-  listed (in-editor selection/copy/cut/paste, modified indicator, click-to-position,
-  word-nav).
-- Reason: editor save/open are currently unusable.
-
----
-
 [2026-09-15@2e8e8c7] ARCHITECTURE — VT off the UI thread — DONE (92d5ca0)
 
 - DONE: `ThreadedTerminal` runs each terminal's VT+PTY on a worker thread; the UI
@@ -291,23 +280,9 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Per-workspace root directory — core done; picker + context menu remain
-
-- Requires: NO BLOCKERS
-- Detail: DONE (1eccbec): Vtab.root_dir; new terminals spawn with the resolved cwd
-  (workspace root -> config default_directory -> shell default); `workspace.set_root`
-  command (path arg) pins the active workspace's root. REMAINING: (1) a context-menu
-  action to set it (currently only via the palette command's typed path); (2) a
-  directory picker instead of typing; (3) editor surfaces + the editor's open/save
-  dialogs should default to the workspace root too.
-- Reason: requested; "air traffic control" for workspaces (see IDEAS.md — autogroup
-  new workspaces by directory later).
-
----
-
 [2026-09-15@2e8e8c7] Taller workspace tabs showing the pinned directory
 
-- Requires: per-workspace root directory (above)
+- Requires: NO BLOCKERS (workspaces have a root directory: `Vtab.root_dir`)
 - Detail: Make the sidebar workspace rows taller and show the directory each is
   pinned to (its root dir) under/next to the name.
 - Reason: visibility of a workspace's cwd; pairs with the per-workspace root dir.
@@ -590,3 +565,16 @@
   Later: if the root is a code repo, index code SYMBOLS (via the LSP) and search
   those instead of/along files.
 - Reason: fast keyboard-only navigation; requested.
+
+---
+
+[2026-10-04@c994011] Floating picker — follow-ups
+
+- Requires: NO BLOCKERS
+- Detail: The picker chooses a directory, a file (`editor.open`), or where to
+  save (Save As). (1) Save mode's name field only appends/backspaces: no caret
+  movement, selection, or paste. (2) In save mode typing goes to the name, so the
+  list can't be filtered or given a typed path — e.g. Tab to move focus between
+  the name and the header field. (3) Saving over an existing file only says
+  "Replace" on the button; no confirm step.
+- Reason: the picker is now the app's open/save dialog; it should feel like one.
