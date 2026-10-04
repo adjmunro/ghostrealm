@@ -28,7 +28,7 @@ use crate::plugins::terminal::{self, TerminalView};
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
 
-/// Reserved surface id addressing the floating directory picker's file browser
+/// Reserved surface id addressing the floating picker's file browser
 /// (e.g. as a button owner). The picker is not a tree surface, so it never
 /// renders as a pane and survives prunes.
 pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
@@ -38,9 +38,9 @@ pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
 
-/// What confirming the floating directory picker does with its directory.
+/// What confirming the floating picker does with its directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DirPick {
+pub enum Pick {
     /// Pin the active workspace's root.
     ActiveRoot,
     /// Create a new workspace rooted there.
@@ -54,8 +54,8 @@ pub struct AppState {
     views: HashMap<SurfaceId, Box<dyn View>>,
     /// Registered content kinds, in picker order.
     plugins: Vec<Box<dyn Plugin>>,
-    /// The floating directory picker, while open, and what confirming it does.
-    dir_picker: Option<(FileBrowserView, DirPick)>,
+    /// The floating picker, while open, and what confirming it does.
+    picker: Option<(FileBrowserView, Pick)>,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -83,7 +83,7 @@ impl AppState {
             tree: Tree::new(),
             views: HashMap::new(),
             plugins: crate::plugins::builtin(),
-            dir_picker: None,
+            picker: None,
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -348,45 +348,45 @@ impl AppState {
         Ok(())
     }
 
-    /// Whether the floating directory picker is open.
-    pub fn dir_picker_open(&self) -> bool {
-        self.dir_picker.is_some()
+    /// Whether the floating picker is open.
+    pub fn picker_open(&self) -> bool {
+        self.picker.is_some()
     }
 
-    /// The floating directory picker's file browser, while open.
-    pub fn dir_picker_mut(&mut self) -> Option<&mut FileBrowserView> {
-        self.dir_picker.as_mut().map(|(b, _)| b)
+    /// The floating picker's file browser, while open.
+    pub fn picker_mut(&mut self) -> Option<&mut FileBrowserView> {
+        self.picker.as_mut().map(|(b, _)| b)
     }
 
     /// What confirming the open picker does.
-    pub fn dir_picker_purpose(&self) -> Option<DirPick> {
-        self.dir_picker.as_ref().map(|(_, p)| *p)
+    pub fn picker_purpose(&self) -> Option<Pick> {
+        self.picker.as_ref().map(|(_, p)| *p)
     }
 
-    /// Open the floating directory picker for `purpose`, rooted at the active
+    /// Open the floating picker for `purpose`, rooted at the active
     /// workspace's dir (else the app default, else the current dir).
-    pub fn open_dir_picker(&mut self, purpose: DirPick) {
+    pub fn open_picker(&mut self, purpose: Pick) {
         let root = self
             .active()
             .and_then(|vt| self.resolve_cwd(vt))
             .or_else(|| self.default_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.dir_picker = Some((FileBrowserView::picker(root), purpose));
+        self.picker = Some((FileBrowserView::picker(root), purpose));
     }
 
-    /// Close the floating directory picker.
-    pub fn close_dir_picker(&mut self) {
-        self.dir_picker = None;
+    /// Close the floating picker.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
     }
 
     /// Confirm the picker with its chosen directory, then close it.
-    pub fn confirm_dir_picker(&mut self) {
-        if let Some((browser, purpose)) = self.dir_picker.take() {
+    pub fn confirm_picker(&mut self) {
+        if let Some((browser, purpose)) = self.picker.take() {
             let dir = browser.choice();
             match purpose {
-                DirPick::ActiveRoot => self.set_active_root_dir(dir),
-                DirPick::NewWorkspace => {
+                Pick::ActiveRoot => self.set_active_root_dir(dir),
+                Pick::NewWorkspace => {
                     self.new_workspace_in(dir);
                 }
             }
@@ -881,7 +881,7 @@ pub fn build_registry() -> Registry<AppState> {
         .arg(ArgSpec::optional("dir", ArgKind::Str, "the workspace directory")),
         Box::new(|s: &mut AppState, a| {
             if a.get("dir").is_none() {
-                s.open_dir_picker(DirPick::NewWorkspace);
+                s.open_picker(Pick::NewWorkspace);
                 return Ok(CmdOutcome::ok());
             }
             let id = s.new_workspace_in(a.get_str("dir")?);
@@ -910,7 +910,7 @@ pub fn build_registry() -> Registry<AppState> {
             "Choose the active workspace's directory in a floating file picker",
         ),
         Box::new(|s: &mut AppState, _| {
-            s.open_dir_picker(DirPick::ActiveRoot);
+            s.open_picker(Pick::ActiveRoot);
             Ok(CmdOutcome::ok())
         }),
     );
@@ -1379,18 +1379,18 @@ mod tests {
     }
 
     #[test]
-    fn dir_picker_confirm_pins_the_workspace_root() {
+    fn picker_confirm_pins_the_workspace_root() {
         let mut s = AppState::new();
         let dir = crate::plugin::testing::tmpdir("app-picker");
         s.set_default_dir(Some(dir.clone()));
         let vt = s.new_empty_vtab();
-        s.open_dir_picker(DirPick::ActiveRoot);
-        assert!(s.dir_picker_open());
+        s.open_picker(Pick::ActiveRoot);
+        assert!(s.picker_open());
         let sub = dir.join("sub");
         std::fs::create_dir(&sub).unwrap();
-        s.dir_picker_mut().unwrap().tree_mut().set_root(&sub);
-        s.confirm_dir_picker();
-        assert!(!s.dir_picker_open());
+        s.picker_mut().unwrap().tree_mut().set_root(&sub);
+        s.confirm_picker();
+        assert!(!s.picker_open());
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(sub.as_path()));
     }
 
@@ -1404,16 +1404,16 @@ mod tests {
         let count = |s: &AppState| s.tree.vtabs().len();
 
         r.execute("workspace.new", &Args::new(), &mut s).unwrap();
-        assert_eq!(s.dir_picker_purpose(), Some(DirPick::NewWorkspace));
+        assert_eq!(s.picker_purpose(), Some(Pick::NewWorkspace));
         assert_eq!(count(&s), 0, "nothing is created before a directory is picked");
-        s.close_dir_picker();
+        s.close_picker();
         assert_eq!(count(&s), 0, "cancelling creates nothing");
 
         r.execute("workspace.new", &Args::new(), &mut s).unwrap();
         let proj = dir.join("proj");
         std::fs::create_dir(&proj).unwrap();
-        s.dir_picker_mut().unwrap().tree_mut().set_root(&proj);
-        s.confirm_dir_picker();
+        s.picker_mut().unwrap().tree_mut().set_root(&proj);
+        s.confirm_picker();
         assert_eq!(count(&s), 1);
         let vt = s.active().unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(proj.as_path()));
@@ -1421,7 +1421,7 @@ mod tests {
         // Given a directory, the command skips the picker.
         let args = Args::new().with("dir", Value::Str(dir.display().to_string()));
         r.execute("workspace.new", &args, &mut s).unwrap();
-        assert!(!s.dir_picker_open());
+        assert!(!s.picker_open());
         assert_eq!(count(&s), 2);
         let vt = s.active().unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(dir.as_path()));

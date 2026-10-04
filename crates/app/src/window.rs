@@ -27,7 +27,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState, DirPick, PICKER_SID, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
@@ -407,7 +407,7 @@ struct State {
     title_buffer: Buffer,
     /// Where to draw the title-bar label this frame (set by `build_titlebar`).
     title_place: Option<Placement>,
-    /// The floating directory picker's panel rect this frame (for click-outside).
+    /// The floating picker's panel rect this frame (for click-outside).
     picker_panel: Option<Rect>,
     /// The last left press (time, position, click count), for counting
     /// double-clicks.
@@ -537,7 +537,7 @@ enum ButtonAction {
     OpenPlugin(&'static str),
     /// A button a view registered while painting: (owning surface, view-local id).
     View(SurfaceId, u32),
-    /// Confirm / cancel the floating directory picker.
+    /// Confirm / cancel the floating picker.
     PickerConfirm,
     PickerCancel,
 }
@@ -1026,11 +1026,11 @@ impl State {
     fn button_at_cursor(&self) -> Option<ButtonAction> {
         let (x, y) = self.cursor;
         // Overlays are modal: the palette and menu own the pointer, and while the
-        // directory picker is open only its own buttons are live.
+        // picker is open only its own buttons are live.
         if self.palette.is_some() || self.menu.is_some() {
             return None;
         }
-        let picker = self.app.dir_picker_open();
+        let picker = self.app.picker_open();
         let mut hit = None;
         for &(r, action) in &self.buttons {
             let modal = matches!(
@@ -1068,7 +1068,7 @@ impl State {
             return false; // released off the button — cancelled
         }
         match armed {
-            ButtonAction::NewVtab => self.app.open_dir_picker(DirPick::NewWorkspace),
+            ButtonAction::NewVtab => self.app.open_picker(Pick::NewWorkspace),
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
@@ -1080,8 +1080,8 @@ impl State {
             ButtonAction::View(sid, id) => {
                 self.view_event(sid, |v, cx| v.button(cx, id));
             }
-            ButtonAction::PickerConfirm => self.app.confirm_dir_picker(),
-            ButtonAction::PickerCancel => self.app.close_dir_picker(),
+            ButtonAction::PickerConfirm => self.app.confirm_picker(),
+            ButtonAction::PickerCancel => self.app.close_picker(),
         }
         self.dirty = true;
         true
@@ -1111,7 +1111,7 @@ impl State {
             return false;
         }
         let pos = self.cursor;
-        let target = if self.app.dir_picker_open() {
+        let target = if self.app.picker_open() {
             Some(PICKER_SID)
         } else {
             self.surface_under_cursor()
@@ -1138,7 +1138,7 @@ impl State {
     fn view_event(&mut self, sid: SurfaceId, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
         let ui = self.ui();
         let view: &mut dyn View = if sid == PICKER_SID {
-            match self.app.dir_picker_mut() {
+            match self.app.picker_mut() {
                 Some(v) => v,
                 None => return false,
             }
@@ -1199,9 +1199,9 @@ impl State {
 
     fn on_click(&mut self) {
         self.mouse_capture = None;
-        // The directory picker is modal: a click in its panel goes to its file
+        // The picker is modal: a click in its panel goes to its file
         // browser, a click outside cancels. (Its buttons arm on press.)
-        if self.app.dir_picker_open() {
+        if self.app.picker_open() {
             let pos = self.cursor;
             match self.picker_panel {
                 Some(panel) if rect_contains(panel, pos.0, pos.1) => {
@@ -1211,7 +1211,7 @@ impl State {
                     });
                     self.mouse_capture = Some(PICKER_SID);
                 }
-                Some(_) => self.app.close_dir_picker(),
+                Some(_) => self.app.close_picker(),
                 None => {}
             }
             self.dirty = true;
@@ -1387,7 +1387,7 @@ impl State {
             }
             MenuAction::SetDir => {
                 self.app.focus_vtab(target);
-                self.app.open_dir_picker(DirPick::ActiveRoot);
+                self.app.open_picker(Pick::ActiveRoot);
                 self.dirty = true;
             }
         }
@@ -1567,8 +1567,8 @@ impl State {
             return;
         }
         let pos = self.cursor;
-        // The directory picker is modal: the wheel scrolls its list.
-        if self.app.dir_picker_open() {
+        // The picker is modal: the wheel scrolls its list.
+        if self.app.picker_open() {
             self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
             return;
         }
@@ -1803,11 +1803,11 @@ impl State {
         cx.place(hint, centre - hint.width * 0.5, y, rect, EMPTY_HINT);
     }
 
-    /// Draw the floating directory picker overlay: a dim backdrop and a centred
+    /// Draw the floating picker overlay: a dim backdrop and a centred
     /// panel hosting a file-browser view (on the overlay layer) above a
     /// confirm/cancel footer.
-    fn build_dir_picker(&mut self, frame: &mut Frame) {
-        if !self.app.dir_picker_open() {
+    fn build_picker(&mut self, frame: &mut Frame) {
+        if !self.app.picker_open() {
             return;
         }
         let (sw, sh) = frame.screen;
@@ -1824,11 +1824,11 @@ impl State {
         let footer_h = ch + 16.0 * scale;
 
         let ui = self.ui();
-        let title_text = match self.app.dir_picker_purpose() {
-            Some(DirPick::NewWorkspace) => "New workspace directory",
+        let title_text = match self.app.picker_purpose() {
+            Some(Pick::NewWorkspace) => "New workspace directory",
             _ => "Set workspace directory",
         };
-        let Some(view) = self.app.dir_picker_mut() else {
+        let Some(view) = self.app.picker_mut() else {
             return;
         };
         let mut cx = PaintCx::new(
@@ -2377,16 +2377,16 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
-        // The directory picker, when open, owns the keyboard: Escape cancels,
+        // The picker, when open, owns the keyboard: Escape cancels,
         // Cmd+Enter confirms, everything else drives its file browser.
-        if self.app.dir_picker_open() {
+        if self.app.picker_open() {
             match &event.logical_key {
                 WKey::Named(NamedKey::Escape) => {
-                    self.app.close_dir_picker();
+                    self.app.close_picker();
                     self.dirty = true;
                 }
                 WKey::Named(NamedKey::Enter) if self.mods.super_ => {
-                    self.app.confirm_dir_picker();
+                    self.app.confirm_picker();
                     self.dirty = true;
                 }
                 _ => {
@@ -3124,8 +3124,8 @@ impl State {
         } else {
             Vec::new()
         };
-        // Floating directory picker (modal overlay). Its text joins the overlay pass.
-        self.build_dir_picker(&mut frame);
+        // Floating picker (modal overlay). Its text joins the overlay pass.
+        self.build_picker(&mut frame);
 
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();
@@ -3261,7 +3261,7 @@ impl State {
             )
             .context("text prepare")?;
 
-        // Palette, menu and the directory picker are mutually exclusive; each draws
+        // Palette, menu and the picker are mutually exclusive; each draws
         // above everything via the overlay text renderer (each from its own pool).
         let overlay_areas: Vec<TextArea> = if !palette_placements.is_empty() {
             palette_placements

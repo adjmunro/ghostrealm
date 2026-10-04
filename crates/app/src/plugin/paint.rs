@@ -154,7 +154,7 @@ pub struct TextItem {
 }
 
 /// Which pass a view paints into. Views in panes paint the base layer; a view
-/// hosted in a modal (the directory picker) paints the overlay layer, above all
+/// hosted in a modal (the picker) paints the overlay layer, above all
 /// pane content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
