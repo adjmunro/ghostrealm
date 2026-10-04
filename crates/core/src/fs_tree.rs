@@ -573,7 +573,7 @@ impl FsTree {
                 if partial.is_empty() && name.starts_with('.') && !self.show_hidden {
                     continue;
                 }
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = is_dir_following_links(e.file_type().ok(), &e.path());
                 out.push((is_dir, e.path()));
             }
         }
@@ -646,7 +646,7 @@ impl FsTree {
                 .to_string_lossy()
                 .into_owned();
             let name = dent.file_name().to_string_lossy().into_owned();
-            let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = is_dir_following_links(dent.file_type(), dent.path());
             let (size, mtime) = dent
                 .metadata()
                 .map(|m| (m.len(), m.modified().ok()))
@@ -824,7 +824,7 @@ impl FsTree {
             }
             let path = dent.path().to_path_buf();
             let name = dent.file_name().to_string_lossy().into_owned();
-            let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = is_dir_following_links(dent.file_type(), dent.path());
             let (size, mtime) = dent
                 .metadata()
                 .map(|m| (m.len(), m.modified().ok()))
@@ -858,6 +858,16 @@ impl FsTree {
             .parents(true)
             .follow_links(false);
         b
+    }
+}
+
+/// Whether an entry is a directory, resolving a symlink to its target: listings
+/// don't follow links, so a link's own type never says "directory".
+fn is_dir_following_links(file_type: Option<std::fs::FileType>, path: &Path) -> bool {
+    match file_type {
+        Some(t) if t.is_symlink() => path.is_dir(),
+        Some(t) => t.is_dir(),
+        None => false,
     }
 }
 
@@ -986,6 +996,26 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    #[test]
+    fn symlinked_dirs_list_and_expand_as_dirs() {
+        let d = tmpdir();
+        fs::create_dir(d.join("real")).unwrap();
+        fs::write(d.join("real").join("inside.txt"), "x").unwrap();
+        fs::write(d.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        std::os::unix::fs::symlink(d.join("file.txt"), d.join("filelink")).unwrap();
+        let mut t = FsTree::new(&d);
+        let kind = |t: &mut FsTree, name: &str| t.rows().iter().find(|r| r.name == name).map(|r| r.is_dir);
+        assert_eq!(kind(&mut t, "link"), Some(true), "a symlink to a dir is a dir");
+        assert_eq!(kind(&mut t, "filelink"), Some(false), "a symlink to a file is a file");
+        t.toggle_dir(&d.join("link"));
+        let names: Vec<String> = t.rows().iter().map(|r| r.name.clone()).collect();
+        assert!(names.contains(&"inside.txt".to_string()), "expanding a linked dir lists it: {names:?}");
+        assert_eq!(t.suggestions("li"), vec![d.join("link")]);
+        t.set_query("lin");
+        assert_eq!(kind(&mut t, "link"), Some(true), "filter results agree");
     }
 
     #[test]
