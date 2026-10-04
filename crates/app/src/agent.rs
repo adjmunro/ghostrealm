@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn set_splits_and_get_tree_reflects_it() {
         let resps = drive(&[
-            r#"{"op":"set","id":"workspace.new"}"#,
+            r#"{"op":"set","id":"workspace.new","args":{"dir":"/"}}"#,
             r#"{"op":"set","id":"split.leftright"}"#,
             r#"{"op":"get","what":"tree"}"#,
         ]);

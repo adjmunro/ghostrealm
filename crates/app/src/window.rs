@@ -27,7 +27,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_state::{build_registry, AppState, PICKER_SID, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, AppState, DirPick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
@@ -1068,9 +1068,7 @@ impl State {
             return false; // released off the button — cancelled
         }
         match armed {
-            ButtonAction::NewVtab => {
-                self.app.new_empty_vtab();
-            }
+            ButtonAction::NewVtab => self.app.open_dir_picker(DirPick::NewWorkspace),
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
@@ -1389,7 +1387,7 @@ impl State {
             }
             MenuAction::SetDir => {
                 self.app.focus_vtab(target);
-                self.app.open_dir_picker();
+                self.app.open_dir_picker(DirPick::ActiveRoot);
                 self.dirty = true;
             }
         }
@@ -1826,6 +1824,10 @@ impl State {
         let footer_h = ch + 16.0 * scale;
 
         let ui = self.ui();
+        let title_text = match self.app.dir_picker_purpose() {
+            Some(DirPick::NewWorkspace) => "New workspace directory",
+            _ => "Set workspace directory",
+        };
         let Some(view) = self.app.dir_picker_mut() else {
             return;
         };
@@ -1844,7 +1846,7 @@ impl State {
         cx.border(panel, cx.chrome.accent);
 
         let title_rect = Rect { x: px, y: py, w: pw, h: title_h };
-        let title = cx.shape("Set workspace directory", Family::SansSerif, pw);
+        let title = cx.shape(title_text, Family::SansSerif, pw);
         cx.place(title, px + (pw - title.width) * 0.5, py + (title_h - ch) * 0.5, title_rect, theme::TITLE);
 
         let body = Rect {

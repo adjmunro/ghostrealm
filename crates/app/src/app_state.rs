@@ -38,6 +38,15 @@ pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
 
+/// What confirming the floating directory picker does with its directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirPick {
+    /// Pin the active workspace's root.
+    ActiveRoot,
+    /// Create a new workspace rooted there.
+    NewWorkspace,
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// Each surface's content. A surface without a view is "empty" — it shows
@@ -45,8 +54,8 @@ pub struct AppState {
     views: HashMap<SurfaceId, Box<dyn View>>,
     /// Registered content kinds, in picker order.
     plugins: Vec<Box<dyn Plugin>>,
-    /// The floating directory picker, while open.
-    dir_picker: Option<FileBrowserView>,
+    /// The floating directory picker, while open, and what confirming it does.
+    dir_picker: Option<(FileBrowserView, DirPick)>,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -346,18 +355,24 @@ impl AppState {
 
     /// The floating directory picker's file browser, while open.
     pub fn dir_picker_mut(&mut self) -> Option<&mut FileBrowserView> {
-        self.dir_picker.as_mut()
+        self.dir_picker.as_mut().map(|(b, _)| b)
     }
 
-    /// Open the floating directory picker rooted at the active workspace's dir
-    /// (else the app default, else the current dir).
-    pub fn open_dir_picker(&mut self) {
+    /// What confirming the open picker does.
+    pub fn dir_picker_purpose(&self) -> Option<DirPick> {
+        self.dir_picker.as_ref().map(|(_, p)| *p)
+    }
+
+    /// Open the floating directory picker for `purpose`, rooted at the active
+    /// workspace's dir (else the app default, else the current dir).
+    pub fn open_dir_picker(&mut self, purpose: DirPick) {
         let root = self
             .active()
             .and_then(|vt| self.resolve_cwd(vt))
+            .or_else(|| self.default_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.dir_picker = Some(FileBrowserView::picker(root));
+        self.dir_picker = Some((FileBrowserView::picker(root), purpose));
     }
 
     /// Close the floating directory picker.
@@ -365,13 +380,24 @@ impl AppState {
         self.dir_picker = None;
     }
 
-    /// Confirm the picker: pin the active workspace's root to its chosen
-    /// directory, then close it.
+    /// Confirm the picker with its chosen directory, then close it.
     pub fn confirm_dir_picker(&mut self) {
-        if let Some(dir) = self.dir_picker.as_ref().map(|b| b.choice()) {
-            self.set_active_root_dir(dir);
+        if let Some((browser, purpose)) = self.dir_picker.take() {
+            let dir = browser.choice();
+            match purpose {
+                DirPick::ActiveRoot => self.set_active_root_dir(dir),
+                DirPick::NewWorkspace => {
+                    self.new_workspace_in(dir);
+                }
+            }
         }
-        self.close_dir_picker();
+    }
+
+    /// Create a new empty workspace rooted at `dir`; it becomes active.
+    pub fn new_workspace_in(&mut self, dir: impl Into<std::path::PathBuf>) -> VtabId {
+        let vt = self.new_empty_vtab();
+        self.set_active_root_dir(dir);
+        vt
     }
 
     /// Create a new workspace named `name` (pinned) whose sole surface is `view`
@@ -847,9 +873,18 @@ pub fn build_registry() -> Registry<AppState> {
     let mut r = Registry::new();
 
     r.register(
-        CommandMeta::new("workspace.new", "New Workspace", "Open a new empty workspace"),
-        Box::new(|s: &mut AppState, _| {
-            let id = s.new_empty_vtab();
+        CommandMeta::new(
+            "workspace.new",
+            "New Workspace",
+            "Open a new empty workspace in a directory (chosen in a picker unless given)",
+        )
+        .arg(ArgSpec::optional("dir", ArgKind::Str, "the workspace directory")),
+        Box::new(|s: &mut AppState, a| {
+            if a.get("dir").is_none() {
+                s.open_dir_picker(DirPick::NewWorkspace);
+                return Ok(CmdOutcome::ok());
+            }
+            let id = s.new_workspace_in(a.get_str("dir")?);
             Ok(CmdOutcome::msg(format!("opened workspace {}", id.0)))
         }),
     );
@@ -875,7 +910,7 @@ pub fn build_registry() -> Registry<AppState> {
             "Choose the active workspace's directory in a floating file picker",
         ),
         Box::new(|s: &mut AppState, _| {
-            s.open_dir_picker();
+            s.open_dir_picker(DirPick::ActiveRoot);
             Ok(CmdOutcome::ok())
         }),
     );
@@ -1349,7 +1384,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("app-picker");
         s.set_default_dir(Some(dir.clone()));
         let vt = s.new_empty_vtab();
-        s.open_dir_picker();
+        s.open_dir_picker(DirPick::ActiveRoot);
         assert!(s.dir_picker_open());
         let sub = dir.join("sub");
         std::fs::create_dir(&sub).unwrap();
@@ -1357,6 +1392,39 @@ mod tests {
         s.confirm_dir_picker();
         assert!(!s.dir_picker_open());
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(sub.as_path()));
+    }
+
+    #[test]
+    fn new_workspace_is_created_only_once_its_directory_is_picked() {
+        use ghostrealm_core::{Args, Value};
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-new-ws");
+        s.set_default_dir(Some(dir.clone()));
+        let count = |s: &AppState| s.tree.vtabs().len();
+
+        r.execute("workspace.new", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.dir_picker_purpose(), Some(DirPick::NewWorkspace));
+        assert_eq!(count(&s), 0, "nothing is created before a directory is picked");
+        s.close_dir_picker();
+        assert_eq!(count(&s), 0, "cancelling creates nothing");
+
+        r.execute("workspace.new", &Args::new(), &mut s).unwrap();
+        let proj = dir.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        s.dir_picker_mut().unwrap().tree_mut().set_root(&proj);
+        s.confirm_dir_picker();
+        assert_eq!(count(&s), 1);
+        let vt = s.active().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(proj.as_path()));
+
+        // Given a directory, the command skips the picker.
+        let args = Args::new().with("dir", Value::Str(dir.display().to_string()));
+        r.execute("workspace.new", &args, &mut s).unwrap();
+        assert!(!s.dir_picker_open());
+        assert_eq!(count(&s), 2);
+        let vt = s.active().unwrap();
+        assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(dir.as_path()));
     }
 
     #[test]
