@@ -406,23 +406,24 @@
 
 ---
 
-[2026-09-29@19e0239] File browser — preview pane
+[2026-10-05T20:35+1300@0c5b05d7] File browser — preview pane follow-ups
 
-- Requires: NO BLOCKERS (image first; media is a large follow-up)
-- Detail: When the browser pane is wide enough (a minimum pixel width; below it,
-  hide the preview rather than repositioning it to the bottom), split off a
-  right-hand preview of the hovered/selected file:
-  - **details** always: name, size, mtime/ctime, kind, and for a dir its entry
-    count.
-  - **text files**: a scrollable head of the contents (reuse the editor's read +
-    row rendering).
-  - **images**: decode and show the image (wgpu texture upload; new render path).
-  - **video/audio**: play with an autoplay setting (`[preview] autoplay`, default
-    true) — a UI toggle button flips it and writes it back to config + hot-reloads
-    (like the existing editor soft-wrap toggle pattern). Media decode/playback is a
-    big dependency decision (e.g. an ffmpeg/symphonia route) — spike separately.
-  Build order: details + text preview → images → media. Keep the min-width gate so
-  a narrow pane just shows the tree.
+- Requires: NO BLOCKERS
+- Detail: The preview (details, text head, images, audio) is in. Remaining:
+  - **video**: decode + play (an ffmpeg-class dependency decision; spike
+    separately). Reuse the audio controls and `PaintCx::image` per frame.
+  - **opening media**: clicking an image/audio file in the browser opens it in
+    the editor (the catch-all). Add an image/audio viewer plugin that claims
+    those paths (the preview's loader and player are the parts to reuse).
+  - **autoplay toggle**: the preview's `autoplay` button is a per-pane override
+    of `[file_browser] preview_autoplay`; write it back to the config instead,
+    if that is the wanted behaviour.
+  - **text**: syntax highlighting once the highlighter lives in core (see the
+    syntax highlighting entry).
+  - **wake, not poll**: the preview polls its loader on a 15 ms timer while a
+    load is in flight. `View::refresh` (repaint without marking unread) would
+    replace the poll once the loader wakes the UI (`OpenCx::waker`) and the
+    floating picker's view is refreshed like a pane's.
 - Reason: Finder-style at-a-glance preview; explicitly requested (autoplay wanted
   on by default).
 

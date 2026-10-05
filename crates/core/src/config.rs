@@ -117,11 +117,20 @@ pub enum OpenIn {
 pub struct FileBrowser {
     /// Where opening a file puts it.
     pub open_in: OpenIn,
+    /// Show the preview beside the list once the browser is at least this wide
+    /// (logical px). The browser's `preview` toggle overrides it per pane.
+    pub preview_min_width: u32,
+    /// Start playing audio once the preview has shown it for a moment.
+    pub preview_autoplay: bool,
 }
 
 impl Default for FileBrowser {
     fn default() -> Self {
-        FileBrowser { open_in: OpenIn::Split }
+        FileBrowser {
+            open_in: OpenIn::Split,
+            preview_min_width: 900,
+            preview_autoplay: true,
+        }
     }
 }
 

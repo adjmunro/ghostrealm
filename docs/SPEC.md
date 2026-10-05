@@ -51,9 +51,11 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
 ## Rendering model (current)
 
 Per frame: every view is pumped (a terminal checks its VT worker's published
-grid); then each pane's active view paints into a `Frame`: quads under text, text
-items, quads over text, overlay text. The app draws the quads via an instanced
-quad pipeline and the text via glyphon. Text is either a content-keyed shaped row
+grid); then each pane's active view paints into a `Frame`: quads under text, images,
+text items, quads over text, overlay images, overlay text. The app draws the quads
+via an instanced quad pipeline, images via a textured-quad pipeline (a texture per
+view image, re-uploaded only when its version changes and freed once undrawn), and
+the text via glyphon. Text is either a content-keyed shaped row
 from the shared `RowCache` (shaped within a per-frame time budget) or a per-frame
 scratch buffer. A terminal snapshots only when its grid changed and resizes its
 PTY only when its cell grid changes.
