@@ -34,6 +34,10 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+, | open the config file |
 | Cmd+S / Cmd+Shift+S | save / save as (editor; an unsaved buffer asks where) |
 
+Text fields and the editor share macOS editing keys: Option+←/→ by word,
+Cmd+←/→ to the line's start/end, Cmd+↑/↓ to the start/end, Shift to select with
+any of them; Option/Cmd+Backspace delete a word / to the line's start; Cmd+A/C/X/V.
+
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
 Click a sidebar row to switch vtab, a pane to focus it, a tab to switch it.
 Everything is also reachable from the palette (and the agent).

@@ -44,6 +44,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   own header (the editor's filename ribbon).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
+- Text input: `plugin::text_edit` maps keys to edits by macOS conventions
+  (`edit_for`) and applies them to a `LineEdit` (one line, cursor, selection);
+  draw it with `text_field`. Every text input uses it, so they all edit alike.
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
 into the overlay layer; it doesn't need to know.

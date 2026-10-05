@@ -154,15 +154,15 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Editing keys — bracketed paste + editor word motion remain
+[2026-09-15@2e8e8c7] Editing keys — bracketed paste remains
 
 - Requires: NO BLOCKERS
 - Detail: DONE — terminal (785bf9a): Shift+Arrow grid selection (word with Option),
   Option+Left/Right word motion (ESC-b/f), Cmd+Left/Right/Up/Down line motion, Cmd+C
   copy, Cmd+V paste, Shift+Enter sends LF without a false busy dot (262af58). Editor
-  (f591f3d): Shift selection, Cmd+C/X/V, Cmd+arrow line/doc nav. REMAINING: (1)
-  bracketed-paste wrapping so a multi-line terminal paste doesn't auto-execute each
-  line; (2) Option+Arrow word motion IN the editor (currently char move).
+  and every text field: `plugin::text_edit` (macOS motions, Shift selection,
+  word/line deletes, Cmd+A/C/X/V). REMAINING: bracketed-paste wrapping so a
+  multi-line terminal paste doesn't auto-execute each line.
 - Reason: expected editor behaviour; the muscle memory the user relies on.
 
 ---
@@ -227,8 +227,8 @@
   directory… (they open the argument prompt). REMAINING: (1) a right-click context
   menu for horizontal/terminal tabs (rename that surface, close it, …) — needs a
   per-surface rename command; (2) "Close workspace" should confirm when the workspace
-  has more than one pane (avoid accidental loss) — needs a small confirm step (reuse
-  the Menu widget with Confirm/Cancel, or a dedicated confirm overlay).
+  has more than one pane (avoid accidental loss) — `AppState::confirm` exists (Save
+  As replace uses it); add a `Confirmed` variant for closing.
 - Reason: context actions per tab type; prevent accidental loss.
 
 ---
@@ -572,9 +572,30 @@
 
 - Requires: NO BLOCKERS
 - Detail: The picker chooses a directory, a file (`editor.open`), or where to
-  save (Save As). (1) Save mode's name field only appends/backspaces: no caret
-  movement, selection, or paste. (2) In save mode typing goes to the name, so the
-  list can't be filtered or given a typed path — e.g. Tab to move focus between
-  the name and the header field. (3) Saving over an existing file only says
-  "Replace" on the button; no confirm step.
+  save (Save As). In save mode typing goes to the name, so the list can't be
+  filtered or given a typed path — e.g. Tab to move focus between the name and
+  the header field. While a confirmation is open the picker is hidden: overlay
+  text draws above all overlay quads, so modals can't stack (needs per-modal
+  layers in `Frame`).
 - Reason: the picker is now the app's open/save dialog; it should feel like one.
+
+---
+
+[2026-10-05@9b31ef6] Mouse selection in single-line text fields
+
+- Requires: NO BLOCKERS
+- Detail: `LineEdit` fields (palette, file-browser filter, Save As name) edit by
+  keyboard only. Click to place the cursor, drag / Shift+click / double-click to
+  select — the editor already maps clicks to positions; fields need their glyph
+  geometry from the last paint.
+- Reason: fields should take the mouse like the editor does.
+
+---
+
+[2026-10-05@9b31ef6] Delete files (with confirmation)
+
+- Requires: NO BLOCKERS
+- Detail: Nothing deletes files today. Add delete to the file browser (a row
+  context menu / Cmd+Backspace on the selection) behind `AppState::confirm`, moving
+  to the macOS Trash rather than unlinking.
+- Reason: requested alongside the replace confirmation.
