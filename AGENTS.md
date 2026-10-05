@@ -20,6 +20,8 @@
 - Do not bump Zig blindly: its major.minor must equal the pinned Ghostty's `build.zig.zon` `minimum_zig_version`, and it must be new enough to link this host's macOS SDK. See [`docs/libghostty-findings.md`](docs/libghostty-findings.md) → "Build toolchain".
 - `libghostty-vt` comes from git (pinned `rev`), not crates.io — the published crate is stale.
 - `cargo` lives in `~/.cargo/bin`, which the agent shell's `PATH` lacks: `export PATH="$HOME/.cargo/bin:$PATH"` first. There is no `timeout` binary either.
+- The web host (`crates/web-host`, CEF) is not a default workspace member: plain `cargo build/test` skip it. Build + bundle it with `mise run web` (CMake + Ninja come from `mise.toml`). Toggling its `bundle` feature rebuilds `cef`, so always build it via that task. Its integration test (`cargo test -p ghostrealm-web --test host`) skips unless the bundle exists.
+- The host runs headless (no display needed), so web behaviour is verifiable without a GUI: drive it with `ghostrealm agent` (`web.new`, `web.eval`, `get surface`) or the host test.
 
 ## Verifying the app
 

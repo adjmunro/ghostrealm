@@ -22,7 +22,19 @@ crates/core        app spine: command registry, tab/split tree, inbox, config, f
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
+crates/web         web surface contract: JSON-line protocol, shared-memory frames, host client
+crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; not a default member
 ```
+
+- **Web surfaces run out of process.** `ghostrealm-web-host` hosts Chromium (CEF,
+  off-screen rendering) and talks to the app over its stdin/stdout (one JSON object
+  per line, `crates/web/src/protocol.rs`). Page pixels go through a memory-mapped,
+  double-buffered BGRA file per page (`frame.rs`); the `web` plugin shows the
+  newest frame with `PaintCx::image`, a texture in the same wgpu scene. Input (mouse, keys, edit
+  commands) is forwarded as requests. One host serves every web surface and is
+  spawned on first use. Build it with `mise run web` (needs CMake + Ninja, pinned
+  in `mise.toml`; CEF's binary distribution is downloaded by `cef-dll-sys`). The
+  app finds it beside its own binary, at `[web] host`, or `$GHOSTREALM_WEB_HOST`.
 
 - **App ↔ terminal seam:** `TerminalBackend` (in `crates/terminal`) exposes only
   backend-neutral types. Inside `terminal-ghostty`, the PTY / VT / (future) font

@@ -650,3 +650,18 @@
 - Reason: discover (and change) shortcuts where you use them; idea, not
   committed to.
 
+---
+
+[2026-10-05@e175cf0] Web surface — follow-ups
+
+- Requires: NO BLOCKERS
+- Detail: The basic CEF web surface is in (toolbar, URL bar, page input, agent
+  commands). REMAINING: (1) verify on a real desktop session — page drawing,
+  HiDPI sharpness, cursor shapes, typing (incl. Option/dead keys) and
+  Cmd+C/V/X/A in pages; (2) IME composition (`ime_set_composition`); (3) file
+  upload dialogs, downloads, JS alert/confirm dialogs (currently CEF defaults /
+  unhandled); (4) drag and drop; (5) restart the host automatically after a crash
+  (today a dead host is noticed on the next resize/open); (6) Linux bundle is
+  untested; (7) devtools (`show_dev_tools`, or the remote debugging port) as a
+  command.
+- Reason: a usable everyday browser pane.

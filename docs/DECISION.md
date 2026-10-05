@@ -76,3 +76,14 @@
 - Detail: No backfill/doctor pass and no generated option or keybinding listings in the file.
 - Reason: the file had outgrown listing every option; hover docs and checking keep it discoverable and safe without the clutter.
 
+---
+
+[2026-10-05T21:13+1300@e175cf0d]
+
+- Category: Web surface / embedded browser
+- Detail: Web pages render via CEF (`cef` crate, prebuilt CEF binary distribution) in a separate host process (`crates/web-host`), off-screen, with software compositing. Frames reach the app through shared-memory files and are drawn as textures in the app's own wgpu scene; input and commands go over a JSON-line pipe (`crates/web`).
+- Detail: One page per web surface — no in-browser tabs; popups and new-window links open in place. The pane/tab system provides tabs.
+- Detail: The app side is the `web` plugin (`crates/app/src/plugins/web/`). It draws pages through `PaintCx::image` and takes keys through `View::raw_key` (presses and releases with the physical key), both added to the plugin API for it.
+- Detail: The host crate is excluded from the workspace's `default-members`; the app builds and tests without CEF and reports a missing host in the pane.
+- Reason: Process isolation keeps a renderer crash or hang from taking down the multiplexer and its shells, and keeps Chromium's NSApplication requirements and ~250 MB of binaries out of the main binary. Off-screen rendering keeps "unified compositing; no native subviews" and cross-platform.
+- Reason: Software compositing because frames are consumed as CPU pixels anyway (GPU compositing adds a readback), and it paints without a window server.
