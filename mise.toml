@@ -1,2 +1,14 @@
 [tools]
 zig = "0.16.0"
+# Build CEF's C++ wrapper (cef-dll-sys) for the web host crate.
+cmake = "4.4.4"
+ninja = "1.13.2"
+
+# Build the CEF web host and bundle it beside the `ghostrealm` binary, where the
+# app looks for it. Always build with `--features bundle` so cef isn't rebuilt
+# when switching between the host and the bundler.
+[tasks.web]
+run = [
+    "cargo build -p ghostrealm-web-host --features bundle --bins",
+    "cargo run -p ghostrealm-web-host --features bundle --bin ghostrealm-web-bundle",
+]

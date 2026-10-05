@@ -7,6 +7,16 @@ members = [
     "crates/lsp",
     "crates/app",
     "crates/web",
+    "crates/web-host",
+]
+# The CEF web host downloads and links Chromium; keep plain `cargo build/test`
+# free of it. Build it with `mise run web` (see mise.toml).
+default-members = [
+    "crates/terminal",
+    "crates/terminal-ghostty",
+    "crates/core",
+    "crates/app",
+    "crates/web",
 ]
 
 [workspace.package]
