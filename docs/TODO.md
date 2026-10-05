@@ -665,3 +665,75 @@
   untested; (7) devtools (`show_dev_tools`, or the remote debugging port) as a
   command.
 - Reason: a usable everyday browser pane.
+
+---
+
+[2026-10-05@93248d9] Agent channel → the running app (+ MCP server)
+
+- Requires: NO BLOCKERS
+- Detail: `ghostrealm agent` runs its own headless AppState; it cannot see or drive
+  the panes in an open window. Serve the same protocol from the running app over a
+  local socket (per-window path, exported to child shells as an env var), and wrap
+  it as an MCP server (stdio shim that connects to that socket) so an agent in a
+  terminal tab controls *this* window's workspaces, terminals, and web panes.
+  Scope agent access per the existing "hide from agent" idea.
+- Reason: agent control of the live UI is the point of the agent channel.
+
+---
+
+[2026-10-05@93248d9] Web — structured page text + ref-based actions for agents
+
+- Requires: NO BLOCKERS (builds on `web.eval`)
+- Detail: `get surface` returns flat page text. Add a compact structured outline
+  (headings, links, buttons, inputs, landmarks, with stable element refs), built by
+  an injected script (or CEF's accessibility tree), plus `web.click {ref}` /
+  `web.type {ref, text}` / `web.select`, so an agent can act on a page without
+  pixels or guessed selectors.
+- Reason: agents read and act on pages reliably and cheaply without screenshots.
+
+---
+
+[2026-10-05@93248d9] Agent screenshot command
+
+- Requires: agent channel → running app (for terminal/chrome captures)
+- Detail: `get what=screenshot` (surface id, or the whole window) returning a PNG
+  (base64; an MCP image result). Web surfaces can encode their latest shared frame
+  directly; terminals/chrome need an offscreen render of the scene.
+- Reason: some questions are visual (layout, rendering bugs, canvases).
+
+---
+
+[2026-10-05@93248d9] Web — preload on link hover and URL-bar typing
+
+- Requires: NO BLOCKERS
+- Detail: (1) Link hover: inject speculation rules (prefetch/prerender with
+  `eagerness: moderate`, Chromium's own hover heuristic) on page load. (2) URL bar:
+  after a short typing pause, when the input resolves to an address (not a
+  search), preconnect, and optionally prerender in a hidden browser that is swapped
+  in on Enter. Configurable (`[web] preload = off | connect | prerender`); never
+  prerender searches, and accept that prerendering issues real GET requests
+  (side effects, analytics, intent leaked to the site).
+- Reason: navigation feels instant.
+
+---
+
+[2026-10-05@93248d9] Web — GPU (accelerated) off-screen rendering
+
+- Requires: verify GPU compositing paints on a real display (it produced no
+  frames headless, hence `--disable-gpu-compositing`)
+- Detail: Replace CPU frames with CEF shared textures (`shared_texture_enabled`,
+  `on_accelerated_paint`): an IOSurface on macOS, a DMA-BUF on Linux. Pass the
+  handle to the app (IOSurface mach port; DMA-BUF fd over a Unix socket) and import
+  it as a wgpu texture (cef-rs `accelerated_osr` already imports into wgpu 30).
+  Removes the raster→shm→upload copies; keeps process isolation and unified
+  compositing. Keep the CPU path as a fallback.
+- Reason: video, scrolling, and animation at HiDPI without burning CPU.
+
+---
+
+[2026-10-05@93248d9] Web — exit the host when no web surfaces remain
+
+- Requires: NO BLOCKERS
+- Detail: The host is spawned on first use and lives until the app quits. Close it
+  (stdin EOF) a little after the last web surface closes; it respawns on demand.
+- Reason: an idle Chromium browser + GPU process hold a few hundred MB.
