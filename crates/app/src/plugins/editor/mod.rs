@@ -17,12 +17,13 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::{AppState, Pick};
+use crate::plugin::text_edit::edit_for;
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
     View,
 };
 
-pub use buffer::{EditorBuffer, Motion};
+pub use buffer::EditorBuffer;
 use toml::toml_row_spans;
 use wrap::wrap_line;
 
@@ -402,11 +403,31 @@ impl View for EditorView {
         }
     }
 
+    /// Text editing per [`crate::plugin::text_edit`], plus Enter, Tab, and
+    /// Cmd+S (save; Shift+S saves as).
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
-        let used = if k.mods.super_ {
-            self.cmd_key(cx, k)
-        } else {
-            self.plain_key(k)
+        let m = k.mods;
+        let used = match k.key {
+            Key::Char(c) if m.super_ && c.eq_ignore_ascii_case(&'s') => {
+                if m.shift {
+                    cx.request(Request::SaveAs);
+                } else {
+                    self.save(cx);
+                }
+                true
+            }
+            Key::Enter if !m.super_ && !m.ctrl => {
+                self.buf.insert_newline();
+                true
+            }
+            Key::Tab if !m.super_ && !m.ctrl && !m.shift => {
+                self.buf.insert_str(&" ".repeat(TAB_WIDTH));
+                true
+            }
+            _ => match edit_for(k) {
+                Some(edit) => self.buf.apply(edit, cx).used(),
+                None => false,
+            },
         };
         if used {
             self.note_edits();
@@ -550,86 +571,6 @@ impl View for EditorView {
     }
 }
 
-impl EditorView {
-    /// Keys without Cmd: motions (Shift extends the selection) and typing.
-    fn plain_key(&mut self, k: &KeyPress) -> bool {
-        let e = &mut self.buf;
-        let motion = match k.key {
-            Key::Left => Some(Motion::Left),
-            Key::Right => Some(Motion::Right),
-            Key::Up => Some(Motion::Up),
-            Key::Down => Some(Motion::Down),
-            Key::Home => Some(Motion::Home),
-            Key::End => Some(Motion::End),
-            _ => None,
-        };
-        if let Some(m) = motion {
-            if k.mods.shift {
-                e.move_cursor_selecting(m);
-            } else {
-                e.move_cursor(m);
-            }
-            return true;
-        }
-        match k.key {
-            Key::Enter => e.insert_newline(),
-            Key::Backspace => e.backspace(),
-            Key::Delete => e.delete_forward(),
-            Key::Tab => e.insert_str(&" ".repeat(TAB_WIDTH)),
-            // Ctrl chords aren't text.
-            Key::Char(_) if k.mods.ctrl => return false,
-            Key::Char(c) => {
-                let typed = k.text.clone().unwrap_or_else(|| c.to_string());
-                let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
-                if typed.is_empty() {
-                    return false;
-                }
-                e.insert_str(&typed);
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// Cmd chords the app didn't bind: clipboard (C/X/V), save (S; Shift+S saves
-    /// as), and line / document navigation (arrows; Shift extends the selection).
-    fn cmd_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
-        let selecting = k.mods.shift;
-        let e = &mut self.buf;
-        match k.key {
-            Key::Char(c) => match c.to_ascii_lowercase() {
-                'c' => {
-                    if let Some(t) = e.selected_text() {
-                        cx.set_clipboard_text(t);
-                    }
-                }
-                'x' => {
-                    if let Some(t) = e.selected_text() {
-                        e.delete_selection();
-                        cx.set_clipboard_text(t);
-                    }
-                }
-                'v' => {
-                    if let Some(t) = cx.clipboard_text() {
-                        e.insert_str(&t);
-                    }
-                }
-                's' if selecting => cx.request(Request::SaveAs),
-                's' => self.save(cx),
-                _ => return false,
-            },
-            Key::Left if selecting => e.move_cursor_selecting(Motion::Home),
-            Key::Left => e.move_cursor(Motion::Home),
-            Key::Right if selecting => e.move_cursor_selecting(Motion::End),
-            Key::Right => e.move_cursor(Motion::End),
-            Key::Up => e.move_document(false, selecting),
-            Key::Down => e.move_document(true, selecting),
-            _ => return false,
-        }
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +694,25 @@ mod tests {
         assert_eq!(v.path(), Some(path));
         assert!(!v.modified());
         assert_eq!(v.title().as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn option_moves_by_word_and_cmd_shift_selects_to_line_start() {
+        let mut v = view_with("hello big world");
+        let h = Harness::new();
+        h.key(&mut v, cmd(Key::Right));
+        let mut opt_left = press(Key::Left);
+        opt_left.mods.alt = true;
+        h.key(&mut v, opt_left);
+        assert_eq!(v.buffer().cursor, (0, 10));
+        let mut cmd_shift_left = cmd(Key::Left);
+        cmd_shift_left.mods.shift = true;
+        h.key(&mut v, cmd_shift_left);
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("hello big "));
+        let mut opt_bs = press(Key::Backspace);
+        opt_bs.mods.alt = true;
+        h.key(&mut v, opt_bs);
+        assert_eq!(v.buffer().lines, vec!["world"]);
     }
 
     #[test]

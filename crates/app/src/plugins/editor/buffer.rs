@@ -8,16 +8,7 @@
 
 use std::path::PathBuf;
 
-/// Cursor / edit motions the window maps keys onto.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Motion {
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-}
+use crate::plugin::text_edit::{word_left, word_right, Applied, Clipboard, Edit, Motion};
 
 pub struct EditorBuffer {
     /// The text, one entry per line. Always at least one (possibly empty) line.
@@ -198,103 +189,115 @@ impl EditorBuffer {
     /// Delete the char before the cursor, joining with the previous line at the
     /// start of a line. Deletes the selection instead when there is one.
     pub fn backspace(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        let (row, col) = self.cursor;
-        if col > 0 {
-            let b = self.byte_of(row, col - 1);
-            self.lines[row].remove(b);
-            self.cursor.1 = col - 1;
-            self.touch();
-        } else if row > 0 {
-            let prev_len = self.line_len(row - 1);
-            let cur = self.lines.remove(row);
-            self.lines[row - 1].push_str(&cur);
-            self.cursor = (row - 1, prev_len);
-            self.touch();
-        }
+        self.delete(Motion::Left);
     }
 
     /// Delete the char at the cursor, joining the next line at end of line.
     /// Deletes the selection instead when there is one.
     pub fn delete_forward(&mut self) {
+        self.delete(Motion::Right);
+    }
+
+    /// Delete the selection, else the text between the cursor and `motion`.
+    pub fn delete(&mut self, motion: Motion) {
         if self.delete_selection() {
             return;
         }
-        let (row, col) = self.cursor;
-        if col < self.line_len(row) {
-            let b = self.byte_of(row, col);
-            self.lines[row].remove(b);
-            self.touch();
-        } else if row + 1 < self.lines.len() {
-            let next = self.lines.remove(row + 1);
-            self.lines[row].push_str(&next);
-            self.touch();
+        let t = self.target(motion);
+        if t != self.cursor {
+            self.anchor = Some(t);
+            self.delete_selection();
         }
     }
 
-    /// Move the cursor, clearing any selection (a plain, non-selecting move).
+    /// Move the cursor, clearing any selection (a plain, non-selecting move). A
+    /// plain Left/Right collapses a selection to that side.
     pub fn move_cursor(&mut self, motion: Motion) {
+        self.cursor = match (self.selection(), motion) {
+            (Some((s, _)), Motion::Left) => s,
+            (Some((_, e)), Motion::Right) => e,
+            _ => self.target(motion),
+        };
         self.anchor = None;
-        self.move_cursor_raw(motion);
     }
 
     /// Move the cursor while extending a selection (Shift+motion): anchors at the
     /// current cursor if there's no selection yet.
     pub fn move_cursor_selecting(&mut self, motion: Motion) {
-        if self.anchor.is_none() {
-            self.anchor = Some(self.cursor);
-        }
-        self.move_cursor_raw(motion);
+        self.anchor.get_or_insert(self.cursor);
+        self.cursor = self.target(motion);
     }
 
-    fn move_cursor_raw(&mut self, motion: Motion) {
+    pub fn select_all(&mut self) {
+        self.anchor = Some((0, 0));
+        let last = self.lines.len() - 1;
+        self.cursor = (last, self.line_len(last));
+    }
+
+    fn chars(&self, row: usize) -> Vec<char> {
+        self.lines[row].chars().collect()
+    }
+
+    /// Where `motion` takes the cursor. Word motion crosses line breaks: from a
+    /// line's start it reaches the last word of the line above.
+    fn target(&self, motion: Motion) -> (usize, usize) {
         let (row, col) = self.cursor;
-        self.cursor = match motion {
-            Motion::Left => {
-                if col > 0 {
-                    (row, col - 1)
-                } else if row > 0 {
-                    (row - 1, self.line_len(row - 1))
-                } else {
-                    (0, 0)
-                }
+        let last = self.lines.len() - 1;
+        match motion {
+            Motion::Left if col > 0 => (row, col - 1),
+            Motion::Left if row > 0 => (row - 1, self.line_len(row - 1)),
+            Motion::Right if col < self.line_len(row) => (row, col + 1),
+            Motion::Right if row < last => (row + 1, 0),
+            Motion::Left | Motion::Right => (row, col),
+            Motion::WordLeft if col == 0 && row > 0 => {
+                (row - 1, word_left(&self.chars(row - 1), self.line_len(row - 1)))
             }
-            Motion::Right => {
-                if col < self.line_len(row) {
-                    (row, col + 1)
-                } else if row + 1 < self.lines.len() {
-                    (row + 1, 0)
-                } else {
-                    (row, col)
-                }
+            Motion::WordLeft => (row, word_left(&self.chars(row), col)),
+            Motion::WordRight if col == self.line_len(row) && row < last => {
+                (row + 1, word_right(&self.chars(row + 1), 0))
             }
+            Motion::WordRight => (row, word_right(&self.chars(row), col)),
             Motion::Up if row > 0 => (row - 1, col.min(self.line_len(row - 1))),
-            Motion::Down if row + 1 < self.lines.len() => {
-                (row + 1, col.min(self.line_len(row + 1)))
-            }
+            Motion::Down if row < last => (row + 1, col.min(self.line_len(row + 1))),
             Motion::Up | Motion::Down => (row, col),
-            Motion::Home => (row, 0),
-            Motion::End => (row, self.line_len(row)),
-        };
+            Motion::LineStart => (row, 0),
+            Motion::LineEnd => (row, self.line_len(row)),
+            Motion::DocStart => (0, 0),
+            Motion::DocEnd => (last, self.line_len(last)),
+        }
     }
 
-    /// Move to the document start/end, optionally extending the selection.
-    pub fn move_document(&mut self, to_end: bool, selecting: bool) {
-        if selecting {
-            if self.anchor.is_none() {
-                self.anchor = Some(self.cursor);
+    /// Apply a text edit (see [`crate::plugin::text_edit`]).
+    pub fn apply(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
+        let edits = self.edits;
+        match edit {
+            Edit::Move { to, select: true } => self.move_cursor_selecting(to),
+            Edit::Move { to, select: false } => self.move_cursor(to),
+            Edit::Delete(to) => self.delete(to),
+            Edit::Insert(s) => self.insert_str(&s),
+            Edit::SelectAll => self.select_all(),
+            Edit::Copy => {
+                if let Some(t) = self.selected_text() {
+                    clip.set_text(t);
+                }
             }
-        } else {
-            self.anchor = None;
+            Edit::Cut => {
+                if let Some(t) = self.selected_text() {
+                    self.delete_selection();
+                    clip.set_text(t);
+                }
+            }
+            Edit::Paste => {
+                if let Some(t) = clip.text() {
+                    self.insert_str(&t);
+                }
+            }
         }
-        self.cursor = if to_end {
-            let r = self.lines.len().saturating_sub(1);
-            (r, self.line_len(r))
+        if self.edits != edits {
+            Applied::Changed
         } else {
-            (0, 0)
-        };
+            Applied::Moved
+        }
     }
 
     /// Scroll to keep the cursor visible — vertically within `rows` lines, and
@@ -436,10 +439,45 @@ mod tests {
             e.insert_char(c);
         }
         // cursor at (1,2); Home then backspace joins the two lines.
-        e.move_cursor(Motion::Home);
+        e.move_cursor(Motion::LineStart);
         e.backspace();
         assert_eq!(e.lines, vec!["abcd"]);
         assert_eq!(e.cursor, (0, 2));
+    }
+
+    #[test]
+    fn word_motion_crosses_lines() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("let foo = 1;\nbar");
+        e.cursor = (1, 0);
+        e.move_cursor(Motion::WordLeft);
+        assert_eq!(e.cursor, (0, 10), "the last word of the line above");
+        e.move_cursor(Motion::WordLeft);
+        assert_eq!(e.cursor, (0, 4));
+        e.cursor = (0, 12);
+        e.move_cursor(Motion::WordRight);
+        assert_eq!(e.cursor, (1, 3));
+    }
+
+    #[test]
+    fn deletes_by_word_and_to_line_start() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("one two three");
+        e.delete(Motion::WordLeft);
+        assert_eq!(e.lines, vec!["one two "]);
+        e.delete(Motion::LineStart);
+        assert_eq!(e.lines, vec![""]);
+    }
+
+    #[test]
+    fn select_all_and_paste_over_it() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("a\nb");
+        let mut clip = Some("x\ny".to_string());
+        e.apply(Edit::SelectAll, &mut clip);
+        assert_eq!(e.selected_text().as_deref(), Some("a\nb"));
+        e.apply(Edit::Paste, &mut clip);
+        assert_eq!(e.lines, vec!["x", "y"]);
     }
 
     #[test]
