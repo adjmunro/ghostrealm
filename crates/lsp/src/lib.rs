@@ -18,7 +18,7 @@ pub mod server;
 pub mod text;
 
 pub use client::{io_connection, Client, Event, Waker};
-pub use lsp_server::Connection;
+pub use lsp_server::{Connection, RequestId};
 pub use lsp_types as types;
 pub use server::{serve, Document, LanguageServer, ServeError};
 pub use text::Encoding;

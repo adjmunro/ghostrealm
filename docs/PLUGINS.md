@@ -15,6 +15,9 @@ browser, image viewer, ...) should be too. The API lives in
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
   - `register_commands`: add palette/keybinding/agent commands (`<id>.new` by
     convention).
+  - `config_sections`: the config sections the plugin reads, as catalogue
+    entries (type, range, default, description). The config file is checked
+    against them and shows them on hover; see "Config" below.
 - **`View`**: one surface's content (one tab in a pane). Only `paint` is required;
   every other hook defaults to "not interested". Views live in
   `AppState::views` (headless-safe: the agent channel and tests drive them with no
@@ -41,6 +44,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
+- `above(|cx| ...)` paints into the overlay pass, over every pane (a view's
+  popups, such as the editor's hover docs).
 - `tab_strip` says whether the pane shows a strip; a single-tab view may draw its
   own header (the editor's filename ribbon).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
@@ -64,7 +69,9 @@ into the overlay layer; it doesn't need to know.
   cursor goes; `Move` is hover.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
 - `focus_changed`, `deadline`/`tick` (timers), `pump`/`is_busy` (background work
-  and the inbox), `autosave(cfg)` (app blur/quit; the view decides whether it
+  and the inbox), `refresh` (background results that aren't output, e.g. a
+  language service's diagnostics: repaints without marking the workspace
+  unread), `autosave(cfg)` (app blur/quit; the view decides whether it
   autosaves), `path`/`save_as` (Save As), `write_input`/`text`
   (agent channel).
 - Effects outside the view go through `cx.request(Request::…)`, applied after
@@ -84,6 +91,24 @@ into the overlay layer; it doesn't need to know.
 4. Follow the button convention (hover highlight, fire on mouse-up) via
    `PaintCx::button`.
 
+## Config
+
+A plugin's options live in its own `[section]` of the config file. Describe
+each in `config_sections` with a `SectionSpec` of `OptionSpec`s
+(`ghostrealm_core::config`): its `Kind` (bool, ranged int/number, enum with a
+description per value, path, colour, chord), default, and description. The
+loader drops or clamps entries that don't fit, and the config file's language
+service flags them and shows the docs on hover. A test checks every typed
+config field is catalogued and every documented default is the real one.
+
+## Language services
+
+`OpenCx::languages` starts the language service for a file, if it has one
+(`crate::languages`). The view owns the returned `ghostrealm_lsp::Client`:
+dropping the view shuts the service down, so it runs only while the file is
+open. First-party servers implement `ghostrealm_lsp::LanguageServer` and run
+in-process; external ones are spawned processes speaking LSP on stdio.
+
 ## Testing
 
 `plugin::testing::Harness` paints a view and delivers input with no window or
@@ -93,4 +118,6 @@ first-party plugin has tests on it; new plugins should too.
 ## Not yet
 
 In-process Rust only, compiled into the app. See TODO.md for out-of-tree plugins,
-per-plugin config sections, and moving the app's own chrome onto `PaintCx`.
+typed per-plugin config (the catalogue entries are the plugin's; the typed
+fields still live on `core::Config`), and moving the app's own chrome onto
+`PaintCx`.

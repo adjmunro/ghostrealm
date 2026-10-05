@@ -556,6 +556,14 @@ impl<'a> PaintCx<'a> {
         });
     }
 
+    /// Paint `f` above every pane's content (a view's popups): its quads and
+    /// text go to the overlay pass.
+    pub fn above(&mut self, f: impl FnOnce(&mut Self)) {
+        let layer = std::mem::replace(&mut self.layer, Layer::Overlay);
+        f(self);
+        self.layer = layer;
+    }
+
     /// Ask for another (paced) frame after this one, e.g. to continue an eased
     /// scroll.
     pub fn request_frame(&mut self) {

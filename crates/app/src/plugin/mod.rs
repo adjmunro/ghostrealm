@@ -86,6 +86,8 @@ pub struct OpenCx {
     pub command: Option<String>,
     /// Wakes the UI after background work publishes something new.
     pub waker: Option<Waker>,
+    /// Starts the language service for a file, if it has one.
+    pub languages: Option<Arc<crate::languages::Languages>>,
 }
 
 /// A kind of content a surface can hold. Registered once; opens [`View`]s.
@@ -171,6 +173,13 @@ pub trait View: Any {
             changed: false,
             more: false,
         }
+    }
+
+    /// Apply results background work posted that aren't output (e.g. a
+    /// language service's diagnostics). Returns whether to repaint. Unlike
+    /// [`pump`](Self::pump), it never marks the workspace unread.
+    fn refresh(&mut self) -> bool {
+        false
     }
 
     /// Whether the view is doing work the user is waiting on (a running

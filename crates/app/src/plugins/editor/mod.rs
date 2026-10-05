@@ -1,9 +1,11 @@
 //! The text editor plugin: a minimal editable buffer with line numbers,
 //! soft-wrap, selection, and TOML highlighting. It claims any file path, so it
-//! is the fallback when no more specific plugin opens a file.
+//! is the fallback when no more specific plugin opens a file. A file with a
+//! language service shows its diagnostics and hover docs.
 
 pub mod buffer;
 mod stats;
+pub mod lang;
 pub mod toml;
 pub mod wrap;
 
@@ -16,6 +18,7 @@ use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
+use ghostrealm_lsp::Client;
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::{AppState, Pick};
@@ -27,6 +30,7 @@ use crate::plugin::{
 
 pub use buffer::EditorBuffer;
 use stats::Stats;
+use lang::{paint_popup, Lang, Pos};
 use toml::toml_row_spans;
 use wrap::wrap_line;
 
@@ -72,8 +76,14 @@ impl Plugin for EditorPlugin {
         true
     }
 
-    fn open_path(&self, path: &Path, _cx: &OpenCx) -> Result<Box<dyn View>> {
-        Ok(Box::new(EditorView::new(EditorBuffer::open(path.to_path_buf()))))
+    fn open_path(&self, path: &Path, cx: &OpenCx) -> Result<Box<dyn View>> {
+        let mut view = EditorView::new(EditorBuffer::open(path.to_path_buf()));
+        if let Some((client, language_id)) =
+            cx.languages.as_ref().and_then(|l| l.start(path, cx.waker.clone()))
+        {
+            view.attach(client, language_id);
+        }
+        Ok(Box::new(view))
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
@@ -185,6 +195,8 @@ pub struct EditorView {
     seen_edits: u64,
     last_edit_at: Option<Instant>,
     layout: Layout,
+    /// The file's language service, if it has one.
+    lang: Option<Lang>,
 }
 
 impl EditorView {
@@ -205,7 +217,18 @@ impl EditorView {
                 text_x: 0.0,
                 wrap_cols: usize::MAX,
             },
+            lang: None,
         }
+    }
+
+    /// Connect the buffer to a language service (`client`, speaking
+    /// `language_id`). The service runs until this view is dropped.
+    pub fn attach(&mut self, client: Client, language_id: &str) {
+        let uri = match &self.buf.path {
+            Some(p) => ghostrealm_lsp::text::file_uri(p),
+            None => "untitled:scratch".parse().expect("a valid URI"),
+        };
+        self.lang = Some(Lang::new(client, uri, language_id, &self.buf.lines, self.buf.edits));
     }
 
     pub fn buffer(&self) -> &EditorBuffer {
@@ -214,6 +237,11 @@ impl EditorView {
 
     pub fn buffer_mut(&mut self) -> &mut EditorBuffer {
         &mut self.buf
+    }
+
+    /// The file's language service, if it has one.
+    pub fn lang(&self) -> Option<&Lang> {
+        self.lang.as_ref()
     }
 
     fn wrap_on(&self, cfg: &Config) -> bool {
@@ -270,7 +298,14 @@ impl EditorView {
         format!("Autosave {state}\n{last}")
     }
 
-    /// Start the idle-autosave clock if the buffer changed since last looked.
+    /// When the idle autosave is due, if armed.
+    fn autosave_deadline(&self, cfg: &Config) -> Option<Instant> {
+        let after = self.autosave_after(cfg)?;
+        self.last_edit_at.map(|t| t + Duration::from_secs(after as u64))
+    }
+
+    /// Start the idle-autosave clock if the buffer changed since last looked,
+    /// and send the change to the language service.
     fn note_edits(&mut self) {
         if self.buf.edits != self.seen_edits {
             self.seen_edits = self.buf.edits;
@@ -278,6 +313,14 @@ impl EditorView {
                 self.last_edit_at = Some(Instant::now());
             }
         }
+        if let Some(lang) = &mut self.lang {
+            lang.sync(&self.buf.lines, self.buf.edits);
+        }
+    }
+
+    /// Close the hover popup. Returns whether one was showing.
+    fn dismiss_popup(&mut self) -> bool {
+        self.lang.as_mut().is_some_and(Lang::dismiss)
     }
 
     /// Save to the backing file, reporting it to the app; without one, ask
@@ -293,37 +336,60 @@ impl EditorView {
         }
     }
 
-    /// The `(line, col)` under a point, from the last paint's layout (wrap- and
-    /// scroll-aware); a point below the text lands at the end of the last line.
-    fn pos_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32) -> Option<(usize, usize)> {
+    /// The visual row at height `y`, from the last paint's layout (wrap- and
+    /// scroll-aware): its logical line, the column it starts at, and how many
+    /// characters it shows from there. `None` below the text.
+    fn visual_row(&self, y: f32, cell_h: f32) -> Option<(usize, usize, usize)> {
         let l = self.layout;
-        if !rect_contains(l.body, x, y) {
-            return None;
-        }
         let e = &self.buf;
         let row_off = ((y - l.body.y) / cell_h).floor().max(0.0) as usize;
-        let col_off = ((x - l.text_x) / cell_w).round().max(0.0) as usize;
-        // Walk visual rows from the scroll top to the clicked one, as paint does.
+        // Walk visual rows from the scroll top to the one at `y`, as paint does.
         let mut vidx = 0usize;
         for ln in e.scroll..e.lines.len() {
             if l.wrap_cols == usize::MAX {
                 if vidx == row_off {
                     // Unwrapped rows are shifted left by hscroll.
-                    let hs = e.hscroll;
-                    return Some((ln, (hs + col_off).min(hs.max(e.line_len(ln)))));
+                    return Some((ln, e.hscroll, e.line_len(ln).saturating_sub(e.hscroll)));
                 }
                 vidx += 1;
             } else {
                 for (text, start) in wrap_line(&e.lines[ln], l.wrap_cols) {
                     if vidx == row_off {
-                        return Some((ln, (start + col_off).min(start + text.chars().count())));
+                        return Some((ln, start, text.chars().count()));
                     }
                     vidx += 1;
                 }
             }
         }
-        let last = e.lines.len().saturating_sub(1);
-        Some((last, e.line_len(last)))
+        None
+    }
+
+    /// The `(line, col)` caret position nearest a point; a point below the
+    /// text lands at the end of the last line.
+    fn pos_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32) -> Option<Pos> {
+        let l = self.layout;
+        if !rect_contains(l.body, x, y) {
+            return None;
+        }
+        let col_off = ((x - l.text_x) / cell_w).round().max(0.0) as usize;
+        match self.visual_row(y, cell_h) {
+            Some((ln, start, len)) => Some((ln, (start + col_off).min(start + len))),
+            None => {
+                let last = self.buf.lines.len().saturating_sub(1);
+                Some((last, self.buf.line_len(last)))
+            }
+        }
+    }
+
+    /// The character under a point, if it is over one.
+    fn char_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32) -> Option<Pos> {
+        let l = self.layout;
+        if !rect_contains(l.body, x, y) || x < l.text_x {
+            return None;
+        }
+        let col_off = ((x - l.text_x) / cell_w).floor() as usize;
+        let (ln, start, len) = self.visual_row(y, cell_h)?;
+        (col_off < len).then_some((ln, start + col_off))
     }
 
     /// The filename ribbon a single-tab editor shows in place of a tab: the name
@@ -547,11 +613,54 @@ impl View for EditorView {
                 cx.fill_top(Rect { x, y: *y, w: 2.0 * scale, h: ch }, cx.chrome.accent, 0.9);
             }
         }
+        if !cx.hovered(body) {
+            self.dismiss_popup();
+        }
+        let Some(lang) = &self.lang else { return };
+        let lines = &self.buf.lines;
+        // Diagnostics: an underline under each visual row's part of the span.
+        let thick = (1.5 * scale).max(1.0);
+        for (start, end, color) in lang.underlines(lines) {
+            for (i, (ln, text, row_start, y)) in vis.iter().enumerate() {
+                if *ln < start.0 || *ln > end.0 {
+                    continue;
+                }
+                // The span's part of this line, cut to this visual row. A line's
+                // last row runs on past its text, so a span there (e.g. a missing
+                // value) still shows.
+                let from = if *ln == start.0 { start.1 } else { 0 };
+                let to = if *ln == end.0 { end.1 } else { lines[*ln].chars().count() };
+                let last_row = vis.get(i + 1).is_none_or(|next| next.0 != *ln);
+                let row_end = if last_row { usize::MAX } else { row_start + text.chars().count() };
+                let (a, b) = (from.max(*row_start), to.min(row_end));
+                if b <= a {
+                    continue;
+                }
+                let x0 = (text_x + (a - row_start) as f32 * cw - hscroll_px).max(text_x);
+                let x1 = (text_x + (b - row_start) as f32 * cw - hscroll_px).min(body.x + body.w);
+                if x1 > x0 {
+                    cx.fill_top(Rect { x: x0, y: y + ch - thick, w: x1 - x0, h: thick }, color, 0.9);
+                }
+            }
+        }
+        if let Some(popup) = &lang.popup {
+            let (line, col) = popup.at;
+            let row = vis.iter().find(|(ln, text, start, _)| {
+                *ln == line && *start <= col && col <= start + text.chars().count()
+            });
+            if let Some((_, _, start, y)) = row {
+                let x = text_x + (col - start) as f32 * cw - hscroll_px;
+                paint_popup(cx, popup, (x, *y), body);
+            }
+        }
     }
 
     /// Text editing per [`crate::plugin::text_edit`] (with undo/redo), plus
     /// Enter, Tab, and Cmd+S (save; Shift+S saves as).
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
+        if self.dismiss_popup() {
+            cx.redraw();
+        }
         let m = k.mods;
         let used = match k.key {
             Key::Char(c) if m.super_ && c.eq_ignore_ascii_case(&'s') => {
@@ -588,6 +697,7 @@ impl View for EditorView {
             // A press moves the cursor and anchors a potential selection; one only
             // shows once the cursor is dragged away.
             MouseEvent::Down { pos: (x, y), .. } => {
+                self.dismiss_popup();
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
                     self.buf.cursor = p;
                     self.buf.anchor = Some(p);
@@ -609,7 +719,12 @@ impl View for EditorView {
                     cx.redraw();
                 }
             }
-            MouseEvent::Move { .. } => {}
+            MouseEvent::Move { pos: (x, y) } => {
+                let at = self.char_at(x, y, cw, ch);
+                if self.lang.as_mut().is_some_and(|l| l.pointer(at, Instant::now())) {
+                    cx.redraw();
+                }
+            }
         }
     }
 
@@ -636,6 +751,7 @@ impl View for EditorView {
             e.hscroll = next;
         }
         if changed {
+            self.dismiss_popup();
             cx.request_frame();
         }
     }
@@ -666,18 +782,28 @@ impl View for EditorView {
     }
 
     fn deadline(&self, cfg: &Config) -> Option<Instant> {
-        let after = self.autosave_after(cfg)?;
-        self.last_edit_at.map(|t| t + Duration::from_secs(after as u64))
+        let hover = self.lang.as_ref().and_then(Lang::deadline);
+        self.autosave_deadline(cfg).into_iter().chain(hover).min()
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
-        if self.deadline(cx.cfg).is_some_and(|d| now >= d) {
+        if let Some(lang) = &mut self.lang {
+            if lang.tick(&self.buf.lines, now) {
+                cx.redraw();
+            }
+        }
+        if self.autosave_deadline(cx.cfg).is_some_and(|d| now >= d) {
             self.last_edit_at = None;
             if let Some(path) = self.save_if_modified() {
                 cx.request(Request::Saved(path));
             }
             cx.redraw();
         }
+    }
+
+    fn refresh(&mut self) -> bool {
+        let lines = &self.buf.lines;
+        self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
 
     fn autosave(&mut self, cfg: &Config) -> Option<PathBuf> {
@@ -748,6 +874,131 @@ mod tests {
     fn paint_in_strip(h: &mut Harness, v: &mut EditorView) {
         h.tab_strip = true;
         h.paint(v, RECT);
+    }
+
+    /// A language server that flags every "bad" and documents every word.
+    struct Flags;
+
+    impl ghostrealm_lsp::LanguageServer for Flags {
+        fn name(&self) -> &str {
+            "flags"
+        }
+
+        fn capabilities(&self) -> ghostrealm_lsp::types::ServerCapabilities {
+            ghostrealm_lsp::types::ServerCapabilities {
+                hover_provider: Some(ghostrealm_lsp::types::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            }
+        }
+
+        fn diagnostics(&mut self, doc: &ghostrealm_lsp::Document) -> Vec<ghostrealm_lsp::types::Diagnostic> {
+            doc.text
+                .match_indices("bad")
+                .map(|(i, _)| ghostrealm_lsp::types::Diagnostic {
+                    range: doc.range(i..i + 3),
+                    message: "flagged".into(),
+                    ..Default::default()
+                })
+                .collect()
+        }
+
+        fn hover(
+            &mut self,
+            doc: &ghostrealm_lsp::Document,
+            pos: ghostrealm_lsp::types::Position,
+        ) -> Option<ghostrealm_lsp::types::Hover> {
+            use ghostrealm_lsp::types::{Hover, HoverContents, MarkupContent, MarkupKind};
+            let off = doc.offset(pos)?;
+            let start = doc.text[..off].rfind(' ').map_or(0, |i| i + 1);
+            let end = doc.text[off..].find([' ', '\n']).map_or(doc.text.len(), |i| off + i);
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: format!("docs for {}", &doc.text[start..end]),
+                }),
+                range: Some(doc.range(start..end)),
+            })
+        }
+    }
+
+    fn attached(text: &str) -> EditorView {
+        let mut v = view_with(text);
+        v.attach(Client::in_process(Flags, None), "plaintext");
+        v
+    }
+
+    /// Wait for the language service to post something.
+    fn settle(v: &mut EditorView) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !v.refresh() {
+            assert!(Instant::now() < deadline, "the language service never answered");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn popup_text(v: &EditorView) -> Option<Vec<String>> {
+        let popup = v.lang.as_ref()?.popup.as_ref()?;
+        Some(popup.text.iter().map(|(t, _)| t.clone()).collect())
+    }
+
+    #[test]
+    fn diagnostics_are_underlined_and_follow_edits() {
+        let mut h = Harness::new();
+        let mut v = attached("ok bad\n");
+        paint_in_strip(&mut h, &mut v);
+        let plain = h.frame.top.len();
+        settle(&mut v);
+        paint_in_strip(&mut h, &mut v);
+        assert_eq!(h.frame.top.len(), plain + 1, "one underline");
+
+        v.buffer_mut().cursor = (1, 0);
+        for c in "bad".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        settle(&mut v);
+        paint_in_strip(&mut h, &mut v);
+        assert_eq!(h.frame.top.len(), plain + 2, "the typed word is flagged too");
+    }
+
+    #[test]
+    fn resting_on_a_word_shows_its_diagnostic_then_its_docs() {
+        let mut h = Harness::new();
+        let mut v = attached("ok bad\n");
+        settle(&mut v);
+        paint_in_strip(&mut h, &mut v);
+
+        let p = at(0, 4);
+        h.cursor = p;
+        h.mouse(&mut v, MouseEvent::Move { pos: p });
+        assert_eq!(popup_text(&v), None, "nothing before the dwell");
+        let due = v.deadline(&h.cfg).expect("a hover is due");
+        h.tick(&mut v, due);
+        assert_eq!(popup_text(&v), Some(vec!["flagged".to_string()]));
+        settle(&mut v);
+        assert_eq!(popup_text(&v), Some(vec!["flagged".to_string(), "docs for bad".to_string()]));
+        paint_in_strip(&mut h, &mut v);
+        assert!(!h.frame.overlay_text.is_empty(), "the popup paints above the panes");
+
+        // Moving within the word keeps it; moving off closes it.
+        h.mouse(&mut v, MouseEvent::Move { pos: at(0, 5) });
+        assert!(popup_text(&v).is_some());
+        h.mouse(&mut v, MouseEvent::Move { pos: at(0, 0) });
+        assert_eq!(popup_text(&v), None);
+    }
+
+    #[test]
+    fn typing_closes_the_popup() {
+        let mut h = Harness::new();
+        let mut v = attached("word\n");
+        paint_in_strip(&mut h, &mut v);
+        settle(&mut v);
+        h.mouse(&mut v, MouseEvent::Move { pos: at(0, 1) });
+        let due = v.deadline(&h.cfg).unwrap();
+        h.tick(&mut v, due);
+        settle(&mut v);
+        assert!(popup_text(&v).is_some());
+        h.key(&mut v, press(Key::Right));
+        assert_eq!(popup_text(&v), None);
     }
 
     #[test]

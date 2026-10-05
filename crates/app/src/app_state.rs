@@ -96,6 +96,8 @@ pub struct AppState {
     /// Shared source for per-surface PTY wakers (the GUI wires this to its event
     /// loop). Cloned into a fresh `PtyWaker` for each spawned terminal.
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Language services handed to views opening files.
+    languages: Option<Arc<crate::languages::Languages>>,
     next_tab_number: u32,
     /// Per-vtab deadline until which an optimistic (post-Enter) busy status holds
     /// even if the foreground process group hasn't moved yet.
@@ -121,6 +123,7 @@ impl AppState {
             confirm: None,
             shell_line: None,
             waker: None,
+            languages: None,
             next_tab_number: 1,
             optimistic_busy: HashMap::new(),
             inbox: Inbox::default(),
@@ -177,6 +180,12 @@ impl AppState {
     /// that pokes its event loop). Terminals spawned after this call use it.
     pub fn with_waker(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.waker = Some(f);
+        self
+    }
+
+    /// Give views that open files these language services.
+    pub fn with_languages(mut self, languages: Arc<crate::languages::Languages>) -> Self {
+        self.languages = Some(languages);
         self
     }
 
@@ -270,6 +279,7 @@ impl AppState {
             cwd: self.resolve_cwd(vt),
             command: self.shell_line.clone(),
             waker: self.waker.clone(),
+            languages: self.languages.clone(),
         };
         let plugin = self
             .plugins
@@ -368,6 +378,7 @@ impl AppState {
             cwd: self.active().and_then(|vt| self.resolve_cwd(vt)),
             command: None,
             waker: self.waker.clone(),
+            languages: self.languages.clone(),
         };
         plugin.open_path(path, &cx)
     }
@@ -531,6 +542,12 @@ impl AppState {
         vt
     }
 
+    /// An editor on the settings file, with its language service.
+    fn settings_view(&self, path: std::path::PathBuf) -> Box<dyn View> {
+        self.view_for_path(Some(editor::ID), &path)
+            .unwrap_or_else(|_| Box::new(EditorView::new(EditorBuffer::open(path))))
+    }
+
     /// Open the settings file in a dedicated "settings" workspace: focus the
     /// existing one (opening the editor there if it was closed), or create it.
     pub fn open_settings(&mut self, path: std::path::PathBuf) {
@@ -554,11 +571,11 @@ impl AppState {
                     })
                     .unwrap_or(false);
                 if !has_editor {
-                    self.open_view_in_focused(Box::new(EditorView::new(EditorBuffer::open(path))));
+                    self.open_view_in_focused(self.settings_view(path));
                 }
             }
             None => {
-                let view = Box::new(EditorView::new(EditorBuffer::open(path)));
+                let view = self.settings_view(path);
                 let vt = self.new_view_vtab(SETTINGS_VTAB_NAME, view);
                 self.focus_vtab(vt);
             }
@@ -846,6 +863,7 @@ impl AppState {
                 changed_surfaces.push(*id);
             }
             more |= pumped.more;
+            changed |= view.refresh();
             if let Some(t) = view.title() {
                 titles.push((*id, t));
             }
@@ -1180,6 +1198,28 @@ pub fn build_registry() -> Registry<AppState> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_settings_file_opens_with_its_language_service() {
+        let dir = crate::plugin::testing::tmpdir("settings-lsp");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[nope]\n").unwrap();
+        let catalogue = Arc::new(crate::settings::catalogue(&build_registry()));
+        let languages = crate::languages::Languages::new(Some(path.clone()), catalogue);
+        let mut s = AppState::new().with_languages(Arc::new(languages));
+        s.open_settings(path);
+        let sid = s.focused_surface().expect("the settings editor is focused");
+        let editor = s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
+        assert!(editor.lang().is_some());
+
+        // Another file gets none.
+        let other = dir.join("notes.toml");
+        std::fs::write(&other, "").unwrap();
+        s.open_path_with_in_focused(editor::ID, &other).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let editor = s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
+        assert!(editor.lang().is_none());
+    }
 
     #[test]
     fn new_vtab_spawns_a_surface() {

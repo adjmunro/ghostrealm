@@ -658,7 +658,12 @@ impl State {
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
         }
-        app = app.with_waker(waker);
+        app = app
+            .with_waker(waker)
+            .with_languages(Arc::new(crate::languages::Languages::new(
+                ghostrealm_core::config::config_path(),
+                catalogue.clone(),
+            )));
         app.set_inbox_config(cfg.inbox);
         app.set_default_dir(cfg.default_dir());
         // A CLI command spawns a terminal running it; a bare launch opens the empty

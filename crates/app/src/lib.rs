@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod app_state;
+pub mod languages;
 #[cfg(target_os = "macos")]
 mod macos_keys;
 pub mod plugin;
