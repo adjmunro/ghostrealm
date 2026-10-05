@@ -542,6 +542,9 @@ enum ButtonAction {
     /// Confirm / cancel the floating picker.
     PickerConfirm,
     PickerCancel,
+    /// Accept / cancel the open confirmation.
+    ConfirmAccept,
+    ConfirmCancel,
 }
 
 impl State {
@@ -1033,13 +1036,15 @@ impl State {
             return None;
         }
         let picker = self.app.picker_open();
+        let confirm = self.app.confirm().is_some();
         let mut hit = None;
         for &(r, action) in &self.buttons {
             let modal = matches!(
                 action,
                 ButtonAction::PickerConfirm | ButtonAction::PickerCancel | ButtonAction::View(PICKER_SID, _)
             );
-            if picker && !modal {
+            let asking = matches!(action, ButtonAction::ConfirmAccept | ButtonAction::ConfirmCancel);
+            if (confirm && !asking) || (picker && !confirm && !modal) {
                 continue;
             }
             if rect_contains(r, x, y) {
@@ -1084,6 +1089,8 @@ impl State {
             }
             ButtonAction::PickerConfirm => self.confirm_picker(None),
             ButtonAction::PickerCancel => self.app.close_picker(),
+            ButtonAction::ConfirmAccept => self.accept_confirm(),
+            ButtonAction::ConfirmCancel => self.app.cancel_confirm(),
         }
         self.dirty = true;
         true
@@ -1109,7 +1116,7 @@ impl State {
     /// Deliver hover to the view under the cursor (the picker's, while it is
     /// open). Returns whether it asked for a redraw.
     fn hover_view(&mut self) -> bool {
-        if self.mouse_down || self.palette.is_some() || self.menu.is_some() {
+        if self.mouse_down || self.palette.is_some() || self.menu.is_some() || self.app.confirm().is_some() {
             return false;
         }
         let pos = self.cursor;
@@ -1191,6 +1198,17 @@ impl State {
             Some(p) => self.app.confirm_picker_with(p),
             None => self.app.confirm_picker(),
         };
+        self.after_pick(done);
+    }
+
+    /// Go ahead with the open confirmation's action.
+    fn accept_confirm(&mut self) {
+        let done = self.app.accept_confirm();
+        self.after_pick(done);
+    }
+
+    /// Follow up a picker action: hot-reload a written config, report failure.
+    fn after_pick(&mut self, done: Result<Option<std::path::PathBuf>>) {
         match done {
             Ok(Some(written)) => self.saved(written),
             Ok(None) => {}
@@ -1221,6 +1239,10 @@ impl State {
 
     fn on_click(&mut self) {
         self.mouse_capture = None;
+        // A confirmation takes only its buttons (they arm on press).
+        if self.app.confirm().is_some() {
+            return;
+        }
         // The picker is modal: a click in its panel goes to its file
         // browser, a click outside cancels. (Its buttons arm on press.)
         if self.app.picker_open() {
@@ -1589,6 +1611,9 @@ impl State {
             return;
         }
         let pos = self.cursor;
+        if self.app.confirm().is_some() {
+            return;
+        }
         // The picker is modal: the wheel scrolls its list.
         if self.app.picker_open() {
             self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
@@ -1829,7 +1854,9 @@ impl State {
     /// panel hosting a file-browser view (on the overlay layer) above a
     /// confirm/cancel footer.
     fn build_picker(&mut self, frame: &mut Frame) {
-        if !self.app.picker_open() {
+        // Overlay text draws above every overlay quad, so a confirmation can't
+        // stack over the picker: the picker hides until it is answered.
+        if !self.app.picker_open() || self.app.confirm().is_some() {
             return;
         }
         let (sw, sh) = frame.screen;
@@ -1931,6 +1958,64 @@ impl State {
         }
         let owned = frame.view_buttons.drain(..);
         self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
+    }
+
+    /// Draw the open confirmation: a dim backdrop and a centred panel with the
+    /// question above [Cancel] [<accept>].
+    fn build_confirm(&mut self, frame: &mut Frame) {
+        let Some(confirm) = self.app.confirm().cloned() else {
+            return;
+        };
+        let (sw, sh) = frame.screen;
+        let scale = self.scale;
+        let ch = self.cell_h;
+        let pad = 12.0 * scale;
+        frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
+        let bh = ch + 8.0 * scale;
+        let pw = (sw * 0.4).clamp(320.0 * scale, 520.0 * scale).min((sw - 40.0 * scale).max(1.0));
+        let ph = ch + bh + pad * 3.0;
+        let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
+        let panel = Rect { x: px, y: py, w: pw, h: ph };
+        let ui = self.ui();
+        let mut cx = PaintCx::new(
+            &self.cfg,
+            &self.chrome,
+            ui,
+            self.cursor,
+            &mut self.text,
+            frame,
+            Layer::Overlay,
+            PICKER_SID,
+        );
+        cx.fill(panel, cx.chrome.background);
+        cx.border(panel, cx.chrome.accent);
+        let msg = cx.shape(&confirm.message, Family::SansSerif, pw - pad * 2.0);
+        cx.place(msg, px + pad, py + pad, panel, theme::TITLE);
+
+        // [Cancel] [<accept>], right-aligned; the accept button is primary.
+        let by = py + ph - pad - bh;
+        let mut right = px + pw - pad;
+        for (label, action, primary) in [
+            (confirm.accept, ButtonAction::ConfirmAccept, true),
+            ("Cancel", ButtonAction::ConfirmCancel, false),
+        ] {
+            let w = label.chars().count() as f32 * ui.cell_w;
+            let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
+            let hov = cx.hovered(hit);
+            if primary {
+                cx.fill_alpha(hit, cx.chrome.accent, 0.5);
+            } else {
+                cx.fill(hit, cx.chrome.sidebar);
+            }
+            if hov {
+                cx.highlight(hit);
+            }
+            let s = cx.shape(label, Family::SansSerif, w + pad);
+            let color = if primary || hov { theme::LABEL_HOVER } else { theme::LABEL };
+            cx.place(s, hit.x + (hit.w - s.width) * 0.5, by + (bh - ch) * 0.5, hit, color);
+            self.buttons.push((hit, action));
+            right -= w + pad * 3.0;
+        }
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -2422,6 +2507,20 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
+        // A confirmation owns the keyboard: Enter accepts, Escape cancels. A held
+        // key's repeats are ignored, so the Enter that asked can't also answer.
+        if self.app.confirm().is_some() {
+            if event.repeat {
+                return;
+            }
+            match &event.logical_key {
+                WKey::Named(NamedKey::Enter) => self.accept_confirm(),
+                WKey::Named(NamedKey::Escape) => self.app.cancel_confirm(),
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
         // The picker, when open, owns the keyboard: Escape cancels,
         // Cmd+Enter confirms, everything else drives its file browser.
         if self.app.picker_open() {
@@ -3169,8 +3268,10 @@ impl State {
         } else {
             Vec::new()
         };
-        // Floating picker (modal overlay). Its text joins the overlay pass.
+        // Floating picker and confirmation (modal overlays). Their text joins the
+        // overlay pass.
         self.build_picker(&mut frame);
+        self.build_confirm(&mut frame);
 
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();

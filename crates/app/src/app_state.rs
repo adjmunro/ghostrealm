@@ -62,6 +62,23 @@ impl Pick {
     }
 }
 
+/// A question the user answers before an action goes ahead (e.g. replacing a
+/// file). While one is open it is the only thing that takes input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Confirm {
+    pub message: String,
+    /// The accept button's label: it names the action ("Replace").
+    pub accept: &'static str,
+    then: Confirmed,
+}
+
+/// What accepting a [`Confirm`] does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Confirmed {
+    /// Finish the picker with this path.
+    Pick(std::path::PathBuf),
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// Each surface's content. A surface without a view is "empty" — it shows
@@ -71,6 +88,8 @@ pub struct AppState {
     plugins: Vec<Box<dyn Plugin>>,
     /// The floating picker, while open, and what confirming it does.
     picker: Option<(FileBrowserView, Pick)>,
+    /// The open confirmation, if any.
+    confirm: Option<Confirm>,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -99,6 +118,7 @@ impl AppState {
             views: HashMap::new(),
             plugins: crate::plugins::builtin(),
             picker: None,
+            confirm: None,
             shell_line: None,
             waker: None,
             next_tab_number: 1,
@@ -414,6 +434,25 @@ impl AppState {
     /// Close the floating picker.
     pub fn close_picker(&mut self) {
         self.picker = None;
+        self.confirm = None;
+    }
+
+    /// The open confirmation, if any.
+    pub fn confirm(&self) -> Option<&Confirm> {
+        self.confirm.as_ref()
+    }
+
+    /// Dismiss the confirmation; what asked for it stays as it was.
+    pub fn cancel_confirm(&mut self) {
+        self.confirm = None;
+    }
+
+    /// Go ahead with the confirmed action. Returns the file written, if any.
+    pub fn accept_confirm(&mut self) -> Result<Option<std::path::PathBuf>> {
+        match self.confirm.take() {
+            Some(Confirm { then: Confirmed::Pick(path), .. }) => self.finish_picker(path),
+            None => Ok(None),
+        }
     }
 
     /// Confirm the picker with its browser's choice, then close it. With no
@@ -426,12 +465,30 @@ impl AppState {
         }
     }
 
-    /// Close the picker and act on `path` per its purpose. Returns the file
-    /// written, if any.
+    /// Close the picker and act on `path` per its purpose. Saving over another
+    /// existing file asks first ([`Self::confirm`]) and leaves the picker open.
+    /// Returns the file written, if any.
     pub fn confirm_picker_with(
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
+        if let Some((_, Pick::SaveAs(sid))) = &self.picker {
+            let own = self.view(*sid).and_then(|v| v.path());
+            if path.is_file() && own.as_deref() != Some(path.as_path()) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.confirm = Some(Confirm {
+                    message: format!("\u{201c}{name}\u{201d} already exists. Replace it?"),
+                    accept: "Replace",
+                    then: Confirmed::Pick(path),
+                });
+                return Ok(None);
+            }
+        }
+        self.finish_picker(path)
+    }
+
+    /// Close the picker and act on `path` per its purpose.
+    fn finish_picker(&mut self, path: std::path::PathBuf) -> Result<Option<std::path::PathBuf>> {
         let Some((_, purpose)) = self.picker.take() else {
             return Ok(None);
         };
@@ -1505,6 +1562,34 @@ mod tests {
             p.surfaces.iter().find(|x| x.id == sid).map(|x| x.title.clone())
         });
         assert_eq!(title.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn save_as_over_another_file_asks_first() {
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-replace");
+        let (mine, theirs) = (dir.join("mine.txt"), dir.join("theirs.txt"));
+        std::fs::write(&mine, "mine").unwrap();
+        std::fs::write(&theirs, "theirs").unwrap();
+        s.new_empty_vtab();
+        s.open_path_with_in_focused(editor::ID, &mine).unwrap();
+        let sid = s.focused_surface().unwrap();
+
+        s.open_save_as(sid);
+        assert_eq!(s.confirm_picker_with(mine.clone()).unwrap(), Some(mine.clone()), "its own file: no question");
+
+        s.open_save_as(sid);
+        assert_eq!(s.confirm_picker_with(theirs.clone()).unwrap(), None);
+        assert_eq!(s.confirm().map(|c| c.accept), Some("Replace"));
+        assert!(s.picker_open(), "the picker waits behind the question");
+        s.cancel_confirm();
+        assert!(s.picker_open() && s.confirm().is_none());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs", "nothing written");
+
+        s.confirm_picker_with(theirs.clone()).unwrap();
+        assert_eq!(s.accept_confirm().unwrap(), Some(theirs.clone()));
+        assert!(!s.picker_open());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine\n");
     }
 
     #[test]
