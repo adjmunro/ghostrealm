@@ -238,7 +238,8 @@ impl LineEdit {
         (a != self.cursor).then(|| (a.min(self.cursor), a.max(self.cursor)))
     }
 
-    fn byte_of(&self, col: usize) -> usize {
+    /// Byte offset of column `col`.
+    pub fn byte_of(&self, col: usize) -> usize {
         self.text.char_indices().nth(col).map(|(b, _)| b).unwrap_or(self.text.len())
     }
 

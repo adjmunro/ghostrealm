@@ -29,6 +29,7 @@ use winit::window::{Window, WindowId};
 
 use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
+use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
     TextKit, TextSrc, UiMetrics, View,
@@ -475,7 +476,8 @@ struct PendingArgs {
 
 /// Command-palette / run-anything overlay state.
 struct Palette {
-    query: String,
+    /// The search query, run line, or argument being typed.
+    input: LineEdit,
     /// Selected result index into the full (filtered) result list.
     selected: usize,
     /// Index of the first visible result row (scroll offset).
@@ -2333,7 +2335,7 @@ impl State {
                 .unwrap_or_default();
             self.menu = None;
             self.palette = Some(Palette {
-                query: String::new(),
+                input: LineEdit::default(),
                 selected: 0,
                 scroll: 0,
                 mode: PaletteMode::Commands,
@@ -2352,7 +2354,7 @@ impl State {
     fn open_palette(&mut self) {
         self.menu = None;
         self.palette = Some(Palette {
-            query: String::new(),
+            input: LineEdit::default(),
             selected: 0,
             scroll: 0,
             mode: PaletteMode::Commands,
@@ -2369,7 +2371,7 @@ impl State {
             Some(p) if p.mode == mode => self.palette = None,
             _ => {
                 self.palette = Some(Palette {
-                    query: String::new(),
+                    input: LineEdit::default(),
                     selected: 0,
                     scroll: 0,
                     mode,
@@ -2536,7 +2538,7 @@ impl State {
         }
 
         let (query, selected, mode) = match &self.palette {
-            Some(p) => (p.query.clone(), p.selected, p.mode),
+            Some(p) => (p.input.text().to_string(), p.selected, p.mode),
             None => return,
         };
         let result_count = || {
@@ -2570,13 +2572,6 @@ impl State {
                     }
                 }
             },
-            WKey::Named(NamedKey::Backspace) => {
-                if let Some(p) = self.palette.as_mut() {
-                    p.query.pop();
-                    p.selected = 0;
-                    p.scroll = 0;
-                }
-            }
             WKey::Named(NamedKey::ArrowDown) => {
                 let n = result_count();
                 if let Some(p) = self.palette.as_mut() {
@@ -2593,25 +2588,24 @@ impl State {
                     }
                 }
             }
-            WKey::Named(NamedKey::Space) => {
-                if let Some(p) = self.palette.as_mut() {
-                    p.query.push(' ');
-                    p.selected = 0;
-                    p.scroll = 0;
-                }
-            }
-            WKey::Character(s) => {
-                if let Some(c) = s.chars().next() {
+            _ => {
+                if self.palette_edit(event) == Applied::Changed {
                     if let Some(p) = self.palette.as_mut() {
-                        p.query.push(c);
                         p.selected = 0;
                         p.scroll = 0;
                     }
                 }
             }
-            _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Apply a text-editing key to the palette's input.
+    fn palette_edit(&mut self, event: &winit::event::KeyEvent) -> Applied {
+        match (winit_key_press(event, self.mods), self.palette.as_mut()) {
+            (Some(press), Some(p)) => p.input.key(&press, &mut self.clipboard),
+            _ => Applied::Ignored,
+        }
     }
 
     /// Key handling while the palette is collecting a command's arguments.
@@ -2621,7 +2615,7 @@ impl State {
             WKey::Named(NamedKey::Enter) => {
                 let mut run: Option<(String, Args)> = None;
                 if let Some(p) = self.palette.as_mut() {
-                    let query = p.query.clone();
+                    let query = p.input.text().to_string();
                     if let Some(pend) = p.pending.as_mut() {
                         let idx = pend.values.len();
                         if let Some(spec) = pend.specs.get(idx) {
@@ -2634,7 +2628,7 @@ impl State {
                                     }
                                     run = Some((pend.id.clone(), args));
                                 } else {
-                                    p.query.clear();
+                                    p.input.set_text("");
                                 }
                             }
                             // An unparseable value keeps the query for a retry.
@@ -2646,24 +2640,9 @@ impl State {
                     let _ = self.registry.execute(&id, &args, &mut self.app);
                 }
             }
-            WKey::Named(NamedKey::Backspace) => {
-                if let Some(p) = self.palette.as_mut() {
-                    p.query.pop();
-                }
+            _ => {
+                self.palette_edit(event);
             }
-            WKey::Named(NamedKey::Space) => {
-                if let Some(p) = self.palette.as_mut() {
-                    p.query.push(' ');
-                }
-            }
-            WKey::Character(s) => {
-                if let Some(c) = s.chars().next() {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.query.push(c);
-                    }
-                }
-            }
-            _ => {}
         }
         self.dirty = true;
     }
@@ -2672,7 +2651,7 @@ impl State {
     /// its text lines, returning their placements (indices into palette_buffers).
     fn build_palette(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
         // Snapshot palette state, including any in-progress argument prompt.
-        let (query, mode, pending) = match &self.palette {
+        let (input, mode, pending) = match &self.palette {
             Some(p) => {
                 let pend = p.pending.as_ref().map(|pd| {
                     let idx = pd.values.len();
@@ -2689,11 +2668,12 @@ impl State {
                         .unwrap_or_default();
                     (pd.title.clone(), name, desc, kind_hint, idx, pd.specs.len())
                 });
-                (p.query.clone(), p.mode, pend)
+                (p.input.clone(), p.mode, pend)
             }
             None => return Vec::new(),
         };
 
+        let query = input.text().to_string();
         let is_search = pending.is_none() && mode == PaletteMode::Commands;
         // Command mode fuzzy-searches the registry (hidden commands excluded); run
         // mode takes the raw line; arg mode collects an argument.
@@ -2793,10 +2773,8 @@ impl State {
 
         if let Some((title, name, desc, kind_hint, idx, total)) = &pending {
             // Argument-collection view: input the current argument.
-            lines.push(vec![(
-                format!("\u{203a} {title} — {name}: {query}"),
-                [235, 235, 245],
-            )]);
+            let prefix = format!("\u{203a} {title} — {name}: ");
+            lines.push(vec![(format!("{prefix}{query}"), [235, 235, 245])]);
             let more = if idx + 1 < *total {
                 "Enter for next"
             } else {
@@ -2840,14 +2818,15 @@ impl State {
                     color: [235, 235, 245],
                 });
             }
+            self.palette_caret(quads, (sw, sh), (text_x, panel_y + pad), prefix.len(), &input);
             return placements;
         }
 
-        let prompt = match mode {
-            PaletteMode::Commands => format!("\u{203a} {}", query),
-            PaletteMode::Run => format!("\u{2b95} {}", query),
+        let prefix = match mode {
+            PaletteMode::Commands => "\u{203a} ",
+            PaletteMode::Run => "\u{2b95} ",
         };
-        lines.push(vec![(prompt, [235, 235, 245])]);
+        lines.push(vec![(format!("{prefix}{query}"), [235, 235, 245])]);
         match mode {
             PaletteMode::Run => lines.push(vec![(
                 "  (Enter to run in a new tab)".to_string(),
@@ -2918,7 +2897,31 @@ impl State {
                 color: [235, 235, 245],
             });
         }
+        self.palette_caret(quads, (sw, sh), (text_x, panel_y + pad), prefix.len(), &input);
         placements
+    }
+
+    /// The caret and selection on the palette's input line (buffer 0, shaped,
+    /// drawn at `origin`), whose text starts `prefix` bytes in.
+    fn palette_caret(
+        &self,
+        quads: &mut Vec<QuadInstance>,
+        (sw, sh): (f32, f32),
+        (x, y): (f32, f32),
+        prefix: usize,
+        input: &LineEdit,
+    ) {
+        let Some(buf) = self.palette_buffers.first() else {
+            return;
+        };
+        let at = |col: usize| x + glyph_x(buf, prefix + input.byte_of(col));
+        let band = |x0: f32, w: f32| Rect { x: x0, y, w, h: self.cell_h };
+        if let Some((s, e)) = input.selection() {
+            let x0 = at(s);
+            quads.push(rect_quad(band(x0, at(e) - x0), sw, sh, self.chrome.accent, 0.35));
+        }
+        let caret = band(at(input.cursor()), 2.0 * self.scale);
+        quads.push(rect_quad(caret, sw, sh, self.chrome.accent, 0.9));
     }
 
     fn render(&mut self) -> Result<()> {
@@ -3520,6 +3523,19 @@ fn winit_key_press(event: &winit::event::KeyEvent, mods: Mods) -> Option<KeyPres
         _ => return None,
     };
     Some(KeyPress { key, mods, text })
+}
+
+/// The x offset (px) where the glyph at byte `byte` of `buf`'s first line
+/// starts, or the line's end past its last glyph.
+fn glyph_x(buf: &Buffer, byte: usize) -> f32 {
+    let Some(run) = buf.layout_runs().next() else {
+        return 0.0;
+    };
+    run.glyphs
+        .iter()
+        .find(|g| g.start >= byte)
+        .map(|g| g.x)
+        .unwrap_or(run.line_w)
 }
 
 /// A path's last component for a button label (the full path for a root like `/`),

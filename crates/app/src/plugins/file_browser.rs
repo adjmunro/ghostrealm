@@ -20,6 +20,7 @@ use ghostrealm_terminal::{Key, KeyPress};
 use glyphon::Family;
 
 use crate::app_state::AppState;
+use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
 };
@@ -113,8 +114,11 @@ pub struct FileBrowserView {
     completion: Option<usize>,
     /// The clicked (selected) entry; cleared once it is no longer listed.
     chosen: Option<PathBuf>,
+    /// The filter / path input, mirroring the tree's query (the tree clears it
+    /// on navigation; see [`Self::sync_input`]).
+    input: LineEdit,
     /// The file name [`Mode::Save`] saves under (may hold a relative path).
-    name: String,
+    name: LineEdit,
     /// The entry the previous click landed on, for double-click.
     last_click: Option<PathBuf>,
     // Geometry from the last paint, for mapping input to rows.
@@ -134,7 +138,8 @@ impl FileBrowserView {
             sel: None,
             completion: None,
             chosen: None,
-            name: String::new(),
+            input: LineEdit::default(),
+            name: LineEdit::default(),
             last_click: None,
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
@@ -159,7 +164,15 @@ impl FileBrowserView {
 
     /// Set the file name [`Mode::Save`] saves under.
     pub fn set_name(&mut self, name: impl Into<String>) {
-        self.name = name.into();
+        self.name.set_text(name);
+    }
+
+    /// Take the tree's query into the input when the tree changed it (navigation
+    /// clears it).
+    fn sync_input(&mut self) {
+        if self.input.text() != self.tree.query() {
+            self.input.set_text(self.tree.query());
+        }
     }
 
     pub fn tree(&self) -> &FsTree {
@@ -184,7 +197,7 @@ impl FileBrowserView {
             ),
             Mode::PickFile => self.chosen.clone().filter(|p| !p.is_dir()),
             Mode::Save => {
-                let name = self.name.trim();
+                let name = self.name.text().trim();
                 if name.is_empty() {
                     return None;
                 }
@@ -213,29 +226,18 @@ impl FileBrowserView {
         }
     }
 
-    /// [`Mode::Save`]'s keys: typing and Backspace edit the file name, Enter
-    /// picks. Returns `None` for keys the list handles (arrows).
-    fn save_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> Option<bool> {
-        match k.key {
-            Key::Backspace => {
-                self.name.pop();
-            }
-            Key::Enter => match self.choice() {
+    /// [`Mode::Save`]'s keys: Enter picks; text editing goes to the file name.
+    fn save_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
+        if k.key == Key::Enter {
+            match self.choice() {
                 Some(target) => cx.request(Request::Pick(target)),
-                None => return Some(false),
-            },
-            Key::Char(c) => {
-                let typed = k.text.clone().unwrap_or_else(|| c.to_string());
-                let add: String = typed.chars().filter(|c| !c.is_control()).collect();
-                if add.is_empty() {
-                    return Some(false);
-                }
-                self.name.push_str(&add);
+                None => return false,
             }
-            _ => return None,
+        } else if !self.name.key(k, cx).used() {
+            return false;
         }
         cx.redraw();
-        Some(true)
+        true
     }
 
     /// [`Mode::Save`]'s file-name row, at the bottom of `rect`. Returns its
@@ -336,7 +338,7 @@ impl FileBrowserView {
 
     /// The header: parent button, input field, and the filter/view toggles.
     /// Returns the header height.
-    fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect, value: &str) -> f32 {
+    fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect, value: &LineEdit) -> f32 {
         let scale = cx.ui.scale;
         let ch = cx.ui.cell_h;
         let pad = 8.0 * scale;
@@ -411,6 +413,7 @@ impl View for FileBrowserView {
         let pad = 8.0 * scale;
         let accent = cx.chrome.accent;
 
+        self.sync_input();
         let query = self.tree.query().to_string();
         let is_path = !query.is_empty() && self.tree.input_is_path();
         let suggestions: Vec<PathBuf> = if is_path {
@@ -428,9 +431,10 @@ impl View for FileBrowserView {
                 if p.is_dir() {
                     s.push('/');
                 }
-                s
+                LineEdit::new(s)
             });
-        let header_h = self.paint_header(cx, rect, preview.as_deref().unwrap_or(&query));
+        let value = preview.unwrap_or_else(|| self.input.clone());
+        let header_h = self.paint_header(cx, rect, &value);
         let footer_h = if self.mode == Mode::Save {
             self.paint_name_field(cx, rect)
         } else {
@@ -525,28 +529,27 @@ impl View for FileBrowserView {
         }
     }
 
+    /// Up/Down (Tab: completions) move the highlight, Enter opens or enters it,
+    /// Escape clears the input, and other keys edit the input (see
+    /// [`crate::plugin::text_edit`]). Plain ←/→ expand/collapse the highlighted
+    /// row while the input is empty, and → at the end of a path accepts the
+    /// highlighted completion.
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
-        if k.mods.super_ {
-            return false;
-        }
         if self.mode == Mode::Save {
-            if let Some(used) = self.save_key(cx, k) {
-                return used;
-            }
+            return self.save_key(cx, k);
         }
+        self.sync_input();
+        let m = k.mods;
+        let plain = !(m.shift || m.alt || m.super_ || m.ctrl);
         let path_mode = self.tree.input_is_path();
+        let at_end = self.input.selection().is_none()
+            && self.input.cursor() == self.input.text().chars().count();
         match k.key {
-            Key::Escape => {
+            Key::Escape if plain => {
                 self.tree.set_query("");
                 self.clear_highlight();
             }
-            Key::Backspace => {
-                let mut q = self.tree.query().to_string();
-                q.pop();
-                self.tree.set_query(q);
-                self.clear_highlight();
-            }
-            Key::Down | Key::Up | Key::Tab => {
+            Key::Down | Key::Up | Key::Tab if !m.super_ => {
                 let delta = if k.key == Key::Up { -1 } else { 1 };
                 if path_mode {
                     let n = self.tree.completions().len();
@@ -557,10 +560,9 @@ impl View for FileBrowserView {
                     self.ensure_sel_visible();
                 }
             }
-            Key::Right => {
-                if path_mode {
-                    self.accept_completion();
-                } else if let Some(r) = self.selected_row() {
+            Key::Right if plain && path_mode && at_end => self.accept_completion(),
+            Key::Right if plain && self.input.is_empty() => {
+                if let Some(r) = self.selected_row() {
                     if r.is_category && !r.expanded {
                         self.tree.toggle_category(&r.key);
                     } else if r.is_dir && !r.is_category && !r.expanded {
@@ -568,14 +570,12 @@ impl View for FileBrowserView {
                     }
                 }
             }
-            Key::Left => {
-                if !path_mode {
-                    if let Some(r) = self.selected_row() {
-                        if r.is_category && r.expanded {
-                            self.tree.toggle_category(&r.key);
-                        } else if r.is_dir && !r.is_category && r.expanded {
-                            self.tree.toggle_dir(&r.path);
-                        }
+            Key::Left if plain && self.input.is_empty() => {
+                if let Some(r) = self.selected_row() {
+                    if r.is_category && r.expanded {
+                        self.tree.toggle_category(&r.key);
+                    } else if r.is_dir && !r.is_category && r.expanded {
+                        self.tree.toggle_dir(&r.path);
                     }
                 }
             }
@@ -597,19 +597,16 @@ impl View for FileBrowserView {
                     }
                 }
             }
-            Key::Char(c) => {
-                let typed = k.text.clone().unwrap_or_else(|| c.to_string());
-                let add: String = typed.chars().filter(|c| !c.is_control()).collect();
-                if add.is_empty() {
-                    return false;
+            _ => match self.input.key(k, cx) {
+                Applied::Ignored => return false,
+                Applied::Moved => {}
+                Applied::Changed => {
+                    self.tree.set_query(self.input.text());
+                    self.clear_highlight();
                 }
-                let mut q = self.tree.query().to_string();
-                q.push_str(&add);
-                self.tree.set_query(q);
-                self.clear_highlight();
-            }
-            _ => return false,
+            },
         }
+        self.sync_input();
         cx.redraw();
         true
     }
@@ -652,7 +649,7 @@ impl View for FileBrowserView {
                     self.chosen = Some(row.path.clone());
                     self.last_click = Some(row.path.clone());
                     if self.mode == Mode::Save {
-                        self.name = file_name(&row.path);
+                        self.name.set_text(file_name(&row.path));
                     }
                     if self.mode == Mode::Browse || again {
                         self.open_file(cx, row.path);
@@ -813,6 +810,34 @@ mod tests {
     }
 
     #[test]
+    fn the_filter_edits_at_the_cursor() {
+        let (_d, mut v) = fixture();
+        let h = Harness::new();
+        h.key(&mut v, press(Key::Char('b')));
+        h.key(&mut v, press(Key::Char('t')));
+        h.key(&mut v, press(Key::Left));
+        h.key(&mut v, press(Key::Char('x')));
+        assert_eq!(v.tree().query(), "bxt");
+        let mut opt_bs = press(Key::Backspace);
+        opt_bs.mods.alt = true;
+        h.key(&mut v, opt_bs);
+        assert_eq!(v.tree().query(), "t", "Option+Backspace removes the word before the cursor");
+    }
+
+    #[test]
+    fn arrows_expand_rows_only_while_the_filter_is_empty() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.key(&mut v, press(Key::Down));
+        h.key(&mut v, press(Key::Right));
+        assert!(v.tree().is_expanded(&d.join("adir")));
+        h.key(&mut v, press(Key::Char('a')));
+        h.key(&mut v, press(Key::Left));
+        assert_eq!(v.input.cursor(), 0, "with text, Left moves the cursor");
+    }
+
+    #[test]
     fn enter_enters_a_directory_or_opens_a_file() {
         let (d, mut v) = fixture();
         let mut h = Harness::new();
@@ -919,6 +944,17 @@ mod tests {
         h.key(&mut v, press(Key::Backspace));
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(out.requests, vec![Request::Pick(d.join("adir").join("new.m"))]);
+    }
+
+    #[test]
+    fn save_name_supports_select_all_and_retype() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        v.set_name("draft.txt");
+        let h = Harness::new();
+        h.key(&mut v, crate::plugin::testing::cmd(Key::Char('a')));
+        h.key(&mut v, press(Key::Char('z')));
+        assert_eq!(v.choice(), Some(d.join("z")));
     }
 
     #[test]
