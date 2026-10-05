@@ -1,0 +1,12 @@
+[package]
+name = "ghostrealm-web"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
