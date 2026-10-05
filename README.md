@@ -74,6 +74,10 @@ terminals, chrome, and overlays composite together and stay cross-platform.
 
 ## Config
 
-First run writes a documented default to `$XDG_CONFIG_HOME/ghostrealm/config.toml`
-(`~/.config/ghostrealm/config.toml`). Sections: `[sidebar] [terminal] [chrome]
-[tabs] [inbox]`. Unknown keys are ignored and missing ones use defaults.
+`$XDG_CONFIG_HOME/ghostrealm/config.toml` (`~/.config/ghostrealm/config.toml`).
+It lists only what you set; every other option uses its default. First run
+writes just the default `[keybindings]`, and only commands listed there are
+bound. Cmd+, opens it in the editor, where hovering a section or option shows
+its docs and bad entries are flagged. Saving hot-reloads it: a flagged entry is
+dropped (its default applies) or clamped into range, and a file that doesn't
+parse leaves the running config unchanged.

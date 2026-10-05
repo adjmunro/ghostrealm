@@ -10,6 +10,7 @@ mod macos_keys;
 pub mod plugin;
 pub mod plugins;
 pub mod row_cache;
+pub mod settings;
 pub mod tap;
 pub mod window;
 

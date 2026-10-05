@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::fs_tree::{FileRow, FsTree, FsView, GitFilter};
 use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
 use ghostrealm_terminal::{Key, KeyPress};
@@ -76,6 +77,26 @@ impl Plugin for FileBrowserPlugin {
                 Ok(CmdOutcome::ok())
             }),
         );
+    }
+
+    fn config_sections(&self) -> Vec<SectionSpec> {
+        const OPEN_IN: &[(&str, &str)] = &[
+            (
+                "split",
+                "A horizontal split beside the file browser (a tab when the pane is too narrow).",
+            ),
+            ("tab", "A tab in the file browser's own pane."),
+        ];
+        vec![SectionSpec::options(
+            "file_browser",
+            "The file browser.",
+            vec![OptionSpec::new(
+                "open_in",
+                Kind::Enum(OPEN_IN),
+                Some("\"split\""),
+                "Where opening a file puts it.",
+            )],
+        )]
     }
 }
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use ghostrealm_core::config::Catalogue;
 use ghostrealm_core::{
     ArgKind, ArgSpec, Args, Axis, Chrome, Config, PaneId, Rect, Registry, Side,
     SurfaceId, TabStatus, Value, VtabId,
@@ -445,6 +446,8 @@ struct State {
 
     app: AppState,
     registry: Registry<AppState>,
+    /// Every config option, for checking the config file on (re)load.
+    catalogue: Arc<Catalogue>,
     cfg: Config,
     /// Chrome colours resolved once at startup (explicit `[chrome]`, else inherited
     /// from Ghostty, else defaults).
@@ -625,10 +628,11 @@ impl State {
         let palette_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
-        // Build the registry first so a freshly created config can list every
-        // command in its `[keybindings]` block.
+        // The registry and plugins make up the catalogue the config is checked
+        // against.
         let registry = build_registry();
-        let cfg = ghostrealm_core::config::load_or_create_with(&keybindable_commands(&registry));
+        let catalogue = Arc::new(crate::settings::catalogue(&registry));
+        let cfg = ghostrealm_core::config::load_or_create(&catalogue).unwrap_or_default();
         let chrome = cfg.resolved_chrome();
         let double_tap_window = Duration::from_millis(cfg.input.double_tap_window_ms as u64);
         let (cell_w, cell_h) = measure_cell(
@@ -743,6 +747,7 @@ impl State {
             quad_capacity,
             app,
             registry,
+            catalogue,
             cfg,
             chrome,
             mods: Mods::default(),
@@ -783,24 +788,19 @@ impl State {
         self.dirty = true;
     }
 
-    /// Reload the config file from disk and apply it (config is the source of truth).
+    /// Reload the config file from disk and apply it (config is the source of
+    /// truth). A file that doesn't parse leaves the current config in place.
     fn reload_config(&mut self) {
-        let cfg =
-            ghostrealm_core::config::load_or_create_with(&keybindable_commands(&self.registry));
-        self.apply_config(cfg);
-        self.window.request_redraw();
+        if let Some(cfg) = ghostrealm_core::config::load_or_create(&self.catalogue) {
+            self.apply_config(cfg);
+            self.window.request_redraw();
+        }
     }
 
-    /// Open the config file in an editor pane (creating it with defaults if absent).
-    /// Saving it (Cmd+S) hot-reloads the config.
+    /// Open the config file in an editor pane (creating it if absent). Saving it
+    /// (Cmd+S) hot-reloads the config.
     fn open_config_editor(&mut self) {
-        if let Some(path) = ghostrealm_core::config::config_path() {
-            let commands = keybindable_commands(&self.registry);
-            // Ensure it exists, seeded with the full keybindings block, then bring
-            // an out-of-date file up to date (append missing sections + the
-            // keybindings block) without disturbing the user's set values.
-            let _ = ghostrealm_core::config::load_or_create_with(&commands);
-            ghostrealm_core::config::backfill_config(&commands);
+        if let Some(path) = ghostrealm_core::config::ensure_file() {
             // Settings live in their own "settings" workspace, not the focused pane.
             self.app.open_settings(path);
             self.dirty = true;
@@ -3829,24 +3829,6 @@ fn status_color(status: TabStatus) -> [u8; 3] {
     }
 }
 
-/// UI actions that are keybindable but aren't registry commands (they act on
-/// window state, not `AppState`), so they must be listed for the config block
-/// alongside the registry's commands. Dispatched specially in [`State::on_key`].
-const SPECIAL_COMMANDS: &[(&str, &str)] = &[("palette.toggle", "Command Palette")];
-
-/// Every keybindable command as `(id, title)` — the non-hidden registry commands
-/// plus the special UI actions — used to seed the config's authoritative
-/// `[keybindings]` block so it always lists every available action.
-fn keybindable_commands(registry: &Registry<AppState>) -> Vec<(&'static str, &'static str)> {
-    let mut cmds: Vec<(&'static str, &'static str)> = registry
-        .metas()
-        .filter(|m| !m.hidden)
-        .map(|m| (m.id, m.title))
-        .collect();
-    cmds.extend_from_slice(SPECIAL_COMMANDS);
-    cmds
-}
-
 /// A compact directory label that fits in `max` characters, no wrap/overflow:
 /// prefer "parent/current", else "current", else "curr…" truncated with an
 /// ellipsis. `~` is substituted for the home directory's own segment.
@@ -4084,24 +4066,6 @@ mod tests {
         // disk; otherwise boot silently falls back to the ~800ms full scan.
         let (_, family) = super::curated_font_db().expect("a monospace candidate on macOS");
         assert!(!family.is_empty(), "pinned monospace family must be named");
-    }
-
-    #[test]
-    fn every_default_binding_is_a_listed_command() {
-        // Deterministic guard: the generated keybindings block lists these
-        // commands, so a default binding must never point at one that's absent
-        // (registry command or special UI action).
-        let reg = crate::app_state::build_registry();
-        let listed: std::collections::HashSet<&str> = super::keybindable_commands(&reg)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        for id in ghostrealm_core::config::default_binding_ids() {
-            assert!(
-                listed.contains(id),
-                "default binding for `{id}` is missing from keybindable_commands"
-            );
-        }
     }
 
     #[test]

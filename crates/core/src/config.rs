@@ -1,7 +1,8 @@
-//! The TOML config: a single shareable dotfile at an XDG path. Missing fields
-//! fall back to defaults (`#[serde(default)]`), so a partial file is valid and
-//! new keys don't break old files. On first run the documented default is
-//! written out.
+//! The TOML config: a single shareable dotfile at an XDG path. It lists only
+//! what the user sets; missing fields fall back to defaults
+//! (`#[serde(default)]`). Every option is described in the [`catalogue`], which
+//! the [`check`]er (shared by the loader and the config language server) uses
+//! to flag and drop bad entries without rejecting the whole file.
 
 pub mod catalogue;
 pub mod check;
@@ -216,7 +217,7 @@ pub struct Workspace {
 }
 
 /// The whole config.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub workspace: Workspace,
@@ -231,10 +232,34 @@ pub struct Config {
     pub input: Input,
     pub file_browser: FileBrowser,
     pub inbox: Inbox,
-    /// `[keybindings]`: command id -> chord, overlaying the built-in defaults.
-    /// An empty table means "use built-ins". `palette.toggle` is a pseudo-id the
-    /// app handles specially (open the command palette).
+    /// `[keybindings]`: command id -> chord. Only listed commands are bound: a
+    /// file without the section binds nothing (the field default is empty, not
+    /// [`Config::default`]'s). `palette.toggle` is a pseudo-id the app handles
+    /// specially (open the command palette).
+    #[serde(default)]
     pub keybindings: HashMap<String, String>,
+}
+
+/// What a new config file holds: every option at its default, plus the default
+/// keybindings ([`default_file`] parses to exactly this).
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            workspace: Workspace::default(),
+            sidebar: Sidebar::default(),
+            terminal: Terminal::default(),
+            chrome: None,
+            tabs: Tabs::default(),
+            editor: Editor::default(),
+            input: Input::default(),
+            file_browser: FileBrowser::default(),
+            inbox: Inbox::default(),
+            keybindings: default_bindings()
+                .into_iter()
+                .map(|(chord, id)| (id.to_string(), chord.to_string()))
+                .collect(),
+        }
+    }
 }
 
 impl Config {
@@ -255,47 +280,24 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// The chord bound to a command id (for showing shortcuts in the palette): a
-    /// user override wins over the built-in default. Returns the canonical chord.
-    /// The config's `[keybindings]` maps `command id -> chord`.
+    /// The canonical chord bound to a command id (for showing shortcuts in the
+    /// palette), if any.
     pub fn binding_for(&self, id: &str) -> Option<String> {
-        // The config's `[keybindings]` is authoritative when it has any *valid*
-        // entry (a value that parses as a chord); otherwise — empty, or entirely
-        // malformed (e.g. an old-format file) — the built-in defaults apply. This
-        // keeps a bad edit from silently unbinding everything.
-        if !self.has_valid_bindings() {
-            return default_bindings()
-                .into_iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| k.to_string());
-        }
         self.keybindings.get(id).and_then(|c| normalize_chord(c))
     }
 
-    /// Resolve a chord (any modifier order/alias) to a command id. The config's
-    /// `[keybindings]` (`command id -> chord`) is authoritative when it has any
-    /// valid entry; else the built-in defaults apply.
+    /// The command id bound to a chord (any modifier order/alias), if any.
     pub fn binding(&self, chord: &str) -> Option<String> {
         let target = normalize_chord(chord)?;
-        if !self.has_valid_bindings() {
-            return default_bindings()
-                .get(target.as_str())
-                .map(|s| s.to_string());
-        }
         self.keybindings
             .iter()
             .find(|(_, c)| normalize_chord(c).as_deref() == Some(target.as_str()))
             .map(|(id, _)| id.clone())
     }
-
-    /// Whether any keybinding entry has a value that parses as a chord. A file
-    /// with no valid entries (empty, or all malformed) uses the built-in defaults.
-    fn has_valid_bindings(&self) -> bool {
-        self.keybindings.values().any(|c| normalize_chord(c).is_some())
-    }
 }
 
-/// Built-in chord -> command id defaults (canonical chord form).
+/// The chord -> command id bindings a new config file starts with (canonical
+/// chord form).
 fn default_bindings() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         // The command palette opens on a double-tap of Shift (Run mode: double
@@ -349,67 +351,6 @@ pub fn normalize_chord(chord: &str) -> Option<String> {
     Some(s)
 }
 
-/// The default config written on first run. Kept in sync with [`Config::default`]
-/// by a test, so the comments here document the real defaults.
-pub const DEFAULT_CONFIG_TOML: &str = r#"# ghostrealm config. Commit/sync this as a dotfile. Each option below lists its
-# type, allowed values/range, and default. Edit + save (Cmd+S) to hot-reload.
-
-[workspace]
-# default_directory (string path | unset) — base directory new workspaces start
-#   in (a workspace's own pinned root overrides it). `~` is expanded. Unset = $HOME.
-# default_directory = "~/Developer"
-
-[sidebar]
-side = "left"    # "left" | "right"       (default "left")   — which edge the sidebar sits on
-width = 190.0    # number, logical px, > 0 (default 190.0)   — sidebar width
-
-[terminal]
-font_size = 15.0    # number, points, > 0 (default 15.0)
-line_height = 18.0  # number, points, > 0 (default 18.0)   — row height (>= font_size)
-
-# [chrome] — colours for our own UI (not the terminal contents). Each is RGB
-#   [r, g, b], components 0..=255. Unset (the default): inherit from your Ghostty
-#   config (background/foreground/cursor), falling back to the values below.
-#   Uncomment to override.
-# [chrome]
-# background = [20, 20, 24]   # behind panes / split dividers
-# sidebar = [24, 24, 30]
-# accent = [90, 140, 220]     # focused-pane border, palette selection
-
-[tabs]
-autohide_single_tab = true  # bool (default true) — hide a pane's tab strip when it has one terminal
-
-[editor]
-line_numbers = "absolute"  # "off" | "absolute" | "relative" (default absolute) — gutter line numbers; relative shows the absolute number on the cursor line
-cursor_line = true         # bool (default true) — highlight the line the cursor is on
-soft_wrap = true           # bool (default true) — wrap long lines (toggle per-pane with the ribbon button)
-autosave_on_unfocus = true # bool (default true) — save a modified file when its editor loses focus
-autosave_after = 15        # integer seconds, >= 0 (default 15) — save a modified file after this idle time (0 = off)
-
-[input]
-focus_follows_mouse = false  # bool (default false)          — hovering a pane focuses it
-double_tap_window_ms = 300   # integer ms, >= 0 (default 300) — max gap between a double-tap's two taps
-double_click_ms = 200        # integer ms, >= 0 (default 200) — max gap between a mouse double-click's two clicks
-
-[file_browser]
-open_in = "split"            # "split" | "tab" (default "split") — where opening a file
-                             #   in the file browser puts it: a horizontal split beside
-                             #   the file browser (falls back to a tab when the pane is narrow),
-                             #   or a tab in the file browser's own pane
-
-[inbox]
-auto_read_after = 3     # integer seconds, >= 0 (default 3)  — focus time before unread -> read (0 = manual only)
-auto_unread_before = 1  # integer seconds, >= 0 (default 1)  — grace after an auto-read to re-mark unread on unfocus
-
-[keybindings]
-# "command id" = "chord". Cmd chords only (other keys go to the terminal); any
-# modifier order/alias works (cmd/super/meta, opt/alt). This section is the
-# complete, authoritative set of bindings — every command is listed below, bound
-# ones as active lines and unbound ones commented out. Edit a chord to rebind,
-# delete or comment a line to unbind, or uncomment a line and set its chord to
-# bind it. If the whole section is empty, the built-in defaults apply.
-"#;
-
 /// Expand a user-entered directory: trims whitespace, expands a leading `~` to
 /// `$HOME`; `None` for an empty string. Does not check existence.
 pub fn expand_tilde(s: &str) -> Option<PathBuf> {
@@ -434,264 +375,124 @@ pub fn config_path() -> Option<PathBuf> {
     Some(base.join("ghostrealm").join("config.toml"))
 }
 
-/// Load the config, creating a documented default file if none exists. A parse
-/// error is reported and the built-in defaults are used (never fatal).
-/// Command ids that carry a built-in default binding. Callers building the
-/// keybindings list can assert every one is a listed command, so a default can
-/// never point at an action missing from the generated block.
+/// Command ids that carry a default binding (written into a new config file).
 pub fn default_binding_ids() -> Vec<&'static str> {
     default_bindings().into_values().collect()
 }
 
-/// The default config file text with a generated, authoritative `[keybindings]`
-/// block: every command listed (deterministically, sorted by id), bound ones as
-/// active lines and unbound ones commented out. `commands` is `(id, title)` for
-/// every keybindable command — pass the registry's, so the block can never drift
-/// out of sync with the available actions. An empty `commands` yields the bare
-/// template (empty section → built-in defaults apply).
-pub fn default_config_with_keybindings(commands: &[(&str, &str)]) -> String {
-    format!("{DEFAULT_CONFIG_TOML}{}", keybindings_lines(commands))
+/// The text of a new config file: the default keybindings and nothing else.
+/// Every other option is documented on hover in the editor and takes its
+/// default until set.
+pub fn default_file() -> String {
+    let mut bindings: Vec<(&str, &str)> = default_bindings().into_iter().map(|(c, id)| (id, c)).collect();
+    bindings.sort();
+    let mut s = String::from(
+        "# ghostrealm config. Only what you set is listed; every other option uses\n\
+         # its default. Hover a section or option for its docs.\n\n[keybindings]\n",
+    );
+    for (id, chord) in bindings {
+        s.push_str(&format!("\"{id}\" = \"{chord}\"\n"));
+    }
+    s
 }
 
-/// Just the generated `[keybindings]` body — one line per command, sorted by id,
-/// bound ones active and unbound ones commented out.
-fn keybindings_lines(commands: &[(&str, &str)]) -> String {
-    let defaults = default_bindings();
-    let chord_for = |id: &str| -> Option<&'static str> {
-        defaults.iter().find(|&(_, &v)| v == id).map(|(&k, _)| k)
+/// Parse config `text` against `cat`. Flagged entries are dropped (so their
+/// defaults apply) or clamped. `None` when the text isn't valid TOML.
+pub fn parse(text: &str, cat: &Catalogue) -> (Option<Config>, Vec<Finding>) {
+    let checked = check(text, cat);
+    let mut findings = checked.findings;
+    let cfg = checked.table.and_then(|t| match toml::Value::Table(t).try_into::<Config>() {
+        Ok(cfg) => Some(cfg),
+        // The checker passed something the typed config rejects: a catalogue
+        // entry disagrees with its field.
+        Err(e) => {
+            findings.push(Finding {
+                span: 0..0,
+                severity: Severity::Error,
+                message: format!("config doesn't match its catalogue: {e}"),
+            });
+            None
+        }
+    });
+    (cfg, findings)
+}
+
+/// The config file's path, creating the file with [`default_file`] when absent.
+pub fn ensure_file() -> Option<PathBuf> {
+    let path = config_path()?;
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, default_file());
+    }
+    Some(path)
+}
+
+/// Read the config file (see [`ensure_file`]). Findings go to stderr. `None`
+/// when the file can't be read or isn't valid TOML: the caller keeps the config
+/// it has.
+pub fn load_or_create(cat: &Catalogue) -> Option<Config> {
+    let path = ensure_file()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("ghostrealm: can't read {}: {e}", path.display());
+            return None;
+        }
     };
-    let mut cmds: Vec<(&str, &str)> = commands.to_vec();
-    cmds.sort_by(|a, b| a.0.cmp(b.0));
-    cmds.dedup_by(|a, b| a.0 == b.0);
-    let mut out = String::new();
-    for (id, title) in cmds {
-        match chord_for(id) {
-            Some(chord) => out.push_str(&format!("\"{id}\" = \"{chord}\"  # {title}\n")),
-            None => out.push_str(&format!("# \"{id}\" = \"cmd+?\"  # {title} (unbound)\n")),
-        }
+    let (cfg, findings) = parse(&text, cat);
+    for f in &findings {
+        let (line, col) = line_col(&text, f.span.start);
+        let level = match f.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        eprintln!("{}:{line}:{col}: {level}: {}", path.display(), f.message);
     }
-    out
+    cfg
 }
 
-/// Top-level `[section]` names that are active (uncommented) headers in `text`.
-fn active_section_headers(text: &str) -> std::collections::HashSet<String> {
-    text.lines()
-        .filter_map(|l| {
-            let t = l.trim();
-            if t.starts_with('[') && !t.starts_with("[[") && t.ends_with(']') {
-                Some(t[1..t.len() - 1].trim().to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Split [`DEFAULT_CONFIG_TOML`] into `(section_name, block_text)` per top-level
-/// `[section]`, in order. The preamble before the first section is dropped.
-fn template_sections() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut cur: Option<(String, String)> = None;
-    for line in DEFAULT_CONFIG_TOML.lines() {
-        let t = line.trim();
-        let is_header =
-            t.starts_with('[') && !t.starts_with("[[") && t.ends_with(']') && !t.starts_with('#');
-        if is_header {
-            if let Some(sec) = cur.take() {
-                out.push(sec);
-            }
-            let name = t[1..t.len() - 1].trim().to_string();
-            cur = Some((name, format!("{line}\n")));
-        } else if let Some((_, block)) = cur.as_mut() {
-            block.push_str(line);
-            block.push('\n');
-        }
-    }
-    if let Some(sec) = cur.take() {
-        out.push(sec);
-    }
-    out
-}
-
-/// Whether the `[keybindings]` section of `text` has any active (uncommented)
-/// binding line (a quoted chord key).
-fn has_active_keybinding(text: &str) -> bool {
-    let mut in_kb = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[") {
-            in_kb = &t[1..t.len() - 1] == "keybindings";
-            continue;
-        }
-        if in_kb && t.starts_with('"') {
-            return true;
-        }
-    }
-    false
-}
-
-/// Bring existing config `text` up to date without disturbing any existing line:
-/// append every documented top-level section the file is missing, and if the
-/// `[keybindings]` section has no active bindings, add the generated block
-/// (inserted under an existing header, else appended as a new section). Returns
-/// the new text, or `None` if nothing needed adding.
-pub fn backfill_text(text: &str, commands: &[(&str, &str)]) -> Option<String> {
-    // Never rewrite a file that doesn't parse — a broken edit shouldn't be
-    // "fixed" by us clobbering it.
-    if toml::from_str::<Config>(text).is_err() {
-        return None;
-    }
-    let present = active_section_headers(text);
-    let sections = template_sections();
-    let mut result = text.to_string();
-    let mut changed = false;
-
-    for (name, block) in &sections {
-        if name == "keybindings" || present.contains(name) {
-            continue;
-        }
-        if !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push('\n');
-        result.push_str(block.trim_end());
-        result.push('\n');
-        changed = true;
-    }
-
-    if !has_active_keybinding(text) {
-        let lines = keybindings_lines(commands);
-        if present.contains("keybindings") {
-            // Insert the generated bindings right after the existing header so they
-            // fall under the [keybindings] table.
-            let mut rebuilt = String::new();
-            for line in result.lines() {
-                rebuilt.push_str(line);
-                rebuilt.push('\n');
-                if line.trim() == "[keybindings]" {
-                    rebuilt.push_str(&lines);
-                }
-            }
-            result = rebuilt;
-        } else {
-            let header = sections
-                .iter()
-                .find(|(n, _)| n == "keybindings")
-                .map(|(_, b)| b.clone())
-                .unwrap_or_else(|| "[keybindings]\n".to_string());
-            if !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push('\n');
-            result.push_str(header.trim_end());
-            result.push('\n');
-            result.push_str(&lines);
-        }
-        changed = true;
-    }
-
-    changed.then_some(result)
-}
-
-/// Backfill the on-disk config file in place (see [`backfill_text`]). Returns
-/// whether it changed anything.
-pub fn backfill_config(commands: &[(&str, &str)]) -> bool {
-    let Some(path) = config_path() else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    match backfill_text(&text, commands) {
-        Some(updated) => std::fs::write(&path, updated).is_ok(),
-        None => false,
-    }
-}
-
-pub fn load_or_create() -> Config {
-    load_or_create_with(&[])
-}
-
-/// Like [`load_or_create`], but seeds a freshly created config with a generated
-/// `[keybindings]` block covering every command in `commands`.
-pub fn load_or_create_with(commands: &[(&str, &str)]) -> Config {
-    let Some(path) = config_path() else {
-        return Config::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!(
-                    "ghostrealm: {} is invalid ({e}); using defaults",
-                    path.display()
-                );
-                Config::default()
-            }
-        },
-        Err(_) => {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&path, default_config_with_keybindings(commands));
-            Config::default()
-        }
-    }
+/// 1-based line and column (in chars) of byte `offset` in `text`.
+fn line_col(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, col)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn backfill_adds_missing_sections_and_keybindings() {
-        // A sparse, out-of-date config: a customised [terminal] and an empty
-        // [keybindings]. Nothing else.
-        let old = "[terminal]\nfont_size = 20.0\n\n[keybindings]\n# (empty)\n";
-        let cmds = [
-            ("surface.new", "New Terminal Tab"),
-            ("workspace.new", "New Workspace"),
-            ("editor.scratch", "New Editor"),
-        ];
-        let updated = backfill_text(old, &cmds).expect("backfill should add sections");
-        let cfg: Config = toml::from_str(&updated).expect("backfilled config parses");
-
-        // The user's value is preserved untouched.
-        assert!((cfg.terminal.font_size - 20.0).abs() < 1e-6);
-        // Missing sections were appended.
-        for sec in ["[sidebar]", "[editor]", "[input]", "[inbox]", "[tabs]"] {
-            assert!(updated.contains(sec), "backfill adds {sec}");
-        }
-        // The authoritative keybindings block was seeded (so bindings resolve).
-        assert!(!cfg.keybindings.is_empty());
-        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
-        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("workspace.new"));
-        // An unbound command appears as a comment for reference.
-        assert!(updated.contains("editor.scratch"));
-        // Idempotent: a second pass changes nothing.
-        assert!(
-            backfill_text(&updated, &cmds).is_none(),
-            "backfill is idempotent"
-        );
+    fn cat() -> Catalogue {
+        let commands: Vec<KeyDoc> = default_binding_ids()
+            .into_iter()
+            .map(|key| KeyDoc { key, title: "", doc: "" })
+            .collect();
+        Catalogue::new(core_sections(&commands))
     }
 
     #[test]
-    fn backfill_leaves_a_current_config_untouched() {
-        let full = default_config_with_keybindings(&[("surface.new", "New Terminal Tab")]);
-        assert!(
-            backfill_text(&full, &[("surface.new", "New Terminal Tab")]).is_none(),
-            "a freshly generated config needs no backfill"
-        );
+    fn the_default_file_is_the_default_config() {
+        let (cfg, findings) = parse(&default_file(), &cat());
+        assert_eq!(findings, vec![]);
+        assert_eq!(cfg, Some(Config::default()));
     }
 
     #[test]
-    fn default_toml_matches_default_config() {
-        let parsed: Config = toml::from_str(DEFAULT_CONFIG_TOML).expect("default toml parses");
-        assert_eq!(
-            parsed,
-            Config::default(),
-            "DEFAULT_CONFIG_TOML drifted from Config::default(); update the template/comments."
-        );
+    fn one_bad_entry_costs_only_that_entry() {
+        let text = "[terminal]\nfont_size = \"big\"\nline_height = 20.0\n[nope]\n";
+        let (cfg, findings) = parse(text, &cat());
+        let cfg = cfg.unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(cfg.terminal.font_size, Terminal::default().font_size);
+        assert_eq!(cfg.terminal.line_height, 20.0);
+    }
+
+    #[test]
+    fn a_syntax_error_yields_no_config() {
+        assert_eq!(parse("[terminal\n", &cat()).0, None);
     }
 
     #[test]
@@ -728,20 +529,20 @@ mod tests {
     }
 
     #[test]
-    fn binding_uses_defaults_then_overrides() {
-        let mut cfg = Config::default();
+    fn only_listed_commands_are_bound() {
+        let cfg = Config::default();
         assert_eq!(cfg.binding("cmd+t").as_deref(), Some("surface.new"));
-        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("workspace.new"));
-        // cmd+k is no longer a default (the palette opens on double-Shift).
-        assert_eq!(cfg.binding("cmd+k"), None);
         assert_eq!(cfg.binding("cmd+j"), None);
-        // Authoritative once present: `command id = chord`. Any modifier
-        // order/alias resolves; ids not listed are unbound.
-        cfg.keybindings
-            .insert("workspace.close".to_string(), "Super+T".to_string());
-        assert_eq!(cfg.binding("cmd+t").as_deref(), Some("workspace.close"));
-        assert_eq!(cfg.binding_for("workspace.close").as_deref(), Some("cmd+t"));
-        assert_eq!(cfg.binding("cmd+n"), None); // not in the authoritative set
+
+        let (cfg, _) = parse("[keybindings]\n\"surface.new\" = \"Super+N\"\n", &cat());
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.binding("cmd+n").as_deref(), Some("surface.new"));
+        assert_eq!(cfg.binding_for("surface.new").as_deref(), Some("cmd+n"));
+        assert_eq!(cfg.binding("cmd+t"), None);
+
+        // No section: nothing bound.
+        let (cfg, _) = parse("[tabs]\n", &cat());
+        assert!(cfg.unwrap().keybindings.is_empty());
     }
 }
 

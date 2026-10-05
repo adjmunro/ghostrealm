@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use ghostrealm_core::config::SectionSpec;
 use ghostrealm_core::{Config, Rect, Registry};
 use ghostrealm_terminal::{KeyPress, Pumped};
 
@@ -112,6 +113,11 @@ pub trait Plugin {
     }
     /// Add this plugin's commands to the registry (palette, keybindings, agent).
     fn register_commands(&self, _registry: &mut Registry<AppState>) {}
+    /// The config sections this plugin reads, for the option catalogue (hover
+    /// docs and checking in the config file).
+    fn config_sections(&self) -> Vec<SectionSpec> {
+        Vec::new()
+    }
 }
 
 /// One surface's content: a live instance of a [`Plugin`]'s kind.

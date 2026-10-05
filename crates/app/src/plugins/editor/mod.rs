@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -116,6 +117,41 @@ impl Plugin for EditorPlugin {
                 Ok(CmdOutcome::ok())
             }),
         );
+    }
+
+    fn config_sections(&self) -> Vec<SectionSpec> {
+        const LINE_NUMBERS: &[(&str, &str)] = &[
+            ("off", "No gutter."),
+            ("absolute", "Every line shows its number."),
+            ("relative", "Distance from the cursor's line; the cursor's line shows its number."),
+        ];
+        vec![SectionSpec::options(
+            "editor",
+            "The text editor.",
+            vec![
+                OptionSpec::new("line_numbers", Kind::Enum(LINE_NUMBERS), Some("\"absolute\""), "Line-number gutter."),
+                OptionSpec::new("cursor_line", Kind::Bool, Some("true"), "Highlight the line the cursor is on."),
+                OptionSpec::new(
+                    "soft_wrap",
+                    Kind::Bool,
+                    Some("true"),
+                    "Wrap long lines at the pane edge (toggle per pane with the ribbon button). \
+                     Off clips them.",
+                ),
+                OptionSpec::new(
+                    "autosave_on_unfocus",
+                    Kind::Bool,
+                    Some("true"),
+                    "Save a modified file when its editor loses focus.",
+                ),
+                OptionSpec::new(
+                    "autosave_after",
+                    Kind::Int { min: 0, max: 3600 },
+                    Some("15"),
+                    "Save a modified file after this many seconds without edits (0 = off).",
+                ),
+            ],
+        )]
     }
 }
 
