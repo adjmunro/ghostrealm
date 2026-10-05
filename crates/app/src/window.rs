@@ -1342,6 +1342,10 @@ impl State {
 
     /// Right-click opens a context menu over the sidebar vtab under the cursor.
     fn on_right_click(&mut self) {
+        // Modal overlays keep the pointer; a context menu would open beneath them.
+        if self.app.picker_open() {
+            return;
+        }
         self.palette = None;
         let (x, y) = self.cursor;
         self.menu = None;
