@@ -30,6 +30,7 @@ pub mod event;
 pub mod paint;
 #[cfg(test)]
 pub mod testing;
+pub mod text_edit;
 pub mod theme;
 pub mod widgets;
 
