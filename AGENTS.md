@@ -25,6 +25,7 @@
 
 - The sandbox has no display: a launched `ghostrealm` window never fires winit's `resumed`, so it neither draws nor writes its config — it just idles without error. A "still alive after 2s" smoke check only proves it didn't crash at startup; it does NOT prove rendering. Don't claim the GUI works from that alone.
 - Judge performance (scroll, typing, rendering) only from `--release` builds. The default dev profile leaves font shaping (cosmic-text/swash) unoptimised, so a debug build feels slow on its own, which is not a regression.
+- On macOS, a test that spawns the debug `ghostrealm` binary waits ~2s before its `main` runs (process load, outside our code). Time from `main` before blaming a spawned server or CLI path for slowness.
 - Verify headlessly instead: `cargo test` (core logic, backend PTY/VT, agent protocol, inbox, config) + the offscreen wgpu render test. Drive behaviour through `ghostrealm agent` (JSON on stdin/stdout) or `ghostrealm dump <cmd>` (grid as text). Real visual confirmation needs a human on a desktop session.
 
 ## Editing Agents.md

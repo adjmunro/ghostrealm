@@ -8,6 +8,7 @@ default-run = "ghostrealm"
 
 [dependencies]
 ghostrealm-core.workspace = true
+ghostrealm-lsp.workspace = true
 ghostrealm-terminal.workspace = true
 ghostrealm-terminal-ghostty.workspace = true
 anyhow.workspace = true

@@ -1,8 +1,16 @@
 //! The config file as the settings UI: the option catalogue it is checked and
-//! documented against (the app's sections plus each plugin's).
+//! documented against (the app's sections plus each plugin's), and the
+//! language server that brings both into the editor.
 
-use ghostrealm_core::config::{core_sections, Catalogue, KeyDoc};
+use std::sync::Arc;
+
+use ghostrealm_core::config::{check, core_sections, hover_at, Catalogue, KeyDoc, Severity};
 use ghostrealm_core::Registry;
+use ghostrealm_lsp::types::{
+    Diagnostic, DiagnosticSeverity, Hover, HoverContents, HoverProviderCapability, MarkupContent,
+    MarkupKind, Position, ServerCapabilities,
+};
+use ghostrealm_lsp::{Document, LanguageServer};
 
 use crate::app_state::AppState;
 
@@ -35,6 +43,70 @@ pub fn catalogue(registry: &Registry<AppState>) -> Catalogue {
         sections.extend(plugin.config_sections());
     }
     Catalogue::new(sections)
+}
+
+/// The config file's language server: the checker's findings as diagnostics,
+/// and the catalogue's docs on hover.
+pub struct ConfigServer {
+    catalogue: Arc<Catalogue>,
+}
+
+impl ConfigServer {
+    pub fn new(catalogue: Arc<Catalogue>) -> Self {
+        ConfigServer { catalogue }
+    }
+}
+
+impl LanguageServer for ConfigServer {
+    fn name(&self) -> &str {
+        "ghostrealm-config"
+    }
+
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        }
+    }
+
+    fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
+        check(&doc.text, &self.catalogue)
+            .findings
+            .into_iter()
+            .map(|f| Diagnostic {
+                range: doc.range(f.span),
+                severity: Some(match f.severity {
+                    Severity::Error => DiagnosticSeverity::ERROR,
+                    Severity::Warning => DiagnosticSeverity::WARNING,
+                }),
+                source: Some("ghostrealm".into()),
+                message: f.message,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn hover(&mut self, doc: &Document, pos: Position) -> Option<Hover> {
+        let (span, text) = hover_at(&doc.text, &self.catalogue, doc.offset(pos)?)?;
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::PlainText, value: text }),
+            range: Some(doc.range(span)),
+        })
+    }
+}
+
+/// `ghostrealm lsp <name>`: serve a first-party language server on stdio, for
+/// any LSP client (another editor, or a test).
+pub fn serve_stdio(name: &str) -> anyhow::Result<()> {
+    let mut server = match name {
+        "config" => ConfigServer::new(Arc::new(catalogue(&crate::app_state::build_registry()))),
+        other => anyhow::bail!("no language server `{other}` (available: config)"),
+    };
+    let (conn, io) = ghostrealm_lsp::Connection::stdio();
+    ghostrealm_lsp::serve(&mut server, &conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(conn);
+    io.join()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -82,8 +154,7 @@ mod tests {
     #[test]
     fn every_option_is_catalogued() {
         let cat = super::catalogue(&build_registry());
-        let mut cfg = Config::default();
-        cfg.chrome = Some(Default::default());
+        let mut cfg = Config { chrome: Some(Default::default()), ..Default::default() };
         cfg.workspace.default_directory = Some("~".into());
         let toml::Value::Table(all) = toml::Value::try_from(&cfg).unwrap() else {
             unreachable!()

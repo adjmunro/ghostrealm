@@ -24,6 +24,7 @@ use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
 /// - `ghostrealm`                 → open the window (single terminal, for now)
 /// - `ghostrealm agent [cmd...]`  → JSON agent channel over stdin/stdout
 /// - `ghostrealm dump [cmd...]`   → headless: run a command, print the grid
+/// - `ghostrealm lsp <name>`      → serve a first-party language server on stdio
 pub fn run_cli() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -38,6 +39,7 @@ pub fn run_cli() -> Result<()> {
             let stdout = std::io::stdout();
             agent::run(stdin.lock(), stdout.lock(), state)
         }
+        Some("lsp") => settings::serve_stdio(args.get(1).map_or("", String::as_str)),
         Some("dump") => {
             args.remove(0);
             let command_line = if args.is_empty() {
