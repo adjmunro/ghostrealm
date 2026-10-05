@@ -3,10 +3,16 @@
 //! new keys don't break old files. On first run the documented default is
 //! written out.
 
+pub mod catalogue;
+pub mod check;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub use catalogue::{core_sections, Catalogue, Entries, KeyDoc, Kind, OptionSpec, SectionSpec};
+pub use check::{check, hover_at, Checked, Finding, Severity};
 
 /// Which side the vertical tab sidebar sits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
