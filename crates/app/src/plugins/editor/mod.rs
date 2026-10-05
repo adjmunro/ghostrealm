@@ -817,10 +817,14 @@ impl View for EditorView {
         self.buf.path.clone()
     }
 
-    /// Creates missing parent directories, so a typed `sub/name` works.
+    /// Creates missing parent directories, so a typed `sub/name` works. The
+    /// old file's language service doesn't apply to the new one, so it stops.
     fn save_as(&mut self, path: PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+        }
+        if self.buf.path.as_ref() != Some(&path) {
+            self.lang = None;
         }
         self.buf.path = Some(path);
         self.buf.save()?;
@@ -1158,6 +1162,14 @@ mod tests {
         let (used, out) = h.key(&mut v, redo);
         assert!(used && out.redraw);
         assert_eq!(v.buffer().lines, vec!["hi", ""]);
+    }
+
+    #[test]
+    fn save_as_elsewhere_stops_the_language_service() {
+        let path = tmpdir("editor-save-as-lang").join("copy.toml");
+        let mut v = attached("bad\n");
+        v.save_as(path).unwrap();
+        assert!(v.lang().is_none());
     }
 
     #[test]
