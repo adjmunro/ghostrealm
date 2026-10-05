@@ -87,3 +87,13 @@
 - Detail: The host crate is excluded from the workspace's `default-members`; the app builds and tests without CEF and reports a missing host in the pane.
 - Reason: Process isolation keeps a renderer crash or hang from taking down the multiplexer and its shells, and keeps Chromium's NSApplication requirements and ~250 MB of binaries out of the main binary. Off-screen rendering keeps "unified compositing; no native subviews" and cross-platform.
 - Reason: Software compositing because frames are consumed as CPU pixels anyway (GPU compositing adds a readback), and it paints without a window server.
+
+---
+
+[2026-10-05T20:35+1300@0c5b05d7]
+
+- Category: Dependencies / media preview
+- Detail: Images decode with `image` (still formats only: bmp, gif, ico, jpeg, png, tiff, webp; no rayon). Audio plays through `rodio` (cpal output + symphonia decoders: flac, mp3, mp4/aac, vorbis, wav; no recording).
+- Detail: Images reach the GPU through `PaintCx::image` (the textured-quad path web pages draw through), not through a per-view GPU surface.
+- Detail: Workspace `rust-version` is 1.88 (`image` needs it; `wgpu` already needed 1.87).
+- Reason: pure-Rust decoders keep the build free of system media libraries on macOS. On Linux, cpal needs the ALSA development headers (`libasound2-dev`) to build.
