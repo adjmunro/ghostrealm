@@ -64,6 +64,7 @@ line — over the same command registry the palette and keybindings use:
 ```
 crates/app        bin: winit + wgpu scene, sidebar/palette/tabs, agent channel, config wiring
 crates/core       registry, tab/split tree, inbox status, fuzzy search, config   (headless, tested)
+crates/lsp        language services over LSP: first-party server host + editor client
 crates/terminal   the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
 ```
@@ -80,4 +81,5 @@ writes just the default `[keybindings]`, and only commands listed there are
 bound. Cmd+, opens it in the editor, where hovering a section or option shows
 its docs and bad entries are flagged. Saving hot-reloads it: a flagged entry is
 dropped (its default applies) or clamped into range, and a file that doesn't
-parse leaves the running config unchanged.
+parse leaves the running config unchanged. `ghostrealm lsp config` serves the
+same checks and docs to any LSP-capable editor over stdio.

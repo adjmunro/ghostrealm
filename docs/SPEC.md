@@ -19,6 +19,7 @@ crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input rout
   src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
   src/plugins/       first-party plugins: terminal, editor, file_browser
 crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree
+crates/lsp         language services over LSP: first-party server host + editor client
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
 ```
@@ -71,8 +72,10 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       unread success/failure.
 - [x] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
       colours, autohide, config-driven keybindings, sidebar `side`, chrome
-      inheritance from the Ghostty config). Follow-up: resolve Ghostty themes for
-      inheritance (TODO.md).
+      inheritance from the Ghostty config), checked against an option catalogue,
+      with diagnostics and hover docs in the editor from the config language
+      server. Follow-ups: completion, resolve Ghostty themes for inheritance
+      (TODO.md).
 
 Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
 sidebar/inbox, palette, config, and the agent channel are all in and tested.

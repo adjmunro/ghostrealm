@@ -201,7 +201,8 @@
   (CommandMeta::hidden()) excluded from the human palette. REMAINING: (1) order by
   most-recently-used (needs a persisted usage history); (2) pinning — a clickable
   star on the right to keep favourites at the top (needs persisted pins). Both want
-  a small persistent store (or a config section).
+  a small state file beside the config, not the config itself: they are
+  machine-local history, and the config is the shareable dotfile.
 - Reason: usability + discoverability.
 
 ---
@@ -289,23 +290,13 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Settings = the config file in our editor — core done; self-doc + backfill remain
+[2026-09-15@2e8e8c7] Settings = the config file in our editor — watcher remains
 
 - Requires: NO BLOCKERS
-- Detail: DONE (64a72b0): Cmd+, opens config.toml in an editor pane (created with
-  defaults if absent); saving it (Cmd+S) hot-reloads — apply_config re-resolves
-  chrome/inbox/default_directory and re-measures metrics on a font change (invalidate
-  shaping cache + reflow), keybindings/sidebar read live. REMAINING:
-  1. Make the config fully self-documenting: EVERY option's comment gives a
-     description, its constraints (numeric range, enum variants like
-     `side = "left" | "right"`, list options), and its default. Today only some
-     sections are documented.
-  2. A "backfill / doctor" action: merge MISSING keys (+ documented comments) into
-     an existing config WITHOUT overwriting the user's set values, so upgrades
-     surface new options without clobbering customisations.
-  3. Hot-reload on EXTERNAL edits (a file watcher) — today only our editor's save
-     triggers a reload. Also surface parse errors non-fatally (keep the old config).
-- Reason: the file is the settings UI; keep it discoverable and upgrade-safe.
+- Detail: Hot-reload on EXTERNAL edits (a file watcher): today only a save from
+  our editor reloads. A file that doesn't parse already leaves the running config
+  in place. Lower priority than the language-service follow-ups.
+- Reason: edits from another editor or a synced dotfile should apply.
 
 ---
 
@@ -335,20 +326,6 @@
   optional polish rather than a needed fix. Only invest if profiling shows
   UI-thread shaping/prepare is still the bottleneck. Related IDEAS.md note: "Do
   we re-render the whole screen when dirty? Or can we render only part of it?"
-
----
-
-[2026-09-17@584a284]
-
-- Requires: NO BLOCKERS
-- Detail: Harden config loading against malformed/unexpected input. Today a parse
-  error falls back to Config::default() (non-fatal, good), but audit for: values
-  out of documented range (clamp rather than accept/crash), enum/string fields
-  with bad variants, negative/zero sizes, huge numbers, non-UTF8, partial tables,
-  and the authoritative [keybindings] block (bad chords, unknown command ids,
-  duplicate chords). Prefer clamp-and-warn over reject-whole-file where sensible.
-- Reason: the config is user-edited (and hot-reloaded); a bad edit should never
-  crash the app or silently wipe settings.
 
 ---
 
@@ -508,8 +485,9 @@
   menu) onto `PaintCx` as the empty-pane picker and dir picker already are,
   retiring their per-widget buffer pools; (2) extract the API
   into its own crate for out-of-tree Rust plugins — needs commands registered
-  against a trait rather than `Registry<AppState>`; (3) per-plugin config sections
-  (today first-party plugins read typed fields on `core::Config`); (4) view-scoped
+  against a trait rather than `Registry<AppState>`; (3) per-plugin typed config — each
+  plugin already documents its sections (`Plugin::config_sections`), but the typed
+  fields still live on `core::Config`; a plugin should deserialize its own section; (4) view-scoped
   commands and keybindings (e.g. editor-only chords in `[keybindings]`, palette
   entries that act on the focused view); (5) a web-browser plugin — a CEF/webview
   composites its own surface, so `PaintCx` needs a textured-quad primitive fed by a
@@ -528,31 +506,6 @@
   list" (viewport + easing + budgeted placement) the row-based views share, with
   view-specific hooks only where needed (e.g. the terminal's grid snapshot).
 - Reason: one scroll-optimisation path; the file browser proved the win, don't fork it.
----
-
-[2026-09-30@463e7cf] Settings — search/add from the full option list
-
-- Requires: NO BLOCKERS
-- Detail: The config no longer needs to dump every option. Instead, when the
-  config file is open in the editor, offer a way to search the full option catalogue
-  and insert a chosen option (with its documented comment + default) at the cursor —
-  a palette-like picker over all known settings. Pairs with the backfill/doctor
-  idea. Keeps the file lean while staying discoverable.
-- Reason: a complete but un-cluttered settings surface.
-
----
-
-[2026-09-30@463e7cf] A ghostrealm LSP (config first)
-
-- Requires: LSP plumbing (see the plugin/syntax entries)
-- Detail: Once we have LSP support, ship our own LSP that understands the config
-  file: validate keys (flag unknown/misspelled options), report out-of-range or
-  wrong-type values and basic TOML syntax errors non-fatally, and provide on-hover
-  docs for each option (reuse the same catalogue as the settings search). Later,
-  extend to command ids in `[keybindings]` (unknown id / duplicate chord) and to
-  other ghostrealm file types.
-- Reason: make the file-as-settings-UI safe and self-explaining.
-
 ---
 
 [2026-09-30@463e7cf] Double-tap rework + fuzzy file-search popup
@@ -641,3 +594,37 @@
   feed the same layer later. The editor never knows about git.
 - Reason: see what changed since the last commit in place, not just how much.
 
+---
+
+[2026-10-05@7654ce1] Language services — follow-ups
+
+- Requires: NO BLOCKERS
+- Detail: DONE: `crates/lsp` (first-party `LanguageServer` + `serve`, the editor's
+  `Client` for in-process or spawned servers), the config server (diagnostics from
+  the checker, hover from the catalogue; also `ghostrealm lsp config` on stdio),
+  and the editor's underlines and hover popup. REMAINING, roughly in order:
+  1. Completion (`textDocument/completion`): section names in headers, option
+     keys per section, enum values, command ids in `[keybindings]`; plus the
+     editor's completion popup. With a slim config file this is how options are
+     discovered (today: hover a section header for its option list).
+  2. External servers: a config section mapping file types to a server command
+     (e.g. a Kotlin server for `.kt`), spawned via `Client::spawn` with the
+     workspace root. Share one process between a workspace's documents of the
+     same language, shutting it down when the last one closes.
+  3. Diagnostics beyond the underline: a gutter marker, and a way to jump
+     between them.
+  4. Markdown hover contents (the client advertises plain text only).
+- Reason: finish the config file as the settings UI, then open the editor to
+  existing language servers instead of building language support in-tree.
+
+---
+
+[2026-10-05@7654ce1] Colour swatches in the gutter + colour picker
+
+- Requires: flexible colour values with alpha (the colour-input entry above)
+- Detail: The config server answers `textDocument/documentColor`; the editor
+  draws a small square in the gutter, filled with the colour each line's value
+  resolves to. Clicking the square opens a colour picker (a built-in plugin)
+  that writes the chosen value back via `textDocument/colorPresentation`.
+- Reason: see and pick colours in place; requested (picker later than the
+  language service itself).

@@ -53,3 +53,26 @@
 - Detail: Named `Plugin`/`View`, not "panel": the glossary already uses Panel for a pane.
 - Detail: The API stays inside the app crate for now; `Plugin::register_commands` takes `Registry<AppState>`, which would be a cycle in a separate crate.
 - Reason: build new kinds (Git GUI, web browser, previews) as uniform modules that obey the same perf and input rules as the terminal. It also shrinks window.rs to layout/chrome/routing, and makes content testable headless.
+
+---
+
+[2026-10-05T20:43+1300@7654ce1]
+
+- Category: Architecture / language services
+- Detail: Editor language features speak the Language Server Protocol, first-party ones included. `crates/lsp`: a first-party server implements `LanguageServer` (name, capabilities, a hook per feature) and `serve` runs the protocol around it; the editor holds one `Client` per open document, backed by a first-party server on an in-process thread (same LSP messages over channels) or an external server process on stdio.
+- Detail: A service runs only while its document is open: dropping the `Client` sends `shutdown`/`exit` (a process that lingers is killed).
+- Detail: `lsp-types` for the protocol types, `lsp-server` (rust-analyzer's) for framing and the handshake.
+- Detail: First-party servers can also run standalone (`ghostrealm lsp <name>`), so other editors can use them and tests drive them as external processes.
+- Reason: one interface for our own small servers and existing ones (add a Kotlin server rather than build Kotlin support); in-process keeps first-party servers cheap; standard messages keep them honest and reusable.
+
+---
+
+[2026-10-05T20:43+1300@7654ce1]
+
+- Category: Config
+- Detail: The config file lists only what the user sets. Every option's type, range/values, default, and description live in an option catalogue (`core::config::catalogue`): the app's sections plus each plugin's (`Plugin::config_sections`).
+- Detail: One checker serves the loader and the config language server. The loader drops or clamps each flagged entry instead of rejecting the file, and keeps the running config when the file doesn't parse; the editor shows the same findings as diagnostics, and the catalogue's docs on hover.
+- Detail: `[keybindings]` binds only the commands it lists. The default chords exist only as the text of a new config file.
+- Detail: No backfill/doctor pass and no generated option or keybinding listings in the file.
+- Reason: the file had outgrown listing every option; hover docs and checking keep it discoverable and safe without the clutter.
+
