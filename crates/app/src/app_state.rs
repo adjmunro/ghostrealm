@@ -400,6 +400,11 @@ impl AppState {
     }
 
     /// The floating picker's file browser, while open.
+    pub fn picker(&self) -> Option<&FileBrowserView> {
+        self.picker.as_ref().map(|(b, _)| b)
+    }
+
+    /// The floating picker's file browser, while open.
     pub fn picker_mut(&mut self) -> Option<&mut FileBrowserView> {
         self.picker.as_mut().map(|(b, _)| b)
     }

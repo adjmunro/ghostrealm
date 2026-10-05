@@ -1612,10 +1612,15 @@ impl State {
         }
     }
 
+    /// Every view with timers: the panes' views and the floating picker's.
+    fn timed_views(&self) -> impl Iterator<Item = (SurfaceId, &dyn View)> {
+        let picker = self.app.picker().map(|v| (PICKER_SID, v as &dyn View));
+        self.app.views().chain(picker)
+    }
+
     /// The earliest timer any view has pending.
     fn next_view_deadline(&self) -> Option<Instant> {
-        self.app
-            .views()
+        self.timed_views()
             .filter_map(|(_, v)| v.deadline(&self.cfg))
             .min()
     }
@@ -1625,8 +1630,7 @@ impl State {
     fn fire_view_timers(&mut self) -> bool {
         let now = Instant::now();
         let due: Vec<SurfaceId> = self
-            .app
-            .views()
+            .timed_views()
             .filter(|(_, v)| v.deadline(&self.cfg).is_some_and(|d| now >= d))
             .map(|(sid, _)| sid)
             .collect();
