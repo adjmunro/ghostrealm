@@ -1,9 +1,12 @@
 //! Text editing shared by every text input: the editor, the palette, the file
-//! browser's filter, and the picker's name field.
+//! browser's filter, and the picker's name field. The terminal takes its
+//! readline word/line motions from the same [`Keymap`].
 //!
-//! [`edit_for`] maps a key press to an [`Edit`] by macOS conventions, and each
-//! text model applies it: [`LineEdit`] for one line, the editor's buffer for
-//! many. Modifiers combine — Shift extends the selection with any motion:
+//! A [`Keymap`] maps chords to [`Action`]s, one table per platform; Shift
+//! extends the selection with any motion, so tables bind motions without it.
+//! [`edit_for`] turns a key press into an [`Edit`] through the platform's map,
+//! and each text model applies it: [`LineEdit`] for one line, the editor's
+//! buffer for many. On macOS:
 //!
 //! | Key | Motion |
 //! |---|---|
@@ -16,7 +19,10 @@
 //! Backspace/Delete remove a character, Option a word, Cmd to the line's start
 //! (Backspace) or end (Delete); with a selection they remove it. Cmd+A selects
 //! all; Cmd+C/X/V copy, cut, and paste. Ctrl chords are never edits (Ctrl+arrows
-//! belong to macOS).
+//! belong to macOS). Linux and Windows use Ctrl where macOS uses Option (words)
+//! and Cmd (the text's ends, select all, clipboard), and Home/End for lines.
+
+use std::sync::OnceLock;
 
 use ghostrealm_terminal::{Key, KeyPress};
 
@@ -52,54 +58,193 @@ pub enum Edit {
     Paste,
 }
 
-/// The edit `k` performs, if it is a text-editing key. Enter, Tab, and Escape
-/// are not: each input gives them its own meaning.
-pub fn edit_for(k: &KeyPress) -> Option<Edit> {
-    let m = k.mods;
-    if m.ctrl {
-        return None;
-    }
-    let mv = |to| Some(Edit::Move { to, select: m.shift });
-    if m.super_ {
-        return match k.key {
-            Key::Left => mv(Motion::LineStart),
-            Key::Right => mv(Motion::LineEnd),
-            Key::Up | Key::Home => mv(Motion::DocStart),
-            Key::Down | Key::End => mv(Motion::DocEnd),
-            Key::Backspace => Some(Edit::Delete(Motion::LineStart)),
-            Key::Delete => Some(Edit::Delete(Motion::LineEnd)),
-            Key::Char(c) => match c.to_ascii_lowercase() {
-                'a' => Some(Edit::SelectAll),
-                'c' => Some(Edit::Copy),
-                'x' => Some(Edit::Cut),
-                'v' => Some(Edit::Paste),
-                _ => None,
-            },
-            _ => None,
+/// What a bound chord does. With Shift held, a [`Action::Move`] selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Move(Motion),
+    Delete(Motion),
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// A key with its modifiers, Shift aside (Shift selects). Letters are stored
+/// lowercase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Chord {
+    key: Key,
+    alt: bool,
+    ctrl: bool,
+    super_: bool,
+}
+
+impl Chord {
+    fn of(k: &KeyPress) -> Self {
+        let key = match k.key {
+            Key::Char(c) => Key::Char(c.to_ascii_lowercase()),
+            key => key,
         };
+        Chord { key, alt: k.mods.alt, ctrl: k.mods.ctrl, super_: k.mods.super_ }
     }
-    let (left, right) = if m.alt {
-        (Motion::WordLeft, Motion::WordRight)
-    } else {
-        (Motion::Left, Motion::Right)
-    };
-    match k.key {
-        Key::Left => mv(left),
-        Key::Right => mv(right),
-        Key::Up => mv(Motion::Up),
-        Key::Down => mv(Motion::Down),
-        Key::Home => mv(Motion::LineStart),
-        Key::End => mv(Motion::LineEnd),
-        Key::Backspace => Some(Edit::Delete(left)),
-        Key::Delete => Some(Edit::Delete(right)),
-        Key::Char(c) => {
-            // Option-composed characters (å, ∑, ...) are text, as on macOS.
-            let typed = k.text.clone().unwrap_or_else(|| c.to_string());
-            let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
-            (!typed.is_empty()).then_some(Edit::Insert(typed))
+
+    /// Parse `"alt+left"`, `"cmd+backspace"`, `"ctrl+a"`, ... (case-insensitive;
+    /// `cmd`/`super`, `alt`/`option`). Shift is not allowed: it selects.
+    fn parse(s: &str) -> Option<Self> {
+        let mut c = Chord { key: Key::Char(' '), alt: false, ctrl: false, super_: false };
+        let mut parts = s.split('+').map(str::trim).peekable();
+        while let Some(part) = parts.next() {
+            let p = part.to_ascii_lowercase();
+            if parts.peek().is_some() {
+                match p.as_str() {
+                    "alt" | "option" | "opt" => c.alt = true,
+                    "ctrl" | "control" => c.ctrl = true,
+                    "cmd" | "super" | "command" => c.super_ = true,
+                    _ => return None,
+                }
+                continue;
+            }
+            c.key = match p.as_str() {
+                "left" => Key::Left,
+                "right" => Key::Right,
+                "up" => Key::Up,
+                "down" => Key::Down,
+                "home" => Key::Home,
+                "end" => Key::End,
+                "backspace" => Key::Backspace,
+                "delete" => Key::Delete,
+                _ => {
+                    let mut chars = p.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(ch), None) => Key::Char(ch),
+                        _ => return None,
+                    }
+                }
+            };
         }
-        _ => None,
+        Some(c)
     }
+}
+
+/// Chords to text-editing actions.
+#[derive(Clone, Debug)]
+pub struct Keymap {
+    bindings: Vec<(Chord, Action)>,
+}
+
+/// Bindings both tables share.
+const COMMON: &[(&str, Action)] = &[
+    ("left", Action::Move(Motion::Left)),
+    ("right", Action::Move(Motion::Right)),
+    ("up", Action::Move(Motion::Up)),
+    ("down", Action::Move(Motion::Down)),
+    ("home", Action::Move(Motion::LineStart)),
+    ("end", Action::Move(Motion::LineEnd)),
+    ("backspace", Action::Delete(Motion::Left)),
+    ("delete", Action::Delete(Motion::Right)),
+];
+
+const MACOS: &[(&str, Action)] = &[
+    ("alt+left", Action::Move(Motion::WordLeft)),
+    ("alt+right", Action::Move(Motion::WordRight)),
+    ("alt+up", Action::Move(Motion::Up)),
+    ("alt+down", Action::Move(Motion::Down)),
+    ("cmd+left", Action::Move(Motion::LineStart)),
+    ("cmd+right", Action::Move(Motion::LineEnd)),
+    ("cmd+up", Action::Move(Motion::DocStart)),
+    ("cmd+down", Action::Move(Motion::DocEnd)),
+    ("cmd+home", Action::Move(Motion::DocStart)),
+    ("cmd+end", Action::Move(Motion::DocEnd)),
+    ("alt+backspace", Action::Delete(Motion::WordLeft)),
+    ("alt+delete", Action::Delete(Motion::WordRight)),
+    ("cmd+backspace", Action::Delete(Motion::LineStart)),
+    ("cmd+delete", Action::Delete(Motion::LineEnd)),
+    ("cmd+a", Action::SelectAll),
+    ("cmd+c", Action::Copy),
+    ("cmd+x", Action::Cut),
+    ("cmd+v", Action::Paste),
+];
+
+/// Linux and Windows.
+const PC: &[(&str, Action)] = &[
+    ("ctrl+left", Action::Move(Motion::WordLeft)),
+    ("ctrl+right", Action::Move(Motion::WordRight)),
+    ("ctrl+up", Action::Move(Motion::Up)),
+    ("ctrl+down", Action::Move(Motion::Down)),
+    ("ctrl+home", Action::Move(Motion::DocStart)),
+    ("ctrl+end", Action::Move(Motion::DocEnd)),
+    ("ctrl+backspace", Action::Delete(Motion::WordLeft)),
+    ("ctrl+delete", Action::Delete(Motion::WordRight)),
+    ("ctrl+a", Action::SelectAll),
+    ("ctrl+c", Action::Copy),
+    ("ctrl+x", Action::Cut),
+    ("ctrl+v", Action::Paste),
+];
+
+impl Keymap {
+    fn from_table(tables: &[&[(&str, Action)]]) -> Self {
+        let bindings = tables
+            .iter()
+            .flat_map(|t| t.iter())
+            .map(|(chord, action)| {
+                let c = Chord::parse(chord).unwrap_or_else(|| panic!("bad chord `{chord}`"));
+                (c, *action)
+            })
+            .collect();
+        Keymap { bindings }
+    }
+
+    pub fn macos() -> Self {
+        Self::from_table(&[COMMON, MACOS])
+    }
+
+    /// Linux and Windows.
+    pub fn pc() -> Self {
+        Self::from_table(&[COMMON, PC])
+    }
+
+    /// This platform's keymap.
+    pub fn platform() -> &'static Keymap {
+        static MAP: OnceLock<Keymap> = OnceLock::new();
+        MAP.get_or_init(|| if cfg!(target_os = "macos") { Keymap::macos() } else { Keymap::pc() })
+    }
+
+    /// The action bound to `k`'s chord (Shift ignored).
+    pub fn action(&self, k: &KeyPress) -> Option<Action> {
+        let chord = Chord::of(k);
+        self.bindings.iter().find(|(c, _)| *c == chord).map(|(_, a)| *a)
+    }
+
+    /// The edit `k` performs, if it is a text-editing key: a bound action, else
+    /// typed text (a character without Ctrl or Cmd; Option-composed characters
+    /// like å are text). Enter, Tab, and Escape are not edits: each input gives
+    /// them its own meaning.
+    pub fn edit_for(&self, k: &KeyPress) -> Option<Edit> {
+        if let Some(action) = self.action(k) {
+            return Some(match action {
+                Action::Move(to) => Edit::Move { to, select: k.mods.shift },
+                Action::Delete(to) => Edit::Delete(to),
+                Action::SelectAll => Edit::SelectAll,
+                Action::Copy => Edit::Copy,
+                Action::Cut => Edit::Cut,
+                Action::Paste => Edit::Paste,
+            });
+        }
+        let Key::Char(c) = k.key else {
+            return None;
+        };
+        if k.mods.ctrl || k.mods.super_ {
+            return None;
+        }
+        let typed = k.text.clone().unwrap_or_else(|| c.to_string());
+        let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
+        (!typed.is_empty()).then_some(Edit::Insert(typed))
+    }
+}
+
+/// The edit `k` performs under this platform's [`Keymap`].
+pub fn edit_for(k: &KeyPress) -> Option<Edit> {
+    Keymap::platform().edit_for(k)
 }
 
 /// Word characters, for Option motion: letters, digits, and `_`.
@@ -394,7 +539,32 @@ mod tests {
     }
 
     #[test]
+    fn chords_parse_and_reject_shift() {
+        let c = Chord::parse("Cmd+Option+Left").unwrap();
+        assert!(c.super_ && c.alt && !c.ctrl && c.key == Key::Left);
+        assert_eq!(Chord::parse("ctrl+a").map(|c| c.key), Some(Key::Char('a')));
+        assert_eq!(Chord::parse("shift+left"), None, "Shift selects; it isn't bound");
+        assert_eq!(Chord::parse("alt+nope"), None);
+    }
+
+    #[test]
+    fn pc_uses_ctrl_for_words_and_the_clipboard() {
+        let pc = Keymap::pc();
+        let ctrl = |key| k(key, |m| m.ctrl = true);
+        assert_eq!(pc.edit_for(&ctrl(Key::Left)), Some(Edit::Move { to: Motion::WordLeft, select: false }));
+        let ctrl_shift_end = k(Key::End, |m| {
+            m.ctrl = true;
+            m.shift = true;
+        });
+        assert_eq!(pc.edit_for(&ctrl_shift_end), Some(Edit::Move { to: Motion::DocEnd, select: true }));
+        assert_eq!(pc.edit_for(&ctrl(Key::Char('v'))), Some(Edit::Paste));
+        assert_eq!(pc.edit_for(&ctrl(Key::Char('q'))), None, "unbound Ctrl chords aren't text");
+        assert_eq!(pc.edit_for(&k(Key::Left, |m| m.super_ = true)), None);
+    }
+
+    #[test]
     fn modifiers_pick_the_motion_and_shift_selects() {
+        let edit_for = |k: &KeyPress| Keymap::macos().edit_for(k);
         assert_eq!(edit_for(&plain(Key::Left)), Some(Edit::Move { to: Motion::Left, select: false }));
         let opt_shift = k(Key::Right, |m| {
             m.alt = true;
