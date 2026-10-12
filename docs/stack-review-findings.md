@@ -22,13 +22,6 @@ it; the rest come from reading the code.
   user-visible error surface yet (no toast or status line). Decision needed:
   where should errors like this show?
 
-### 6. Closing a terminal can hang the UI (not reproduced)
-
-- `ThreadedTerminal::drop` joins the worker on the UI thread
-  ([`threaded.rs:150`](../crates/terminal-ghostty/src/threaded.rs)). If the worker
-  is blocked in a PTY write to a child that isn't reading (a large paste into a
-  busy program), the join never returns.
-
 ## Low
 
 7. The git filter runs `git status --porcelain` without `-z`

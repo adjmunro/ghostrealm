@@ -13,11 +13,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use ghostrealm_terminal::{Grid, KeyPress, Lifecycle, Pumped, Scroll, TerminalBackend};
 
+use portable_pty::ChildKiller;
+
 use crate::{CommandBuilder, GhosttyTerminal, PtyWaker};
+
+/// How long a dropped terminal's worker gets to shut down before its child is
+/// killed (a worker blocked writing to a child that isn't reading never sees
+/// `Shutdown`).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Wakes the UI event loop after the worker publishes a change.
 pub type UiWaker = Arc<dyn Fn() + Send + Sync>;
@@ -68,6 +76,8 @@ pub struct ThreadedTerminal {
     /// Last grid seen, for `snapshot()` (peek) callers like the agent.
     last_grid: Grid,
     worker: Option<JoinHandle<()>>,
+    /// Kills the child if the worker doesn't shut down in time.
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
 }
 
 impl ThreadedTerminal {
@@ -91,7 +101,8 @@ impl ThreadedTerminal {
             }),
             generation: AtomicU64::new(0),
         });
-        let (start_tx, start_rx) = mpsc::channel::<Result<()>>();
+        type Started = Result<Box<dyn ChildKiller + Send + Sync>>;
+        let (start_tx, start_rx) = mpsc::channel::<Started>();
         let worker_shared = Arc::clone(&shared);
         // The PTY reader wakes the worker (not the UI) by posting `PtyReady`.
         let waker_tx = cmd_tx.clone();
@@ -114,7 +125,7 @@ impl ThreadedTerminal {
                     Some(pty_waker),
                 ) {
                     Ok(t) => {
-                        let _ = start_tx.send(Ok(()));
+                        let _ = start_tx.send(Ok(t.child_killer()));
                         t
                     }
                     Err(e) => {
@@ -126,11 +137,11 @@ impl ThreadedTerminal {
             })
             .map_err(|e| anyhow!("spawn vt-worker: {e}"))?;
 
-        match start_rx.recv() {
-            Ok(Ok(())) => {}
+        let killer = match start_rx.recv() {
+            Ok(Ok(killer)) => killer,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("vt-worker died during startup")),
-        }
+        };
 
         Ok(ThreadedTerminal {
             cmd_tx,
@@ -139,6 +150,7 @@ impl ThreadedTerminal {
             last_snapshot_gen: 0,
             last_grid: Grid::empty(),
             worker: Some(worker),
+            killer: Some(killer),
         })
     }
 
@@ -147,12 +159,25 @@ impl ThreadedTerminal {
     }
 }
 
+/// Dropping returns at once (it runs on the UI thread); a reaper thread waits
+/// for the worker, killing the child after [`SHUTDOWN_GRACE`] to unblock it.
 impl Drop for ThreadedTerminal {
     fn drop(&mut self) {
         self.send(Cmd::Shutdown);
-        if let Some(h) = self.worker.take() {
-            let _ = h.join();
-        }
+        let (Some(worker), Some(mut killer)) = (self.worker.take(), self.killer.take()) else {
+            return;
+        };
+        let reap = move || {
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !worker.is_finished() {
+                let _ = killer.kill();
+            }
+            let _ = worker.join();
+        };
+        let _ = std::thread::Builder::new().name("vt-reaper".into()).spawn(reap);
     }
 }
 
@@ -362,6 +387,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         assert!(seen, "input written to the handle should reach the child");
+    }
+
+    #[test]
+    fn dropping_a_terminal_stuck_writing_does_not_block_and_kills_the_child() {
+        let dir = std::env::temp_dir().join(format!("ghostrealm-reap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pid_file = dir.join("pid");
+        let _ = std::fs::remove_file(&pid_file);
+        // The child never reads its input, so a large write blocks the worker.
+        let cmd = sh(&format!("stty raw -echo; echo $$ > '{}'; exec sleep 30", pid_file.display()));
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(cmd), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the child never started");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        term.write_bytes(&vec![b'x'; 1 << 20]);
+        std::thread::sleep(Duration::from_millis(100));
+
+        let start = Instant::now();
+        drop(term);
+        assert!(start.elapsed() < Duration::from_millis(100), "drop blocked: {:?}", start.elapsed());
+
+        // Gone, or a zombie (the test process never reaps it).
+        let alive = || {
+            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
+            out.is_ok_and(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
+        };
+        let deadline = Instant::now() + SHUTDOWN_GRACE + Duration::from_secs(3);
+        while alive() {
+            assert!(Instant::now() < deadline, "the child outlived the grace period");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

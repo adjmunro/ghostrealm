@@ -24,7 +24,7 @@ use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::Terminal;
-use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, ChildKiller, MasterPty, PtySize};
 
 /// Re-exported so the app can describe a command without depending on
 /// `portable-pty` directly.
@@ -191,6 +191,11 @@ impl GhosttyTerminal {
             reader_done: false,
             dirty: true,
         })
+    }
+
+    /// A handle that kills the child from another thread.
+    pub fn child_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.child.clone_killer()
     }
 
     /// Write whatever the VT engine queued for the child, then flush.
