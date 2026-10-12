@@ -7,18 +7,6 @@ needed" wait on a product call.
 
 ## Medium
 
-### 2. An overflowing number literal silently empties the whole config (confirmed)
-
-- Where: `check` in [`core/src/config/check.rs:66`](../crates/core/src/config/check.rs) (from `2258248`); reached from `parse` / `load_or_create` ([`config.rs:435`](../crates/core/src/config.rs), [`:469`](../crates/core/src/config.rs)) and the config language server.
-- Repro: any value TOML parses but can't convert, e.g. `font_size = 1e400`,
-  `x = 99999999999999999999`, `0xffffffffffffffffff`.
-- Cause: `toml::Table::deserialize(...).unwrap_or_default()` swallows the
-  conversion error: the table is `Some(empty)` with no findings, so every
-  keybinding is unbound and every option takes its default. The per-entry
-  checks never run.
-- Fix: report the error as a finding at its span and return `table: None`, so
-  the loader keeps the running config.
-
 ### 3. No-op edits clear redo and can evict the oldest undo step (confirmed)
 
 - Where: `checkpoint` / `drop_checkpoint` in [`plugins/editor/buffer.rs:369`](../crates/app/src/plugins/editor/buffer.rs) (from `8639400`).

@@ -431,7 +431,8 @@ pub fn default_file() -> String {
 }
 
 /// Parse config `text` against `cat`. Flagged entries are dropped (so their
-/// defaults apply) or clamped. `None` when the text isn't valid TOML.
+/// defaults apply) or clamped. `None` when the text isn't valid TOML or holds
+/// a number out of TOML's range.
 pub fn parse(text: &str, cat: &Catalogue) -> (Option<Config>, Vec<Finding>) {
     let checked = check(text, cat);
     let mut findings = checked.findings;
@@ -527,6 +528,12 @@ mod tests {
     #[test]
     fn a_syntax_error_yields_no_config() {
         assert_eq!(parse("[terminal\n", &cat()).0, None);
+    }
+
+    #[test]
+    fn an_overflowing_number_yields_no_config() {
+        // Not an empty table: that would unbind every key and reset every option.
+        assert_eq!(parse("[terminal]\nfont_size = 1e400\n", &cat()).0, None);
     }
 
     #[test]

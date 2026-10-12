@@ -43,7 +43,8 @@ impl Finding {
 pub struct Checked {
     pub findings: Vec<Finding>,
     /// The parsed config with every flagged entry dropped or adjusted, ready to
-    /// deserialize. `None` when the text isn't valid TOML.
+    /// deserialize. `None` when the text isn't valid TOML or holds a number out
+    /// of TOML's range.
     pub table: Option<toml::Table>,
 }
 
@@ -63,7 +64,17 @@ pub fn check(text: &str, cat: &Catalogue) -> Checked {
         .iter()
         .map(|e| Finding::error(e.span().unwrap_or(0..0), e.message()))
         .collect();
-    let mut table = toml::Table::deserialize(doc.clone().into_deserializer()).unwrap_or_default();
+    // A literal the parser accepts but can't convert (an integer past i64, a
+    // float past f64) fails the whole table: report it and apply nothing, so
+    // the loader keeps the config it has.
+    let (mut table, converted) = match toml::Table::deserialize(doc.clone().into_deserializer()) {
+        Ok(table) => (table, true),
+        Err(e) => {
+            let message = format!("{}; the file is not applied", e.message());
+            findings.push(Finding::error(e.span().unwrap_or(0..0), message));
+            (toml::Table::new(), false)
+        }
+    };
     // Recovery fills a broken value with a placeholder; checking it would
     // report the syntax error twice.
     let broken = |r: &Range<usize>| {
@@ -156,7 +167,7 @@ pub fn check(text: &str, cat: &Catalogue) -> Checked {
     findings.sort_by_key(|f| f.span.start);
     Checked {
         findings,
-        table: errors.is_empty().then_some(table),
+        table: (errors.is_empty() && converted).then_some(table),
     }
 }
 
@@ -374,6 +385,19 @@ mod tests {
         assert!(checked.table.is_none());
         assert_eq!(checked.findings.len(), 1);
         assert_eq!(checked.findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn an_unconvertible_number_is_an_error_and_no_table() {
+        for literal in ["1e400", "99999999999999999999", "0xffffffffffffffffff"] {
+            let text = format!("[keybindings]\n\"surface.new\" = \"cmd+t\"\n[terminal]\nfont_size = {literal}\n");
+            let checked = check(&text, &cat());
+            assert!(checked.table.is_none(), "{literal}");
+            let found = messages(&text);
+            assert_eq!(found.len(), 1, "{literal}: {found:?}");
+            assert_eq!(found[0].0, Severity::Error);
+            assert_eq!(found[0].1, literal);
+        }
     }
 
     #[test]
