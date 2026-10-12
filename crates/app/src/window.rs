@@ -4169,7 +4169,9 @@ mod tests {
         assert!(!family.is_empty(), "pinned monospace family must be named");
     }
 
+    // An unoptimised build's shaping cost says nothing about a regression.
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing: run with --release")]
     fn full_screen_shaping_cost() {
         let mut font_system = FontSystem::new();
         let (_cw, _ch) = measure_cell(&mut font_system, 1.0, FONT_SIZE, LINE_HEIGHT);

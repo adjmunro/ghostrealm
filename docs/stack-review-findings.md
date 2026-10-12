@@ -31,13 +31,6 @@ it; the rest come from reading the code.
    close the pane (or tab) when its shell exits, or keep it showing the
    final output?
 
-## Flaky test
-
-`window::tests::full_screen_shaping_cost`
-([`window.rs:3955`](../crates/app/src/window.rs)) asserts < 50 ms per frame; a
-debug build measures ~41 ms uncontended and 100–150 ms when other builds compete
-for the CPU. Raise the budget, gate it on `--release`, or `#[ignore]` it.
-
 ## To confirm
 
 `41d9d6b` changed the first cardinal rule in `docs/GIT.md` from "do not commit
