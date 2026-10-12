@@ -181,9 +181,9 @@ pub trait View: Any {
     /// Run timers that are due at `now`.
     fn tick(&mut self, _cx: &mut EventCx, _now: Instant) {}
 
-    /// Persist unsaved state if it has a home (the app is losing focus or
-    /// quitting). Returns the file written, if any.
-    fn autosave(&mut self) -> Option<PathBuf> {
+    /// Persist unsaved state if it has a home and the view autosaves (the app is
+    /// losing focus or quitting). Returns the file written, if any.
+    fn autosave(&mut self, _cfg: &Config) -> Option<PathBuf> {
         None
     }
 

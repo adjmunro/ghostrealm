@@ -568,11 +568,11 @@ impl AppState {
     /// Persist every view's unsaved state that has a home (autosave on app
     /// blur/quit). Returns whether the config file was among what was saved (so
     /// the caller can hot-reload it).
-    pub fn autosave_all(&mut self) -> bool {
+    pub fn autosave_all(&mut self, cfg: &Config) -> bool {
         let config_path = ghostrealm_core::config::config_path();
         let mut saved_config = false;
         for view in self.views.values_mut() {
-            if let Some(path) = view.autosave() {
+            if let Some(path) = view.autosave(cfg) {
                 saved_config |= Some(path) == config_path;
             }
         }

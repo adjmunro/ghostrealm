@@ -42,8 +42,12 @@ const EDITOR_CURSOR_LINE_ALPHA: f32 = 0.05;
 /// Spaces a Tab inserts.
 const TAB_WIDTH: usize = 4;
 
-/// The ribbon's soft-wrap toggle (see [`View::button`]).
+/// The ribbon's toggles (see [`View::button`]).
 const BTN_WRAP: u32 = 0;
+const BTN_AUTOSAVE: u32 = 1;
+/// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
+/// but `[editor] autosave_after` is 0.
+const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
 
 pub struct EditorPlugin;
 
@@ -127,6 +131,11 @@ pub struct EditorView {
     buf: EditorBuffer,
     /// This view's soft-wrap override; `None` follows `[editor] soft_wrap`.
     soft_wrap: Option<bool>,
+    /// This view's autosave override (the ribbon toggle); `None` follows
+    /// `[editor] autosave_after` / `autosave_on_unfocus`.
+    autosave: Option<bool>,
+    /// When the buffer was last written (any save).
+    last_saved: Option<Instant>,
     /// Sub-line wheel remainder (px) carried between events so slow scrolls
     /// accumulate instead of rounding away.
     scroll_accum: f32,
@@ -143,6 +152,8 @@ impl EditorView {
             seen_edits: buf.edits,
             buf,
             soft_wrap: None,
+            autosave: None,
+            last_saved: None,
             scroll_accum: 0.0,
             last_edit_at: None,
             layout: Layout {
@@ -165,6 +176,55 @@ impl EditorView {
         self.soft_wrap.unwrap_or(cfg.editor.soft_wrap)
     }
 
+    /// Whether this view autosaves at all: the toggle, else whether `[editor]`
+    /// enables either trigger.
+    fn autosave_on(&self, cfg: &Config) -> bool {
+        self.autosave
+            .unwrap_or(cfg.editor.autosave_after > 0 || cfg.editor.autosave_on_unfocus)
+    }
+
+    /// Idle seconds before an autosave: `[editor] autosave_after` (0 = never),
+    /// unless the toggle overrides it.
+    fn autosave_after(&self, cfg: &Config) -> Option<u32> {
+        let after = cfg.editor.autosave_after;
+        match self.autosave {
+            Some(false) => None,
+            Some(true) => Some(if after > 0 { after } else { AUTOSAVE_AFTER_DEFAULT }),
+            None => (after > 0).then_some(after),
+        }
+    }
+
+    /// Whether losing focus (the pane's or the app's) or quitting autosaves.
+    fn autosave_on_unfocus(&self, cfg: &Config) -> bool {
+        self.autosave.unwrap_or(cfg.editor.autosave_on_unfocus)
+    }
+
+    /// Write a modified, file-backed buffer. Returns the file written.
+    fn save_if_modified(&mut self) -> Option<PathBuf> {
+        if !self.buf.modified || self.buf.path.is_none() {
+            return None;
+        }
+        self.buf.save().ok().filter(|saved| *saved)?;
+        self.saved();
+        self.buf.path.clone()
+    }
+
+    /// Note a write: disarm the idle timer, stamp the save time.
+    fn saved(&mut self) {
+        self.last_edit_at = None;
+        self.last_saved = Some(Instant::now());
+    }
+
+    /// The autosave toggle's tooltip: its state and the last save.
+    fn autosave_tip(&self, cfg: &Config) -> String {
+        let state = if self.autosave_on(cfg) { "on" } else { "off" };
+        let last = match self.last_saved {
+            Some(t) => format!("Last save: {}", ago(t.elapsed())),
+            None => "Not saved yet".to_string(),
+        };
+        format!("Autosave {state}\n{last}")
+    }
+
     /// Start the idle-autosave clock if the buffer changed since last looked.
     fn note_edits(&mut self) {
         if self.buf.edits != self.seen_edits {
@@ -183,9 +243,9 @@ impl EditorView {
             return;
         };
         if let Ok(true) = self.buf.save() {
+            self.saved();
             cx.request(Request::Saved(path));
         }
-        self.last_edit_at = None;
     }
 
     /// The `(line, col)` under a point, from the last paint's layout (wrap- and
@@ -222,7 +282,8 @@ impl EditorView {
     }
 
     /// The filename ribbon a single-tab editor shows in place of a tab: the name
-    /// (italic when unsaved), size/line-count metrics, and the soft-wrap toggle.
+    /// (italic when unsaved), size/line-count metrics, and the autosave and
+    /// soft-wrap toggles.
     fn paint_ribbon(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         let pad = 8.0 * cx.ui.scale;
@@ -236,17 +297,46 @@ impl EditorView {
         cx.tooltip(wb, "Soft wrap");
         let wb_color = if wrap { cx.chrome.accent } else { theme::GLYPH };
         cx.label("\u{21a9}", Font::MONO, wb.x + (wb.w - cw) * 0.5, top, wb, wb_color);
-        // Metrics, right-aligned before the toggle.
+        // Autosave toggle (a floppy disk: green on, grey off) left of it.
+        let ab = Rect { x: wb.x - ch, ..wb };
+        if cx.button(ab, BTN_AUTOSAVE) {
+            cx.highlight(hover_box(ab, ch));
+        }
+        cx.tooltip(ab, self.autosave_tip(cx.cfg));
+        let disk = if self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
+        paint_floppy(cx, ab, ch * 0.6, disk);
+        // Metrics, right-aligned before the toggles.
         let e = &self.buf;
         let bytes = e.lines.iter().map(|l| l.len()).sum::<usize>() + e.lines.len().saturating_sub(1);
         let meta = format!("{bytes} B   \u{b7}   {} lines", e.lines.len());
-        let meta_left = wb.x - pad - meta.chars().count() as f32 * cw;
+        let meta_left = ab.x - pad - meta.chars().count() as f32 * cw;
         let meta_clip = Rect { x: meta_left, y: r.y, w: (r.x + r.w - meta_left).max(0.0), h: r.h };
         cx.label(&meta, Font::SANS, meta_left, top, meta_clip, theme::TEXT_DIM);
         // Filename, left-aligned, clipped before the metrics.
         let name_clip = Rect { x: r.x, y: r.y, w: (meta_left - r.x).max(0.0), h: r.h };
         let font = Font::SANS.italic(e.modified);
         cx.label(&e.title(), font, r.x + pad, top, name_clip, theme::TEXT);
+    }
+}
+
+/// A floppy-disk icon `side` px square, centred in `r`: a body in `color` with
+/// the shutter and label cut out in the ribbon colour.
+fn paint_floppy(cx: &mut PaintCx, r: Rect, side: f32, color: [u8; 3]) {
+    let x = r.x + (r.w - side) * 0.5;
+    let y = r.y + (r.h - side) * 0.5;
+    let bg = cx.chrome.sidebar;
+    cx.fill(Rect { x, y, w: side, h: side }, color);
+    cx.fill(Rect { x: x + side * 0.25, y, w: side * 0.45, h: side * 0.3 }, bg);
+    cx.fill(Rect { x: x + side * 0.18, y: y + side * 0.55, w: side * 0.64, h: side * 0.3 }, bg);
+}
+
+/// A duration as a short "… ago" phrase.
+fn ago(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 5 => "just now".to_string(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s => format!("{}h ago", s / 3600),
     }
 }
 
@@ -496,45 +586,49 @@ impl View for EditorView {
     }
 
     fn button(&mut self, cx: &mut EventCx, id: u32) {
-        if id == BTN_WRAP {
-            self.soft_wrap = Some(!self.wrap_on(cx.cfg));
-            cx.redraw();
+        match id {
+            BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
+            BTN_AUTOSAVE => {
+                let on = !self.autosave_on(cx.cfg);
+                self.autosave = Some(on);
+                // Switching on arms the idle timer for edits already pending.
+                if on && self.buf.modified {
+                    self.last_edit_at = Some(Instant::now());
+                }
+            }
+            _ => return,
         }
+        cx.redraw();
     }
 
     fn focus_changed(&mut self, cx: &mut EventCx, focused: bool) {
-        if !focused && cx.cfg.editor.autosave_on_unfocus {
-            if let Some(path) = self.autosave() {
+        if !focused && self.autosave_on_unfocus(cx.cfg) {
+            if let Some(path) = self.save_if_modified() {
                 cx.request(Request::Saved(path));
             }
         }
     }
 
     fn deadline(&self, cfg: &Config) -> Option<Instant> {
-        let after = cfg.editor.autosave_after;
-        if after == 0 {
-            return None;
-        }
+        let after = self.autosave_after(cfg)?;
         self.last_edit_at.map(|t| t + Duration::from_secs(after as u64))
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
         if self.deadline(cx.cfg).is_some_and(|d| now >= d) {
             self.last_edit_at = None;
-            if let Some(path) = self.autosave() {
+            if let Some(path) = self.save_if_modified() {
                 cx.request(Request::Saved(path));
             }
             cx.redraw();
         }
     }
 
-    fn autosave(&mut self) -> Option<PathBuf> {
-        if !self.buf.modified || self.buf.path.is_none() {
+    fn autosave(&mut self, cfg: &Config) -> Option<PathBuf> {
+        if !self.autosave_on_unfocus(cfg) {
             return None;
         }
-        self.buf.save().ok().filter(|saved| *saved)?;
-        self.last_edit_at = None;
-        self.buf.path.clone()
+        self.save_if_modified()
     }
 
     fn path(&self) -> Option<PathBuf> {
@@ -548,7 +642,7 @@ impl View for EditorView {
         }
         self.buf.path = Some(path);
         self.buf.save()?;
-        self.last_edit_at = None;
+        self.saved();
         Ok(())
     }
 
@@ -759,6 +853,43 @@ mod tests {
         h.key(&mut v, press(Key::Char('z')));
         let out = h.focus(&mut v, false);
         assert_eq!(out.requests, vec![Request::Saved(path)]);
+    }
+
+    #[test]
+    fn the_autosave_toggle_stops_idle_and_unfocus_saves() {
+        let path = tmpdir("editor-autosave-off").join("f.txt");
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let h = Harness::new();
+        assert!(v.autosave_on(&h.cfg), "the config's default is on");
+        h.button(&mut v, BTN_AUTOSAVE);
+        h.key(&mut v, press(Key::Char('a')));
+        assert_eq!(v.deadline(&h.cfg), None, "no idle timer");
+        assert!(h.focus(&mut v, false).requests.is_empty(), "no save on unfocus");
+        assert_eq!(v.autosave(&h.cfg), None, "nor on quit");
+        assert!(v.modified());
+    }
+
+    #[test]
+    fn switching_autosave_on_works_even_when_the_config_has_it_off() {
+        let path = tmpdir("editor-autosave-on").join("f.txt");
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut h = Harness::new();
+        h.cfg.editor.autosave_after = 0;
+        h.cfg.editor.autosave_on_unfocus = false;
+        h.key(&mut v, press(Key::Char('a')));
+        assert!(!v.autosave_on(&h.cfg) && v.deadline(&h.cfg).is_none());
+        h.button(&mut v, BTN_AUTOSAVE);
+        let due = v.deadline(&h.cfg).expect("pending edits arm the timer");
+        assert_eq!(h.tick(&mut v, due).requests, vec![Request::Saved(path)]);
+        assert!(v.autosave_tip(&h.cfg).starts_with("Autosave on\nLast save: just now"));
+    }
+
+    #[test]
+    fn ago_reads_in_the_largest_unit() {
+        assert_eq!(ago(Duration::from_secs(2)), "just now");
+        assert_eq!(ago(Duration::from_secs(42)), "42s ago");
+        assert_eq!(ago(Duration::from_secs(185)), "3m ago");
+        assert_eq!(ago(Duration::from_secs(7300)), "2h ago");
     }
 
     #[test]

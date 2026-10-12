@@ -222,17 +222,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // for seconds — sometimes long enough that macOS marks the app
                 // unresponsive. Exiting lets the OS reclaim threads and fds; the
                 // closing PTY masters SIGHUP the child shells, exactly as closing
-                // any terminal does. Flush unsaved editors first (autosave).
-                if state.cfg.editor.autosave_on_unfocus {
-                    let _ = state.app.autosave_all();
-                }
+                // any terminal does. Flush unsaved editors first (each view's
+                // autosave setting decides).
+                let _ = state.app.autosave_all(&state.cfg);
                 state.window.set_visible(false);
                 std::process::exit(0);
             }
             WindowEvent::Focused(false) => {
                 // App lost focus: autosave editors (switching to another app), and
                 // hot-reload the config if it was one of them.
-                if state.cfg.editor.autosave_on_unfocus && state.app.autosave_all() {
+                if state.app.autosave_all(&state.cfg) {
                     state.reload_config();
                 }
             }
