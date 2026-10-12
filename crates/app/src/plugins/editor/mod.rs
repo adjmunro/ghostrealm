@@ -25,7 +25,7 @@ use crate::app_state::{AppState, Pick};
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
-    View,
+    View, Waker,
 };
 
 pub use buffer::EditorBuffer;
@@ -68,8 +68,8 @@ impl Plugin for EditorPlugin {
         "Editor"
     }
 
-    fn open(&self, _cx: &OpenCx) -> Result<Box<dyn View>> {
-        Ok(Box::new(EditorView::new(EditorBuffer::scratch())))
+    fn open(&self, cx: &OpenCx) -> Result<Box<dyn View>> {
+        Ok(Box::new(EditorView::with_waker(EditorBuffer::scratch(), cx.waker.clone())))
     }
 
     fn opens_path(&self, _path: &Path) -> bool {
@@ -79,7 +79,7 @@ impl Plugin for EditorPlugin {
     fn open_path(&self, path: &Path, cx: &OpenCx) -> Result<Box<dyn View>> {
         let buf = EditorBuffer::open(path.to_path_buf())
             .with_context(|| format!("can't edit {}", path.display()))?;
-        let mut view = EditorView::new(buf);
+        let mut view = EditorView::with_waker(buf, cx.waker.clone());
         if let Some((client, language_id)) =
             cx.languages.as_ref().and_then(|l| l.start(path, cx.waker.clone()))
         {
@@ -203,7 +203,13 @@ pub struct EditorView {
 
 impl EditorView {
     pub fn new(buf: EditorBuffer) -> Self {
-        let mut stats = Stats::new();
+        Self::with_waker(buf, None)
+    }
+
+    /// Like [`Self::new`], waking the UI with `waker` when background work
+    /// (the ribbon's statistic) finishes.
+    pub fn with_waker(buf: EditorBuffer, waker: Option<Waker>) -> Self {
+        let mut stats = Stats::new(waker);
         stats.fetch_head(buf.path.clone());
         EditorView {
             stats,
@@ -812,8 +818,9 @@ impl View for EditorView {
     }
 
     fn refresh(&mut self) -> bool {
+        let stats = self.stats.poll();
         let lines = &self.buf.lines;
-        self.lang.as_mut().is_some_and(|l| l.refresh(lines))
+        stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
 
     fn autosave(&mut self, cfg: &Config) -> Option<PathBuf> {

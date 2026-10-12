@@ -13,12 +13,6 @@ needed" wait on a product call.
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-12. **The "changes since HEAD" statistic diffs on the UI thread on every
-    keystroke.** `Stats::spans` ([`plugins/editor/stats.rs:133`](../crates/app/src/plugins/editor/stats.rs),
-    from `d0705c1`/`13e2bda`) runs `line_changes` from `paint_ribbon`
-    ([`plugins/editor/mod.rs:421`](../crates/app/src/plugins/editor/mod.rs)):
-    ~45 ms in release (0.7–1.4 s in debug) for a file far from `HEAD`, bounded by
-    `MAX_EDITS = 4000`. Fix: compute on a worker keyed by edit count, or debounce.
 13. **Hover popups paint over modals.** The editor's hover popup
     ([`plugins/editor/lang.rs:257`](../crates/app/src/plugins/editor/lang.rs),
     painted from [`plugins/editor/mod.rs:653`](../crates/app/src/plugins/editor/mod.rs),

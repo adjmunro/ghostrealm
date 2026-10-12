@@ -3,12 +3,13 @@
 //! included).
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 
 use ghostrealm_core::{git, line_diff};
 
 use super::buffer::{split_lines, EditorBuffer};
-use crate::plugin::theme;
+use crate::plugin::{theme, Waker};
 
 /// Which statistic the ribbon shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,17 +34,30 @@ impl Stat {
 pub struct Stats {
     shown: Stat,
     /// The file's lines at `HEAD`; `None` when untracked (or not fetched yet).
-    head: Option<Vec<String>>,
+    head: Option<Arc<Vec<String>>>,
     /// A `HEAD` fetch in flight on a worker thread.
     pending: Option<Receiver<Option<String>>>,
     /// Values keyed by the buffer's edit count they were computed at.
     words: Option<(u64, usize)>,
     changes: Option<(u64, (usize, usize))>,
+    /// A diff against `HEAD` in flight on a worker thread (it can take tens of
+    /// milliseconds, too long for a keystroke's frame).
+    diffing: Option<Receiver<(u64, (usize, usize))>>,
+    /// Wakes the UI when background work finishes.
+    waker: Option<Waker>,
 }
 
 impl Stats {
-    pub fn new() -> Self {
-        Stats { shown: Stat::Lines, head: None, pending: None, words: None, changes: None }
+    pub fn new(waker: Option<Waker>) -> Self {
+        Stats {
+            shown: Stat::Lines,
+            head: None,
+            pending: None,
+            words: None,
+            changes: None,
+            diffing: None,
+            waker,
+        }
     }
 
     #[cfg(test)]
@@ -60,23 +74,61 @@ impl Stats {
             return;
         };
         let (tx, rx) = mpsc::channel();
+        let waker = self.waker.clone();
         std::thread::spawn(move || {
             let _ = tx.send(git::head_text(&path));
+            if let Some(w) = waker {
+                w();
+            }
         });
         self.pending = Some(rx);
     }
 
-    /// Take a finished `HEAD` fetch.
-    pub fn poll(&mut self) {
+    /// Take finished background work: a `HEAD` fetch or a diff. Returns
+    /// whether any arrived.
+    pub fn poll(&mut self) -> bool {
+        let mut arrived = false;
         if let Some(Ok(text)) = self.pending.as_ref().map(|rx| rx.try_recv()) {
             self.pending = None;
             self.set_head(text);
+            arrived = true;
         }
+        if let Some(rx) = &self.diffing {
+            match rx.try_recv() {
+                Ok(c) => {
+                    self.changes = Some(c);
+                    self.diffing = None;
+                    arrived = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.diffing = None,
+            }
+        }
+        arrived
+    }
+
+    /// Diff `buf` against `head` on a worker, unless one is already running
+    /// (its result, if stale, prompts the next).
+    fn start_diff(&mut self, head: Arc<Vec<String>>, buf: &EditorBuffer) {
+        if self.diffing.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (lines, at) = (buf.lines.clone(), buf.edits);
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((at, line_diff::line_changes(&head, &lines)));
+            if let Some(w) = waker {
+                w();
+            }
+        });
+        self.diffing = Some(rx);
     }
 
     fn set_head(&mut self, text: Option<String>) {
-        self.head = text.map(|t| split_lines(&t));
+        self.head = text.map(|t| Arc::new(split_lines(&t)));
         self.changes = None;
+        self.diffing = None;
         if self.head.is_none() && self.shown == Stat::Changes {
             self.shown = Stat::Lines;
         }
@@ -124,16 +176,15 @@ impl Stats {
                 one(count(n, "byte", "bytes"))
             }
             Stat::Changes => {
-                let Some(head) = &self.head else {
+                let Some(head) = self.head.clone() else {
                     return one(String::new());
                 };
-                let (added, deleted) = match self.changes {
-                    Some((at, c)) if at == buf.edits => c,
-                    _ => {
-                        let c = line_diff::line_changes(head, &buf.lines);
-                        self.changes = Some((buf.edits, c));
-                        c
-                    }
+                // Until the diff for these edits lands, show the last one.
+                if self.changes.is_none_or(|(at, _)| at != buf.edits) {
+                    self.start_diff(head, buf);
+                }
+                let Some((_, (added, deleted))) = self.changes else {
+                    return one("\u{2026}".to_string());
                 };
                 vec![
                     (format!("+{}", group(added)), theme::ADDED),
@@ -171,11 +222,21 @@ mod tests {
         spans.into_iter().map(|(s, _)| s).collect()
     }
 
+    /// Wait for the diff in flight.
+    fn settle(s: &mut Stats) {
+        let start = std::time::Instant::now();
+        while s.diffing.is_some() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the diff never landed");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            s.poll();
+        }
+    }
+
     #[test]
     fn cycles_lines_words_bytes_and_skips_changes_when_untracked() {
         let mut b = EditorBuffer::scratch();
         b.insert_str("hello big\nworld");
-        let mut s = Stats::new();
+        let mut s = Stats::new(None);
         assert_eq!(text(s.spans(&b)), "2 lines");
         assert_eq!(s.tip(), "Click for words");
         s.cycle();
@@ -190,13 +251,19 @@ mod tests {
     fn a_tracked_file_adds_changes_since_head() {
         let mut b = EditorBuffer::scratch();
         b.insert_str("a\nB\nc\nd");
-        let mut s = Stats::new();
+        let mut s = Stats::new(None);
         s.set_head(Some("a\nb\nc\n".into()));
         for _ in 0..3 {
             s.cycle();
         }
         assert_eq!(s.shown(), Stat::Changes);
+        assert_eq!(text(s.spans(&b)), "\u{2026}", "the diff runs in the background");
+        settle(&mut s);
         assert_eq!(text(s.spans(&b)), "+2  \u{2212}1");
+        b.insert_str("\ne");
+        assert_eq!(text(s.spans(&b)), "+2  \u{2212}1", "the last diff, until the next lands");
+        settle(&mut s);
+        assert_eq!(text(s.spans(&b)), "+3  \u{2212}1");
         s.set_head(None);
         assert_eq!(s.shown(), Stat::Lines, "untracked again: off the changes view");
     }
@@ -215,14 +282,14 @@ mod tests {
         std::fs::write(&file, "x\n").unwrap();
         assert!(git(&["add", "f.txt"]));
         assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
-        let mut s = Stats::new();
+        let mut s = Stats::new(None);
         s.fetch_head(Some(file));
         let start = std::time::Instant::now();
         while s.head.is_none() && start.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(10));
             s.poll();
         }
-        assert_eq!(s.head, Some(vec!["x".to_string()]));
+        assert_eq!(s.head.as_deref(), Some(&vec!["x".to_string()]));
     }
 
     #[test]
