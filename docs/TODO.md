@@ -631,5 +631,13 @@
   Start with (a). Cost: compute the line hunks once per edit (cached on the edit
   count, like the counts), keep a per-line status for O(1) lookup, and run the
   intra-line diff only for visible changed rows, cached per line.
+- Approach: native, not a "git LSP" (LSP has no primitives for line tints,
+  gutter markers, or phantom rows; git isn't per-language; per-keystroke IPC
+  would lag an in-process diff that costs microseconds). Split it in two:
+  (1) a decoration layer on the editor — line/range background tints, gutter
+  markers, later phantom rows — painted for visible rows only; (2) providers
+  that produce decorations for a buffer. Git is the first provider (HEAD text +
+  line hunks + intra-line diff); LSP diagnostics and the section outline can
+  feed the same layer later. The editor never knows about git.
 - Reason: see what changed since the last commit in place, not just how much.
 
