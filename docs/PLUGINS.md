@@ -38,15 +38,17 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   content (terminal grid, editor text) and build the key with `row_key` from your
   cells so a cache hit costs no allocation.
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
-  fires `View::button(id)` on mouse-up over the same button.
+  fires `View::button(id)` on mouse-up over the same button. An icon-only
+  button names itself with `tooltip(rect, text)` (shown after a short hover).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
 - `tab_strip` says whether the pane shows a strip; a single-tab view may draw its
   own header (the editor's filename ribbon).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
-- Text input: `plugin::text_edit` maps keys to edits by macOS conventions
-  (`edit_for`) and applies them to a `LineEdit` (one line, cursor, selection);
-  draw it with `text_field`. Every text input uses it, so they all edit alike.
+- Text input: `plugin::text_edit` maps keys to edits through the platform's
+  `Keymap` (`edit_for`) and applies them to a `LineEdit` (one line, cursor,
+  selection); draw it with `text_field`. Every text input uses it, so they all
+  edit alike.
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
 into the overlay layer; it doesn't need to know.
@@ -62,7 +64,8 @@ into the overlay layer; it doesn't need to know.
   cursor goes; `Move` is hover.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
 - `focus_changed`, `deadline`/`tick` (timers), `pump`/`is_busy` (background work
-  and the inbox), `autosave`, `path`/`save_as` (Save As), `write_input`/`text`
+  and the inbox), `autosave(cfg)` (app blur/quit; the view decides whether it
+  autosaves), `path`/`save_as` (Save As), `write_input`/`text`
   (agent channel).
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),

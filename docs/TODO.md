@@ -383,11 +383,14 @@
 [2026-09-18@09c015c]
 
 - Requires: NO BLOCKERS
-- Detail: Editor undo/redo (Cmd+Z / Cmd+Shift+Z). Needs an edit-history stack on
-  EditorBuffer (snapshots or a reversible op log with coalescing of consecutive
-  typing into one undo step), wired to the key handler. User has further ideas on
-  scope/behaviour — discuss before building.
-- Reason: basic editing expectation; currently edits can't be undone.
+- Detail: DONE (rudimentary): Cmd+Z / Cmd+Shift+Z in the editor; whole-buffer
+  snapshots (200 steps), typing runs and single-char delete runs coalesce,
+  undoing to the saved text clears `modified`. REMAINING: (1) a reversible op
+  log instead of snapshots (each step copies the whole buffer — costly for big
+  files); (2) finer runs (break at word boundaries / after a pause); (3) undo in
+  single-line fields (`LineEdit`); (4) history survives Save As / reload. User
+  has further ideas on scope/behaviour — discuss before extending.
+- Reason: basic editing expectation.
 
 ---
 
