@@ -628,3 +628,25 @@
   that writes the chosen value back via `textDocument/colorPresentation`.
 - Reason: see and pick colours in place; requested (picker later than the
   language service itself).
+
+---
+
+[2026-10-13@939ddd4] Shortcuts sheet for the focused pane (title-bar button)
+
+- Requires: views that declare their own chords (plugin follow-up (4),
+  view-scoped keybindings); editing needs config write-back
+- Detail: A button in the title bar beside the sidebar toggle opens a sheet of
+  every shortcut that applies to the focused pane's view (one global button,
+  not one per pane, since splits show several views). Sections, top to bottom:
+  1. Global: app chords from `[keybindings]` (splits, workspaces, panes).
+  2. Text editing: the platform `Keymap` (`plugin::text_edit`) — word/line
+     motions, deletes, clipboard, undo; fixed per platform today.
+  3. Everything else: the view's own chords (e.g. the editor's Cmd+S /
+     Cmd+Shift+S) and any custom bindings that fit neither group above.
+  Later, let the sheet edit bindings: a global chord writes back to
+  `[keybindings]` (flagging clashes, as the config checker does).
+  Open: where the button lives without the macOS title-bar strip, and whether
+  the text keymap becomes configurable.
+- Reason: discover (and change) shortcuts where you use them; idea, not
+  committed to.
+
