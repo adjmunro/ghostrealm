@@ -5,20 +5,6 @@ Open bugs found reviewing `1e1ff67..8a77896`. Line numbers are against
 reproduced it; the rest come from reading the code. Items marked "Decision
 needed" wait on a product call.
 
-## High
-
-### 1. A test writes the environment to another session's scratch path
-
-- Where: `config_server_over_stdio` in [`tests/config_lsp.rs:27`](../crates/app/tests/config_lsp.rs) (from `b626ede`).
-- Cause: a leftover debug line writes `std::env::vars()` to a hard-coded
-  `/private/tmp/claude-501/...config-rework-plan.../scratchpad/test.env` and
-  unwraps the result.
-- Effect: every `cargo test` copies the environment (tokens included) to disk;
-  on any machine without that directory (CI, another user, after a reboot) the
-  test panics.
-- Fix: delete the line. The file it wrote still exists on this machine; delete
-  it by hand.
-
 ## Medium
 
 ### 2. An overflowing number literal silently empties the whole config (confirmed)

@@ -24,7 +24,6 @@ fn wait_for<T>(client: &mut Client, mut pick: impl FnMut(Event) -> Option<T>) ->
 fn config_server_over_stdio() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ghostrealm"));
     cmd.args(["lsp", "config"]);
-    std::fs::write("/private/tmp/claude-501/-Users-adjmunro-Developer-ghostrealm--claude-worktrees-config-rework-plan-8d1492/b6ecd412-c327-4062-9cd7-04f6c7a59245/scratchpad/test.env", std::env::vars().map(|(k, v)| format!("{k}={v}\0")).collect::<String>()).unwrap();
     let mut client = Client::spawn(cmd, None, None).expect("spawn the config server");
     let text = "[sidebar]\nside = \"top\"\n[nope]\n";
     client.open("file:///tmp/config.toml".parse().unwrap(), "toml", text.into());
