@@ -3274,6 +3274,10 @@ impl State {
         let mut strip_placements: Vec<Placement> = Vec::new();
         let mut strip_idx = 0usize;
         let multi_pane = resolved.len() > 1;
+        let modal = self.palette.is_some()
+            || self.menu.is_some()
+            || self.app.picker_open()
+            || self.app.confirm().is_some();
 
         // Close-button chrome: one shared '×' glyph placed at every tab/workspace
         // close button, and the hit rects those buttons occupy (rebuilt each frame).
@@ -3429,6 +3433,7 @@ impl State {
                 );
                 cx.focused = pr.focused;
                 cx.tab_strip = *strip_h > 0.0;
+                cx.modal = modal;
                 view.paint(&mut cx, *term);
                 painted.push(sid);
                 if pr.focused && multi_pane {

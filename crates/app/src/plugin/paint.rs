@@ -497,6 +497,10 @@ pub struct PaintCx<'a> {
     /// The pane shows a tab strip above the view (a single-tab pane may hide it;
     /// a view that wants a header of its own then draws one).
     pub tab_strip: bool,
+    /// A modal overlay (palette, menu, picker, confirmation) covers the panes:
+    /// [`above`](Self::above) paints nothing, and a view should close its
+    /// popups.
+    pub modal: bool,
     pub(crate) text: &'a mut TextKit,
     pub(crate) frame: &'a mut Frame,
     pub(crate) layer: Layer,
@@ -522,6 +526,7 @@ impl<'a> PaintCx<'a> {
             cursor,
             focused: false,
             tab_strip: false,
+            modal: false,
             text,
             frame,
             layer,
@@ -729,8 +734,12 @@ impl<'a> PaintCx<'a> {
     }
 
     /// Paint `f` above every pane's content (a view's popups): its quads and
-    /// text go to the overlay pass.
+    /// text go to the overlay pass. Nothing paints while a modal is open: it
+    /// would draw over (or under the dim of) the modal.
     pub fn above(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.modal {
+            return;
+        }
         let layer = std::mem::replace(&mut self.layer, Layer::Overlay);
         f(self);
         self.layer = layer;

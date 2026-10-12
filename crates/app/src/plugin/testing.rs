@@ -21,6 +21,8 @@ pub struct Harness {
     pub cursor: (f32, f32),
     /// Paint as if the pane shows a tab strip above the view.
     pub tab_strip: bool,
+    /// Paint as if a modal overlay covers the panes.
+    pub modal: bool,
 }
 
 impl Default for Harness {
@@ -52,6 +54,7 @@ impl Harness {
             frame: Frame::new((800.0, 600.0)),
             cursor: (-1.0, -1.0),
             tab_strip: false,
+            modal: false,
         }
     }
 
@@ -73,6 +76,7 @@ impl Harness {
         );
         cx.focused = true;
         cx.tab_strip = self.tab_strip;
+        cx.modal = self.modal;
         view.paint(&mut cx, rect);
         self.text.finish_paint();
         &self.frame

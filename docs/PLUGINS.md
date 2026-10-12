@@ -54,7 +54,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   link's pointer, a text field's I-beam).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
 - `above(|cx| ...)` paints into the overlay pass, over every pane (a view's
-  popups, such as the editor's hover docs).
+  popups, such as the editor's hover docs). While `cx.modal` (a palette, menu,
+  picker, or confirmation covers the panes) it paints nothing; close popups
+  then, so they don't reappear when the modal goes.
 - `tab_strip` says whether the pane shows a strip; a single-tab view may draw its
   own header (the editor's filename ribbon).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and

@@ -500,6 +500,9 @@ impl View for EditorView {
     }
 
     fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
+        if cx.modal {
+            self.dismiss_popup();
+        }
         let (cw, ch, scale) = (cx.ui.cell_w, cx.ui.cell_h, cx.ui.scale);
         let wrap = self.wrap_on(cx.cfg);
         // Without a tab strip, the filename gets a ribbon of its own.
@@ -1005,6 +1008,24 @@ mod tests {
         assert!(popup_text(&v).is_some());
         h.mouse(&mut v, MouseEvent::Move { pos: at(0, 0) });
         assert_eq!(popup_text(&v), None);
+    }
+
+    #[test]
+    fn a_modal_closes_the_popup() {
+        let mut h = Harness::new();
+        let mut v = attached("word\n");
+        paint_in_strip(&mut h, &mut v);
+        settle(&mut v);
+        h.mouse(&mut v, MouseEvent::Move { pos: at(0, 1) });
+        let due = v.deadline(&h.cfg).unwrap();
+        h.tick(&mut v, due);
+        settle(&mut v);
+        assert!(popup_text(&v).is_some());
+        h.modal = true;
+        paint_in_strip(&mut h, &mut v);
+        assert_eq!(popup_text(&v), None);
+        assert!(h.frame.overlay_text.is_empty(), "nothing paints over the modal");
+        assert_eq!(v.deadline(&h.cfg), None, "and it doesn't come back under it");
     }
 
     #[test]

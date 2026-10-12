@@ -13,14 +13,6 @@ needed" wait on a product call.
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-13. **Hover popups paint over modals.** The editor's hover popup
-    ([`plugins/editor/lang.rs:257`](../crates/app/src/plugins/editor/lang.rs),
-    painted from [`plugins/editor/mod.rs:653`](../crates/app/src/plugins/editor/mod.rs),
-    from `7654ce1`) draws its text over the Save As/Open picker and the confirm
-    dialog; it isn't dismissed when a modal opens, its dwell timer can open it
-    under one, and with the palette or a menu open its box draws under the dim.
-    Fix: dismiss view popups when a modal opens and skip view overlays while one
-    is open.
 14. **Missing `[keybindings]` binds nothing, silently** (`019dc17`). Files
     written before then carry the comment "If the whole section is empty, the
     built-in defaults apply", which is now false. Decision needed: a missing
