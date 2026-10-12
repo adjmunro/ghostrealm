@@ -19,6 +19,10 @@ pub const TEXT_DIM: [u8; 3] = [140, 140, 155];
 /// Icon glyphs (close '×', toggles), and the same under the cursor.
 pub const GLYPH: [u8; 3] = [140, 140, 155];
 pub const GLYPH_HOVER: [u8; 3] = [235, 235, 245];
+/// A toggle that is on, and a successful result.
+pub const ON: [u8; 3] = [80, 180, 90];
+/// A tooltip's panel.
+pub const TOOLTIP_BG: [u8; 3] = [44, 44, 54];
 /// A text field's border and typed text.
 pub const INPUT_BORDER: [u8; 3] = [80, 80, 95];
 pub const INPUT_TEXT: [u8; 3] = [225, 225, 235];

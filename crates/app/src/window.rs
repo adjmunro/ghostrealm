@@ -31,8 +31,8 @@ use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, TextItem,
-    TextKit, TextSrc, UiMetrics, View,
+    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, Shaped,
+    TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::tap::TapDetector;
 
@@ -50,6 +50,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 /// background-only for this frame and finish on following frames, so a fast
 /// scroll into fresh content never stalls a frame on a burst of shaping.
 const SHAPE_BUDGET: Duration = Duration::from_millis(5);
+/// How long a tooltip's anchor must stay hovered before the tooltip shows.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 /// Max child-output bytes drained per surface per frame. Bounds VT-parse work so
 /// one burst can't stall a frame; the remainder is pumped on following frames.
 const PUMP_BUDGET: usize = 512 * 1024;
@@ -192,6 +194,12 @@ impl ApplicationHandler<UserEvent> for App {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
         if let Some(d) = state.next_view_deadline() {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
+        if let Some(d) = state.tooltip_due {
+            if Instant::now() >= d {
+                state.dirty = true;
+            }
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
         match wake {
@@ -410,6 +418,10 @@ struct State {
     title_place: Option<Placement>,
     /// The floating picker's panel rect this frame (for click-outside).
     picker_panel: Option<Rect>,
+    /// The tooltip anchor under the cursor and since when, for the show delay.
+    tooltip_hover: Option<(Rect, Instant)>,
+    /// When a pending tooltip is due to show (a wake-up).
+    tooltip_due: Option<Instant>,
     /// The last left press (time, position, click count), for counting
     /// double-clicks.
     last_press: Option<(Instant, (f32, f32), u32)>,
@@ -716,6 +728,8 @@ impl State {
             title_buffer,
             title_place: None,
             picker_panel: None,
+            tooltip_hover: None,
+            tooltip_due: None,
             last_press: None,
             mouse_capture: None,
             sidebar_hidden: false,
@@ -2022,6 +2036,62 @@ impl State {
         }
     }
 
+    /// Draw the hovered tooltip once its anchor has been hovered for
+    /// [`TOOLTIP_DELAY`] (until then, schedule the wake that shows it): a small
+    /// panel below the anchor (above, near the bottom edge). A pane's tooltip is
+    /// suppressed while a modal overlay is open.
+    fn build_tooltip(&mut self, frame: &mut Frame) {
+        let modal = self.palette.is_some()
+            || self.menu.is_some()
+            || self.app.picker_open()
+            || self.app.confirm().is_some();
+        let tip = frame.tooltip.take().filter(|(_, _, layer)| !modal || *layer == Layer::Overlay);
+        let Some((anchor, text, _)) = tip else {
+            self.tooltip_hover = None;
+            self.tooltip_due = None;
+            return;
+        };
+        let now = Instant::now();
+        let since = match self.tooltip_hover {
+            Some((r, t)) if r == anchor => t,
+            _ => now,
+        };
+        self.tooltip_hover = Some((anchor, since));
+        if now < since + TOOLTIP_DELAY {
+            self.tooltip_due = Some(since + TOOLTIP_DELAY);
+            return;
+        }
+        self.tooltip_due = None;
+
+        let (sw, sh) = frame.screen;
+        let (scale, ch) = (self.scale, self.cell_h);
+        let pad = 6.0 * scale;
+        let ui = self.ui();
+        let mut cx = PaintCx::new(
+            &self.cfg,
+            &self.chrome,
+            ui,
+            self.cursor,
+            &mut self.text,
+            frame,
+            Layer::Overlay,
+            PICKER_SID,
+        );
+        let lines: Vec<Shaped> = text.lines().map(|l| cx.shape(l, Family::SansSerif, sw)).collect();
+        let w = lines.iter().map(|s| s.width).fold(0.0, f32::max) + pad * 2.0;
+        let h = lines.len() as f32 * ch + pad * 2.0;
+        let gap = 4.0 * scale;
+        let below = anchor.y + anchor.h + gap;
+        let y = if below + h <= sh { below } else { (anchor.y - gap - h).max(0.0) };
+        let x = anchor.x.clamp(0.0, (sw - w).max(0.0));
+        let panel = Rect { x, y, w, h };
+        cx.fill(panel, theme::TOOLTIP_BG);
+        cx.border(panel, theme::INPUT_BORDER);
+        for (i, line) in lines.into_iter().enumerate() {
+            cx.place(line, x + pad, y + pad + i as f32 * ch, panel, theme::TEXT);
+        }
+    }
+
     /// Push sidebar quads and shape vtab-name text; returns placements into
     /// `sidebar_buffers`.
     fn build_sidebar(
@@ -3276,6 +3346,7 @@ impl State {
         // overlay pass.
         self.build_picker(&mut frame);
         self.build_confirm(&mut frame);
+        self.build_tooltip(&mut frame);
 
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();
@@ -3753,7 +3824,7 @@ fn status_color(status: TabStatus) -> [u8; 3] {
     match status {
         TabStatus::Read => [90, 90, 100],
         TabStatus::Busy => [210, 180, 60],
-        TabStatus::Unread { success: true } => [80, 180, 90],
+        TabStatus::Unread { success: true } => theme::ON,
         TabStatus::Unread { success: false } => [200, 80, 80],
         TabStatus::NeedsInput => [210, 120, 40],
     }

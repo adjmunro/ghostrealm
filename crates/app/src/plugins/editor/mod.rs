@@ -233,6 +233,7 @@ impl EditorView {
         if cx.button(wb, BTN_WRAP) {
             cx.highlight(hover_box(wb, ch));
         }
+        cx.tooltip(wb, "Soft wrap");
         let wb_color = if wrap { cx.chrome.accent } else { theme::GLYPH };
         cx.label("\u{21a9}", Font::MONO, wb.x + (wb.w - cw) * 0.5, top, wb, wb_color);
         // Metrics, right-aligned before the toggle.
@@ -606,6 +607,17 @@ mod tests {
         assert!(frame.view_buttons.iter().any(|(_, _, id)| *id == BTN_WRAP));
         paint_in_strip(&mut h, &mut v);
         assert!(h.frame.view_buttons.is_empty(), "under a tab strip, no ribbon");
+    }
+
+    #[test]
+    fn hovering_the_wrap_toggle_offers_a_tooltip() {
+        let mut v = view_with("x");
+        let mut h = Harness::new();
+        let wrap = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_WRAP).unwrap().0;
+        assert!(h.frame.tooltip.is_none(), "not hovered");
+        h.cursor = (wrap.x + 1.0, wrap.y + 1.0);
+        let tip = h.paint(&mut v, RECT).tooltip.clone().map(|t| t.1);
+        assert_eq!(tip.as_deref(), Some("Soft wrap"));
     }
 
     #[test]

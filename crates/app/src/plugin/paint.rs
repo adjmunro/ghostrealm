@@ -175,6 +175,9 @@ pub struct Frame {
     pub view_buttons: Vec<(Rect, SurfaceId, u32)>,
     /// A view needs another paced frame (an animation step, deferred work).
     pub wants_frame: bool,
+    /// The hovered tooltip: its anchor, text (lines split on `\n`), and the
+    /// layer that asked. The app shows it once the hover has lasted a moment.
+    pub tooltip: Option<(Rect, String, Layer)>,
 }
 
 impl Frame {
@@ -187,6 +190,7 @@ impl Frame {
             overlay_text: Vec::new(),
             view_buttons: Vec::new(),
             wants_frame: false,
+            tooltip: None,
         }
     }
 
@@ -437,6 +441,14 @@ impl<'a> PaintCx<'a> {
     pub fn button(&mut self, r: Rect, id: u32) -> bool {
         self.frame.view_buttons.push((r, self.owner, id));
         self.hovered(r)
+    }
+
+    /// Show `text` (lines split on `\n`) as a tooltip while `r` stays hovered —
+    /// for icon buttons with no label.
+    pub fn tooltip(&mut self, r: Rect, text: impl Into<String>) {
+        if self.hovered(r) {
+            self.frame.tooltip = Some((r, text.into(), self.layer));
+        }
     }
 
     /// Shape `text` (one colour, set at placement) into a scratch slot `width`
