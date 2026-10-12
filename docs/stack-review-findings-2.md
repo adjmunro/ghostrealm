@@ -22,15 +22,6 @@ needed" wait on a product call.
     (`sidebar.width` min 40, `font_size` max 96, `double_tap_window_ms` max 2000)
     change existing files' behaviour silently when launched from Finder.
     Decision needed: surface them how (inbox, toast, settings status)?
-17. **Path/URI comparisons are exact (latent).** The config language service
-    matches `config_path == path` ([`languages.rs:27`](../crates/app/src/languages.rs)),
-    so a symlinked path misses; `file_uri` ([`lsp/src/text.rs:105`](../crates/lsp/src/text.rs))
-    percent-encodes RFC 3986 sub-delimiters and is lossy for non-UTF-8 paths;
-    the client compares diagnostics URIs as strings
-    ([`lsp/src/client.rs:252`](../crates/lsp/src/client.rs)), dropping them from
-    servers that normalise URIs. Fix: canonicalise paths; encode per RFC 3986's
-    path grammar; compare decoded paths.
-
 ## Web browser and file-browser preview
 
 Review in progress.

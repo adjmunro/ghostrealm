@@ -249,7 +249,7 @@ impl Client {
                     let Ok(p) = serde_json::from_value::<PublishDiagnosticsParams>(n.params) else {
                         return;
                     };
-                    if self.doc.as_ref().is_some_and(|(uri, _)| *uri == p.uri) {
+                    if self.doc.as_ref().is_some_and(|(uri, _)| crate::text::same_document(uri, &p.uri)) {
                         events.push(Event::Diagnostics(p.diagnostics));
                     }
                 }

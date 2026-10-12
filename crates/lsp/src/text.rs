@@ -100,19 +100,63 @@ fn floor_char_boundary(text: &str, mut i: usize) -> usize {
     i
 }
 
-/// A `file://` URI for an absolute path, percent-encoding everything but
-/// unreserved characters and `/`.
+/// A `file://` URI for an absolute path. The path's bytes are kept as they
+/// are where RFC 3986 allows them in a path (unreserved, sub-delimiters, `:`,
+/// `@`, `/`) and percent-encoded otherwise, so a non-UTF-8 path round-trips.
 pub fn file_uri(path: &Path) -> Uri {
     let mut s = String::from("file://");
-    for b in path.to_string_lossy().bytes() {
+    for &b in path_bytes(path).iter() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 s.push(b as char)
             }
+            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => {
+                s.push(b as char)
+            }
+            b':' | b'@' => s.push(b as char),
             _ => s.push_str(&format!("%{b:02X}")),
         }
     }
     s.parse().expect("a percent-encoded file path is a valid URI")
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().into()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    path.to_string_lossy().into_owned().into_bytes().into()
+}
+
+/// The decoded path bytes of a `file:` URI (any authority dropped), or `None`
+/// for another scheme or a malformed escape.
+fn file_path_bytes(uri: &Uri) -> Option<Vec<u8>> {
+    let rest = uri.as_str().strip_prefix("file:")?;
+    let path = match rest.strip_prefix("//") {
+        Some(auth_path) => &auth_path[auth_path.find('/')?..],
+        None => rest,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    Some(out)
+}
+
+/// Whether two URIs name the same document: equal, or `file:` URIs of the
+/// same path however each is encoded (servers may normalise what they echo).
+pub fn same_document(a: &Uri, b: &Uri) -> bool {
+    a == b || file_path_bytes(a).is_some_and(|p| file_path_bytes(b).as_ref() == Some(&p))
 }
 
 #[cfg(test)]
@@ -150,5 +194,28 @@ mod tests {
     fn file_uris_are_percent_encoded() {
         let uri = file_uri(Path::new("/Users/me/my config/ghost#realm.toml"));
         assert_eq!(uri.as_str(), "file:///Users/me/my%20config/ghost%23realm.toml");
+        let uri = file_uri(Path::new("/a/b@c:d/e;f=g(1)+h,i!.toml"));
+        assert_eq!(uri.as_str(), "file:///a/b@c:d/e;f=g(1)+h,i!.toml", "path characters stay");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.txt"));
+        let uri = file_uri(path);
+        assert_eq!(uri.as_str(), "file:///tmp/caf%E9.txt");
+        assert_eq!(file_path_bytes(&uri).unwrap(), b"/tmp/caf\xe9.txt");
+    }
+
+    #[test]
+    fn documents_match_however_their_uris_are_encoded() {
+        let ours = file_uri(Path::new("/a/b@c/d e.toml"));
+        let uri = |s: &str| s.parse::<Uri>().unwrap();
+        assert!(same_document(&ours, &uri("file:///a/b%40c/d%20e.toml")));
+        assert!(same_document(&ours, &uri("file://localhost/a/b@c/d%20e.toml")));
+        assert!(!same_document(&ours, &uri("file:///a/b@c/d%20f.toml")));
+        assert!(!same_document(&uri("untitled:x"), &uri("untitled:y")));
+        assert!(same_document(&uri("untitled:x"), &uri("untitled:x")));
     }
 }
