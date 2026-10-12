@@ -292,6 +292,9 @@ impl EditorView {
 
     /// The autosave toggle's tooltip: its state and the last save.
     fn autosave_tip(&self, cfg: &Config) -> String {
+        if self.buf.path.is_none() {
+            return "Autosave off (no file)".to_string();
+        }
         let state = if self.autosave_on(cfg) { "on" } else { "off" };
         let last = match self.last_saved {
             Some(t) => format!("Last save: {}", ago(t.elapsed())),
@@ -412,13 +415,15 @@ impl EditorView {
         cx.tooltip(wb, "Soft wrap");
         let wb_color = if wrap { cx.chrome.accent } else { theme::GLYPH };
         cx.label("\u{21a9}", Font::MONO, wb.x + (wb.w - cw) * 0.5, top, wb, wb_color);
-        // Autosave toggle (a floppy disk: green on, grey off) left of it.
+        // Autosave toggle (a floppy disk: green on, grey off) left of it; a
+        // buffer with no file never autosaves, so there it is off and inert.
         let ab = Rect { x: wb.x - ch, ..wb };
-        if cx.button(ab, BTN_AUTOSAVE) {
+        let has_file = self.buf.path.is_some();
+        if has_file && cx.button(ab, BTN_AUTOSAVE) {
             cx.highlight(hover_box(ab, ch));
         }
         cx.tooltip(ab, self.autosave_tip(cx.cfg));
-        let disk = if self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
+        let disk = if has_file && self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
         paint_floppy(cx, ab, FLOPPY * ch, disk);
         // The statistic (click to cycle), right-aligned against the disk.
         self.stats.poll();
@@ -1023,6 +1028,7 @@ mod tests {
     #[test]
     fn the_statistic_sits_against_the_disk_and_cycles_on_click() {
         let mut v = view_with("one two");
+        v.buf.path = Some(tmpdir("editor-stat").join("f.txt"));
         let mut h = Harness::new();
         let buttons = h.paint(&mut v, RECT).view_buttons.clone();
         let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
@@ -1032,6 +1038,15 @@ mod tests {
         assert_eq!(v.stats.shown(), stats::Stat::Lines);
         h.button(&mut v, BTN_STAT);
         assert_eq!(v.stats.shown(), stats::Stat::Words);
+    }
+
+    #[test]
+    fn a_scratch_buffer_shows_autosave_off_and_inert() {
+        let mut v = view_with("x");
+        let mut h = Harness::new();
+        let frame = h.paint(&mut v, RECT);
+        assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_AUTOSAVE), "no toggle to click");
+        assert_eq!(v.autosave_tip(&Config::default()), "Autosave off (no file)");
     }
 
     #[test]
