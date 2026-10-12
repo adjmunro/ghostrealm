@@ -350,8 +350,10 @@ impl EditorView {
         for ln in e.scroll..e.lines.len() {
             if l.wrap_cols == usize::MAX {
                 if vidx == row_off {
-                    // Unwrapped rows are shifted left by hscroll.
-                    return Some((ln, e.hscroll, e.line_len(ln).saturating_sub(e.hscroll)));
+                    // Unwrapped rows are shifted left by hscroll; a line shorter
+                    // than that shows nothing and starts at its end.
+                    let len = e.line_len(ln);
+                    return Some((ln, e.hscroll.min(len), len.saturating_sub(e.hscroll)));
                 }
                 vidx += 1;
             } else {
@@ -1056,6 +1058,20 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 1), clicks: 1 });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 1), dragged: false });
         assert_eq!(v.buffer().selection(), None);
+    }
+
+    #[test]
+    fn a_click_past_a_short_scrolled_line_lands_at_its_end() {
+        let mut v = view_with(&format!("ab\n{}", "x".repeat(100)));
+        v.soft_wrap = Some(false);
+        v.buf.hscroll = 50;
+        let mut h = Harness::new();
+        paint_in_strip(&mut h, &mut v);
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 3), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: false });
+        assert_eq!(v.buffer().cursor, (0, 2));
+        h.key(&mut v, press(Key::Backspace));
+        assert_eq!(v.buffer().lines[0], "a");
     }
 
     #[test]

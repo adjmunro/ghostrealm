@@ -183,6 +183,11 @@ impl EditorBuffer {
         };
         let start = self.byte_of(sr, sc);
         let end = self.byte_of(er, ec);
+        // A range past the end of a line holds no text.
+        if sr == er && start == end {
+            self.anchor = None;
+            return false;
+        }
         if sr == er {
             self.lines[sr].replace_range(start..end, "");
         } else {
@@ -674,6 +679,19 @@ mod tests {
         e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
         e.undo();
         assert_eq!(e.lines, vec![""], "the undo removed the typing, not the no-op");
+    }
+
+    #[test]
+    fn deleting_past_the_end_of_a_line_changes_nothing() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("ab");
+        e.modified = false;
+        e.cursor = (0, 5);
+        let edits = e.edits;
+        assert_eq!(e.apply(Edit::Delete(Motion::Left), &mut None::<String>), Applied::Moved);
+        assert_eq!(e.edits, edits);
+        assert!(!e.modified);
+        assert_eq!(e.lines, vec!["ab"]);
     }
 
     #[test]

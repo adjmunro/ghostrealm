@@ -25,15 +25,6 @@ needed" wait on a product call.
 
 ## Low
 
-5. **Cursor past the end of a line makes phantom edits (confirmed).** The
-   backspace panic from the first review no longer panics (`2190161`), but a
-   click past a short line with soft-wrap off still lands the cursor at
-   `hscroll` ([`plugins/editor/mod.rs:342`](../crates/app/src/plugins/editor/mod.rs)
-   `visual_row` / `pos_at`). Backspace there deletes nothing, yet
-   `delete_selection` ([`buffer.rs:176`](../crates/app/src/plugins/editor/buffer.rs))
-   calls `touch()`: the buffer reports `Changed`, turns modified, records an
-   undo step, and arms autosave. Fix: clamp the clicked column to the line, and
-   skip `touch()` on an empty range.
 6. **Save As picker: Up/Down don't move the list highlight.** `save_key`
    ([`plugins/file_browser/mod.rs:289`](../crates/app/src/plugins/file_browser/mod.rs),
    from `9cb7f2d`) consumes them; the list handling is in `key` (`:628`). Tab is

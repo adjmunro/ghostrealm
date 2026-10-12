@@ -6,17 +6,6 @@ it; the rest come from reading the code.
 
 ## High
 
-### 1. Editor panics on Backspace after a click past a short line (confirmed)
-
-- Where: `pos_at` in [`plugins/editor/mod.rs:207`](../crates/app/src/plugins/editor/mod.rs) (from `ddbb98d`).
-- Repro: soft-wrap off, scroll a long line right (hscroll > the length of another
-  line), click that shorter line, press Backspace.
-- Cause: the unwrapped branch clamps the column to `hs.max(line_len)`, so the
-  cursor lands at `hscroll` past the line's end. `EditorBuffer::backspace` then
-  calls `String::remove(len)` and panics: "cannot remove a char from the end of a
-  string".
-- Fix: clamp to `line_len` (or clamp the cursor in the buffer's edit methods).
-
 ### 3. Config backfill corrupts a config whose section header has a trailing comment (confirmed)
 
 - Where: `active_section_headers` / `backfill_text` in [`core/src/config.rs:471`](../crates/core/src/config.rs) (from `09c015c`).
