@@ -195,8 +195,10 @@ impl EditorBuffer {
         };
         let start = self.byte_of(sr, sc);
         let end = self.byte_of(er, ec);
-        // A range past the end of a line holds no text.
+        // A range past the end of a line holds no text; the cursor moves to
+        // the line's end.
         if sr == er && start == end {
+            self.cursor = (sr, sc.min(self.line_len(sr)));
             self.anchor = None;
             return false;
         }
@@ -722,6 +724,7 @@ mod tests {
         assert_eq!(e.edits, edits);
         assert!(!e.modified);
         assert_eq!(e.lines, vec!["ab"]);
+        assert_eq!(e.cursor, (0, 2), "back on the line");
     }
 
     #[test]
