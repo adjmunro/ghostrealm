@@ -29,9 +29,6 @@ needed" wait on a product call.
 10. **Autosave toggle shows "on" for a scratch buffer**, which never autosaves
     (`autosave_on`, [`plugins/editor/mod.rs:253`](../crates/app/src/plugins/editor/mod.rs),
     from `c4a58ed`). Fix: grey it out, tooltip "Autosave off (no file)".
-11. **Misplaced doc comments** in [`plugins/terminal.rs`](../crates/app/src/plugins/terminal.rs):
-    `cmd_key` (`:237`) carries a stale first paragraph above its real one, and
-    `selection_row_span`'s comment (`:590`) sits on `readline`.
 12. **The "changes since HEAD" statistic diffs on the UI thread on every
     keystroke.** `Stats::spans` ([`plugins/editor/stats.rs:133`](../crates/app/src/plugins/editor/stats.rs),
     from `d0705c1`/`13e2bda`) runs `line_changes` from `paint_ribbon`

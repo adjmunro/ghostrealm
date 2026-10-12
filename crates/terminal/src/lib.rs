@@ -10,14 +10,14 @@
 /// never deals with palette indices or "default" sentinels.
 pub type Rgb = [u8; 3];
 
-/// Per-cell rendition flags, backend-neutral.
+/// Per-cell rendition flags, backend-neutral. There is no inverse-video flag:
+/// the backend swaps foreground and background when it builds the snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttrs {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
-    /// Foreground/background already swapped by the backend when it built the
-    /// snapshot, so the renderer does not need to know about inverse video.
+    /// Faint (SGR 2).
     pub dim: bool,
 }
 
@@ -29,8 +29,8 @@ pub struct Cell {
     pub fg: Rgb,
     pub bg: Rgb,
     pub attrs: CellAttrs,
-    /// True for the lead cell of a double-width grapheme (its trailing cell is
-    /// emitted as a blank so column indexing stays 1:1 with the grid).
+    /// Reserved for the lead cell of a double-width grapheme. No backend sets
+    /// it yet (every cell reports `false`), so renderers can't rely on it.
     pub wide: bool,
 }
 
@@ -165,7 +165,7 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
-    /// Function key F1..=F24.
+    /// Function key F1..=F12.
     Function(u8),
 }
 

@@ -234,8 +234,6 @@ impl TerminalView {
         self.selection = Some(Selection { anchor, head });
     }
 
-    /// Cmd chords the app didn't bind: line start/end (arrows) and the
-    /// clipboard. Everything else is swallowed — Cmd never reaches the shell.
     /// Cmd chords the keymap didn't turn into readline keys: copy and paste.
     fn cmd_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         match k.key {
@@ -587,8 +585,6 @@ fn selection_text(grid: &Grid, sel: Selection) -> String {
     out
 }
 
-/// The inclusive column span `[first, last]` of a selection on `row`, if the row
-/// is within it.
 /// The readline (emacs-mode) keys for a word/line motion or delete, which
 /// shells' line editors bind by default. Other actions have none.
 fn readline(action: Action) -> Option<&'static [u8]> {
@@ -605,6 +601,8 @@ fn readline(action: Action) -> Option<&'static [u8]> {
     })
 }
 
+/// The inclusive column span `[first, last]` of a selection on `row`, if the row
+/// is within it.
 fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     let ((sc, sr), (ec, er)) = sel.ordered();
     if row < sr || row > er || cols == 0 {

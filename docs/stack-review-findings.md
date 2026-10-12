@@ -30,11 +30,6 @@ it; the rest come from reading the code.
 8. Shell exit isn't acted on: the pane stays after `exit`. Decision needed:
    close the pane (or tab) when its shell exits, or keep it showing the
    final output?
-9. Doc comments:
-   - `CellAttrs::dim` carries the inverse-video comment ([`terminal/src/lib.rs:21`](../crates/terminal/src/lib.rs)).
-   - `Key::Function` says F1..=F24; F13+ map to `Unidentified`.
-   - `Cell::wide` is documented but never set.
-   - `load_or_create`'s doc comment sits on `default_binding_ids` ([`config.rs:431`](../crates/core/src/config.rs)).
 
 ## Flaky test
 
