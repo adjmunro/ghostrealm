@@ -10,6 +10,7 @@ pub mod fs_tree;
 pub mod fuzzy;
 pub mod ghostty;
 pub mod git;
+pub mod highlight;
 pub mod line_diff;
 pub mod registry;
 pub mod tree;

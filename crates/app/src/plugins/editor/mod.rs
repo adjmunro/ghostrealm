@@ -6,7 +6,6 @@
 pub mod buffer;
 mod stats;
 pub mod lang;
-pub mod toml;
 pub mod wrap;
 
 use std::any::Any;
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
+use ghostrealm_core::highlight::toml::toml_row_spans;
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -31,7 +31,6 @@ use crate::plugin::{
 pub use buffer::EditorBuffer;
 use stats::Stats;
 use lang::{paint_popup, Lang, Pos};
-use toml::toml_row_spans;
 use wrap::wrap_line;
 
 pub const ID: &str = "editor";
@@ -613,7 +612,7 @@ impl View for EditorView {
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
         for (ln, text, start, y) in &vis {
             let spans: Vec<(String, [u8; 3])> = if highlight_toml {
-                toml_row_spans(&self.buf.lines[*ln], *start, text.chars().count())
+                toml_row_spans(&self.buf.lines[*ln], *start, text.chars().count(), EDITOR_FG)
             } else {
                 vec![(text.clone(), EDITOR_FG)]
             };

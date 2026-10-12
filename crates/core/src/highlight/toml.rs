@@ -1,6 +1,4 @@
-//! Heuristic, line-local TOML syntax highlighting for the editor.
-
-use super::EDITOR_FG;
+//! Heuristic, line-local TOML syntax highlighting.
 
 /// TOML syntax-highlight token colours.
 pub const TOML_COMMENT: [u8; 3] = [110, 140, 110];
@@ -11,12 +9,12 @@ pub const TOML_NUMBER: [u8; 3] = [200, 160, 220];
 
 /// Per-character colours for a single TOML line: comments, `[section]` headers,
 /// `key =` names, quoted strings, and numbers/booleans; everything else is the
-/// default fg. Heuristic and line-local (no multi-line strings), which is plenty
+/// `fg`. Heuristic and line-local (no multi-line strings), which is plenty
 /// for highlighting a config file.
-pub fn toml_line_colors(line: &str) -> Vec<[u8; 3]> {
+pub fn toml_line_colors(line: &str, fg: [u8; 3]) -> Vec<[u8; 3]> {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
-    let mut col = vec![EDITOR_FG; n];
+    let mut col = vec![fg; n];
     let ts = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(n);
     if ts >= n {
         return col;
@@ -105,20 +103,20 @@ fn colour_bare_token(chars: &[char], s: usize, e: usize, col: &mut [[u8; 3]]) {
 
 /// Coloured spans for the visual row `line[start..start+len]` (char indices),
 /// coalescing runs of one colour. Used to shape a highlighted editor row.
-pub fn toml_row_spans(line: &str, start: usize, len: usize) -> Vec<(String, [u8; 3])> {
-    let colors = toml_line_colors(line);
+pub fn toml_row_spans(line: &str, start: usize, len: usize, fg: [u8; 3]) -> Vec<(String, [u8; 3])> {
+    let colors = toml_line_colors(line, fg);
     let chars: Vec<char> = line.chars().collect();
     let end = (start + len).min(chars.len());
     let mut spans: Vec<(String, [u8; 3])> = Vec::new();
     for (i, ch) in chars.iter().enumerate().take(end).skip(start) {
-        let c = colors.get(i).copied().unwrap_or(EDITOR_FG);
+        let c = colors.get(i).copied().unwrap_or(fg);
         match spans.last_mut() {
             Some((s, col)) if *col == c => s.push(*ch),
             _ => spans.push((ch.to_string(), c)),
         }
     }
     if spans.is_empty() {
-        spans.push((String::new(), EDITOR_FG));
+        spans.push((String::new(), fg));
     }
     spans
 }
@@ -127,16 +125,18 @@ pub fn toml_row_spans(line: &str, start: usize, len: usize) -> Vec<(String, [u8;
 mod tests {
     use super::*;
 
+    const FG: [u8; 3] = [220, 220, 230];
+
     #[test]
     fn toml_highlight_basics() {
-        assert!(toml_line_colors("# hi").iter().all(|c| *c == TOML_COMMENT));
-        assert!(toml_line_colors("[editor]").iter().all(|c| *c == TOML_HEADER));
+        assert!(toml_line_colors("# hi", FG).iter().all(|c| *c == TOML_COMMENT));
+        assert!(toml_line_colors("[editor]", FG).iter().all(|c| *c == TOML_HEADER));
         let line = "soft_wrap = true";
-        let c = toml_line_colors(line);
+        let c = toml_line_colors(line, FG);
         assert_eq!(c[0], TOML_KEY, "key name coloured");
         assert_eq!(c[line.find("true").unwrap()], TOML_NUMBER, "bool coloured");
         let line = "name = \"value\"  # note";
-        let c = toml_line_colors(line);
+        let c = toml_line_colors(line, FG);
         assert_eq!(c[line.find('"').unwrap()], TOML_STRING, "string coloured");
         assert_eq!(c[line.find('#').unwrap()], TOML_COMMENT, "trailing comment");
     }
