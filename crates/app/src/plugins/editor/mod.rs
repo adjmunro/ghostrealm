@@ -13,7 +13,7 @@ use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
@@ -77,7 +77,9 @@ impl Plugin for EditorPlugin {
     }
 
     fn open_path(&self, path: &Path, cx: &OpenCx) -> Result<Box<dyn View>> {
-        let mut view = EditorView::new(EditorBuffer::open(path.to_path_buf()));
+        let buf = EditorBuffer::open(path.to_path_buf())
+            .with_context(|| format!("can't edit {}", path.display()))?;
+        let mut view = EditorView::new(buf);
         if let Some((client, language_id)) =
             cx.languages.as_ref().and_then(|l| l.start(path, cx.waker.clone()))
         {
@@ -1086,7 +1088,7 @@ mod tests {
     #[test]
     fn cmd_s_saves_and_reports_the_file() {
         let path = tmpdir("editor-save").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         h.key(&mut v, press(Key::Char('x')));
         assert!(v.modified());
@@ -1109,7 +1111,7 @@ mod tests {
     #[test]
     fn cmd_shift_s_asks_where_even_with_a_file() {
         let path = tmpdir("editor-save-as").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path));
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
         let h = Harness::new();
         let mut k = cmd(Key::Char('S'));
         k.mods.shift = true;
@@ -1184,7 +1186,7 @@ mod tests {
     #[test]
     fn idle_autosave_arms_on_edit_and_fires_after_the_delay() {
         let path = tmpdir("editor-idle").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         assert_eq!(v.deadline(&h.cfg), None, "nothing to save yet");
         h.key(&mut v, press(Key::Char('y')));
@@ -1199,7 +1201,7 @@ mod tests {
     #[test]
     fn losing_focus_autosaves() {
         let path = tmpdir("editor-blur").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         h.key(&mut v, press(Key::Char('z')));
         let out = h.focus(&mut v, false);
@@ -1209,7 +1211,7 @@ mod tests {
     #[test]
     fn the_autosave_toggle_stops_idle_and_unfocus_saves() {
         let path = tmpdir("editor-autosave-off").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         assert!(v.autosave_on(&h.cfg), "the config's default is on");
         h.button(&mut v, BTN_AUTOSAVE);
@@ -1223,7 +1225,7 @@ mod tests {
     #[test]
     fn switching_autosave_on_works_even_when_the_config_has_it_off() {
         let path = tmpdir("editor-autosave-on").join("f.txt");
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()));
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let mut h = Harness::new();
         h.cfg.editor.autosave_after = 0;
         h.cfg.editor.autosave_on_unfocus = false;

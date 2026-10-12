@@ -88,12 +88,15 @@ impl EditorBuffer {
     }
 
     /// Load `path` into a buffer. A missing file starts empty (a new file).
-    pub fn open(path: PathBuf) -> Self {
+    /// Any other read error (not UTF-8, unreadable, a directory) fails: an
+    /// empty buffer bound to the file would overwrite it on save.
+    pub fn open(path: PathBuf) -> std::io::Result<Self> {
         let lines = match std::fs::read_to_string(&path) {
             Ok(text) => split_lines(&text),
-            Err(_) => vec![String::new()],
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![String::new()],
+            Err(e) => return Err(e),
         };
-        EditorBuffer {
+        Ok(EditorBuffer {
             lines,
             cursor: (0, 0),
             scroll: 0,
@@ -104,7 +107,7 @@ impl EditorBuffer {
             edits: 0,
             anchor: None,
             history: History::default(),
-        }
+        })
     }
 
     /// A short display name for the tab (file name, or "*scratch*").
@@ -651,7 +654,7 @@ mod tests {
     #[test]
     fn undoing_back_to_the_save_clears_modified() {
         let path = std::env::temp_dir().join(format!("ghostrealm-undo-{}.txt", std::process::id()));
-        let mut e = EditorBuffer::open(path.clone());
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
         typed(&mut e, "saved");
         e.save().unwrap();
         typed(&mut e, "!");
@@ -724,16 +727,27 @@ mod tests {
 
     #[test]
     fn open_missing_file_starts_empty_with_a_name() {
-        let e = EditorBuffer::open(PathBuf::from("/no/such/file-xyz.txt"));
+        let e = EditorBuffer::open(PathBuf::from("/no/such/file-xyz.txt")).unwrap();
         assert_eq!(e.lines, vec![String::new()]);
         assert_eq!(e.title(), "file-xyz.txt");
+    }
+
+    #[test]
+    fn open_refuses_a_file_it_cannot_read_as_text() {
+        let path = std::env::temp_dir().join(format!("ghostrealm-latin1-{}.txt", std::process::id()));
+        std::fs::write(&path, b"caf\xe9\n").unwrap();
+        let err = EditorBuffer::open(path.clone()).err().expect("not UTF-8: refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xe9\n", "untouched");
+        let _ = std::fs::remove_file(path);
+        assert!(EditorBuffer::open(std::env::temp_dir()).is_err(), "a directory is refused");
     }
 
     #[test]
     fn save_round_trips() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("ghostrealm-edit-{}.txt", std::process::id()));
-        let mut e = EditorBuffer::open(path.clone());
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
         for c in "hello".chars() {
             e.insert_char(c);
         }
@@ -743,7 +757,7 @@ mod tests {
         }
         assert!(e.save().unwrap(), "a path-backed buffer saves");
         assert!(!e.modified);
-        let back = EditorBuffer::open(path.clone());
+        let back = EditorBuffer::open(path.clone()).unwrap();
         assert_eq!(back.lines, vec!["hello".to_string(), "world".to_string()]);
         let _ = std::fs::remove_file(path);
     }

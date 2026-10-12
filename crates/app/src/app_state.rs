@@ -21,7 +21,7 @@ use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
 use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
-use crate::plugins::editor::{self, EditorBuffer, EditorView};
+use crate::plugins::editor;
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 
@@ -548,14 +548,13 @@ impl AppState {
     }
 
     /// An editor on the settings file, with its language service.
-    fn settings_view(&self, path: std::path::PathBuf) -> Box<dyn View> {
-        self.view_for_path(Some(editor::ID), &path)
-            .unwrap_or_else(|_| Box::new(EditorView::new(EditorBuffer::open(path))))
+    fn settings_view(&self, path: &Path) -> Result<Box<dyn View>> {
+        self.view_for_path(Some(editor::ID), path)
     }
 
     /// Open the settings file in a dedicated "settings" workspace: focus the
     /// existing one (opening the editor there if it was closed), or create it.
-    pub fn open_settings(&mut self, path: std::path::PathBuf) {
+    pub fn open_settings(&mut self, path: std::path::PathBuf) -> Result<()> {
         let existing = self
             .tree
             .vtabs()
@@ -576,15 +575,17 @@ impl AppState {
                     })
                     .unwrap_or(false);
                 if !has_editor {
-                    self.open_view_in_focused(self.settings_view(path));
+                    let view = self.settings_view(&path)?;
+                    self.open_view_in_focused(view);
                 }
             }
             None => {
-                let view = self.settings_view(path);
+                let view = self.settings_view(&path)?;
                 let vt = self.new_view_vtab(SETTINGS_VTAB_NAME, view);
                 self.focus_vtab(vt);
             }
         }
+        Ok(())
     }
 
     /// Persist every view's unsaved state that has a home (autosave on app
@@ -1202,6 +1203,7 @@ pub fn build_registry() -> Registry<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::editor::EditorView;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1212,7 +1214,7 @@ mod tests {
         let catalogue = Arc::new(crate::settings::catalogue(&build_registry()));
         let languages = crate::languages::Languages::new(Some(path.clone()), catalogue);
         let mut s = AppState::new().with_languages(Arc::new(languages));
-        s.open_settings(path);
+        s.open_settings(path).unwrap();
         let sid = s.focused_surface().expect("the settings editor is focused");
         let editor = s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
         assert!(editor.lang().is_some());
@@ -1580,6 +1582,17 @@ mod tests {
         let sid = s.focused_surface().unwrap();
         let ed = s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap();
         assert_eq!(ed.buffer().path.as_deref(), Some(file.as_path()));
+    }
+
+    #[test]
+    fn a_file_that_is_not_text_does_not_open() {
+        let mut s = AppState::new();
+        let file = crate::plugin::testing::tmpdir("app-open-binary").join("latin1.txt");
+        std::fs::write(&file, b"caf\xe9").unwrap();
+        s.new_empty_vtab();
+        let err = s.open_path_in_focused(&file).unwrap_err();
+        assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
+        assert_eq!(s.focused_surface(), None, "no tab bound to it");
     }
 
     #[test]

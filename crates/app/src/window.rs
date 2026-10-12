@@ -830,7 +830,9 @@ impl State {
     fn open_config_editor(&mut self) {
         if let Some(path) = ghostrealm_core::config::ensure_file() {
             // Settings live in their own "settings" workspace, not the focused pane.
-            self.app.open_settings(path);
+            if let Err(e) = self.app.open_settings(path.clone()) {
+                eprintln!("ghostrealm: open {}: {e:#}", path.display());
+            }
             self.dirty = true;
         }
     }

@@ -17,15 +17,6 @@ it; the rest come from reading the code.
   string".
 - Fix: clamp to `line_len` (or clamp the cursor in the buffer's edit methods).
 
-### 2. Opening an unreadable file binds an empty buffer to it; saving clobbers it (confirmed)
-
-- Where: `EditorBuffer::open` in [`plugins/editor/buffer.rs:62`](../crates/app/src/plugins/editor/buffer.rs) (from `2e8e8c7`).
-- Repro: open a non-UTF-8 file (e.g. Latin-1) from the file browser or Open File
-  picker, type one character; autosave (on by default) or Cmd+S overwrites it.
-- Cause: every `read_to_string` error is treated as "new file".
-- Fix: only `NotFound` starts empty; any other error refuses to open (or opens
-  read-only).
-
 ### 3. Config backfill corrupts a config whose section header has a trailing comment (confirmed)
 
 - Where: `active_section_headers` / `backfill_text` in [`core/src/config.rs:471`](../crates/core/src/config.rs) (from `09c015c`).
