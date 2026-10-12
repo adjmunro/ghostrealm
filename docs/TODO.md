@@ -602,3 +602,34 @@
   context menu / Cmd+Backspace on the selection) behind `AppState::confirm`, moving
   to the macOS Trash rather than unlinking.
 - Reason: requested alongside the replace confirmation.
+
+---
+
+[2026-10-13@13e2bda] Editor — section outline (jump to a header)
+
+- Requires: per-language header extraction — a hook on the plug-and-play syntax
+  interface for simple formats; the LSP (document symbols) for code
+- Detail: Not a minimap: a list of the file's section headers that jumps to one.
+  Headers per language: TOML `[table]` / `[[array]]`, Markdown `#` headings, code
+  symbols once an LSP is wired. Clicking a header scrolls so it sits mid-screen.
+  Undecided: where the list lives (side panel, ribbon dropdown, palette-like
+  popup), nesting, whether it tracks the cursor's current section.
+- Reason: navigate long files (the config included) by structure.
+
+---
+
+[2026-10-13@13e2bda] Editor — inline git change highlights
+
+- Requires: line-level diff hunks (`core::line_diff` only counts today)
+- Detail: While the ribbon statistic shows changes (or via a toggle), tint line
+  backgrounds like the cursor-line highlight (both can apply): green for added
+  lines, red for changed, with the changed characters in a more vibrant shade
+  (an intra-line diff). Deleted lines have no row in the buffer; options: (a) a
+  red marker in the gutter between the surrounding lines (hover/click shows the
+  removed text), (b) read-only phantom rows drawn between real lines — truer to
+  the diff, but every row-to-line mapping (clicks, wrap, scroll) must skip them.
+  Start with (a). Cost: compute the line hunks once per edit (cached on the edit
+  count, like the counts), keep a per-line status for O(1) lookup, and run the
+  intra-line diff only for visible changed rows, cached per line.
+- Reason: see what changed since the last commit in place, not just how much.
+
