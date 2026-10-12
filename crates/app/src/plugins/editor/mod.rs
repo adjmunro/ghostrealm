@@ -828,11 +828,11 @@ impl View for EditorView {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        if self.buf.path.as_ref() != Some(&path) {
+        let moved = self.buf.path.as_ref() != Some(&path);
+        self.buf.save_as(path)?;
+        if moved {
             self.lang = None;
         }
-        self.buf.path = Some(path);
-        self.buf.save()?;
         self.saved();
         Ok(())
     }
@@ -1162,6 +1162,17 @@ mod tests {
         assert_eq!(v.path(), Some(path));
         assert!(!v.modified());
         assert_eq!(v.title().as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn a_failed_save_as_keeps_the_old_file() {
+        let dir = tmpdir("editor-save-as-fail");
+        let old = dir.join("old.txt");
+        std::fs::write(&old, "x").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(old.clone()).unwrap());
+        // A directory can't be written as a file.
+        assert!(v.save_as(dir.clone()).is_err());
+        assert_eq!(v.path(), Some(old));
     }
 
     #[test]

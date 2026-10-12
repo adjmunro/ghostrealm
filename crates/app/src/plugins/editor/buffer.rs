@@ -482,14 +482,27 @@ impl EditorBuffer {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
+        self.write_to(&path)?;
+        Ok(true)
+    }
+
+    /// Write the buffer to `path` and make that its file. On failure the
+    /// buffer keeps its old path, so later saves don't aim at the failed one.
+    pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.write_to(&path)?;
+        self.path = Some(path);
+        Ok(())
+    }
+
+    fn write_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let mut text = self.lines.join("\n");
         text.push('\n');
-        std::fs::write(&path, text)?;
+        std::fs::write(path, text)?;
         self.modified = false;
         // Typing after a save starts a new step, so undo can return here.
         self.history.saved_version = self.history.version;
         self.history.run = None;
-        Ok(true)
+        Ok(())
     }
 }
 

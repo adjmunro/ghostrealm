@@ -28,13 +28,12 @@ it; the rest come from reading the code.
   (scratch) buffers.
 - TODO.md only tracks a close confirmation for multi-pane workspaces.
 
-### 5. Save As failures are silent and still re-point the buffer
+### 5. Save As failures are silent
 
-- The error goes to stderr only, after the picker has closed
-  ([`window.rs:1195`](../crates/app/src/window.rs)).
-- `EditorView::save_as` sets `buf.path` before writing
-  ([`plugins/editor/mod.rs:527`](../crates/app/src/plugins/editor/mod.rs)), so a
-  failed save leaves later autosaves aimed at the failed path.
+- The error goes to stderr only, after the picker has closed (`after_pick`,
+  [`window.rs:1294`](../crates/app/src/window.rs)). The app has no
+  user-visible error surface yet (no toast or status line). Decision needed:
+  where should errors like this show?
 
 ### 6. Closing a terminal can hang the UI (not reproduced)
 
