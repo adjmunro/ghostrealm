@@ -310,6 +310,11 @@ impl ImageSource for PageImage {
     fn bgra(&self) -> Option<&[u8]> {
         self.0.pixels()
     }
+
+    /// A page frame covers its rect: its alpha channel is not used.
+    fn opaque(&self) -> bool {
+        true
+    }
 }
 
 pub struct WebView {
@@ -739,7 +744,8 @@ impl View for WebView {
                     .and_then(|h| h.frame(self.page));
                 if let Some(f) = frame {
                     let version = f.version();
-                    cx.image(0, version, Arc::new(PageImage(f)), (body.x, body.y), body);
+                    let rect = Rect { x: body.x, y: body.y, w: f.width as f32, h: f.height as f32 };
+                    cx.image(0, version, Arc::new(PageImage(f)), rect, body);
                 }
                 cx.cursor(body, cursor_icon(self.state.cursor));
             }

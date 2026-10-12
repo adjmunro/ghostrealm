@@ -48,7 +48,7 @@ use crate::app_state::AppState;
 
 pub use event::{EventCx, MouseEvent, Outcome, RawKey, Request};
 pub use paint::{
-    Font, Frame, ImageItem, ImageSource, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc,
+    Font, Frame, Image, ImageItem, ImageSource, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc,
 };
 
 /// Called from any thread to wake the UI (it schedules a paced redraw).

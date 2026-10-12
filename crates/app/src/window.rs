@@ -379,7 +379,7 @@ struct State {
     font_locale: String,
 
     quad_pipeline: wgpu::RenderPipeline,
-    /// Textures for the images views place (e.g. web pages).
+    /// Textures for the images views place (web pages, file previews).
     images: ImageRenderer,
     /// The mouse cursor shown now, and the rect a view asked for it over (the
     /// cursor resets to the default when the mouse leaves that rect).
@@ -3432,7 +3432,14 @@ impl State {
         self.build_confirm(&mut frame);
         self.build_tooltip(&mut frame);
 
-        self.images.prepare(&self.device, &self.queue, &frame.images, self.config.width, self.config.height);
+        self.images.prepare(
+            &self.device,
+            &self.queue,
+            &frame.images,
+            &frame.overlay_images,
+            self.config.width,
+            self.config.height,
+        );
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();
         let mut quads = std::mem::take(&mut frame.bg);
@@ -3672,7 +3679,7 @@ impl State {
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, 0..n_bg);
             }
-            self.images.draw(&mut pass, self.config.width, self.config.height);
+            self.images.draw_base(&mut pass, self.config.width, self.config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .context("text render")?;
@@ -3682,6 +3689,7 @@ impl State {
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, n_bg..total);
             }
+            self.images.draw_overlay(&mut pass, self.config.width, self.config.height);
             if !palette_placements.is_empty()
                 || !menu_placements.is_empty()
                 || !frame.overlay_text.is_empty()

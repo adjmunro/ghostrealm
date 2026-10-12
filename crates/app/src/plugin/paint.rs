@@ -1,12 +1,13 @@
 //! Immediate-mode painting for views (and the app's own chrome).
 //!
 //! A frame is built into a [`Frame`]: quads in two layers (under text, over
-//! text) and text items that reference either the content-keyed [`RowCache`] or
-//! a per-frame scratch buffer pool in the shared [`TextKit`]. The app turns the
-//! frame into GPU draws after every view has painted. Nothing here touches the
-//! GPU, so views can be painted (and tested) headless.
+//! text), images, and text items that reference either the content-keyed
+//! [`RowCache`] or a per-frame scratch buffer pool in the shared [`TextKit`].
+//! The app turns the frame into GPU draws after every view has painted. Nothing
+//! here touches the GPU, so views can be painted (and tested) headless.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -156,12 +157,118 @@ pub struct TextItem {
 }
 
 /// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded
-/// (what a web engine or an image decoder produces).
+/// with straight alpha (what a web engine or an image decoder produces).
 pub trait ImageSource {
     /// `(width, height)` in physical pixels.
     fn size(&self) -> (u32, u32);
     /// `width * height * 4` bytes, or `None` if the pixels are gone.
     fn bgra(&self) -> Option<&[u8]>;
+    /// Smaller copies for drawing below full size, each half the size of the
+    /// last: `(width, height, bgra)`. Without them a shrunk image aliases.
+    fn mips(&self) -> &[(u32, u32, Vec<u8>)] {
+        &[]
+    }
+    /// Draw without blending, ignoring alpha (a web page's frame).
+    fn opaque(&self) -> bool {
+        false
+    }
+}
+
+/// Decoded pixels with a box-filtered mip chain, so they stay smooth drawn
+/// smaller than their size. Build one where decoding happens (a worker), not in
+/// `paint`, and pass [`id`](Self::id) as the `version` to [`PaintCx::image`].
+pub struct Image {
+    id: u64,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+    /// Each half the size of the last, down to 1x1.
+    mips: Vec<(u32, u32, Vec<u8>)>,
+}
+
+impl Image {
+    /// An image from `width` x `height` straight-alpha RGBA8 pixels (what the
+    /// `image` crate decodes to).
+    pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Arc<Image> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        assert_eq!(rgba.len(), width as usize * height as usize * 4, "RGBA8 size");
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        let (width, height) = (width.max(1), height.max(1));
+        let mut mips: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        let (mut w, mut h) = (width, height);
+        while w > 1 || h > 1 {
+            let next = halve(w, h, mips.last().map_or(&rgba, |m| &m.2));
+            (w, h) = (next.0, next.1);
+            mips.push(next);
+        }
+        Arc::new(Image {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            width,
+            height,
+            bgra: rgba,
+            mips,
+        })
+    }
+
+    /// Unique per image.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The largest rect with the image's aspect ratio that fits `r`, centred,
+    /// never scaled above `max_scale` (1.0 keeps small images pixel-sized).
+    pub fn fit(&self, r: Rect, max_scale: f32) -> Rect {
+        let (iw, ih) = (self.width as f32, self.height as f32);
+        let s = (r.w / iw).min(r.h / ih).min(max_scale).max(0.0);
+        let (w, h) = (iw * s, ih * s);
+        Rect {
+            x: (r.x + (r.w - w) * 0.5).round(),
+            y: (r.y + (r.h - h) * 0.5).round(),
+            w: w.round(),
+            h: h.round(),
+        }
+    }
+}
+
+impl ImageSource for Image {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn bgra(&self) -> Option<&[u8]> {
+        Some(&self.bgra)
+    }
+
+    fn mips(&self) -> &[(u32, u32, Vec<u8>)] {
+        &self.mips
+    }
+}
+
+/// The next mip level: each pixel the average of (up to) a 2x2 block.
+fn halve(w: u32, h: u32, px: &[u8]) -> (u32, u32, Vec<u8>) {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = Vec::with_capacity(nw as usize * nh as usize * 4);
+    for y in 0..nh {
+        let (y0, y1) = ((y * 2).min(h - 1), (y * 2 + 1).min(h - 1));
+        for x in 0..nw {
+            let (x0, x1) = ((x * 2).min(w - 1), (x * 2 + 1).min(w - 1));
+            for c in 0..4 {
+                let at = |x: u32, y: u32| px[(y as usize * w as usize + x as usize) * 4 + c] as u32;
+                out.push(((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8);
+            }
+        }
+    }
+    (nw, nh, out)
 }
 
 /// An image placed this frame. The app keeps one GPU texture per
@@ -172,8 +279,8 @@ pub struct ImageItem {
     pub id: u32,
     pub version: u64,
     pub source: Arc<dyn ImageSource>,
-    /// Top-left, physical px; drawn at the image's own pixel size.
-    pub at: (f32, f32),
+    /// Where it draws (physical px), stretched to fit.
+    pub rect: Rect,
     pub clip: Rect,
 }
 
@@ -188,15 +295,16 @@ pub enum Layer {
 
 /// Everything painted this frame, in draw order: `bg` quads, then `images`, then
 /// `text`, then `top` quads (cursors, borders, overlay panels), then
-/// `overlay_text`.
+/// `overlay_images`, then `overlay_text`.
 pub struct Frame {
     /// Surface size in physical pixels.
     pub screen: (f32, f32),
     pub bg: Vec<QuadInstance>,
+    pub images: Vec<ImageItem>,
     pub text: Vec<TextItem>,
     pub top: Vec<QuadInstance>,
+    pub overlay_images: Vec<ImageItem>,
     pub overlay_text: Vec<TextItem>,
-    pub images: Vec<ImageItem>,
     /// The mouse cursor a view asked for, and the rect it applies to.
     pub cursor: Option<(Rect, CursorIcon)>,
     /// Buttons views registered: (hit rect, owning surface, view-local id).
@@ -213,10 +321,11 @@ impl Frame {
         Frame {
             screen,
             bg: Vec::new(),
+            images: Vec::new(),
             text: Vec::new(),
             top: Vec::new(),
+            overlay_images: Vec::new(),
             overlay_text: Vec::new(),
-            images: Vec::new(),
             cursor: None,
             view_buttons: Vec::new(),
             wants_frame: false,
@@ -481,27 +590,30 @@ impl<'a> PaintCx<'a> {
         }
     }
 
-    /// Draw `source` with its top-left at `at`, at its own pixel size, clipped to
-    /// `clip`: over this pane's quads, under its text. `id` names the image
-    /// within the view; bump `version` whenever the pixels change (the app
-    /// re-uploads only then). Base layer only: an image never draws over an
-    /// overlay.
+    /// Draw `source` stretched over `rect`, clipped to `clip`: above this
+    /// layer's fills, under its text. `id` names the image within the view; bump
+    /// `version` whenever the pixels change (the app re-uploads only then).
+    /// [`Image::fit`] keeps an aspect ratio.
     pub fn image(
         &mut self,
         id: u32,
         version: u64,
         source: Arc<dyn ImageSource>,
-        at: (f32, f32),
+        rect: Rect,
         clip: Rect,
     ) {
-        self.frame.images.push(ImageItem {
+        let item = ImageItem {
             owner: self.owner,
             id,
             version,
             source,
-            at,
+            rect,
             clip,
-        });
+        };
+        match self.layer {
+            Layer::Base => self.frame.images.push(item),
+            Layer::Overlay => self.frame.overlay_images.push(item),
+        }
     }
 
     /// Show the `icon` mouse cursor while `r` is hovered.
@@ -635,5 +747,23 @@ impl<'a> PaintCx<'a> {
             Layer::Base => self.frame.text.push(item),
             Layer::Overlay => self.frame.overlay_text.push(item),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_is_bgra_with_a_mip_chain_and_fits_a_rect() {
+        let img = Image::from_rgba(5, 2, [1, 2, 3, 4].repeat(5 * 2));
+        assert_eq!(&img.bgra().unwrap()[..4], &[3, 2, 1, 4], "RGBA becomes BGRA");
+        let sizes: Vec<(u32, u32)> = img.mips().iter().map(|(w, h, _)| (*w, *h)).collect();
+        assert_eq!(sizes, vec![(2, 1), (1, 1)]);
+        assert!(img.mips().iter().all(|(w, h, px)| px.len() == (*w * *h * 4) as usize));
+        assert_eq!(&img.mips()[1].2, &[3, 2, 1, 4], "a solid colour averages to itself");
+        let r = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        assert_eq!(img.fit(r, 1.0), Rect { x: 48.0, y: 49.0, w: 5.0, h: 2.0 }, "never upscaled");
+        assert_eq!(img.fit(r, f32::MAX), Rect { x: 0.0, y: 30.0, w: 100.0, h: 40.0 });
     }
 }
