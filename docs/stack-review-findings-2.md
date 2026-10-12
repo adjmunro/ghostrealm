@@ -13,10 +13,6 @@ needed" wait on a product call.
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-9. **Double-tap Shift/Ctrl opens the palette over a confirmation or picker.**
-   `handle_key_taps` ([`window.rs:2618`](../crates/app/src/window.rs)) toggles
-   the palette regardless; the confirm buttons stop responding and Enter
-   replaces the file. Fix: ignore taps while a confirmation or picker is open.
 10. **Autosave toggle shows "on" for a scratch buffer**, which never autosaves
     (`autosave_on`, [`plugins/editor/mod.rs:253`](../crates/app/src/plugins/editor/mod.rs),
     from `c4a58ed`). Fix: grey it out, tooltip "Autosave off (no file)".

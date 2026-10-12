@@ -2638,6 +2638,13 @@ impl State {
                 }
                 false
             }
+            // A confirmation or the picker owns the keyboard; a palette over it
+            // would take its keys and leave it unanswerable.
+            ElementState::Released if self.app.confirm().is_some() || self.app.picker_open() => {
+                self.shift_taps.interrupt();
+                self.ctrl_taps.interrupt();
+                false
+            }
             ElementState::Released => {
                 let now = Instant::now();
                 if is_shift && self.shift_taps.release(now) {
