@@ -24,10 +24,9 @@ it; the rest come from reading the code.
 
 ## Low
 
-7. The git filter runs `git status --porcelain` without `-z`
-   ([`fs_tree.rs:446`](../crates/core/src/fs_tree.rs)): quoted paths (spaces,
-   non-ASCII) never match, untracked directories are collapsed, and it runs on the
-   UI thread.
+7. The git filter runs `git status` on the UI thread (`ensure_git_status`,
+   [`fs_tree.rs:438`](../crates/core/src/fs_tree.rs)), the first time a git
+   filter or the git view is shown after a refresh; a large repo stalls a frame.
 8. Shell exit isn't acted on: the pane stays after `exit`. The worker refreshes
    lifecycle only when a command arrives, so a late reap can leave it `Running`.
 9. Doc comments:

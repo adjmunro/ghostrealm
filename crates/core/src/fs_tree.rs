@@ -433,49 +433,37 @@ impl FsTree {
             .unwrap_or_default()
     }
 
-    /// Run `git status --porcelain` for the repo containing the root and record a
-    /// per-path state. A non-repo (or git failure) yields an empty map.
+    /// Run `git status` for the repo containing the root and record a per-path
+    /// state. A non-repo (or git failure) yields an empty map.
     fn ensure_git_status(&mut self) {
         if self.git_status.is_some() {
             return;
         }
-        let mut map: HashMap<PathBuf, GitState> = HashMap::new();
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(["status", "--porcelain", "--no-renames"])
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                // Resolve the repo top-level so porcelain paths (repo-relative) map
-                // to absolute paths.
-                let top = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&self.root)
-                    .args(["rev-parse", "--show-toplevel"])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-                    .unwrap_or_else(|| self.root.clone());
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if line.len() < 4 {
-                        continue;
-                    }
-                    let code = &line[..2];
-                    let rel = line[3..].trim();
-                    let abs = top.join(rel);
-                    let untracked = code == "??";
-                    map.insert(
-                        abs,
-                        GitState {
-                            modified: !untracked,
-                            untracked,
-                        },
-                    );
-                }
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout)
+        };
+        // Porcelain paths are relative to the repo's top level; the prefix maps
+        // them under the root without comparing absolute paths (which a
+        // symlinked root would spell differently).
+        let status = git(&["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"]);
+        let prefix = git(&["rev-parse", "--show-prefix"]);
+        let map = match (status, prefix) {
+            (Some(status), Some(prefix)) => {
+                let prefix = String::from_utf8_lossy(&prefix).trim_end_matches('\n').to_string();
+                parse_porcelain_z(&status, prefix.as_bytes())
+                    .into_iter()
+                    .map(|(rel, st)| (self.root.join(rel), st))
+                    .collect()
             }
-        }
+            _ => HashMap::new(),
+        };
         self.git_status = Some(map);
     }
 
@@ -998,10 +986,72 @@ fn size_bucket(size: u64) -> (i64, &'static str) {
     }
 }
 
+/// Parse `git status --porcelain -z --no-renames` output: each entry is
+/// `XY <path>\0`, the path verbatim (unquoted) and relative to the repo's top
+/// level. Keeps the entries under `prefix` (the root's path in the repo, with
+/// a trailing `/`, or empty for the top level), relative to it.
+fn parse_porcelain_z(out: &[u8], prefix: &[u8]) -> Vec<(PathBuf, GitState)> {
+    out.split(|b| *b == 0)
+        .filter(|e| e.len() > 3)
+        .filter_map(|e| {
+            let untracked = &e[..2] == b"??";
+            let rel = e[3..].strip_prefix(prefix)?;
+            let state = GitState { modified: !untracked, untracked };
+            Some((path_from_bytes(rel), state))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(b: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(b))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(b: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(b).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn porcelain_z_paths_are_verbatim_and_under_the_prefix() {
+        let out = b" M sub/a b.txt\0?? sub/caf\xc3\xa9/new.txt\0 M top.txt\0";
+        let found = parse_porcelain_z(out, b"sub/");
+        let modified = GitState { modified: true, untracked: false };
+        let untracked = GitState { modified: false, untracked: true };
+        assert_eq!(
+            found,
+            vec![(PathBuf::from("a b.txt"), modified), (PathBuf::from("caf\u{e9}/new.txt"), untracked)]
+        );
+        assert_eq!(parse_porcelain_z(out, b"").len(), 3);
+    }
+
+    #[test]
+    fn the_git_filter_sees_spaced_names_and_files_in_untracked_dirs() {
+        let d = tmpdir();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return; // no git here
+        }
+        fs::write(d.join("a b.txt"), "x").unwrap();
+        assert!(git(&["add", "a b.txt"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
+        fs::write(d.join("a b.txt"), "y").unwrap();
+        fs::create_dir(d.join("new dir")).unwrap();
+        fs::write(d.join("new dir").join("n.txt"), "x").unwrap();
+
+        let mut t = FsTree::new(&d);
+        t.ensure_git_status();
+        assert!(t.git_state(&d.join("a b.txt")).modified);
+        assert!(t.git_state(&d.join("new dir").join("n.txt")).untracked);
+    }
 
     fn tmpdir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
