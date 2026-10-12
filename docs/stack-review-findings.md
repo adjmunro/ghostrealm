@@ -4,19 +4,6 @@ Open bugs found reviewing `develop` up to `feat/editor-file-picker` (`1e1ff67`).
 None is fixed anywhere in the stack. "Confirmed" means a throwaway test reproduced
 it; the rest come from reading the code.
 
-## High
-
-### 3. Config backfill corrupts a config whose section header has a trailing comment (confirmed)
-
-- Where: `active_section_headers` / `backfill_text` in [`core/src/config.rs:471`](../crates/core/src/config.rs) (from `09c015c`).
-- Repro: a config containing `[terminal] # mine`, then Cmd+, (open settings).
-- Cause: header detection requires the trimmed line to end with `]`, so the
-  section reads as missing and a second `[terminal]` table is appended. The file
-  no longer parses, every setting falls back to its default, and backfill never
-  touches it again (it skips files that don't parse).
-- Fix: strip trailing comments before matching; re-parse the result and write
-  only if it still parses.
-
 ## Medium
 
 ### 4. Unsaved editor content is dropped without autosave or a prompt
