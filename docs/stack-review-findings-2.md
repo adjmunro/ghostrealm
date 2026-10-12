@@ -7,10 +7,6 @@ needed" wait on a product call.
 
 ## Low
 
-6. **Save As picker: Up/Down don't move the list highlight.** `save_key`
-   ([`plugins/file_browser/mod.rs:289`](../crates/app/src/plugins/file_browser/mod.rs),
-   from `9cb7f2d`) consumes them; the list handling is in `key` (`:628`). Tab is
-   left alone: TODO.md plans it for focus.
 7. **Terminal readline translation applies inside full-screen apps.** Word/line
    motions become readline keys ([`plugins/terminal.rs:594`](../crates/app/src/plugins/terminal.rs),
    from `903b54d`) in the alternate screen too, and on Linux/Windows they replace

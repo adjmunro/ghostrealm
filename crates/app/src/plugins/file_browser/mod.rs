@@ -285,9 +285,19 @@ impl FileBrowserView {
         }
     }
 
-    /// [`Mode::Save`]'s keys: Enter picks; text editing goes to the file name.
+    /// [`Mode::Save`]'s keys: Enter picks; Up/Down move the highlight, which
+    /// picks the directory to save into (a file's, for a file) but leaves the
+    /// name; other text editing goes to the file name.
     fn save_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
-        if k.key == Key::Enter {
+        if matches!(k.key, Key::Up | Key::Down) && !k.mods.super_ {
+            let delta = if k.key == Key::Up { -1 } else { 1 };
+            let n = self.tree.rows().len();
+            move_highlight(&mut self.sel, n, delta);
+            self.ensure_sel_visible();
+            if let Some(row) = self.selected_row().filter(|r| !r.is_category) {
+                self.chosen = Some(row.path);
+            }
+        } else if k.key == Key::Enter {
             match self.choice() {
                 Some(target) => cx.request(Request::Pick(target)),
                 None => return false,
@@ -1058,6 +1068,23 @@ mod tests {
         h.key(&mut v, press(Key::Backspace));
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(out.requests, vec![Request::Pick(d.join("adir").join("new.m"))]);
+    }
+
+    #[test]
+    fn save_arrows_move_the_highlight_and_keep_the_name() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        v.set_name("new.md");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.sel, Some(0));
+        assert_eq!(v.choice(), Some(d.join("adir").join("new.md")), "into the highlighted dir");
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.sel, Some(1));
+        assert_eq!(v.choice(), Some(d.join("new.md")), "a file's own dir; the name stays");
+        h.key(&mut v, press(Key::Up));
+        assert_eq!(v.sel, Some(0));
     }
 
     #[test]
