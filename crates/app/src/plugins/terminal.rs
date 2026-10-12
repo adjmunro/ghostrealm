@@ -14,6 +14,7 @@ use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Lifecycle, Mods, Pumped, Sc
 use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 
 use crate::app_state::AppState;
+use crate::plugin::text_edit::{Action, Keymap, Motion};
 use crate::plugin::{EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View};
 
 pub const ID: &str = "terminal";
@@ -235,11 +236,9 @@ impl TerminalView {
 
     /// Cmd chords the app didn't bind: line start/end (arrows) and the
     /// clipboard. Everything else is swallowed — Cmd never reaches the shell.
+    /// Cmd chords the keymap didn't turn into readline keys: copy and paste.
     fn cmd_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         match k.key {
-            // Readline line start / end.
-            Key::Left | Key::Up => self.write(&[0x01]),
-            Key::Right | Key::Down => self.write(&[0x05]),
             Key::Char(c) if c.eq_ignore_ascii_case(&'c') => self.copy_selection(cx),
             Key::Char(c) if c.eq_ignore_ascii_case(&'v') => match cx.clipboard_text() {
                 Some(text) if !text.is_empty() => self.write(text.as_bytes()),
@@ -327,6 +326,16 @@ impl View for TerminalView {
 
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let m = k.mods;
+        let action = Keymap::platform().action(k);
+        // The text keymap's word/line motions and deletes become the readline
+        // keys shells bind (Shift+Cmd too; Shift+Option selects below).
+        if m.super_ || (!m.shift && (m.alt || m.ctrl)) {
+            if let Some(bytes) = action.and_then(readline) {
+                self.write(bytes);
+                cx.redraw();
+                return true;
+            }
+        }
         if m.super_ {
             let used = self.cmd_key(cx, k);
             cx.redraw();
@@ -348,10 +357,11 @@ impl View for TerminalView {
                 self.term.scroll(s);
                 return true;
             }
-            // Shift+Arrow selects over the grid (word-wise with Alt) instead of
-            // corrupting the shell input.
+            // Shift+Arrow selects over the grid (word-wise with the keymap's word
+            // modifier) instead of corrupting the shell input.
             if matches!(k.key, Key::Left | Key::Right | Key::Up | Key::Down) {
-                self.extend_selection(k.key, m.alt);
+                let by_word = matches!(action, Some(Action::Move(Motion::WordLeft | Motion::WordRight)));
+                self.extend_selection(k.key, by_word);
                 return true;
             }
             // Shift+Enter sends a bare LF — not the Enter path, so it never
@@ -362,29 +372,15 @@ impl View for TerminalView {
                 return true;
             }
         }
-        if m.alt {
-            // Option+Left/Right = readline word motion (ESC-b / ESC-f);
-            // Option+Up/Down send a plain arrow, not a corrupting modified CSI.
-            match k.key {
-                Key::Left => {
-                    self.write(b"\x1bb");
-                    return true;
-                }
-                Key::Right => {
-                    self.write(b"\x1bf");
-                    return true;
-                }
-                Key::Up | Key::Down => {
-                    self.before_input();
-                    self.term.send_key(&KeyPress {
-                        key: k.key,
-                        mods: Mods::default(),
-                        text: None,
-                    });
-                    return true;
-                }
-                _ => {}
-            }
+        // Option+Up/Down send a plain arrow, not a corrupting modified CSI.
+        if m.alt && matches!(k.key, Key::Up | Key::Down) {
+            self.before_input();
+            self.term.send_key(&KeyPress {
+                key: k.key,
+                mods: Mods::default(),
+                text: None,
+            });
+            return true;
         }
         self.before_input();
         self.term.send_key(k);
@@ -593,6 +589,22 @@ fn selection_text(grid: &Grid, sel: Selection) -> String {
 
 /// The inclusive column span `[first, last]` of a selection on `row`, if the row
 /// is within it.
+/// The readline (emacs-mode) keys for a word/line motion or delete, which
+/// shells' line editors bind by default. Other actions have none.
+fn readline(action: Action) -> Option<&'static [u8]> {
+    Some(match action {
+        Action::Move(Motion::WordLeft) => b"\x1bb",
+        Action::Move(Motion::WordRight) => b"\x1bf",
+        Action::Move(Motion::LineStart | Motion::DocStart) => b"\x01",
+        Action::Move(Motion::LineEnd | Motion::DocEnd) => b"\x05",
+        Action::Delete(Motion::WordLeft) => b"\x1b\x7f",
+        Action::Delete(Motion::WordRight) => b"\x1bd",
+        Action::Delete(Motion::LineStart) => b"\x15",
+        Action::Delete(Motion::LineEnd) => b"\x0b",
+        _ => return None,
+    })
+}
+
 fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     let ((sc, sr), (ec, er)) = sel.ordered();
     if row < sr || row > er || cols == 0 {
@@ -639,6 +651,23 @@ mod tests {
         assert_eq!(selection_text(&grid, rev), "bc\ndef\ngh", "order doesn't matter");
         let one = Selection { anchor: (0, 0), head: (3, 0) };
         assert_eq!(selection_text(&grid, one), "abc", "trailing blanks trimmed");
+    }
+
+    #[test]
+    fn keymap_motions_become_readline_keys() {
+        let key = |key, f: fn(&mut Mods)| {
+            let mut mods = Mods::default();
+            f(&mut mods);
+            KeyPress { key, mods, text: None }
+        };
+        let mac = |k: KeyPress| Keymap::macos().action(&k).and_then(readline);
+        assert_eq!(mac(key(Key::Left, |m| m.alt = true)), Some(&b"\x1bb"[..]));
+        assert_eq!(mac(key(Key::Down, |m| m.super_ = true)), Some(&b"\x05"[..]));
+        assert_eq!(mac(key(Key::Backspace, |m| m.super_ = true)), Some(&b"\x15"[..]));
+        assert_eq!(mac(key(Key::Char('v'), |m| m.super_ = true)), None, "paste isn't readline");
+        let pc = |k: KeyPress| Keymap::pc().action(&k).and_then(readline);
+        assert_eq!(pc(key(Key::Right, |m| m.ctrl = true)), Some(&b"\x1bf"[..]));
+        assert_eq!(pc(key(Key::Char('c'), |m| m.ctrl = true)), None, "Ctrl+C still reaches the shell");
     }
 
     #[test]
