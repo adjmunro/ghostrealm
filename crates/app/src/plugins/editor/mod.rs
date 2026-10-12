@@ -3,6 +3,7 @@
 //! is the fallback when no more specific plugin opens a file.
 
 pub mod buffer;
+mod stats;
 pub mod toml;
 pub mod wrap;
 
@@ -24,6 +25,7 @@ use crate::plugin::{
 };
 
 pub use buffer::EditorBuffer;
+use stats::Stats;
 use toml::toml_row_spans;
 use wrap::wrap_line;
 
@@ -45,6 +47,7 @@ const TAB_WIDTH: usize = 4;
 /// The ribbon's toggles (see [`View::button`]).
 const BTN_WRAP: u32 = 0;
 const BTN_AUTOSAVE: u32 = 1;
+const BTN_STAT: u32 = 2;
 /// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -136,6 +139,8 @@ pub struct EditorView {
     autosave: Option<bool>,
     /// When the buffer was last written (any save).
     last_saved: Option<Instant>,
+    /// The ribbon's statistic (click to cycle).
+    stats: Stats,
     /// Sub-line wheel remainder (px) carried between events so slow scrolls
     /// accumulate instead of rounding away.
     scroll_accum: f32,
@@ -148,7 +153,10 @@ pub struct EditorView {
 
 impl EditorView {
     pub fn new(buf: EditorBuffer) -> Self {
+        let mut stats = Stats::new();
+        stats.fetch_head(buf.path.clone());
         EditorView {
+            stats,
             seen_edits: buf.edits,
             buf,
             soft_wrap: None,
@@ -213,6 +221,7 @@ impl EditorView {
     fn saved(&mut self) {
         self.last_edit_at = None;
         self.last_saved = Some(Instant::now());
+        self.stats.fetch_head(self.buf.path.clone());
     }
 
     /// The autosave toggle's tooltip: its state and the last save.
@@ -282,7 +291,7 @@ impl EditorView {
     }
 
     /// The filename ribbon a single-tab editor shows in place of a tab: the name
-    /// (italic when unsaved), size/line-count metrics, and the autosave and
+    /// (italic when unsaved), a statistic (click to cycle), and the autosave and
     /// soft-wrap toggles.
     fn paint_ribbon(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
@@ -304,20 +313,30 @@ impl EditorView {
         }
         cx.tooltip(ab, self.autosave_tip(cx.cfg));
         let disk = if self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
-        paint_floppy(cx, ab, ch * 0.6, disk);
-        // Metrics, right-aligned before the toggles.
+        paint_floppy(cx, ab, FLOPPY * ch, disk);
+        // The statistic (click to cycle), right-aligned against the disk.
+        self.stats.poll();
+        let spans = self.stats.spans(&self.buf);
+        let stat = cx.shape_spans(&spans, Font::SANS, r.w);
+        let gap = 6.0 * cx.ui.scale;
+        let disk_left = ab.x + (ab.w - FLOPPY * ch) * 0.5;
+        let stat_left = disk_left - gap - stat.width;
+        let sb = Rect { x: stat_left - gap, y: r.y, w: stat.width + gap * 2.0, h: r.h };
+        if cx.button(sb, BTN_STAT) {
+            cx.highlight(sb);
+        }
+        cx.tooltip(sb, self.stats.tip());
+        cx.place(stat, stat_left, top, sb, theme::TEXT_DIM);
+        // Filename, left-aligned, clipped before the statistic.
         let e = &self.buf;
-        let bytes = e.lines.iter().map(|l| l.len()).sum::<usize>() + e.lines.len().saturating_sub(1);
-        let meta = format!("{bytes} B   \u{b7}   {} lines", e.lines.len());
-        let meta_left = ab.x - pad - meta.chars().count() as f32 * cw;
-        let meta_clip = Rect { x: meta_left, y: r.y, w: (r.x + r.w - meta_left).max(0.0), h: r.h };
-        cx.label(&meta, Font::SANS, meta_left, top, meta_clip, theme::TEXT_DIM);
-        // Filename, left-aligned, clipped before the metrics.
-        let name_clip = Rect { x: r.x, y: r.y, w: (meta_left - r.x).max(0.0), h: r.h };
+        let name_clip = Rect { x: r.x, y: r.y, w: (sb.x - r.x).max(0.0), h: r.h };
         let font = Font::SANS.italic(e.modified);
         cx.label(&e.title(), font, r.x + pad, top, name_clip, theme::TEXT);
     }
 }
+
+/// The floppy-disk icon's side, in rows.
+const FLOPPY: f32 = 0.6;
 
 /// A floppy-disk icon `side` px square, centred in `r`: a body in `color` with
 /// the shutter and label cut out in the ribbon colour.
@@ -588,6 +607,7 @@ impl View for EditorView {
     fn button(&mut self, cx: &mut EventCx, id: u32) {
         match id {
             BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
+            BTN_STAT => self.stats.cycle(),
             BTN_AUTOSAVE => {
                 let on = !self.autosave_on(cx.cfg);
                 self.autosave = Some(on);
@@ -702,6 +722,20 @@ mod tests {
         assert!(frame.view_buttons.iter().any(|(_, _, id)| *id == BTN_WRAP));
         paint_in_strip(&mut h, &mut v);
         assert!(h.frame.view_buttons.is_empty(), "under a tab strip, no ribbon");
+    }
+
+    #[test]
+    fn the_statistic_sits_against_the_disk_and_cycles_on_click() {
+        let mut v = view_with("one two");
+        let mut h = Harness::new();
+        let buttons = h.paint(&mut v, RECT).view_buttons.clone();
+        let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
+        let (stat, disk) = (at(BTN_STAT), at(BTN_AUTOSAVE));
+        let disk_left = disk.x + (disk.w - FLOPPY * UI.cell_h) * 0.5;
+        assert!((stat.x + stat.w - disk_left).abs() < 1.0, "right edge meets the disk");
+        assert_eq!(v.stats.shown(), stats::Stat::Lines);
+        h.button(&mut v, BTN_STAT);
+        assert_eq!(v.stats.shown(), stats::Stat::Words);
     }
 
     #[test]

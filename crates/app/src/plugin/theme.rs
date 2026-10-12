@@ -21,6 +21,9 @@ pub const GLYPH: [u8; 3] = [140, 140, 155];
 pub const GLYPH_HOVER: [u8; 3] = [235, 235, 245];
 /// A toggle that is on, and a successful result.
 pub const ON: [u8; 3] = [80, 180, 90];
+/// Lines added and deleted (diff counts).
+pub const ADDED: [u8; 3] = [80, 180, 90];
+pub const DELETED: [u8; 3] = [210, 90, 90];
 /// A tooltip's panel.
 pub const TOOLTIP_BG: [u8; 3] = [44, 44, 54];
 /// A text field's border and typed text.

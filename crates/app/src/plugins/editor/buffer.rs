@@ -470,7 +470,7 @@ impl EditorBuffer {
 
 /// Split file text into lines, dropping a single trailing newline so a normal
 /// file doesn't gain a phantom empty last line.
-fn split_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_lines(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
     if lines.len() > 1 && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
         lines.pop();
