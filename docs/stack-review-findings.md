@@ -9,8 +9,8 @@ it; the rest come from reading the code.
 ### 4. Unsaved editor content is dropped without autosave or a prompt
 
 - Closing an editor tab/pane/workspace drops the view
-  (`prune_orphan_surfaces_after`, [`app_state.rs:598`](../crates/app/src/app_state.rs)).
-- Quitting (`CloseRequested`, [`window.rs:209`](../crates/app/src/window.rs))
+  (`prune_orphan_surfaces_after`, [`app_state.rs:680`](../crates/app/src/app_state.rs)).
+- Quitting (`CloseRequested`, [`window.rs:220`](../crates/app/src/window.rs))
   autosaves only when `autosave_on_unfocus = true`, and never saves pathless
   (scratch) buffers.
 - TODO.md only tracks a close confirmation for multi-pane workspaces.
