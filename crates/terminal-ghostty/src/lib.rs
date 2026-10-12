@@ -193,6 +193,11 @@ impl GhosttyTerminal {
         })
     }
 
+    /// Whether the child's side of the PTY has closed (its output ended).
+    pub fn output_closed(&self) -> bool {
+        self.reader_done
+    }
+
     /// A handle that kills the child from another thread.
     pub fn child_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
         self.child.clone_killer()

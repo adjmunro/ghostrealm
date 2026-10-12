@@ -27,8 +27,9 @@ it; the rest come from reading the code.
 7. The git filter runs `git status` on the UI thread (`ensure_git_status`,
    [`fs_tree.rs:438`](../crates/core/src/fs_tree.rs)), the first time a git
    filter or the git view is shown after a refresh; a large repo stalls a frame.
-8. Shell exit isn't acted on: the pane stays after `exit`. The worker refreshes
-   lifecycle only when a command arrives, so a late reap can leave it `Running`.
+8. Shell exit isn't acted on: the pane stays after `exit`. Decision needed:
+   close the pane (or tab) when its shell exits, or keep it showing the
+   final output?
 9. Doc comments:
    - `CellAttrs::dim` carries the inverse-video comment ([`terminal/src/lib.rs:21`](../crates/terminal/src/lib.rs)).
    - `Key::Function` says F1..=F24; F13+ map to `Unidentified`.

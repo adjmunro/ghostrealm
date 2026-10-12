@@ -27,6 +27,13 @@ use crate::{CommandBuilder, GhosttyTerminal, PtyWaker};
 /// `Shutdown`).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// How often an otherwise idle worker checks whether the child has exited:
+/// nothing else wakes it when the exit brings no output (a background job
+/// still holds the PTY) or the reap trails the EOF. Faster once the output
+/// has ended, when the exit is due.
+const EXIT_POLL: Duration = Duration::from_millis(500);
+const EXIT_POLL_AFTER_EOF: Duration = Duration::from_millis(50);
+
 /// Wakes the UI event loop after the worker publishes a change.
 pub type UiWaker = Arc<dyn Fn() + Send + Sync>;
 
@@ -266,7 +273,20 @@ fn worker_loop(
     // Block until there's something to do, then drain the whole batch so a flood of
     // PtyReady/commands collapses into one pump + one publish. Exits when the last
     // handle drops (channel closed) or on `Shutdown`.
-    while let Ok(first) = cmd_rx.recv() {
+    let mut exit_poll = Some(EXIT_POLL);
+    loop {
+        let first = if let Some(timeout) = exit_poll {
+            match cmd_rx.recv_timeout(timeout) {
+                Ok(m) => Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match cmd_rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            }
+        };
         let mut pump = false;
         let mut shutdown = false;
         let mut apply = |m: Cmd, term: &mut GhosttyTerminal| match m {
@@ -282,7 +302,9 @@ fn worker_loop(
             Cmd::PtyReady => pump = true,
             Cmd::Shutdown => shutdown = true,
         };
-        apply(first, term);
+        if let Some(m) = first {
+            apply(m, term);
+        }
         while let Ok(m) = cmd_rx.try_recv() {
             apply(m, term);
         }
@@ -308,6 +330,8 @@ fn worker_loop(
             busy: term.is_busy(),
             lifecycle: term.lifecycle(),
         };
+        exit_poll = (new_meta.lifecycle == Lifecycle::Running)
+            .then(|| if term.output_closed() { EXIT_POLL_AFTER_EOF } else { EXIT_POLL });
         let meta_changed = {
             let mut m = shared.meta.lock().unwrap();
             let changed =
@@ -424,6 +448,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_exit_without_output_is_noticed() {
+        // The background job keeps the PTY open, so the exit brings no EOF, and
+        // no command follows to wake the worker.
+        let cmd = sh("sleep 3 & sleep 0.3");
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(cmd), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while term.lifecycle() == Lifecycle::Running {
+            assert!(Instant::now() < deadline, "the exit was never noticed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(0)));
     }
 
     #[test]
