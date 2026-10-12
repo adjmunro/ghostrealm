@@ -702,6 +702,7 @@ impl View for EditorView {
             // shows once the cursor is dragged away.
             MouseEvent::Down { pos: (x, y), .. } => {
                 self.dismiss_popup();
+                self.buf.end_undo_run();
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
                     self.buf.cursor = p;
                     self.buf.anchor = Some(p);
@@ -1072,6 +1073,23 @@ mod tests {
         assert_eq!(v.buffer().cursor, (0, 2));
         h.key(&mut v, press(Key::Backspace));
         assert_eq!(v.buffer().lines[0], "a");
+    }
+
+    #[test]
+    fn typing_after_a_mouse_selection_is_its_own_undo_step() {
+        let mut v = view_with("");
+        let mut h = Harness::new();
+        paint_in_strip(&mut h, &mut v);
+        for c in "abc".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 3) });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: true });
+        h.key(&mut v, press(Key::Char('x')));
+        assert_eq!(v.buffer().lines, vec!["x"]);
+        h.key(&mut v, cmd(Key::Char('z')));
+        assert_eq!(v.buffer().lines, vec!["abc"]);
     }
 
     #[test]

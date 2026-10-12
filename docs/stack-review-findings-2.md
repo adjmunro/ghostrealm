@@ -5,24 +5,6 @@ Open bugs found reviewing `1e1ff67..8a77896`. Line numbers are against
 reproduced it; the rest come from reading the code. Items marked "Decision
 needed" wait on a product call.
 
-## Medium
-
-### 3. No-op edits clear redo and can evict the oldest undo step (confirmed)
-
-- Where: `checkpoint` / `drop_checkpoint` in [`plugins/editor/buffer.rs:369`](../crates/app/src/plugins/editor/buffer.rs) (from `8639400`).
-- Repro: type, undo, then press Backspace at the start of the buffer (or Cut with
-  no selection); Redo does nothing.
-- Cause: `checkpoint` clears `redo` and trims the stack to `MAX_UNDO` before the
-  edit runs; `drop_checkpoint` withdraws the snapshot but restores neither.
-- Fix: clear redo and trim only once the edit changed the text.
-
-### 4. A mouse selection joins the open typing run, so undo skips a state (confirmed)
-
-- Where: `checkpoint` ([`buffer.rs:371`](../crates/app/src/plugins/editor/buffer.rs)) keys the run by cursor; the mouse handlers ([`plugins/editor/mod.rs:699`](../crates/app/src/plugins/editor/mod.rs)) set cursor and anchor directly.
-- Repro: type `abc`, drag-select columns 0..3, type `x`, Cmd+Z: the buffer is
-  empty instead of `abc`.
-- Fix: a mouse press ends the run.
-
 ## Low
 
 6. **Save As picker: Up/Down don't move the list highlight.** `save_key`

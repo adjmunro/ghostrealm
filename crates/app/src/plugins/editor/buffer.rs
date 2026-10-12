@@ -70,6 +70,18 @@ struct History {
     saved_version: u64,
 }
 
+impl History {
+    /// An edit changed the text: what was undone can't be redone, and the
+    /// oldest steps past [`MAX_UNDO`] go.
+    fn committed(&mut self) {
+        self.redo.clear();
+        if self.undo.len() > MAX_UNDO {
+            let excess = self.undo.len() - MAX_UNDO;
+            self.undo.drain(..excess);
+        }
+    }
+}
+
 impl EditorBuffer {
     /// An empty scratch buffer.
     pub fn scratch() -> Self {
@@ -350,6 +362,9 @@ impl EditorBuffer {
             Edit::Undo => self.undo(),
             Edit::Redo => self.redo(),
         }
+        if step.is_some() && self.edits != edits {
+            self.history.committed();
+        }
         match step {
             // A step that changed nothing leaves no undo entry.
             Some(_) if opened && self.edits == edits => self.drop_checkpoint(),
@@ -382,13 +397,15 @@ impl EditorBuffer {
         let snap = self.snapshot();
         let h = &mut self.history;
         h.undo.push(snap);
-        if h.undo.len() > MAX_UNDO {
-            h.undo.remove(0);
-        }
-        h.redo.clear();
         h.next_version += 1;
         h.version = h.next_version;
         true
+    }
+
+    /// End the open typing/deleting run, so the next edit starts a new undo
+    /// step (e.g. after the cursor moved by mouse).
+    pub fn end_undo_run(&mut self) {
+        self.history.run = None;
     }
 
     /// Withdraw the step [`Self::checkpoint`] just opened.
@@ -692,6 +709,31 @@ mod tests {
         assert_eq!(e.edits, edits);
         assert!(!e.modified);
         assert_eq!(e.lines, vec!["ab"]);
+    }
+
+    #[test]
+    fn a_no_op_edit_keeps_redo() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "a");
+        e.undo();
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        e.apply(Edit::Cut, &mut None::<String>);
+        e.redo();
+        assert_eq!(e.lines, vec!["a"]);
+    }
+
+    #[test]
+    fn undo_keeps_at_most_max_undo_steps() {
+        let mut e = EditorBuffer::scratch();
+        for _ in 0..MAX_UNDO + 5 {
+            e.apply(Edit::Insert("ab".into()), &mut None::<String>);
+        }
+        assert_eq!(e.history.undo.len(), MAX_UNDO);
+        e.undo();
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        e.apply(Edit::Move { to: Motion::DocStart, select: false }, &mut None::<String>);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.history.undo.len(), MAX_UNDO, "a no-op evicts nothing");
     }
 
     #[test]
