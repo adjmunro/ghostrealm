@@ -151,7 +151,7 @@ pub fn check(text: &str, cat: &Catalogue) -> Checked {
                 let chord = values.get(key).and_then(Value::as_str).and_then(normalize_chord);
                 if let Some(chord) = chord {
                     if let Some((_, first)) = chords.iter().find(|(c, _)| *c == chord) {
-                        findings.push(Finding::warning(
+                        findings.push(Finding::error(
                             v.span(),
                             format!("`{chord}` is already bound to `{first}`; this binding is ignored"),
                         ));
@@ -206,6 +206,11 @@ fn check_value(key: &str, kind: Kind, found: &Value) -> Verdict {
         Kind::Float { min, max } => {
             let f = match found {
                 Value::Float(f) if f.is_finite() => *f,
+                Value::Float(_) => {
+                    return Verdict::Invalid(format!(
+                        "`{key}` must be a finite number ({min}–{max}); the default applies"
+                    ))
+                }
                 Value::Integer(i) => *i as f64,
                 _ => return mismatch(),
             };
@@ -368,6 +373,7 @@ mod tests {
         let text = "[keybindings]\n\"surface.new\" = \"cmd+t\"\n\"pane.close\" = \"Super+T\"\n";
         let found = messages(text);
         assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, Severity::Error, "the binding is dropped");
         assert_eq!(found[0].1, "\"Super+T\"");
         assert!(found[0].2.contains("already bound to `surface.new`"));
         let table = check(text, &cat()).table.unwrap();
@@ -376,6 +382,16 @@ mod tests {
         let found = messages("[keybindings]\n\"surface.new\" = \"cmd+t+w\"\n");
         assert_eq!(found[0].0, Severity::Error);
         assert!(found[0].2.contains("not a chord"));
+    }
+
+    #[test]
+    fn nan_and_inf_are_not_finite_numbers() {
+        for v in ["nan", "inf", "-inf"] {
+            let found = messages(&format!("[terminal]\nfont_size = {v}\n"));
+            assert_eq!(found.len(), 1, "{v}: {found:?}");
+            assert_eq!(found[0].0, Severity::Error);
+            assert!(found[0].2.contains("must be a finite number"), "{}", found[0].2);
+        }
     }
 
     #[test]

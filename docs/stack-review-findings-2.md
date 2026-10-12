@@ -22,10 +22,6 @@ needed" wait on a product call.
     (`sidebar.width` min 40, `font_size` max 96, `double_tap_window_ms` max 2000)
     change existing files' behaviour silently when launched from Finder.
     Decision needed: surface them how (inbox, toast, settings status)?
-16. **Config check nits** ([`core/src/config/check.rs`](../crates/core/src/config/check.rs)):
-    a duplicate chord (`:145`) is a Warning though the binding is dropped (an
-    Error by the severity definitions); `nan`/`inf` for a number reads "expects
-    number 40–1000, found float" (`:197`).
 17. **Path/URI comparisons are exact (latent).** The config language service
     matches `config_path == path` ([`languages.rs:27`](../crates/app/src/languages.rs)),
     so a symlinked path misses; `file_uri` ([`lsp/src/text.rs:105`](../crates/lsp/src/text.rs))
