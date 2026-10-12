@@ -26,15 +26,16 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, Request, Shaped,
-    TextItem, TextKit, TextSrc, UiMetrics, View,
+    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, RawKey, Request,
+    Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
+use crate::images::ImageRenderer;
 use crate::tap::TapDetector;
 
 /// Divider gap between split panes, in physical pixels.
@@ -270,6 +271,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Hover reaches the view under the cursor (e.g. the file browser's
                 // highlight follows the mouse).
                 redraw |= state.hover_view();
+                // Leaving the rect a view set a cursor for restores the default.
+                if state.cursor_rect.is_some_and(|r| !rect_contains(r, state.cursor.0, state.cursor.1)) {
+                    state.cursor_rect = None;
+                    state.set_cursor_icon(CursorIcon::Default);
+                    redraw = true;
+                }
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -321,8 +328,11 @@ impl ApplicationHandler<UserEvent> for App {
                     state.on_key(&event);
                     state.mark_dirty();
                     state.window.request_redraw();
-                } else if toggled {
-                    state.window.request_redraw();
+                } else {
+                    // Views that do their own key handling (a web page) need releases.
+                    if state.on_key_release(&event) || toggled {
+                        state.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -369,6 +379,14 @@ struct State {
     font_locale: String,
 
     quad_pipeline: wgpu::RenderPipeline,
+    /// Textures for the images views place (e.g. web pages).
+    images: ImageRenderer,
+    /// The mouse cursor shown now, and the rect a view asked for it over (the
+    /// cursor resets to the default when the mouse leaves that rect).
+    cursor_icon: CursorIcon,
+    cursor_rect: Option<Rect>,
+    /// Views painted last frame (on screen), for [`View::shown`].
+    shown: std::collections::HashSet<SurfaceId>,
     quad_buffer: wgpu::Buffer,
     quad_capacity: u64,
 
@@ -684,6 +702,7 @@ impl State {
         let title_buffer = Buffer::new(&mut font_system, warm_metrics);
 
         let quad_pipeline = build_quad_pipeline(&device, format);
+        let images = ImageRenderer::new(&device, format);
         let quad_capacity = 4096;
         let quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("quad-instances"),
@@ -748,6 +767,10 @@ impl State {
             clipboard: arboard::Clipboard::new().ok(),
             cursor: (0.0, 0.0),
             quad_pipeline,
+            images,
+            cursor_icon: CursorIcon::Default,
+            cursor_rect: None,
+            shown: std::collections::HashSet::new(),
             quad_buffer,
             quad_capacity,
             app,
@@ -1148,6 +1171,46 @@ impl State {
             Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Move { pos })),
             None => false,
         }
+    }
+
+    /// A key release: offered raw to the focused view when nothing modal owns
+    /// the keyboard. Returns whether it asked for a redraw.
+    fn on_key_release(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.app.confirm().is_some() || self.app.picker_open() || self.palette.is_some() {
+            return false;
+        }
+        let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) else {
+            return false;
+        };
+        let raw = RawKey { event, press: None };
+        self.view_event(sid, |v, cx| {
+            v.raw_key(cx, &raw);
+        })
+    }
+
+    fn set_cursor_icon(&mut self, icon: CursorIcon) {
+        if icon != self.cursor_icon {
+            self.cursor_icon = icon;
+            self.window.set_cursor(icon);
+        }
+    }
+
+    /// Tell views that came on or went off screen this frame.
+    fn update_shown(&mut self, painted: &[SurfaceId]) {
+        let now: std::collections::HashSet<SurfaceId> = painted.iter().copied().collect();
+        let gone: Vec<SurfaceId> = self.shown.difference(&now).copied().collect();
+        let new: Vec<SurfaceId> = now.difference(&self.shown).copied().collect();
+        for sid in gone {
+            if let Some(v) = self.app.view_mut(sid) {
+                v.shown(false);
+            }
+        }
+        for sid in new {
+            if let Some(v) = self.app.view_mut(sid) {
+                v.shown(true);
+            }
+        }
+        self.shown = now;
     }
 
     /// Cell geometry and scale for view contexts.
@@ -2659,13 +2722,17 @@ impl State {
             }
         }
 
-        // The focused view takes the key.
+        // The focused view takes the key: raw first (views with their own key
+        // handling), else mapped.
         if let Some(sid) = self.app.focused_surface().filter(|s| self.app.view(*s).is_some()) {
-            if let Some(press) = winit_key_press(event, self.mods) {
-                self.view_event(sid, |v, cx| {
-                    v.key(cx, &press);
-                });
-            }
+            let raw = RawKey { event, press: winit_key_press(event, self.mods) };
+            self.view_event(sid, |v, cx| {
+                if !v.raw_key(cx, &raw) {
+                    if let Some(press) = &raw.press {
+                        v.key(cx, press);
+                    }
+                }
+            });
             return;
         }
 
@@ -3181,6 +3248,7 @@ impl State {
         self.close_buffer
             .shape_until_scroll(&mut self.text.font_system, false);
 
+        let mut painted: Vec<SurfaceId> = Vec::new();
         for (pr, strip_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
@@ -3317,6 +3385,7 @@ impl State {
                 cx.focused = pr.focused;
                 cx.tab_strip = *strip_h > 0.0;
                 view.paint(&mut cx, *term);
+                painted.push(sid);
                 if pr.focused && multi_pane {
                     push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
                 }
@@ -3326,6 +3395,17 @@ impl State {
         }
         // Rows the shaping budget deferred need a follow-up frame.
         let deferred = self.text.finish_paint();
+        self.update_shown(&painted);
+        match frame.cursor {
+            Some((r, icon)) => {
+                self.cursor_rect = Some(r);
+                self.set_cursor_icon(icon);
+            }
+            None => {
+                self.cursor_rect = None;
+                self.set_cursor_icon(CursorIcon::Default);
+            }
+        }
 
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
@@ -3352,6 +3432,7 @@ impl State {
         self.build_confirm(&mut frame);
         self.build_tooltip(&mut frame);
 
+        self.images.prepare(&self.device, &self.queue, &frame.images, self.config.width, self.config.height);
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();
         let mut quads = std::mem::take(&mut frame.bg);
@@ -3591,6 +3672,7 @@ impl State {
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, 0..n_bg);
             }
+            self.images.draw(&mut pass, self.config.width, self.config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .context("text render")?;

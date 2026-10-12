@@ -43,6 +43,12 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).
+- Images: `image(id, version, source, at, clip)` draws BGRA pixels from an
+  `ImageSource` at their own pixel size, over the pane's quads and under its
+  text. The app keeps a texture per `(view, id)` and re-uploads only when
+  `version` changes (the web view's page frames).
+- Cursor: `cursor(rect, icon)` shows a mouse cursor while `rect` is hovered (a
+  link's pointer, a text field's I-beam).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
 - `above(|cx| ...)` paints into the overlay pass, over every pane (a view's
   popups, such as the editor's hover docs).
@@ -68,7 +74,11 @@ into the overlay layer; it doesn't need to know.
   counts double-clicks), then `Drag`/`Up { dragged }` for that press wherever the
   cursor goes; `Move` is hover.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
-- `focus_changed`, `deadline`/`tick` (timers), `pump`/`is_busy` (background work
+- `raw_key(&RawKey) -> bool`: every press *and release* with the platform event
+  (physical key, unmodified character), before `key`; return true to take it.
+  For views embedding an engine with its own key handling (the web view).
+- `focus_changed`, `shown` (the view came on or went off screen: a hidden view
+  can pause rendering), `deadline`/`tick` (timers), `pump`/`is_busy` (background work
   and the inbox), `refresh` (background results that aren't output, e.g. a
   language service's diagnostics: repaints without marking the workspace
   unread), `autosave(cfg)` (app blur/quit; the view decides whether it

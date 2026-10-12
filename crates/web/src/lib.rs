@@ -8,5 +8,5 @@ pub mod client;
 pub mod frame;
 pub mod protocol;
 
-pub use client::{find_host, FrameInfo, ViewState, WebHost};
+pub use client::{find_host, FrameInfo, SharedFrame, ViewState, WebHost};
 pub use protocol::{Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, Request};

@@ -14,7 +14,7 @@ pub mod line_diff;
 pub mod registry;
 pub mod tree;
 
-pub use config::{Chrome, Config, Inbox, LineNumbers, Side};
+pub use config::{Chrome, Config, Inbox, LineNumbers, Side, Web};
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};

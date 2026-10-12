@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use ghostrealm_core::Config;
-use ghostrealm_terminal::Mods;
+use ghostrealm_terminal::{KeyPress, Mods};
 
 use super::UiMetrics;
 
@@ -20,6 +20,16 @@ pub enum MouseEvent {
     Up { pos: (f32, f32), dragged: bool },
     /// Hover with no button held.
     Move { pos: (f32, f32) },
+}
+
+/// A key event as the platform reported it — presses and releases, with the
+/// physical key — for views that forward keys to an engine with its own
+/// keyboard handling (a web page). See [`View::raw_key`](super::View::raw_key).
+pub struct RawKey<'a> {
+    pub event: &'a winit::event::KeyEvent,
+    /// The press as the app maps it for [`View::key`](super::View::key); `None`
+    /// for a release or a key with no mapping.
+    pub press: Option<KeyPress>,
 }
 
 /// Something a view asks the app to do once the current call returns.

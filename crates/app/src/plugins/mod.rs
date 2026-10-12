@@ -4,6 +4,7 @@
 pub mod editor;
 pub mod file_browser;
 pub mod terminal;
+pub mod web;
 
 use crate::plugin::Plugin;
 
@@ -13,6 +14,7 @@ pub fn builtin() -> Vec<Box<dyn Plugin>> {
     vec![
         Box::new(terminal::TerminalPlugin),
         Box::new(file_browser::FileBrowserPlugin),
+        Box::new(web::WebPlugin::new()),
         Box::new(editor::EditorPlugin),
     ]
 }

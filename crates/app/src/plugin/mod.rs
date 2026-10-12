@@ -46,8 +46,10 @@ use ghostrealm_terminal::{KeyPress, Pumped};
 
 use crate::app_state::AppState;
 
-pub use event::{EventCx, MouseEvent, Outcome, Request};
-pub use paint::{Font, Frame, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc};
+pub use event::{EventCx, MouseEvent, Outcome, RawKey, Request};
+pub use paint::{
+    Font, Frame, ImageItem, ImageSource, Layer, PaintCx, Shaped, TextItem, TextKit, TextSrc,
+};
 
 /// Called from any thread to wake the UI (it schedules a paced redraw).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -150,6 +152,15 @@ pub trait View: Any {
         false
     }
 
+    /// Every key press and release while this view is focused, as the platform
+    /// reported it, before [`key`](Self::key). Return true to take it (`key`
+    /// then isn't called). For views embedding an engine that does its own key
+    /// handling and needs releases and physical keys (a web page). The app's
+    /// own chords still win.
+    fn raw_key(&mut self, _cx: &mut EventCx, _key: &RawKey) -> bool {
+        false
+    }
+
     /// Left-button mouse input. `Down` arrives for a press inside the view (after
     /// the app focused its pane); `Drag` and `Up` follow for that same press even
     /// if the cursor leaves the view. `Move` is hover with no button held.
@@ -164,6 +175,11 @@ pub trait View: Any {
 
     /// Keyboard focus moved onto (`true`) or away from (`false`) this view.
     fn focus_changed(&mut self, _cx: &mut EventCx, _focused: bool) {}
+
+    /// The view came on screen (`true`: it is painted, as its pane's active tab
+    /// in the shown workspace) or left it. A hidden view can pause rendering
+    /// work. Views start hidden until first painted.
+    fn shown(&mut self, _visible: bool) {}
 
     /// Drain background output into the view's state, bounded to about
     /// `budget` bytes. `changed` marks the view's workspace unread when it isn't

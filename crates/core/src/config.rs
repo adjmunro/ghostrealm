@@ -125,6 +125,28 @@ impl Default for FileBrowser {
     }
 }
 
+/// `[web]`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Web {
+    /// Page a new web view opens.
+    pub home: String,
+    /// Search URL for URL-bar input that isn't an address; `{}` is the query.
+    pub search: String,
+    /// The web host executable. `None` = beside the `ghostrealm` binary.
+    pub host: Option<String>,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Web {
+            home: "https://duckduckgo.com".into(),
+            search: "https://duckduckgo.com/?q={}".into(),
+            host: None,
+        }
+    }
+}
+
 /// `[input]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -231,6 +253,7 @@ pub struct Config {
     pub editor: Editor,
     pub input: Input,
     pub file_browser: FileBrowser,
+    pub web: Web,
     pub inbox: Inbox,
     /// `[keybindings]`: command id -> chord. Only listed commands are bound: a
     /// file without the section binds nothing (the field default is empty, not
@@ -253,6 +276,7 @@ impl Default for Config {
             editor: Editor::default(),
             input: Input::default(),
             file_browser: FileBrowser::default(),
+            web: Web::default(),
             inbox: Inbox::default(),
             keybindings: default_bindings()
                 .into_iter()
@@ -309,6 +333,7 @@ fn default_bindings() -> HashMap<&'static str, &'static str> {
         ("cmd+n", "workspace.new"),
         ("cmd+]", "pane.focus_next"),
         ("cmd+[", "pane.focus_prev"),
+        ("cmd+l", "web.focus_url"),
     ])
 }
 

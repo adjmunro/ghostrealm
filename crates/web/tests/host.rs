@@ -56,10 +56,12 @@ fn page_paints_and_answers_text_and_eval() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut seen = None;
     while Instant::now() < deadline && seen.is_none_or(|(_, _, bgr)| bgr != [0, 0, 255]) {
-        host.with_frame(1, 0, |w, h, px| {
-            let i = ((h as usize - 2) * w as usize + (w as usize - 2)) * 4;
-            seen = Some((w, h, [px[i], px[i + 1], px[i + 2]]));
-        });
+        if let Some(f) = host.frame(1) {
+            let (w, h) = (f.width as usize, f.height as usize);
+            let px = f.pixels().expect("mapped frame");
+            let i = ((h - 2) * w + (w - 2)) * 4;
+            seen = Some((f.width, f.height, [px[i], px[i + 1], px[i + 2]]));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let (w, h, bgr) = seen.expect("no frame arrived");

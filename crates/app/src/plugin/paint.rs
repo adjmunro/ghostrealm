@@ -7,10 +7,12 @@
 //! GPU, so views can be painted (and tested) headless.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, TextBounds, Weight};
+use winit::window::CursorIcon;
 
 use super::{rect_contains, theme, UiMetrics};
 use crate::row_cache::RowCache;
@@ -153,6 +155,28 @@ pub struct TextItem {
     pub color: [u8; 3],
 }
 
+/// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded
+/// (what a web engine or an image decoder produces).
+pub trait ImageSource {
+    /// `(width, height)` in physical pixels.
+    fn size(&self) -> (u32, u32);
+    /// `width * height * 4` bytes, or `None` if the pixels are gone.
+    fn bgra(&self) -> Option<&[u8]>;
+}
+
+/// An image placed this frame. The app keeps one GPU texture per
+/// `(owner, id)` and re-uploads it only when `version` changes.
+#[derive(Clone)]
+pub struct ImageItem {
+    pub owner: SurfaceId,
+    pub id: u32,
+    pub version: u64,
+    pub source: Arc<dyn ImageSource>,
+    /// Top-left, physical px; drawn at the image's own pixel size.
+    pub at: (f32, f32),
+    pub clip: Rect,
+}
+
 /// Which pass a view paints into. Views in panes paint the base layer; a view
 /// hosted in a modal (the picker) paints the overlay layer, above all
 /// pane content.
@@ -162,8 +186,9 @@ pub enum Layer {
     Overlay,
 }
 
-/// Everything painted this frame, in draw order: `bg` quads, then `text`, then
-/// `top` quads (cursors, borders, overlay panels), then `overlay_text`.
+/// Everything painted this frame, in draw order: `bg` quads, then `images`, then
+/// `text`, then `top` quads (cursors, borders, overlay panels), then
+/// `overlay_text`.
 pub struct Frame {
     /// Surface size in physical pixels.
     pub screen: (f32, f32),
@@ -171,6 +196,9 @@ pub struct Frame {
     pub text: Vec<TextItem>,
     pub top: Vec<QuadInstance>,
     pub overlay_text: Vec<TextItem>,
+    pub images: Vec<ImageItem>,
+    /// The mouse cursor a view asked for, and the rect it applies to.
+    pub cursor: Option<(Rect, CursorIcon)>,
     /// Buttons views registered: (hit rect, owning surface, view-local id).
     pub view_buttons: Vec<(Rect, SurfaceId, u32)>,
     /// A view needs another paced frame (an animation step, deferred work).
@@ -188,6 +216,8 @@ impl Frame {
             text: Vec::new(),
             top: Vec::new(),
             overlay_text: Vec::new(),
+            images: Vec::new(),
+            cursor: None,
             view_buttons: Vec::new(),
             wants_frame: false,
             tooltip: None,
@@ -448,6 +478,36 @@ impl<'a> PaintCx<'a> {
     pub fn tooltip(&mut self, r: Rect, text: impl Into<String>) {
         if self.hovered(r) {
             self.frame.tooltip = Some((r, text.into(), self.layer));
+        }
+    }
+
+    /// Draw `source` with its top-left at `at`, at its own pixel size, clipped to
+    /// `clip`: over this pane's quads, under its text. `id` names the image
+    /// within the view; bump `version` whenever the pixels change (the app
+    /// re-uploads only then). Base layer only: an image never draws over an
+    /// overlay.
+    pub fn image(
+        &mut self,
+        id: u32,
+        version: u64,
+        source: Arc<dyn ImageSource>,
+        at: (f32, f32),
+        clip: Rect,
+    ) {
+        self.frame.images.push(ImageItem {
+            owner: self.owner,
+            id,
+            version,
+            source,
+            at,
+            clip,
+        });
+    }
+
+    /// Show the `icon` mouse cursor while `r` is hovered.
+    pub fn cursor(&mut self, r: Rect, icon: CursorIcon) {
+        if self.hovered(r) {
+            self.frame.cursor = Some((r, icon));
         }
     }
 

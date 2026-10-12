@@ -66,6 +66,37 @@ pub struct ViewState {
     pub frame: Option<FrameInfo>,
     /// The last failed load, cleared when a new load starts.
     pub error: Option<String>,
+    /// Bumped on every event for this page, so a caller can tell it changed.
+    pub version: u64,
+}
+
+/// A page frame the app can hold onto: its shared mapping plus where in it the
+/// pixels are. Reading never copies; the host may overwrite the slot two frames
+/// later, which at worst shows a newer frame.
+#[derive(Clone)]
+pub struct SharedFrame {
+    reader: Arc<FrameReader>,
+    pub slot: u8,
+    pub width: u32,
+    pub height: u32,
+    pub seq: u64,
+}
+
+impl SharedFrame {
+    /// The frame's BGRA pixels.
+    pub fn pixels(&self) -> Option<&[u8]> {
+        self.reader.slot(self.slot, self.width, self.height)
+    }
+
+    /// Identifies the frame's content: changes whenever a new frame arrives,
+    /// including after the host replaced its frame file or restarted.
+    pub fn version(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.reader.path().hash(&mut h);
+        self.seq.hash(&mut h);
+        h.finish()
+    }
 }
 
 #[derive(Default)]
@@ -84,7 +115,7 @@ pub struct WebHost {
     stdin: Mutex<Option<ChildStdin>>,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     next_req: AtomicU64,
-    readers: HashMap<u64, FrameReader>,
+    readers: HashMap<u64, Arc<FrameReader>>,
 }
 
 impl WebHost {
@@ -175,30 +206,23 @@ impl WebHost {
         self.readers.remove(&id);
     }
 
-    /// Hand the latest frame of `id` to `f` if it is newer than `since`.
-    /// Returns the frame's sequence number when `f` ran.
-    pub fn with_frame(
-        &mut self,
-        id: u64,
-        since: u64,
-        f: impl FnOnce(u32, u32, &[u8]),
-    ) -> Option<u64> {
+    /// The latest frame of `id`.
+    pub fn frame(&mut self, id: u64) -> Option<SharedFrame> {
         let info = self.view(id)?.frame?;
-        if info.seq <= since {
-            return None;
-        }
         let stale = self.readers.get(&id).is_none_or(|r| r.path() != info.path);
         if stale {
             // The host may already have replaced this file; skip to the next frame.
             let reader = FrameReader::open(&info.path).ok()?;
-            self.readers.insert(id, reader);
+            self.readers.insert(id, Arc::new(reader));
         }
-        let pixels = self
-            .readers
-            .get(&id)?
-            .slot(info.slot, info.width, info.height)?;
-        f(info.width, info.height, pixels);
-        Some(info.seq)
+        let frame = SharedFrame {
+            reader: self.readers.get(&id)?.clone(),
+            slot: info.slot,
+            width: info.width,
+            height: info.height,
+            seq: info.seq,
+        };
+        frame.pixels().is_some().then_some(frame)
     }
 
     /// Note that a navigation was just requested for `id`, so [`wait_loaded`]
@@ -302,6 +326,9 @@ impl Drop for WebHost {
 fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
     let (lock, cv) = shared;
     let mut s = lock.lock().unwrap();
+    if let Some(id) = page_of(&ev) {
+        s.views.entry(id).or_default().version += 1;
+    }
     match ev {
         Event::Ready => s.ready = true,
         Event::Frame {
@@ -349,4 +376,17 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         }
     }
     cv.notify_all();
+}
+
+/// The page an event updates the state of (not replies, which answer requests).
+fn page_of(ev: &Event) -> Option<u64> {
+    match ev {
+        Event::Frame { id, .. }
+        | Event::Address { id, .. }
+        | Event::Title { id, .. }
+        | Event::Loading { id, .. }
+        | Event::Cursor { id, .. }
+        | Event::LoadError { id, .. } => Some(*id),
+        _ => None,
+    }
 }

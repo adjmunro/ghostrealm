@@ -1,0 +1,480 @@
+//! Draws the images views place with [`PaintCx::image`]: one GPU texture per
+//! `(surface, id)`, re-uploaded only when the image's version changes, drawn 1:1
+//! with physical pixels and clipped to the view's rect.
+//!
+//! [`PaintCx::image`]: crate::plugin::PaintCx::image
+
+use std::collections::HashMap;
+
+use ghostrealm_core::SurfaceId;
+
+use crate::plugin::ImageItem;
+
+struct Texture {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+    version: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageQuad {
+    /// Top-left in NDC.
+    pos: [f32; 2],
+    /// Width/height in NDC (height negative to grow downward).
+    size: [f32; 2],
+}
+
+/// A prepared draw: texture key, instance index, scissor rect.
+struct Draw {
+    key: (SurfaceId, u32),
+    scissor: (u32, u32, u32, u32),
+}
+
+pub struct ImageRenderer {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+    textures: HashMap<(SurfaceId, u32), Texture>,
+    instances: wgpu::Buffer,
+    capacity: u64,
+    draws: Vec<Draw>,
+}
+
+impl ImageRenderer {
+    pub fn new(device: &wgpu::Device, target: wgpu::TextureFormat) -> Self {
+        // Image pixels are sRGB-encoded; sample them as sRGB when the target is,
+        // so they are decoded and re-encoded unchanged.
+        let format = if target.is_srgb() {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Bgra8Unorm
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("image"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_WGSL.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageQuad>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // Images draw 1:1 with physical pixels, so nearest sampling is exact.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image"),
+            ..Default::default()
+        });
+        let capacity = 8;
+        ImageRenderer {
+            pipeline,
+            layout,
+            sampler,
+            format,
+            textures: HashMap::new(),
+            instances: instance_buffer(device, capacity),
+            capacity,
+            draws: Vec::new(),
+        }
+    }
+
+    /// Upload changed images and lay out this frame's draws on a `sw`x`sh`
+    /// target. Textures of images not placed this frame are dropped.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        images: &[ImageItem],
+        sw: u32,
+        sh: u32,
+    ) {
+        self.draws.clear();
+        let mut quads: Vec<ImageQuad> = Vec::new();
+        for img in images {
+            let key = (img.owner, img.id);
+            let (w, h) = img.source.size();
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let current = self
+                .textures
+                .get(&key)
+                .is_some_and(|t| t.version == img.version && t.width == w && t.height == h);
+            if !current {
+                let Some(pixels) = img.source.bgra() else {
+                    continue;
+                };
+                if pixels.len() < w as usize * h as usize * 4 {
+                    continue;
+                }
+                self.upload(device, queue, key, w, h, img.version, pixels);
+            }
+            let x0 = img.clip.x.max(0.0) as u32;
+            let y0 = img.clip.y.max(0.0) as u32;
+            let x1 = ((img.clip.x + img.clip.w).max(0.0) as u32).min(sw);
+            let y1 = ((img.clip.y + img.clip.h).max(0.0) as u32).min(sh);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let (fw, fh) = (sw as f32, sh as f32);
+            quads.push(ImageQuad {
+                pos: [img.at.0 / fw * 2.0 - 1.0, 1.0 - img.at.1 / fh * 2.0],
+                size: [w as f32 / fw * 2.0, -(h as f32 / fh * 2.0)],
+            });
+            self.draws.push(Draw {
+                key,
+                scissor: (x0, y0, x1 - x0, y1 - y0),
+            });
+        }
+        let placed: Vec<(SurfaceId, u32)> = images.iter().map(|i| (i.owner, i.id)).collect();
+        self.textures.retain(|k, _| placed.contains(k));
+        if quads.is_empty() {
+            return;
+        }
+        if quads.len() as u64 > self.capacity {
+            self.capacity = (quads.len() as u64).next_power_of_two();
+            self.instances = instance_buffer(device, self.capacity);
+        }
+        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&quads));
+    }
+
+    /// Draw the prepared images; restores a full-target scissor afterwards.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, sw: u32, sh: u32) {
+        if self.draws.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
+        for (i, d) in self.draws.iter().enumerate() {
+            let Some(t) = self.textures.get(&d.key) else {
+                continue;
+            };
+            let (x, y, w, h) = d.scissor;
+            pass.set_bind_group(0, &t.bind_group, &[]);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.draw(0..4, i as u32..i as u32 + 1);
+        }
+        pass.set_scissor_rect(0, 0, sw, sh);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: (SurfaceId, u32),
+        width: u32,
+        height: u32,
+        version: u64,
+        pixels: &[u8],
+    ) {
+        let fits = self
+            .textures
+            .get(&key)
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !fits {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("image"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.textures.insert(
+                key,
+                Texture {
+                    texture,
+                    bind_group,
+                    width,
+                    height,
+                    version,
+                },
+            );
+        }
+        let Some(t) = self.textures.get_mut(&key) else {
+            return;
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &t.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels[..width as usize * height as usize * 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        t.version = version;
+    }
+}
+
+fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("image-instances"),
+        size: capacity * std::mem::size_of::<ImageQuad>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+const IMAGE_WGSL: &str = r#"
+struct Inst {
+    @location(0) pos: vec2<f32>,
+    @location(1) size: vec2<f32>,
+};
+struct VOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+@group(0) @binding(0) var img: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VOut {
+    var corners = array<vec2<f32>, 4>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0));
+    let c = corners[vi];
+    var o: VOut;
+    o.clip = vec4<f32>(inst.pos + c * inst.size, 0.0, 1.0);
+    o.uv = c;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSample(img, samp, in.uv).rgb, 1.0);
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ghostrealm_core::Rect;
+
+    use super::*;
+    use crate::plugin::ImageSource;
+
+    struct Solid(Vec<u8>, u32);
+
+    impl ImageSource for Solid {
+        fn size(&self) -> (u32, u32) {
+            (self.1, self.1)
+        }
+        fn bgra(&self) -> Option<&[u8]> {
+            Some(&self.0)
+        }
+    }
+
+    /// A BGRA image lands at its position, channels in order, clipped to its
+    /// clip rect, and nothing outside.
+    #[test]
+    fn image_draws_at_its_position_clipped() {
+        pollster::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .expect("no GPU adapter for the headless render test");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .expect("request device");
+
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let dim = 64u32;
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: dim,
+                    height: dim,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let mut r = ImageRenderer::new(&device, format);
+            // A 32x32 blue (BGRA) image at (0, 0), clipped to its left half.
+            let item = ImageItem {
+                owner: SurfaceId(1),
+                id: 0,
+                version: 1,
+                source: Arc::new(Solid([255u8, 0, 0, 255].repeat(32 * 32), 32)),
+                at: (0.0, 0.0),
+                clip: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 16.0,
+                    h: 32.0,
+                },
+            };
+            r.prepare(&device, &queue, &[item], dim, dim);
+
+            let bpr = dim * 4;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (bpr * dim) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                r.draw(&mut pass, dim, dim);
+            }
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(dim),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: dim,
+                    height: dim,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("poll");
+            rx.recv().expect("map channel").expect("map ok");
+            let data = slice.get_mapped_range().expect("map range");
+            let px = |x: u32, y: u32| {
+                let o = (y * bpr + x * 4) as usize;
+                [data[o], data[o + 1], data[o + 2]]
+            };
+            assert_eq!(px(8, 8), [0, 0, 255], "inside: blue, as RGBA");
+            assert_eq!(
+                px(24, 8),
+                [0, 0, 0],
+                "inside the image but outside its clip"
+            );
+            assert_eq!(px(48, 48), [0, 0, 0], "outside the image");
+        });
+    }
+}

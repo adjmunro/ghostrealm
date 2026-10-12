@@ -5,7 +5,8 @@
 //! - `{"op":"search","query":"split"}`       → matching command ids + scores
 //! - `{"op":"set","id":"...","args":{...}}`  → run a command
 //! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces
-//! - `{"op":"get","what":"surface","id":N}`  → a surface's content as text
+//! - `{"op":"get","what":"surface","id":N}`  → a surface's content as text (a web
+//!   page: its address, title, and text once loaded)
 //! - `{"op":"input","text":"ls\r","id":N}`   → type into a surface (id optional,
 //!   defaulting to the focused surface)
 //! - `{"op":"pump"}`                         → drain background output
@@ -249,6 +250,27 @@ mod tests {
             "expected a missing-arg error mentioning `name`, got {:?}",
             resps[1]
         );
+    }
+
+    #[test]
+    fn web_commands_are_listed_and_need_a_web_surface() {
+        let resps = drive(&[
+            r#"{"op":"help"}"#,
+            r#"{"op":"set","id":"web.back"}"#,
+            r#"{"op":"set","id":"web.navigate","args":{"url":"example.com","id":999}}"#,
+        ]);
+        let ids: Vec<&str> = resps[0]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        for id in ["web.new", "web.navigate", "web.back", "web.forward", "web.reload", "web.eval"] {
+            assert!(ids.contains(&id), "help should list {id}");
+        }
+        assert_eq!(resps[1]["ok"], json!(false));
+        assert!(resps[1]["error"].as_str().unwrap().contains("no web surface"));
+        assert!(resps[2]["error"].as_str().unwrap().contains("not a web surface"));
     }
 
     #[test]
