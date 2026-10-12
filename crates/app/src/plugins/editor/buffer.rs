@@ -31,6 +31,43 @@ pub struct EditorBuffer {
     /// Selection anchor (row, col); `None` = no selection. The selection spans
     /// anchor..cursor.
     pub anchor: Option<(usize, usize)>,
+    history: History,
+}
+
+/// Most undo steps kept; older ones are dropped.
+const MAX_UNDO: usize = 200;
+
+/// Undo granularity: a run of typed characters, or of single-character
+/// deletes, is one step while each edit continues where the last left off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Typing,
+    Deleting,
+    Other,
+}
+
+/// The buffer's text, cursor, and selection at one point, and which version
+/// of the text it is.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+    anchor: Option<(usize, usize)>,
+    version: u64,
+}
+
+/// Undo/redo as whole-buffer snapshots.
+#[derive(Debug, Default)]
+struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The open run of typing/deleting and where its last edit left the cursor.
+    run: Option<(Step, (usize, usize))>,
+    /// The current text's version (each undo step gets a fresh one) and the
+    /// version last written, so undoing back to it clears `modified`.
+    version: u64,
+    next_version: u64,
+    saved_version: u64,
 }
 
 impl EditorBuffer {
@@ -46,6 +83,7 @@ impl EditorBuffer {
             modified: false,
             edits: 0,
             anchor: None,
+            history: History::default(),
         }
     }
 
@@ -65,6 +103,7 @@ impl EditorBuffer {
             modified: false,
             edits: 0,
             anchor: None,
+            history: History::default(),
         }
     }
 
@@ -267,9 +306,17 @@ impl EditorBuffer {
         }
     }
 
-    /// Apply a text edit (see [`crate::plugin::text_edit`]).
+    /// Apply a text edit (see [`crate::plugin::text_edit`]). Edits that change
+    /// the text are recorded for undo.
     pub fn apply(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
         let edits = self.edits;
+        let step = match &edit {
+            Edit::Insert(s) if s.chars().count() == 1 && s != "\n" => Some(Step::Typing),
+            Edit::Delete(Motion::Left | Motion::Right) => Some(Step::Deleting),
+            Edit::Insert(_) | Edit::Delete(_) | Edit::Cut | Edit::Paste => Some(Step::Other),
+            Edit::Move { .. } | Edit::SelectAll | Edit::Copy | Edit::Undo | Edit::Redo => None,
+        };
+        let opened = step.is_some_and(|step| self.checkpoint(step));
         match edit {
             Edit::Move { to, select: true } => self.move_cursor_selecting(to),
             Edit::Move { to, select: false } => self.move_cursor(to),
@@ -292,11 +339,83 @@ impl EditorBuffer {
                     self.insert_str(&t);
                 }
             }
+            Edit::Undo => self.undo(),
+            Edit::Redo => self.redo(),
+        }
+        match step {
+            // A step that changed nothing leaves no undo entry.
+            Some(_) if opened && self.edits == edits => self.drop_checkpoint(),
+            Some(Step::Typing | Step::Deleting) => self.history.run = step.map(|s| (s, self.cursor)),
+            _ => self.history.run = None,
         }
         if self.edits != edits {
             Applied::Changed
         } else {
             Applied::Moved
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            cursor: self.cursor,
+            anchor: self.anchor,
+            version: self.history.version,
+        }
+    }
+
+    /// Record the state before a `step` edit, unless it continues the open run.
+    /// Returns whether it opened a new undo step.
+    fn checkpoint(&mut self, step: Step) -> bool {
+        let h = &self.history;
+        if step != Step::Other && h.run == Some((step, self.cursor)) {
+            return false;
+        }
+        let snap = self.snapshot();
+        let h = &mut self.history;
+        h.undo.push(snap);
+        if h.undo.len() > MAX_UNDO {
+            h.undo.remove(0);
+        }
+        h.redo.clear();
+        h.next_version += 1;
+        h.version = h.next_version;
+        true
+    }
+
+    /// Withdraw the step [`Self::checkpoint`] just opened.
+    fn drop_checkpoint(&mut self) {
+        if let Some(s) = self.history.undo.pop() {
+            self.history.version = s.version;
+        }
+    }
+
+    /// Make `s` the buffer's state; it is unmodified if it is the saved version.
+    fn restore(&mut self, s: Snapshot) {
+        self.lines = s.lines;
+        self.cursor = s.cursor;
+        self.anchor = s.anchor;
+        self.history.version = s.version;
+        self.history.run = None;
+        self.edits = self.edits.wrapping_add(1);
+        self.modified = s.version != self.history.saved_version;
+    }
+
+    /// Step back to the state before the last undo step.
+    pub fn undo(&mut self) {
+        if let Some(s) = self.history.undo.pop() {
+            let cur = self.snapshot();
+            self.history.redo.push(cur);
+            self.restore(s);
+        }
+    }
+
+    /// Re-apply the last undone step.
+    pub fn redo(&mut self) {
+        if let Some(s) = self.history.redo.pop() {
+            let cur = self.snapshot();
+            self.history.undo.push(cur);
+            self.restore(s);
         }
     }
 
@@ -342,6 +461,9 @@ impl EditorBuffer {
         text.push('\n');
         std::fs::write(&path, text)?;
         self.modified = false;
+        // Typing after a save starts a new step, so undo can return here.
+        self.history.saved_version = self.history.version;
+        self.history.run = None;
         Ok(true)
     }
 }
@@ -478,6 +600,77 @@ mod tests {
         assert_eq!(e.selected_text().as_deref(), Some("a\nb"));
         e.apply(Edit::Paste, &mut clip);
         assert_eq!(e.lines, vec!["x", "y"]);
+    }
+
+    fn typed(e: &mut EditorBuffer, text: &str) {
+        for c in text.chars() {
+            e.apply(Edit::Insert(c.to_string()), &mut None::<String>);
+        }
+    }
+
+    #[test]
+    fn typing_undoes_as_one_step_and_redoes() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "hello");
+        e.apply(Edit::Insert("\n".into()), &mut None::<String>);
+        typed(&mut e, "world");
+        e.undo();
+        assert_eq!(e.lines, vec!["hello", ""]);
+        e.undo();
+        assert_eq!(e.lines, vec!["hello"], "the newline is its own step");
+        e.undo();
+        assert_eq!(e.lines, vec![""]);
+        e.undo();
+        assert_eq!(e.lines, vec![""], "nothing left to undo");
+        e.redo();
+        e.redo();
+        assert_eq!(e.lines, vec!["hello", ""]);
+        assert_eq!(e.cursor, (1, 0));
+    }
+
+    #[test]
+    fn moving_the_cursor_ends_a_typing_run() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "ab");
+        e.apply(Edit::Move { to: Motion::Left, select: false }, &mut None::<String>);
+        typed(&mut e, "x");
+        e.undo();
+        assert_eq!(e.lines, vec!["ab"]);
+    }
+
+    #[test]
+    fn a_new_edit_clears_redo() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "a");
+        e.undo();
+        typed(&mut e, "b");
+        e.redo();
+        assert_eq!(e.lines, vec!["b"]);
+    }
+
+    #[test]
+    fn undoing_back_to_the_save_clears_modified() {
+        let path = std::env::temp_dir().join(format!("ghostrealm-undo-{}.txt", std::process::id()));
+        let mut e = EditorBuffer::open(path.clone());
+        typed(&mut e, "saved");
+        e.save().unwrap();
+        typed(&mut e, "!");
+        assert!(e.modified);
+        e.undo();
+        assert!(!e.modified, "back to what's on disk");
+        e.undo();
+        assert!(e.modified);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_no_op_edit_leaves_no_undo_step() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "a");
+        e.apply(Edit::Move { to: Motion::DocStart, select: false }, &mut None::<String>);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        e.undo();
+        assert_eq!(e.lines, vec![""], "the undo removed the typing, not the no-op");
     }
 
     #[test]

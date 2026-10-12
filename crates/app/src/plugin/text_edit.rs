@@ -18,7 +18,8 @@
 //!
 //! Backspace/Delete remove a character, Option a word, Cmd to the line's start
 //! (Backspace) or end (Delete); with a selection they remove it. Cmd+A selects
-//! all; Cmd+C/X/V copy, cut, and paste. Ctrl chords are never edits (Ctrl+arrows
+//! all; Cmd+C/X/V copy, cut, and paste; Cmd+Z undoes and Cmd+Shift+Z redoes
+//! (where the text keeps history). Ctrl chords are never edits (Ctrl+arrows
 //! belong to macOS). Linux and Windows use Ctrl where macOS uses Option (words)
 //! and Cmd (the text's ends, select all, clipboard), and Home/End for lines.
 
@@ -56,6 +57,8 @@ pub enum Edit {
     Copy,
     Cut,
     Paste,
+    Undo,
+    Redo,
 }
 
 /// What a bound chord does. With Shift held, a [`Action::Move`] selects.
@@ -67,6 +70,9 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    /// With Shift held, redo.
+    Undo,
+    Redo,
 }
 
 /// A key with its modifiers, Shift aside (Shift selects). Letters are stored
@@ -163,6 +169,7 @@ const MACOS: &[(&str, Action)] = &[
     ("cmd+c", Action::Copy),
     ("cmd+x", Action::Cut),
     ("cmd+v", Action::Paste),
+    ("cmd+z", Action::Undo),
 ];
 
 /// Linux and Windows.
@@ -179,6 +186,8 @@ const PC: &[(&str, Action)] = &[
     ("ctrl+c", Action::Copy),
     ("ctrl+x", Action::Cut),
     ("ctrl+v", Action::Paste),
+    ("ctrl+z", Action::Undo),
+    ("ctrl+y", Action::Redo),
 ];
 
 impl Keymap {
@@ -228,6 +237,9 @@ impl Keymap {
                 Action::Copy => Edit::Copy,
                 Action::Cut => Edit::Cut,
                 Action::Paste => Edit::Paste,
+                Action::Undo if k.mods.shift => Edit::Redo,
+                Action::Undo => Edit::Undo,
+                Action::Redo => Edit::Redo,
             });
         }
         let Key::Char(c) = k.key else {
@@ -278,7 +290,7 @@ pub fn word_right(chars: &[char], col: usize) -> usize {
 }
 
 /// Where copy/cut/paste go: the system clipboard (through an [`EventCx`] or the
-/// app's handle), or a string in tests.
+/// app's handle), or a private string.
 pub trait Clipboard {
     fn text(&mut self) -> Option<String>;
     fn set_text(&mut self, text: String);
@@ -306,7 +318,7 @@ impl Clipboard for Option<arboard::Clipboard> {
     }
 }
 
-#[cfg(test)]
+/// A private clipboard: tests, and edits with no system clipboard at hand.
 impl Clipboard for Option<String> {
     fn text(&mut self) -> Option<String> {
         self.clone()
@@ -519,6 +531,7 @@ impl LineEdit {
                 }
                 _ => Applied::Moved,
             },
+            Edit::Undo | Edit::Redo => Applied::Ignored,
         }
     }
 }

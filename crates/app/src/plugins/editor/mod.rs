@@ -17,7 +17,7 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::{AppState, Pick};
-use crate::plugin::text_edit::edit_for;
+use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
     View,
@@ -494,8 +494,8 @@ impl View for EditorView {
         }
     }
 
-    /// Text editing per [`crate::plugin::text_edit`], plus Enter, Tab, and
-    /// Cmd+S (save; Shift+S saves as).
+    /// Text editing per [`crate::plugin::text_edit`] (with undo/redo), plus
+    /// Enter, Tab, and Cmd+S (save; Shift+S saves as).
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let m = k.mods;
         let used = match k.key {
@@ -508,11 +508,11 @@ impl View for EditorView {
                 true
             }
             Key::Enter if !m.super_ && !m.ctrl => {
-                self.buf.insert_newline();
+                self.buf.apply(Edit::Insert("\n".into()), cx);
                 true
             }
             Key::Tab if !m.super_ && !m.ctrl && !m.shift => {
-                self.buf.insert_str(&" ".repeat(TAB_WIDTH));
+                self.buf.apply(Edit::Insert(" ".repeat(TAB_WIDTH)), cx);
                 true
             }
             _ => match edit_for(k) {
@@ -646,9 +646,10 @@ impl View for EditorView {
         Ok(())
     }
 
-    /// Agent input is typed at the cursor.
+    /// Agent input is typed at the cursor (one undo step).
     fn write_input(&mut self, bytes: &[u8]) -> bool {
-        self.buf.insert_str(&String::from_utf8_lossy(bytes));
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        self.buf.apply(Edit::Insert(text), &mut None::<String>);
         self.note_edits();
         true
     }
@@ -819,6 +820,23 @@ mod tests {
         opt_bs.mods.alt = true;
         h.key(&mut v, opt_bs);
         assert_eq!(v.buffer().lines, vec!["world"]);
+    }
+
+    #[test]
+    fn cmd_z_undoes_and_cmd_shift_z_redoes() {
+        let mut v = view_with("");
+        let h = Harness::new();
+        for c in "hi".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        h.key(&mut v, press(Key::Enter));
+        h.key(&mut v, cmd(Key::Char('z')));
+        assert_eq!(v.buffer().lines, vec!["hi"]);
+        let mut redo = cmd(Key::Char('Z'));
+        redo.mods.shift = true;
+        let (used, out) = h.key(&mut v, redo);
+        assert!(used && out.redraw);
+        assert_eq!(v.buffer().lines, vec!["hi", ""]);
     }
 
     #[test]
