@@ -3047,6 +3047,7 @@ impl State {
             for (i, spans) in lines.iter().enumerate() {
                 let buf = &mut self.palette_buffers[i];
                 buf.set_metrics(metrics);
+                buf.set_wrap(if i == 0 { Wrap::None } else { Wrap::WordOrGlyph });
                 buf.set_size(Some(text_w), Some(line_h));
                 buf.set_rich_text(
                     spans.iter().map(|(t, c)| (t.as_str(), attrs_for(*c))),
@@ -3068,7 +3069,9 @@ impl State {
                     color: [235, 235, 245],
                 });
             }
-            self.palette_caret(quads, (sw, sh), (text_x, panel_y + pad), prefix.len(), &input);
+            let left = self.scroll_palette_input(&mut placements, text_x, text_w, prefix.len(), &input);
+            let clip = (text_x, text_x + text_w);
+            self.palette_caret(quads, (sw, sh), (left, panel_y + pad), clip, prefix.len(), &input);
             return placements;
         }
 
@@ -3126,6 +3129,7 @@ impl State {
         for (i, spans) in lines.iter().enumerate() {
             let buf = &mut self.palette_buffers[i];
             buf.set_metrics(metrics);
+            buf.set_wrap(if i == 0 { Wrap::None } else { Wrap::WordOrGlyph });
             buf.set_size(Some(text_w), Some(line_h));
             buf.set_rich_text(
                 spans.iter().map(|(t, c)| (t.as_str(), attrs_for(*c))),
@@ -3147,17 +3151,45 @@ impl State {
                 color: [235, 235, 245],
             });
         }
-        self.palette_caret(quads, (sw, sh), (text_x, panel_y + pad), prefix.len(), &input);
+        let left = self.scroll_palette_input(&mut placements, text_x, text_w, prefix.len(), &input);
+        let clip = (text_x, text_x + text_w);
+        self.palette_caret(quads, (sw, sh), (left, panel_y + pad), clip, prefix.len(), &input);
         placements
     }
 
+    /// Scroll the palette's input line (placement 0, unwrapped) left so the
+    /// caret stays inside the `text_w` wide text area at `text_x`, clipping
+    /// what scrolls out. Returns the line's new left edge.
+    fn scroll_palette_input(
+        &self,
+        placements: &mut [Placement],
+        text_x: f32,
+        text_w: f32,
+        prefix: usize,
+        input: &LineEdit,
+    ) -> f32 {
+        let Some(buf) = self.palette_buffers.first() else {
+            return text_x;
+        };
+        let caret = glyph_x(buf, prefix + input.byte_of(input.cursor()));
+        let left = text_x - input_shift(caret, 2.0 * self.scale, text_w);
+        if let Some(p) = placements.first_mut() {
+            p.left = left;
+            p.bounds.left = text_x.floor() as i32;
+            p.bounds.right = (text_x + text_w).ceil() as i32;
+        }
+        left
+    }
+
     /// The caret and selection on the palette's input line (buffer 0, shaped,
-    /// drawn at `origin`), whose text starts `prefix` bytes in.
+    /// drawn at `origin`), whose text starts `prefix` bytes in. The selection
+    /// is clipped to the text area's `(left, right)`.
     fn palette_caret(
         &self,
         quads: &mut Vec<QuadInstance>,
         (sw, sh): (f32, f32),
         (x, y): (f32, f32),
+        (clip_l, clip_r): (f32, f32),
         prefix: usize,
         input: &LineEdit,
     ) {
@@ -3167,8 +3199,8 @@ impl State {
         let at = |col: usize| x + glyph_x(buf, prefix + input.byte_of(col));
         let band = |x0: f32, w: f32| Rect { x: x0, y, w, h: self.cell_h };
         if let Some((s, e)) = input.selection() {
-            let x0 = at(s);
-            quads.push(rect_quad(band(x0, at(e) - x0), sw, sh, self.chrome.accent, 0.35));
+            let (x0, x1) = (at(s).clamp(clip_l, clip_r), at(e).clamp(clip_l, clip_r));
+            quads.push(rect_quad(band(x0, x1 - x0), sw, sh, self.chrome.accent, 0.35));
         }
         let caret = band(at(input.cursor()), 2.0 * self.scale);
         quads.push(rect_quad(caret, sw, sh, self.chrome.accent, 0.9));
@@ -3801,6 +3833,12 @@ fn winit_key_press(event: &winit::event::KeyEvent, mods: Mods) -> Option<KeyPres
     Some(KeyPress { key, mods, text })
 }
 
+/// How far to scroll a single-line input left so a caret `caret_w` wide at
+/// `caret_x` (px from the line's start) fits in `width`.
+fn input_shift(caret_x: f32, caret_w: f32, width: f32) -> f32 {
+    (caret_x + caret_w - width).max(0.0)
+}
+
 /// The x offset (px) where the glyph at byte `byte` of `buf`'s first line
 /// starts, or the line's end past its last glyph.
 fn glyph_x(buf: &Buffer, byte: usize) -> f32 {
@@ -4113,11 +4151,11 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_quad_pipeline, measure_cell, rect_contains, sidebar_rect_for, workspace_rect_for,
-        QuadInstance,
+        build_quad_pipeline, glyph_x, input_shift, measure_cell, rect_contains, sidebar_rect_for,
+        workspace_rect_for, QuadInstance,
     };
     use ghostrealm_core::{Rect, Side};
-    use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+    use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -4167,6 +4205,23 @@ mod tests {
         // disk; otherwise boot silently falls back to the ~800ms full scan.
         let (_, family) = super::curated_font_db().expect("a monospace candidate on macOS");
         assert!(!family.is_empty(), "pinned monospace family must be named");
+    }
+
+    #[test]
+    fn an_unwrapped_input_line_scrolls_to_keep_the_caret_in_view() {
+        let mut font_system = FontSystem::new();
+        let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
+        let mut b = Buffer::new(&mut font_system, metrics);
+        b.set_wrap(Wrap::None);
+        b.set_size(Some(100.0), Some(LINE_HEIGHT));
+        let text = "x".repeat(80);
+        b.set_text(&text, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut font_system, false);
+        assert_eq!(b.layout_runs().count(), 1, "one run, however narrow");
+        let end = glyph_x(&b, text.len());
+        assert!(end > 100.0, "the caret's x runs past the width: {end}");
+        assert_eq!(input_shift(end, 2.0, 100.0), end + 2.0 - 100.0);
+        assert_eq!(input_shift(50.0, 2.0, 100.0), 0.0, "in view: no scroll");
     }
 
     // An unoptimised build's shaping cost says nothing about a regression.

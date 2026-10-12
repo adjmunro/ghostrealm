@@ -13,11 +13,6 @@ needed" wait on a product call.
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-8. **Palette caret drifts when the input is wider than the panel.** Palette
-   buffers word-wrap with a one-line height
-   ([`window.rs:3038`](../crates/app/src/window.rs), `:3117`), and `glyph_x`
-   (`:3804`) searches only the first layout run. Fix: `Wrap::None` plus
-   horizontal scroll, as `widgets::text_field` does.
 9. **Double-tap Shift/Ctrl opens the palette over a confirmation or picker.**
    `handle_key_taps` ([`window.rs:2618`](../crates/app/src/window.rs)) toggles
    the palette regardless; the confirm buttons stop responding and Enter
