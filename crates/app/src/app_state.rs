@@ -563,7 +563,6 @@ impl AppState {
             .map(|v| v.id);
         match existing {
             Some(vt) => {
-                self.focus_vtab(vt);
                 let has_editor = self
                     .tree
                     .vtab(vt)
@@ -574,8 +573,11 @@ impl AppState {
                             .any(|s| self.view(s.id).is_some_and(|v| v.plugin() == editor::ID))
                     })
                     .unwrap_or(false);
-                if !has_editor {
-                    let view = self.settings_view(&path)?;
+                // Make the editor first: a file that won't open leaves the
+                // focus where it was.
+                let view = if has_editor { None } else { Some(self.settings_view(&path)?) };
+                self.focus_vtab(vt);
+                if let Some(view) = view {
                     self.open_view_in_focused(view);
                 }
             }
@@ -1593,6 +1595,19 @@ mod tests {
         let err = s.open_path_in_focused(&file).unwrap_err();
         assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
         assert_eq!(s.focused_surface(), None, "no tab bound to it");
+    }
+
+    #[test]
+    fn a_settings_file_that_wont_open_leaves_the_focus_alone() {
+        let path = crate::plugin::testing::tmpdir("settings-unreadable").join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let mut s = AppState::new();
+        s.open_settings(path.clone()).unwrap();
+        s.close_focused_surface();
+        let elsewhere = s.new_empty_vtab();
+        std::fs::write(&path, b"caf\xe9").unwrap();
+        assert!(s.open_settings(path).is_err());
+        assert_eq!(s.active(), Some(elsewhere), "not moved to an empty settings workspace");
     }
 
     #[test]

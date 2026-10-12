@@ -15,12 +15,16 @@ it; the rest come from reading the code.
   (scratch) buffers.
 - TODO.md only tracks a close confirmation for multi-pane workspaces.
 
-### 5. Save As failures are silent
+### 5. Save As and open failures are silent
 
-- The error goes to stderr only, after the picker has closed (`after_pick`,
-  [`window.rs:1294`](../crates/app/src/window.rs)). The app has no
-  user-visible error surface yet (no toast or status line). Decision needed:
-  where should errors like this show?
+- A Save As error goes to stderr only, after the picker has closed
+  (`after_pick`, [`window.rs:1294`](../crates/app/src/window.rs)).
+- So does a file that won't open (not UTF-8, unreadable): clicking it in the
+  file browser or opening the settings does nothing visible
+  (`open_requested_file`, [`window.rs:1002`](../crates/app/src/window.rs);
+  `open_config_editor`, `:830`).
+- The app has no user-visible error surface yet (no toast or status line).
+  Decision needed: where should errors like these show?
 
 ## Low
 
