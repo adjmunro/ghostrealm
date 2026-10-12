@@ -198,6 +198,18 @@ impl GhosttyTerminal {
         self.reader_done
     }
 
+    /// The child's process id (its process group's, too: it leads its own
+    /// session).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// The PTY's foreground process group (the running command, else the
+    /// shell).
+    pub fn foreground_group(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
     /// A handle that kills the child from another thread.
     pub fn child_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
         self.child.clone_killer()

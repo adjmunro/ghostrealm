@@ -22,10 +22,14 @@ use portable_pty::ChildKiller;
 
 use crate::{CommandBuilder, GhosttyTerminal, PtyWaker};
 
-/// How long a dropped terminal's worker gets to shut down before its child is
-/// killed (a worker blocked writing to a child that isn't reading never sees
-/// `Shutdown`).
+/// How long a dropped terminal's worker gets to see `Shutdown` before the
+/// child is sent SIGHUP. A worker blocked writing to a child that isn't
+/// reading never sees it; the child's exit fails the write.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long after SIGHUP before SIGKILL goes to the child's and the
+/// foreground command's process groups (either may ignore SIGHUP).
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// How often an otherwise idle worker checks whether the child has exited:
 /// nothing else wakes it when the exit brings no output (a background job
@@ -59,6 +63,8 @@ struct Meta {
     title: Option<String>,
     busy: bool,
     lifecycle: Lifecycle,
+    /// The PTY's foreground process group, for a forced shutdown.
+    foreground: Option<i32>,
 }
 
 /// Shared between the worker (writer) and the handle (reader).
@@ -85,6 +91,7 @@ pub struct ThreadedTerminal {
     worker: Option<JoinHandle<()>>,
     /// Kills the child if the worker doesn't shut down in time.
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    child_pid: Option<u32>,
 }
 
 impl ThreadedTerminal {
@@ -105,10 +112,11 @@ impl ThreadedTerminal {
                 title: None,
                 busy: false,
                 lifecycle: Lifecycle::Running,
+                foreground: None,
             }),
             generation: AtomicU64::new(0),
         });
-        type Started = Result<Box<dyn ChildKiller + Send + Sync>>;
+        type Started = Result<(Box<dyn ChildKiller + Send + Sync>, Option<u32>)>;
         let (start_tx, start_rx) = mpsc::channel::<Started>();
         let worker_shared = Arc::clone(&shared);
         // The PTY reader wakes the worker (not the UI) by posting `PtyReady`.
@@ -132,7 +140,7 @@ impl ThreadedTerminal {
                     Some(pty_waker),
                 ) {
                     Ok(t) => {
-                        let _ = start_tx.send(Ok(t.child_killer()));
+                        let _ = start_tx.send(Ok((t.child_killer(), t.child_pid())));
                         t
                     }
                     Err(e) => {
@@ -144,8 +152,8 @@ impl ThreadedTerminal {
             })
             .map_err(|e| anyhow!("spawn vt-worker: {e}"))?;
 
-        let killer = match start_rx.recv() {
-            Ok(Ok(killer)) => killer,
+        let (killer, child_pid) = match start_rx.recv() {
+            Ok(Ok(started)) => started,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("vt-worker died during startup")),
         };
@@ -158,6 +166,7 @@ impl ThreadedTerminal {
             last_grid: Grid::empty(),
             worker: Some(worker),
             killer: Some(killer),
+            child_pid,
         })
     }
 
@@ -166,27 +175,57 @@ impl ThreadedTerminal {
     }
 }
 
-/// Dropping returns at once (it runs on the UI thread); a reaper thread waits
-/// for the worker, killing the child after [`SHUTDOWN_GRACE`] to unblock it.
+/// Dropping returns at once (it runs on the UI thread). A reaper thread waits
+/// for the worker; if it is stuck, the reaper sends the child SIGHUP after
+/// [`SHUTDOWN_GRACE`], then SIGKILL to its and the foreground command's
+/// process groups after [`KILL_GRACE`]. A child already seen to exit isn't
+/// signalled (its pid may be reused); the reaper then leaves the worker be.
 impl Drop for ThreadedTerminal {
     fn drop(&mut self) {
         self.send(Cmd::Shutdown);
         let (Some(worker), Some(mut killer)) = (self.worker.take(), self.killer.take()) else {
             return;
         };
+        let (shared, pid) = (Arc::clone(&self.shared), self.child_pid);
         let reap = move || {
-            let deadline = Instant::now() + SHUTDOWN_GRACE;
-            while !worker.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+            let finished = |grace: Duration| {
+                let deadline = Instant::now() + grace;
+                while !worker.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                worker.is_finished()
+            };
+            let exited = || matches!(shared.meta.lock().unwrap().lifecycle, Lifecycle::Exited(_));
+            if finished(SHUTDOWN_GRACE) || exited() {
+                return;
             }
-            if !worker.is_finished() {
-                let _ = killer.kill();
+            let _ = killer.kill();
+            if finished(KILL_GRACE) || exited() {
+                return;
             }
-            let _ = worker.join();
+            let foreground = shared.meta.lock().unwrap().foreground;
+            force_kill(pid, foreground);
         };
         let _ = std::thread::Builder::new().name("vt-reaper".into()).spawn(reap);
     }
 }
+
+/// SIGKILL the process groups of the child (`pid` leads its own) and of the
+/// foreground command.
+#[cfg(unix)]
+fn force_kill(pid: Option<u32>, foreground: Option<i32>) {
+    let groups = pid.and_then(|p| i32::try_from(p).ok()).into_iter().chain(foreground);
+    for group in groups.filter(|g| *g > 1) {
+        // SAFETY: killpg only sends a signal.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+}
+
+/// The killer's TerminateProcess is already forceful.
+#[cfg(not(unix))]
+fn force_kill(_pid: Option<u32>, _foreground: Option<i32>) {}
 
 impl TerminalBackend for ThreadedTerminal {
     fn resize(&mut self, cols: u16, rows: u16, cell_w_px: u32, cell_h_px: u32) {
@@ -329,6 +368,7 @@ fn worker_loop(
             title: term.title(),
             busy: term.is_busy(),
             lifecycle: term.lifecycle(),
+            foreground: term.foreground_group(),
         };
         exit_poll = (new_meta.lifecycle == Lifecycle::Running)
             .then(|| if term.output_closed() { EXIT_POLL_AFTER_EOF } else { EXIT_POLL });
@@ -419,8 +459,12 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let pid_file = dir.join("pid");
         let _ = std::fs::remove_file(&pid_file);
-        // The child never reads its input, so a large write blocks the worker.
-        let cmd = sh(&format!("stty raw -echo; echo $$ > '{}'; exec sleep 30", pid_file.display()));
+        // The child never reads its input, so a large write blocks the worker,
+        // and it ignores SIGHUP.
+        let cmd = sh(&format!(
+            "trap '' HUP; stty raw -echo; echo $$ > '{}'; exec sleep 30",
+            pid_file.display()
+        ));
         let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(cmd), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(4);
         let pid = loop {
@@ -442,7 +486,7 @@ mod tests {
             let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
             out.is_ok_and(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
         };
-        let deadline = Instant::now() + SHUTDOWN_GRACE + Duration::from_secs(3);
+        let deadline = Instant::now() + SHUTDOWN_GRACE + KILL_GRACE + Duration::from_secs(3);
         while alive() {
             assert!(Instant::now() < deadline, "the child outlived the grace period");
             std::thread::sleep(Duration::from_millis(20));

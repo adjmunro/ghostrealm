@@ -219,12 +219,12 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 // Snappy quit: hide the window for instant visual feedback, then
-                // exit the process outright. Graceful teardown (joining VT-worker
-                // threads, wgpu/Metal device drop) is synchronous and can stall
-                // for seconds — sometimes long enough that macOS marks the app
-                // unresponsive. Exiting lets the OS reclaim threads and fds; the
-                // closing PTY masters SIGHUP the child shells, exactly as closing
-                // any terminal does. Flush unsaved editors first (each view's
+                // exit the process outright. Graceful teardown (the wgpu/Metal
+                // device drop) is synchronous and can stall for seconds —
+                // sometimes long enough that macOS marks the app unresponsive.
+                // Exiting lets the OS reclaim threads and fds; the closing PTY
+                // masters SIGHUP the child shells, exactly as closing any
+                // terminal does. Flush unsaved editors first (each view's
                 // autosave setting decides).
                 let _ = state.app.autosave_all(&state.cfg);
                 state.window.set_visible(false);
