@@ -24,9 +24,11 @@ it; the rest come from reading the code.
 
 ## Low
 
-7. The git filter runs `git status` on the UI thread (`ensure_git_status`,
-   [`fs_tree.rs:438`](../crates/core/src/fs_tree.rs)), the first time a git
-   filter or the git view is shown after a refresh; a large repo stalls a frame.
+7. The git filter runs `git status --untracked-files=all` on the UI thread
+   (`ensure_git_status`, [`fs_tree.rs:438`](../crates/core/src/fs_tree.rs)),
+   the first time a git filter or the git view is shown after a refresh. A
+   large repo, or a large untracked directory (listed file by file), stalls
+   a frame.
 8. Shell exit isn't acted on: the pane stays after `exit`. Decision needed:
    close the pane (or tab) when its shell exits, or keep it showing the
    final output?

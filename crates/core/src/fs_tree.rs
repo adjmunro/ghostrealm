@@ -456,8 +456,9 @@ impl FsTree {
         let prefix = git(&["rev-parse", "--show-prefix"]);
         let map = match (status, prefix) {
             (Some(status), Some(prefix)) => {
-                let prefix = String::from_utf8_lossy(&prefix).trim_end_matches('\n').to_string();
-                parse_porcelain_z(&status, prefix.as_bytes())
+                // Bytes, not text: a non-UTF-8 root must still match.
+                let prefix = prefix.strip_suffix(b"\n").unwrap_or(&prefix);
+                parse_porcelain_z(&status, prefix)
                     .into_iter()
                     .map(|(rel, st)| (self.root.join(rel), st))
                     .collect()
@@ -1029,6 +1030,8 @@ mod tests {
             vec![(PathBuf::from("a b.txt"), modified), (PathBuf::from("caf\u{e9}/new.txt"), untracked)]
         );
         assert_eq!(parse_porcelain_z(out, b"").len(), 3);
+        let latin1 = parse_porcelain_z(b" M d\xff/x\0", b"d\xff/");
+        assert_eq!(latin1, vec![(PathBuf::from("x"), modified)], "a non-UTF-8 prefix matches");
     }
 
     #[test]
