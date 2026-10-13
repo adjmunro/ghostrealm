@@ -136,6 +136,41 @@ impl EditorBuffer {
             .unwrap_or_else(|| "*scratch*".to_string())
     }
 
+    /// Select the word at `(row, col)`: the run of characters of the same class
+    /// (word characters, whitespace, or other punctuation) that contains it. At
+    /// the end of a line this is the run before the caret. Does nothing on an
+    /// empty line.
+    pub fn select_word_at(&mut self, (row, col): (usize, usize)) {
+        let chars: Vec<char> = match self.lines.get(row) {
+            Some(l) => l.chars().collect(),
+            None => return,
+        };
+        if chars.is_empty() {
+            return;
+        }
+        let at = col.min(chars.len() - 1);
+        let class = |c: char| {
+            if c.is_alphanumeric() || c == '_' {
+                0
+            } else if c.is_whitespace() {
+                1
+            } else {
+                2
+            }
+        };
+        let k = class(chars[at]);
+        let mut start = at;
+        while start > 0 && class(chars[start - 1]) == k {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < chars.len() && class(chars[end]) == k {
+            end += 1;
+        }
+        self.anchor = Some((row, start));
+        self.cursor = (row, end);
+    }
+
     pub fn line_len(&self, row: usize) -> usize {
         self.lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
     }
@@ -646,6 +681,20 @@ mod tests {
         e.backspace();
         assert_eq!(e.lines, vec!["abcd"]);
         assert_eq!(e.cursor, (0, 2));
+    }
+
+    #[test]
+    fn selects_the_word_under_a_position() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("let foo_1 = (bar);");
+        e.select_word_at((0, 6));
+        assert_eq!(e.selected_text().as_deref(), Some("foo_1"));
+        e.select_word_at((0, 3));
+        assert_eq!(e.selected_text().as_deref(), Some(" "), "whitespace is a run");
+        e.select_word_at((0, 12));
+        assert_eq!(e.selected_text().as_deref(), Some("("), "punctuation is one run");
+        e.select_word_at((0, 18));
+        assert_eq!(e.selected_text().as_deref(), Some(");"), "end of line takes the last run");
     }
 
     #[test]

@@ -454,11 +454,18 @@ impl View for TerminalView {
                 self.report_mouse(MouseAction::Motion, None, mods, pos);
             }
             // A press only records the anchor; a plain click never highlights.
-            MouseEvent::Down { pos: (x, y), .. } => {
+            MouseEvent::Down { pos: (x, y), clicks } => {
                 if self.selection.take().is_some() {
                     cx.redraw();
                 }
                 self.press_cell = self.cell_at(x, y);
+                // A double-click selects (and copies) the word under the pointer.
+                if let Some((col, row)) = self.press_cell.filter(|_| clicks == 2) {
+                    let (start, end) = word_span(&self.grid, row, col);
+                    self.selection = Some(Selection { anchor: (start, row), head: (end, row) });
+                    self.copy_selection(cx);
+                    cx.redraw();
+                }
             }
             MouseEvent::Drag { pos: (x, y) } => {
                 let (Some(anchor), Some(head)) = (self.press_cell, self.cell_at(x, y)) else {
@@ -641,6 +648,33 @@ fn word_col(grid: &Grid, row: u16, col: u16, forward: bool) -> u16 {
     c
 }
 
+/// The first and last columns of the run of like cells (word characters,
+/// blanks, or other punctuation) containing `col` on `row`.
+fn word_span(grid: &Grid, row: u16, col: u16) -> (u16, u16) {
+    let cols = grid.size.cols;
+    if cols == 0 {
+        return (col, col);
+    }
+    let class = |c: u16| {
+        match grid.cell(c, row).and_then(|cell| cell.text.chars().next()) {
+            Some(ch) if ch.is_alphanumeric() || ch == '_' => 0,
+            Some(ch) if !ch.is_whitespace() => 2,
+            _ => 1,
+        }
+    };
+    let col = col.min(cols - 1);
+    let k = class(col);
+    let mut start = col;
+    while start > 0 && class(start - 1) == k {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols && class(end + 1) == k {
+        end += 1;
+    }
+    (start, end)
+}
+
 /// The text of a selection over `grid`, row-major, trailing spaces trimmed per
 /// line and rows joined with newlines.
 fn selection_text(grid: &Grid, sel: Selection) -> String {
@@ -816,6 +850,23 @@ mod tests {
         // A fresh press clears it.
         h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 1 });
         assert!(v.selection.is_none());
+    }
+
+    #[test]
+    fn word_span_stops_at_blanks_and_punctuation() {
+        let grid = grid_of(&["ab_1 (cd)"]);
+        assert_eq!(word_span(&grid, 0, 1), (0, 3));
+        assert_eq!(word_span(&grid, 0, 5), (5, 5), "punctuation");
+        assert_eq!(word_span(&grid, 0, 7), (6, 7));
+    }
+
+    #[test]
+    fn double_click_selects_a_word() {
+        let mut v = running("printf 'hello world'; sleep 2", "hello world");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(7, 0), clicks: 2 });
+        assert_eq!(selection_text(&v.grid, v.selection.unwrap()), "world");
     }
 
     #[test]

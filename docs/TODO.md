@@ -931,10 +931,6 @@
 
 - Requires: NO BLOCKERS
 - Detail:
-  - **Double-click selects a word**: `MouseEvent::Down` carries `clicks`, but
-    neither the editor nor the terminal reads it (only the file browser and the
-    web view do). Double-click should select the word under the pointer in the
-    editor (and the terminal).
   - **Ribbon word count**: the stats tooltip reads "Click for words"
     (`stats.rs`, `Stats::tip`); want "Click for wordcount". Also: the stats text
     and the autosave icon overlap in padding/margin; give them a gap.

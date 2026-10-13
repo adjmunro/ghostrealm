@@ -725,12 +725,16 @@ impl View for EditorView {
         match *event {
             // A press moves the cursor and anchors a potential selection; one only
             // shows once the cursor is dragged away.
-            MouseEvent::Down { pos: (x, y), .. } => {
+            MouseEvent::Down { pos: (x, y), clicks } => {
                 self.dismiss_popup();
                 self.buf.end_undo_run();
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
                     self.buf.cursor = p;
                     self.buf.anchor = Some(p);
+                    // A double-click selects the word; its release keeps it.
+                    if clicks == 2 {
+                        self.buf.select_word_at(p);
+                    }
                     cx.redraw();
                 }
             }
@@ -744,7 +748,7 @@ impl View for EditorView {
             }
             // A plain click leaves no selection; a drag keeps it (for Cmd+C).
             MouseEvent::Up { dragged, .. } => {
-                if !dragged {
+                if !dragged && self.buf.anchor == Some(self.buf.cursor) {
                     self.buf.anchor = None;
                     cx.redraw();
                 }
@@ -1118,6 +1122,16 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 1), clicks: 1 });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 1), dragged: false });
         assert_eq!(v.buffer().selection(), None);
+    }
+
+    #[test]
+    fn double_click_selects_the_word_and_keeps_it_on_release() {
+        let mut v = view_with("hello world");
+        let mut h = Harness::new();
+        paint_in_strip(&mut h, &mut v);
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 7), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 7), dragged: false });
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
     }
 
     #[test]
