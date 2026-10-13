@@ -397,7 +397,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                state.fire_button();
+                if !state.fire_menu() {
+                    state.fire_button();
+                }
                 state.end_press();
                 state.window.request_redraw();
             }
@@ -641,6 +643,8 @@ struct Menu {
     items: Vec<(String, MenuAction)>,
     /// Item under the cursor, for highlight.
     hover: Option<usize>,
+    /// Item the left button went down on; it runs on release over the same item.
+    armed: Option<usize>,
     /// Per-item rects (physical px), filled at render for hit-testing.
     rows: Vec<Rect>,
     /// The panel rect (physical px), for click-outside dismissal.
@@ -1639,6 +1643,7 @@ impl State {
             anchor: (x, y),
             items,
             hover: None,
+            armed: None,
             rows: Vec::new(),
             panel: Rect {
                 x: 0.0,
@@ -1650,20 +1655,39 @@ impl State {
         self.dirty = true;
     }
 
-    /// A left click while the context menu is open: run a clicked item, else close.
+    /// A left press while the context menu is open: arm the item under it (it
+    /// runs on release), or close the menu when the press is outside it.
     fn menu_click(&mut self) {
         let (x, y) = self.cursor;
-        let hit = self.menu.as_ref().and_then(|m| {
-            m.rows
-                .iter()
-                .position(|r| rect_contains(*r, x, y))
-                .map(|i| (m.items[i].1, m.target.clone()))
-        });
-        self.menu = None;
-        if let Some((action, target)) = hit {
-            self.apply_menu_action(action, target);
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.armed = menu.rows.iter().position(|r| rect_contains(*r, x, y));
+        if menu.armed.is_none() && !rect_contains(menu.panel, x, y) {
+            self.menu = None;
         }
         self.dirty = true;
+    }
+
+    /// The left button went up: run the armed menu item if the cursor is still
+    /// over it. Returns whether the menu handled the release.
+    fn fire_menu(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let Some(armed) = menu.armed.take() else {
+            return false;
+        };
+        let over = menu.rows.get(armed).is_some_and(|r| rect_contains(*r, x, y));
+        if !over {
+            return true; // released off the item: cancelled, the menu stays
+        }
+        let (action, target) = (menu.items[armed].1, menu.target.clone());
+        self.menu = None;
+        self.apply_menu_action(action, target);
+        self.dirty = true;
+        true
     }
 
     /// Highlight the menu item under the cursor; returns whether it changed.
