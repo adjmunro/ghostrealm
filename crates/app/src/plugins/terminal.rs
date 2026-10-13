@@ -100,6 +100,8 @@ struct Selection {
     anchor: (u16, u16),
     /// Where it currently ends.
     head: (u16, u16),
+    /// Chosen as a whole (word or line), so a single cell is still a selection.
+    explicit: bool,
 }
 
 impl Selection {
@@ -115,7 +117,7 @@ impl Selection {
     }
 
     fn is_empty(&self) -> bool {
-        self.anchor == self.head
+        self.anchor == self.head && !self.explicit
     }
 }
 
@@ -265,7 +267,7 @@ impl TerminalView {
             Key::Down => head.1 = (head.1 + 1).min(rows - 1),
             _ => return,
         }
-        self.selection = Some(Selection { anchor, head });
+        self.selection = Some(Selection { anchor, head, explicit: false });
     }
 
     /// Cmd chords the keymap didn't turn into readline keys: copy and paste.
@@ -459,10 +461,16 @@ impl View for TerminalView {
                     cx.redraw();
                 }
                 self.press_cell = self.cell_at(x, y);
-                // A double-click selects (and copies) the word under the pointer.
-                if let Some((col, row)) = self.press_cell.filter(|_| clicks == 2) {
-                    let (start, end) = word_span(&self.grid, row, col);
-                    self.selection = Some(Selection { anchor: (start, row), head: (end, row) });
+                // A double-click selects (and copies) the word under the pointer;
+                // a triple-click the row.
+                if let Some((col, row)) = self.press_cell.filter(|_| clicks >= 2) {
+                    let (start, end) = if clicks == 2 {
+                        word_span(&self.grid, row, col)
+                    } else {
+                        (0, self.grid.size.cols.saturating_sub(1))
+                    };
+                    self.selection =
+                        Some(Selection { anchor: (start, row), head: (end, row), explicit: true });
                     self.copy_selection(cx);
                     cx.redraw();
                 }
@@ -471,7 +479,7 @@ impl View for TerminalView {
                 let (Some(anchor), Some(head)) = (self.press_cell, self.cell_at(x, y)) else {
                     return;
                 };
-                let sel = Some(Selection { anchor, head });
+                let sel = Some(Selection { anchor, head, explicit: false });
                 if self.selection != sel {
                     self.selection = sel;
                     cx.redraw();
@@ -648,14 +656,28 @@ fn word_col(grid: &Grid, row: u16, col: u16, forward: bool) -> u16 {
     c
 }
 
+/// Whether cell `(col, row)` is the empty second half of a double-width
+/// grapheme (CJK, emoji) in the cell before it.
+fn is_spacer(grid: &Grid, row: u16, col: u16) -> bool {
+    col > 0
+        && grid.cell(col, row).is_some_and(|c| c.text.is_empty())
+        && grid
+            .cell(col - 1, row)
+            .is_some_and(|c| unicode_width::UnicodeWidthStr::width(c.text.as_str()) == 2)
+}
+
 /// The first and last columns of the run of like cells (word characters,
-/// blanks, or other punctuation) containing `col` on `row`.
+/// blanks, or other punctuation) containing `col` on `row`. A double-width
+/// grapheme's spacer cell belongs to the grapheme.
 fn word_span(grid: &Grid, row: u16, col: u16) -> (u16, u16) {
     let cols = grid.size.cols;
     if cols == 0 {
         return (col, col);
     }
-    let class = |c: u16| {
+    let class = |mut c: u16| {
+        if is_spacer(grid, row, c) {
+            c -= 1;
+        }
         match grid.cell(c, row).and_then(|cell| cell.text.chars().next()) {
             Some(ch) if ch.is_alphanumeric() || ch == '_' => 0,
             Some(ch) if !ch.is_whitespace() => 2,
@@ -686,6 +708,9 @@ fn selection_text(grid: &Grid, sel: Selection) -> String {
         let last = if row == er { ec } else { last_col };
         let mut line = String::new();
         for col in first..=last.min(last_col) {
+            if is_spacer(grid, row, col) {
+                continue;
+            }
             match grid.cell(col, row) {
                 Some(c) if !c.text.is_empty() => line.push_str(&c.text),
                 _ => line.push(' '),
@@ -757,11 +782,11 @@ mod tests {
     #[test]
     fn selection_text_spans_and_trims() {
         let grid = grid_of(&["abc ", "def ", "ghi "]);
-        let sel = Selection { anchor: (1, 0), head: (1, 2) };
+        let sel = Selection { anchor: (1, 0), head: (1, 2), explicit: false };
         assert_eq!(selection_text(&grid, sel), "bc\ndef\ngh");
-        let rev = Selection { anchor: (1, 2), head: (1, 0) };
+        let rev = Selection { anchor: (1, 2), head: (1, 0), explicit: false };
         assert_eq!(selection_text(&grid, rev), "bc\ndef\ngh", "order doesn't matter");
-        let one = Selection { anchor: (0, 0), head: (3, 0) };
+        let one = Selection { anchor: (0, 0), head: (3, 0), explicit: false };
         assert_eq!(selection_text(&grid, one), "abc", "trailing blanks trimmed");
     }
 
@@ -858,6 +883,38 @@ mod tests {
         assert_eq!(word_span(&grid, 0, 1), (0, 3));
         assert_eq!(word_span(&grid, 0, 5), (5, 5), "punctuation");
         assert_eq!(word_span(&grid, 0, 7), (6, 7));
+    }
+
+    #[test]
+    fn word_span_keeps_a_wide_grapheme_with_its_spacer() {
+        let mut grid = grid_of(&["(\u{4e16}  b"]);
+        // grid_of puts the wide char in one cell; its spacer is the blank after.
+        assert_eq!(word_span(&grid, 0, 1), (1, 2), "the lead cell takes its spacer");
+        assert_eq!(word_span(&grid, 0, 2), (1, 2), "the spacer finds its lead");
+        let sel = Selection { anchor: (1, 0), head: (2, 0), explicit: true };
+        assert_eq!(selection_text(&grid, sel), "\u{4e16}", "no space for the spacer");
+        grid.cells[3].text = "x".into();
+        assert_eq!(word_span(&grid, 0, 1), (1, 4), "following letters join the run");
+    }
+
+    #[test]
+    fn a_single_cell_word_is_a_selection_that_copies() {
+        let mut v = running("printf 'a b c'; sleep 2", "a b c");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 2 });
+        let sel = v.selection.unwrap();
+        assert!(!sel.is_empty(), "one cell, but chosen as a whole");
+        assert_eq!(selection_text(&v.grid, sel), "b");
+    }
+
+    #[test]
+    fn triple_click_selects_the_row() {
+        let mut v = running("printf 'hello world'; sleep 2", "hello world");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 3 });
+        assert_eq!(selection_text(&v.grid, v.selection.unwrap()), "hello world");
     }
 
     #[test]
@@ -967,7 +1024,7 @@ mod tests {
     fn a_forwarded_wheel_clears_the_selection() {
         let mut v = echoing("\\033[?1000h\\033[?1006h");
         let h = Harness::new();
-        v.selection = Some(Selection { anchor: (0, 0), head: (3, 0) });
+        v.selection = Some(Selection { anchor: (0, 0), head: (3, 0), explicit: false });
         h.scroll(&mut v, cell(1, 2), UI.cell_h);
         assert!(v.selection.is_none());
     }

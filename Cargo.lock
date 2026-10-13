@@ -1183,6 +1183,7 @@ dependencies = [
  "rodio",
  "serde_json",
  "toml",
+ "unicode-width",
  "wgpu",
  "winit",
 ]
