@@ -96,6 +96,19 @@ enum Confirmed {
     /// Move this path to the Trash, after saving `save` (accept) or without
     /// saving (discard) the open views of it.
     UnsavedTrash { path: std::path::PathBuf, save: Vec<SurfaceId> },
+    /// `sid`'s file changed on disk since it was loaded: write over it
+    /// (accept) or load the disk version over its edits (discard). Then carry
+    /// on with `rest`, the other views a Save and Close was saving, and `then`.
+    DiskConflict { sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume> },
+}
+
+/// What a save that stopped to ask about a changed file goes on to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Resume {
+    /// Leave, once the saving is done.
+    Leave(Leave),
+    /// Move this path to the Trash, once the saving is done.
+    Trash(std::path::PathBuf),
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -588,50 +601,95 @@ impl AppState {
                 Ok(Vec::new())
             }
             Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
-                self.save_views(&save)?;
-                self.trash_now(&path)?;
-                Ok(Vec::new())
+                self.save_views(&save, Some(Resume::Trash(path)))
+            }
+            Some(Confirm { then: Confirmed::DiskConflict { sid, rest, then }, .. }) => {
+                let view = self
+                    .views
+                    .get_mut(&sid)
+                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+                let mut written = Vec::new();
+                if let Some(path) = view.path() {
+                    view.save_as(path.clone())?;
+                    written.push(path);
+                }
+                written.extend(self.save_views(&rest, then)?);
+                Ok(written)
             }
             Some(Confirm { then: Confirmed::Pick(path), .. }) => {
                 Ok(self.finish_picker(path)?.into_iter().collect())
             }
             Some(Confirm { then: Confirmed::Unsaved { what, save }, .. }) => {
                 // Nothing is closed unless every save worked.
-                let written = self.save_views(&save)?;
-                self.perform(what);
-                Ok(written)
+                self.save_views(&save, Some(Resume::Leave(what)))
             }
             None => Ok(Vec::new()),
         }
     }
 
-    /// Save each of `surfaces` to its own file. Returns the files written.
-    fn save_views(&mut self, surfaces: &[SurfaceId]) -> Result<Vec<std::path::PathBuf>> {
+    /// Save each of `surfaces` to its own file, then do `then`. A view whose
+    /// file changed on disk stops the saving to ask ([`Self::ask_disk_conflict`]),
+    /// which carries on with the rest once answered. Returns the files written.
+    fn save_views(&mut self, surfaces: &[SurfaceId], then: Option<Resume>) -> Result<Vec<std::path::PathBuf>> {
         let mut written = Vec::new();
-        for sid in surfaces {
+        for (i, sid) in surfaces.iter().enumerate() {
             let view = self
                 .views
                 .get_mut(sid)
                 .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
             let Some(path) = view.path() else { continue };
+            if view.disk_conflict() {
+                self.ask_disk_conflict_then(*sid, surfaces[i + 1..].to_vec(), then);
+                return Ok(written);
+            }
             view.save_as(path.clone())?;
             written.push(path);
+        }
+        match then {
+            Some(Resume::Leave(what)) => self.perform(what),
+            Some(Resume::Trash(path)) => self.trash_now(&path)?,
+            None => {}
         }
         Ok(written)
     }
 
-    /// Go ahead with the confirmed action without its saving. Does nothing
-    /// unless the question has a discard button.
-    pub fn discard_confirm(&mut self) -> Result<()> {
+    /// Ask whether to write over `sid`'s file, which changed on disk since the
+    /// view loaded or wrote it (Overwrite), load the disk version instead
+    /// (Reload, losing the view's edits), or leave things as they are.
+    pub fn ask_disk_conflict(&mut self, sid: SurfaceId) {
+        self.ask_disk_conflict_then(sid, Vec::new(), None);
+    }
+
+    fn ask_disk_conflict_then(&mut self, sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume>) {
+        let name = self.views.get(&sid).and_then(|v| v.title()).unwrap_or_default();
+        self.confirm = Some(Confirm {
+            message: format!("\u{201c}{name}\u{201d} changed on disk since you opened it."),
+            accept: Some("Overwrite"),
+            discard: Some("Reload"),
+            then: Confirmed::DiskConflict { sid, rest, then },
+        });
+    }
+
+    /// Go ahead with the confirmed action without its saving (for a changed
+    /// file, by loading the disk version). Does nothing unless the question
+    /// has a discard button. Returns the files written.
+    pub fn discard_confirm(&mut self) -> Result<Vec<std::path::PathBuf>> {
         if !self.confirm.as_ref().is_some_and(|c| c.discard.is_some()) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
+            Some(Confirm { then: Confirmed::DiskConflict { sid, rest, then }, .. }) => {
+                self.views
+                    .get_mut(&sid)
+                    .ok_or_else(|| anyhow::anyhow!("the view to reload has closed"))?
+                    .reload()?;
+                return self.save_views(&rest, then);
+            }
             _ => {}
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Ask before closing or quitting over unsaved changes ([`Self::confirm`]).
@@ -676,7 +734,8 @@ impl AppState {
         if let Some((_, Pick::SaveAs(sid) | Pick::SaveCopy(sid))) = &self.picker {
             let own = self.view(*sid).and_then(|v| v.path());
             let copy = matches!(self.picker, Some((_, Pick::SaveCopy(_))));
-            if path.is_file() && (copy || own.as_deref() != Some(path.as_path())) {
+            let stale = !copy && self.view(*sid).is_some_and(|v| v.disk_conflict());
+            if path.is_file() && (copy || stale || own.as_deref() != Some(path.as_path())) {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.confirm = Some(Confirm {
                     message: format!("\u{201c}{name}\u{201d} already exists. Replace it?"),
@@ -2368,6 +2427,103 @@ mod tests {
         assert!(s.view(sid).is_none());
     }
 
+    /// `edited`, then another program rewrites the file.
+    fn conflicted(dir: &Path, name: &str) -> (AppState, SurfaceId, std::path::PathBuf) {
+        let (s, sid, file) = edited(dir, name);
+        std::fs::write(&file, "theirs\n").unwrap();
+        (s, sid, file)
+    }
+
+    fn lines(s: &AppState, sid: SurfaceId) -> Vec<String> {
+        s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines.clone()
+    }
+
+    #[test]
+    fn a_save_conflict_asks_and_overwrite_writes() {
+        let dir = crate::plugin::testing::tmpdir("conflict-overwrite");
+        let (mut s, sid, file) = conflicted(&dir, "a.txt");
+        s.ask_disk_conflict(sid);
+        let c = s.confirm().expect("asks");
+        assert_eq!((c.accept, c.discard), (Some("Overwrite"), Some("Reload")));
+        assert_eq!(c.message, "\u{201c}a.txt\u{201d} changed on disk since you opened it.");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n", "nothing written yet");
+        assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
+        assert!(!s.view(sid).unwrap().modified() && !s.view(sid).unwrap().disk_conflict());
+        assert!(s.confirm().is_none());
+    }
+
+    #[test]
+    fn a_save_conflict_reload_takes_the_disk_version_and_cancel_changes_nothing() {
+        let dir = crate::plugin::testing::tmpdir("conflict-reload");
+        let (mut s, sid, file) = conflicted(&dir, "a.txt");
+        s.ask_disk_conflict(sid);
+        s.cancel_confirm();
+        assert_eq!(lines(&s, sid), ["newold"]);
+        assert!(s.view(sid).unwrap().modified());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+
+        s.ask_disk_conflict(sid);
+        assert!(s.discard_confirm().unwrap().is_empty());
+        assert_eq!(lines(&s, sid), ["theirs"]);
+        assert!(!s.view(sid).unwrap().modified() && !s.view(sid).unwrap().disk_conflict());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+        assert!(s.confirm().is_none());
+    }
+
+    #[test]
+    fn save_and_close_asks_about_a_changed_file_before_closing() {
+        let dir = crate::plugin::testing::tmpdir("conflict-close");
+        // Overwrite: written, then closed.
+        let (mut s, sid, file) = conflicted(&dir, "a.txt");
+        s.close_focused_surface();
+        assert!(s.accept_confirm().unwrap().is_empty(), "stopped to ask: nothing written");
+        let c = s.confirm().expect("the changed-file question");
+        assert_eq!(c.accept, Some("Overwrite"));
+        assert!(s.view(sid).is_some());
+        assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
+        assert!(s.view(sid).is_none(), "closed after the write");
+
+        // Reload: the disk version is kept, then it closes.
+        let (mut s, sid, file) = conflicted(&dir, "b.txt");
+        s.close_focused_surface();
+        s.accept_confirm().unwrap();
+        s.discard_confirm().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+        assert!(s.view(sid).is_none());
+
+        // Cancel: stays open, unsaved.
+        let (mut s, sid, file) = conflicted(&dir, "c.txt");
+        s.close_focused_surface();
+        s.accept_confirm().unwrap();
+        s.cancel_confirm();
+        assert!(s.view(sid).unwrap().modified());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn autosave_on_blur_or_quit_leaves_a_changed_file_alone() {
+        let dir = crate::plugin::testing::tmpdir("conflict-autosave");
+        let (mut s, sid, file) = conflicted(&dir, "a.txt");
+        let cfg = Config::default();
+        assert!(cfg.editor.autosave_on_unfocus);
+        s.autosave_all(&cfg);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+        assert!(s.view(sid).unwrap().modified());
+        assert!(s.confirm().is_none(), "no dialog for an autosave");
+    }
+
+    #[test]
+    fn save_as_over_its_own_changed_file_asks_to_replace() {
+        let dir = crate::plugin::testing::tmpdir("conflict-save-as");
+        let (mut s, sid, file) = conflicted(&dir, "a.txt");
+        s.open_save_as(sid);
+        s.confirm_picker_with(file.clone()).unwrap();
+        assert_eq!(s.confirm().and_then(|c| c.accept), Some("Replace"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+    }
+
     #[test]
     fn closing_a_pane_or_workspace_asks_when_any_view_in_it_is_modified() {
         let dir = crate::plugin::testing::tmpdir("close-pane");
@@ -2447,9 +2603,10 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("save-fails");
         for quit in [false, true] {
             let (mut s, sid, file) = edited(&dir, if quit { "q.txt" } else { "c.txt" });
-            // A directory in the file's place makes the write fail.
-            std::fs::remove_file(&file).unwrap();
-            std::fs::create_dir(&file).unwrap();
+            // A read-only file makes the write fail.
+            let mut perms = std::fs::metadata(&file).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&file, perms).unwrap();
             if quit {
                 s.request_quit();
             } else {

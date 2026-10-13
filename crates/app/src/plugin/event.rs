@@ -51,6 +51,10 @@ pub enum Request {
     ///
     /// [`View::save_as`]: super::View::save_as
     SaveAs,
+    /// The view's file changed on disk since it loaded or wrote it, so saving
+    /// needs an answer first: ask whether to overwrite it or reload (the view
+    /// stays as it is until then).
+    SaveConflict,
     /// Open the file and folder context menu on `target` at `at` (physical px).
     FileMenu {
         target: crate::file_menu::FileTarget,

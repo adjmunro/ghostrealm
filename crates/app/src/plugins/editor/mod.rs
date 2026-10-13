@@ -309,9 +309,16 @@ impl EditorView {
         self.autosave.unwrap_or(cfg.editor.autosave_on_unfocus)
     }
 
-    /// Write a modified, file-backed buffer. Returns the file written.
+    /// Write a modified, file-backed buffer. Returns the file written. A file
+    /// that changed on disk since the buffer loaded or wrote it is left alone,
+    /// and the buffer stays modified: only an explicit save may ask to
+    /// overwrite it.
     fn save_if_modified(&mut self) -> Option<PathBuf> {
         if !self.buf.modified || self.buf.path.is_none() {
+            return None;
+        }
+        if self.buf.disk_changed() {
+            self.buf.changed_on_disk = true;
             return None;
         }
         self.buf.save().ok().filter(|saved| *saved)?;
@@ -408,6 +415,10 @@ impl EditorView {
             cx.request(Request::SaveAs);
             return;
         };
+        if self.buf.disk_changed() {
+            cx.request(Request::SaveConflict);
+            return;
+        }
         if let Ok(true) = self.buf.save() {
             self.saved();
             cx.request(Request::Saved(path));
@@ -1507,6 +1518,63 @@ mod tests {
         assert_eq!(out.requests, vec![Request::Saved(path.clone())]);
         assert!(!v.modified());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\n");
+    }
+
+    /// An editor with unsaved text "x" whose file another program then
+    /// rewrote.
+    fn conflicted(name: &str) -> (EditorView, PathBuf) {
+        let path = tmpdir(name).join("f.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        v.buffer_mut().insert_str("x");
+        std::fs::write(&path, "someone else's\n").unwrap();
+        (v, path)
+    }
+
+    #[test]
+    fn cmd_s_over_a_file_changed_on_disk_asks_instead_of_writing() {
+        let (mut v, path) = conflicted("editor-save-conflict");
+        let h = Harness::new();
+        let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
+        assert!(used);
+        assert_eq!(out.requests, vec![Request::SaveConflict]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's\n");
+        assert!(v.modified());
+    }
+
+    #[test]
+    fn autosave_skips_a_file_changed_on_disk_and_keeps_the_edits() {
+        let (mut v, path) = conflicted("editor-autosave-conflict");
+        let h = Harness::new();
+        let out = h.focus(&mut v, false);
+        assert!(out.requests.is_empty(), "no save on blur");
+        assert_eq!(v.save_if_modified(), None);
+        assert_eq!(v.autosave(&h.cfg), None, "nor on quit or app blur");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's\n");
+        assert!(v.modified() && v.buffer().changed_on_disk, "still unsaved, and marked");
+    }
+
+    #[test]
+    fn saving_a_file_deleted_on_disk_recreates_it_without_asking() {
+        let (mut v, path) = conflicted("editor-save-deleted");
+        std::fs::remove_file(&path).unwrap();
+        let h = Harness::new();
+        let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
+        assert_eq!(out.requests, vec![Request::Saved(path.clone())]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xdisk\n");
+        assert!(!v.disk_conflict(), "the recreated file is ours");
+    }
+
+    #[test]
+    fn a_save_is_not_a_conflict_with_itself() {
+        let (mut v, path) = conflicted("editor-save-twice");
+        v.reload().unwrap();
+        v.buffer_mut().insert_str("y");
+        let h = Harness::new();
+        for _ in 0..2 {
+            let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
+            assert_eq!(out.requests, vec![Request::Saved(path.clone())]);
+        }
     }
 
     #[test]

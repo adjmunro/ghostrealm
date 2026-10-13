@@ -1489,6 +1489,7 @@ impl State {
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
+                Request::SaveConflict => self.app.ask_disk_conflict(sid),
                 Request::Busy => self.app.mark_busy(sid),
                 Request::Close => {
                     if let Some(key) = self.key_in_flight {
@@ -1530,8 +1531,9 @@ impl State {
 
     /// Go ahead with the open confirmation's action without saving.
     fn discard_confirm(&mut self) {
-        if let Err(e) = self.app.discard_confirm() {
-            eprintln!("ghostrealm: {e:#}");
+        match self.app.discard_confirm() {
+            Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
+            Err(e) => eprintln!("ghostrealm: {e:#}"),
         }
         self.dirty = true;
         self.exit_if_quitting();
