@@ -59,9 +59,11 @@ Default App, Open in Terminal (folders), Cut / Copy / Paste / Duplicate, Copy Pa
 Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclude
 (in a git repository), Rename, Save Copy As (editor), and Delete, last under a rule.
 Delete moves to the Trash (macOS only for now) and closes the file's editors; it asks
-first unless git tracks the file and it is unmodified. Names are asked for in the
-palette's argument prompt. Each item is also a `file.*` command (palette, agent, key
-bindings) acting on the focused file, or on its `path` argument. Cut and Copy keep the
+first unless git tracks the file and it is unmodified (a folder: all of it, and it
+isn't a repository itself). Names are asked for in the palette's argument prompt.
+Each item is also a `file.*` command (palette, agent, key bindings) acting on the
+focused file, or on its `path` argument (a relative one is taken from the workspace
+folder). Cut and Copy keep the
 file inside the app: Paste works within ghostrealm, not with Finder.
 
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
