@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
+pub mod markdown;
 pub mod toml;
 
 /// What a stretch of text is, independent of how it is drawn.
@@ -63,7 +64,7 @@ pub trait Highlighter: Sync {
 }
 
 /// Every registered highlighter.
-pub static ALL: &[&dyn Highlighter] = &[&toml::Toml];
+pub static ALL: &[&dyn Highlighter] = &[&toml::Toml, &markdown::Markdown];
 
 /// The highlighter claiming `ext` (case-insensitive, without the dot).
 pub fn for_extension(ext: &str) -> Option<&'static dyn Highlighter> {
@@ -169,6 +170,8 @@ mod tests {
         assert_eq!(for_extension("toml").map(|h| h.name()), Some("toml"));
         assert_eq!(for_extension("TOML").map(|h| h.name()), Some("toml"));
         assert_eq!(for_path(Path::new("a/b/Cargo.toml")).map(|h| h.name()), Some("toml"));
+        assert_eq!(for_extension("MD").map(|h| h.name()), Some("markdown"));
+        assert_eq!(for_path(Path::new("a/b/README.markdown")).map(|h| h.name()), Some("markdown"));
         assert!(for_extension("rs").is_none());
         assert!(for_path(Path::new("Makefile")).is_none());
     }

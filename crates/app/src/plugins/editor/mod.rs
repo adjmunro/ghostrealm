@@ -1266,6 +1266,26 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_files_paint_every_row_through_edits_and_scrolling() {
+        let dir = tmpdir("editor-highlight");
+        let path = dir.join("doc.md");
+        let text: String = std::iter::once("```".to_string())
+            .chain((1..60).map(|i| format!("# line {i}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, text).unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        let mut h = Harness::new();
+        let rows = (RECT.h / UI.cell_h) as usize;
+        for scroll in [0, 20, 52] {
+            v.buf.scroll = scroll;
+            h.key(&mut v, press(Key::Char('x')));
+            let drawn = h.paint(&mut v, RECT).text.len();
+            assert!(drawn >= rows.min(60 - scroll) - 1, "scroll {scroll}: {drawn} rows");
+        }
+    }
+
+    #[test]
     fn save_as_elsewhere_stops_the_language_service() {
         let path = tmpdir("editor-save-as-lang").join("copy.toml");
         let mut v = attached("bad\n");

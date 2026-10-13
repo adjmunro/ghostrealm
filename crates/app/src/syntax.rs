@@ -83,4 +83,16 @@ mod tests {
         assert_eq!(toml(line, 20, 5), vec![(String::new(), FG)]);
         assert_eq!(toml("", 0, 0), vec![(String::new(), FG)]);
     }
+
+    #[test]
+    fn markdown_rows_follow_the_carried_fence_state() {
+        use ghostrealm_core::highlight::markdown::Markdown;
+        let (_, inside) = Markdown.line("```", 0);
+        let line = "# not *a* heading";
+        let fenced = row_spans(line, &Markdown.line(line, inside).0, 0, 99, FG);
+        assert_eq!(fenced, vec![(line.to_string(), color(Token::Code, FG))]);
+        let free = row_spans(line, &Markdown.line(line, 0).0, 0, 99, FG);
+        assert_eq!(free[0], ("#".to_string(), color(Token::Marker, FG)));
+        assert!(free.len() > 1);
+    }
 }
