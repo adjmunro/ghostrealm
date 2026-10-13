@@ -50,6 +50,12 @@ pub fn remove_stale(dir: &Path, running: impl Fn(u32) -> bool) {
     }
 }
 
+/// Bytes in a `width x height` BGRA frame, or `None` if that overflows (the
+/// sizes come from the other process).
+fn frame_bytes(width: u32, height: u32) -> Option<usize> {
+    (width as usize).checked_mul(height as usize)?.checked_mul(4)
+}
+
 /// Slot `slot`'s sequence word in a mapping starting at `base`.
 ///
 /// # Safety
@@ -100,13 +106,12 @@ impl FrameWriter {
     /// Copy one BGRA frame (`width * height * 4` bytes, tightly packed) into the
     /// next slot.
     pub fn write(&mut self, width: u32, height: u32, pixels: &[u8]) -> io::Result<WrittenFrame> {
-        let bytes = width as usize * height as usize * 4;
-        if pixels.len() < bytes {
+        let Some(bytes) = frame_bytes(width, height).filter(|b| pixels.len() >= *b) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "short frame buffer",
             ));
-        }
+        };
         let fits = self
             .current
             .as_ref()
@@ -160,7 +165,11 @@ impl FrameWriter {
             }
             r => r?,
         };
-        file.set_len((HEADER + bytes * 2) as u64)?;
+        let len = bytes
+            .checked_mul(2)
+            .and_then(|b| b.checked_add(HEADER))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+        file.set_len(len as u64)?;
         // SAFETY: the file is private to this writer (fresh, unique name) and is
         // never truncated while mapped.
         let map = unsafe { MmapMut::map_mut(&file)? };
@@ -203,7 +212,7 @@ impl FrameReader {
     /// Where `slot`'s pixels for a `width x height` frame lie, if the file
     /// holds them.
     fn span(&self, slot: u8, width: u32, height: u32) -> Option<std::ops::Range<usize>> {
-        let bytes = width as usize * height as usize * 4;
+        let bytes = frame_bytes(width, height)?;
         let slot_bytes = self.map.len().checked_sub(HEADER)? / 2;
         if slot > 1 || bytes > slot_bytes {
             return None;
@@ -269,6 +278,10 @@ mod tests {
         assert_eq!(px, [9; 8]);
         assert!(!r.holds(0, 100, 100), "out-of-range frame is rejected");
         assert!(!r.read(0, 1, 100, 100, &mut px));
+        // Sizes whose byte count overflows (2^31 x 2^31 x 4 wraps to 0).
+        assert!(!r.holds(0, 1 << 31, 1 << 31));
+        assert!(!r.read(a.slot, a.seq, 1 << 31, 1 << 31, &mut px));
+        assert!(w.write(1 << 31, 1 << 31, &[0; 8]).is_err());
 
         // Two frames later the first slot holds a newer frame: the old one
         // is gone rather than read torn or replaced.

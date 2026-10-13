@@ -55,6 +55,8 @@ pub struct ImageRenderer {
     nearest: wgpu::BindGroup,
     smooth: wgpu::BindGroup,
     textures: HashMap<(SurfaceId, u32), Texture>,
+    /// The device's largest texture side; bigger images aren't drawn.
+    max_side: u32,
     instances: wgpu::Buffer,
     capacity: u64,
     /// This frame's draws in instance order: base layer, then overlay.
@@ -156,6 +158,7 @@ impl ImageRenderer {
             nearest,
             smooth,
             textures: HashMap::new(),
+            max_side: device.limits().max_texture_dimension_2d,
             instances: instance_buffer(device, capacity),
             capacity,
             draws: Vec::new(),
@@ -199,9 +202,7 @@ impl ImageRenderer {
                     data.push((w, h, pixels));
                     data.extend(img.source.mips().iter().map(|(w, h, px)| (*w, *h, px.as_slice())));
                 }
-                let whole = !data.is_empty()
-                    && data.iter().all(|(w, h, px)| px.len() >= *w as usize * *h as usize * 4);
-                if whole {
+                if uploadable(&data, self.max_side) {
                     self.upload(device, queue, key, img.version, &data);
                 } else if !self.textures.contains_key(&key) {
                     continue;
@@ -352,6 +353,21 @@ impl ImageRenderer {
     }
 }
 
+/// Whether every level fits a texture (at most `max_side` a side) and holds
+/// its pixels. Sizes may come from another process (a web page's frame), so
+/// the byte count is checked for overflow.
+fn uploadable(levels: &[(u32, u32, &[u8])], max_side: u32) -> bool {
+    !levels.is_empty()
+        && levels.iter().all(|(w, h, px)| {
+            *w <= max_side
+                && *h <= max_side
+                && (*w as usize)
+                    .checked_mul(*h as usize)
+                    .and_then(|n| n.checked_mul(4))
+                    .is_some_and(|n| px.len() >= n)
+        })
+}
+
 /// `r` as a scissor rect within a `sw`x`sh` target, or `None` if nothing of it
 /// is on the target.
 fn scissor(r: Rect, sw: u32, sh: u32) -> Option<(u32, u32, u32, u32)> {
@@ -411,6 +427,18 @@ mod tests {
     use crate::plugin::{Image, ImageSource};
 
     struct Solid(Vec<u8>, u32);
+
+    /// Pixels of any claimed size.
+    struct Claimed(Vec<u8>, u32, u32);
+
+    impl ImageSource for Claimed {
+        fn size(&self) -> (u32, u32) {
+            (self.1, self.2)
+        }
+        fn bgra(&self) -> Option<&[u8]> {
+            Some(&self.0)
+        }
+    }
 
     impl ImageSource for Solid {
         fn size(&self) -> (u32, u32) {
@@ -575,6 +603,24 @@ mod tests {
             assert_eq!(px(&data, 24, 8), [0, 0, 0], "inside the image but outside its clip");
             assert_eq!(px(&data, 56, 8), [0, 0, 0], "outside the image");
             assert_eq!(px(&data, 40, 40), [30, 20, 10], "an opaque source draws its pixels as given");
+        });
+    }
+
+    /// A size past the device's limit, or one whose byte count overflows, is
+    /// not drawn (rather than failing texture creation or wrapping the size
+    /// check).
+    #[test]
+    fn oversized_images_are_skipped() {
+        pollster::block_on(async {
+            let (device, queue) = gpu().await;
+            let max = device.limits().max_texture_dimension_2d;
+            let full = rect(0.0, 0.0, DIM as f32, DIM as f32);
+            let wide = Arc::new(Claimed(vec![255; (max as usize + 1) * 4], max + 1, 1));
+            let huge = Arc::new(Claimed(vec![255; 4], 1 << 31, 1 << 31));
+            let mut r = ImageRenderer::new(&device, FORMAT);
+            let data = render(&device, &queue, &mut r, &[item(0, wide, full, full), item(1, huge, full, full)], &[]);
+            assert_eq!(px(&data, 4, 4), [0, 0, 0]);
+            assert!(r.textures.is_empty());
         });
     }
 
