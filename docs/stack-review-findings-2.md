@@ -131,18 +131,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low
 
-#### 42. Hover nits
-
-- Where: `restrict` call site
-  ([`window.rs:3281`](../crates/app/src/window.rs)), from `e9617b8`.
-- `restrict` ignores `mouse_down`, so a modal opened from the keyboard
-  mid-press sends `Leave` mid-press. That contradicts the
-  [`event.rs`](../crates/app/src/plugin/event.rs) doc ("never during a press"),
-  and the web view sends CEF a leave without button flags. Fix: skip `restrict`
-  while `mouse_down`, or apply it on release.
-- Related, pre-existing: switching tab or workspace by keyboard leaves hover on
-  a view that is now hidden. Restrict hover to views painted that frame.
-
 ### Informational
 
 #### 43. Image alpha blends in linear light

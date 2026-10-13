@@ -1191,11 +1191,14 @@ impl State {
     }
 
     /// Which views may have hover: none while the palette, a menu, or a
-    /// confirmation owns the pointer; only the picker's while it is open.
+    /// confirmation owns the pointer; only the picker's while it is open; and
+    /// only views painted last frame (a view on a hidden tab or workspace is
+    /// not under the pointer).
     fn may_hover(&self) -> impl Fn(SurfaceId) -> bool {
         let blocked = self.palette.is_some() || self.menu.is_some() || self.app.confirm().is_some();
         let picker = self.app.picker_open();
-        move |sid| !blocked && (!picker || sid == PICKER_SID)
+        let shown = self.shown.clone();
+        move |sid| !blocked && (!picker || sid == PICKER_SID) && (sid == PICKER_SID || shown.contains(&sid))
     }
 
     /// Tell `sid` (a view that lost hover) that the pointer left it. Returns
@@ -3299,7 +3302,7 @@ impl State {
         // A modal that opened (from the keyboard, say) takes hover from the
         // view under the pointer.
         let may_hover = self.may_hover();
-        let left = self.hover.restrict(may_hover);
+        let left = self.hover.restrict(self.mouse_down, may_hover);
         self.send_leave(left);
         if !self.dirty {
             return Ok(());
@@ -3510,6 +3513,11 @@ impl State {
         // Rows the shaping budget deferred need a follow-up frame.
         let deferred = self.text.finish_paint();
         self.update_shown(&painted);
+        // A view that just went off screen (a keyboard tab or workspace switch)
+        // no longer has the pointer.
+        let may_hover = self.may_hover();
+        let left = self.hover.restrict(self.mouse_down, may_hover);
+        self.send_leave(left);
         match frame.cursor {
             Some((r, icon)) => {
                 self.cursor_rect = Some(r);
@@ -4215,9 +4223,11 @@ impl Hover {
     }
 
     /// Only views `allowed` may keep hover. Returns the view that lost it.
-    fn restrict(&mut self, allowed: impl Fn(SurfaceId) -> bool) -> Option<SurfaceId> {
+    /// Never during a `pressed` button: the view that took the press keeps
+    /// hover until the release, so it never hears `Leave` mid-press.
+    fn restrict(&mut self, pressed: bool, allowed: impl Fn(SurfaceId) -> bool) -> Option<SurfaceId> {
         match self.view {
-            Some(v) if !allowed(v) => self.set(None),
+            Some(v) if !pressed && !allowed(v) => self.set(None),
             _ => None,
         }
     }
@@ -4298,9 +4308,10 @@ mod tests {
         assert_eq!(h.set(a), None, "moving within a view keeps its hover");
         assert_eq!(h.set(b), a, "moving on ends the last view's hover");
 
-        assert_eq!(h.restrict(|_| true), None);
-        assert_eq!(h.restrict(|_| false), b, "a modal ends it");
-        assert_eq!(h.restrict(|_| false), None, "once");
+        assert_eq!(h.restrict(false, |_| true), None);
+        assert_eq!(h.restrict(true, |_| false), None, "not mid-press");
+        assert_eq!(h.restrict(false, |s| s != SurfaceId(2)), b, "a modal or a hidden view ends it");
+        assert_eq!(h.restrict(false, |_| false), None, "once");
 
         h.set(a);
         assert_eq!(h.left_window(false), a, "leaving the window ends it");
