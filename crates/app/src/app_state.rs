@@ -415,10 +415,14 @@ impl AppState {
         self.picker.as_ref().map(|(_, p)| *p)
     }
 
-    /// Open the floating picker for `purpose`, rooted at the active
+    /// Open the floating picker for `purpose`. A new workspace starts at the
+    /// app default directory; every other purpose starts at the active
     /// workspace's dir (else the app default, else the current dir).
     pub fn open_picker(&mut self, purpose: Pick) {
-        let root = self.picker_root();
+        let root = match purpose {
+            Pick::NewWorkspace => self.default_root(),
+            _ => self.picker_root(),
+        };
         self.picker = Some((FileBrowserView::picker(root, purpose.mode()), purpose));
     }
 
@@ -427,7 +431,13 @@ impl AppState {
     fn picker_root(&self) -> std::path::PathBuf {
         self.active()
             .and_then(|vt| self.resolve_cwd(vt))
-            .or_else(|| self.default_dir.clone())
+            .unwrap_or_else(|| self.default_root())
+    }
+
+    /// The app default directory, else the current dir.
+    fn default_root(&self) -> std::path::PathBuf {
+        self.default_dir
+            .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
@@ -1711,6 +1721,11 @@ mod tests {
         assert_eq!(count(&s), 1);
         let vt = s.active().unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(proj.as_path()));
+
+        // The picker starts at the default directory, not the active workspace's.
+        r.execute("workspace.new", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.picker().unwrap().tree().root(), dir.as_path());
+        s.close_picker();
 
         // Given a directory, the command skips the picker.
         let args = Args::new().with("dir", Value::Str(dir.display().to_string()));

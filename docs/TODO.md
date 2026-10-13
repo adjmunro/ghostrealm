@@ -931,11 +931,6 @@
 
 - Requires: NO BLOCKERS
 - Detail:
-  - **New workspace directory**: the New Workspace button (and `workspace.new`)
-    opens the picker at the active workspace's root, else the default directory
-    (`AppState::picker_root`). Want it to start at the default directory
-    (`[workspace] default_directory`). Save As without a file shares
-    `picker_root`; keep its behaviour unless the owner wants it changed too.
   - **Opens in the wrong pane**: clicking an option on a "nothing open" pane
     opens it in the *focused* pane, not the clicked one (the button press is
     armed and suppresses the pane focus that a plain click applies). Open in the
