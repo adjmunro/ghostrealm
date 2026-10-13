@@ -89,6 +89,10 @@ pub struct GhosttyTerminal {
     cell_h: u32,
     /// Cached once the child is observed to have exited.
     exited: Option<Lifecycle>,
+    /// The signal that ended the child, from the `waitid` siginfo of the thread
+    /// that waited for it ([`Self::note_exit_signal`]). Preferred over
+    /// [`signal_number`], which only knows signals below 32.
+    exit_signal: Option<i32>,
     /// The reader thread signalled EOF (child's PTY closed).
     reader_done: bool,
     /// Grid changed since the last `snapshot()`; lets the app skip re-snapshotting
@@ -211,6 +215,7 @@ impl GhosttyTerminal {
             cell_w,
             cell_h,
             exited: None,
+            exit_signal: None,
             reader_done: false,
             dirty: true,
         })
@@ -232,6 +237,12 @@ impl GhosttyTerminal {
     /// session).
     pub fn child_pid(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    /// Record the signal that ended the child, as its exit waiter saw it, so
+    /// [`Terminal::lifecycle`] reports it whatever its number.
+    pub(crate) fn note_exit_signal(&mut self, signal: Option<i32>) {
+        self.exit_signal = signal;
     }
 
     /// The PTY's foreground process group (the running command, else the
@@ -691,7 +702,8 @@ impl TerminalBackend for GhosttyTerminal {
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
-                let done = match status.signal().and_then(signal_number) {
+                let signal = self.exit_signal.or_else(|| status.signal().and_then(signal_number));
+                let done = match signal {
                     Some(signal) => Lifecycle::Signaled(signal),
                     None => Lifecycle::Exited(Some(status.exit_code() as i32)),
                 };
@@ -704,7 +716,8 @@ impl TerminalBackend for GhosttyTerminal {
 }
 
 /// The number of the signal whose `strsignal` text is `description`: the only
-/// form of it `portable_pty`'s exit status keeps.
+/// form of it `portable_pty`'s exit status keeps. Used when no exit waiter
+/// supplied the number (the non-threaded terminal); knows signals below 32.
 #[cfg(unix)]
 fn signal_number(description: &str) -> Option<i32> {
     (1..32).find(|&n| {

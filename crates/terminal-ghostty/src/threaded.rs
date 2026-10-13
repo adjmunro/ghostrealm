@@ -58,8 +58,9 @@ enum Cmd {
     Scroll(Scroll),
     /// The PTY reader forwarded output; drain + parse it.
     PtyReady,
-    /// The child exited (not yet reaped): refresh the lifecycle.
-    ChildExited,
+    /// The child exited (not yet reaped), by the given signal if it was killed
+    /// by one: refresh the lifecycle.
+    ChildExited(Option<i32>),
     Shutdown,
 }
 
@@ -173,8 +174,8 @@ impl ThreadedTerminal {
         if let Some(pid) = child_pid {
             let tx = cmd_tx.clone();
             let _ = std::thread::Builder::new().name("vt-exit-waiter".into()).spawn(move || {
-                wait_for_exit(pid);
-                let _ = tx.send(Cmd::ChildExited);
+                let signal = wait_for_exit(pid);
+                let _ = tx.send(Cmd::ChildExited(signal));
             });
         }
 
@@ -348,21 +349,39 @@ impl TerminalBackend for ThreadedTerminal {
 }
 
 /// Block until the child `pid` has exited, leaving it unreaped (the worker
-/// reaps it, in `lifecycle`). Returns early if it can't wait (it was reaped
-/// already).
+/// reaps it, in `lifecycle`). Returns the signal that killed it, if one did,
+/// from the `waitid` siginfo. Returns early with `None` if it can't wait (it
+/// was reaped already).
 #[cfg(unix)]
-fn wait_for_exit(pid: u32) {
+fn wait_for_exit(pid: u32) -> Option<i32> {
     let pid: libc::id_t = pid;
     loop {
         // SAFETY: waitid writes only the zeroed siginfo it is given.
-        let r = unsafe {
+        let (r, info) = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+            let r = libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT);
+            (r, info)
         };
-        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
+        if r == 0 {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: waitid filled si_status for a WEXITED report.
+            let status = unsafe { info.si_status() };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let status = info.si_status;
+            return killed_by(info.si_code, status);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
         }
     }
+}
+
+/// The signal in a `waitid` report with `si_code` and `si_status`: the status
+/// is a signal number only when the child was killed (`CLD_KILLED`) or dumped
+/// core (`CLD_DUMPED`), else its exit code.
+#[cfg(unix)]
+fn killed_by(si_code: i32, si_status: i32) -> Option<i32> {
+    matches!(si_code, libc::CLD_KILLED | libc::CLD_DUMPED).then_some(si_status)
 }
 
 /// How long the idle worker waits before checking for the child's exit:
@@ -418,7 +437,7 @@ fn worker_loop(
             } => term.resize(cols, rows, cell_w, cell_h),
             Cmd::Scroll(s) => term.scroll(s),
             Cmd::PtyReady => pump = true,
-            Cmd::ChildExited => {}
+            Cmd::ChildExited(signal) => term.note_exit_signal(signal),
             Cmd::Shutdown => shutdown = true,
         };
         if let Some(m) = first {
@@ -598,6 +617,40 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(150), "it waited for the exit");
         let status = child.try_wait().unwrap().expect("exited, and still ours to reap");
         assert_eq!(status.code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_waiter_reports_the_signal_that_killed_the_child() {
+        let spawn = |script: &str| std::process::Command::new("sh").args(["-c", script]).spawn().unwrap();
+        let mut killed = spawn("kill -9 $$");
+        assert_eq!(wait_for_exit(killed.id()), Some(libc::SIGKILL));
+        killed.wait().unwrap();
+        let mut exited = spawn("exit 9");
+        assert_eq!(wait_for_exit(exited.id()), None, "an exit code is not a signal");
+        exited.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_killed_or_dumped_report_carries_a_signal() {
+        assert_eq!(killed_by(libc::CLD_KILLED, 40), Some(40));
+        assert_eq!(killed_by(libc::CLD_DUMPED, 11), Some(11));
+        assert_eq!(killed_by(libc::CLD_EXITED, 9), None);
+    }
+
+    /// Real-time signals are numbered from 32 on Linux, past what the
+    /// `strsignal` text lookup covers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_time_signal_is_reported_by_number() {
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(sh("kill -40 $$")), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while term.lifecycle() == Lifecycle::Running {
+            assert!(Instant::now() < deadline, "the exit was never noticed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(term.lifecycle(), Lifecycle::Signaled(40));
     }
 
     #[cfg(unix)]
