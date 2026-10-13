@@ -52,6 +52,24 @@ pub fn reply_to_terminate(go_ahead: bool) {
     NSApplication::sharedApplication(mtm).replyToApplicationShouldTerminate(go_ahead);
 }
 
+/// [`reply_to_terminate`], sent once the current run-loop callback has
+/// returned. A yes can make AppKit call `applicationWillTerminate:` before the
+/// reply call returns, which winit panics on if its own event handler is still
+/// running ("another event is currently being handled").
+pub fn reply_to_terminate_later(go_ahead: bool) {
+    schedule_reply(go_ahead, |run| dispatch2::DispatchQueue::main().exec_async(run), reply_to_terminate);
+}
+
+/// Hand `enqueue` a job that calls `reply(go_ahead)`; nothing is replied
+/// until the job runs.
+fn schedule_reply(
+    go_ahead: bool,
+    enqueue: impl FnOnce(Box<dyn FnOnce() + Send>),
+    reply: fn(bool),
+) {
+    enqueue(Box::new(move || reply(go_ahead)));
+}
+
 /// Give `class` an `applicationShouldTerminate:` that asks `on_request`.
 /// Returns false if the class already has one of its own.
 fn install(class: &AnyClass, on_request: impl Fn() -> Terminate + 'static) -> bool {
@@ -92,6 +110,20 @@ mod tests {
     use objc2::msg_send;
     use objc2::runtime::{ClassBuilder, NSObject};
     use objc2::ClassType;
+
+    #[test]
+    fn a_scheduled_reply_is_sent_only_when_the_queued_job_runs() {
+        use std::sync::atomic::{AtomicI8, Ordering};
+        static SENT: AtomicI8 = AtomicI8::new(-1);
+        fn record(go_ahead: bool) {
+            SENT.store(go_ahead as i8, Ordering::SeqCst);
+        }
+        let mut queued: Option<Box<dyn FnOnce() + Send>> = None;
+        schedule_reply(true, |job| queued = Some(job), record);
+        assert_eq!(SENT.load(Ordering::SeqCst), -1, "nothing is sent while the caller is still running");
+        queued.take().expect("a job was queued")();
+        assert_eq!(SENT.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn a_termination_request_asks_the_app_and_is_held_unless_told_to_go_ahead() {

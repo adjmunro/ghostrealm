@@ -809,6 +809,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -1169,6 +1171,7 @@ dependencies = [
  "arboard",
  "block2 0.6.2",
  "bytemuck",
+ "dispatch2",
  "ghostrealm-core",
  "ghostrealm-lsp",
  "ghostrealm-terminal",

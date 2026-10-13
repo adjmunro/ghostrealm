@@ -174,9 +174,11 @@ impl UnsavedFlag {
 }
 
 #[cfg(target_os = "macos")]
-use crate::macos_quit::reply_to_terminate;
+use crate::macos_quit::{reply_to_terminate, reply_to_terminate_later};
 #[cfg(not(target_os = "macos"))]
 fn reply_to_terminate(_go_ahead: bool) {}
+#[cfg(not(target_os = "macos"))]
+fn reply_to_terminate_later(_go_ahead: bool) {}
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -262,7 +264,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         match self.unsaved.settle(state.app.has_unsaved()) {
-            Some(true) => reply_to_terminate(true),
+            // After this handler returns: terminating inside it would re-enter winit.
+            Some(true) => reply_to_terminate_later(true),
             // Asked from outside the window (it may be minimised, or the app
             // in the background): bring it forward to show the question.
             Some(false) => {
