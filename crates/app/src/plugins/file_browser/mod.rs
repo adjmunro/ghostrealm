@@ -780,7 +780,7 @@ impl View for FileBrowserView {
                     }
                 }
             }
-            MouseEvent::Drag { .. } | MouseEvent::Up { .. } => {}
+            MouseEvent::Drag { .. } | MouseEvent::Up { .. } | MouseEvent::Leave { .. } => {}
         }
     }
 

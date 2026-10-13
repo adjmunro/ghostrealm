@@ -744,6 +744,8 @@ impl View for EditorView {
                     cx.redraw();
                 }
             }
+            // The hover popup may extend over the next pane: leave it up.
+            MouseEvent::Leave { .. } => {}
         }
     }
 

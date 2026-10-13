@@ -20,6 +20,10 @@ pub enum MouseEvent {
     Up { pos: (f32, f32), dragged: bool },
     /// Hover with no button held.
     Move { pos: (f32, f32) },
+    /// The pointer, last hovering this view, moved on to something else
+    /// (another view, the app's chrome, or out of the window): drop hover state.
+    /// `pos` is where it went.
+    Leave { pos: (f32, f32) },
 }
 
 /// A key event as the platform reported it — presses and releases, with the

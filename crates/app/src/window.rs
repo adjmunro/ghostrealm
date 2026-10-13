@@ -254,6 +254,11 @@ impl ApplicationHandler<UserEvent> for App {
                     super_: s.super_key(),
                 };
             }
+            WindowEvent::CursorLeft { .. } => {
+                if state.leave_hovered(None) {
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = (position.x as f32, position.y as f32);
                 let mut redraw = false;
@@ -387,6 +392,8 @@ struct State {
     cursor_rect: Option<Rect>,
     /// Views painted last frame (on screen), for [`View::shown`].
     shown: std::collections::HashSet<SurfaceId>,
+    /// The view last sent hover, told when the pointer leaves it.
+    hovered: Option<SurfaceId>,
     quad_buffer: wgpu::Buffer,
     quad_capacity: u64,
 
@@ -771,6 +778,7 @@ impl State {
             cursor_icon: CursorIcon::Default,
             cursor_rect: None,
             shown: std::collections::HashSet::new(),
+            hovered: None,
             quad_buffer,
             quad_capacity,
             app,
@@ -1169,8 +1177,23 @@ impl State {
             self.surface_under_cursor()
                 .filter(|s| self.app.view(*s).is_some())
         };
-        match target {
+        let left = self.leave_hovered(target);
+        let moved = match target {
             Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Move { pos })),
+            None => false,
+        };
+        left | moved
+    }
+
+    /// Tell the view last hovered that the pointer left it, unless it is
+    /// `next` (where the pointer is now). Returns whether it asked to redraw.
+    fn leave_hovered(&mut self, next: Option<SurfaceId>) -> bool {
+        let prev = std::mem::replace(&mut self.hovered, next);
+        match prev.filter(|p| Some(*p) != next) {
+            Some(sid) => {
+                let pos = self.cursor;
+                self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Leave { pos }))
+            }
             None => false,
         }
     }

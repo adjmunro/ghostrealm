@@ -416,7 +416,7 @@ impl View for TerminalView {
                 }
                 self.press_cell = None;
             }
-            MouseEvent::Move { .. } => {}
+            MouseEvent::Move { .. } | MouseEvent::Leave { .. } => {}
         }
     }
 

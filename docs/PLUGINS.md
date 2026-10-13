@@ -77,7 +77,8 @@ into the overlay layer; it doesn't need to know.
   view.
 - `mouse(&MouseEvent)`: `Down { clicks }` (the app focuses the pane first and
   counts double-clicks), then `Drag`/`Up { dragged }` for that press wherever the
-  cursor goes; `Move` is hover.
+  cursor goes; `Move` is hover, and `Leave` follows the last `Move` when the
+  pointer moves on to another view, the app's chrome, or out of the window.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
 - `raw_key(&RawKey) -> bool`: every press *and release* with the platform event
   (physical key, unmodified character), before `key`; return true to take it.

@@ -917,6 +917,11 @@ impl View for WebView {
                 }
                 self.hovering = inside;
             }
+            MouseEvent::Leave { pos } => {
+                if std::mem::take(&mut self.hovering) {
+                    self.mouse_to_page(pos, 0, flags, MouseAction::Leave);
+                }
+            }
         }
     }
 
@@ -1197,6 +1202,18 @@ mod tests {
             panic!("web.new succeeded without a host");
         };
         assert!(msg.contains("opened web surface"), "{msg}");
+    }
+
+    #[test]
+    fn leaving_the_view_ends_the_page_hover() {
+        let mut v = hostless();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let inside = (v.body.x + 10.0, v.body.y + 10.0);
+        h.mouse(&mut v, MouseEvent::Move { pos: inside });
+        assert!(v.hovering);
+        h.mouse(&mut v, MouseEvent::Leave { pos: (900.0, 10.0) });
+        assert!(!v.hovering, "the page is told the pointer left");
     }
 
     #[test]
