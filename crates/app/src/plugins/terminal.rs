@@ -487,6 +487,11 @@ MouseEvent::Move { .. } | MouseEvent::Leave { .. } => {}
             for _ in 0..lines.abs().min(MAX_WHEEL_REPORTS) {
                 self.report_mouse(MouseAction::Press, Some(button), cx.mods, pos);
             }
+            // The program redraws in response; a viewport-relative selection
+            // would highlight stale text.
+            if self.selection.take().is_some() {
+                cx.redraw();
+            }
             return;
         }
         // Queue the motion instead of jumping: paint eases it out a bounded step
@@ -891,6 +896,15 @@ mod tests {
         h.scroll(&mut v, cell(1, 2), -UI.cell_h);
         v.write(b"\r");
         assert_eq!(echoed(&mut v, "^[[<65"), "READY^[[<64;2;3M^[[<64;2;3M^[[<65;2;3M");
+    }
+
+    #[test]
+    fn a_forwarded_wheel_clears_the_selection() {
+        let mut v = echoing("\\033[?1000h\\033[?1006h");
+        let h = Harness::new();
+        v.selection = Some(Selection { anchor: (0, 0), head: (3, 0) });
+        h.scroll(&mut v, cell(1, 2), UI.cell_h);
+        assert!(v.selection.is_none());
     }
 
     #[test]
