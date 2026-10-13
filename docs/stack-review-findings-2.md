@@ -67,9 +67,6 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
 31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
     [`browser.rs:626`](../crates/web-host/src/browser.rs)), which breaks OAuth and
     payment popup flows. Decision needed: open them as a new tab in the pane?
-32. **Image mips average sRGB-encoded values** (`halve`,
-    [`plugin/paint.rs:266`](../crates/app/src/plugin/paint.rs)), so a shrunk
-    image with fine detail comes out slightly dark. Fix: average in linear light.
 33. **Autoplay can start audio in a hidden tab.** `tick`
     ([`preview.rs:343`](../crates/app/src/plugins/file_browser/preview.rs)) runs
     for hidden views, and only `paint` pauses. **Decided:** the file

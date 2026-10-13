@@ -12,6 +12,13 @@ use ghostrealm_core::{Rect, SurfaceId};
 
 use crate::plugin::ImageItem;
 
+/// Image pixels are sRGB-encoded and premultiplied in linear light (see
+/// [`ImageSource`](crate::plugin::ImageSource)): sampled as sRGB they read as
+/// linear light, which blends correctly and which the target encodes back. Quads
+/// and text also write linear light whatever the target, so images match them on
+/// a non-sRGB target too.
+const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
 struct Texture {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -47,7 +54,6 @@ pub struct ImageRenderer {
     /// Group 1: nearest sampling for 1:1 draws, trilinear for scaled ones.
     nearest: wgpu::BindGroup,
     smooth: wgpu::BindGroup,
-    format: wgpu::TextureFormat,
     textures: HashMap<(SurfaceId, u32), Texture>,
     instances: wgpu::Buffer,
     capacity: u64,
@@ -58,13 +64,6 @@ pub struct ImageRenderer {
 
 impl ImageRenderer {
     pub fn new(device: &wgpu::Device, target: wgpu::TextureFormat) -> Self {
-        // Image pixels are sRGB-encoded; sample them as sRGB when the target is,
-        // so they are decoded and re-encoded unchanged.
-        let format = if target.is_srgb() {
-            wgpu::TextureFormat::Bgra8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Bgra8Unorm
-        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("image"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -156,7 +155,6 @@ impl ImageRenderer {
             layout,
             nearest,
             smooth,
-            format,
             textures: HashMap::new(),
             instances: instance_buffer(device, capacity),
             capacity,
@@ -301,7 +299,7 @@ impl ImageRenderer {
                 mip_level_count: count,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.format,
+                format: TEXTURE_FORMAT,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -455,7 +453,8 @@ mod tests {
             .expect("request device")
     }
 
-    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+    /// The kind of target the app draws to (the surface's default format is sRGB).
+    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
     /// Prepare and draw `base` then `overlay` onto a black `DIM`x`DIM` RGBA
     /// target, and read it back.
@@ -630,6 +629,28 @@ mod tests {
             let data = render(&device, &queue, &mut r, &base, &[]);
             let mid = px(&data, DIM / 2, 8);
             assert!(mid.iter().all(|c| *c >= 250), "white over white stays white, got {mid:?}");
+        });
+    }
+
+    /// A half-transparent image blends in linear light: 50% white over white
+    /// stays white, and 50% white over black emits half the light (188).
+    #[test]
+    fn partly_transparent_pixels_blend_in_linear_light() {
+        pollster::block_on(async {
+            let white = Arc::new(Solid([255u8; 4].repeat(16 * 16), 16));
+            let half = || Image::from_rgba(1, 1, vec![255, 255, 255, 128]);
+            let base = [
+                item(0, white, rect(0.0, 0.0, 16.0, 16.0), rect(0.0, 0.0, 64.0, 64.0)),
+                item(1, half(), rect(0.0, 0.0, 16.0, 16.0), rect(0.0, 0.0, 64.0, 64.0)),
+                item(2, half(), rect(32.0, 0.0, 16.0, 16.0), rect(0.0, 0.0, 64.0, 64.0)),
+            ];
+            let (device, queue) = gpu().await;
+            let mut r = ImageRenderer::new(&device, FORMAT);
+            let data = render(&device, &queue, &mut r, &base, &[]);
+            let over_white = px(&data, 8, 8);
+            assert!(over_white.iter().all(|c| *c >= 254), "over white: {over_white:?}");
+            let over_black = px(&data, 40, 8);
+            assert!(over_black.iter().all(|c| c.abs_diff(188) <= 1), "over black: {over_black:?}");
         });
     }
 

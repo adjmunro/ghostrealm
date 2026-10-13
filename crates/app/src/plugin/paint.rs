@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
@@ -157,9 +157,12 @@ pub struct TextItem {
 }
 
 /// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded,
-/// with premultiplied alpha (what a web engine produces; [`Image::from_rgba`]
-/// premultiplies decoded pixels). Premultiplied pixels filter and blend without
-/// dark fringes where opaque meets transparent.
+/// with alpha premultiplied in linear light (each colour channel is
+/// `encode(decode(c) * a)`; [`Image::from_rgba`] premultiplies decoded pixels so).
+/// The renderer samples them as sRGB, so a channel reads back as linear light
+/// times alpha, which is what premultiplied blending in linear light needs.
+/// Premultiplied pixels filter and blend without dark fringes where opaque meets
+/// transparent.
 pub trait ImageSource {
     /// `(width, height)` in physical pixels.
     fn size(&self) -> (u32, u32);
@@ -190,16 +193,18 @@ pub struct Image {
 
 impl Image {
     /// An image from `width` x `height` straight-alpha RGBA8 pixels (what the
-    /// `image` crate decodes to), premultiplied before its mips are built.
+    /// `image` crate decodes to), premultiplied in linear light before its mips
+    /// are built.
     pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Arc<Image> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "RGBA8 size");
         for px in rgba.chunks_exact_mut(4) {
             px.swap(0, 2);
-            let a = px[3] as u32;
+            let a = px[3];
             if a != 255 {
+                let a = a as f32 / 255.0;
                 for c in &mut px[..3] {
-                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                    *c = encode(DECODE[*c as usize] * a);
                 }
             }
         }
@@ -262,7 +267,8 @@ impl ImageSource for Image {
     }
 }
 
-/// The next mip level: each pixel the average of (up to) a 2x2 block.
+/// The next mip level: each pixel the average of (up to) a 2x2 block, in
+/// linear light (averaging encoded values darkens fine detail).
 fn halve(w: u32, h: u32, px: &[u8]) -> (u32, u32, Vec<u8>) {
     let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
     let mut out = Vec::with_capacity(nw as usize * nh as usize * 4);
@@ -270,13 +276,31 @@ fn halve(w: u32, h: u32, px: &[u8]) -> (u32, u32, Vec<u8>) {
         let (y0, y1) = ((y * 2).min(h - 1), (y * 2 + 1).min(h - 1));
         for x in 0..nw {
             let (x0, x1) = ((x * 2).min(w - 1), (x * 2 + 1).min(w - 1));
-            for c in 0..4 {
-                let at = |x: u32, y: u32| px[(y as usize * w as usize + x as usize) * 4 + c] as u32;
-                out.push(((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8);
+            let block = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+            let at = |(x, y): (u32, u32), c: usize| px[(y as usize * w as usize + x as usize) * 4 + c];
+            for c in 0..3 {
+                let sum: f32 = block.iter().map(|p| DECODE[at(*p, c) as usize]).sum();
+                out.push(encode(sum / 4.0));
             }
+            let alpha: u32 = block.iter().map(|p| at(*p, 3) as u32).sum();
+            out.push(((alpha + 2) / 4) as u8);
         }
     }
     (nw, nh, out)
+}
+
+/// Each sRGB-encoded byte value in linear light.
+static DECODE: LazyLock<[f32; 256]> = LazyLock::new(|| std::array::from_fn(|i| srgb_to_linear(i as u8) as f32));
+
+/// The linear values halfway between consecutive encoded bytes: a linear value
+/// encodes to the number of these below it.
+static ENCODE_STEPS: LazyLock<[f32; 255]> =
+    LazyLock::new(|| std::array::from_fn(|i| (DECODE[i] + DECODE[i + 1]) / 2.0));
+
+/// The sRGB-encoded byte nearest (in linear light) to linear value `l`.
+/// `encode(DECODE[c]) == c` for every byte `c`.
+fn encode(l: f32) -> u8 {
+    ENCODE_STEPS.partition_point(|s| *s < l) as u8
 }
 
 /// An image placed this frame. The app keeps one GPU texture per
@@ -780,9 +804,21 @@ mod tests {
         assert!(img.mips().iter().all(|(w, h, px)| px.len() == (*w * *h * 4) as usize));
         assert_eq!(&img.mips()[1].2, &[3, 2, 1, 255], "a solid colour averages to itself");
         let half = Image::from_rgba(1, 1, vec![200, 100, 50, 128]);
-        assert_eq!(half.bgra().unwrap(), &[25, 50, 100, 128], "alpha is premultiplied");
+        assert_eq!(half.bgra().unwrap(), &[34, 72, 147, 128], "alpha is premultiplied in linear light");
         let r = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         assert_eq!(img.fit(r, 1.0), Rect { x: 48.0, y: 49.0, w: 5.0, h: 2.0 }, "never upscaled");
         assert_eq!(img.fit(r, f32::MAX), Rect { x: 0.0, y: 30.0, w: 100.0, h: 40.0 });
+    }
+
+    /// Mips average in linear light: a black-and-white checkerboard shrinks to
+    /// the grey that emits half the light (188), not the encoded midpoint (128).
+    #[test]
+    fn mips_average_in_linear_light() {
+        let (b, w) = ([0, 0, 0, 255], [255, 255, 255, 255]);
+        let img = Image::from_rgba(2, 2, [b, w, w, b].concat());
+        assert_eq!(img.mips()[0].2, [188, 188, 188, 255]);
+        for c in 0..=255u8 {
+            assert_eq!(encode(DECODE[c as usize]), c, "encoding inverts decoding");
+        }
     }
 }
