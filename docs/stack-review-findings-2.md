@@ -76,12 +76,6 @@ carries no button, so only left clicks reach a page.
 - Fix: drop the device once playback finishes or pauses (after a short grace);
   reopen it on Play.
 
-#### 26. `crates/lsp` is missing from `default-members`
-
-- Where: [`Cargo.toml`](../Cargo.toml) (from `0c67045`/`35e68b9`).
-- Effect: its tests don't run under a plain `cargo test`.
-- Fix: add it.
-
 ### Low
 
 18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
