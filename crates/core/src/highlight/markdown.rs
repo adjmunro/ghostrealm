@@ -17,7 +17,7 @@
 //! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
 //! unmarked, so a pathological line costs a bounded number of scans.
 
-use super::{runs, Highlighter, Span, State, Token, ALL};
+use super::{runs, CommentSyntax, Highlighter, Span, State, Token, ALL};
 
 pub struct Markdown;
 
@@ -35,6 +35,10 @@ impl Highlighter for Markdown {
         let mut tok = vec![Token::Plain; chars.len()];
         let next = block(&chars, &mut tok, state);
         (runs(&tok), next)
+    }
+
+    fn comment(&self) -> CommentSyntax {
+        CommentSyntax { line: None, block: Some(("<!--", "-->")) }
     }
 
     fn block(&self, line: &str, state_in: State, state_out: State) -> bool {

@@ -2,7 +2,7 @@
 //! `key =` names, quoted strings, and numbers/booleans. No multi-line strings,
 //! which is plenty for a config file.
 
-use super::{runs, Highlighter, Span, State, Token};
+use super::{runs, CommentSyntax, Highlighter, Span, State, Token};
 
 pub struct Toml;
 
@@ -17,6 +17,10 @@ impl Highlighter for Toml {
 
     fn carries_state(&self) -> bool {
         false
+    }
+
+    fn comment(&self) -> CommentSyntax {
+        CommentSyntax { line: Some("#"), block: None }
     }
 
     fn line(&self, line: &str, _state: State) -> (Vec<Span>, State) {

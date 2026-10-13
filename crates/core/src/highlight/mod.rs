@@ -46,6 +46,16 @@ pub struct Span {
     pub token: Token,
 }
 
+/// How a language writes comments: the metadata a comment toggle needs, kept
+/// beside the highlighter because neither LSP nor the editor knows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommentSyntax {
+    /// The token that starts a comment running to the end of the line (`#`).
+    pub line: Option<&'static str>,
+    /// The tokens that open and close a comment (`<!--`, `-->`).
+    pub block: Option<(&'static str, &'static str)>,
+}
+
 /// What a highlighter carries from the end of one line to the start of the
 /// next (e.g. "inside a fenced block"). Opaque to callers; `0` starts a
 /// document.
@@ -68,6 +78,11 @@ pub trait Highlighter: Sync {
     /// char 0 to the line's end (none for an empty line). Also returns the
     /// state the next line enters with.
     fn line(&self, line: &str, state: State) -> (Vec<Span>, State);
+
+    /// How this language writes comments; none by default (no comment toggle).
+    fn comment(&self) -> CommentSyntax {
+        CommentSyntax::default()
+    }
 
     /// Whether `line`, entering with `state_in` and leaving with `state_out`,
     /// belongs to a block drawn as a unit (a fenced code block, including its
@@ -359,6 +374,15 @@ mod tests {
         let (_, open) = cache.line(md, "```toml", 0);
         assert_ne!(open, 0);
         assert_eq!(cache.line(md, "```", open).1, 0);
+    }
+
+    #[test]
+    fn languages_declare_their_comment_syntax() {
+        let toml = for_extension("toml").unwrap().comment();
+        assert_eq!((toml.line, toml.block), (Some("#"), None));
+        let md = for_extension("md").unwrap().comment();
+        assert_eq!((md.line, md.block), (None, Some(("<!--", "-->"))));
+        assert_eq!(Fences.comment(), CommentSyntax::default());
     }
 
     #[test]
