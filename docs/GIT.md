@@ -58,6 +58,9 @@ Except for dependency bumps, which should look like so:
 - Automatically create a new stacked branch every turn (unless no changes were made in the previous turn), or when the new overarching goal is significantly/conceptually different.
 - Always make a backup branch before risky changes, for example, when modifying commit history, and then verify the backup against the new branch. Delete the backup if full and complete, and not degraded. Note that it might not be identical, such as when rebasing. However, if the sum of all changes *can* be identical (no base delta), then it *must* be identical before accepting the change & deleting the backup.
 - When rebasing, aim to preserve the *intent* behind both branches changes (unless redundant).
+- `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed, and anything found is fixed or written down (findings docs / `TODO.md`).
+- Commits above `develop` must be reviewed, with findings written down, before `develop` advances to them.
+- Fixes take priority over features unless the owner chooses a feature.
 
 ### Format
 
