@@ -46,17 +46,6 @@ carries no button, so only left clicks reach a page.
 
 ### Medium
 
-#### 22. A zero-width or zero-height image kills the preview loader (confirmed, fuzzed)
-
-- Where: `Image::from_rgba` ([`plugin/paint.rs:192`](../crates/app/src/plugin/paint.rs))
-  bumps the size to 1 and `halve` (`:258`) indexes the empty pixels; reached from
-  `decode_image` ([`plugins/file_browser/preview.rs:120`](../crates/app/src/plugins/file_browser/preview.rs)).
-- Repro: a 30-byte 17×0 GIF.
-- Effect: the loader thread panics; previews stop for that pane, and `tick` keeps
-  polling every 15 ms forever (~66 redraws/s).
-- Fix: reject `w == 0 || h == 0` as `Content::Error`; catch a panic in `load`;
-  stop polling once the loader is gone.
-
 #### 24. A FIFO or device node hangs the preview loader (confirmed)
 
 - Where: `load` → `read_text` ([`preview.rs:109`](../crates/app/src/plugins/file_browser/preview.rs),

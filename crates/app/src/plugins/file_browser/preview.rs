@@ -126,6 +126,9 @@ fn decode_image(path: &Path) -> Result<Content, String> {
     let mut img = image::DynamicImage::from_decoder(decoder).map_err(fail)?;
     img.apply_orientation(orientation);
     let (width, height) = (img.width(), img.height());
+    if width == 0 || height == 0 {
+        return Err("empty image".into());
+    }
     if width > IMAGE_MAX_SIDE || height > IMAGE_MAX_SIDE {
         img = img.resize(IMAGE_MAX_SIDE, IMAGE_MAX_SIDE, image::imageops::FilterType::Triangle);
     }
@@ -169,32 +172,49 @@ fn read_text(path: &Path) -> Result<Option<Content>, String> {
 struct Loader {
     tx: Sender<PathBuf>,
     done: Arc<Mutex<Option<Preview>>>,
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl Loader {
     fn new() -> Self {
+        Self::with(load)
+    }
+
+    /// A loader that runs `load`. A panic in it (a decoder bug on a malformed
+    /// file) becomes that entry's error rather than ending the worker.
+    fn with(load: fn(&Path) -> Preview) -> Self {
         let (tx, rx) = mpsc::channel::<PathBuf>();
         let done = Arc::new(Mutex::new(None));
         let out = done.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("preview-loader".into())
             .spawn(move || {
                 while let Ok(mut path) = rx.recv() {
                     while let Ok(newer) = rx.try_recv() {
                         path = newer;
                     }
-                    let p = load(&path);
+                    let p = std::panic::catch_unwind(|| load(&path)).unwrap_or_else(|_| Preview {
+                        path: path.clone(),
+                        kind: "File".into(),
+                        size: None,
+                        modified: None,
+                        content: Content::Error("can't preview this file".into()),
+                    });
                     if let Ok(mut slot) = out.lock() {
                         *slot = Some(p);
                     }
                 }
             })
             .expect("spawn preview loader");
-        Loader { tx, done }
+        Loader { tx, done, thread }
     }
 
     fn take(&self) -> Option<Preview> {
         self.done.lock().ok()?.take()
+    }
+
+    fn alive(&self) -> bool {
+        !self.thread.is_finished()
     }
 }
 
@@ -300,6 +320,19 @@ impl PreviewPane {
                 }
                 self.shown = Some(p);
                 self.poll_at = None;
+                cx.redraw();
+            } else if self.loader.as_ref().is_some_and(|l| !l.alive()) {
+                // Nothing more will arrive: stop polling, and start a fresh
+                // loader for the next entry.
+                self.loader = None;
+                self.poll_at = None;
+                self.shown = self.wanted.clone().map(|path| Preview {
+                    path,
+                    kind: "File".into(),
+                    size: None,
+                    modified: None,
+                    content: Content::Error("the preview stopped".into()),
+                });
                 cx.redraw();
             }
         }
@@ -628,6 +661,76 @@ pub(crate) mod tests {
 
         std::fs::write(d.join("bad.png"), "not a png").unwrap();
         assert!(matches!(load(&d.join("bad.png")).content, Content::Error(_)));
+    }
+
+    #[test]
+    fn an_image_with_no_pixels_is_an_error_not_a_panic() {
+        let d = tmpdir("preview-empty-img");
+        // A fuzzed 17x0 GIF that used to panic building mips.
+        std::fs::write(d.join("empty.gif"), include_bytes!("testdata/zero-height.gif")).unwrap();
+        let p = load(&d.join("empty.gif"));
+        assert!(matches!(p.content, Content::Error(_)), "{:?}", p.kind);
+    }
+
+    fn tick(pane: &mut PreviewPane, now: Instant) {
+        let cfg = Config::default();
+        let mut cx = EventCx::new(&cfg, crate::plugin::testing::UI, Default::default(), None);
+        pane.tick(&mut cx, now);
+    }
+
+    /// Tick `pane` until it stops polling (or a second passes).
+    fn settle(pane: &mut PreviewPane) {
+        let until = Instant::now() + Duration::from_secs(1);
+        while pane.loading() && Instant::now() < until {
+            std::thread::sleep(POLL_EVERY);
+            tick(pane, Instant::now());
+        }
+    }
+
+    #[test]
+    fn a_panicking_load_shows_an_error_and_the_loader_carries_on() {
+        fn explode(path: &Path) -> Preview {
+            if path.ends_with("bad") {
+                panic!("decoder bug");
+            }
+            load(path)
+        }
+        let d = tmpdir("preview-panic");
+        std::fs::write(d.join("good.txt"), "hi").unwrap();
+        let mut pane = PreviewPane { loader: Some(Loader::with(explode)), ..Default::default() };
+        pane.show(Some(&d.join("bad")));
+        settle(&mut pane);
+        assert!(!pane.loading());
+        assert!(matches!(pane.shown().unwrap().content, Content::Error(_)));
+        pane.show(Some(&d.join("good.txt")));
+        settle(&mut pane);
+        assert!(matches!(pane.shown().unwrap().content, Content::Text { .. }));
+    }
+
+    #[test]
+    fn a_dead_loader_stops_the_polling() {
+        let d = tmpdir("preview-dead");
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        let mut pane = PreviewPane::default();
+        pane.show(Some(&d.join("a.txt")));
+        settle(&mut pane);
+        // A loader whose worker has gone, with a request it will never answer.
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || drop(rx));
+        thread_wait(&thread);
+        pane.loader = Some(Loader { tx, done: Arc::default(), thread });
+        pane.show(Some(&d.join("gone")));
+        settle(&mut pane);
+        assert!(!pane.loading(), "stops polling");
+        assert!(pane.deadline().is_none(), "no timer left");
+        assert!(matches!(pane.shown().unwrap().content, Content::Error(_)));
+        assert!(pane.loader.is_none(), "the next entry starts a new loader");
+    }
+
+    fn thread_wait(t: &std::thread::JoinHandle<()>) {
+        while !t.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
