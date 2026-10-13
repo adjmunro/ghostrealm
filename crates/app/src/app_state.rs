@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Axis, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
+    ArgKind, ArgSpec, Axis, CloseOnExit, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
     TabStatus, Tree, VtabId,
 };
 use ghostrealm_core::Config;
@@ -144,6 +144,8 @@ pub struct AppState {
     inbox: Inbox,
     /// Base directory new workspaces start in when they have no pinned root.
     default_dir: Option<std::path::PathBuf>,
+    /// When a terminal closes by itself after its shell exits.
+    close_on_exit: CloseOnExit,
     /// When the active vtab was focused, for the auto-read dwell timer.
     focus_started: Instant,
     /// The vtab most recently auto-read by dwell, and when — for the unfocus grace
@@ -174,6 +176,7 @@ impl AppState {
             optimistic_busy: HashMap::new(),
             inbox: Inbox::default(),
             default_dir: None,
+            close_on_exit: CloseOnExit::default(),
             focus_started: Instant::now(),
             last_auto_read: None,
             system: Box::new(HostSystem),
@@ -185,6 +188,11 @@ impl AppState {
     /// Set the inbox timing config (auto-read dwell + unfocus grace).
     pub fn set_inbox_config(&mut self, inbox: Inbox) {
         self.inbox = inbox;
+    }
+
+    /// Set when a terminal closes by itself after its shell exits (from config).
+    pub fn set_close_on_exit(&mut self, mode: CloseOnExit) {
+        self.close_on_exit = mode;
     }
 
     /// Set the base directory new workspaces start in (from config).
@@ -858,6 +866,17 @@ impl AppState {
         self.leave(Leave::Vtab(id));
     }
 
+    /// Close surface `sid` wherever it is, as the Close command would if it
+    /// were the focused pane's active surface.
+    pub fn close_surface_id(&mut self, sid: SurfaceId) {
+        let found = self.tree.vtabs().iter().find_map(|v| {
+            v.panes().iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
+        });
+        if let Some((vt, pane)) = found {
+            self.leave(Leave::Surface(vt, pane, sid));
+        }
+    }
+
     /// Close one surface (htab) within a pane; the tree collapses the pane, and
     /// then the vtab, if that was its last surface.
     pub fn close_surface(&mut self, vtab: VtabId, pane: PaneId, surface: SurfaceId) {
@@ -1096,8 +1115,10 @@ impl AppState {
         let mut cx = EventCx::new(&cfg, UiMetrics::default(), press.mods, None);
         let used = view.key(&mut cx, press);
         for req in cx.finish().requests {
-            if req == Request::Busy {
-                self.mark_busy(sid);
+            match req {
+                Request::Busy => self.mark_busy(sid),
+                Request::Close => self.close_surface_id(sid),
+                _ => {}
             }
         }
         used
@@ -1138,8 +1159,15 @@ impl AppState {
         let mut more = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
         let mut changed_surfaces: Vec<SurfaceId> = Vec::new();
+        let mut finished: Vec<SurfaceId> = Vec::new();
+        let close_on_exit = self.close_on_exit;
         for (id, view) in self.views.iter_mut() {
             let pumped = view.pump(budget);
+            if let Some(exit) = view.downcast_mut::<TerminalView>().and_then(|t| t.exit()) {
+                if close_on_exit.closes(exit == Lifecycle::Exited(Some(0))) {
+                    finished.push(*id);
+                }
+            }
             if pumped.changed {
                 changed = true;
                 changed_surfaces.push(*id);
@@ -1152,6 +1180,11 @@ impl AppState {
         }
         for (id, title) in titles {
             self.tree.set_surface_title(id, title, false);
+        }
+        // A terminal whose shell exited closes the way Close would.
+        for sid in finished {
+            self.close_surface_id(sid);
+            changed = true;
         }
         // Output in a background vtab marks it unread (needs_input is sticky).
         for sid in changed_surfaces {
@@ -2091,6 +2124,103 @@ mod tests {
             TabStatus::Read,
             "after the grace lapses and no command is running, busy clears to read"
         );
+    }
+
+    /// Pump `s` until `done` (or 5 s pass); whether it held.
+    fn pump_until(s: &mut AppState, done: impl Fn(&mut AppState) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            s.pump_all();
+            if done(s) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Whether workspace `vt` has no surface left.
+    fn emptied(s: &AppState, vt: VtabId) -> bool {
+        s.tree.vtab(vt).is_some_and(|v| v.panes().iter().all(|p| p.surfaces.is_empty()))
+    }
+
+    fn enter() -> KeyPress {
+        KeyPress { key: ghostrealm_terminal::Key::Enter, mods: ghostrealm_terminal::Mods::default(), text: None }
+    }
+
+    #[test]
+    fn a_shell_that_exits_with_code_0_closes_its_surface() {
+        let mut s = AppState::new().with_shell_line("exit 0");
+        let vt = s.new_vtab().unwrap();
+        assert!(pump_until(&mut s, |s| emptied(s, vt)), "the surface closes\n{}", s.describe());
+    }
+
+    #[test]
+    fn a_failed_shell_stays_with_a_banner_and_any_key_closes_it() {
+        let mut s = AppState::new().with_shell_line("exit 3");
+        let vt = s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        let banner = "exited with code 3 \u{2014} press any key to close";
+        assert!(
+            pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))),
+            "{:?}",
+            s.surface_text(sid)
+        );
+        assert!(!emptied(&s, vt), "kept");
+        s.pump_all();
+        assert!(!emptied(&s, vt), "still kept after more pumps");
+        assert!(s.send_key_to_focused(&enter()));
+        assert!(emptied(&s, vt), "a key closes it");
+    }
+
+    #[test]
+    fn a_shell_killed_by_a_signal_stays_with_the_signal_named() {
+        let mut s = AppState::new().with_shell_line("kill -9 $$");
+        let vt = s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        let banner = "killed by signal SIGKILL \u{2014} press any key to close";
+        assert!(
+            pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))),
+            "{:?}",
+            s.surface_text(sid)
+        );
+        assert!(!emptied(&s, vt));
+    }
+
+    #[test]
+    fn close_on_exit_chooses_which_exits_close() {
+        // always: a failure closes too.
+        let mut s = AppState::new().with_shell_line("exit 1");
+        s.set_close_on_exit(CloseOnExit::Always);
+        let vt = s.new_vtab().unwrap();
+        assert!(pump_until(&mut s, |s| emptied(s, vt)));
+
+        // never: even a clean exit stays, with a banner.
+        let mut s = AppState::new().with_shell_line("exit 0");
+        s.set_close_on_exit(CloseOnExit::Never);
+        let vt = s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        let banner = "exited with code 0 \u{2014} press any key to close";
+        assert!(pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))));
+        assert!(!emptied(&s, vt));
+        assert!(s.send_key_to_focused(&enter()));
+        assert!(emptied(&s, vt));
+    }
+
+    #[test]
+    fn a_background_tab_whose_shell_exits_closes_only_itself() {
+        let mut s = AppState::new().with_shell_line("sleep 30");
+        let vt = s.new_vtab().unwrap();
+        let first = s.focused_surface().unwrap();
+        s.shell_line = Some("sleep 0.2".into());
+        s.open_plugin_in_focused(terminal::ID).unwrap();
+        let second = s.focused_surface().unwrap();
+        let pane = s.tree.vtab(vt).unwrap().focused_pane;
+        // Focus goes back to the first, so the second is the background tab.
+        s.tree.vtab_mut(vt).unwrap().pane_mut(pane).unwrap().active = 0;
+        assert!(pump_until(&mut s, |s| s.surface_text(second).is_none()), "the exited tab closes");
+        assert_eq!(s.focused_surface(), Some(first));
+        assert!(s.surface_text(first).is_some(), "the other tab stays");
     }
 
     #[test]

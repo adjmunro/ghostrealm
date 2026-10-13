@@ -145,6 +145,9 @@ pub struct TerminalView {
     /// Whole lines still to scroll, eased out a step per frame (negative
     /// reveals older history, like `Scroll::Delta`).
     pending_scroll: i32,
+    /// How the shell ended, once seen. The pane then shows a banner and the
+    /// next key closes it, unless `[terminal] close_on_exit` closed it first.
+    exit: Option<Lifecycle>,
 }
 
 impl TerminalView {
@@ -161,6 +164,7 @@ impl TerminalView {
             reporting: false,
             scroll_accum: 0.0,
             pending_scroll: 0,
+            exit: None,
         }
     }
 
@@ -168,6 +172,22 @@ impl TerminalView {
     pub fn lifecycle(&mut self) -> Lifecycle {
         self.term.lifecycle()
     }
+
+    /// How the shell ended, if it has (as of the last pump).
+    pub fn exit(&self) -> Option<Lifecycle> {
+        self.exit
+    }
+
+    /// Note the shell's end the first time it is seen. Returns whether it was.
+    fn observe_exit(&mut self) -> bool {
+        if self.exit.is_some() {
+            return false;
+        }
+        let state = self.term.lifecycle();
+        self.exit = state.has_exited().then_some(state);
+        self.exit.is_some()
+    }
+
 
     /// Advance the viewport toward the queued scroll by one eased step. Returns
     /// whether more remains.
@@ -317,6 +337,8 @@ impl View for TerminalView {
             self.snapshotted = true;
         }
 
+        let banner = self.exit.map(exit_banner);
+        let banner_row = banner_row(&self.grid);
         let grid = &self.grid;
         cx.fill(rect, grid.default_bg);
         if let Some(sel) = self.selection {
@@ -349,9 +371,16 @@ impl View for TerminalView {
                 None => ("", grid.default_fg),
             }));
             let top = rect.y + row as f32 * ch;
+            if let Some(text) = banner.as_deref().filter(|_| row == banner_row) {
+                let line = Rect { x: rect.x, y: top, w: rect.w, h: ch };
+                cx.fill_alpha(line, cx.chrome.accent, 0.35);
+                let key = cx.row_key(std::iter::once((text, grid.default_fg)));
+                cx.budgeted_row(key, || vec![(text.to_string(), grid.default_fg)], rect.x, top, rect.w, rect, grid.default_fg);
+                continue;
+            }
             cx.budgeted_row(key, || row_spans(grid, row), rect.x, top, rect.w, rect, grid.default_fg);
         }
-        if grid.cursor.visible {
+        if grid.cursor.visible && banner.is_none() {
             let fg = grid
                 .cell(grid.cursor.col, grid.cursor.row)
                 .map(|c| c.fg)
@@ -362,6 +391,12 @@ impl View for TerminalView {
 
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let m = k.mods;
+        // Nothing is listening any more: a key closes the pane. Cmd chords
+        // stay with copy and paste.
+        if self.exit.is_some() && !m.super_ {
+            cx.request(Request::Close);
+            return true;
+        }
         let action = Keymap::platform().action(k);
         // The text keymap's word/line motions and deletes become the readline
         // keys shells bind (Shift+Cmd too; Shift+Option selects below).
@@ -542,7 +577,10 @@ impl View for TerminalView {
     }
 
     fn pump(&mut self, budget: usize) -> Pumped {
-        self.term.pump_budgeted(budget)
+        let mut pumped = self.term.pump_budgeted(budget);
+        // The banner appears on the next draw.
+        pumped.changed |= self.observe_exit();
+        pumped
     }
 
     fn is_busy(&self) -> bool {
@@ -557,8 +595,16 @@ impl View for TerminalView {
     fn text(&mut self) -> Option<String> {
         self.term.pump();
         let grid = self.term.snapshot();
+        self.observe_exit();
+        let banner = self.exit.map(exit_banner);
+        let banner_row = banner_row(&grid);
         let mut out = String::new();
         for row in 0..grid.size.rows {
+            if let Some(text) = banner.as_deref().filter(|_| row == banner_row) {
+                out.push_str(text);
+                out.push('\n');
+                continue;
+            }
             let mut line = String::new();
             for col in 0..grid.size.cols {
                 match grid.cell(col, row) {
@@ -579,6 +625,50 @@ impl View for TerminalView {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+/// The row the exit banner takes: the first blank one from the cursor's down,
+/// else the last.
+fn banner_row(grid: &Grid) -> u16 {
+    (grid.cursor.row..grid.size.rows)
+        .find(|&r| row_content_len(grid, r) == 0)
+        .unwrap_or(grid.size.rows.saturating_sub(1))
+}
+
+/// The banner shown once the shell has ended.
+fn exit_banner(end: Lifecycle) -> String {
+    match end {
+        Lifecycle::Exited(Some(code)) => format!("exited with code {code} \u{2014} press any key to close"),
+        Lifecycle::Signaled(n) => format!("killed by signal {} \u{2014} press any key to close", signal_name(n)),
+        _ => "exited \u{2014} press any key to close".to_string(),
+    }
+}
+
+/// `SIGKILL` for 9, and so on; the number for one without a name here.
+fn signal_name(n: i32) -> String {
+    #[cfg(unix)]
+    for (signal, name) in [
+        (libc::SIGHUP, "SIGHUP"),
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGQUIT, "SIGQUIT"),
+        (libc::SIGILL, "SIGILL"),
+        (libc::SIGTRAP, "SIGTRAP"),
+        (libc::SIGABRT, "SIGABRT"),
+        (libc::SIGBUS, "SIGBUS"),
+        (libc::SIGFPE, "SIGFPE"),
+        (libc::SIGKILL, "SIGKILL"),
+        (libc::SIGUSR1, "SIGUSR1"),
+        (libc::SIGSEGV, "SIGSEGV"),
+        (libc::SIGUSR2, "SIGUSR2"),
+        (libc::SIGPIPE, "SIGPIPE"),
+        (libc::SIGALRM, "SIGALRM"),
+        (libc::SIGTERM, "SIGTERM"),
+    ] {
+        if n == signal {
+            return name.to_string();
+        }
+    }
+    n.to_string()
 }
 
 /// Absolute pixel rect of cell (col, row) inside `area`.
@@ -779,6 +869,31 @@ mod tests {
             default_fg: [200, 200, 200],
             default_bg: [0, 0, 0],
         }
+    }
+
+    #[test]
+    fn the_exit_banner_names_the_code_or_the_signal() {
+        let tail = "\u{2014} press any key to close";
+        assert_eq!(exit_banner(Lifecycle::Exited(Some(2))), format!("exited with code 2 {tail}"));
+        assert_eq!(exit_banner(Lifecycle::Exited(None)), format!("exited {tail}"));
+        #[cfg(unix)]
+        {
+            assert_eq!(exit_banner(Lifecycle::Signaled(libc::SIGTERM)), format!("killed by signal SIGTERM {tail}"));
+            assert_eq!(exit_banner(Lifecycle::Signaled(libc::SIGSEGV)), format!("killed by signal SIGSEGV {tail}"));
+        }
+        assert_eq!(exit_banner(Lifecycle::Signaled(99)), format!("killed by signal 99 {tail}"));
+    }
+
+    #[test]
+    fn the_banner_takes_the_first_blank_row_from_the_cursor_down_else_the_last() {
+        let mut g = grid_of(&["out ", "$ x ", "    ", "    "]);
+        g.cursor.row = 1;
+        assert_eq!(banner_row(&g), 2);
+        g.cursor.row = 2;
+        assert_eq!(banner_row(&g), 2);
+        let mut full = grid_of(&["out ", "err "]);
+        full.cursor.row = 1;
+        assert_eq!(banner_row(&full), 1);
     }
 
     #[test]

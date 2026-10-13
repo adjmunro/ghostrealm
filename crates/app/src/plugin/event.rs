@@ -56,6 +56,9 @@ pub enum Request {
         target: crate::file_menu::FileTarget,
         at: (f32, f32),
     },
+    /// Close the view's surface, as the Close command would. A terminal whose
+    /// shell exited asks this on the next key.
+    Close,
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,

@@ -1282,23 +1282,6 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Terminal: close the pane when the shell exits
-
-- Requires: NO BLOCKERS
-- Detail: Decided ([stack-review-findings.md](stack-review-findings.md) item 8):
-  close the pane when its shell exits with code 0. On a non-zero exit or a
-  signal, keep the pane with a banner ("exited with code N — press any key to
-  close"). A setting overrides the behaviour.
-- Owner, verbatim:
-  > For shell exit as number five, I think your recommendation is great. [The
-  > recommendation was: close the pane when the shell exits with code 0; keep it
-  > with a banner "exited with code N — press any key to close" on non-zero exit
-  > or a crash/signal; a setting to override.]
-- Reason: a dead pane left on screen after `exit` is clutter; a failure should
-  stay visible.
-
----
-
 [2026-10-13T20:45+1300@6bc650f] GitHub permalinks
 
 - Requires: NO BLOCKERS (future idea; not now)

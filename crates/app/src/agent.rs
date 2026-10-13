@@ -239,6 +239,24 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_whose_shell_exits_cleanly_leaves_the_tree() {
+        let mut state = AppState::new().with_shell_line("exit 0");
+        let mut registry = build_registry();
+        let new = handle(r#"{"op":"set","id":"workspace.new","args":{"dir":"/"}}"#, &mut state, &mut registry);
+        assert_eq!(new["ok"], json!(true), "{new:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let tree = loop {
+            let tree = handle(r#"{"op":"get","what":"tree"}"#, &mut state, &mut registry);
+            let tree = tree["tree"].as_str().unwrap().to_string();
+            if !tree.contains("surface ") || std::time::Instant::now() > deadline {
+                break tree;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(!tree.contains("surface "), "the surface is gone:\n{tree}");
+    }
+
+    #[test]
     fn set_validates_missing_args() {
         let resps = drive(&[
             r#"{"op":"set","id":"workspace.new"}"#,

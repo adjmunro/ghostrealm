@@ -809,6 +809,7 @@ impl State {
             )));
         app.set_inbox_config(cfg.inbox);
         app.set_default_dir(cfg.default_dir());
+        app.set_close_on_exit(cfg.terminal.close_on_exit);
         // A CLI command spawns a terminal running it; a bare launch opens the empty
         // "nothing open" workspace where the user picks what to open.
         if has_command {
@@ -938,6 +939,7 @@ impl State {
         self.chrome = cfg.resolved_chrome();
         self.app.set_inbox_config(cfg.inbox);
         self.app.set_default_dir(cfg.default_dir());
+        self.app.set_close_on_exit(cfg.terminal.close_on_exit);
         self.cfg = cfg;
         self.dirty = true;
     }
@@ -1420,6 +1422,7 @@ impl State {
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
                 Request::Busy => self.app.mark_busy(sid),
+                Request::Close => self.app.close_surface_id(sid),
                 Request::FileMenu { target, at } => self.open_file_menu(target, at),
             }
         }

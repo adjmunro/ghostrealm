@@ -25,12 +25,6 @@ it; the rest come from reading the code.
    the first time a git filter or the git view is shown after a refresh. A
    large repo, or a large untracked directory (listed file by file), stalls
    a frame.
-8. Shell exit isn't acted on: the pane stays after `exit`. Decision needed:
-   close the pane (or tab) when its shell exits, or keep it showing the
-   final output?
-   **Decided:** close the pane on exit code 0. On a non-zero exit or a signal,
-   keep the pane with a banner ("exited with code N — press any key to close");
-   a setting overrides this. Tracked in TODO.md.
 
 ## To confirm
 
