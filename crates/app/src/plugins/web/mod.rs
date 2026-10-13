@@ -526,11 +526,13 @@ impl WebView {
         }
     }
 
-    /// Start editing the URL bar with the address selected.
+    /// Start editing the URL bar with the address selected; while already
+    /// editing, select what has been typed.
     pub fn edit_url(&mut self) {
-        let mut e = LineEdit::new(self.state.url.clone());
+        let e = self
+            .url_edit
+            .get_or_insert_with(|| LineEdit::new(self.state.url.clone()));
         let _ = e.apply(Edit::SelectAll, &mut None::<String>);
-        self.url_edit = Some(e);
         self.sync_focus(true);
     }
 
@@ -590,6 +592,8 @@ impl WebView {
             return false;
         };
         match press.key {
+            // Cmd+L when no `[keybindings]` entry takes it first.
+            Key::Char(c) if press.mods.super_ && c.eq_ignore_ascii_case(&'l') => self.edit_url(),
             Key::Enter if !press.mods.super_ => {
                 let input = edit.text().to_string();
                 self.url_edit = None;
@@ -610,9 +614,14 @@ impl WebView {
         true
     }
 
-    /// A Cmd chord on the page: clipboard and editing commands, reload.
+    /// A Cmd chord on the page: clipboard and editing commands, reload, and
+    /// Cmd+L (when no `[keybindings]` entry takes it first).
     fn page_chord(&mut self, c: char, shift: bool) -> bool {
         let action = match c.to_ascii_lowercase() {
+            'l' => {
+                self.edit_url();
+                return true;
+            }
             'c' => EditAction::Copy,
             'x' => EditAction::Cut,
             'v' => EditAction::Paste,
@@ -829,7 +838,13 @@ impl View for WebView {
         if cx.mods.super_ {
             // Cmd chords are commands (the page gets no raw Cmd keys).
             return match base {
-                Some(c) if pressed => self.page_chord(c, cx.mods.shift),
+                Some(c) if pressed => {
+                    let used = self.page_chord(c, cx.mods.shift);
+                    if used {
+                        cx.redraw();
+                    }
+                    used
+                }
                 _ => false,
             };
         }
@@ -1145,6 +1160,23 @@ mod tests {
         );
         h.key(&mut v, press(Key::Escape));
         assert!(v.url_edit.is_none(), "Escape cancels editing");
+    }
+
+    #[test]
+    fn cmd_l_edits_the_url_and_reselects_what_was_typed() {
+        let mut v = hostless();
+        assert!(v.page_chord('l', false), "Cmd+L without a binding still edits the URL");
+        assert!(v.url_edit.is_some());
+        let h = Harness::new();
+        for c in "rust".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        // The binding (web.focus_url) and the fallback both keep the typing.
+        v.edit_url();
+        h.key(&mut v, cmd(Key::Char('l')));
+        let e = v.url_edit.as_ref().unwrap();
+        assert_eq!(e.text(), "rust");
+        assert!(e.selection().is_some(), "selected for retyping");
     }
 
     #[test]
