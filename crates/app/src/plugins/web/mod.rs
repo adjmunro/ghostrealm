@@ -350,16 +350,21 @@ fn target<'a>(s: &'a mut AppState, a: &Args) -> Result<&'a mut WebView, CmdError
         })
 }
 
-/// A page frame as an image source.
-struct PageImage(SharedFrame);
+/// A page frame as an image source. Its pixels are copied out of the shared
+/// frame when first asked for (the upload), so the host can't change them
+/// mid-read.
+struct PageImage {
+    frame: SharedFrame,
+    pixels: std::sync::OnceLock<Option<Vec<u8>>>,
+}
 
 impl ImageSource for PageImage {
     fn size(&self) -> (u32, u32) {
-        (self.0.width, self.0.height)
+        (self.frame.width, self.frame.height)
     }
 
     fn bgra(&self) -> Option<&[u8]> {
-        self.0.pixels()
+        self.pixels.get_or_init(|| self.frame.read()).as_deref()
     }
 
     /// A page frame covers its rect: its alpha channel is not used.
@@ -800,7 +805,11 @@ impl View for WebView {
                 if let Some(f) = frame {
                     let version = f.version();
                     let rect = Rect { x: body.x, y: body.y, w: f.width as f32, h: f.height as f32 };
-                    cx.image(0, version, Arc::new(PageImage(f)), rect, body);
+                    let image = PageImage {
+                        frame: f,
+                        pixels: Default::default(),
+                    };
+                    cx.image(0, version, Arc::new(image), rect, body);
                 }
                 cx.cursor(body, cursor_icon(self.state.cursor));
             }

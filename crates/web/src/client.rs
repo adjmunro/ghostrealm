@@ -71,8 +71,8 @@ pub struct ViewState {
 }
 
 /// A page frame the app can hold onto: its shared mapping plus where in it the
-/// pixels are. Reading never copies; the host may overwrite the slot two frames
-/// later, which at worst shows a newer frame.
+/// pixels are. The host may overwrite the slot two frames later; reading then
+/// fails rather than returning a torn frame (a newer one is on its way).
 #[derive(Clone)]
 pub struct SharedFrame {
     reader: Arc<FrameReader>,
@@ -83,9 +83,13 @@ pub struct SharedFrame {
 }
 
 impl SharedFrame {
-    /// The frame's BGRA pixels.
-    pub fn pixels(&self) -> Option<&[u8]> {
-        self.reader.slot(self.slot, self.width, self.height)
+    /// A copy of the frame's BGRA pixels, or `None` if the host has since
+    /// overwritten it.
+    pub fn read(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.reader
+            .read(self.slot, self.seq, self.width, self.height, &mut out)
+            .then_some(out)
     }
 
     /// Identifies the frame's content: changes whenever a new frame arrives,
@@ -279,7 +283,10 @@ impl WebHost {
             height: info.height,
             seq: info.seq,
         };
-        frame.pixels().is_some().then_some(frame)
+        frame
+            .reader
+            .holds(frame.slot, frame.width, frame.height)
+            .then_some(frame)
     }
 
     /// Note that a navigation was just requested for `id`, so [`wait_loaded`]

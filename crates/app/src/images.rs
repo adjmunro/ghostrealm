@@ -196,18 +196,19 @@ impl ImageRenderer {
                 t.version == img.version && t.width == w && t.height == h && t.levels == levels
             });
             if !current {
-                let Some(pixels) = img.source.bgra() else {
-                    continue;
-                };
-                if pixels.len() < w as usize * h as usize * 4 {
+                let mut data = Vec::new();
+                if let Some(pixels) = img.source.bgra() {
+                    data.push((w, h, pixels));
+                    data.extend(img.source.mips().iter().map(|(w, h, px)| (*w, *h, px.as_slice())));
+                }
+                let whole = !data.is_empty()
+                    && data.iter().all(|(w, h, px)| px.len() >= *w as usize * *h as usize * 4);
+                if whole {
+                    self.upload(device, queue, key, img.version, &data);
+                } else if !self.textures.contains_key(&key) {
                     continue;
                 }
-                let mut data = vec![(w, h, pixels)];
-                data.extend(img.source.mips().iter().map(|(w, h, px)| (*w, *h, px.as_slice())));
-                if data.iter().any(|(w, h, px)| px.len() < *w as usize * *h as usize * 4) {
-                    continue;
-                }
-                self.upload(device, queue, key, img.version, &data);
+                // Pixels gone (a web page's overwritten frame): draw the last ones.
             }
             let Some(scissor) = scissor(img.clip, sw, sh) else {
                 continue;
@@ -575,6 +576,41 @@ mod tests {
             assert_eq!(px(&data, 24, 8), [0, 0, 0], "inside the image but outside its clip");
             assert_eq!(px(&data, 56, 8), [0, 0, 0], "outside the image");
             assert_eq!(px(&data, 40, 40), [30, 20, 10], "an opaque source draws its pixels as given");
+        });
+    }
+
+    /// A source whose pixels are gone.
+    struct Gone;
+
+    impl ImageSource for Gone {
+        fn size(&self) -> (u32, u32) {
+            (8, 8)
+        }
+        fn bgra(&self) -> Option<&[u8]> {
+            None
+        }
+    }
+
+    /// A new version whose pixels are gone (a page frame the host overwrote)
+    /// keeps drawing the last upload.
+    #[test]
+    fn an_image_whose_pixels_are_gone_keeps_its_last_upload() {
+        pollster::block_on(async {
+            let full = rect(0.0, 0.0, DIM as f32, DIM as f32);
+            let blue = Arc::new(Solid([255u8, 0, 0, 255].repeat(8 * 8), 8));
+            let (device, queue) = gpu().await;
+            let mut r = ImageRenderer::new(&device, FORMAT);
+            render(&device, &queue, &mut r, &[item(0, blue, rect(0.0, 0.0, 8.0, 8.0), full)], &[]);
+            let gone = ImageItem {
+                version: 2,
+                ..item(0, Arc::new(Gone), rect(0.0, 0.0, 8.0, 8.0), full)
+            };
+            let data = render(&device, &queue, &mut r, &[gone], &[]);
+            assert_eq!(px(&data, 4, 4), [0, 0, 255]);
+            // Never uploaded: nothing to draw.
+            let fresh = item(5, Arc::new(Gone), rect(16.0, 16.0, 8.0, 8.0), full);
+            let data = render(&device, &queue, &mut r, &[fresh], &[]);
+            assert_eq!(px(&data, 20, 20), [0, 0, 0]);
         });
     }
 

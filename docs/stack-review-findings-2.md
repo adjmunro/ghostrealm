@@ -59,12 +59,6 @@ carries no button, so only left clicks reach a page.
     ([`plugins/file_browser/preview.rs:69`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
     timeout per request?
-27. **Page frames can tear; the doc comment says otherwise.** `SharedFrame`
-    ([`web/src/client.rs:73`](../crates/web/src/client.rs)) claims the worst case
-    is a newer frame, but the two slots ([`web/src/frame.rs:50`](../crates/web/src/frame.rs))
-    have no handshake: the host can rewrite a slot while the app uploads it (a
-    cross-process data race behind `&[u8]`). Fix: a seqlock, or a third slot
-    plus an ack.
 28. **Frame files are world-readable on Linux and leak on a crash.** `grow`
     ([`frame.rs:78`](../crates/web/src/frame.rs)) creates them `0644` in the
     shared temp dir, follows symlinks, and doesn't use `create_new`; a crashed
