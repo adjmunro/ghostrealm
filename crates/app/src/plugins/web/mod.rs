@@ -33,7 +33,7 @@ use winit::window::CursorIcon;
 use crate::app_state::AppState;
 use crate::plugin::text_edit::{Edit, LineEdit};
 use crate::plugin::{
-    rect_contains, theme, widgets, EventCx, ImageSource, MouseEvent, OpenCx, PaintCx, Plugin,
+    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, ImageSource, MouseEvent, OpenCx, PaintCx, Plugin,
     RawKey, View, Waker,
 };
 
@@ -428,6 +428,8 @@ pub struct WebView {
     sent_visible: bool,
     /// The URL bar while it is being edited.
     url_edit: Option<LineEdit>,
+    /// The mouse in the URL bar while it is being edited.
+    url_field: FieldMouse,
     /// Page state as of the last [`View::refresh`].
     state: ViewState,
     /// Layout from the last paint, for mouse hit-testing.
@@ -457,6 +459,7 @@ impl WebView {
             on_screen: false,
             sent_visible: true,
             url_edit: None,
+            url_field: FieldMouse::default(),
             state: ViewState::default(),
             url_box: zero,
             body: zero,
@@ -861,13 +864,16 @@ impl View for WebView {
         };
         self.url_box = url_box;
         match &self.url_edit {
-            Some(e) => widgets::text_field(cx, url_box, e, "", cx.focused),
+            Some(e) => {
+                let geom = widgets::text_field(cx, url_box, e, "", cx.focused);
+                self.url_field.painted(geom);
+            }
             None => {
                 let shown = LineEdit::new(self.state.url.clone());
                 widgets::text_field(cx, url_box, &shown, "Enter an address", false);
+                self.url_field.clear();
             }
         }
-        cx.cursor(url_box, CursorIcon::Text);
         if self.state.loading {
             cx.fill(
                 Rect {
@@ -948,6 +954,12 @@ impl View for WebView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        if let Some(edit) = self.url_edit.as_mut() {
+            if self.url_field.event(edit, event, cx.mods.shift) {
+                cx.redraw();
+                return;
+            }
+        }
         let flags = keys::modifier_flags(cx.mods);
         match *event {
             MouseEvent::Down { pos, clicks } => {
@@ -1343,6 +1355,27 @@ mod tests {
         );
         h.key(&mut v, press(Key::Escape));
         assert!(v.url_edit.is_none(), "Escape cancels editing");
+    }
+
+    #[test]
+    fn the_url_bar_takes_the_mouse_once_editing() {
+        let mut v = hostless();
+        let mut h = Harness::new();
+        v.edit_url();
+        let e = v.url_edit.as_mut().unwrap();
+        e.insert("rust lang");
+        h.paint(&mut v, RECT);
+        let g = v.url_field.geom().expect("live while editing");
+        let y = g.rect.y + g.rect.h * 0.5;
+        let cell = |col: usize| g.left + (col as f32 + 0.5) * g.cell_w;
+        let edge = |col: usize| g.left + col as f32 * g.cell_w;
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(1), y), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(3), y) });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(3), y), dragged: true });
+        assert!(v.url_edit.is_some(), "still editing");
+        assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((1, 3)));
+        h.mouse(&mut v, MouseEvent::Down { pos: (cell(7), y), clicks: 2 });
+        assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((5, 9)), "`lang`");
     }
 
     #[test]

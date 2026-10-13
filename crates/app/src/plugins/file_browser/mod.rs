@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    rect_contains, theme, widgets, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
+    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
 };
 use preview::PreviewPane;
 
@@ -169,6 +169,11 @@ pub struct FileBrowserView {
     input: LineEdit,
     /// The file name [`Mode::Save`] saves under (may hold a relative path).
     name: LineEdit,
+    /// The mouse in the header's input field (live while it is the one typed
+    /// into and shows what was typed, not a completion).
+    field: FieldMouse,
+    /// The mouse in [`Mode::Save`]'s file-name field.
+    name_field: FieldMouse,
     /// The entry the previous click landed on, for double-click.
     last_click: Option<PathBuf>,
     // Geometry from the last paint, for mapping input to rows.
@@ -207,6 +212,8 @@ impl FileBrowserView {
             preview_on: None,
             preview_shown: false,
             reveal_chosen: false,
+            field: FieldMouse::default(),
+            name_field: FieldMouse::default(),
         }
     }
 
@@ -345,7 +352,8 @@ impl FileBrowserView {
         let inset = 4.0 * scale;
         let x = row.x + label_w + pad * 2.0;
         let field = Rect { x, y: row.y + inset, w: (row.x + row.w - pad - x).max(1.0), h: h - inset * 2.0 };
-        widgets::text_field(cx, field, &self.name, "file name", true);
+        let geom = widgets::text_field(cx, field, &self.name, "file name", true);
+        self.name_field.painted(geom);
         h
     }
 
@@ -440,7 +448,7 @@ impl FileBrowserView {
 
     /// The header: parent button, input field, and the filter/view toggles.
     /// Returns the header height.
-    fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect, value: &LineEdit) -> f32 {
+    fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect, value: &LineEdit, editable: bool) -> f32 {
         let scale = cx.ui.scale;
         let ch = cx.ui.cell_h;
         let pad = 8.0 * scale;
@@ -498,7 +506,12 @@ impl FileBrowserView {
         };
         let root = self.tree.root().display().to_string();
         // Saving types into the name field instead.
-        widgets::text_field(cx, field, value, &root, self.mode != Mode::Save);
+        let geom = widgets::text_field(cx, field, value, &root, self.mode != Mode::Save);
+        if editable {
+            self.field.painted(geom);
+        } else {
+            self.field.clear();
+        }
         header_h
     }
 }
@@ -541,8 +554,9 @@ impl View for FileBrowserView {
             });
         let min_w = cx.cfg.file_browser.preview_min_width as f32 * scale;
         self.preview_shown = self.mode != Mode::PickDir && self.preview_on.unwrap_or(rect.w >= min_w);
+        let editable = preview.is_none() && self.mode != Mode::Save;
         let value = preview.unwrap_or_else(|| self.input.clone());
-        let header_h = self.paint_header(cx, rect, &value);
+        let header_h = self.paint_header(cx, rect, &value, editable);
         let footer_h = if self.mode == Mode::Save {
             self.paint_name_field(cx, rect)
         } else {
@@ -742,6 +756,11 @@ impl View for FileBrowserView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        let extend = cx.mods.shift;
+        if self.field.event(&mut self.input, event, extend) || self.name_field.event(&mut self.name, event, extend) {
+            cx.redraw();
+            return;
+        }
         match *event {
             MouseEvent::Down { pos: (x, y), clicks } => {
                 if self.preview_shown && self.preview.contains((x, y)) {
@@ -1168,6 +1187,71 @@ mod tests {
         h.key(&mut v, crate::plugin::testing::cmd(Key::Char('a')));
         h.key(&mut v, press(Key::Char('z')));
         assert_eq!(v.choice(), Some(d.join("z")));
+    }
+
+    /// The centre of column `col`'s cell in a painted field.
+    fn cell_at(g: widgets::FieldGeom, col: usize) -> (f32, f32) {
+        (g.left + (col as f32 + 0.5) * g.cell_w - g.first as f32 * g.cell_w, g.rect.y + g.rect.h * 0.5)
+    }
+
+    /// The left edge of column `col`'s cell: the caret position before it.
+    fn edge_at(g: widgets::FieldGeom, col: usize) -> (f32, f32) {
+        (g.left + col as f32 * g.cell_w - g.first as f32 * g.cell_w, g.rect.y + g.rect.h * 0.5)
+    }
+
+    #[test]
+    fn the_save_name_takes_the_mouse() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        v.set_name("draft one.txt");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let g = v.name_field.geom().expect("the name field is live");
+        // Click places the cursor between two cells; typing lands there.
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: false });
+        h.key(&mut v, press(Key::Char('X')));
+        assert_eq!(v.name.text(), "draftX one.txt");
+        // Drag selects; typing replaces the selection.
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Drag { pos: edge_at(g, 5) });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: true });
+        h.key(&mut v, press(Key::Char('n')));
+        assert_eq!(v.name.text(), "nX one.txt");
+        // Double-click selects the word, triple-click all.
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 2 });
+        assert_eq!(v.name.selection(), Some((3, 6)), "`one`");
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 3 });
+        assert_eq!(v.name.selection(), Some((0, 10)));
+        // Shift+click extends from the anchor.
+        let shift = ghostrealm_terminal::Mods { shift: true, ..Default::default() };
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 1), dragged: false });
+        h.mouse_with(&mut v, shift, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1 });
+        assert_eq!(v.name.selection(), Some((1, 5)));
+    }
+
+    #[test]
+    fn the_filter_field_takes_the_mouse_but_a_save_dialogs_header_does_not() {
+        let (_, mut v) = fixture();
+        let mut h = Harness::new();
+        const WIDE: Rect = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 300.0 };
+        for c in "ab".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        h.paint(&mut v, WIDE);
+        let g = v.field.geom().expect("the filter is live");
+        assert_eq!(v.input.text(), "ab");
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 0), clicks: 2 });
+        assert_eq!(v.input.selection(), Some((0, 2)));
+        h.mouse(&mut v, MouseEvent::Up { pos: cell_at(g, 0), dragged: false });
+        assert_eq!(v.input.selection(), Some((0, 2)), "the release keeps the word");
+        // A save dialog types into the name, so its header field is inert.
+        let mut save = FileBrowserView::picker(v.tree().root().to_path_buf(), Mode::Save);
+        h.paint(&mut save, WIDE);
+        assert!(save.field.geom().is_none());
     }
 
     #[test]

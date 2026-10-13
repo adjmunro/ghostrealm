@@ -565,6 +565,50 @@ impl LineEdit {
         })
     }
 
+    /// A mouse press at caret column `caret` (the boundary nearest the pointer)
+    /// over character `over` (the one under it, for word selection). `clicks`
+    /// counts quick successive presses: 1 places the cursor, 2 selects the word
+    /// under the pointer, 3 or more everything. With `extend` (Shift), a single
+    /// press stretches the selection from the anchor, or from the cursor if
+    /// there is none. Following [`drag_to`](Self::drag_to)s extend the
+    /// selection of a single press.
+    pub fn press(&mut self, caret: usize, over: usize, clicks: u32, extend: bool) {
+        let caret = caret.min(self.len());
+        match clicks {
+            0 | 1 if extend => {
+                self.anchor.get_or_insert(self.cursor);
+                self.cursor = caret;
+            }
+            0 | 1 => {
+                self.cursor = caret;
+                self.anchor = Some(caret);
+            }
+            2 => {
+                let chars: Vec<char> = self.text.chars().collect();
+                match word_span(&chars, over) {
+                    Some((s, e)) => (self.anchor, self.cursor) = (Some(s), e),
+                    None => (self.anchor, self.cursor) = (None, 0),
+                }
+            }
+            _ => (self.anchor, self.cursor) = (Some(0), self.len()),
+        }
+    }
+
+    /// The pointer moved to caret column `caret` with the button held: extend
+    /// the selection to it.
+    pub fn drag_to(&mut self, caret: usize) {
+        self.anchor.get_or_insert(self.cursor);
+        self.cursor = caret.min(self.len());
+    }
+
+    /// The button was released: a press that selected nothing leaves no
+    /// anchor behind.
+    pub fn release(&mut self) {
+        if self.anchor == Some(self.cursor) {
+            self.anchor = None;
+        }
+    }
+
     /// Apply the edit for key `k` (see [`edit_for`]).
     pub fn key(&mut self, k: &KeyPress, clip: &mut dyn Clipboard) -> Applied {
         match edit_for(k) {
@@ -656,6 +700,47 @@ mod tests {
 
     fn plain(key: Key) -> KeyPress {
         k(key, |_| {})
+    }
+
+    #[test]
+    fn a_press_places_the_cursor_and_a_drag_selects() {
+        let mut e = LineEdit::new("hello world");
+        e.press(3, 3, 1, false);
+        e.release();
+        assert_eq!((e.cursor(), e.selection()), (3, None));
+        e.press(2, 2, 1, false);
+        e.drag_to(7);
+        e.release();
+        assert_eq!((e.cursor(), e.selection()), (7, Some((2, 7))));
+        e.drag_to(99);
+        assert_eq!(e.cursor(), 11, "clamped to the end");
+    }
+
+    #[test]
+    fn shift_press_extends_from_the_anchor_or_the_cursor() {
+        let mut e = LineEdit::new("hello world");
+        e.press(2, 2, 1, false);
+        e.release();
+        e.press(6, 6, 1, true);
+        assert_eq!(e.selection(), Some((2, 6)));
+        e.press(9, 9, 1, true);
+        assert_eq!(e.selection(), Some((2, 9)), "the anchor stays");
+    }
+
+    #[test]
+    fn double_click_selects_the_word_and_triple_click_everything() {
+        let mut e = LineEdit::new("foo.bar baz");
+        e.press(5, 5, 2, false);
+        assert_eq!(e.selection(), Some((4, 7)), "bar, as the editor would");
+        e.release();
+        assert_eq!(e.selection(), Some((4, 7)), "the release keeps it");
+        e.press(3, 3, 2, false);
+        assert_eq!(e.selection(), Some((3, 4)), "punctuation is its own run");
+        e.press(1, 1, 3, false);
+        assert_eq!(e.selection(), Some((0, 11)));
+        let mut empty = LineEdit::new("");
+        empty.press(0, 0, 2, false);
+        assert_eq!(empty.selection(), None);
     }
 
     #[test]
