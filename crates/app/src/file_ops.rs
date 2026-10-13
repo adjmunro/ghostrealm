@@ -136,8 +136,11 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
         #[cfg(not(unix))]
         std::fs::copy(src, dst)?;
-    } else {
+    } else if meta.is_file() {
         std::fs::copy(src, dst)?;
+    } else {
+        // A pipe, socket, or device: opening one to read it can block forever.
+        bail!("can't copy {}: not a regular file", src.display());
     }
     Ok(())
 }
@@ -519,5 +522,20 @@ pub mod tests {
         assert_eq!(names(&d.join("a/sub")), Vec::<String>::new(), "nothing was written");
         // A symlink itself is copied as a link, even into the folder it names.
         assert_eq!(copy_into(&d.join("link"), &d.join("a/sub")).unwrap(), d.join("a/sub/link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_holding_a_pipe_fails_to_copy_instead_of_waiting_on_it() {
+        let d = tmpdir("ops-fifo");
+        std::fs::create_dir(d.join("dir")).unwrap();
+        if !std::process::Command::new("mkfifo").arg(d.join("dir/pipe")).status().is_ok_and(|s| s.success()) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let src = d.join("dir");
+        std::thread::spawn(move || tx.send(duplicate(&src).is_err()));
+        let failed = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the copy returns");
+        assert!(failed);
     }
 }
