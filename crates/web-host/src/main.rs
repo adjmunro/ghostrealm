@@ -182,6 +182,14 @@ fn serve_stdin() {
             post_task(ThreadId::UI, Some(&mut RequestTask::new(None)));
             std::thread::sleep(SHUTDOWN_GRACE);
             eprintln!("ghostrealm-web-host: shutdown stalled; exiting");
+            // CEF may still be shutting down on the UI thread: `exit` would run
+            // atexit handlers and static destructors under it.
+            #[cfg(unix)]
+            // SAFETY: `_exit` only ends the process.
+            unsafe {
+                libc::_exit(0)
+            };
+            #[cfg(not(unix))]
             std::process::exit(0);
         })
         .expect("spawn request reader");
