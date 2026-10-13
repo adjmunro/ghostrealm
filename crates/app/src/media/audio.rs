@@ -1,4 +1,4 @@
-//! Audio playback for the preview. A thread of its own owns the output device
+//! Audio playback. A thread of its own owns the output device
 //! (opening it can take tens of ms, and the device handle isn't `Send` on every
 //! platform); the view sends it commands and reads back a [`Status`]. Dropping
 //! the [`AudioPlayer`] ends the thread, which stops playback.

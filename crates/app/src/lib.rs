@@ -9,6 +9,7 @@ pub mod file_menu;
 pub mod file_ops;
 pub mod images;
 pub mod languages;
+pub mod media;
 #[cfg(target_os = "macos")]
 mod macos_keys;
 #[cfg(target_os = "macos")]

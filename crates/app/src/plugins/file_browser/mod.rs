@@ -12,7 +12,6 @@
 //! A wide enough browser shows a [`preview`] of the highlighted (else selected)
 //! entry beside the list; the header's `preview` toggle overrides the width rule.
 
-mod audio;
 pub(crate) mod preview;
 
 use std::any::Any;
@@ -1443,7 +1442,7 @@ mod tests {
     #[test]
     fn hiding_the_view_pauses_a_playing_track_and_showing_it_leaves_it_paused() {
         let (h, mut v, wav) = previewing_audio_with_autoplay();
-        let player = audio::AudioPlayer::new();
+        let player = crate::media::audio::AudioPlayer::new();
         player.play(&wav);
         v.preview.install_player(player);
         assert!(v.preview.audio_status().is_some_and(|s| s.playing));

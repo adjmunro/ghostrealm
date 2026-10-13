@@ -14,7 +14,7 @@ use ghostrealm_core::highlight::{self, Span};
 use ghostrealm_core::{Config, Rect};
 use glyphon::Family;
 
-use super::audio::{self, AudioPlayer};
+use crate::media::audio::{self, AudioPlayer};
 use crate::plugin::{rect_contains, theme, EventCx, Font, Image, PaintCx};
 use crate::syntax;
 
