@@ -345,6 +345,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // A button pressed before switching away is cancelled, not
                 // fired by a release that may arrive without its press.
                 state.armed_button = None;
+                // Likewise a selection dragged in the palette's input line.
+                state.palette_release();
             }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
@@ -1922,6 +1924,8 @@ impl State {
     /// A press on the palette's input line selects text there; whether it
     /// began on the line.
     fn palette_press(&mut self) -> bool {
+        // A release lost to a focus switch mid-drag never ended the last one.
+        self.palette_release();
         let (x, y) = self.cursor;
         let on_line = self.palette_line.is_some_and(|(r, ..)| rect_contains(r, x, y));
         if !on_line {
