@@ -223,11 +223,10 @@ impl Plugin for WebPlugin {
                     page.start = Some(u.to_string());
                 }
                 // Start the page now, so a host that can't run is reported here.
-                if !page.send(None) {
+                if let Err(e) = page.start() {
                     return Err(CmdError::Failed(format!(
-                        "opened web surface {}, but {}",
-                        sid.0,
-                        page.no_host()
+                        "opened web surface {}, but {e}",
+                        sid.0
                     )));
                 }
                 Ok(CmdOutcome::msg(format!("opened web surface {}", sid.0)))
@@ -488,6 +487,27 @@ impl WebView {
             Some(r) => host.send(&r),
             None => true,
         }
+    }
+
+    /// Create the page in the host. Without a waker (the agent channel) no
+    /// repaint would show a failure that comes later, so wait for the host to
+    /// be ready and return why it isn't; with one (the GUI) return at once and
+    /// let the pane show it.
+    fn start(&mut self) -> Result<(), String> {
+        if !self.send(None) {
+            return Err(self.no_host());
+        }
+        if self.slot.borrow().waker.is_some() {
+            return Ok(());
+        }
+        if self.with_host(|h, _| h.wait_ready(LOAD_WAIT)) == Some(true) {
+            return Ok(());
+        }
+        // Picks up the reason of a host that exited.
+        if self.slot.borrow_mut().host().is_some() {
+            return Err(format!("the web host was not ready within {}s", LOAD_WAIT.as_secs()));
+        }
+        Err(self.no_host())
     }
 
     /// Run `f` with the host (after making sure the page exists).
@@ -1127,6 +1147,27 @@ mod tests {
             assert!(Instant::now() < until, "requests so far: {got}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn starting_from_the_agent_reports_a_host_that_fails_after_spawning() {
+        let (mut v, _) = stub_host(
+            "web-start-fail",
+            r#"echo '{"ev":"failed","error":"the web profile is in use"}'; exit 1"#,
+        );
+        assert_eq!(v.start(), Err("the web profile is in use".into()));
+
+        let (mut v, _) = stub_host("web-start-ok", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+        assert_eq!(v.start(), Ok(()));
+    }
+
+    #[test]
+    fn starting_from_the_gui_does_not_wait_for_the_host() {
+        let (mut v, _) = stub_host("web-start-gui", "cat > /dev/null");
+        v.slot.borrow_mut().waker = Some(Arc::new(|| {}));
+        let t = Instant::now();
+        assert_eq!(v.start(), Ok(()));
+        assert!(t.elapsed() < Duration::from_secs(1), "waited {:?}", t.elapsed());
     }
 
     #[test]

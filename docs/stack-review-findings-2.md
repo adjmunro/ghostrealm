@@ -55,8 +55,8 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     world instead?
 19. **Every ghostrealm process shares one web profile**
     (`~/Library/Caches/ghostrealm/web`), so a second process (another GUI, or
-    `ghostrealm agent` running `web.new`) can't start its host; the pane says the
-    profile is in use. Decision needed: share cookies and logins between the GUI
+    `ghostrealm agent` running `web.new`) can't start its host; the pane (and the
+    agent's `web.new`) says the profile is in use. Decision needed: share cookies and logins between the GUI
     and the agent, or a profile per process? Leaning towards one shared
     ghostrealm profile (GUI and agent), isolated from other browsers on the
     machine; not final.
