@@ -2174,6 +2174,24 @@ mod tests {
     }
 
     #[test]
+    fn the_exit_banner_does_not_hide_a_last_line_with_output_on_it() {
+        // Fills the screen and ends on a line with no newline: the cursor's
+        // row, the last, holds output.
+        let mut s = AppState::new()
+            .with_shell_line("i=0; while [ $i -lt 80 ]; do echo line$i; i=$((i+1)); done; printf 'fatal: last'; exit 3");
+        s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        let banner = "exited with code 3";
+        assert!(
+            pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))),
+            "{:?}",
+            s.surface_text(sid)
+        );
+        let text = s.surface_text(sid).unwrap();
+        assert!(text.contains("fatal: last"), "the last line is kept:\n{text}");
+    }
+
+    #[test]
     fn a_shell_killed_by_a_signal_stays_with_the_signal_named() {
         let mut s = AppState::new().with_shell_line("kill -9 $$");
         let vt = s.new_vtab().unwrap();

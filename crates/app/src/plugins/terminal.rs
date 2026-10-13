@@ -338,7 +338,8 @@ impl View for TerminalView {
         }
 
         let banner = self.exit.map(exit_banner);
-        let banner_row = banner_row(&self.grid);
+        // With no blank row to take, the banner covers the last one on screen.
+        let banner_row = banner_row(&self.grid).unwrap_or(self.grid.size.rows.saturating_sub(1));
         let grid = &self.grid;
         cx.fill(rect, grid.default_bg);
         if let Some(sel) = self.selection {
@@ -600,7 +601,7 @@ impl View for TerminalView {
         let banner_row = banner_row(&grid);
         let mut out = String::new();
         for row in 0..grid.size.rows {
-            if let Some(text) = banner.as_deref().filter(|_| row == banner_row) {
+            if let Some(text) = banner.as_deref().filter(|_| Some(row) == banner_row) {
                 out.push_str(text);
                 out.push('\n');
                 continue;
@@ -613,6 +614,11 @@ impl View for TerminalView {
                 }
             }
             out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        // No blank row to take: the banner follows the output.
+        if let Some(text) = banner.as_deref().filter(|_| banner_row.is_none()) {
+            out.push_str(text);
             out.push('\n');
         }
         Some(out)
@@ -628,11 +634,9 @@ impl View for TerminalView {
 }
 
 /// The row the exit banner takes: the first blank one from the cursor's down,
-/// else the last.
-fn banner_row(grid: &Grid) -> u16 {
-    (grid.cursor.row..grid.size.rows)
-        .find(|&r| row_content_len(grid, r) == 0)
-        .unwrap_or(grid.size.rows.saturating_sub(1))
+/// if any.
+fn banner_row(grid: &Grid) -> Option<u16> {
+    (grid.cursor.row..grid.size.rows).find(|&r| row_content_len(grid, r) == 0)
 }
 
 /// The banner shown once the shell has ended.
@@ -885,15 +889,15 @@ mod tests {
     }
 
     #[test]
-    fn the_banner_takes_the_first_blank_row_from_the_cursor_down_else_the_last() {
+    fn the_banner_takes_the_first_blank_row_from_the_cursor_down() {
         let mut g = grid_of(&["out ", "$ x ", "    ", "    "]);
         g.cursor.row = 1;
-        assert_eq!(banner_row(&g), 2);
+        assert_eq!(banner_row(&g), Some(2));
         g.cursor.row = 2;
-        assert_eq!(banner_row(&g), 2);
+        assert_eq!(banner_row(&g), Some(2));
         let mut full = grid_of(&["out ", "err "]);
         full.cursor.row = 1;
-        assert_eq!(banner_row(&full), 1);
+        assert_eq!(banner_row(&full), None);
     }
 
     #[test]
