@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 
 use cef::*;
-use ghostrealm_web::protocol::{Event, Request};
+use ghostrealm_web::protocol::{Event, Request, PROTOCOL_VERSION};
 
 /// Overrides the profile directory (cookies, cache, local storage).
 const CACHE_ENV: &str = "GHOSTREALM_WEB_CACHE";
@@ -236,7 +236,9 @@ wrap_browser_process_handler! {
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
-            emit(&Event::Ready);
+            emit(&Event::Ready {
+                protocol: PROTOCOL_VERSION,
+            });
             serve_stdin();
         }
 

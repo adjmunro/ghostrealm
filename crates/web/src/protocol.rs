@@ -7,6 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The version of this protocol, frame files included. Bump it whenever a
+/// request, an event, or the frame file layout changes incompatibly: the app
+/// refuses a host that reports another one.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
 /// passes them through unchanged.
 pub mod mods {
@@ -180,8 +185,12 @@ pub enum Cursor {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
 pub enum Event {
-    /// CEF initialised; requests are now served.
-    Ready,
+    /// CEF initialised; requests are now served. `protocol` is the host's
+    /// [`PROTOCOL_VERSION`] (0 from a host older than the field).
+    Ready {
+        #[serde(default)]
+        protocol: u32,
+    },
     /// A new frame for `id` is in `path`, slot `slot` (see [`crate::frame`]).
     Frame {
         id: u64,
@@ -304,6 +313,14 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""ev":"loading""#), "{s}");
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+    }
+
+    #[test]
+    fn ready_carries_the_protocol_version() {
+        let s = serde_json::to_string(&Event::Ready { protocol: PROTOCOL_VERSION }).unwrap();
+        assert_eq!(s, format!(r#"{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}"#));
+        let old = serde_json::from_str::<Event>(r#"{"ev":"ready"}"#).unwrap();
+        assert_eq!(old, Event::Ready { protocol: 0 }, "a host without the field is version 0");
     }
 
     #[test]

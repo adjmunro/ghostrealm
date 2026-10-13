@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::frame::FrameReader;
-use crate::protocol::{Cursor, Event, MouseAction, Request};
+use crate::protocol::{Cursor, Event, MouseAction, Request, PROTOCOL_VERSION};
 
 /// Executable name of the host (and of its macOS bundle, `<name>.app`).
 pub const HOST_NAME: &str = "ghostrealm-web-host";
@@ -245,14 +245,16 @@ impl WebHost {
         self.shared.0.lock().unwrap().ready
     }
 
-    /// Why the host gave up, if it said before exiting.
+    /// Why the host can't be used: it gave up (and is exiting), or it speaks
+    /// another protocol version.
     pub fn failure(&self) -> Option<String> {
         self.shared.0.lock().unwrap().failure.clone()
     }
 
-    /// Block until the host reports CEF is initialised (or `timeout`/exit).
+    /// Block until the host reports CEF is initialised (or `timeout`, exit, or
+    /// a [`failure`](Self::failure)).
     pub fn wait_ready(&self, timeout: Duration) -> bool {
-        self.wait_until(timeout, |s| s.ready)
+        self.wait_until(timeout, |s| s.ready || s.failure.is_some())
             .is_some_and(|s| s.ready)
     }
 
@@ -448,7 +450,13 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         s.views.entry(id).or_default().version += 1;
     }
     match ev {
-        Event::Ready => s.ready = true,
+        Event::Ready { protocol } if protocol == PROTOCOL_VERSION => s.ready = true,
+        Event::Ready { protocol } => {
+            s.failure = Some(format!(
+                "the web host bundle is out of date (protocol {protocol}, this ghostrealm \
+                 speaks {PROTOCOL_VERSION}); rebuild it with `mise run web`"
+            ));
+        }
         Event::Frame {
             id,
             path,
@@ -596,6 +604,22 @@ mod tests {
             ok: true,
             value: value.into(),
         }
+    }
+
+    #[test]
+    fn a_host_speaking_another_protocol_is_refused() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        apply_event(&shared, Event::Ready { protocol: 0 });
+        {
+            let s = shared.0.lock().unwrap();
+            assert!(!s.ready);
+            let failure = s.failure.as_deref().unwrap_or_default();
+            assert!(failure.contains("out of date") && failure.contains("mise run web"), "{failure}");
+        }
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        apply_event(&shared, Event::Ready { protocol: PROTOCOL_VERSION });
+        let s = shared.0.lock().unwrap();
+        assert!(s.ready && s.failure.is_none());
     }
 
     #[test]

@@ -88,7 +88,9 @@ impl HostSlot {
     fn host(&mut self) -> Option<&mut WebHost> {
         if let Some(h) = &self.host {
             let ready = h.is_ready();
-            if !h.is_alive() {
+            // A host that failed is exiting, or can't be spoken to (another
+            // protocol version): drop it, which asks it to exit.
+            if !h.is_alive() || h.failure().is_some() {
                 let error = match h.failure() {
                     Some(e) => e,
                     None if ready => "the web host exited".into(),
@@ -1061,6 +1063,7 @@ impl View for WebView {
 mod tests {
     use super::*;
     use crate::plugin::testing::{cmd, press, Harness};
+    use ghostrealm_web::protocol::PROTOCOL_VERSION;
 
     /// A view whose host can't be found (tests don't bundle one).
     fn hostless() -> WebView {
@@ -1157,8 +1160,20 @@ mod tests {
         );
         assert_eq!(v.start(), Err("the web profile is in use".into()));
 
-        let (mut v, _) = stub_host("web-start-ok", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+        let ready = format!(r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'; cat > /dev/null"#);
+        let (mut v, _) = stub_host("web-start-ok", &ready);
         assert_eq!(v.start(), Ok(()));
+    }
+
+    #[test]
+    fn a_host_bundle_from_another_protocol_version_is_reported() {
+        let (mut v, _) = stub_host("web-old-host", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+        let err = v.start().unwrap_err();
+        assert!(err.contains("out of date") && err.contains("mise run web"), "{err}");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        assert!(v.slot.borrow().error.as_deref().is_some_and(|e| e.contains("out of date")));
+        assert!(v.slot.borrow().host.is_none(), "the host is let go");
     }
 
     #[test]
