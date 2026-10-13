@@ -30,6 +30,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
+use crate::config_watch::{self, ConfigWatch};
 use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::file_menu::{FileAction, FileTarget, MenuEntry};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
@@ -299,6 +300,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
+        if state.window_focused {
+            if Instant::now() >= state.config_check_due {
+                state.check_config_file();
+            }
+            let d = state.config_check_due;
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
         match wake {
             Some(t) if Instant::now() >= t => {
                 state.window.request_redraw();
@@ -317,7 +325,12 @@ impl ApplicationHandler<UserEvent> for App {
                 state.request_quit();
                 state.window.request_redraw();
             }
+            WindowEvent::Focused(true) => {
+                state.window_focused = true;
+                state.check_config_file();
+            }
             WindowEvent::Focused(false) => {
+                state.window_focused = false;
                 // App lost focus: autosave editors (switching to another app), and
                 // hot-reload the config if it was one of them.
                 if state.app.autosave_all(&state.cfg) {
@@ -562,6 +575,13 @@ struct State {
     tooltip_hover: Option<(Rect, Instant)>,
     /// When a pending tooltip is due to show (a wake-up).
     tooltip_due: Option<Instant>,
+    /// Notices edits to the config file made outside the app.
+    config_watch: ConfigWatch,
+    /// Whether the window has keyboard focus (the config file is polled only
+    /// then).
+    window_focused: bool,
+    /// When the focused window next checks the config file.
+    config_check_due: Instant,
     /// The last left press (time, position, click count), for counting
     /// double-clicks.
     last_press: Option<(Instant, (f32, f32), u32)>,
@@ -905,6 +925,9 @@ impl State {
             picker_panel: None,
             tooltip_hover: None,
             tooltip_due: None,
+            config_watch: ConfigWatch::new(ghostrealm_core::config::config_path()),
+            window_focused: true,
+            config_check_due: Instant::now() + config_watch::POLL,
             last_press: None,
             mouse_capture: None,
             sidebar_hidden: false,
@@ -971,7 +994,21 @@ impl State {
     /// Reload the config file from disk and apply it (config is the source of
     /// truth). A file that doesn't parse leaves the current config in place.
     fn reload_config(&mut self) {
+        self.config_watch.mark_seen();
         if let Some(cfg) = ghostrealm_core::config::load_or_create(&self.catalogue) {
+            self.apply_config(cfg);
+            self.window.request_redraw();
+        }
+    }
+
+    /// Reload the config if the file changed outside the app since it was last
+    /// loaded. Only the running config reloads: a config open in an editor
+    /// keeps its buffer, unsaved edits included (saving it later writes the
+    /// buffer over the external edit).
+    fn check_config_file(&mut self) {
+        self.config_check_due = Instant::now() + config_watch::POLL;
+        let catalogue = self.catalogue.clone();
+        if let Some(cfg) = self.config_watch.poll(|| ghostrealm_core::config::load_or_create(&catalogue)) {
             self.apply_config(cfg);
             self.window.request_redraw();
         }

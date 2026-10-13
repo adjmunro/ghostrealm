@@ -283,16 +283,6 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Settings = the config file in our editor — watcher remains
-
-- Requires: NO BLOCKERS
-- Detail: Hot-reload on EXTERNAL edits (a file watcher): today only a save from
-  our editor reloads. A file that doesn't parse already leaves the running config
-  in place. Lower priority than the language-service follow-ups.
-- Reason: edits from another editor or a synced dotfile should apply.
-
----
-
 [2026-09-16@8eae419]
 
 - Requires: NO BLOCKERS (but assess necessity first — see Reason)

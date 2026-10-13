@@ -106,5 +106,8 @@ writes just the default `[keybindings]`, and only commands listed there are
 bound. Cmd+, opens it in the editor, where hovering a section or option shows
 its docs and bad entries are flagged. Saving hot-reloads it: a flagged entry is
 dropped (its default applies) or clamped into range, and a file that doesn't
-parse leaves the running config unchanged. `ghostrealm lsp config` serves the
+parse leaves the running config unchanged. An edit from another editor applies
+too: the focused window checks the file's modification time and size every 2 s
+and when it gains focus. The running config reloads; an open editor buffer of
+it keeps its unsaved edits. `ghostrealm lsp config` serves the
 same checks and docs to any LSP-capable editor over stdio.
