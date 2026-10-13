@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use ghostrealm_terminal::{Grid, KeyPress, Lifecycle, Pumped, Scroll, TerminalBackend};
+use ghostrealm_terminal::{Grid, KeyPress, Lifecycle, MouseReport, Pumped, Scroll, TerminalBackend};
 
 use portable_pty::ChildKiller;
 
@@ -47,6 +47,8 @@ pub type UiWaker = Arc<dyn Fn() + Send + Sync>;
 enum Cmd {
     Key(KeyPress),
     Bytes(Vec<u8>),
+    Paste(String),
+    Mouse(MouseReport),
     Resize {
         cols: u16,
         rows: u16,
@@ -67,6 +69,8 @@ struct Meta {
     title: Option<String>,
     busy: bool,
     lifecycle: Lifecycle,
+    /// The program enabled mouse tracking.
+    mouse_tracking: bool,
     /// The PTY's foreground process group, for a forced shutdown.
     foreground: Option<i32>,
 }
@@ -116,6 +120,7 @@ impl ThreadedTerminal {
                 title: None,
                 busy: false,
                 lifecycle: Lifecycle::Running,
+                mouse_tracking: false,
                 foreground: None,
             }),
             generation: AtomicU64::new(0),
@@ -267,6 +272,18 @@ impl TerminalBackend for ThreadedTerminal {
         self.send(Cmd::Bytes(bytes.to_vec()));
     }
 
+    fn paste(&mut self, text: &str) {
+        self.send(Cmd::Paste(text.to_string()));
+    }
+
+    fn mouse_tracking(&self) -> bool {
+        self.shared.meta.lock().unwrap().mouse_tracking
+    }
+
+    fn send_mouse(&mut self, report: &MouseReport) {
+        self.send(Cmd::Mouse(*report));
+    }
+
     fn scroll(&mut self, scroll: Scroll) {
         self.send(Cmd::Scroll(scroll));
     }
@@ -384,6 +401,8 @@ fn worker_loop(
         let mut apply = |m: Cmd, term: &mut GhosttyTerminal| match m {
             Cmd::Key(k) => term.send_key(&k),
             Cmd::Bytes(b) => term.write_bytes(&b),
+            Cmd::Paste(t) => term.paste(&t),
+            Cmd::Mouse(r) => term.send_mouse(&r),
             Cmd::Resize {
                 cols,
                 rows,
@@ -422,6 +441,7 @@ fn worker_loop(
             title: term.title(),
             busy: term.is_busy(),
             lifecycle: term.lifecycle(),
+            mouse_tracking: term.mouse_tracking(),
             foreground: term.foreground_group(),
         };
         exit_poll = exit_poll_after(term, new_meta.lifecycle);
@@ -611,6 +631,35 @@ mod tests {
         assert!(other.try_wait().unwrap().is_none(), "an unrelated group survives");
         let _ = other.kill();
         let _ = other.wait();
+    }
+
+    #[test]
+    fn mouse_tracking_and_pastes_go_through_the_worker() {
+        use ghostrealm_terminal::{MouseAction, MouseButton, MouseReport, Mods};
+        let cmd = sh("stty -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; exec cat -v");
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(cmd), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !term.mouse_tracking() {
+            assert!(Instant::now() < deadline, "tracking never showed in the meta");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        term.send_mouse(&MouseReport {
+            action: MouseAction::Press,
+            button: Some(MouseButton::Left),
+            mods: Mods::default(),
+            at: (0.5, 0.5),
+        });
+        term.paste("hi");
+        term.write_bytes(b"\r");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let g = term.snapshot();
+            if (0..10).any(|r| row_text(&g, r) == "^[[<0;1;1M^[[200~hi^[[201~") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the worker never wrote the mouse report and paste");
+            std::thread::sleep(Duration::from_millis(15));
+        }
     }
 
     #[test]

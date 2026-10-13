@@ -4,7 +4,9 @@
 
 use std::time::{Duration, Instant};
 
-use ghostrealm_terminal::{Key, KeyPress, Lifecycle, Mods, Scroll, TerminalBackend};
+use ghostrealm_terminal::{
+    Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton, MouseReport, Scroll, TerminalBackend,
+};
 use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
 
 fn sh(cmd: &str) -> CommandBuilder {
@@ -373,4 +375,143 @@ fn fast_scroll_stress_does_not_panic() {
         term.scroll(Scroll::Bottom);
         let _ = term.snapshot();
     }
+}
+
+/// A terminal whose child switches `modes` on (`\e[?2004h`, ...) and then
+/// echoes its input through `cat -v`, so control bytes show as `^[`. Waits
+/// until the VT has processed the switch (`ready` is true).
+fn cat_v_with(modes: &str, ready: impl Fn(&GhosttyTerminal) -> bool) -> GhosttyTerminal {
+    let line = format!("stty -echo; printf '{modes}'; exec cat -v");
+    let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh(&line))).expect("spawn backend");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready(&term) {
+        assert!(Instant::now() < deadline, "the child never enabled {modes:?}");
+        term.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    term
+}
+
+/// Pump until some row contains `want`, returning that row.
+fn wait_for_row(term: &mut GhosttyTerminal, want: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        term.pump();
+        for row in 0..10 {
+            let text = row_text(term, row);
+            if text.contains(want) {
+                return text;
+            }
+        }
+        assert!(Instant::now() < deadline, "no row with {want:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn bracketed_on(t: &GhosttyTerminal) -> bool {
+    t.encode_paste("x").is_ok_and(|b| b.starts_with(b"\x1b[200~"))
+}
+
+#[test]
+fn bracketed_paste_wraps_and_neutralises_the_end_marker() {
+    let mut term = cat_v_with("\\033[?2004h", bracketed_on);
+    term.paste("one\ntwo\x1b[201~; rm -rf ~");
+    term.write_bytes(b"\r");
+    // The pasted newline stays inside the markers, and the embedded end marker
+    // lost its ESC so it cannot close the bracket early.
+    wait_for_row(&mut term, "^[[200~one");
+    let second = wait_for_row(&mut term, "two");
+    assert_eq!(second, "two [201~; rm -rf ~^[[201~", "{second:?}");
+}
+
+#[test]
+fn paste_is_unwrapped_when_the_program_did_not_ask_for_brackets() {
+    let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("stty -echo; exec cat -v")))
+        .expect("spawn backend");
+    assert_eq!(term.encode_paste("a\nb").unwrap(), b"a\nb", "as typed today");
+    term.paste("plain text\r");
+    let row = wait_for_row(&mut term, "plain text");
+    assert_eq!(row, "plain text");
+}
+
+fn report(
+    action: MouseAction,
+    button: Option<MouseButton>,
+    at: (f32, f32),
+) -> MouseReport {
+    MouseReport { action, button, mods: Mods::default(), at }
+}
+
+fn tracking(t: &GhosttyTerminal) -> bool {
+    t.mouse_tracking()
+}
+
+#[test]
+fn mouse_reports_are_silent_until_the_program_enables_tracking() {
+    let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("sleep 2"))).expect("spawn backend");
+    assert!(!term.mouse_tracking());
+    let press = report(MouseAction::Press, Some(MouseButton::Left), (2.5, 1.5));
+    assert!(term.encode_mouse(&press).unwrap().is_empty());
+}
+
+#[test]
+fn sgr_mouse_encodes_cells_buttons_and_modifiers() {
+    let mut term = cat_v_with("\\033[?1000h\\033[?1006h", tracking);
+    let left = Some(MouseButton::Left);
+    let mut enc = |r: MouseReport| String::from_utf8(term.encode_mouse(&r).unwrap()).unwrap();
+    assert_eq!(enc(report(MouseAction::Press, left, (2.5, 1.5))), "\x1b[<0;3;2M");
+    assert_eq!(enc(report(MouseAction::Release, left, (2.5, 1.5))), "\x1b[<0;3;2m");
+    assert_eq!(
+        enc(report(MouseAction::Press, Some(MouseButton::Right), (0.0, 0.0))),
+        "\x1b[<2;1;1M"
+    );
+    assert_eq!(
+        enc(report(MouseAction::Press, Some(MouseButton::WheelUp), (5.2, 3.9))),
+        "\x1b[<64;6;4M"
+    );
+    assert_eq!(
+        enc(report(MouseAction::Press, Some(MouseButton::WheelDown), (5.2, 3.9))),
+        "\x1b[<65;6;4M"
+    );
+    let shifted = MouseReport {
+        mods: Mods { shift: true, ctrl: true, alt: true, ..Default::default() },
+        ..report(MouseAction::Press, left, (0.5, 0.5))
+    };
+    // shift 4 + alt 8 + ctrl 16
+    assert_eq!(enc(shifted), "\x1b[<28;1;1M");
+    // Normal tracking (1000) doesn't report motion.
+    assert_eq!(enc(report(MouseAction::Motion, left, (9.5, 4.5))), "");
+}
+
+#[test]
+fn motion_follows_the_tracking_mode_and_skips_repeats_in_one_cell() {
+    let mut any = cat_v_with("\\033[?1003h\\033[?1006h", tracking);
+    let enc = |t: &mut GhosttyTerminal, r: MouseReport| String::from_utf8(t.encode_mouse(&r).unwrap()).unwrap();
+    let hover = report(MouseAction::Motion, None, (4.5, 2.5));
+    assert_eq!(enc(&mut any, hover), "\x1b[<35;5;3M", "any-event reports hover");
+    assert_eq!(enc(&mut any, hover), "", "same cell again");
+    let drag = report(MouseAction::Motion, Some(MouseButton::Left), (6.5, 2.5));
+    assert_eq!(enc(&mut any, drag), "\x1b[<32;7;3M");
+
+    let mut button = cat_v_with("\\033[?1002h\\033[?1006h", tracking);
+    assert_eq!(enc(&mut button, hover), "", "button-event ignores hover");
+    assert_eq!(enc(&mut button, drag), "\x1b[<32;7;3M", "but reports a drag");
+}
+
+#[test]
+fn legacy_mouse_encoding_is_used_without_sgr() {
+    let mut term = cat_v_with("\\033[?1000h", tracking);
+    let press = report(MouseAction::Press, Some(MouseButton::Left), (2.5, 1.5));
+    // CSI M, then 32+button, 32+col+1, 32+row+1.
+    assert_eq!(term.encode_mouse(&press).unwrap(), b"\x1b[M #\"");
+}
+
+#[test]
+fn mouse_reports_reach_the_program() {
+    let mut term = cat_v_with("\\033[?1000h\\033[?1006h", tracking);
+    term.send_mouse(&report(MouseAction::Press, Some(MouseButton::Left), (2.5, 1.5)));
+    term.send_mouse(&report(MouseAction::Release, Some(MouseButton::Left), (2.5, 1.5)));
+    term.write_bytes(b"\r");
+    let row = wait_for_row(&mut term, "^[[<0;3;2M");
+    assert_eq!(row, "^[[<0;3;2M^[[<0;3;2m");
 }

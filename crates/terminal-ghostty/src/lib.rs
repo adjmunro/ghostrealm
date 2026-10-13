@@ -16,10 +16,14 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use anyhow::{Context, Result};
 use ghostrealm_terminal::{
-    Cell, CellAttrs, Cursor, Grid, GridSize, Key, KeyPress, Lifecycle, Mods, Pumped, Rgb, Scroll,
-    TerminalBackend,
+    Cell, CellAttrs, Cursor, Grid, GridSize, Key, KeyPress, Lifecycle, Mods, MouseAction,
+    MouseButton, MouseReport, Pumped, Rgb, Scroll, TerminalBackend,
 };
+use libghostty_vt::error::Error as VtError;
 use libghostty_vt::key as vtkey;
+use libghostty_vt::mouse as vtmouse;
+use libghostty_vt::paste as vtpaste;
+use libghostty_vt::terminal::Mode;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
@@ -70,6 +74,13 @@ pub struct GhosttyTerminal {
     /// pushed by the `on_pty_write` callback during `vt_write`.
     pty_out: Rc<RefCell<VecDeque<u8>>>,
     encoder: vtkey::Encoder<'static>,
+    mouse_encoder: vtmouse::Encoder<'static>,
+    /// Mouse buttons currently held (a bit per [`button_bit`]), which the
+    /// encoder needs to report motion outside the grid during a drag.
+    mouse_held: u8,
+    /// The cell of the last pointer event reported, to drop motion that stays
+    /// inside it. (The encoder's own tracking is cleared by every option sync.)
+    mouse_cell: Option<(u32, u32)>,
     cell_w: u32,
     cell_h: u32,
     /// Cached once the child is observed to have exited.
@@ -170,6 +181,7 @@ impl GhosttyTerminal {
         }
 
         let encoder = vtkey::Encoder::new().context("create key encoder")?;
+        let mouse_encoder = vtmouse::Encoder::new().context("create mouse encoder")?;
         let render_state = RenderState::new().context("render state")?;
         let row_iter = RowIterator::new().context("row iter")?;
         let cell_iter = CellIterator::new().context("cell iter")?;
@@ -185,6 +197,9 @@ impl GhosttyTerminal {
             rx,
             pty_out,
             encoder,
+            mouse_encoder,
+            mouse_held: 0,
+            mouse_cell: None,
             cell_w,
             cell_h,
             exited: None,
@@ -393,6 +408,109 @@ impl GhosttyTerminal {
             .context("encode key")?;
         Ok(out)
     }
+
+    /// The bytes that paste `text` into the program (no PTY I/O): bracketed when
+    /// the program enabled mode 2004, else as typed.
+    pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>> {
+        if self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false) {
+            bracketed_paste(text)
+        } else {
+            Ok(text.as_bytes().to_vec())
+        }
+    }
+
+    /// Encode a pointer event in the protocol the program selected (empty when
+    /// tracking is off or the mode doesn't report this event). Exposed for
+    /// unit tests; `send_mouse` calls this and writes the result.
+    pub fn encode_mouse(&mut self, report: &MouseReport) -> Result<Vec<u8>> {
+        let (cols, rows) = (self.term.cols().unwrap_or(0) as u32, self.term.rows().unwrap_or(0) as u32);
+        let (cw, ch) = (self.cell_w.max(1), self.cell_h.max(1));
+        let bit = report.button.map_or(0, button_bit);
+        match report.action {
+            MouseAction::Press => self.mouse_held |= bit,
+            MouseAction::Release => self.mouse_held &= !bit,
+            MouseAction::Motion => {}
+        }
+        let mut event = vtmouse::Event::new().context("mouse event")?;
+        event
+            .set_action(match report.action {
+                MouseAction::Press => vtmouse::Action::Press,
+                MouseAction::Release => vtmouse::Action::Release,
+                MouseAction::Motion => vtmouse::Action::Motion,
+            })
+            .set_button(report.button.map(|b| match b {
+                MouseButton::Left => vtmouse::Button::Left,
+                MouseButton::Middle => vtmouse::Button::Middle,
+                MouseButton::Right => vtmouse::Button::Right,
+                MouseButton::WheelUp => vtmouse::Button::Four,
+                MouseButton::WheelDown => vtmouse::Button::Five,
+            }))
+            .set_mods(Self::map_mods(report.mods))
+            .set_position(vtmouse::Position {
+                x: report.at.0 * cw as f32,
+                y: report.at.1 * ch as f32,
+            });
+        self.mouse_encoder
+            .set_options_from_terminal(&self.term)
+            .set_size(vtmouse::EncoderSize {
+                screen_width: cols * cw,
+                screen_height: rows * ch,
+                cell_width: cw,
+                cell_height: ch,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            })
+            .set_any_button_pressed(self.mouse_held != 0);
+        let cell = (
+            (report.at.0.max(0.0) as u32).min(cols.saturating_sub(1)),
+            (report.at.1.max(0.0) as u32).min(rows.saturating_sub(1)),
+        );
+        let pixels = self.term.mode(Mode::SGR_PIXELS_MOUSE).unwrap_or(false);
+        if report.action == MouseAction::Motion && !pixels && self.mouse_cell == Some(cell) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        self.mouse_encoder
+            .encode_to_vec(&event, &mut out)
+            .context("encode mouse")?;
+        if !out.is_empty() {
+            self.mouse_cell = Some(cell);
+        }
+        Ok(out)
+    }
+}
+
+/// `text` wrapped in the bracketed-paste markers. Control bytes (ESC, so an
+/// embedded end marker included, NUL, DEL, and the terminal-driver line-editing
+/// keys) become spaces, as in xterm, so a paste can neither end the bracket
+/// early nor act as a keystroke.
+pub fn bracketed_paste(text: &str) -> Result<Vec<u8>> {
+    let mut data = text.as_bytes().to_vec();
+    // Markers add 12 bytes; the encoder reports the size it needs if short.
+    let mut buf = vec![0u8; data.len() + 16];
+    let written = match vtpaste::encode(&mut data, true, &mut buf) {
+        Ok(n) => n,
+        Err(VtError::OutOfSpace { required }) => {
+            buf.resize(required, 0);
+            vtpaste::encode(&mut data, true, &mut buf).context("encode paste")?
+        }
+        Err(e) => return Err(e).context("encode paste"),
+    };
+    buf.truncate(written);
+    Ok(buf)
+}
+
+/// A bit per mouse button for [`GhosttyTerminal::mouse_held`]; wheel notches
+/// are never held.
+fn button_bit(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Right => 4,
+        MouseButton::WheelUp | MouseButton::WheelDown => 0,
+    }
 }
 
 impl TerminalBackend for GhosttyTerminal {
@@ -424,6 +542,26 @@ impl TerminalBackend for GhosttyTerminal {
     fn write_bytes(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    fn paste(&mut self, text: &str) {
+        // Output queued behind this paste may have toggled the mode.
+        self.pump_budgeted(usize::MAX);
+        if let Ok(bytes) = self.encode_paste(text) {
+            self.write_bytes(&bytes);
+        }
+    }
+
+    fn mouse_tracking(&self) -> bool {
+        self.term.is_mouse_tracking().unwrap_or(false)
+    }
+
+    fn send_mouse(&mut self, report: &MouseReport) {
+        if let Ok(bytes) = self.encode_mouse(report) {
+            if !bytes.is_empty() {
+                self.write_bytes(&bytes);
+            }
+        }
     }
 
     fn scroll(&mut self, scroll: Scroll) {

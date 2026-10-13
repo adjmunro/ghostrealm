@@ -188,6 +188,39 @@ pub struct KeyPress {
     pub text: Option<String>,
 }
 
+/// What a mouse report describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    /// The pointer moved (with `button` set while dragging).
+    Motion,
+}
+
+/// A mouse button. A wheel notch is a [`Press`](MouseAction::Press) of a wheel
+/// "button" with no release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// One pointer event to report to a program that enabled mouse tracking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MouseReport {
+    pub action: MouseAction,
+    /// The button involved; `None` for motion with nothing held.
+    pub button: Option<MouseButton>,
+    pub mods: Mods,
+    /// Pointer position in cells from the grid's top-left, fractional within a
+    /// cell (`(2.5, 0.5)` is the centre of the third column, first row). The
+    /// backend turns it into the cell or pixel coordinates the program asked for.
+    pub at: (f32, f32),
+}
+
 /// A hosted terminal. Single-threaded: all methods are called on the UI thread.
 pub trait TerminalBackend {
     /// Resize the grid. `cell_w_px`/`cell_h_px` are the pixel size of one cell,
@@ -199,6 +232,25 @@ pub trait TerminalBackend {
 
     /// Write raw bytes to the child (e.g. bracketed paste payloads).
     fn write_bytes(&mut self, bytes: &[u8]);
+
+    /// Paste `text`: wrapped in the bracketed-paste markers when the program
+    /// enabled that mode (with control bytes, including any embedded end marker,
+    /// neutralised), else written as typed. The default writes it as typed.
+    fn paste(&mut self, text: &str) {
+        self.write_bytes(text.as_bytes());
+    }
+
+    /// Whether the program enabled mouse tracking (X10, normal, button or any
+    /// event), so pointer events belong to it ([`send_mouse`](Self::send_mouse))
+    /// rather than to local selection and scrolling.
+    fn mouse_tracking(&self) -> bool {
+        false
+    }
+
+    /// Report a pointer event in whichever protocol the program selected. Does
+    /// nothing unless [`mouse_tracking`](Self::mouse_tracking) is on and the
+    /// tracking mode reports this kind of event.
+    fn send_mouse(&mut self, _report: &MouseReport) {}
 
     /// Move the scrollback viewport. Marks the grid dirty so the next frame
     /// re-snapshots the scrolled region.
