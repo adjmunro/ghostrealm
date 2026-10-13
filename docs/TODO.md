@@ -230,7 +230,8 @@
 - Detail: (1) Split commands are hard to find (buried below the palette fold) — add
   default keybindings and surface them. (2) Draggable split handles to resize panes
   with the mouse. (3) A split currently halves the *current* pane; want free
-  resizing (including small panes) rather than a fixed half.
+  resizing (including small panes) rather than a fixed half. (4) Owner review
+  (2026-10-13): centre the handle on the border between the panes.
 - Reason: expected tiling UX.
 
 ---
@@ -427,7 +428,8 @@
   shaped span (glyphon `Attrs::weight`). (3) no header UI to SET the ext filter
   (`set_ext_filter` exists; git & recent have buttons) — add a control or an
   `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
-  explicit range + created-vs-modified. (5) recursive fuzzy walk caps at 20k
+  explicit range + created-vs-modified (owner review 2026-10-13: the `date`
+  grouped view also buckets by modified time only; give it the same choice). (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
 
@@ -462,7 +464,8 @@
   (markers hidden; needs cursor-column mapping over hidden text). A Markdown
   feature checks whether a link/image target exists (a local file on disk; a
   reachable URL needs a network decision) and flags broken ones with inline error
-  markers.
+  markers. Owner review (2026-10-13) restates the target: Markdown shown
+  formatted with the markup symbols still visible and editable (the mixed mode).
 - Reason: nicer Markdown editing; requested, and wanted soon.
 
 ---
@@ -546,7 +549,10 @@
 - Requires: NO BLOCKERS
 - Detail: Nothing deletes files today. Add delete to the file browser (a row
   context menu / Cmd+Backspace on the selection) behind `AppState::confirm`, moving
-  to the macOS Trash rather than unlinking.
+  to the macOS Trash rather than unlinking. Owner review (2026-10-13): this
+  becomes the Delete item of the file context menu (see "File and folder
+  context menu"), with no confirmation for git-tracked files; Trash vs
+  permanent delete is an open question there.
 - Reason: requested alongside the replace confirmation.
 
 ---
@@ -833,5 +839,180 @@
 - Detail: Go through the open "Decision needed" items in
   [stack-review-findings.md](stack-review-findings.md) and
   [stack-review-findings-2.md](stack-review-findings-2.md), and the decision items
-  in this file. Check the decisions are consistent with each other.
+  in this file (including the keybinding-id quoting / per-scope tables
+  decision and the context-menu open questions). Check the decisions are
+  consistent with each other.
 - Reason: several decisions are pending and may interact.
+
+---
+
+> The entries below are from the project owner's review of build 914539d
+> (2026-10-13). All are HIGH PRIORITY (quality of life). Each was checked
+> against e9617b8; notes that were already fixed are not listed. The "Small
+> fixes" entries are actionable now; the "Discussion" entries need a design
+> session before any code.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — new workspace and "nothing open" pane
+
+- Requires: NO BLOCKERS
+- Detail:
+  - **New workspace directory**: the New Workspace button (and `workspace.new`)
+    opens the picker at the active workspace's root, else the default directory
+    (`AppState::picker_root`). Want it to start at the default directory
+    (`[workspace] default_directory`). Save As without a file shares
+    `picker_root`; keep its behaviour unless the owner wants it changed too.
+  - **Opens in the wrong pane**: clicking an option on a "nothing open" pane
+    opens it in the *focused* pane, not the clicked one (the button press is
+    armed and suppresses the pane focus that a plain click applies). Open in the
+    clicked pane, or make the click move focus to it first.
+  - **Focus highlight**: the focused-pane border is drawn only after a view
+    paints, so a focused "nothing open" pane never gets it. Draw it for empty
+    panes too.
+  - **Order and labels**: the options are numbered by plugin registration order
+    (Terminal, File browser, Web browser, Editor). Want the web browser as #4,
+    so the editor moves to #3. Label the editor option "New File" instead of
+    "Editor".
+  - **Shortcuts on the page**: the page shows only the `pane.close` chord (as
+    Cmd+W). Show the split chords too (`split.leftright`, `split.topbottom`),
+    looked up from `[keybindings]` the same way.
+- Reason: owner review; the empty pane is the first thing a new split shows.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — editor and file browser polish
+
+- Requires: NO BLOCKERS (the Cmd+/ item needs a binding decision)
+- Detail:
+  - **Double-click selects a word**: `MouseEvent::Down` carries `clicks`, but
+    neither the editor nor the terminal reads it (only the file browser and the
+    web view do). Double-click should select the word under the pointer in the
+    editor (and the terminal).
+  - **Ribbon word count**: the stats tooltip reads "Click for words"
+    (`stats.rs`, `Stats::tip`); want "Click for wordcount". Also: the stats text
+    and the autosave icon overlap in padding/margin; give them a gap.
+  - **File-browser ribbon padding**: reduce the padding on the ribbon's option
+    toggles (`preview`, `hidden`, `.gitignore`, git filter, view); each hit
+    area is its label plus `pad` on both sides, which reads as too wide.
+  - **File-browser date view**: the `date` grouped view buckets by modified
+    time only. Let it use created or modified (a choice). Same choice for the
+    date filter; see "File browser — remaining polish" item (4).
+  - **Split drag handle**: when draggable split handles are built, centre them
+    on the border between panes (see "Splits — discoverability, draggable resize
+    handles, ratios"). No drag handles exist yet.
+  - **Cmd+/ toggles comments** in the editor (comment/uncomment the selected
+    lines, per language). There is no comment toggle today. Cmd+/ is not a
+    built-in default (defaults are Cmd+D / Cmd+Shift+D for splits), but the
+    owner's own `config.toml` binds `split.leftright` to `cmd+/` (and
+    `split.topbottom` to `cmd+shift+/`), which would shadow the editor. Resolve
+    by rebinding the splits, or by choosing another default for the comment
+    toggle; app chords take precedence over the focused view.
+- Reason: owner review; small, visible rough edges.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] PRIORITY: Web browser unavailable after a normal build
+
+- Requires: a choice between the options below (the CEF download size is the cost)
+- Detail: The CEF host bundle is built only by `mise run web`. After a normal
+  build the web surface reports "web host not found: build it with `mise run
+  web`", so the browser is always down until a second command is run. The owner
+  wants it to work without that. Options:
+  - Build the bundle as part of the normal run/build task (a `mise` default/run
+    task, or a build step), so one command yields a working browser. Every
+    first build then needs CMake + Ninja and the CEF download (~250 MB of
+    binaries, per DECISION.md).
+  - Keep the build separate, but have the app locate the bundle, or build it on
+    first use of a web surface (with progress shown), so only users who open a
+    browser pay for it.
+  - Either way, keep `[web] host` / `$GHOSTREALM_WEB_HOST` as overrides.
+- Reason: a feature that needs a separate manual build step looks broken.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] PRIORITY: File and folder context menu (editor file name + file browser)
+
+- Requires: NO BLOCKERS for the menu itself; open questions below for the owner
+- Detail: One shared menu, opened by clicking the editor's file name and by
+  right-clicking a file or directory in the file browser. Modelled on Zed's.
+  The app's `Menu` (`window.rs`) only serves sidebar workspaces today; this
+  needs a menu usable by views. Items, grouped in sections:
+  - **New File / New Folder**: only on empty space or a directory, not on a file.
+  - **Open**: Reveal in Finder ("Show in Finder", macOS); Show in File Browser;
+    Open in Default App; Open in Terminal (directories only). No Markdown
+    Preview (Markdown is formatted in the editor instead; see the discussion
+    entry).
+  - **Edit**: Cut, Copy, Duplicate, Paste, Undo, Redo.
+  - **Copy Path** (absolute; bound to Cmd+Shift+C) and **Copy Relative Path**
+    (no binding).
+  - **Add to .gitignore** and **Add to .git/info/exclude**.
+  - **Rename** and **Save Copy As**.
+  - **Delete** at the bottom, after a horizontal rule. Moves the file to the
+    Trash. No confirmation if the file is tracked by git (recoverable); confirm
+    otherwise (`AppState::confirm`). In the editor it closes the editor like
+    Cmd+W. This replaces the "Delete files (with confirmation)" entry's
+    design; that entry stays until the menu lands.
+- Open questions for the owner:
+  - **Trash or permanent Delete?** Trash is safer and supports "Put Back", but
+    needs a macOS call (`NSFileManager trashItem`) or a small dependency (e.g.
+    the `trash` crate). Permanent Delete has neither cost, nor a way back.
+  - **Permalinks** (a link to the file on the git host at the current commit):
+    the owner is unsure. Default: leave off.
+- Reason: owner review; file actions belong where the file is shown.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] DISCUSSION (design together before building): editor and file browser as one surface
+
+- Requires: a design session with the owner; do not build yet
+- Detail: Two candidate shapes:
+  - One tab, Claude Code style: a show/hide file tree, a filter box (with a
+    "? to search in files" hint), and the document.
+  - The file browser hosts pluggable viewers (image, audio, text preview/editor);
+    the image and audio ones relate to "File browser — preview pane follow-ups".
+  Related, to settle in the same session:
+  - **File-browser pin**: a pin icon. Pinned: opening a file puts the editor in
+    a new tab or split. Unpinned: an integrated editor inside the browser (a
+    back button, or collapse/expand of the browser). Maybe pin left / pin right
+    / unpin. Maybe text previews keep focus on the browser.
+  - **Markdown**: shown formatted, with the markup symbols still visible and
+    editable. This is the "mixed" mode in "PRIORITY: Markdown bold, italic, and
+    underline in the editor"; highlighting already exists.
+  - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.
+- Reason: owner review; the file browser and editor overlap, and the choice
+  decides several smaller features.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] DISCUSSION: settings regenerate / cleanup / reset-to-default
+
+- Requires: a design session with the owner
+- Detail: Ideas: a command to regenerate `config.toml`; a cleanup command; a
+  reset-to-default command that first shows a popup highlighting the options
+  that differ from their defaults. Needs config write-back and a diff of the
+  file against the catalogue defaults.
+- Reason: owner review; the config file is the settings UI.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] DISCUSSION: Markdown language support (LSP, formatting)
+
+- Requires: NO BLOCKERS (language-services follow-up 2 covers external servers)
+- Detail: Syntax highlighting for Markdown exists (`ghostrealm_core::highlight`).
+  Remaining: an LSP for Markdown and formatting. Decide between an external
+  server (see "Language services — follow-ups", item 2) and in-tree support.
+- Reason: owner review.
+
+---
+
+[2026-10-13T20:25+1300@e9617b8] Decision: keybinding ids are quoted; per-scope tables would drop the quotes
+
+- Requires: a decision from the owner (a config format change)
+- Detail: Action ids in `[keybindings]` are quoted (`"pane.close" = "cmd+w"`)
+  because the dotted ids would otherwise parse as TOML dotted keys. Dropping
+  the quotes means per-scope tables, e.g. `[keybindings.web]` with
+  `focus_url = "cmd+l"`. That also gives view-scoped bindings a home (plugin
+  follow-up (4)) but breaks existing config files, so it needs a migration or a
+  versioned format. Include it in the decision session below.
+- Reason: the owner asked why the ids are quoted; the answer is a trade-off, not a bug.
