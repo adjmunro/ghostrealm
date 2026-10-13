@@ -428,7 +428,7 @@ fn bracketed_paste_wraps_and_neutralises_the_end_marker() {
 fn paste_is_unwrapped_when_the_program_did_not_ask_for_brackets() {
     let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("stty -echo; exec cat -v")))
         .expect("spawn backend");
-    assert_eq!(term.encode_paste("a\nb").unwrap(), b"a\nb", "as typed today");
+    assert_eq!(term.encode_paste("a\nb").unwrap(), b"a\nb", "passed through unchanged");
     term.paste("plain text\r");
     let row = wait_for_row(&mut term, "plain text");
     assert_eq!(row, "plain text");
