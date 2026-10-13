@@ -108,6 +108,7 @@ its docs and bad entries are flagged. Saving hot-reloads it: a flagged entry is
 dropped (its default applies) or clamped into range, and a file that doesn't
 parse leaves the running config unchanged. An edit from another editor applies
 too: the focused window checks the file's modification time and size every 2 s
-and when it gains focus. The running config reloads; an open editor buffer of
-it keeps its unsaved edits. `ghostrealm lsp config` serves the
+and when it gains focus. The running config reloads, and so does an editor
+showing the file, unless it holds unsaved edits (those stay, and saving them
+writes over the other editor's change). `ghostrealm lsp config` serves the
 same checks and docs to any LSP-capable editor over stdio.

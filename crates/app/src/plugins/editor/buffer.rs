@@ -821,6 +821,32 @@ impl EditorBuffer {
         }
     }
 
+    /// Replace the text with its file's as it is on disk now (another program
+    /// wrote it), as one undo step; the buffer is then unmodified, and undoing
+    /// the step returns to the old text as an unsaved edit. Returns whether
+    /// the text changed.
+    pub fn reload(&mut self) -> std::io::Result<bool> {
+        let Some(path) = &self.path else { return Ok(false) };
+        let lines = split_lines(&std::fs::read_to_string(path)?);
+        if lines == self.lines {
+            return Ok(false);
+        }
+        self.checkpoint(Step::Other);
+        self.history.committed();
+        self.history.run = None;
+        self.history.saved_version = self.history.version;
+        self.lines = lines;
+        let row = self.cursor.0.min(self.lines.len() - 1);
+        self.cursor = (row, self.cursor.1.min(self.line_len(row)));
+        self.anchor = None;
+        self.auto_closers = AutoClosers::default();
+        self.clamp_scroll_bounds();
+        self.edits = self.edits.wrapping_add(1);
+        self.dirty_from = Some(0);
+        self.modified = false;
+        Ok(true)
+    }
+
     /// Write the buffer to its path. Returns whether it had a path to save to.
     pub fn save(&mut self) -> std::io::Result<bool> {
         let Some(path) = self.path.clone() else {
@@ -1360,6 +1386,26 @@ mod tests {
         typed(&mut e, "b");
         e.redo();
         assert_eq!(e.lines, vec!["b"]);
+    }
+
+    #[test]
+    fn a_reload_takes_the_file_as_one_undo_step_and_keeps_the_cursor_in_the_text() {
+        let path = crate::plugin::testing::tmpdir("buffer-reload").join("f.txt");
+        std::fs::write(&path, "one\ntwo three\n").unwrap();
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
+        e.cursor = (1, 9);
+        e.anchor = Some((1, 4));
+        assert!(!e.reload().unwrap(), "the same text is no change");
+        std::fs::write(&path, "uno\n").unwrap();
+        assert!(e.reload().unwrap());
+        assert_eq!(e.lines, ["uno"]);
+        assert_eq!((e.cursor, e.anchor), ((0, 3), None));
+        assert!(!e.modified, "it is what's on disk");
+        e.undo();
+        assert_eq!(e.lines, ["one", "two three"]);
+        assert!(e.modified, "the old text is now an unsaved edit");
+        e.redo();
+        assert!(!e.modified);
     }
 
     #[test]

@@ -970,6 +970,14 @@ impl View for EditorView {
         self.stats.fetch_head(Some(to));
     }
 
+    /// Unsaved edits stay: they are the user's, and saving them is a choice.
+    fn changed_on_disk(&mut self, path: &Path) {
+        let ours = self.buf.path.as_deref().is_some_and(|p| crate::languages::same_file(p, path));
+        if ours && !self.buf.modified && self.buf.reload().unwrap_or(false) {
+            self.note_edits();
+        }
+    }
+
     fn save_as(&mut self, path: PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1271,6 +1279,31 @@ mod tests {
         assert!(v.modified() && v.path() == Some(old.clone()));
         v.files_changed(&[(old, dir.join("b.txt"))]);
         assert_eq!(v.path(), Some(dir.join("b.txt")));
+    }
+
+    #[test]
+    fn a_file_changed_on_disk_reloads_an_unmodified_buffer_and_spares_unsaved_edits() {
+        let dir = tmpdir("editor-on-disk");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        std::fs::write(&path, "a = 2\n").unwrap();
+        v.changed_on_disk(&dir.join("other.toml"));
+        assert_eq!(v.buffer().lines, ["a = 1"], "another file is not ours");
+        v.changed_on_disk(&path);
+        assert_eq!(v.buffer().lines, ["a = 2"]);
+        assert!(!v.modified());
+        // An edit and save now keep the other program's change.
+        v.buffer_mut().cursor = (0, 5);
+        v.buffer_mut().insert_str("0");
+        assert_eq!(v.save_if_modified(), Some(path.clone()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a = 20\n");
+        // Unsaved edits are not replaced.
+        v.buffer_mut().insert_str("0");
+        std::fs::write(&path, "a = 3\n").unwrap();
+        v.changed_on_disk(&path);
+        assert_eq!(v.buffer().lines, ["a = 200"]);
+        assert!(v.modified());
     }
 
     #[test]

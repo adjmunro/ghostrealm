@@ -251,6 +251,11 @@ pub trait View: Any {
     /// follows it.
     fn files_changed(&mut self, _moved: &[(PathBuf, PathBuf)]) {}
 
+    /// Another program wrote the file at `path`. A view showing it without
+    /// unsaved changes re-reads it, so a later save doesn't write stale text
+    /// over the new one.
+    fn changed_on_disk(&mut self, _path: &Path) {}
+
     /// Raw input from the agent channel. Returns whether the view accepts it.
     fn write_input(&mut self, _bytes: &[u8]) -> bool {
         false

@@ -1002,14 +1002,25 @@ impl State {
     }
 
     /// Reload the config if the file changed outside the app since it was last
-    /// loaded. Only the running config reloads: a config open in an editor
-    /// keeps its buffer, unsaved edits included (saving it later writes the
-    /// buffer over the external edit).
+    /// loaded. An editor showing it without unsaved changes re-reads it; one
+    /// with unsaved changes keeps them (saving them writes over the external
+    /// edit).
     fn check_config_file(&mut self) {
         self.config_check_due = Instant::now() + config_watch::POLL;
         let catalogue = self.catalogue.clone();
-        if let Some(cfg) = self.config_watch.poll(|| ghostrealm_core::config::load_or_create(&catalogue)) {
+        let app = &mut self.app;
+        let mut changed = false;
+        let loaded = self.config_watch.poll(|| {
+            changed = true;
+            if let Some(path) = ghostrealm_core::config::config_path() {
+                app.changed_on_disk(&path);
+            }
+            ghostrealm_core::config::load_or_create(&catalogue)
+        });
+        if let Some(cfg) = loaded {
             self.apply_config(cfg);
+        }
+        if changed {
             self.window.request_redraw();
         }
     }
