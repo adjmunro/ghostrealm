@@ -78,7 +78,9 @@ into the overlay layer; it doesn't need to know.
 - `mouse(&MouseEvent)`: `Down { clicks }` (the app focuses the pane first and
   counts double-clicks), then `Drag`/`Up { dragged }` for that press wherever the
   cursor goes; `Move` is hover, and `Leave` follows the last `Move` when the
-  pointer moves on to another view, the app's chrome, or out of the window.
+  pointer moves on to another view or the app's chrome, a modal (palette, menu,
+  confirmation, picker) takes the pointer, or the pointer leaves the window
+  (on release, if a press was held).
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
   `cx.mods` carries the modifiers held during `mouse` and `scroll` too (the
   terminal forwards the pointer to a program that enabled mouse tracking unless

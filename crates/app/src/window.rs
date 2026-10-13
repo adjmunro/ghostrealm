@@ -255,10 +255,12 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::CursorLeft { .. } => {
-                if state.leave_hovered(None) {
+                let left = state.hover.left_window(state.mouse_down);
+                if state.send_leave(left) {
                     state.window.request_redraw();
                 }
             }
+            WindowEvent::CursorEntered { .. } => state.hover.entered(),
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = (position.x as f32, position.y as f32);
                 let mut redraw = false;
@@ -393,7 +395,7 @@ struct State {
     /// Views painted last frame (on screen), for [`View::shown`].
     shown: std::collections::HashSet<SurfaceId>,
     /// The view last sent hover, told when the pointer leaves it.
-    hovered: Option<SurfaceId>,
+    hover: Hover,
     quad_buffer: wgpu::Buffer,
     quad_capacity: u64,
 
@@ -778,7 +780,7 @@ impl State {
             cursor_icon: CursorIcon::Default,
             cursor_rect: None,
             shown: std::collections::HashSet::new(),
-            hovered: None,
+            hover: Hover::default(),
             quad_buffer,
             quad_capacity,
             app,
@@ -1167,17 +1169,20 @@ impl State {
     /// Deliver hover to the view under the cursor (the picker's, while it is
     /// open). Returns whether it asked for a redraw.
     fn hover_view(&mut self) -> bool {
-        if self.mouse_down || self.palette.is_some() || self.menu.is_some() || self.app.confirm().is_some() {
+        if self.mouse_down {
             return false;
         }
         let pos = self.cursor;
+        let may_hover = self.may_hover();
         let target = if self.app.picker_open() {
             Some(PICKER_SID)
         } else {
             self.surface_under_cursor()
                 .filter(|s| self.app.view(*s).is_some())
-        };
-        let left = self.leave_hovered(target);
+        }
+        .filter(|s| may_hover(*s));
+        let left = self.hover.set(target);
+        let left = self.send_leave(left);
         let moved = match target {
             Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Move { pos })),
             None => false,
@@ -1185,17 +1190,22 @@ impl State {
         left | moved
     }
 
-    /// Tell the view last hovered that the pointer left it, unless it is
-    /// `next` (where the pointer is now). Returns whether it asked to redraw.
-    fn leave_hovered(&mut self, next: Option<SurfaceId>) -> bool {
-        let prev = std::mem::replace(&mut self.hovered, next);
-        match prev.filter(|p| Some(*p) != next) {
-            Some(sid) => {
-                let pos = self.cursor;
-                self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Leave { pos }))
-            }
-            None => false,
-        }
+    /// Which views may have hover: none while the palette, a menu, or a
+    /// confirmation owns the pointer; only the picker's while it is open.
+    fn may_hover(&self) -> impl Fn(SurfaceId) -> bool {
+        let blocked = self.palette.is_some() || self.menu.is_some() || self.app.confirm().is_some();
+        let picker = self.app.picker_open();
+        move |sid| !blocked && (!picker || sid == PICKER_SID)
+    }
+
+    /// Tell `sid` (a view that lost hover) that the pointer left it. Returns
+    /// whether it asked to redraw.
+    fn send_leave(&mut self, sid: Option<SurfaceId>) -> bool {
+        let Some(sid) = sid else {
+            return false;
+        };
+        let pos = self.cursor;
+        self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Leave { pos }))
     }
 
     /// A key release: offered raw to the focused view when nothing modal owns
@@ -1706,6 +1716,8 @@ impl State {
             let pos = self.cursor;
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
         }
+        let left = self.hover.released();
+        self.send_leave(left);
     }
 
     /// Scroll the scrollback of the pane under the cursor (or the focused pane).
@@ -3263,6 +3275,11 @@ impl State {
             self.last_focused_surface = focused;
         }
         self.fire_view_timers();
+        // A modal that opened (from the keyboard, say) takes hover from the
+        // view under the pointer.
+        let may_hover = self.may_hover();
+        let left = self.hover.restrict(may_hover);
+        self.send_leave(left);
         if !self.dirty {
             return Ok(());
         }
@@ -4156,6 +4173,59 @@ fn build_quad_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wg
     })
 }
 
+/// Which view has the pointer's hover, so the view sent the last `Move` gets
+/// one `Leave` when the pointer moves on, a modal takes the pointer, or the
+/// pointer leaves the window.
+#[derive(Default)]
+struct Hover {
+    view: Option<SurfaceId>,
+    /// The pointer left the window during a press. The press's view still
+    /// gets the drag, so it hears `Leave` on release instead.
+    outside: bool,
+}
+
+impl Hover {
+    /// Hover moves to `next` (`None`: no view). Returns the view that lost it.
+    fn set(&mut self, next: Option<SurfaceId>) -> Option<SurfaceId> {
+        let prev = std::mem::replace(&mut self.view, next);
+        prev.filter(|p| Some(*p) != next)
+    }
+
+    /// Only views `allowed` may keep hover. Returns the view that lost it.
+    fn restrict(&mut self, allowed: impl Fn(SurfaceId) -> bool) -> Option<SurfaceId> {
+        match self.view {
+            Some(v) if !allowed(v) => self.set(None),
+            _ => None,
+        }
+    }
+
+    /// The pointer left the window, `pressed` or not. Returns the view that
+    /// lost hover.
+    fn left_window(&mut self, pressed: bool) -> Option<SurfaceId> {
+        if pressed {
+            self.outside = true;
+            None
+        } else {
+            self.set(None)
+        }
+    }
+
+    /// The pointer came back into the window.
+    fn entered(&mut self) {
+        self.outside = false;
+    }
+
+    /// The press ended. Returns the view that lost hover, if the pointer
+    /// left the window during the press.
+    fn released(&mut self) -> Option<SurfaceId> {
+        if std::mem::take(&mut self.outside) {
+            self.set(None)
+        } else {
+            None
+        }
+    }
+}
+
 const QUAD_WGSL: &str = r#"
 struct Inst {
     @location(0) pos: vec2<f32>,
@@ -4188,11 +4258,41 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 mod tests {
     use super::{
         build_quad_pipeline, glyph_x, input_shift, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, QuadInstance,
+        workspace_rect_for, Hover, QuadInstance,
     };
-    use ghostrealm_core::{Rect, Side};
+    use ghostrealm_core::{Rect, Side, SurfaceId};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    /// Each view that had hover hears `Leave` once: when the pointer moves to
+    /// another view, a modal takes the pointer, or the pointer leaves the
+    /// window (on release, if a press was held).
+    #[test]
+    fn hover_ends_once_per_view() {
+        let (a, b) = (Some(SurfaceId(1)), Some(SurfaceId(2)));
+        let mut h = Hover::default();
+        assert_eq!(h.set(a), None);
+        assert_eq!(h.set(a), None, "moving within a view keeps its hover");
+        assert_eq!(h.set(b), a, "moving on ends the last view's hover");
+
+        assert_eq!(h.restrict(|_| true), None);
+        assert_eq!(h.restrict(|_| false), b, "a modal ends it");
+        assert_eq!(h.restrict(|_| false), None, "once");
+
+        h.set(a);
+        assert_eq!(h.left_window(false), a, "leaving the window ends it");
+        assert_eq!(h.left_window(false), None);
+
+        h.set(a);
+        assert_eq!(h.left_window(true), None, "not mid-press");
+        assert_eq!(h.released(), a, "on release, outside the window");
+        assert_eq!(h.released(), None);
+
+        h.set(a);
+        h.left_window(true);
+        h.entered();
+        assert_eq!(h.released(), None, "back inside before release");
+    }
 
     #[test]
     fn sidebar_and_workspace_split_by_side() {
