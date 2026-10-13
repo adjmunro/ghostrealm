@@ -9,6 +9,8 @@ pub mod images;
 pub mod languages;
 #[cfg(target_os = "macos")]
 mod macos_keys;
+#[cfg(target_os = "macos")]
+mod macos_quit;
 pub mod plugin;
 pub mod plugins;
 pub mod row_cache;

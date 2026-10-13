@@ -577,6 +577,11 @@ impl AppState {
         self.leave(Leave::Quit);
     }
 
+    /// Whether quitting now would ask about unsaved changes first.
+    pub fn has_unsaved(&self) -> bool {
+        self.guard_unsaved && !self.unsaved_in(Leave::Quit).is_empty()
+    }
+
     /// Whether a quit has been agreed and the window should exit.
     pub fn quitting(&self) -> bool {
         self.quitting
@@ -2074,6 +2079,7 @@ mod tests {
         s.new_empty_vtab();
         s.open_path_with_in_focused(editor::ID, &dir.join("new.txt")).unwrap();
         assert!(!s.view(s.focused_surface().unwrap()).unwrap().modified());
+        assert!(!s.has_unsaved());
         s.close_focused_surface();
         assert!(s.confirm().is_none());
         assert_eq!(surface_count(&s), 0);
@@ -2162,6 +2168,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("quit");
         let (mut s, _, file) = edited(&dir, "a.txt");
         s.new_empty_vtab(); // the modified view is in a background workspace
+        assert!(s.has_unsaved());
         s.request_quit();
         let c = s.confirm().expect("asks");
         assert_eq!(
@@ -2230,6 +2237,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("close-agent");
         let (mut s, sid, _) = edited(&dir, "a.txt");
         s.guard_unsaved = false;
+        assert!(!s.has_unsaved(), "nothing to ask about");
         s.close_focused_surface();
         assert!(s.confirm().is_none() && s.view(sid).is_none());
     }

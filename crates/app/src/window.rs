@@ -5,6 +5,8 @@
 //! foreground text via glyphon), all in one wgpu scene. Cmd-chords run app
 //! commands through the registry; other keys go to the focused surface.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -93,6 +95,8 @@ enum UserEvent {
     /// The background font loader finished; the full system-font DB is waiting on
     /// the channel and should be swapped in. Carries no data (the DB isn't `Copy`).
     FontsLoaded,
+    /// The system asked the app to quit (the app menu, the Dock, logout).
+    Quit,
 }
 
 pub fn run(command_line: Option<String>) -> Result<()> {
@@ -107,6 +111,7 @@ pub fn run(command_line: Option<String>) -> Result<()> {
         command_line,
         proxy,
         wake_pending: Arc::new(AtomicBool::new(false)),
+        unsaved: Rc::new(Cell::new(false)),
     };
     event_loop.run_app(&mut app).context("run app")?;
     Ok(())
@@ -120,6 +125,9 @@ struct App {
     /// waker send at most one pending `PtyOutput` event no matter how many chunks
     /// arrive, so a flood doesn't drown the event queue.
     wake_pending: Arc<AtomicBool>,
+    /// Whether quitting would ask about unsaved changes, as of the last event.
+    /// The system's quit request reads it: AppKit wants an answer at once.
+    unsaved: Rc<Cell<bool>>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -144,6 +152,17 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
         crate::macos_keys::route_reserved_chords(&window);
+        #[cfg(target_os = "macos")]
+        crate::macos_quit::intercept_terminate({
+            let (proxy, unsaved) = (self.proxy.clone(), self.unsaved.clone());
+            move || {
+                if !unsaved.get() {
+                    return true;
+                }
+                let _ = proxy.send_event(UserEvent::Quit);
+                false
+            }
+        });
         match pollster::block_on(State::new(
             window,
             self.command_line.clone(),
@@ -173,6 +192,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // The full font DB is ready: swap it in for complete glyph fallback.
             UserEvent::FontsLoaded => state.upgrade_fonts(),
+            // Asked from outside the window (it may be minimised, or the app in
+            // the background): bring it forward to show any question.
+            UserEvent::Quit => {
+                state.request_quit();
+                if state.app.confirm().is_some() {
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                }
+                state.window.request_redraw();
+            }
         }
     }
 
@@ -184,6 +213,7 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        self.unsaved.set(state.app.has_unsaved());
         // Fire view timers (e.g. an editor's idle autosave) that came due while
         // the app sat idle.
         if state.fire_view_timers() {
