@@ -412,8 +412,9 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<Moved> {
 }
 
 /// Move `src` into `dir` as a copy followed by removing what was copied.
-/// Anything added to a folder while it was copied is not in the copy, so it is
-/// left where it is.
+/// Anything added to a folder while it was copied is not in the copy, and a
+/// file changed since it was copied differs from its copy, so both are left
+/// where they are.
 fn move_by_copy(src: &Path, dir: &Path, name: &OsStr) -> Result<Moved> {
     let mut copied = Vec::new();
     let dest = copy_to_free(src, dir, name, &mut copied)?;

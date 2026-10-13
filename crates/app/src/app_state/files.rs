@@ -326,6 +326,13 @@ fn path_arg() -> ArgSpec {
     ArgSpec::optional("path", ArgKind::Str, "the file or folder (the focused one unless given)")
 }
 
+/// The result of a paste. A move across filesystems leaves in place what was
+/// added to the original, or changed, while it was copied.
+fn pasted_message(pasted: &file_ops::Moved) -> String {
+    let left = if pasted.source_left { "; the original wasn't fully removed: what was added to it or changed during the move remains" } else { "" };
+    format!("pasted {}{left}", pasted.dest.display())
+}
+
 fn dir_arg() -> ArgSpec {
     ArgSpec::optional("dir", ArgKind::Str, "the folder (the focused file's folder unless given)")
 }
@@ -411,8 +418,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         Box::new(|s: &mut AppState, a| {
             let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
             let pasted = s.paste_into(&dir).map_err(failed)?;
-            let left = if pasted.source_left { "; the original wasn't fully removed: files added to it meanwhile remain" } else { "" };
-            Ok(CmdOutcome::msg(format!("pasted {}{left}", pasted.dest.display())))
+            Ok(CmdOutcome::msg(pasted_message(&pasted)))
         }),
     );
     r.register(
@@ -908,5 +914,15 @@ mod tests {
         assert_eq!(editor_path(&s, sid), Some(d.join("y.txt")), "the editor follows");
         run(&mut s, "file.new_file", &[("dir", Path::new("sub")), ("name", Path::new("n.txt"))]).unwrap();
         assert!(d.join("sub/n.txt").exists());
+    }
+
+    #[test]
+    fn a_paste_that_left_part_of_the_original_says_what_and_why() {
+        let whole = file_ops::Moved { dest: PathBuf::from("/to/a"), source_left: false };
+        assert_eq!(pasted_message(&whole), "pasted /to/a");
+        let left = file_ops::Moved { dest: PathBuf::from("/to/a"), source_left: true };
+        let msg = pasted_message(&left);
+        assert!(msg.starts_with("pasted /to/a; the original wasn't fully removed"), "{msg}");
+        assert!(msg.contains("added") && msg.contains("changed"), "both reasons are named: {msg}");
     }
 }
