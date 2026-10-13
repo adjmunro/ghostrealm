@@ -3,3 +3,4 @@
 //! it now; anything else that shows an image or plays a sound should too.
 
 pub mod audio;
+pub mod image;

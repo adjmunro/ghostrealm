@@ -15,6 +15,7 @@ use ghostrealm_core::{Config, Rect};
 use glyphon::Family;
 
 use crate::media::audio::{self, AudioPlayer};
+use crate::media;
 use crate::plugin::{rect_contains, theme, EventCx, Font, Image, PaintCx};
 use crate::syntax;
 
@@ -147,23 +148,9 @@ fn special_kind(meta: &std::fs::Metadata) -> &'static str {
 /// Decode an image, upright per its EXIF orientation and at most
 /// [`IMAGE_MAX_SIDE`] on either side.
 fn decode_image(path: &Path) -> Result<Content, String> {
-    use image::ImageDecoder;
-    let fail = |e: image::ImageError| e.to_string();
-    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
-    let mut decoder = reader.with_guessed_format().map_err(|e| e.to_string())?.into_decoder().map_err(fail)?;
-    let orientation = decoder.orientation().map_err(fail)?;
-    let mut img = image::DynamicImage::from_decoder(decoder).map_err(fail)?;
-    img.apply_orientation(orientation);
-    let (width, height) = (img.width(), img.height());
-    if width == 0 || height == 0 {
-        return Err("empty image".into());
-    }
-    if width > IMAGE_MAX_SIDE || height > IMAGE_MAX_SIDE {
-        img = img.resize(IMAGE_MAX_SIDE, IMAGE_MAX_SIDE, image::imageops::FilterType::Triangle);
-    }
-    let rgba = img.to_rgba8();
-    let image = Image::from_rgba(rgba.width(), rgba.height(), rgba.into_raw());
-    Ok(Content::Image { image, width, height })
+    let d = media::image::decode(path, IMAGE_MAX_SIDE)?;
+    let image = Image::from_rgba(d.width, d.height, d.rgba);
+    Ok(Content::Image { image, width: d.source_width, height: d.source_height })
 }
 
 /// The head of a text file, or `None` if it looks binary (a NUL byte, or
@@ -771,7 +758,7 @@ pub(crate) mod tests {
     fn an_image_with_no_pixels_is_an_error_not_a_panic() {
         let d = tmpdir("preview-empty-img");
         // A fuzzed 17x0 GIF that used to panic building mips.
-        std::fs::write(d.join("empty.gif"), include_bytes!("testdata/zero-height.gif")).unwrap();
+        std::fs::write(d.join("empty.gif"), include_bytes!("../../media/testdata/zero-height.gif")).unwrap();
         let p = load(&d.join("empty.gif"));
         assert!(matches!(p.content, Content::Error(_)), "{:?}", p.kind);
     }
