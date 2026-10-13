@@ -143,7 +143,7 @@ impl ApplicationHandler<UserEvent> for App {
         };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
-        crate::macos_keys::route_help_chord(&window);
+        crate::macos_keys::route_reserved_chords(&window);
         match pollster::block_on(State::new(
             window,
             self.command_line.clone(),

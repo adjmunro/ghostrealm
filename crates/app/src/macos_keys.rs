@@ -15,7 +15,7 @@ use winit::window::Window;
 
 /// Route the system-reserved Help chord to `window`'s view for the life of the
 /// app. Call once, on the main thread, after the window exists.
-pub fn route_help_chord(window: &Window) {
+pub fn route_reserved_chords(window: &Window) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -30,7 +30,7 @@ pub fn route_help_chord(window: &Window) {
     let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit passes a valid event for the duration of the call.
         let ev = unsafe { event.as_ref() };
-        if is_help_chord(ev) && ev.window(view.mtm()) == view.window() {
+        if is_reserved_chord(ev) && ev.window(view.mtm()) == view.window() {
             view.keyDown(ev);
             return std::ptr::null_mut();
         }
@@ -44,7 +44,7 @@ pub fn route_help_chord(window: &Window) {
 }
 
 /// ⌘? — Shift+/ on layouts where `?` is shifted `/` — with no Ctrl/Option.
-fn is_help_chord(ev: &NSEvent) -> bool {
+fn is_reserved_chord(ev: &NSEvent) -> bool {
     if ev.r#type() != NSEventType::KeyDown {
         return false;
     }
