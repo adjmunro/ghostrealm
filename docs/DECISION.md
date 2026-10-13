@@ -81,6 +81,7 @@
 [2026-10-05T21:13+1300@04794e15]
 
 - Category: Web surface / embedded browser
+- Status: PARTLY SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (popups no longer open in place)
 - Detail: Web pages render via CEF (`cef` crate, prebuilt CEF binary distribution) in a separate host process (`crates/web-host`), off-screen, with software compositing. Frames reach the app through shared-memory files and are drawn as textures in the app's own wgpu scene; input and commands go over a JSON-line pipe (`crates/web`).
 - Detail: One page per web surface — no in-browser tabs; popups and new-window links open in place. The pane/tab system provides tabs.
 - Detail: The app side is the `web` plugin (`crates/app/src/plugins/web/`). It draws pages through `PaintCx::image` and takes keys through `View::raw_key` (presses and releases with the physical key), both added to the plugin API for it.
@@ -103,7 +104,7 @@
 [2026-10-13T19:17+1300@b804592e]
 
 - Category: Web surface / security
-- Status: OPEN RISK: undecided; see [stack-review-findings-2.md](stack-review-findings-2.md) item 21
+- Status: SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (the sandbox is to be enabled)
 - Detail: The web host runs Chromium with its sandbox off for every process (`no_sandbox: 1` in `crates/web-host/src/main.rs`). A renderer exploit runs with the user's rights: their files, SSH keys, and the app's shells.
 - Detail: Enabling it needs `cef_sandbox` linked into the macOS helper bundles, and Chromium's setuid or namespace sandbox on Linux.
 - Reason: recorded so the trade-off is visible; whether to ship the browser before sandboxing it is not yet decided.
@@ -117,3 +118,31 @@
 - Detail: Config files generated before this carry the comment "If the whole section is empty, the built-in defaults apply"; it is no longer true (relevant to a future migration note).
 - Detail: Recommended bindings are kept as a list per command and added to the user's file only on request (TODO.md), never automatically.
 - Reason: the user's file is the only source of bindings; nothing is bound implicitly.
+
+---
+
+[2026-10-13T20:40+1300@e534aa0]
+
+- Category: Web surface / security
+- Detail: Chromium's sandbox is enabled for every web-host process. There is no runtime flag to turn it off; add one only if debugging ever needs it.
+- Detail: Needs `cef_sandbox` linked into the macOS helper bundles, and Chromium's setuid or namespace sandbox on Linux. Work tracked in TODO.md ("Web — enable the Chromium sandbox").
+- Reason: a renderer exploit otherwise runs with the user's rights (files, SSH keys, the app's shells), and the agent-driven browser loads arbitrary pages. Owner, verbatim: "Definitely, I think, turn on the Chromium sandbox. I'm not even sure if we should have the ability to turn it off. If we need to turn it off in the future, maybe we can just program it to be able to turn off then. I don't think we need to have a flag or anything for this. No real advantage to turning it off, except for maybe debugging."
+
+---
+
+[2026-10-13T20:40+1300@e534aa0]
+
+- Category: Web surface / profiles
+- Detail: The web profile moves out of `~/Library/Caches/ghostrealm/web` to the platform's application-data directory (Application Support on macOS): cookies and logins are data, not a cache.
+- Detail: Profile model (design, not yet built; TODO.md "Web — profiles"): a profile picker in the browser and the GUI; human-only profiles that agents cannot reach structurally (no cookies or tokens exposed, enforced by the host and agent channel, not by instructions); agent profiles shared between agents; a per-profile scope, set by the agent or the human, of private to one workspace or shared across workspaces.
+- Detail: Chromium locks a profile to one process, so the host is owned by the running app and agents connect through it (TODO.md "Agent channel → the running app"), rather than each process spawning its own host on a shared profile.
+- Reason: multiple profiles are available anyway; separating human from agent state gives the isolation. Owner, verbatim: "We want this kind of isolation built in and structural, not markdown prayers or rules."
+
+---
+
+[2026-10-13T20:40+1300@e534aa0]
+
+- Category: UX principle / agent-operated surfaces
+- Detail: Agent-operated activity (a browser, an emulator, a pop-up) runs in the background and never takes focus, raises a window, or switches the human's active pane or workspace. If it can be done hidden, it is done hidden.
+- Detail: Web pop-ups: when a human triggers one, it opens as a floating pop-up window above the whole app while the originating tab stays alive (fallback: a new tab), so `window.opener` and OAuth/payment flows work. When an agent triggers one, it opens hidden, in the background. This replaces "popups and new-window links open in place" in the web surface decision above.
+- Reason: owner, verbatim: "it's really distracting when the agent keeps on refocusing on a browser to do things or an emulator to do things while I'm trying to do things as a human. So if you can do things in the background, then that's definitely a preference for agent operated stuff."

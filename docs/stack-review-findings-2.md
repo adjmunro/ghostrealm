@@ -12,8 +12,15 @@ test reproduced it; the rest come from reading the code. Items marked
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-   **Decided:** a TOML setting, boolean, default true (translate in full-screen
-   programs too). Tracked in TODO.md.
+   Earlier decision: a TOML setting, boolean, default true (translate in
+   full-screen programs too).
+   **Revised, decision pending:** the owner wants the text-editing keys to do
+   the same thing inside Vim, not Vim's own meaning of the readline bytes. The
+   proposal is a translation layer: in the alternate screen, send standard
+   xterm key sequences (Option+Left -> `CSI 1;3D`, Cmd+Left -> Home) instead of
+   readline bytes (`ESC b`, `^A`), so Vim can map them in insert mode (normal
+   mode has no "word left" for those keys without mappings). Alternative: turn
+   the translation off in full-screen apps. Tracked in TODO.md.
 14. **Missing `[keybindings]` binds nothing, silently** (`019dc17`). Files
     written before then carry the comment "If the whole section is empty, the
     built-in defaults apply", which is now false. **Decided:** a missing or empty
@@ -46,6 +53,8 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
   and the app's shells).
 - Decision needed: ship before sandboxing, or enable it (`cef_sandbox` in the
   macOS helpers, the setuid/namespace sandbox on Linux)?
+- **Decided:** enable it, with no runtime flag to turn it off. See DECISION.md
+  (Web surface / security); work tracked in TODO.md.
 
 ### Low
 
@@ -53,6 +62,9 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     its result (by replacing `console.log`, `eval` or `JSON.stringify`); the
     command's description says so. Decision needed: evaluate in an isolated
     world instead?
+    **Decided:** yes, an isolated world (HIGH priority within the web work; an
+    agent-driven browser is a prompt-injection and misuse risk). Tracked in
+    TODO.md.
 19. **Every ghostrealm process shares one web profile**
     (`~/Library/Caches/ghostrealm/web`), so a second process (another GUI, or
     `ghostrealm agent` running `web.new`) can't start its host; the pane (and the
@@ -60,6 +72,10 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     and the agent, or a profile per process? Leaning towards one shared
     ghostrealm profile (GUI and agent), isolated from other browsers on the
     machine; not final.
+    **Decided:** the profile moves to Application Support, and the profile model
+    is human-only profiles agents cannot reach plus shareable agent profiles
+    with a per-workspace or shared scope. See DECISION.md (Web surface /
+    profiles) and TODO.md ("Web — profiles").
 24. **A preview can block on a stuck mount.** `load`'s `metadata` call
     ([`plugins/file_browser/preview.rs:73`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
@@ -67,6 +83,10 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
 31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
     [`browser.rs:626`](../crates/web-host/src/browser.rs)), which breaks OAuth and
     payment popup flows. Decision needed: open them as a new tab in the pane?
+    **Decided:** a human-triggered popup opens as a floating pop-up window above
+    the app with the original tab kept alive (fallback: a new tab); an
+    agent-triggered popup opens hidden in the background. See DECISION.md
+    (UX principle / agent-operated surfaces); work tracked in TODO.md.
 33. **Autoplay can start audio in a hidden tab.** `tick`
     ([`preview.rs:343`](../crates/app/src/plugins/file_browser/preview.rs)) runs
     for hidden views, and only `paint` pauses. **Decided:** the file
