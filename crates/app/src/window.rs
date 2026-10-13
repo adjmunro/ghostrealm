@@ -4289,8 +4289,6 @@ struct Placement {
     color: [u8; 3],
 }
 
-/// Break `text` at spaces into lines no wider than `max_w` as `width_of`
-/// measures them. A word wider than that gets a line of its own.
 /// Whether `key` is a modifier (or lock) key, which makes no text of its own.
 fn is_modifier_key(key: &WKey) -> bool {
     use NamedKey::*;
@@ -4302,6 +4300,8 @@ fn is_modifier_key(key: &WKey) -> bool {
     )
 }
 
+/// Break `text` at spaces into lines no wider than `max_w` as `width_of`
+/// measures them. A word wider than that gets a line of its own.
 fn wrap_words(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
