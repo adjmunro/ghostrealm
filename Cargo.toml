@@ -20,6 +20,12 @@ default-members = [
     "crates/web",
 ]
 
+# Every test binary links wgpu, Ghostty and cosmic-text; with full debug info
+# each is ~90 MB. Line tables keep backtraces with file:line. For variable-level
+# debugging: `CARGO_PROFILE_DEV_DEBUG=true cargo build`.
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
