@@ -26,7 +26,7 @@ use crate::syntax;
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
-    View, Waker,
+    RowStyles, View, Waker,
 };
 
 pub use buffer::EditorBuffer;
@@ -616,22 +616,29 @@ impl View for EditorView {
         // cache-friendly), shaped within the frame's budget.
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
         for (ln, text, start, y) in &vis {
-            let spans: Vec<(String, [u8; 3])> = match highlighter {
+            let len = text.chars().count();
+            let (spans, styles) = match highlighter {
                 Some(h) => {
                     let state = if h.carries_state() {
                         self.hl_states.state_in(h, &e.lines, e.edits, *ln)
                     } else {
                         0
                     };
-                    let hl = self.hl_spans.spans(h, &e.lines[*ln], state);
-                    syntax::row_spans(&e.lines[*ln], hl, *start, text.chars().count(), EDITOR_FG)
+                    let (hl, next) = self.hl_spans.line(h, &e.lines[*ln], state);
+                    let block = h.block(state, next);
+                    if block {
+                        let r = Rect { x: text_x, y: *y, w: body.x + body.w - text_x, h: ch };
+                        cx.fill_alpha(r, theme::CODE_BG, theme::CODE_BG_ALPHA);
+                    }
+                    syntax::styled_row_spans(&e.lines[*ln], hl, *start, len, EDITOR_FG, block)
                 }
-                None => vec![(text.clone(), EDITOR_FG)],
+                None => (vec![(text.clone(), EDITOR_FG)], Vec::new()),
             };
-            let key = cx.row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
+            let styles = RowStyles { runs: &styles, cell_w: cw };
+            let key = cx.row_key_styled(spans.iter().map(|(s, c)| (s.as_str(), *c)), styles);
             // Wide enough for the whole row, so layout is hscroll-independent.
-            let shape_w = (text.chars().count() as f32 * cw).max(text_w);
-            cx.budgeted_row(key, || spans, text_x - hscroll_px, *y, shape_w, text_clip, EDITOR_FG);
+            let shape_w = (len as f32 * cw).max(text_w);
+            cx.budgeted_row_styled(key, || spans, styles, text_x - hscroll_px, *y, shape_w, text_clip, EDITOR_FG);
         }
         // Cursor bar on the cursor line's last visual row that its column reaches.
         if let Some((_, _, start, y)) =
@@ -899,6 +906,7 @@ impl View for EditorView {
 mod tests {
     use super::*;
     use crate::plugin::testing::{cmd, press, tmpdir, Harness, UI};
+    use crate::plugin::TextSrc;
 
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 };
 
@@ -1338,6 +1346,102 @@ mod tests {
             let drawn = h.paint(&mut v, RECT).text.len();
             assert!(drawn >= rows.min(60 - scroll) - 1, "scroll {scroll}: {drawn} rows");
         }
+    }
+
+    fn markdown_view(tag: &str, text: &str) -> EditorView {
+        let path = tmpdir(tag).join("doc.md");
+        std::fs::write(&path, text).unwrap();
+        EditorView::new(EditorBuffer::open(path).unwrap())
+    }
+
+    /// The bg quads of a painted frame as pixel rects `(x, y, w, h)`.
+    fn bg_rects(h: &Harness) -> Vec<(f32, f32, f32, f32)> {
+        let (sw, sh) = h.frame.screen;
+        h.frame
+            .bg
+            .iter()
+            .map(|q| {
+                (
+                    ((q.pos[0] + 1.0) / 2.0 * sw).round(),
+                    ((1.0 - q.pos[1]) / 2.0 * sh).round(),
+                    (q.size[0] / 2.0 * sw).round(),
+                    (-q.size[1] / 2.0 * sh).round(),
+                )
+            })
+            .collect()
+    }
+
+    /// The source of the text drawn in the editor's text column on visual row `row`.
+    fn text_item(h: &Harness, row: usize) -> TextSrc {
+        let (x, y) = at(row, 0);
+        h.frame.text.iter().find(|t| t.left == x && (t.top - y).abs() < 2.0).expect("a text row").src
+    }
+
+    #[test]
+    fn plain_markdown_rows_draw_exactly_as_unhighlighted_ones() {
+        let mut h = Harness::new();
+        let text = "hello world\n- item one\n> quote";
+        let mut md = markdown_view("editor-md-plain", text);
+        paint_in_strip(&mut h, &mut md);
+        let md_quads = bg_rects(&h).len();
+        let row0 = text_item(&h, 0);
+        let mut txt = view_with(text);
+        paint_in_strip(&mut h, &mut txt);
+        assert_eq!(bg_rects(&h).len(), md_quads, "no decoration quads for plain rows");
+        // The first row has one span in the plain colour: the key a plain row always had.
+        let key = h.text.row_cache.row_key(std::iter::once(("hello world", EDITOR_FG)));
+        assert_eq!(row0, TextSrc::Row(key));
+        paint_in_strip(&mut h, &mut txt);
+        assert_eq!(text_item(&h, 0), TextSrc::Row(key), "same as with no highlighter");
+    }
+
+    #[test]
+    fn markdown_styles_draw_underline_and_code_box_quads_and_keep_the_markers() {
+        let mut h = Harness::new();
+        let mut plain = markdown_view("editor-md-plain2", "see the docs now");
+        paint_in_strip(&mut h, &mut plain);
+        let base = bg_rects(&h);
+
+        let mut v = markdown_view("editor-md-link", "see [the docs](u) now");
+        paint_in_strip(&mut h, &mut v);
+        let got = bg_rects(&h);
+        // "the docs" starts at column 5 and is 8 cells wide; the underline is a thin quad at the row bottom.
+        let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w);
+        let under: Vec<_> = got.iter().filter(|r| !base.contains(r) && r.3 < 3.0).collect();
+        assert_eq!(under.len(), 1, "{got:?}");
+        assert_eq!((under[0].0, under[0].2), (text_x + 5.0 * cw, 8.0 * cw));
+        assert!(under[0].1 >= UI.cell_h - 3.0 && under[0].1 < UI.cell_h, "under the glyphs: {under:?}");
+        // The markup is still in the document and drawn: the whole line is shaped text.
+        assert_eq!(v.buffer().lines[0], "see [the docs](u) now");
+
+        let mut v = markdown_view("editor-md-code", "a `code` b");
+        paint_in_strip(&mut h, &mut v);
+        let boxes: Vec<_> = bg_rects(&h).into_iter().filter(|r| !base.contains(r) && r.3 > 3.0).collect();
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
+        assert_eq!((boxes[0].0, boxes[0].2), (text_x + 3.0 * cw, 4.0 * cw), "the code text, not the backticks");
+    }
+
+    #[test]
+    fn fenced_blocks_get_a_full_width_background_and_their_language_colours() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-fence", "text\n```toml\nname = 1\n```\nafter");
+        paint_in_strip(&mut h, &mut v);
+        let text_x = 4.0 * UI.cell_w;
+        let block: Vec<_> = bg_rects(&h)
+            .into_iter()
+            .filter(|r| r.0 == text_x && r.2 == RECT.w - text_x && r.3 == UI.cell_h)
+            .collect();
+        let ys: Vec<f32> = block.iter().map(|r| r.1).collect();
+        // The cursor line also spans the width; the fence rows are lines 1..=3.
+        for row in 1..=3 {
+            assert!(ys.contains(&(row as f32 * UI.cell_h)), "row {row} tinted: {ys:?}");
+        }
+        assert!(!ys.contains(&(4.0 * UI.cell_h)), "prose after the block is not");
+        // The body is coloured as TOML (a key, an operator, a number), not as one run of code.
+        let toml_row = [("name ", syntax::color(highlight::Token::Key, EDITOR_FG)), ("= ", EDITOR_FG),
+            ("1", syntax::color(highlight::Token::Number, EDITOR_FG))];
+        let key = h.text.row_cache.row_key(toml_row.into_iter());
+        assert_eq!(text_item(&h, 2), TextSrc::Row(key));
     }
 
     #[test]
