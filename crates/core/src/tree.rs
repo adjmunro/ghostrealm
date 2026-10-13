@@ -443,7 +443,10 @@ impl Tree {
             return false;
         };
         p.surfaces.remove(pos);
-        if p.active >= p.surfaces.len() && p.active > 0 {
+        if pos < p.active {
+            // The active surface moved down a place with the ones after `pos`.
+            p.active -= 1;
+        } else if p.active >= p.surfaces.len() && p.active > 0 {
             p.active = p.surfaces.len().saturating_sub(1);
         }
         if p.surfaces.is_empty() {
@@ -628,6 +631,21 @@ mod tests {
         assert!(t.close_surface(vt, p2, s2));
         let v = t.vtab(vt).unwrap();
         assert_eq!(v.panes().len(), 1, "emptying a pane should collapse it");
+    }
+
+    #[test]
+    fn closing_a_surface_before_the_active_one_keeps_the_active_one() {
+        let mut t = Tree::new();
+        let (vt, pane, first) = t.add_vtab("a");
+        let second = t.add_surface(vt, pane).unwrap();
+        let third = t.add_surface(vt, pane).unwrap();
+        t.vtab_mut(vt).unwrap().pane_mut(pane).unwrap().active = 1;
+        let active = |t: &Tree| t.vtab(vt).unwrap().pane_mut_ref(pane).active_surface().unwrap().id;
+        assert_eq!(active(&t), second);
+        assert!(t.close_surface(vt, pane, first));
+        assert_eq!(active(&t), second, "closing an earlier tab");
+        assert!(t.close_surface(vt, pane, third));
+        assert_eq!(active(&t), second, "closing a later tab");
     }
 
     #[test]
