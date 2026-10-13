@@ -351,19 +351,30 @@ impl EditorView {
         }
     }
 
-    /// Comment or uncomment the selected lines per the file's language
-    /// ([`highlight::Highlighter::comment`]). Returns `Err` when the file has no
-    /// comment syntax.
+    /// Comment or uncomment the selected lines per the language of the first
+    /// one ([`highlight::Highlighter::comment_on`]). Returns `Err` when that
+    /// language has no comment syntax.
     pub fn toggle_comment(&mut self) -> Result<(), &'static str> {
-        let syntax = self.buf.path.as_deref().and_then(highlight::for_path).map(|h| h.comment());
-        match syntax {
-            Some(syntax) if syntax != highlight::CommentSyntax::default() => {
-                if self.buf.toggle_comment(syntax) {
-                    self.note_edits();
-                }
-                Ok(())
-            }
-            _ => Err("this file's language has no comment syntax"),
+        const NONE: &str = "this language has no comment syntax";
+        let h = self.buf.path.as_deref().and_then(highlight::for_path).ok_or(NONE)?;
+        let row = self.buf.selection().map_or(self.buf.cursor.0, |((r, _), _)| r);
+        self.sync_hl_states();
+        let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
+        let syntax = h.comment_on(&self.buf.lines[row], state);
+        if syntax == highlight::CommentSyntax::default() {
+            return Err(NONE);
+        }
+        if self.buf.toggle_comment(syntax) {
+            self.note_edits();
+        }
+        Ok(())
+    }
+
+    /// Tell the highlight state cache which lines the edits since it last
+    /// heard have changed.
+    fn sync_hl_states(&mut self) {
+        if let Some(row) = self.buf.dirty_from.take() {
+            self.hl_states.dirty_from(row);
         }
     }
 
@@ -567,9 +578,7 @@ impl View for EditorView {
         }
         self.buf.clamp_scroll_bounds();
 
-        if let Some(row) = self.buf.dirty_from.take() {
-            self.hl_states.dirty_from(row);
-        }
+        self.sync_hl_states();
         let e = &self.buf;
         let (scroll, cursor, sel) = (e.scroll, e.cursor, e.selection());
         // Unwrapped rows hold their whole line, shaped once, drawn shifted left
@@ -1491,6 +1500,23 @@ mod tests {
         assert_eq!(v.buffer().lines, vec!["[f(x)]"], "a selection is wrapped");
         h.key(&mut v, cmd(Key::Char('z')));
         assert_eq!(v.buffer().lines, vec!["f(x)"]);
+    }
+
+    #[test]
+    fn a_comment_inside_a_markdown_code_block_uses_the_blocks_language() {
+        let dir = tmpdir("editor-comment-fence");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "text\n```toml\na = 1\n```\n```zzz\nx\n```\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        v.buf.cursor = (2, 0);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[2], "# a = 1");
+        v.buf.cursor = (0, 0);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[0], "<!-- text -->");
+        v.buf.cursor = (5, 0);
+        assert!(v.toggle_comment().is_err(), "a block in an unknown language has no comment syntax");
+        assert_eq!(v.buffer().lines[5], "x");
     }
 
     #[test]

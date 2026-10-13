@@ -160,8 +160,9 @@ so a scrolled row knows its start state without re-highlighting the file, and a
 reads a file once (the browser's preview) runs `highlight_lines` on its worker.
 A highlighter must bound its work per line: a paint highlights every visible line.
 `Highlighter::comment` declares the language's line and block comment tokens
-(`CommentSyntax`), which the editor's `editor.toggle_comment` (bound to `cmd+/` in
-a new config file, never implicitly) reads.
+(`CommentSyntax`); `comment_on` gives a line's, which differs inside an embedded
+language (a Markdown code block). The editor's `editor.toggle_comment` (bound to
+`cmd+/` in a new config file, never implicitly) reads it.
 To add a language, implement `Highlighter` in a module under `core/src/highlight/`
 and list it in `ALL`.
 

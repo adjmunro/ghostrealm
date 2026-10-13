@@ -84,6 +84,13 @@ pub trait Highlighter: Sync {
         CommentSyntax::default()
     }
 
+    /// How comments are written on `line`, entering with `state`: this
+    /// language's [`Self::comment`] unless the line belongs to another
+    /// language embedded in it (a Markdown code block's).
+    fn comment_on(&self, _line: &str, _state: State) -> CommentSyntax {
+        self.comment()
+    }
+
     /// Whether `line`, entering with `state_in` and leaving with `state_out`,
     /// belongs to a block drawn as a unit (a fenced code block, including its
     /// fences).
@@ -383,6 +390,17 @@ mod tests {
         let md = for_extension("md").unwrap().comment();
         assert_eq!((md.line, md.block), (None, Some(("<!--", "-->"))));
         assert_eq!(Fences.comment(), CommentSyntax::default());
+    }
+
+    #[test]
+    fn a_markdown_code_block_takes_its_languages_comment_syntax() {
+        let md = for_extension("md").unwrap();
+        let toml = md.line("```toml", 0).1;
+        assert_eq!(md.comment_on("a = 1", toml), for_extension("toml").unwrap().comment());
+        assert_eq!(md.comment_on("```", toml), md.comment(), "the closing fence is Markdown");
+        let unknown = md.line("```zzz", 0).1;
+        assert_eq!(md.comment_on("x", unknown), CommentSyntax::default());
+        assert_eq!(md.comment_on("text", 0), md.comment());
     }
 
     #[test]

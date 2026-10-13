@@ -41,6 +41,18 @@ impl Highlighter for Markdown {
         CommentSyntax { line: None, block: Some(("<!--", "-->")) }
     }
 
+    /// A code block's body takes its fence's language (none when unknown):
+    /// `<!-- -->` there would be literal code.
+    fn comment_on(&self, line: &str, state: State) -> CommentSyntax {
+        if state == 0 || self.line(line, state).1 != state {
+            return self.comment();
+        }
+        match (state >> LANG_SHIFT) as usize {
+            0 => CommentSyntax::default(),
+            i => ALL[i - 1].comment(),
+        }
+    }
+
     fn block(&self, line: &str, state_in: State, state_out: State) -> bool {
         state_out != 0 || (state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in))
     }
