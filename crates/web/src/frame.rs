@@ -119,11 +119,16 @@ impl FrameWriter {
         let slot = (self.seq % 2) as u8;
         let slot_bytes = (map.len() - HEADER) / 2;
         let start = HEADER + slot as usize * slot_bytes;
+        // One raw pointer for both the word and the pixels: a `&mut [u8]` over
+        // the mapping would invalidate the atomic derived from it.
+        let base = map.as_mut_ptr();
         // SAFETY: the mapping is page-aligned and longer than the header.
-        let word = unsafe { seq_word(map.as_ptr(), slot) };
+        let word = unsafe { seq_word(base, slot) };
         word.store(0, Ordering::Relaxed);
         fence(Ordering::Release);
-        map[start..start + bytes].copy_from_slice(&pixels[..bytes]);
+        // SAFETY: `start + bytes` is within the slot (it fits), and `pixels`
+        // is a separate allocation.
+        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), base.add(start), bytes) };
         word.store(self.seq, Ordering::Release);
         Ok(WrittenFrame {
             path: path.to_string_lossy().into_owned(),
