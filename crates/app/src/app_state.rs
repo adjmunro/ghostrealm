@@ -20,6 +20,7 @@ use ghostrealm_core::{
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
+use crate::languages::same_file;
 use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor;
 use crate::plugins::file_browser::{FileBrowserView, Mode};
@@ -594,11 +595,15 @@ impl AppState {
     /// blur/quit). Returns whether the config file was among what was saved (so
     /// the caller can hot-reload it).
     pub fn autosave_all(&mut self, cfg: &Config) -> bool {
-        let config_path = ghostrealm_core::config::config_path();
+        self.autosave_all_with_config(cfg, ghostrealm_core::config::config_path().as_deref())
+    }
+
+    /// [`Self::autosave_all`], with the config file at `config_path`.
+    fn autosave_all_with_config(&mut self, cfg: &Config, config_path: Option<&Path>) -> bool {
         let mut saved_config = false;
         for view in self.views.values_mut() {
             if let Some(path) = view.autosave(cfg) {
-                saved_config |= Some(path) == config_path;
+                saved_config |= config_path.is_some_and(|c| same_file(c, &path));
             }
         }
         saved_config
@@ -1608,6 +1613,24 @@ mod tests {
         std::fs::write(&path, b"caf\xe9").unwrap();
         assert!(s.open_settings(path).is_err());
         assert_eq!(s.active(), Some(elsewhere), "not moved to an empty settings workspace");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autosaving_a_symlinked_config_reports_the_config() {
+        let dir = crate::plugin::testing::tmpdir("autosave-config-link");
+        let real = dir.join("config.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.open_path_with_in_focused(editor::ID, &link).unwrap();
+        let sid = s.focused_surface().unwrap();
+        s.views.get_mut(&sid).unwrap().write_input(b"x");
+        let mut cfg = Config::default();
+        cfg.editor.autosave_on_unfocus = true;
+        assert!(s.autosave_all_with_config(&cfg, Some(&real)), "the link is the config");
     }
 
     #[test]

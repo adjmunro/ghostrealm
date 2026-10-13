@@ -1270,7 +1270,8 @@ impl State {
 
     /// A view wrote `path`: hot-reload it if it is the config.
     fn saved(&mut self, path: std::path::PathBuf) {
-        if Some(path) == ghostrealm_core::config::config_path() {
+        let config = ghostrealm_core::config::config_path();
+        if config.is_some_and(|c| crate::languages::same_file(&c, &path)) {
             self.reload_config();
         }
     }

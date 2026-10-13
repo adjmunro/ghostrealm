@@ -34,7 +34,7 @@ impl Languages {
 
 /// Whether two paths name the same file: equal, or equal once symlinks and
 /// `..` are resolved.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || match (a.canonicalize(), b.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
