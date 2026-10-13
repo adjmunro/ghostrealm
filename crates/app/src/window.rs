@@ -31,6 +31,7 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
+use crate::file_menu::{FileAction, FileTarget, MenuEntry};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
@@ -607,6 +608,9 @@ struct PendingArgs {
     specs: Vec<ArgSpec>,
     /// Values collected so far, one per spec in order.
     values: Vec<Value>,
+    /// Arguments already known (the file menu's target), passed along with
+    /// the collected ones.
+    preset: Args,
 }
 
 /// Command-palette / run-anything overlay state.
@@ -632,6 +636,10 @@ enum MenuAction {
     Rename,
     SetDir,
     Close,
+    /// An item of the file menu.
+    File(FileAction),
+    /// A horizontal rule between sections; not clickable.
+    Rule,
 }
 
 /// What a context menu's actions apply to.
@@ -639,6 +647,8 @@ enum MenuAction {
 enum MenuTarget {
     /// A workspace in the sidebar.
     Vtab(ghostrealm_core::VtabId),
+    /// A file, folder, or empty space in a file browser, or an editor's file.
+    File(FileTarget),
 }
 
 /// A right-click context menu.
@@ -1407,7 +1417,7 @@ impl State {
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
                 Request::Busy => self.app.mark_busy(sid),
-                Request::FileMenu { .. } => {}
+                Request::FileMenu { target, at } => self.open_file_menu(target, at),
             }
         }
     }
@@ -1628,6 +1638,9 @@ impl State {
         let (x, y) = self.cursor;
         self.menu = None;
         if !self.in_sidebar(x) {
+            if let Some(sid) = self.surface_under_cursor().filter(|s| self.app.view(*s).is_some()) {
+                self.view_event(sid, |v, cx| v.context_menu(cx, (x, y)));
+            }
             self.dirty = true;
             return;
         }
@@ -1716,7 +1729,14 @@ impl State {
     }
 
     fn apply_menu_action(&mut self, action: MenuAction, target: MenuTarget) {
-        let MenuTarget::Vtab(target) = target;
+        let target = match (action, target) {
+            (MenuAction::File(action), MenuTarget::File(target)) => {
+                self.run_file_action(action, &target);
+                return;
+            }
+            (_, MenuTarget::Vtab(target)) => target,
+            _ => return,
+        };
         match action {
             MenuAction::MarkRead | MenuAction::Dismiss => {
                 self.app.tree.set_status(target, TabStatus::Read)
@@ -1737,7 +1757,44 @@ impl State {
                 self.app.open_picker(Pick::ActiveRoot);
                 self.dirty = true;
             }
+            MenuAction::File(_) | MenuAction::Rule => {}
         }
+    }
+
+    /// Open the file menu on `target` at `at`.
+    fn open_file_menu(&mut self, target: FileTarget, at: (f32, f32)) {
+        if self.app.picker_open() {
+            return;
+        }
+        let items = self
+            .app
+            .file_menu(&target)
+            .into_iter()
+            .map(|e| match e {
+                MenuEntry::Item(a) => (a.label().to_string(), MenuAction::File(a)),
+                MenuEntry::Rule => (String::new(), MenuAction::Rule),
+            })
+            .collect();
+        self.palette = None;
+        self.menu = Some(Menu {
+            target: MenuTarget::File(target),
+            anchor: at,
+            items,
+            hover: None,
+            armed: None,
+            rows: Vec::new(),
+            panel: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+        });
+        self.dirty = true;
+    }
+
+    /// Run a file menu item as its command on `target`; one that needs a name
+    /// asks for it in the palette's argument prompt.
+    fn run_file_action(&mut self, action: FileAction, target: &FileTarget) {
+        let prefill = (action == FileAction::Rename)
+            .then(|| target.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .flatten();
+        self.begin_command_with(action.command(), action.args(target), prefill);
     }
 
     /// A click while the palette is open: run a clicked result, or dismiss when
@@ -2728,7 +2785,10 @@ impl State {
             .max()
             .unwrap_or(6) as f32;
         let panel_w = (maxlen * self.cell_w + pad * 3.0).min(sw * 0.6);
-        let panel_h = items.len() as f32 * row_h + pad;
+        // A rule takes less height than an item.
+        let rule_h = 9.0 * self.scale;
+        let height_of = |a: &MenuAction| if matches!(a, MenuAction::Rule) { rule_h } else { row_h };
+        let panel_h = items.iter().map(|(_, a)| height_of(a)).sum::<f32>() + pad;
         let px = anchor.0.min((sw - panel_w).max(0.0)).max(0.0);
         let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
 
@@ -2752,8 +2812,24 @@ impl State {
 
         let mut rows = Vec::with_capacity(items.len());
         let mut placements = Vec::with_capacity(items.len());
-        for (i, (label, _)) in items.iter().enumerate() {
-            let ry = py + pad * 0.5 + i as f32 * row_h;
+        let mut ry = py + pad * 0.5;
+        for (i, (label, action)) in items.iter().enumerate() {
+            let row_y = ry;
+            ry += height_of(action);
+            if matches!(action, MenuAction::Rule) {
+                let line_h = self.scale.max(1.0);
+                quads.push(rect_quad(
+                    Rect { x: px + pad, y: row_y + (rule_h - line_h) * 0.5, w: panel_w - pad * 2.0, h: line_h },
+                    sw,
+                    sh,
+                    [90, 90, 105],
+                    1.0,
+                ));
+                // Not clickable: an empty rect never contains the cursor.
+                rows.push(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
+                continue;
+            }
+            let ry = row_y;
             let rrect = Rect {
                 x: px,
                 y: ry,
@@ -2803,13 +2879,19 @@ impl State {
     /// Run a command by id: execute immediately if it needs no required args, else
     /// open the palette to collect them (the argument prompt).
     fn begin_command(&mut self, id: &str) {
+        self.begin_command_with(id, Args::new(), None);
+    }
+
+    /// [`Self::begin_command`] with some arguments known (`preset`) and the
+    /// prompt starting with `prefill`.
+    fn begin_command_with(&mut self, id: &str, preset: Args, prefill: Option<String>) {
         let specs: Vec<ArgSpec> = self
             .registry
             .meta(id)
-            .map(|m| m.args.iter().filter(|a| a.required).cloned().collect())
+            .map(|m| m.args.iter().filter(|a| a.required && preset.get(a.name).is_none()).cloned().collect())
             .unwrap_or_default();
         if specs.is_empty() {
-            let _ = self.registry.execute(id, &Args::new(), &mut self.app);
+            self.run_command(id, &preset);
         } else {
             let title = self
                 .registry
@@ -2818,7 +2900,7 @@ impl State {
                 .unwrap_or_default();
             self.menu = None;
             self.palette = Some(Palette {
-                input: LineEdit::default(),
+                input: prefill.map(LineEdit::new).unwrap_or_default(),
                 selected: 0,
                 scroll: 0,
                 mode: PaletteMode::Commands,
@@ -2827,10 +2909,18 @@ impl State {
                     title,
                     specs,
                     values: Vec::new(),
+                    preset,
                 }),
             });
         }
         self.dirty = true;
+    }
+
+    /// Run command `id`, reporting a failure.
+    fn run_command(&mut self, id: &str, args: &Args) {
+        if let Err(e) = self.registry.execute(id, args, &mut self.app) {
+            eprintln!("ghostrealm: {id}: {e}");
+        }
     }
 
     /// Open the command palette (fresh query, first result selected).
@@ -3141,7 +3231,7 @@ impl State {
                             if let Some(val) = parse_arg_value(&spec.kind, &query) {
                                 pend.values.push(val);
                                 if pend.values.len() == pend.specs.len() {
-                                    let mut args = Args::new();
+                                    let mut args = pend.preset.clone();
                                     for (s, v) in pend.specs.iter().zip(&pend.values) {
                                         args.insert(s.name, v.clone());
                                     }
@@ -3156,7 +3246,7 @@ impl State {
                 }
                 if let Some((id, args)) = run {
                     self.palette = None;
-                    let _ = self.registry.execute(&id, &args, &mut self.app);
+                    self.run_command(&id, &args);
                 }
             }
             _ => {
