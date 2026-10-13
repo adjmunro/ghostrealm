@@ -29,7 +29,8 @@
 //! an opening bracket with no selection inserts its closer after the cursor
 //! when the line ends there or whitespace, a closer, or a separator follows
 //! ([`closes_before`]); typing a closer when the same one comes next steps
-//! over it; Backspace between an empty pair removes both. Wrapping is its own
+//! over it, and Backspace between an empty pair removes both, but only for a
+//! closer the editor inserted and only while the cursor stays on that line. Wrapping is its own
 //! undo step.
 
 use std::sync::OnceLock;

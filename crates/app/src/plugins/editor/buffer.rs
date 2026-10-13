@@ -38,7 +38,66 @@ pub struct EditorBuffer {
     /// Selection anchor (row, col); `None` = no selection. The selection spans
     /// anchor..cursor.
     pub anchor: Option<(usize, usize)>,
+    /// Closers typed brackets inserted, which stepping over and
+    /// pair-backspace are limited to.
+    auto_closers: AutoClosers,
     history: History,
+}
+
+/// The columns of the closers the editor inserted on one line, kept in step
+/// with edits on that line. Only the cursor's line is tracked: moving to
+/// another line forgets them (like VS Code's `autoClosingOvertype: auto`).
+#[derive(Clone, Debug, Default)]
+struct AutoClosers {
+    row: usize,
+    cols: Vec<usize>,
+}
+
+impl AutoClosers {
+    fn contains(&self, row: usize, col: usize) -> bool {
+        self.row == row && self.cols.contains(&col)
+    }
+
+    fn add(&mut self, row: usize, col: usize) {
+        if self.row != row {
+            self.cols.clear();
+            self.row = row;
+        }
+        self.cols.push(col);
+    }
+
+    /// `n` chars were inserted at `(row, col)`.
+    fn inserted(&mut self, row: usize, col: usize, n: usize) {
+        if self.row == row {
+            self.cols.iter_mut().filter(|c| **c >= col).for_each(|c| *c += n);
+        }
+    }
+
+    /// `n` chars were removed at `(row, col)`.
+    fn removed(&mut self, row: usize, col: usize, n: usize) {
+        if self.row == row {
+            self.cols.retain(|c| !(col..col + n).contains(c));
+            self.cols.iter_mut().filter(|c| **c >= col + n).for_each(|c| *c -= n);
+        }
+    }
+
+    /// The closer at `(row, col)` was stepped over.
+    fn forget(&mut self, row: usize, col: usize) {
+        if self.row == row {
+            self.cols.retain(|c| *c != col);
+        }
+    }
+
+    /// Keep only the closers on `row`.
+    fn keep_line(&mut self, row: usize) {
+        if self.row != row {
+            self.cols.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cols.clear();
+    }
 }
 
 /// Most undo steps kept; older ones are dropped.
@@ -60,6 +119,7 @@ struct Snapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
     anchor: Option<(usize, usize)>,
+    auto_closers: AutoClosers,
     version: u64,
 }
 
@@ -103,6 +163,7 @@ impl EditorBuffer {
             edits: 0,
             dirty_from: None,
             anchor: None,
+            auto_closers: AutoClosers::default(),
             history: History::default(),
         }
     }
@@ -127,6 +188,7 @@ impl EditorBuffer {
             edits: 0,
             dirty_from: None,
             anchor: None,
+            auto_closers: AutoClosers::default(),
             history: History::default(),
         })
     }
@@ -257,7 +319,9 @@ impl EditorBuffer {
         }
         if sr == er {
             self.lines[sr].replace_range(start..end, "");
+            self.auto_closers.removed(sr, sc, ec - sc);
         } else {
+            self.auto_closers.clear();
             let tail = self.lines[er][end..].to_string();
             self.lines[sr].truncate(start);
             self.lines[sr].push_str(&tail);
@@ -294,7 +358,8 @@ impl EditorBuffer {
     /// Type `s`. A single bracket gets the editor's bracket handling: an
     /// opening one wraps a selection, or else inserts its closer after the
     /// cursor (where [`closes_before`] allows); a closing one moves over an
-    /// identical closer that follows. Anything else is inserted as is.
+    /// identical closer that follows if the editor inserted it. Anything else
+    /// is inserted as is.
     pub fn insert_typed(&mut self, s: &str) {
         let Some(c) = typed_char(s) else {
             return self.insert_str(s);
@@ -308,9 +373,16 @@ impl EditorBuffer {
                 self.insert_char(c);
                 let b = self.byte_of(row, col + 1);
                 self.lines[row].insert(b, close);
+                self.auto_closers.inserted(row, col + 1, 1);
+                self.auto_closers.add(row, col + 1);
                 return;
             }
-        } else if opener_of(c).is_some() && self.selection().is_none() && self.char_at(row, col) == Some(c) {
+        } else if opener_of(c).is_some()
+            && self.selection().is_none()
+            && self.char_at(row, col) == Some(c)
+            && self.auto_closers.contains(row, col)
+        {
+            self.auto_closers.forget(row, col);
             self.cursor.1 += 1;
             return;
         }
@@ -329,16 +401,17 @@ impl EditorBuffer {
         let inner_end = (end.0, end.1 + usize::from(start.0 == end.0));
         let (anchor, cursor) = if forward { (inner_start, inner_end) } else { (inner_end, inner_start) };
         (self.anchor, self.cursor) = (Some(anchor), cursor);
+        self.auto_closers.clear();
         self.touch(start.0);
     }
 
-    /// Whether the cursor sits between an opening bracket and its closer with
-    /// nothing in between (`(|)`).
+    /// Whether the cursor sits between an opening bracket and a closer the
+    /// editor inserted for it, with nothing in between (`(|)`).
     fn in_empty_pair(&self) -> bool {
         let (row, col) = self.cursor;
         let before = col.checked_sub(1).and_then(|c| self.char_at(row, c));
         match (before, self.char_at(row, col)) {
-            (Some(o), Some(c)) => closer_of(o) == Some(c),
+            (Some(o), Some(c)) => closer_of(o) == Some(c) && self.auto_closers.contains(row, col),
             _ => false,
         }
     }
@@ -348,6 +421,7 @@ impl EditorBuffer {
         let (row, col) = self.cursor;
         let b = self.byte_of(row, col);
         self.lines[row].insert(b, c);
+        self.auto_closers.inserted(row, col, 1);
         self.cursor.1 = col + 1;
         self.touch(row);
     }
@@ -358,6 +432,7 @@ impl EditorBuffer {
         let b = self.byte_of(row, col);
         let tail = self.lines[row].split_off(b);
         self.lines.insert(row + 1, tail);
+        self.auto_closers.clear();
         self.cursor = (row + 1, 0);
         self.touch(row);
     }
@@ -489,6 +564,7 @@ impl EditorBuffer {
             Edit::Undo => self.undo(),
             Edit::Redo => self.redo(),
         }
+        self.auto_closers.keep_line(self.cursor.0);
         if step.is_some() && self.edits != edits {
             self.history.committed();
         }
@@ -510,6 +586,7 @@ impl EditorBuffer {
             lines: self.lines.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
+            auto_closers: self.auto_closers.clone(),
             version: self.history.version,
         }
     }
@@ -533,6 +610,7 @@ impl EditorBuffer {
     /// step (e.g. after the cursor moved by mouse).
     pub fn end_undo_run(&mut self) {
         self.history.run = None;
+        self.auto_closers.keep_line(self.cursor.0);
     }
 
     /// Withdraw the step [`Self::checkpoint`] just opened.
@@ -545,6 +623,7 @@ impl EditorBuffer {
     /// Make `s` the buffer's state; it is unmodified if it is the saved version.
     fn restore(&mut self, s: Snapshot) {
         self.lines = s.lines;
+        self.auto_closers = s.auto_closers;
         self.cursor = s.cursor;
         self.anchor = s.anchor;
         self.history.version = s.version;
@@ -704,6 +783,7 @@ impl EditorBuffer {
         let b = self.byte_of(row, col);
         self.lines[row].insert_str(b, text);
         let n = text.chars().count();
+        self.auto_closers.inserted(row, col, n);
         let shift = |p: &mut (usize, usize)| {
             if p.0 == row && p.1 >= col {
                 p.1 += n;
@@ -718,6 +798,7 @@ impl EditorBuffer {
     fn remove_at(&mut self, row: usize, col: usize, n: usize) {
         let (from, to) = (self.byte_of(row, col), self.byte_of(row, col + n));
         self.lines[row].replace_range(from..to, "");
+        self.auto_closers.removed(row, col, n);
         let shift = |p: &mut (usize, usize)| {
             if p.0 == row && p.1 > col {
                 p.1 = (p.1 - n).max(col);
@@ -1052,6 +1133,64 @@ mod tests {
         e.cursor = (0, 1);
         e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
         assert_eq!(e.lines, vec!["]"]);
+    }
+
+    #[test]
+    fn only_closers_the_editor_inserted_are_stepped_over_or_removed_with_their_opener() {
+        // A closer that was already in the text is typed before, not stepped over.
+        let mut e = buffer_with("()");
+        e.cursor = (0, 1);
+        typed(&mut e, ")");
+        assert_eq!(e.lines, vec!["())"]);
+        assert_eq!(e.cursor, (0, 2));
+        // Backspace between an old pair removes just the opener.
+        let mut e = buffer_with("()");
+        e.cursor = (0, 1);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec![")"]);
+        // A closer typed by the user is not auto-inserted, so it isn't stepped over.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "a))");
+        assert_eq!(e.lines, vec!["a))"]);
+    }
+
+    #[test]
+    fn an_auto_inserted_closer_stays_tracked_through_edits_before_it_and_is_dropped_after() {
+        // Typing inside the pair moves the closer along; it is still stepped over.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "(abc)");
+        assert_eq!((e.lines.clone(), e.cursor), (vec!["(abc)".to_string()], (0, 5)));
+        // Text typed before the pair shifts it.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "(");
+        e.cursor = (0, 0);
+        typed(&mut e, "xy");
+        e.cursor = (0, 3);
+        typed(&mut e, ")");
+        assert_eq!((e.lines.clone(), e.cursor), (vec!["xy()".to_string()], (0, 4)), "stepped over");
+        // Deleting before the pair shifts it back.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "ab (");
+        e.cursor = (0, 0);
+        e.apply(Edit::Delete(Motion::Right), &mut None::<String>);
+        e.cursor = (0, 3);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec!["b "], "the empty pair went together");
+        // Leaving the line forgets the closer.
+        let mut e = buffer_with("\ny");
+        typed(&mut e, "(");
+        assert_eq!(e.lines[0], "()");
+        e.apply(Edit::Move { to: Motion::Down, select: false }, &mut None::<String>);
+        e.cursor = (0, 1);
+        typed(&mut e, ")");
+        assert_eq!(e.lines[0], "())", "not stepped over after leaving the line");
+        // Redo brings the tracking back with the text.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "(");
+        e.undo();
+        e.redo();
+        typed(&mut e, ")");
+        assert_eq!(e.lines, vec!["()"]);
     }
 
     #[test]
