@@ -29,7 +29,10 @@
 //! lost directory only costs one slower compile.
 //!
 //! Only `target/` is touched; `~/.cargo` is never read or written. Do not run
-//! it while a build is in progress.
+//! it while a build is in progress. It refuses to run without a readable
+//! `Cargo.lock` (every registry unit would look unlisted), or when
+//! `CARGO_TARGET_DIR` is set but `--target-dir` is not: a target dir shared
+//! with other workspaces would lose their registry units.
 //!
 //! Run it from the repo root with `mise run clean-stale [-- --dry-run]`, or
 //! build it with `rustc -O --edition 2021 scripts/clean-stale.rs`. Options:
@@ -71,13 +74,17 @@ fn main() -> ExitCode {
     let mut opts = Opts { dry_run: false, verbose: false, keep: 3 };
     let mut target = PathBuf::from("target");
     let mut lockfile = PathBuf::from("Cargo.lock");
+    let mut target_given = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" | "-n" => opts.dry_run = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--keep" => opts.keep = args.next().and_then(|n| n.parse().ok()).unwrap_or(opts.keep).max(1),
-            "--target-dir" => target = args.next().map(PathBuf::from).unwrap_or(target),
+            "--target-dir" => {
+                target = args.next().map(PathBuf::from).unwrap_or(target);
+                target_given = true;
+            }
             "--lockfile" => lockfile = args.next().map(PathBuf::from).unwrap_or(lockfile),
             other => {
                 eprintln!("clean-stale: unknown argument {other}");
@@ -85,7 +92,15 @@ fn main() -> ExitCode {
             }
         }
     }
-    let lock = read_lock(&lockfile);
+    if std::env::var_os("CARGO_TARGET_DIR").is_some() && !target_given {
+        eprintln!("clean-stale: CARGO_TARGET_DIR is set; pass --target-dir (and --lockfile) explicitly");
+        return ExitCode::from(2);
+    }
+    // Without the lockfile every registry unit would look unlisted.
+    let Some(lock) = read_lock(&lockfile) else {
+        eprintln!("clean-stale: no packages in {}; run it from the workspace root", lockfile.display());
+        return ExitCode::from(2);
+    };
     let mut total = Totals::default();
     for profile in ["debug", "release"] {
         let dir = target.join(profile);
@@ -113,9 +128,10 @@ struct Lock {
     dirs: HashSet<String>,
 }
 
-fn read_lock(lockfile: &Path) -> Lock {
+/// `None` if it can't be read or lists no packages.
+fn read_lock(lockfile: &Path) -> Option<Lock> {
     let mut lock = Lock::default();
-    let text = fs::read_to_string(lockfile).unwrap_or_default();
+    let text = fs::read_to_string(lockfile).ok()?;
     let mut name = None;
     for line in text.lines() {
         let quoted = |key: &str| line.strip_prefix(key).and_then(|n| n.strip_suffix('"')).map(str::to_string);
@@ -125,7 +141,7 @@ fn read_lock(lockfile: &Path) -> Lock {
             lock.dirs.insert(format!("{n}-{v}"));
         }
     }
-    lock
+    (!lock.dirs.is_empty()).then_some(lock)
 }
 
 /// Whether `source` is in a registry package directory `Cargo.lock` doesn't list.
