@@ -387,7 +387,9 @@
   - **by kind** (higher level): group extensions into Images / Video / Audio /
     Documents / Code / Archives / Data / Other — great for a Downloads folder.
   - **by git status**: Modified / Untracked / Staged / Clean categories.
-  - **by modified date**: Today / This week / This month / Older buckets.
+  - **Modified** (formerly `date`): Today / This week / This month / Older
+    buckets by modification time. It still lists every file; it is a grouping,
+    not a filter.
   - **by size**: tiny / small / large / huge buckets; plus a flat "largest files".
   - **recent**: flat, newest-first across the tree.
   DISAMBIGUATION for any flat/grouped view: when two shown files share a name,
@@ -432,8 +434,8 @@
   `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
   explicit range. Which time to filter by is open: the owner suspects modified
   is the one wanted and created is not useful; created vs modified is a
-  separate question from the `date` view's rename (see "Quality of life (owner review) — editor and file browser
-  polish" for the `date` view's rename). (5) recursive fuzzy walk caps at 20k
+  separate question from the `date` view's rename to "Modified" (see "Quality of
+  life (owner review) — editor and file browser polish"). (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
 
@@ -699,7 +701,11 @@
   unhandled); (4) drag and drop; (5) restart the host automatically after a crash
   (today a dead host is noticed on the next resize/open); (6) Linux bundle is
   untested; (7) devtools (`show_dev_tools`, or the remote debugging port) as a
-  command.
+  command; (8) don't render a page nobody is watching: skip painting when the
+  page is not visible to the user (hidden tab or workspace) AND no agent is
+  actively watching it. Owner (round 3): "Is it visible to the user [...] And is
+  it visible to an agent? Is an agent actively watching it? If it's not, then we
+  don't need to do the whole render stuff."
 - Reason: a usable everyday browser pane.
 
 ---
@@ -900,14 +906,15 @@
     "Keybinding ids without quotes").
   - [stack-review-findings-2.md](stack-review-findings-2.md) items 15 (load-time
     findings), 24 (stuck mount), 34 (preview follows hover; the owner will try
-    it first), 35 (mouse reports while scrolled back), 36 (unbracketed paste),
+    it first), 36 (unbracketed paste),
     and the "To confirm" note in [stack-review-findings.md](stack-review-findings.md).
   - The open design items: the profile scope controls and picker (TODO "Web —
     profiles"), syntax highlighting direction, editor and file browser as one
     surface.
   Decided in the review rounds and no longer open: Chromium sandbox on, web
   profile location, pop-up handling, shell exit, Delete = Trash, GitHub
-  permalinks (future), file-browser date view naming.
+  permalinks (future), the file-browser date view naming (renamed "Modified"),
+  terminal mouse reports while scrolled back.
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -962,8 +969,10 @@
     toggles (`preview`, `hidden`, `.gitignore`, git filter, view); each hit
     area is its label plus `pad` on both sides, which reads as too wide.
   - **File-browser date view**: the grouped view is labelled `date` and does
-    not say what it represents. Rename it to say what it is: modified time (the
-    buckets are by modified time). No created-time choice for now, since
+    not say what it represents. Rename it to "Modified". It still lists every
+    file, grouped by modification time; it is not a filter and hides nothing
+    (owner, round 3: "It's still about the time. It's not some sort of like, oh,
+    these are the modified files."). No created-time choice for now, since
     created time is probably not useful; the date filter follows the same rule
     ("File browser — remaining polish" item (4)).
     Owner, verbatim:
@@ -1496,3 +1505,109 @@
   > maybe we'll need to call it GitHub permalinks so that I actually know what
   > [expletive removed] it's talking about.
 - Reason: owner asked for it recorded; shareable links to code.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Markdown: embedded files (`![alt](path)`)
+
+- Requires: NO BLOCKERS (reuses "Media wrappers: image decoding and audio
+  playback behind our own trait"; sibling of "PRIORITY: Markdown bold, italic,
+  and underline in the editor")
+- Detail: The Markdown renderer embeds files with the GitHub image syntax,
+  `![alt](path)`: a link with a leading `!`.
+  - Images render in place; video and audio are possible, through the media
+    wrappers (decode/playback libraries) rather than new code.
+  - Basic options for the rendered width and height; syntax to decide.
+  - Non-media files (e.g. text) embed as a read-only, scrollable code block,
+    collapsed to a file header; click the header to expand.
+- Owner, verbatim:
+  > the markdown renderer also needs to support embedded files, such as embedded
+  > images, or maybe videos, or maybe audio. So that's a good use case to reuse
+  > those things that we had earlier, maybe. [...] Maybe it's just exclamation
+  > mark, square bracket, alternative text, closing square bracket, round
+  > bracket, path to the file, closing round bracket. [...] maybe we need to
+  > customize the width or the height of the file being rendered. I also think
+  > maybe we don't have to restrict it to images [...] if it's a text file, maybe
+  > it shows up in a code block. in full, but maybe it's scrollable. And read
+  > only. Maybe it's got a thing you have to click to expand to show all of it,
+  > and otherwise it's just like a file header.
+- Reason: owner request; embedded media and files in Markdown.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Markdown: text colour and text background colour
+
+- Requires: a syntax decision (Markdown has none for colour)
+- Detail: Colour for Markdown text: foreground colour and background colour.
+  Syntax open.
+- Owner, verbatim:
+  > I'd also like to add some way to add coloring to the markdown, like text
+  > color, [...] text background color.
+- Reason: owner request.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Indexer: Markdown free text and/or code symbols
+
+- Requires: a design decision (scope)
+- Detail: An indexer. Open: a free-text index for Markdown, a symbol index for
+  code, or both.
+- Owner, verbatim:
+  > on the to-do list, we definitely need some kind of indexer. I'm not sure if
+  > that would be like a free form text indexer for Markdown or if it would be
+  > code only for symbols.
+- Reason: owner request; search across files.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Scroll-to-top and scroll-to-bottom icons
+
+- Requires: NO BLOCKERS
+- Detail: Small icons to jump to the top or bottom of a long terminal, file, or
+  other scrollable view, shown when the content needs scrolling.
+- Owner, verbatim:
+  > We could perhaps add to the to-do adding little icons to scroll to the top or
+  > the bottom of the terminal or a file, etc. if it's long or if you have to
+  > scroll.
+- Reason: owner request; long scrollback and files.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Terminal: mouse reports while scrolled back
+
+- Requires: NO BLOCKERS
+- Detail: Decided ([stack-review-findings-2.md](stack-review-findings-2.md)
+  item 35): never snap to the bottom. While the viewport is scrolled back, the
+  mouse acts locally (selection, copy) and nothing is reported to the program.
+  `report_mouse` in `plugins/terminal.rs` skips reporting when the viewport is
+  not live.
+- Owner, verbatim:
+  > no, why would the terminal scroll to the bottom when you change focus? That
+  > doesn't make sense. What if I'm trying to copy something?
+- Reason: reports land on the wrong row while scrolled back; the owner may be
+  copying.
+
+---
+
+[2026-10-14T00:02+1300@6007201] Update CEF: a separate command
+
+- Requires: NO BLOCKERS
+- Detail: A command, not part of the normal build, that updates CEF (the
+  Chromium Embedded Framework):
+  - fetch the new CEF, build and test against it;
+  - keep the old CEF until the new one builds, then remove the old one so old
+    copies do not accumulate;
+  - candidate for CI automation.
+  Dependency updates stay manual; maybe an "updates available" report.
+- Owner, verbatim:
+  > our cargo build probably also needs like a separate command or something. Not
+  > part of the normal cargo build, but some sort of command to update the
+  > Chromium embedded browser and our dependencies. Or maybe not the
+  > dependencies. Maybe we do that manually. Maybe it just tells us that there's
+  > updates available. But updating Chromium embedded browser, that feels like
+  > something that we should be doing fairly frequently, maybe even
+  > automatically in the CI. [...] if it all still compiles against it, then we
+  > can clean up the old version so we don't have them lying around on our
+  > machine.
+- Reason: CEF should stay current; check whether a new version breaks the build
+  without leaving old copies behind.
