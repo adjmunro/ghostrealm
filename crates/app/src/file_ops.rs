@@ -135,15 +135,51 @@ fn create_copy(src: &Path, dst: &Path) -> Result<()> {
         #[cfg(not(unix))]
         std::fs::copy(src, dst)?;
     } else if meta.is_file() {
-        let mut from = std::fs::File::open(src)?;
-        let mut to = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
-        std::io::copy(&mut from, &mut to)?;
-        to.set_permissions(from.metadata()?.permissions())?;
+        let from = std::fs::File::open(src)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Created with the source's access bits, so a private file's copy is
+        // never readable by others while it fills.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(meta.permissions().mode() & 0o777);
+        }
+        copy_contents(&from, &options.open(dst)?)?;
     } else {
         // A pipe, socket, or device: opening one to read it can block forever.
         bail!("can't copy {}: not a regular file", src.display());
     }
     Ok(())
+}
+
+/// Fill `to` from `from`, with its permissions. On macOS also its extended
+/// attributes, ACL and flags, as Finder keeps them: a move across volumes
+/// copies and then deletes the original, so anything not copied is lost.
+#[cfg(target_os = "macos")]
+fn copy_contents(from: &std::fs::File, to: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: both descriptors stay open for the call; a null state is allowed.
+    let rc = unsafe {
+        libc::fcopyfile(
+            from.as_raw_fd(),
+            to.as_raw_fd(),
+            std::ptr::null_mut(),
+            libc::COPYFILE_DATA | libc::COPYFILE_METADATA,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Fill `to` from `from`, with its permissions.
+#[cfg(not(target_os = "macos"))]
+fn copy_contents(mut from: &std::fs::File, mut to: &std::fs::File) -> std::io::Result<()> {
+    std::io::copy(&mut from, &mut to)?;
+    to.set_permissions(from.metadata()?.permissions())
 }
 
 /// Copy what is inside the directory `src` into the existing directory `dst`.
@@ -703,5 +739,18 @@ pub mod tests {
             copy_recursive(&d.join("a"), &d.join("a2")).unwrap();
             assert_eq!(std::fs::metadata(d.join("a2")).unwrap().permissions().mode() & 0o777, 0o750);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copied_or_moved_file_keeps_its_extended_attributes() {
+        let d = tmpdir("ops-xattr");
+        std::fs::write(d.join("a"), "A").unwrap();
+        let xattr = |args: &[&str]| std::process::Command::new("xattr").args(args).output().unwrap();
+        let a = d.join("a");
+        assert!(xattr(&["-w", "com.ghostrealm.test", "kept", a.to_str().unwrap()]).status.success());
+        copy_recursive(&a, &d.join("b")).unwrap();
+        let read = xattr(&["-p", "com.ghostrealm.test", d.join("b").to_str().unwrap()]);
+        assert_eq!(String::from_utf8_lossy(&read.stdout).trim(), "kept");
     }
 }
