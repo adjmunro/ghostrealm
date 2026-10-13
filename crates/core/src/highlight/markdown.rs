@@ -4,6 +4,10 @@
 //! constructs that need a neighbouring line (setext headings, indented code,
 //! multi-line emphasis) are not recognised.
 //!
+//! A fence whose info string names a language with a registered highlighter
+//! that is line-local (`carries_state` false, e.g. `toml`) highlights its body
+//! lines with it; the language rides in the carried state.
+//!
 //! A fence opened after a list marker or `>` is recognised; it ends at its
 //! closing fence, or at the first non-blank line that leaves the container
 //! (no indent for a list item, no `>` for a quote). Containers are not
@@ -13,7 +17,7 @@
 //! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
 //! unmarked, so a pathological line costs a bounded number of scans.
 
-use super::{runs, Highlighter, Span, State, Token};
+use super::{runs, Highlighter, Span, State, Token, ALL};
 
 pub struct Markdown;
 
@@ -32,6 +36,10 @@ impl Highlighter for Markdown {
         let next = block(&chars, &mut tok, state);
         (runs(&tok), next)
     }
+
+    fn block(&self, state_in: State, state_out: State) -> bool {
+        state_in != 0 || state_out != 0
+    }
 }
 
 /// How deep inline markup nests (emphasis in a link in emphasis ...).
@@ -46,14 +54,41 @@ const TOP: State = 0;
 const LIST: State = 1;
 const QUOTE: State = 2;
 
-/// The state while inside a fence: its length, whether it is `~`, and its
-/// container (a fence is at least 3 long, so the state is never 0).
-fn fence_state(ch: char, len: usize, container: State) -> State {
-    ((len as State) << 3) | (container << 1) | State::from(ch == '~')
+/// Longest fence length the state holds (longer ones are clamped).
+const MAX_FENCE: usize = (1 << 21) - 1;
+/// The state's top byte: 1 + the index into [`ALL`] of the fence's language
+/// highlighter, or 0 for none.
+const LANG_SHIFT: u32 = 24;
+
+/// The state while inside a fence: its length, whether it is `~`, its
+/// container, and its language (a fence is at least 3 long, so the state is
+/// never 0).
+fn fence_state(ch: char, len: usize, container: State, lang: State) -> State {
+    (lang << LANG_SHIFT) | ((len.min(MAX_FENCE) as State) << 3) | (container << 1) | State::from(ch == '~')
 }
 
 fn fence_of(state: State) -> (char, usize, State) {
-    (if state & 1 == 1 { '~' } else { '`' }, (state >> 3) as usize, (state >> 1) & 3)
+    (
+        if state & 1 == 1 { '~' } else { '`' },
+        ((state >> 3) as usize) & MAX_FENCE,
+        (state >> 1) & 3,
+    )
+}
+
+/// The highlighter registered for a fence's info string (its first word), as
+/// `1 + index into ALL`, or 0. Only line-local highlighters qualify: the body
+/// lines enter it with state 0.
+fn fence_lang(info: &[char]) -> State {
+    let word: String = info
+        .iter()
+        .skip_while(|x| x.is_whitespace())
+        .take_while(|x| !x.is_whitespace() && **x != '{')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let word = word.trim_start_matches('.');
+    ALL.iter()
+        .position(|h| !h.carries_state() && (h.name() == word || h.extensions().contains(&word)))
+        .map_or(0, |i| i as State + 1)
 }
 
 /// An opening fence at `p`: the fence char and run length, if the run is 3 or
@@ -116,7 +151,16 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
                 fill(tok, p, n, Token::Marker);
                 return 0;
             }
-            fill(tok, p, n, Token::Code);
+            let lang = state >> LANG_SHIFT;
+            match lang.checked_sub(1).and_then(|i| ALL.get(i as usize)) {
+                Some(h) => {
+                    let body: String = c[p.min(n)..].iter().collect();
+                    for sp in h.line(&body, 0).0 {
+                        fill(tok, p + sp.start, p + sp.end, sp.token);
+                    }
+                }
+                None => fill(tok, p, n, Token::Code),
+            }
             return state;
         }
     }
@@ -125,7 +169,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
         if let Some((fc, run)) = fence_at(c, indent) {
             fill(tok, indent, indent + run, Token::Marker);
             fill(tok, indent + run, n, Token::Key);
-            return fence_state(fc, run, TOP);
+            return fence_state(fc, run, TOP, fence_lang(&c[indent + run..]));
         }
         if first == '#' {
             let hashes = run_of(c, indent, '#');
@@ -183,7 +227,8 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
         if let Some((fc, run)) = fence_at(c, at) {
             fill(tok, at, at + run, Token::Marker);
             fill(tok, at + run, n, Token::Key);
-            return fence_state(fc, run, if item > 0 { LIST } else { QUOTE });
+            let container = if item > 0 { LIST } else { QUOTE };
+            return fence_state(fc, run, container, fence_lang(&c[at + run..]));
         }
     }
     fill(tok, p, n, base);
@@ -569,6 +614,45 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_language_highlights_its_body() {
+        let (open, s) = lex_in("```toml", 0);
+        assert_eq!(open, vec![run("```", Marker), run("toml", Key)]);
+        let (body, s) = lex_in("name = \"x\"", s);
+        assert_eq!(
+            body,
+            vec![run("name ", Key), run("= ", Plain), run("\"x\"", Token::String)]
+        );
+        let (table, s) = lex_in("[editor]", s);
+        assert_eq!(table, vec![run("[editor]", Heading)]);
+        assert_ne!(s, 0, "still inside the fence");
+        let (close, s) = lex_in("```", s);
+        assert_eq!(close, vec![run("```", Marker)]);
+        assert_eq!(s, 0);
+        // Names and extensions both resolve; unknown or stateful ones stay plain code.
+        for info in ["TOML", " toml {x}", ".toml"] {
+            let (_, s) = lex_in(&format!("```{info}"), 0);
+            assert_eq!(lex_in("a = 1", s).0[0], run("a ", Key), "{info:?}");
+        }
+        for info in ["rust", "", "markdown", "md"] {
+            let (_, s) = lex_in(&format!("```{info}"), 0);
+            assert_eq!(lex_in("a = 1", s).0, vec![run("a = 1", Code)], "{info:?}");
+        }
+        // A fenced list item carries the language too.
+        let (_, s) = lex_in("- ```toml", 0);
+        assert_eq!(lex_in("  a = 1", s).0[1], run("a ", Key));
+    }
+
+    #[test]
+    fn markdown_marks_fence_rows_as_a_block() {
+        let (_, open) = lex_in("```toml", 0);
+        let (_, inside) = lex_in("a = 1", open);
+        assert!(Markdown.block(0, open), "the opening fence");
+        assert!(Markdown.block(open, inside), "a body line");
+        assert!(Markdown.block(inside, 0), "the closing fence");
+        assert!(!Markdown.block(0, 0), "prose");
+    }
+
+    #[test]
     fn a_longer_fence_closes_and_a_tilde_fence_is_its_own_kind() {
         let (_, s) = lex_in("````", 0);
         assert_ne!(lex_in("```", s).1, 0, "shorter than the opener");
@@ -743,7 +827,7 @@ mod tests {
     #[test]
     fn every_line_of_up_to_four_markup_characters_is_classified_without_panic() {
         let alphabet: Vec<char> = "*_`[]()!<>#-~:ha ".chars().collect();
-        let fenced = fence_state('`', 3, TOP);
+        let fenced = fence_state('`', 3, TOP, 0);
         let mut layer = vec![String::new()];
         for _ in 0..4 {
             layer = layer

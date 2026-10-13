@@ -68,6 +68,13 @@ pub trait Highlighter: Sync {
     /// char 0 to the line's end (none for an empty line). Also returns the
     /// state the next line enters with.
     fn line(&self, line: &str, state: State) -> (Vec<Span>, State);
+
+    /// Whether a line that enters with `state_in` and leaves with `state_out`
+    /// belongs to a block drawn as a unit (a fenced code block, including its
+    /// fences).
+    fn block(&self, _state_in: State, _state_out: State) -> bool {
+        false
+    }
 }
 
 /// Every registered highlighter.
@@ -183,7 +190,7 @@ impl StateCache {
 /// still on screen aren't re-highlighted every frame.
 #[derive(Default)]
 pub struct SpanCache {
-    map: HashMap<(u64, State), Vec<Span>>,
+    map: HashMap<(u64, State), (Vec<Span>, State)>,
     highlighter: &'static str,
 }
 
@@ -192,11 +199,17 @@ const SPAN_CACHE_CAP: usize = 4096;
 
 impl SpanCache {
     pub fn spans(&mut self, h: &dyn Highlighter, line: &str, state: State) -> &[Span] {
+        self.line(h, line, state).0
+    }
+
+    /// The spans and the state the next line enters with.
+    pub fn line(&mut self, h: &dyn Highlighter, line: &str, state: State) -> (&[Span], State) {
         if self.highlighter != h.name() || self.map.len() >= SPAN_CACHE_CAP {
             self.highlighter = h.name();
             self.map.clear();
         }
-        self.map.entry((hash_line(line), state)).or_insert_with(|| h.line(line, state).0)
+        let (spans, next) = self.map.entry((hash_line(line), state)).or_insert_with(|| h.line(line, state));
+        (spans, *next)
     }
 }
 
@@ -337,6 +350,15 @@ mod tests {
             cache.spans(&h, "a", 1);
         }
         assert_eq!(h.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn span_cache_returns_the_exit_state() {
+        let md = for_extension("md").unwrap();
+        let mut cache = SpanCache::default();
+        let (_, open) = cache.line(md, "```toml", 0);
+        assert_ne!(open, 0);
+        assert_eq!(cache.line(md, "```", open).1, 0);
     }
 
     #[test]
