@@ -4,9 +4,9 @@
 //! hashed copies in `deps/`, `build/`, `.fingerprint/` and `incremental/`.
 //!
 //! A unit (one `.fingerprint/<package>-<hash>` directory) is identified by what
-//! its fingerprint records: target kind (`lib`, `test-bin`, `check-lib`,
-//! `run-build-script`, ...), features, target hash, rustflags, and the source
-//! file it was compiled from (which tells package versions apart). Of the units
+//! its fingerprint records: target kind (`lib`, `test-bin`, `build-script`,
+//! ...), features, target hash, rustflags, and the source file it was
+//! compiled from (which tells package versions apart). Of the units
 //! with the same identity the `--keep` most recently built (default 3) stay and
 //! the rest are removed, with their `deps/` files (`<name>-<hash>*`) and
 //! `build/<package>-<hash>/`. Profile hashes are not part of the identity, so a
@@ -16,9 +16,17 @@
 //! unit that are all in use; the number kept bounds the stale ones. A unit
 //! reused by the latest build but older than `--keep` newer siblings is
 //! removed too; it is rebuilt on the next build. A unit built from a registry
-//! package version that `Cargo.lock` no longer lists is removed outright. Units whose fingerprint can't be read are left alone.
-//! `incremental/` has no such record, so the newest few directories per crate
-//! are kept (it is a cache; a lost directory only costs one slower compile).
+//! package version that `Cargo.lock` no longer lists is removed outright.
+//! Units whose fingerprint can't be read are left alone.
+//!
+//! A build-script run records neither features nor source, so it is not
+//! grouped: it goes with the build-script compile it ran (its `out/` can hold
+//! a large download, such as CEF). A run whose compile is already gone is
+//! removed once another run of the same package has a compile that stays.
+//!
+//! `incremental/` has no such record, so per crate the newest directories are
+//! kept, as many as the crate has units left (at least 4). It is a cache; a
+//! lost directory only costs one slower compile.
 //!
 //! Only `target/` is touched; `~/.cargo` is never read or written. Do not run
 //! it while a build is in progress.
@@ -28,20 +36,21 @@
 //! `--dry-run`/`-n` (remove nothing), `--verbose`/`-v` (list each path),
 //! `--keep N`, `--target-dir DIR`, `--lockfile FILE`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
-/// Incremental-compilation directories kept per crate name (lib, bin, and
-/// their test builds each have one).
+/// The fewest incremental-compilation directories kept per crate name.
 const KEEP_INCREMENTAL: usize = 4;
 
 struct Unit {
     package: String,
     hash: String,
+    /// The fingerprint file's name: `lib-syn`, `test-bin-ghostrealm`, ...
+    kind: String,
     built: SystemTime,
 }
 
@@ -101,7 +110,7 @@ fn main() -> ExitCode {
 #[derive(Default)]
 struct Lock {
     /// `<name>-<version>` of each package, as registry source directories are named.
-    dirs: std::collections::HashSet<String>,
+    dirs: HashSet<String>,
 }
 
 fn read_lock(lockfile: &Path) -> Lock {
@@ -149,13 +158,25 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
         }
     }
 
-    // identity -> units sharing it.
+    // identity -> units sharing it. Build-script runs are decided after the
+    // build-script compiles they belong to.
     let mut groups: HashMap<String, (usize, Vec<Unit>)> = HashMap::new();
+    let mut runs: Vec<(Unit, Option<String>)> = Vec::new();
+    // fingerprint hash -> `.fingerprint/` directory of each build-script compile.
+    let mut scripts: HashMap<String, String> = HashMap::new();
     for e in read_dir(&dir.join(".fingerprint")) {
         let Some(dir_name) = e.file_name().to_str().map(str::to_string) else { continue };
+        if let Ok(h) = fs::read_to_string(e.path().join("build-script-build-script-build")) {
+            scripts.insert(h.trim().to_string(), dir_name.clone());
+        }
         let Some(package) = dir_name.len().checked_sub(17).and_then(|n| dir_name.get(..n)) else { continue };
         let Some((_, hash)) = split_hash(&dir_name) else { continue };
         let Some((kind, json, built)) = fingerprint_json(&e.path()) else { continue };
+        let unit = Unit { package: package.to_string(), hash: hash.to_string(), kind: kind.clone(), built };
+        if kind.starts_with("run-build-script-") {
+            runs.push((unit, script_fingerprint(&json)));
+            continue;
+        }
         let source = dep_info_source(by_hash.get(hash), &dir.join("build").join(&dir_name));
         let identity = format!(
             "{package}|{kind}|{}|{}|{}|{}|{source}",
@@ -165,25 +186,51 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
             field(&json, "rustflags"),
         );
         let keep = if unlisted_registry_source(&source, lock) { 0 } else { opts.keep };
-        let unit = Unit { package: package.to_string(), hash: hash.to_string(), built };
         groups.entry(identity).or_insert((keep, Vec::new())).1.push(unit);
     }
 
+    let mut kept: Vec<Unit> = Vec::new();
+    let mut removed: HashSet<String> = HashSet::new();
     for (keep, mut units) in groups.into_values() {
-        totals.units += units.len();
         units.sort_by(|a, b| b.built.cmp(&a.built).then_with(|| a.hash.cmp(&b.hash)));
-        for unit in units.into_iter().skip(keep) {
-            let name = format!("{}-{}", unit.package, unit.hash);
-            let mut paths = vec![dir.join(".fingerprint").join(&name), dir.join("build").join(&name)];
-            paths.extend(by_hash.get(&unit.hash).cloned().unwrap_or_default());
-            totals.removed += 1;
-            for p in paths {
-                totals.bytes += remove(&p, opts);
+        for (i, unit) in units.into_iter().enumerate() {
+            if i < keep {
+                kept.push(unit);
+            } else {
+                removed.insert(format!("{}-{}", unit.package, unit.hash));
+                totals.bytes += remove_unit(dir, &unit, &by_hash, opts);
             }
         }
     }
 
-    // incremental/<crate>-<id>: newest few per crate.
+    // A build-script run (whose `out/` may hold a large download) goes with the
+    // compile it ran: the run's fingerprint records the compile's fingerprint
+    // hash. A run whose compile is gone is superseded only once another run of
+    // the package has a compile that stays; otherwise it is left alone.
+    let compile_of = |fp: &Option<String>| fp.as_ref().and_then(|h| scripts.get(h));
+    let current: HashSet<String> = runs
+        .iter()
+        .filter(|(_, fp)| compile_of(fp).is_some_and(|c| !removed.contains(c)))
+        .map(|(u, _)| u.package.clone())
+        .collect();
+    for (unit, fp) in runs {
+        let superseded = match compile_of(&fp) {
+            Some(compile) => removed.contains(compile),
+            None => current.contains(&unit.package),
+        };
+        if superseded {
+            removed.insert(format!("{}-{}", unit.package, unit.hash));
+            totals.bytes += remove_unit(dir, &unit, &by_hash, opts);
+        } else {
+            kept.push(unit);
+        }
+    }
+    totals.removed = removed.len();
+    totals.units = kept.len() + removed.len();
+
+    // incremental/<crate>-<id>: one directory per compiled target, so a crate
+    // keeps at least as many as it has units left (lib, bin, tests, each in
+    // check and build mode).
     let mut crates: HashMap<String, Vec<(SystemTime, PathBuf)>> = HashMap::new();
     for e in read_dir(&dir.join("incremental")) {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -191,13 +238,38 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
         let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
         crates.entry(krate.to_string()).or_default().push((modified, e.path()));
     }
-    for mut dirs in crates.into_values() {
+    let kinds: Vec<String> = kept.iter().map(|u| format!("_{}", u.kind.replace('-', "_"))).collect();
+    for (krate, mut dirs) in crates {
+        // `_lib_foo` and `_test_bin_foo` end in `_foo`. Overcounting (a `foo`
+        // that is the tail of another crate's name) only keeps more.
+        let suffix = format!("_{krate}");
+        let units = kinds.iter().filter(|k| k.ends_with(&suffix)).count();
         dirs.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, p) in dirs.into_iter().skip(KEEP_INCREMENTAL) {
+        for (_, p) in dirs.into_iter().skip(units.max(KEEP_INCREMENTAL)) {
             totals.bytes += remove(&p, opts);
         }
     }
     totals
+}
+
+/// Remove a unit's `.fingerprint/` and `build/` directories and `deps/` files.
+fn remove_unit(dir: &Path, unit: &Unit, by_hash: &HashMap<String, Vec<PathBuf>>, opts: &Opts) -> u64 {
+    let name = format!("{}-{}", unit.package, unit.hash);
+    let mut paths = vec![dir.join(".fingerprint").join(&name), dir.join("build").join(&name)];
+    paths.extend(by_hash.get(&unit.hash).cloned().unwrap_or_default());
+    paths.iter().map(|p| remove(p, opts)).sum()
+}
+
+/// The fingerprint hash, as `.fingerprint/` stores it (16 hex digits of the
+/// little-endian `u64`), of the build-script compile a run's fingerprint JSON
+/// depends on: `"deps":[[<id>,"build_script_build",<public>,<hash>]]`.
+fn script_fingerprint(json: &str) -> Option<String> {
+    let rest = &json[json.find("\"build_script_build\",")?..];
+    let rest = &rest[rest.find(',')? + 1..];
+    let rest = &rest[rest.find(',')? + 1..];
+    let digits = &rest[..rest.find(|c: char| !c.is_ascii_digit())?];
+    let n: u64 = digits.parse().ok()?;
+    Some(n.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn read_dir(dir: &Path) -> Vec<fs::DirEntry> {
