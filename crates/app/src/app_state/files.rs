@@ -95,8 +95,17 @@ impl AppState {
             .context("no folder to use; give a dir")
     }
 
-    /// Tell every view that files changed (`moved`: each `(from, to)`).
+    /// Tell every view that files changed (`moved`: each `(from, to)`), and
+    /// keep the workspaces' pinned roots on the folders they were pinned to.
     pub(super) fn changed(&mut self, moved: &[(PathBuf, PathBuf)]) {
+        let ids: Vec<_> = self.tree.vtabs().iter().map(|v| v.id).collect();
+        for id in ids {
+            if let Some(vtab) = self.tree.vtab_mut(id) {
+                if let Some(root) = vtab.root_dir.as_deref().and_then(|r| file_ops::follow(r, moved)) {
+                    vtab.root_dir = Some(root);
+                }
+            }
+        }
         for view in self.views.values_mut() {
             view.files_changed(moved);
         }
@@ -604,6 +613,36 @@ mod tests {
         assert!(v.buffer_mut().save().unwrap());
         assert!(std::fs::read_to_string(d.join("b.txt")).unwrap().starts_with('x'));
         assert!(!d.join("a.txt").exists());
+    }
+
+    #[test]
+    fn moving_the_pinned_root_or_a_folder_above_it_keeps_the_workspace_on_it() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-root-moves");
+        std::fs::create_dir_all(d.join("outer/proj")).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("outer/proj/f.txt"), "").unwrap();
+        s.set_active_root_dir(d.join("outer/proj"));
+        run(&mut s, "file.show_in_browser", &[("path", &d.join("outer/proj/f.txt"))]).unwrap();
+        let browser = s.focused_surface().unwrap();
+        let vt = s.active().unwrap();
+        let other = s.new_workspace_in(d.join("outer"));
+        s.tree.focus_vtab(vt);
+        let root = |s: &AppState, vt| s.tree.vtab(vt).unwrap().root_dir.clone();
+        // The root itself.
+        run(&mut s, "file.rename", &[("path", &d.join("outer/proj")), ("name", Path::new("renamed"))]).unwrap();
+        assert_eq!(root(&s, vt), Some(d.join("outer/renamed")));
+        assert_eq!(s.vtab_dir(vt), Some(d.join("outer/renamed")));
+        assert_eq!(root(&s, other), Some(d.join("outer")), "another workspace's root is untouched");
+        // A folder above it, by a cut-paste move; every workspace under it follows.
+        run(&mut s, "file.cut", &[("path", &d.join("outer"))]).unwrap();
+        run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert_eq!(root(&s, vt), Some(d.join("to/outer/renamed")));
+        assert_eq!(root(&s, other), Some(d.join("to/outer")));
+        let view = s.view(browser).and_then(|v| v.downcast_ref::<FileBrowserView>()).unwrap();
+        assert!(view.tree().root().starts_with(d.join("to/outer")), "the browser's root follows too");
+        // A new terminal starts in the moved folder.
+        assert_eq!(s.resolve_cwd(vt), Some(d.join("to/outer/renamed")));
     }
 
     #[test]
