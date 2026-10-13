@@ -91,6 +91,11 @@ pub fn load(path: &Path) -> Preview {
         };
         return preview("Folder".into(), None, content);
     }
+    if !meta.is_file() {
+        // Opening a pipe or device can block forever (and reading eats a
+        // pipe's data): describe it without touching its content.
+        return preview(special_kind(&meta).into(), None, Content::Nothing);
+    }
     let size = Some(meta.len());
     if IMAGE_EXTS.contains(&ext.as_str()) {
         let content = match decode_image(path) {
@@ -113,6 +118,26 @@ pub fn load(path: &Path) -> Preview {
         Ok(None) => preview(format!("{upper} file"), size, Content::Nothing),
         Err(e) => preview("File".into(), size, Content::Error(e)),
     }
+}
+
+/// What a non-regular, non-directory entry is.
+fn special_kind(meta: &std::fs::Metadata) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let t = meta.file_type();
+        if t.is_fifo() {
+            return "Pipe";
+        }
+        if t.is_socket() {
+            return "Socket";
+        }
+        if t.is_char_device() || t.is_block_device() {
+            return "Device";
+        }
+    }
+    let _ = meta;
+    "Special file"
 }
 
 /// Decode an image, upright per its EXIF orientation and at most
@@ -661,6 +686,27 @@ pub(crate) mod tests {
 
         std::fs::write(d.join("bad.png"), "not a png").unwrap();
         assert!(matches!(load(&d.join("bad.png")).content, Content::Error(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipes_and_devices_are_described_without_being_read() {
+        let d = tmpdir("preview-fifo");
+        // Named like audio, so the extension doesn't pick the plain-file path.
+        let fifo = d.join("pipe.mp3");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load(&path));
+        });
+        let p = rx.recv_timeout(Duration::from_secs(5)).expect("loading a FIFO hung");
+        assert_eq!(p.kind, "Pipe");
+        assert!(matches!(p.content, Content::Nothing));
+
+        let p = load(Path::new("/dev/null"));
+        assert_eq!(p.kind, "Device");
+        assert!(matches!(p.content, Content::Nothing));
     }
 
     #[test]

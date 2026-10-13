@@ -46,16 +46,6 @@ carries no button, so only left clicks reach a page.
 
 ### Medium
 
-#### 24. A FIFO or device node hangs the preview loader (confirmed)
-
-- Where: `load` → `read_text` ([`preview.rs:109`](../crates/app/src/plugins/file_browser/preview.rs),
-  `:139`); `audio::duration` likewise.
-- Effect: the loader blocks in `open`/`read` forever (and consumes the pipe's
-  data); the thread leaks.
-- Fix: read only when `meta.is_file()`; show Pipe/Device/Socket with no content.
-  A `metadata` call stuck on a dead network mount needs a per-request thread or
-  timeout: a design choice, not covered here.
-
 #### 25. The audio device stays open after playback ends (confirmed)
 
 - Where: `run` / `start` ([`plugins/file_browser/audio.rs:96`](../crates/app/src/plugins/file_browser/audio.rs),
@@ -76,6 +66,10 @@ carries no button, so only left clicks reach a page.
     `ghostrealm agent` running `web.new`) can't start its host; the pane says the
     profile is in use. Decision needed: share cookies and logins between the GUI
     and the agent, or a profile per process?
+24. **A preview can block on a stuck mount.** `load`'s `metadata` call
+    ([`plugins/file_browser/preview.rs:69`](../crates/app/src/plugins/file_browser/preview.rs))
+    blocks the loader on a dead network mount. Decision needed: a thread or
+    timeout per request?
 27. **Page frames can tear; the doc comment says otherwise.** `SharedFrame`
     ([`web/src/client.rs:73`](../crates/web/src/client.rs)) claims the worst case
     is a newer frame, but the two slots ([`web/src/frame.rs:50`](../crates/web/src/frame.rs))
