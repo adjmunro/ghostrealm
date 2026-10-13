@@ -4594,7 +4594,100 @@ mod tests {
         pollster::block_on(offscreen_red());
     }
 
-    async fn offscreen_red() {
+    /// Paint one 192x24 monospace row of `text` in `style` and rasterise it: the
+    /// frame's under-text quads on the GPU, then the shaped glyphs composited on
+    /// the CPU. RGBA8 pixels.
+    fn draw_row(text: &str, style: crate::row_cache::RunStyle) -> Vec<u8> {
+        use crate::plugin::testing::{Harness, UI};
+        use crate::plugin::{Layer, PaintCx, RowStyles, TextSrc};
+        use glyphon::cosmic_text::{SwashCache, SwashContent};
+
+        const DIM: u32 = 192;
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let clip = Rect { x: 0.0, y: 0.0, w: DIM as f32, h: DIM as f32 };
+        let fg = [220, 220, 230];
+        let runs = [style];
+        let styles = if style.is_plain() { RowStyles::NONE } else { RowStyles { runs: &runs, cell_w: UI.cell_w } };
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            let key = cx.row_key_styled(std::iter::once((text, fg)), styles);
+            let spans = vec![(text.to_string(), fg)];
+            cx.budgeted_row_styled(key, || spans, styles, 8.0, 8.0, 180.0, clip, fg);
+        }
+        // The frame is laid out for an 800x600 surface: re-express its quads for the texture.
+        let (sw, sh) = h.frame.screen;
+        let quads: Vec<QuadInstance> = h
+            .frame
+            .bg
+            .iter()
+            .map(|q| {
+                let px = |ndc: f32, span: f32| (ndc + 1.0) / 2.0 * span / DIM as f32 * 2.0 - 1.0;
+                QuadInstance {
+                    pos: [px(q.pos[0], sw), -px(-q.pos[1], sh)],
+                    size: [q.size[0] * sw / DIM as f32, q.size[1] * sh / DIM as f32],
+                    color: q.color,
+                }
+            })
+            .collect();
+        let bg = wgpu::Color { r: 0.02, g: 0.02, b: 0.03, a: 1.0 };
+        let mut px = pollster::block_on(render_quads(&quads, DIM, bg));
+        let mut swash = SwashCache::new();
+        for item in &h.frame.text {
+            let TextSrc::Row(key) = item.src else { continue };
+            let buffer = h.text.row_cache.buffer(key).expect("shaped row");
+            for run in buffer.layout_runs() {
+                for g in run.glyphs {
+                    let p = g.physical((item.left, item.top), 1.0);
+                    let Some(img) = swash.get_image(&mut h.text.font_system, p.cache_key).as_ref() else {
+                        continue;
+                    };
+                    if img.content != SwashContent::Mask {
+                        continue;
+                    }
+                    let c = g.color_opt.map_or(fg, |c| [c.r(), c.g(), c.b()]);
+                    for (i, a) in img.data.iter().enumerate() {
+                        let x = p.x + img.placement.left + (i as u32 % img.placement.width) as i32;
+                        let y = (run.line_y as i32) + p.y - img.placement.top + (i as u32 / img.placement.width) as i32;
+                        if x < 0 || y < 0 || x >= DIM as i32 || y >= DIM as i32 {
+                            continue;
+                        }
+                        let o = ((y as u32 * DIM + x as u32) * 4) as usize;
+                        for k in 0..3 {
+                            let old = px[o + k] as u32;
+                            px[o + k] = ((c[k] as u32 * *a as u32 + old * (255 - *a as u32)) / 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        px
+    }
+
+    /// Bold, italic, underline, and a code box each change the pixels of a row; a
+    /// plain row draws the same every time.
+    #[test]
+    fn styled_rows_render_differently_from_plain() {
+        use crate::row_cache::RunStyle;
+        let text = "Hello world, mix";
+        let plain = draw_row(text, RunStyle::PLAIN);
+        assert_eq!(plain, draw_row(text, RunStyle::PLAIN), "rendering is deterministic");
+        assert!(plain.chunks(4).any(|p| p[0] > 100), "the plain row drew glyphs");
+        for (name, style) in [
+            ("bold", RunStyle::BOLD),
+            ("italic", RunStyle::ITALIC),
+            ("underline", RunStyle::UNDERLINE),
+            ("box", RunStyle::BOX),
+        ] {
+            assert_ne!(draw_row(text, style), plain, "{name} looks like plain text");
+        }
+        assert_ne!(draw_row(text, RunStyle::BOLD), draw_row(text, RunStyle::ITALIC));
+    }
+
+    /// Render `quads` over `clear` on a `dim`x`dim` offscreen texture; RGBA8 pixels.
+    async fn render_quads(quads: &[QuadInstance], dim: u32, clear: wgpu::Color) -> Vec<u8> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -4609,7 +4702,6 @@ mod tests {
             .expect("request device");
 
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let dim = 64u32;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d {
@@ -4627,18 +4719,13 @@ mod tests {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let pipeline = build_quad_pipeline(&device, format);
 
-        let inst = QuadInstance {
-            pos: [-1.0, 1.0],
-            size: [2.0, -2.0],
-            color: [1.0, 0.0, 0.0, 1.0],
-        };
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test-quad"),
-            size: std::mem::size_of::<QuadInstance>() as u64,
+            size: (std::mem::size_of::<QuadInstance>() * quads.len().max(1)) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&[inst]));
+        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(quads));
 
         let bytes_per_row = dim * 4;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4658,7 +4745,7 @@ mod tests {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -4669,7 +4756,7 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.draw(0..4, 0..1);
+            pass.draw(0..4, 0..quads.len() as u32);
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -4707,7 +4794,20 @@ mod tests {
             .expect("poll");
         rx.recv().expect("map channel").expect("map ok");
         let data = slice.get_mapped_range().expect("map range");
+        let out = data.to_vec();
+        drop(data);
+        out
+    }
 
+    async fn offscreen_red() {
+        let dim = 64u32;
+        let inst = QuadInstance {
+            pos: [-1.0, 1.0],
+            size: [2.0, -2.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+        };
+        let data = render_quads(&[inst], dim, wgpu::Color::BLACK).await;
+        let bytes_per_row = dim * 4;
         let off = ((dim / 2) * bytes_per_row + (dim / 2) * 4) as usize;
         let px = [data[off], data[off + 1], data[off + 2], data[off + 3]];
         assert!(
