@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
-use ghostrealm_core::highlight::{self, Span, StateCache};
+use ghostrealm_core::highlight::{self, SpanCache, StateCache};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -201,6 +201,8 @@ pub struct EditorView {
     lang: Option<Lang>,
     /// Where each line's syntax-highlight state starts.
     hl_states: StateCache,
+    /// Highlight of the lines on screen, kept between frames.
+    hl_spans: SpanCache,
 }
 
 impl EditorView {
@@ -215,6 +217,7 @@ impl EditorView {
         stats.fetch_head(buf.path.clone());
         EditorView {
             hl_states: StateCache::default(),
+            hl_spans: SpanCache::default(),
             stats,
             seen_edits: buf.edits,
             buf,
@@ -532,6 +535,9 @@ impl View for EditorView {
         }
         self.buf.clamp_scroll_bounds();
 
+        if let Some(row) = self.buf.dirty_from.take() {
+            self.hl_states.dirty_from(row);
+        }
         let e = &self.buf;
         let (scroll, cursor, sel) = (e.scroll, e.cursor, e.selection());
         // Unwrapped rows hold their whole line, shaped once, drawn shifted left
@@ -609,16 +615,15 @@ impl View for EditorView {
         // Text, one cache-keyed row per visual row (wrapped sub-rows stay
         // cache-friendly), shaped within the frame's budget.
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
-        // A wrapped line's rows share one highlight pass.
-        let mut line_spans: Option<(usize, Vec<Span>)> = None;
         for (ln, text, start, y) in &vis {
             let spans: Vec<(String, [u8; 3])> = match highlighter {
                 Some(h) => {
-                    if line_spans.as_ref().is_none_or(|(l, _)| l != ln) {
-                        let state = self.hl_states.state_in(h, &e.lines, e.edits, *ln);
-                        line_spans = Some((*ln, h.line(&e.lines[*ln], state).0));
-                    }
-                    let hl = &line_spans.as_ref().expect("set above").1;
+                    let state = if h.carries_state() {
+                        self.hl_states.state_in(h, &e.lines, e.edits, *ln)
+                    } else {
+                        0
+                    };
+                    let hl = self.hl_spans.spans(h, &e.lines[*ln], state);
                     syntax::row_spans(&e.lines[*ln], hl, *start, text.chars().count(), EDITOR_FG)
                 }
                 None => vec![(text.clone(), EDITOR_FG)],
@@ -1283,6 +1288,44 @@ mod tests {
             let drawn = h.paint(&mut v, RECT).text.len();
             assert!(drawn >= rows.min(60 - scroll) - 1, "scroll {scroll}: {drawn} rows");
         }
+    }
+
+    #[test]
+    fn highlight_state_follows_edits_reported_by_the_buffer() {
+        let dir = tmpdir("editor-highlight-edits");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "a\n```\nb\nc\n```\nd\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        let mut h = Harness::new();
+        let md = highlight::for_extension("md").unwrap();
+        // The state each line enters with, by the cache and by a full pass.
+        let check = |v: &mut EditorView| {
+            let mut state = 0;
+            for (i, l) in v.buf.lines.clone().iter().enumerate() {
+                let got = v.hl_states.state_in(md, &v.buf.lines, v.buf.edits, i);
+                assert_eq!(got, state, "line {i} of {:?}", v.buf.lines);
+                state = md.line(l, state).1;
+            }
+        };
+        paint_in_strip(&mut h, &mut v);
+        check(&mut v);
+        // Delete the opening fence's first backtick: the block is no longer a fence.
+        v.buf.cursor = (1, 0);
+        h.key(&mut v, press(Key::Delete));
+        paint_in_strip(&mut h, &mut v);
+        check(&mut v);
+        // Type it back, then undo.
+        h.key(&mut v, press(Key::Char('`')));
+        paint_in_strip(&mut h, &mut v);
+        check(&mut v);
+        h.key(&mut v, cmd(Key::Char('z')));
+        paint_in_strip(&mut h, &mut v);
+        check(&mut v);
+        // A new line above shifts the fence down.
+        v.buf.cursor = (0, 1);
+        h.key(&mut v, press(Key::Enter));
+        paint_in_strip(&mut h, &mut v);
+        check(&mut v);
     }
 
     #[test]

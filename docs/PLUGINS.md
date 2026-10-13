@@ -133,9 +133,12 @@ highlighter turns one line plus the `State` carried from the line before into
 contiguous `Span`s of palette-free `Token`s (`Comment`, `Heading`, `Key`,
 `Marker`, `Strong`, `Emphasis`, `Code`, `Link`, ...). `syntax::row_spans` maps
 them to colours (`syntax::color`) and slices them to a visual row, ready for
-`PaintCx::row`/`budgeted_row`. A view that edits text keeps a `StateCache` so a
-scrolled row knows its start state without re-highlighting the file; a view that
+`PaintCx::row`/`budgeted_row`. A view that edits text keeps a `StateCache` (only
+for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
+so a scrolled row knows its start state without re-highlighting the file, and a
+`SpanCache` so lines still on screen aren't re-highlighted each frame. A view that
 reads a file once (the browser's preview) runs `highlight_lines` on its worker.
+A highlighter must bound its work per line: a paint highlights every visible line.
 To add a language, implement `Highlighter` in a module under `core/src/highlight/`
 and list it in `ALL`.
 

@@ -28,6 +28,9 @@ pub struct EditorBuffer {
     pub modified: bool,
     /// Monotonic count of text-changing edits, for the idle-autosave timer.
     pub edits: u64,
+    /// The first line changed since a consumer last took this (`None` = none).
+    /// Lets a per-line cache re-check only from there on.
+    pub dirty_from: Option<usize>,
     /// Selection anchor (row, col); `None` = no selection. The selection spans
     /// anchor..cursor.
     pub anchor: Option<(usize, usize)>,
@@ -94,6 +97,7 @@ impl EditorBuffer {
             path: None,
             modified: false,
             edits: 0,
+            dirty_from: None,
             anchor: None,
             history: History::default(),
         }
@@ -117,6 +121,7 @@ impl EditorBuffer {
             path: Some(path),
             modified: false,
             edits: 0,
+            dirty_from: None,
             anchor: None,
             history: History::default(),
         })
@@ -179,9 +184,10 @@ impl EditorBuffer {
         self.anchor = None;
     }
 
-    /// Mark a text-changing edit: sets the unsaved flag and bumps the edit count
-    /// (which the idle-autosave timer watches).
-    fn touch(&mut self) {
+    /// Mark a text-changing edit that starts at line `row`: sets the unsaved
+    /// flag and bumps the edit count (which the idle-autosave timer watches).
+    fn touch(&mut self, row: usize) {
+        self.dirty_from = Some(self.dirty_from.map_or(row, |d| d.min(row)));
         self.modified = true;
         self.edits = self.edits.wrapping_add(1);
     }
@@ -212,7 +218,7 @@ impl EditorBuffer {
         }
         self.cursor = (sr, sc);
         self.anchor = None;
-        self.touch();
+        self.touch(sr);
         true
     }
 
@@ -234,7 +240,7 @@ impl EditorBuffer {
         let b = self.byte_of(row, col);
         self.lines[row].insert(b, c);
         self.cursor.1 = col + 1;
-        self.touch();
+        self.touch(row);
     }
 
     pub fn insert_newline(&mut self) {
@@ -244,7 +250,7 @@ impl EditorBuffer {
         let tail = self.lines[row].split_off(b);
         self.lines.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
-        self.touch();
+        self.touch(row);
     }
 
     /// Delete the char before the cursor, joining with the previous line at the
@@ -425,6 +431,7 @@ impl EditorBuffer {
         self.history.version = s.version;
         self.history.run = None;
         self.edits = self.edits.wrapping_add(1);
+        self.dirty_from = Some(0);
         self.modified = s.version != self.history.saved_version;
     }
 
@@ -524,6 +531,40 @@ pub(crate) fn split_lines(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_report_the_first_line_they_changed() {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str("a\nb\nc\nd");
+        assert_eq!(e.dirty_from.take(), Some(0));
+
+        e.cursor = (2, 1);
+        e.insert_char('x');
+        assert_eq!(e.dirty_from.take(), Some(2));
+        e.insert_newline();
+        assert_eq!(e.dirty_from.take(), Some(2), "the split line, not the new one");
+
+        // Several edits before anyone looks: the earliest wins.
+        e.cursor = (3, 0);
+        e.insert_char('y');
+        e.cursor = (1, 0);
+        e.insert_char('z');
+        e.cursor = (3, 0);
+        e.insert_char('w');
+        assert_eq!(e.dirty_from.take(), Some(1));
+
+        // A selection reaching back to an earlier line starts there.
+        e.anchor = Some((1, 0));
+        e.cursor = (3, 1);
+        assert!(e.delete_selection());
+        assert_eq!(e.dirty_from.take(), Some(1));
+
+        e.cursor = (2, 0);
+        e.apply(Edit::Insert("q".into()), &mut None::<String>);
+        assert_eq!(e.dirty_from.take(), Some(2));
+        e.apply(Edit::Undo, &mut None::<String>);
+        assert_eq!(e.dirty_from.take(), Some(0), "a restore may change any line");
+    }
 
     #[test]
     fn typing_and_newlines() {
