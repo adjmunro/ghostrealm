@@ -601,7 +601,7 @@ impl WebView {
     pub fn edit_url(&mut self) {
         let e = self
             .url_edit
-            .get_or_insert_with(|| LineEdit::new(self.state.url.clone()));
+            .get_or_insert_with(|| LineEdit::new(self.state.url.clone()).with_plain_brackets());
         let _ = e.apply(Edit::SelectAll, &mut None::<String>);
         self.sync_focus(true);
     }
@@ -1384,6 +1384,18 @@ mod tests {
         assert!(v.hovering);
         h.mouse(&mut v, MouseEvent::Leave { pos: (900.0, 10.0) });
         assert!(!v.hovering, "the page is told the pointer left");
+    }
+
+    #[test]
+    fn a_bracket_typed_over_the_selected_url_replaces_it() {
+        let mut v = hostless();
+        v.state.url = "https://example.com/".into();
+        v.edit_url();
+        let h = Harness::new();
+        for c in "[::1]".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        assert_eq!(v.url_edit.as_ref().unwrap().text(), "[::1]");
     }
 
     #[test]

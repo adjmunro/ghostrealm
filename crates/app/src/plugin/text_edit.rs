@@ -24,11 +24,12 @@
 //! and Cmd (the text's ends, select all, clipboard), and Home/End for lines.
 //!
 //! Brackets: typing `(`, `[`, or `{` over a selection wraps it in the pair and
-//! keeps the wrapped text selected (every text input; a paste never wraps). The
-//! editor goes further: an opening bracket with no selection inserts its closer
-//! after the cursor unless a word character follows; typing a closer when the
-//! same one comes next steps over it; Backspace between an empty pair removes
-//! both. Wrapping is its own undo step.
+//! keeps the wrapped text selected (every text input but the URL bar, where
+//! brackets are address syntax; a paste never wraps). The editor goes further:
+//! an opening bracket with no selection inserts its closer after the cursor
+//! unless a word character follows; typing a closer when the same one comes
+//! next steps over it; Backspace between an empty pair removes both. Wrapping
+//! is its own undo step.
 
 use std::sync::OnceLock;
 
@@ -399,6 +400,8 @@ pub struct LineEdit {
     cursor: usize,
     /// Selection anchor column; the selection spans anchor..cursor.
     anchor: Option<usize>,
+    /// Brackets are plain text: typing one over a selection replaces it.
+    plain_brackets: bool,
 }
 
 impl LineEdit {
@@ -407,6 +410,13 @@ impl LineEdit {
         let mut e = LineEdit::default();
         e.set_text(text);
         e
+    }
+
+    /// Typing a bracket over a selection replaces it instead of wrapping it:
+    /// for a field whose brackets are syntax of their own (a URL's `[::1]`).
+    pub fn with_plain_brackets(mut self) -> Self {
+        self.plain_brackets = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -493,6 +503,9 @@ impl LineEdit {
         let (Some(close), Some((s, e))) = (closer_of(open), self.selection()) else {
             return false;
         };
+        if self.plain_brackets {
+            return false;
+        }
         let (be, bs) = (self.byte_of(e), self.byte_of(s));
         self.text.insert(be, close);
         self.text.insert(bs, open);
