@@ -243,54 +243,28 @@ mod tests {
         );
     }
 
-    /// A reader that hands out one request line per `read`, sleeping `pause`
-    /// before the lines named in `slow_before`, so background output can land.
-    struct Paced {
-        lines: std::collections::VecDeque<String>,
-        slow_before: Vec<usize>,
-        index: usize,
-        pause: std::time::Duration,
-    }
-
-    impl std::io::Read for Paced {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let Some(line) = self.lines.pop_front() else { return Ok(0) };
-            if self.slow_before.contains(&self.index) {
-                std::thread::sleep(self.pause);
-            }
-            self.index += 1;
-            let bytes = format!("{line}\n").into_bytes();
-            buf[..bytes.len()].copy_from_slice(&bytes);
-            Ok(bytes.len())
-        }
-    }
-
     #[test]
     fn an_exited_terminal_stays_so_get_surface_reads_its_output() {
         let mut state = AppState::new().with_shell_line("printf 'FINISHED'; exit 0");
         state.new_vtab().unwrap();
         let id = state.focused_surface().unwrap().0;
-        let reader = Paced {
-            lines: [
-                r#"{"op":"get","what":"tree"}"#.to_string(),
-                format!(r#"{{"op":"get","what":"surface","id":{id}}}"#),
-                r#"{"op":"get","what":"tree"}"#.to_string(),
-            ]
-            .into(),
-            slow_before: vec![1],
-            index: 0,
-            pause: std::time::Duration::from_millis(1500),
+        state.set_close_on_exit(CloseOnExit::Never);
+        let mut registry = build_registry();
+        let mut ask = |state: &mut AppState, req: &str| handle(req, state, &mut registry);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let text = loop {
+            let resp = ask(&mut state, &format!(r#"{{"op":"get","what":"surface","id":{id}}}"#));
+            let text = resp["text"].as_str().unwrap_or_else(|| panic!("{resp:?}")).to_string();
+            let exited = state.surface_lifecycle(SurfaceId(id)).is_some_and(|l| l.has_exited());
+            if text.contains("FINISHED") && exited {
+                break text;
+            }
+            assert!(std::time::Instant::now() < deadline, "no output and exit; got:\n{text}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let mut out: Vec<u8> = Vec::new();
-        run(std::io::BufReader::new(reader), &mut out, state).expect("agent run");
-        let resps: Vec<Json> = String::from_utf8(out)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        let text = resps[1]["text"].as_str().unwrap_or_else(|| panic!("{:?}", resps[1]));
         assert!(text.contains("FINISHED"), "the output stays readable:\n{text}");
-        assert!(resps[2]["tree"].as_str().unwrap().contains("surface "), "the surface is still in the tree");
+        let resp = ask(&mut state, r#"{"op":"get","what":"tree"}"#);
+        assert!(resp["tree"].as_str().unwrap().contains("surface "), "the surface is still in the tree");
     }
 
     #[test]
