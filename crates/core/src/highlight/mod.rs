@@ -69,10 +69,10 @@ pub trait Highlighter: Sync {
     /// state the next line enters with.
     fn line(&self, line: &str, state: State) -> (Vec<Span>, State);
 
-    /// Whether a line that enters with `state_in` and leaves with `state_out`
+    /// Whether `line`, entering with `state_in` and leaving with `state_out`,
     /// belongs to a block drawn as a unit (a fenced code block, including its
     /// fences).
-    fn block(&self, _state_in: State, _state_out: State) -> bool {
+    fn block(&self, _line: &str, _state_in: State, _state_out: State) -> bool {
         false
     }
 }

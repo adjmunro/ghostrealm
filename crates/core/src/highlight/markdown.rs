@@ -37,8 +37,8 @@ impl Highlighter for Markdown {
         (runs(&tok), next)
     }
 
-    fn block(&self, state_in: State, state_out: State) -> bool {
-        state_in != 0 || state_out != 0
+    fn block(&self, line: &str, state_in: State, state_out: State) -> bool {
+        state_out != 0 || (state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in))
     }
 }
 
@@ -118,20 +118,27 @@ fn blank(c: &[char]) -> bool {
     c.iter().all(|x| x.is_whitespace())
 }
 
+/// Whether line `c`, entering inside the fence `state`, leaves the fence's
+/// container (which ends the fence): a non-blank line with no indent for a
+/// list item, with no `>` for a quote.
+fn leaves(c: &[char], state: State) -> bool {
+    let indent = run_of(c, 0, ' ');
+    let quoted = c.get(indent) == Some(&'>');
+    !blank(c)
+        && match fence_of(state).2 {
+            LIST => indent == 0 && !quoted,
+            QUOTE => !quoted,
+            _ => false,
+        }
+}
+
 /// Classify one line; returns the state the next line enters with.
 fn block(c: &[char], tok: &mut [Token], state: State) -> State {
     let n = c.len();
     let indent = run_of(c, 0, ' ');
     if state != 0 {
         let (fc, flen, container) = fence_of(state);
-        let quoted = c.get(indent) == Some(&'>');
-        let left = !blank(c)
-            && match container {
-                LIST => indent == 0 && !quoted,
-                QUOTE => !quoted,
-                _ => false,
-            };
-        if !left {
+        if !leaves(c, state) {
             // Skip the container's prefix (indent, `>`), then look for the closer.
             let mut p = 0;
             if container != TOP {
@@ -646,10 +653,24 @@ mod tests {
     fn markdown_marks_fence_rows_as_a_block() {
         let (_, open) = lex_in("```toml", 0);
         let (_, inside) = lex_in("a = 1", open);
-        assert!(Markdown.block(0, open), "the opening fence");
-        assert!(Markdown.block(open, inside), "a body line");
-        assert!(Markdown.block(inside, 0), "the closing fence");
-        assert!(!Markdown.block(0, 0), "prose");
+        assert!(Markdown.block("```toml", 0, open), "the opening fence");
+        assert!(Markdown.block("a = 1", open, inside), "a body line");
+        assert!(Markdown.block("```", inside, 0), "the closing fence");
+        assert!(!Markdown.block("text", 0, 0), "prose");
+    }
+
+    #[test]
+    fn a_line_that_leaves_a_fences_container_is_not_part_of_the_block() {
+        for (open, body, close, after) in
+            [("- ```toml", "  a = 1", "  ```", "after"), ("> ```", "> x", "> ```", "after")]
+        {
+            let (_, s) = lex_in(open, 0);
+            let (_, s) = lex_in(body, s);
+            assert!(Markdown.block(close, s, lex_in(close, s).1), "{close:?} closes the block");
+            let (_, out) = lex_in(after, s);
+            assert_eq!(out, 0, "{after:?} ends the fence");
+            assert!(!Markdown.block(after, s, out), "{after:?} after {open:?} is prose");
+        }
     }
 
     #[test]

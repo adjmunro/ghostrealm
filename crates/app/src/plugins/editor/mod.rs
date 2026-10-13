@@ -625,7 +625,7 @@ impl View for EditorView {
                         0
                     };
                     let (hl, next) = self.hl_spans.line(h, &e.lines[*ln], state);
-                    let block = h.block(state, next);
+                    let block = h.block(&e.lines[*ln], state, next);
                     if block {
                         let r = Rect { x: text_x, y: *y, w: body.x + body.w - text_x, h: ch };
                         cx.fill_alpha(r, theme::CODE_BG, theme::CODE_BG_ALPHA);
