@@ -78,7 +78,7 @@
 
 ---
 
-[2026-10-05T21:13+1300@e175cf0d]
+[2026-10-05T21:13+1300@04794e15]
 
 - Category: Web surface / embedded browser
 - Detail: Web pages render via CEF (`cef` crate, prebuilt CEF binary distribution) in a separate host process (`crates/web-host`), off-screen, with software compositing. Frames reach the app through shared-memory files and are drawn as textures in the app's own wgpu scene; input and commands go over a JSON-line pipe (`crates/web`).
@@ -90,7 +90,7 @@
 
 ---
 
-[2026-10-05T20:35+1300@0c5b05d7]
+[2026-10-05T20:35+1300@3f581979]
 
 - Category: Dependencies / media preview
 - Detail: Images decode with `image` (still formats only: bmp, gif, ico, jpeg, png, tiff, webp; no rayon). Audio plays through `rodio` (cpal output + symphonia decoders: flac, mp3, mp4/aac, vorbis, wav; no recording).

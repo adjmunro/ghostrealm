@@ -406,7 +406,7 @@
 
 ---
 
-[2026-10-05T20:35+1300@0c5b05d7] File browser — preview pane follow-ups
+[2026-10-05T20:35+1300@3f581979] File browser — preview pane follow-ups
 
 - Requires: NO BLOCKERS
 - Detail: The preview (details, text head, images, audio) is in. Remaining:
@@ -653,7 +653,7 @@
 
 ---
 
-[2026-10-05@e175cf0] Web surface — follow-ups
+[2026-10-05@04794e1] Web surface — follow-ups
 
 - Requires: NO BLOCKERS
 - Detail: The basic CEF web surface is in (toolbar, URL bar, page input, agent

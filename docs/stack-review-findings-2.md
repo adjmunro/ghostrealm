@@ -73,6 +73,3 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     clicking an audio row opens the editor. Decision needed: follow the
     selection (as Finder does), pin to the chosen row, or hold the subject while
     the pointer travels to the preview?
-35. **Stale stamps.** DECISION.md and TODO.md stamp the preview entries
-    `@0c5b05d7` and the browser entries `@e175cf0d`/`@e175cf0`, which predate the
-    rebase.
