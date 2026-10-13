@@ -206,11 +206,31 @@ pub fn rename(path: &Path, name: &str) -> Result<PathBuf> {
     if dest == path {
         return Ok(dest);
     }
-    if dest.symlink_metadata().is_ok() {
+    if dest.symlink_metadata().is_ok() && !same_entry_recased(path, &dest) {
         bail!("\u{201c}{name}\u{201d} already exists");
     }
     std::fs::rename(path, &dest).with_context(|| format!("can't rename {}", path.display()))?;
     Ok(dest)
+}
+
+/// Whether `dest` names the entry `path` with only the case changed, as a
+/// case-insensitive filesystem (macOS's default) finds it already there.
+fn same_entry_recased(path: &Path, dest: &Path) -> bool {
+    let same_name = match (path.file_name(), dest.file_name()) {
+        (Some(a), Some(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
+        _ => false,
+    };
+    #[cfg(unix)]
+    let same_file = {
+        use std::os::unix::fs::MetadataExt;
+        match (path.symlink_metadata(), dest.symlink_metadata()) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    };
+    #[cfg(not(unix))]
+    let same_file = false;
+    same_name && same_file
 }
 
 /// Where `path` is now, given that each `(from, to)` of `moved` was moved:
@@ -537,5 +557,20 @@ pub mod tests {
         std::thread::spawn(move || tx.send(duplicate(&src).is_err()));
         let failed = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the copy returns");
         assert!(failed);
+    }
+
+    #[test]
+    fn a_rename_may_change_only_the_case_of_a_name() {
+        let d = tmpdir("ops-rename-case");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        assert_eq!(rename(&d.join("a.txt"), "A.txt").unwrap(), d.join("A.txt"));
+        assert_eq!(names(&d), ["A.txt"]);
+        assert_eq!(std::fs::read_to_string(d.join("A.txt")).unwrap(), "A");
+        // Another file whose name differs only in case is still taken.
+        std::fs::write(d.join("b.txt"), "B").unwrap();
+        if d.join("B.TXT").exists() {
+            assert!(rename(&d.join("A.txt"), "B.txt").is_err(), "case-insensitive: b.txt is taken");
+            assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "B");
+        }
     }
 }
