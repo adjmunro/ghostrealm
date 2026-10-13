@@ -171,6 +171,14 @@ impl EditorBuffer {
         self.cursor = (row, end);
     }
 
+    /// Select the whole of line `row` (without its newline).
+    pub fn select_line_at(&mut self, row: usize) {
+        if row < self.lines.len() {
+            self.anchor = Some((row, 0));
+            self.cursor = (row, self.line_len(row));
+        }
+    }
+
     pub fn line_len(&self, row: usize) -> usize {
         self.lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
     }

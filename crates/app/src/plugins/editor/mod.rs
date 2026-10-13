@@ -731,9 +731,14 @@ impl View for EditorView {
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
                     self.buf.cursor = p;
                     self.buf.anchor = Some(p);
-                    // A double-click selects the word; its release keeps it.
+                    // A double-click selects the word under the pointer (the
+                    // character it is over, not the nearest caret); a triple-click
+                    // the line. The release keeps either.
                     if clicks == 2 {
-                        self.buf.select_word_at(p);
+                        let over = self.char_at(x, y, cw, ch).unwrap_or(p);
+                        self.buf.select_word_at(over);
+                    } else if clicks >= 3 {
+                        self.buf.select_line_at(p.0);
                     }
                     cx.redraw();
                 }
@@ -1131,6 +1136,28 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 7), clicks: 2 });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 7), dragged: false });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn double_click_on_the_right_half_of_a_cell_selects_that_cells_word() {
+        let mut v = view_with("hello world again");
+        let mut h = Harness::new();
+        paint_in_strip(&mut h, &mut v);
+        let (x, y) = at(0, 10); // the `d` ending "world"
+        let pos = (x + UI.cell_w * 0.75, y);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false });
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_line() {
+        let mut v = view_with("one two\nthree");
+        let mut h = Harness::new();
+        paint_in_strip(&mut h, &mut v);
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 5), clicks: 3 });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: false });
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("one two"));
     }
 
     #[test]
