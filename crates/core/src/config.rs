@@ -41,12 +41,38 @@ impl Default for Sidebar {
     }
 }
 
+/// When a terminal closes by itself because its shell exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CloseOnExit {
+    /// Only after an exit with code 0; a failure or a signal stays on screen.
+    #[default]
+    Clean,
+    /// After any exit.
+    Always,
+    /// Never: the terminal stays until it is closed.
+    Never,
+}
+
+impl CloseOnExit {
+    /// Whether to close a terminal whose shell exited cleanly (code 0) or not.
+    pub fn closes(self, clean_exit: bool) -> bool {
+        match self {
+            CloseOnExit::Clean => clean_exit,
+            CloseOnExit::Always => true,
+            CloseOnExit::Never => false,
+        }
+    }
+}
+
 /// `[terminal]`
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Terminal {
     pub font_size: f32,
     pub line_height: f32,
+    /// When the terminal closes after its shell exits.
+    pub close_on_exit: CloseOnExit,
 }
 
 impl Default for Terminal {
@@ -54,6 +80,7 @@ impl Default for Terminal {
         Terminal {
             font_size: 15.0,
             line_height: 18.0,
+            close_on_exit: CloseOnExit::Clean,
         }
     }
 }
@@ -508,6 +535,26 @@ mod tests {
             .map(|key| KeyDoc { key, title: "", doc: "" })
             .collect();
         Catalogue::new(core_sections(&commands))
+    }
+
+    #[test]
+    fn close_on_exit_takes_its_three_values_and_drops_the_rest() {
+        let get = |v: &str| parse(&format!("[terminal]\nclose_on_exit = {v}\n"), &cat());
+        assert_eq!(Terminal::default().close_on_exit, CloseOnExit::Clean);
+        for (v, want) in [
+            ("\"clean\"", CloseOnExit::Clean),
+            ("\"always\"", CloseOnExit::Always),
+            ("\"never\"", CloseOnExit::Never),
+        ] {
+            let (cfg, findings) = get(v);
+            assert_eq!(cfg.unwrap().terminal.close_on_exit, want);
+            assert!(findings.is_empty(), "{v}: {findings:?}");
+        }
+        let (cfg, findings) = get("\"sometimes\"");
+        assert_eq!(cfg.unwrap().terminal.close_on_exit, CloseOnExit::Clean, "falls back");
+        assert!(!findings.is_empty());
+        assert!(CloseOnExit::Clean.closes(true) && !CloseOnExit::Clean.closes(false));
+        assert!(CloseOnExit::Always.closes(false) && !CloseOnExit::Never.closes(true));
     }
 
     #[test]

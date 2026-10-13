@@ -169,6 +169,12 @@ impl Catalogue {
     }
 }
 
+const CLOSE_ON_EXIT: &[(&str, &str)] = &[
+    ("clean", "Close after exit code 0; keep a failed or killed shell with a banner (press any key to close)."),
+    ("always", "Close after any exit."),
+    ("never", "Keep every exited shell with a banner (press any key to close)."),
+];
+
 const SIDES: &[(&str, &str)] = &[("left", "Left edge of the window."), ("right", "Right edge of the window.")];
 
 /// The app's own sections. `commands` lists every command a chord can bind:
@@ -205,7 +211,8 @@ pub fn core_sections(commands: &[KeyDoc]) -> Vec<SectionSpec> {
         ),
         SectionSpec::options(
             "terminal",
-            "Text metrics for terminals and every other monospace view.",
+            "Text metrics for terminals and every other monospace view, and what happens \
+             when a shell exits.",
             vec![
                 OptionSpec::new("font_size", Float { min: 4.0, max: 96.0 }, Some("15.0"), "Font size in points."),
                 OptionSpec::new(
@@ -213,6 +220,12 @@ pub fn core_sections(commands: &[KeyDoc]) -> Vec<SectionSpec> {
                     Float { min: 4.0, max: 200.0 },
                     Some("18.0"),
                     "Row height in points (at least font_size).",
+                ),
+                OptionSpec::new(
+                    "close_on_exit",
+                    Enum(CLOSE_ON_EXIT),
+                    Some("\"clean\""),
+                    "When a terminal closes by itself because its shell exited.",
                 ),
             ],
         ),
