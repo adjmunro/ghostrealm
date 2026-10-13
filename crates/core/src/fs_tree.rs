@@ -87,8 +87,8 @@ pub enum FsView {
     Kind,
     /// Group files by git status (Modified/Untracked/Unchanged).
     GitStatus,
-    /// Group files by modified-date bucket (Today/This week/…).
-    Date,
+    /// Group files by modified-time bucket (Today/This week/…).
+    Modified,
     /// Group files by size bucket.
     Size,
 }
@@ -99,8 +99,8 @@ impl FsView {
             FsView::Tree => FsView::Extension,
             FsView::Extension => FsView::Kind,
             FsView::Kind => FsView::GitStatus,
-            FsView::GitStatus => FsView::Date,
-            FsView::Date => FsView::Size,
+            FsView::GitStatus => FsView::Modified,
+            FsView::Modified => FsView::Size,
             FsView::Size => FsView::Tree,
         }
     }
@@ -112,7 +112,7 @@ impl FsView {
             FsView::Extension => "type",
             FsView::Kind => "kind",
             FsView::GitStatus => "git",
-            FsView::Date => "date",
+            FsView::Modified => "modified",
             FsView::Size => "size",
         }
     }
@@ -308,7 +308,7 @@ impl FsTree {
         }
     }
 
-    /// Advance to the next view mode (tree → type → kind → git → date → size → …).
+    /// Advance to the next view mode (tree → type → kind → git → modified → size → …).
     pub fn cycle_view(&mut self) {
         self.view = self.view.next();
         self.dirty = true;
@@ -802,8 +802,8 @@ impl FsTree {
                     (2, "Unchanged".into())
                 }
             }
-            FsView::Date => {
-                let (o, l) = date_bucket(e.mtime);
+            FsView::Modified => {
+                let (o, l) = modified_bucket(e.mtime);
                 (o, l.into())
             }
             FsView::Size => {
@@ -951,7 +951,7 @@ fn kind_of(name: &str) -> (i64, &'static str) {
 }
 
 /// A modified-time bucket (sort order, label).
-fn date_bucket(mtime: Option<SystemTime>) -> (i64, &'static str) {
+fn modified_bucket(mtime: Option<SystemTime>) -> (i64, &'static str) {
     let Some(elapsed) = mtime.and_then(|t| t.elapsed().ok()) else {
         return (5, "Unknown");
     };
@@ -1294,6 +1294,13 @@ mod tests {
         assert!(rows.iter().any(|r| !r.is_category && r.name == "main.rs"));
         assert!(rows.iter().any(|r| !r.is_category && r.name == "lib.rs"));
         fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn the_time_grouped_view_is_labelled_modified() {
+        assert_eq!(FsView::Modified.label(), "modified");
+        assert_eq!(FsView::GitStatus.next(), FsView::Modified);
+        assert_eq!(FsView::Modified.next(), FsView::Size);
     }
 
     #[test]

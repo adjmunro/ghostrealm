@@ -387,9 +387,8 @@
   - **by kind** (higher level): group extensions into Images / Video / Audio /
     Documents / Code / Archives / Data / Other — great for a Downloads folder.
   - **by git status**: Modified / Untracked / Staged / Clean categories.
-  - **Modified** (formerly `date`): Today / This week / This month / Older
-    buckets by modification time. It still lists every file; it is a grouping,
-    not a filter.
+  - **modified**: Today / This week / This month / Older buckets by
+    modification time. Lists every file; it is a grouping, not a filter.
   - **by size**: tiny / small / large / huge buckets; plus a flat "largest files".
   - **recent**: flat, newest-first across the tree.
   DISAMBIGUATION for any flat/grouped view: when two shown files share a name,
@@ -433,9 +432,7 @@
   (`set_ext_filter` exists; git & recent have buttons) — add a control or an
   `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
   explicit range. Which time to filter by is open: the owner suspects modified
-  is the one wanted and created is not useful; created vs modified is a
-  separate question from the `date` view's rename to "Modified" (see "Quality of
-  life (owner review) — editor and file browser polish"). (5) recursive fuzzy walk caps at 20k
+  is the one wanted and created is not useful. (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
 
@@ -913,8 +910,8 @@
     surface.
   Decided in the review rounds and no longer open: Chromium sandbox on, web
   profile location, pop-up handling, shell exit, Delete = Trash, GitHub
-  permalinks (future), the file-browser date view naming (renamed "Modified"),
-  terminal mouse reports while scrolled back.
+  permalinks (future), the file-browser date view naming, terminal mouse
+  reports while scrolled back.
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -931,19 +928,6 @@
 
 - Requires: NO BLOCKERS
 - Detail:
-  - **File-browser date view**: the grouped view is labelled `date` and does
-    not say what it represents. Rename it to "Modified". It still lists every
-    file, grouped by modification time; it is not a filter and hides nothing
-    (owner, round 3: "It's still about the time. It's not some sort of like, oh,
-    these are the modified files."). No created-time choice for now, since
-    created time is probably not useful; the date filter follows the same rule
-    ("File browser — remaining polish" item (4)).
-    Owner, verbatim:
-    > When I say the file browser date view as created or modified, what I mean
-    > is that it currently says date and I don't know what that represents. So
-    > it needs to be renamed. Whether or not we have both created and modified
-    > is a different matter. Though I suspect modified is the one that we want
-    > and created isn't actually very useful.
   - **Split drag handle**: when draggable split handles are built, centre them
     on the border between panes (see "Splits — discoverability, draggable resize
     handles, ratios"). No drag handles exist yet.
