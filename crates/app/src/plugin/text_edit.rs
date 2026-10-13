@@ -27,9 +27,10 @@
 //! keeps the wrapped text selected (every text input but the URL bar, where
 //! brackets are address syntax; a paste never wraps). The editor goes further:
 //! an opening bracket with no selection inserts its closer after the cursor
-//! unless a word character follows; typing a closer when the same one comes
-//! next steps over it; Backspace between an empty pair removes both. Wrapping
-//! is its own undo step.
+//! when the line ends there or whitespace, a closer, or a separator follows
+//! ([`closes_before`]); typing a closer when the same one comes next steps
+//! over it; Backspace between an empty pair removes both. Wrapping is its own
+//! undo step.
 
 use std::sync::OnceLock;
 
@@ -302,10 +303,12 @@ pub fn typed_char(s: &str) -> Option<char> {
 }
 
 /// Whether auto-closing an opening bracket is welcome before `next` (the char
-/// after the cursor): not before a word character, where the bracket most
-/// likely stands alone (`(` typed in front of `foo`).
+/// after the cursor): at the line's end, before whitespace, a closing bracket,
+/// or a separator. Anywhere else (a word, a quote, an opening bracket, an
+/// operator) the bracket most likely starts an expression the user closes
+/// further on (`(` typed in front of `"foo"`).
 pub fn closes_before(next: Option<char>) -> bool {
-    next.is_none_or(|c| !is_word(c))
+    next.is_none_or(|c| c.is_whitespace() || ")]};:.,=>".contains(c))
 }
 
 /// The start of the word before `col`: skips non-word characters, then the word.

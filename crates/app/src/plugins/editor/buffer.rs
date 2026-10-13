@@ -293,7 +293,7 @@ impl EditorBuffer {
 
     /// Type `s`. A single bracket gets the editor's bracket handling: an
     /// opening one wraps a selection, or else inserts its closer after the
-    /// cursor (unless a word character follows); a closing one moves over an
+    /// cursor (where [`closes_before`] allows); a closing one moves over an
     /// identical closer that follows. Anything else is inserted as is.
     pub fn insert_typed(&mut self, s: &str) {
         let Some(c) = typed_char(s) else {
@@ -978,6 +978,18 @@ mod tests {
         e.cursor = (0, 2);
         typed(&mut e, "[");
         assert_eq!(e.lines, vec!["(x[])"]);
+        // Before an opening bracket, a quote, or an operator it starts an
+        // expression the user is about to close themselves.
+        for (text, want) in [("\"s\"", "(\"s\""), ("[1]", "([1]"), ("-x", "(-x"), ("&y", "(&y")] {
+            let mut e = buffer_with(text);
+            typed(&mut e, "(");
+            assert_eq!(e.lines, vec![want]);
+        }
+        for (text, want) in [(";", "();"), (",", "(),"), (".x", "().x"), ("}", "()}")] {
+            let mut e = buffer_with(text);
+            typed(&mut e, "(");
+            assert_eq!(e.lines, vec![want]);
+        }
         // Other characters, and a closing bracket with no twin after it, are plain.
         let mut e = EditorBuffer::scratch();
         typed(&mut e, "a)");
