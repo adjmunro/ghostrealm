@@ -111,7 +111,7 @@ pub fn run(command_line: Option<String>) -> Result<()> {
         command_line,
         proxy,
         wake_pending: Arc::new(AtomicBool::new(false)),
-        unsaved: Rc::new(Cell::new(false)),
+        unsaved: UnsavedFlag::default(),
     };
     event_loop.run_app(&mut app).context("run app")?;
     Ok(())
@@ -125,9 +125,33 @@ struct App {
     /// waker send at most one pending `PtyOutput` event no matter how many chunks
     /// arrive, so a flood doesn't drown the event queue.
     wake_pending: Arc<AtomicBool>,
-    /// Whether quitting would ask about unsaved changes, as of the last event.
-    /// The system's quit request reads it: AppKit wants an answer at once.
-    unsaved: Rc<Cell<bool>>,
+    /// Whether quitting would ask about unsaved changes. The system's quit
+    /// request reads it: AppKit wants an answer at once.
+    unsaved: UnsavedFlag,
+}
+
+/// A cached answer to "would quitting ask about unsaved changes?", shared with
+/// the system's quit request. The exact value is computed once per loop pass
+/// (`about_to_wait`); every event handler first assumes the worst, because an
+/// event (a keystroke) may edit a buffer and a quit request can arrive in the
+/// same pass before the exact value is refreshed. A wrong `true` only cancels
+/// the termination once: the app's own quit then exits at once when nothing is
+/// unsaved.
+#[derive(Clone, Default)]
+struct UnsavedFlag(Rc<Cell<bool>>);
+
+impl UnsavedFlag {
+    fn assume_unsaved(&self) {
+        self.0.set(true);
+    }
+
+    fn set(&self, unsaved: bool) {
+        self.0.set(unsaved);
+    }
+
+    fn get(&self) -> bool {
+        self.0.get()
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -181,6 +205,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        self.unsaved.assume_unsaved();
         let Some(state) = &mut self.state else { return };
         match event {
             // A terminal produced output. Let the waker send another wake now, and
@@ -245,6 +270,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.unsaved.assume_unsaved();
         let Some(state) = &mut self.state else { return };
         match event {
             WindowEvent::CloseRequested => {
@@ -4422,6 +4448,17 @@ mod tests {
     use ghostrealm_core::{Rect, Side, SurfaceId};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_event_makes_the_cached_unsaved_flag_pessimistic_until_the_next_refresh() {
+        let flag = super::UnsavedFlag::default();
+        flag.set(false);
+        flag.assume_unsaved();
+        assert!(flag.get(), "a terminate request in the same pass must not answer TerminateNow");
+        let shared = flag.clone();
+        flag.set(false);
+        assert!(!shared.get(), "the refresh is seen by the quit hook's clone");
+    }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so
     /// none of it (such as the warning that a buffer would be lost) is cut off.
