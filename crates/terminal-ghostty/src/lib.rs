@@ -425,6 +425,14 @@ impl GhosttyTerminal {
     pub fn encode_mouse(&mut self, report: &MouseReport) -> Result<Vec<u8>> {
         let (cols, rows) = (self.term.cols().unwrap_or(0) as u32, self.term.rows().unwrap_or(0) as u32);
         let (cw, ch) = (self.cell_w.max(1), self.cell_h.max(1));
+        // The pane can extend past the grid (padding strip) and a drag or wheel
+        // can arrive from outside it. Pin the position to the last pixel of the
+        // grid, as xterm does, so no event is dropped as out-of-bounds while its
+        // matching press or release is sent.
+        let at = (
+            report.at.0.clamp(0.0, (cols as f32 - 1.0 / cw as f32).max(0.0)),
+            report.at.1.clamp(0.0, (rows as f32 - 1.0 / ch as f32).max(0.0)),
+        );
         let bit = report.button.map_or(0, button_bit);
         match report.action {
             MouseAction::Press => self.mouse_held |= bit,
@@ -447,8 +455,8 @@ impl GhosttyTerminal {
             }))
             .set_mods(Self::map_mods(report.mods))
             .set_position(vtmouse::Position {
-                x: report.at.0 * cw as f32,
-                y: report.at.1 * ch as f32,
+                x: at.0 * cw as f32,
+                y: at.1 * ch as f32,
             });
         self.mouse_encoder
             .set_options_from_terminal(&self.term)
@@ -464,8 +472,8 @@ impl GhosttyTerminal {
             })
             .set_any_button_pressed(self.mouse_held != 0);
         let cell = (
-            (report.at.0.max(0.0) as u32).min(cols.saturating_sub(1)),
-            (report.at.1.max(0.0) as u32).min(rows.saturating_sub(1)),
+            (at.0 as u32).min(cols.saturating_sub(1)),
+            (at.1 as u32).min(rows.saturating_sub(1)),
         );
         let pixels = self.term.mode(Mode::SGR_PIXELS_MOUSE).unwrap_or(false);
         if report.action == MouseAction::Motion && !pixels && self.mouse_cell == Some(cell) {

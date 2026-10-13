@@ -515,3 +515,19 @@ fn mouse_reports_reach_the_program() {
     let row = wait_for_row(&mut term, "^[[<0;3;2M");
     assert_eq!(row, "^[[<0;3;2M^[[<0;3;2m");
 }
+
+#[test]
+fn positions_outside_the_grid_are_pinned_to_its_edge() {
+    // 40x10 cells; the pane's padding strip and the area around it report
+    // positions past the grid.
+    let mut term = cat_v_with("\\033[?1000h\\033[?1006h", tracking);
+    let left = Some(MouseButton::Left);
+    let mut enc = |r: MouseReport| String::from_utf8(term.encode_mouse(&r).unwrap()).unwrap();
+    assert_eq!(enc(report(MouseAction::Press, left, (40.6, 10.3))), "\x1b[<0;40;10M");
+    assert_eq!(enc(report(MouseAction::Release, left, (40.6, 10.3))), "\x1b[<0;40;10m");
+    assert_eq!(enc(report(MouseAction::Press, left, (-3.0, -0.5))), "\x1b[<0;1;1M");
+    assert_eq!(
+        enc(report(MouseAction::Press, Some(MouseButton::WheelUp), (-1.0, 25.0))),
+        "\x1b[<64;1;10M"
+    );
+}
