@@ -1001,9 +1001,19 @@ mod tests {
         for c in "bad".chars() {
             h.key(&mut v, press(Key::Char(c)));
         }
-        settle(&mut v);
-        paint_in_strip(&mut h, &mut v);
-        assert_eq!(h.frame.top.len(), plain + 2, "the typed word is flagged too");
+        // Each keystroke is a change the service answers separately, so the
+        // first answer can describe "b" or "ba", not "bad". Wait for the one
+        // that flags the finished word.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            v.refresh();
+            paint_in_strip(&mut h, &mut v);
+            if h.frame.top.len() == plain + 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the typed word is flagged too");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
