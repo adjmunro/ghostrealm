@@ -84,7 +84,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   field opts out with `LineEdit::with_plain_brackets`; the editor also
   auto-closes brackets, see `text_edit`'s docs). `text_field` returns the
   `FieldGeom` it drew; keep it in a `widgets::FieldMouse`, paint it each frame
-  (`painted`, or `clear` while the field takes no input), and pass mouse events
+  (`painted`, which also shows the I-beam cursor over it, or `clear` while
+  the field takes no input), and pass mouse events
   to `FieldMouse::event` first: click, drag, Shift+click, double-click (word),
   and triple-click (all) then edit the `LineEdit` like the editor's.
 

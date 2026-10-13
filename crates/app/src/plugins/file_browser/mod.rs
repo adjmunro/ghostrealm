@@ -353,7 +353,7 @@ impl FileBrowserView {
         let x = row.x + label_w + pad * 2.0;
         let field = Rect { x, y: row.y + inset, w: (row.x + row.w - pad - x).max(1.0), h: h - inset * 2.0 };
         let geom = widgets::text_field(cx, field, &self.name, "file name", true);
-        self.name_field.painted(geom);
+        self.name_field.painted(cx, geom);
         h
     }
 
@@ -508,7 +508,7 @@ impl FileBrowserView {
         // Saving types into the name field instead.
         let geom = widgets::text_field(cx, field, value, &root, self.mode != Mode::Save);
         if editable {
-            self.field.painted(geom);
+            self.field.painted(cx, geom);
         } else {
             self.field.clear();
         }
@@ -1140,6 +1140,20 @@ mod tests {
         h.key(&mut v, press(Key::Down));
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
+    }
+
+    #[test]
+    fn only_a_header_field_that_takes_the_mouse_shows_the_text_cursor() {
+        let (d, _) = fixture();
+        let mut h = Harness::new();
+        let mut pick = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        h.paint(&mut pick, RECT);
+        let r = pick.field.geom().expect("a picker's field is live").rect;
+        h.cursor = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+        let icon = |h: &mut Harness, v: &mut FileBrowserView| h.paint(v, RECT).cursor.map(|(_, i)| i);
+        assert_eq!(icon(&mut h, &mut pick), Some(winit::window::CursorIcon::Text));
+        let mut save = FileBrowserView::picker(d, Mode::Save);
+        assert_eq!(icon(&mut h, &mut save), None, "Save's header field is inert");
     }
 
     #[test]

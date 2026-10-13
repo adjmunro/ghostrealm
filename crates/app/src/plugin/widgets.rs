@@ -52,11 +52,15 @@ impl FieldGeom {
 pub struct FieldMouse {
     geom: std::cell::Cell<Option<FieldGeom>>,
     pressed: bool,
+    /// Where a press from [`hold`](Self::hold) began, until its drag starts.
+    origin: Option<(f32, f32)>,
 }
 
 impl FieldMouse {
-    /// Record what [`text_field`] returned for this frame.
-    pub fn painted(&self, geom: FieldGeom) {
+    /// Record what [`text_field`] returned for this frame, and show the text
+    /// cursor over it: only a field that takes the mouse says it painted.
+    pub fn painted(&self, cx: &mut PaintCx, geom: FieldGeom) {
+        cx.cursor(geom.rect, CursorIcon::Text);
         self.geom.set(Some(geom));
     }
 
@@ -70,6 +74,13 @@ impl FieldMouse {
         self.geom.set(None);
     }
 
+    /// A press at `pos` began outside editing and made the field editable (its
+    /// text is selected whole). A drag in the same press selects from `pos`.
+    pub fn hold(&mut self, pos: (f32, f32)) {
+        self.pressed = true;
+        self.origin = Some(pos);
+    }
+
     /// Apply `event` to `edit`; whether the field took it. A press inside the
     /// field starts a selection; the drag and release that follow are the
     /// field's wherever the pointer goes. `extend` is Shift.
@@ -78,19 +89,25 @@ impl FieldMouse {
         match *event {
             MouseEvent::Down { pos, clicks } if g.contains(pos) => {
                 self.pressed = true;
+                self.origin = None;
                 edit.press(g.caret_at(pos.0), g.char_at(pos.0), clicks, extend);
                 true
             }
             MouseEvent::Down { .. } => {
                 self.pressed = false;
+                self.origin = None;
                 false
             }
             MouseEvent::Drag { pos } if self.pressed => {
+                if let Some(from) = self.origin.take() {
+                    edit.press(g.caret_at(from.0), g.char_at(from.0), 1, false);
+                }
                 edit.drag_to(g.caret_at(pos.0));
                 true
             }
             MouseEvent::Up { .. } if self.pressed => {
                 self.pressed = false;
+                self.origin = None;
                 edit.release();
                 true
             }
@@ -103,14 +120,14 @@ impl FieldMouse {
 /// selection (or a dim placeholder when empty), and, when `focused`, a caret at
 /// the cursor. Text is monospace; when it doesn't fit, the field shows its tail
 /// (the most specific part of a path) unless the cursor is further left.
-/// Returns where the text was drawn, for [`FieldMouse`].
+/// Returns where the text was drawn, for [`FieldMouse`], which shows the text
+/// cursor (a field that is inert shows none).
 pub fn text_field(cx: &mut PaintCx, r: Rect, edit: &LineEdit, placeholder: &str, focused: bool) -> FieldGeom {
     let scale = cx.ui.scale;
     let pad = 8.0 * scale;
     let cw = cx.ui.cell_w;
     cx.fill(r, cx.chrome.background);
     cx.border(r, theme::INPUT_BORDER);
-    cx.cursor(r, CursorIcon::Text);
     let inner_w = (r.w - pad).max(1.0);
     let cols = ((inner_w / cw) as usize).max(1);
     let left = r.x + pad * 0.5;

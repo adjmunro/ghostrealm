@@ -866,12 +866,14 @@ impl View for WebView {
         match &self.url_edit {
             Some(e) => {
                 let geom = widgets::text_field(cx, url_box, e, "", cx.focused);
-                self.url_field.painted(geom);
+                self.url_field.painted(cx, geom);
             }
             None => {
                 let shown = LineEdit::new(self.state.url.clone());
-                widgets::text_field(cx, url_box, &shown, "Enter an address", false);
-                self.url_field.clear();
+                let geom = widgets::text_field(cx, url_box, &shown, "Enter an address", false);
+                // A click starts editing, so it takes the mouse already; the
+                // geometry maps a drag in that press to the address.
+                self.url_field.painted(cx, geom);
             }
         }
         if self.state.loading {
@@ -966,6 +968,7 @@ impl View for WebView {
                 if rect_contains(self.url_box, pos.0, pos.1) {
                     if self.url_edit.is_none() {
                         self.edit_url();
+                        self.url_field.hold(pos);
                     }
                     cx.redraw();
                     return;
@@ -1376,6 +1379,44 @@ mod tests {
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((1, 3)));
         h.mouse(&mut v, MouseEvent::Down { pos: (cell(7), y), clicks: 2 });
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((5, 9)), "`lang`");
+    }
+
+    #[test]
+    fn a_click_on_the_idle_url_bar_selects_all_and_a_drag_in_that_press_selects_from_the_press() {
+        let mut v = hostless();
+        v.state.url = "https://rust-lang.org".into();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let g = v.url_field.geom().expect("an idle bar takes the mouse too");
+        let y = g.rect.y + g.rect.h * 0.5;
+        let edge = |col: usize| g.left + col as f32 * g.cell_w;
+        // A plain click selects the whole address.
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(2), y), dragged: false });
+        assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((0, 21)));
+        // A drag from a press on the idle bar selects what it covers.
+        v.url_edit = None;
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(6), y) });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(6), y), dragged: true });
+        assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((2, 6)));
+    }
+
+    #[test]
+    fn the_url_bar_shows_the_text_cursor_idle_and_editing() {
+        let mut v = hostless();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let r = v.url_box;
+        h.cursor = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+        for editing in [false, true] {
+            if editing {
+                v.edit_url();
+            }
+            let frame = h.paint(&mut v, RECT);
+            assert_eq!(frame.cursor.map(|(_, i)| i), Some(winit::window::CursorIcon::Text), "editing: {editing}");
+        }
     }
 
     #[test]
