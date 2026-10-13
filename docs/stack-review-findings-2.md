@@ -129,19 +129,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low–Medium
 
-#### 38. A lost release leaks across views
-
-- Where: `on_click`
-  ([`window.rs:1357`](../crates/app/src/window.rs)) sets `mouse_capture = None`
-  without sending `Up`. `8493dac`'s synthetic release only covers a new press in
-  the same view.
-- Repro: lose a release in terminal A (switch apps mid-drag), then click
-  terminal B. A keeps `reporting == true` and the backend's `mouse_held`; in
-  mode 1002, hovering A encodes `Move`s as drags. The web view leaks `pressed`
-  the same way, and CEF never gets the `Up`.
-- Fix: in `on_click` / `begin_press`, if `mouse_capture` is still `Some` from an
-  unfinished press, send that view `Up` first. Straightforward.
-
 #### 39. A protocol-version mismatch retries forever
 
 - Where: `failed`
