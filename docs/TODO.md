@@ -231,7 +231,9 @@
   default keybindings and surface them. (2) Draggable split handles to resize panes
   with the mouse. (3) A split currently halves the *current* pane; want free
   resizing (including small panes) rather than a fixed half. (4) Owner review
-  (2026-10-13): centre the handle on the border between the panes.
+  (2026-10-13): centre the handle on the border between the panes. (5) A close
+  "x" on a pane and split right/left/up/down buttons (owner's words in
+  "DISCUSSION: editor and file browser as one surface").
 - Reason: expected tiling UX.
 
 ---
@@ -428,8 +430,9 @@
   shaped span (glyphon `Attrs::weight`). (3) no header UI to SET the ext filter
   (`set_ext_filter` exists; git & recent have buttons) — add a control or an
   `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
-  explicit range + created-vs-modified (owner review 2026-10-13: the `date`
-  grouped view also buckets by modified time only; give it the same choice). (5) recursive fuzzy walk caps at 20k
+  explicit range. Modified time only: the owner suspects created time is not
+  useful (see "Quality of life (owner review) — editor and file browser
+  polish" for the `date` view's rename). (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
 
@@ -443,7 +446,9 @@
   line in `highlight::ALL`. Later: consider LSP-backed semantic highlight, but
   keep the rule-based path for the common case. Markdown has no setext headings,
   indented code, or YAML front matter (they need line-number or neighbouring-line
-  context).
+  context). The direction for the main languages (tree-sitter, hand-written, or
+  a unified keyword API) is open: see "DISCUSSION: syntax highlighting
+  direction".
 - Reason: expand language support over time as little modules; requested.
 
 ---
@@ -466,6 +471,32 @@
   reachable URL needs a network decision) and flags broken ones with inline error
   markers. Owner review (2026-10-13) restates the target: Markdown shown
   formatted with the markup symbols still visible and editable (the mixed mode).
+- Efficiency: carry style data only for the rows and segments that use it; a
+  row with no bold, italic, or underline keeps the single-style path and sends
+  nothing extra.
+- Code spans: inline code (one backtick) is drawn as a small boxed or
+  background-tinted span. A fenced block (three backticks) is drawn as a full
+  block with a copy button and, for shell-flavoured blocks, a run button in the
+  left gutter for each runnable command. The block uses the syntax highlighter
+  (and maybe an LSP) for the language named after the opening fence; see
+  "DISCUSSION: syntax highlighting direction".
+- Links: internal and external links are styled with the same machinery. Look
+  and feel to discuss later.
+- Owner, verbatim:
+  > Okay, yeah, I still really want the bold and italics and markdown, so we
+  > better plumb that. Try and make it efficient, though. Like, I don't think
+  > you need to send all that information if none of those are being used, only
+  > when they are being used. Also note that we need to add single grave and
+  > triple grave code blocks. So single grave, obviously, like inline, and we've
+  > just got little squares versus triple grave where we've got like a full on
+  > code block thing going on. And maybe a copy button. And maybe a run button
+  > in the left gutter for individual commands that are actually runnable. Well,
+  > I guess that only applies to shell flavored code blocks. Oh, and code blocks
+  > will need to bring in syntax highlighting and maybe LSPs for the relevant
+  > language of whatever language is defined after the triple grave, the start
+  > of the code block. We probably also want to use those sorts of highlighting
+  > things for some other things like internal links or external links, stuff
+  > like that. Though we can discuss the look and feel of that later.
 - Reason: nicer Markdown editing; requested, and wanted soon.
 
 ---
@@ -551,8 +582,12 @@
   context menu / Cmd+Backspace on the selection) behind `AppState::confirm`, moving
   to the macOS Trash rather than unlinking. Owner review (2026-10-13): this
   becomes the Delete item of the file context menu (see "File and folder
-  context menu"), with no confirmation for git-tracked files; Trash vs
-  permanent delete is an open question there.
+  context menu"), with no confirmation for git-tracked files. Decided: Delete
+  always moves to the Trash; there is no permanent delete.
+- Owner, verbatim:
+  > Yes, I agree that we should just do trash only, but we'll call it delete
+  > because that's normal, but I don't see why we should fight the file system
+  > and cause trouble for ourselves.
 - Reason: requested alongside the replace confirmation.
 
 ---
@@ -677,6 +712,9 @@
   it as an MCP server (stdio shim that connects to that socket) so an agent in a
   terminal tab controls *this* window's workspaces, terminals, and web panes.
   Scope agent access per the existing "hide from agent" idea.
+- Web profiles: Chromium locks a profile to one process, so the web host is
+  owned by the running app and agents connect through this socket instead of
+  spawning their own host (see "Web — profiles").
 - Reason: agent control of the live UI is the point of the agent channel.
 
 ---
@@ -776,16 +814,28 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] Terminal: setting for text-editing key translation in full-screen programs
+[2026-10-13T19:46+1300@d292715] Terminal: text-editing keys inside full-screen programs (decision pending)
 
-- Requires: NO BLOCKERS
-- Detail: Add a TOML setting (boolean, default true) that controls whether the
-  text-editing key translations (Option/Cmd word and line motions and deletes,
-  sent as readline/emacs bytes) still apply while a full-screen program
-  (alternate screen) is running, e.g. vim. See
+- Requires: a decision from the owner (see "Decision session")
+- Detail: Option/Cmd word and line motions and deletes are sent to the program
+  as readline/emacs bytes (`ESC b`, `^A`, ...). Inside a full-screen program
+  (alternate screen) such as Vim, those bytes get Vim's meaning, not the editing
+  action the key stands for. The owner wants the same action in Vim.
+- Detail: Proposal: a translation layer. In the alternate screen, send the
+  standard xterm key sequences instead (Option+Left -> `CSI 1;3D`, Cmd+Left ->
+  Home), which Vim can map in insert mode. Vim's normal mode has no "word left"
+  for those keys without mappings, so the layer may need to ship suggested
+  mappings. Alternative: turn the translation off in full-screen programs.
+  Either way, a TOML boolean controls it. See
   [stack-review-findings-2.md](stack-review-findings-2.md) item 7.
-- Reason: decided in the findings review; some full-screen programs want the raw
-  keys.
+- Owner, verbatim:
+  > I'm looking at number seven, and you're saying that my key bindings won't do
+  > the same thing in Vim. That sounds like a problem to me. I think they should
+  > do the same thing in Vim, not do whatever Vim's key bindings say to do. So I
+  > guess we need a translation layer there. Because I do actually use Vim.
+  > Alternatively, maybe we just consider turning it off.
+- Reason: the translated keys must do the same thing everywhere the owner types,
+  including Vim.
 
 ---
 
@@ -816,7 +866,9 @@
 - Requires: NO BLOCKERS (later work, not now)
 - Detail: Audit the dependency tree (`image`, `rodio`, `cef`,
   `lsp-types`/`lsp-server`, `crossbeam-channel`, `toml`, `libc`, ...) and replace
-  with small in-house implementations where reasonable.
+  with small in-house implementations where reasonable. Wrapping `image` and
+  `rodio` behind our own module comes first and makes either swap local: see
+  "Media wrappers: image decoding and audio playback behind our own trait".
 - Reason: fewer external dependencies to carry and update.
 
 ---
@@ -836,12 +888,23 @@
 [2026-10-13T19:46+1300@d292715] Decision session: open "Decision needed" items
 
 - Requires: a session with the user
-- Detail: Go through the open "Decision needed" items in
-  [stack-review-findings.md](stack-review-findings.md) and
-  [stack-review-findings-2.md](stack-review-findings-2.md), and the decision items
-  in this file (including the keybinding-id quoting / per-scope tables
-  decision and the context-menu open questions). Check the decisions are
-  consistent with each other.
+- Detail: Go through the items still open and check the decisions are
+  consistent with each other:
+  - Text-editing keys inside Vim and other full-screen programs: the
+    translation-layer proposal vs turning the translation off (findings-2 item
+    7; TODO "Terminal: text-editing keys inside full-screen programs").
+  - Keybinding ids without quotes: confirm flattening nested tables (TODO
+    "Keybinding ids without quotes").
+  - [stack-review-findings-2.md](stack-review-findings-2.md) items 15 (load-time
+    findings), 24 (stuck mount), 34 (preview follows hover; the owner will try
+    it first), 35 (mouse reports while scrolled back), 36 (unbracketed paste),
+    and its "To confirm" note.
+  - The open design items: the profile scope controls and picker (TODO "Web —
+    profiles"), syntax highlighting direction, editor and file browser as one
+    surface.
+  Decided in the review rounds and no longer open: Chromium sandbox on, web
+  profile location, pop-up handling, shell exit, Delete = Trash, GitHub
+  permalinks (future), file-browser date view naming.
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -883,7 +946,7 @@
 
 [2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — editor and file browser polish
 
-- Requires: NO BLOCKERS (the Cmd+/ item needs a binding decision)
+- Requires: NO BLOCKERS
 - Detail:
   - **Double-click selects a word**: `MouseEvent::Down` carries `clicks`, but
     neither the editor nor the terminal reads it (only the file browser and the
@@ -895,9 +958,17 @@
   - **File-browser ribbon padding**: reduce the padding on the ribbon's option
     toggles (`preview`, `hidden`, `.gitignore`, git filter, view); each hit
     area is its label plus `pad` on both sides, which reads as too wide.
-  - **File-browser date view**: the `date` grouped view buckets by modified
-    time only. Let it use created or modified (a choice). Same choice for the
-    date filter; see "File browser — remaining polish" item (4).
+  - **File-browser date view**: the grouped view is labelled `date` and does
+    not say what it represents. Rename it to say what it is: modified time (the
+    buckets are by modified time). No created-time choice for now, since
+    created time is probably not useful; the date filter follows the same rule
+    ("File browser — remaining polish" item (4)).
+    Owner, verbatim:
+    > When I say the file browser date view as created or modified, what I mean
+    > is that it currently says date and I don't know what that represents. So
+    > it needs to be renamed. Whether or not we have both created and modified
+    > is a different matter. Though I suspect modified is the one that we want
+    > and created isn't actually very useful.
   - **Split drag handle**: when draggable split handles are built, centre them
     on the border between panes (see "Splits — discoverability, draggable resize
     handles, ratios"). No drag handles exist yet.
@@ -905,35 +976,81 @@
     lines, per language). There is no comment toggle today. Cmd+/ is not a
     built-in default (defaults are Cmd+D / Cmd+Shift+D for splits), but the
     owner's own `config.toml` binds `split.leftright` to `cmd+/` (and
-    `split.topbottom` to `cmd+shift+/`), which would shadow the editor. Resolve
-    by rebinding the splits, or by choosing another default for the comment
-    toggle; app chords take precedence over the focused view.
+    `split.topbottom` to `cmd+shift+/`), which would shadow the editor. The
+    owner will move their own split bindings; app chords take precedence over
+    the focused view.
+  - **Comment syntax is per language.** Standard LSP has no comment-toggle
+    request and carries no comment-syntax information. Editors keep it in
+    per-language configuration (VS Code's `language-configuration.json`
+    `lineComment` / `blockComment`) or derive it from tree-sitter. So the line
+    and block comment tokens belong in a per-language metadata registry beside
+    the highlighters (see "DISCUSSION: syntax highlighting direction").
+    Owner, verbatim:
+    > I think the comment uncomment hotkey, for one, I think I need to change my
+    > split hotkey, but I can do that. I think it needs to tie into the LSP
+    > though, because different languages will have different comment formats. I
+    > don't know if standard LSP supports that.
 - Reason: owner review; small, visible rough edges.
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] PRIORITY: Web browser unavailable after a normal build
+[2026-10-13T20:25+1300@e9617b8] HIGHEST web priority: build the web host with the normal build
 
 - Requires: a choice between the options below (the CEF download size is the cost)
 - Detail: The CEF host bundle is built only by `mise run web`. After a normal
-  build the web surface reports "web host not found: build it with `mise run
-  web`", so the browser is always down until a second command is run. The owner
-  wants it to work without that. Options:
-  - Build the bundle as part of the normal run/build task (a `mise` default/run
-    task, or a build step), so one command yields a working browser. Every
-    first build then needs CMake + Ninja and the CEF download (~250 MB of
-    binaries, per DECISION.md).
-  - Keep the build separate, but have the app locate the bundle, or build it on
-    first use of a web surface (with progress shown), so only users who open a
-    browser pay for it.
+  `cargo build` or `cargo run --release` the web surface reports "web host not
+  found: build it with `mise run web`", so the browser is always down until a
+  second command is run. The owner wants `cargo build` and `cargo run
+  --release` to build the web host too, skipped when nothing changed (cached).
+  Priority: the highest item the next time web work starts; other work may go
+  first.
+- Why it is a separate build:
+  - The host is a separate executable (DECISION.md, Web surface): it must be
+    packaged as a macOS `.app` bundle with the CEF framework and helper apps,
+    because Chromium requires that layout. A bundle binary
+    (`ghostrealm-web-bundle`, behind the `bundle` feature) produces it and also
+    downloads CEF (~250 MB).
+  - Cargo has no post-build step that packages another binary, and the host
+    crate is excluded from the workspace's `default-members`, so `cargo build`
+    never touches it.
+  - `mise run web` is the repo's task-runner wrapper (`mise.toml`, which also
+    pins Zig, CMake, and Ninja) around two cargo commands: build the host with
+    `--features bundle`, then run the bundler. It is not a Rust-ecosystem
+    command; it exists because cargo cannot express the packaging step.
+- Options:
+  - The app's `build.rs` drives the bundle step with change detection. A plain
+    `cargo run --release` then yields a working browser. Costs: a nested cargo
+    invocation (slower, build-directory lock contention), and every first build
+    needs CMake + Ninja and the CEF download.
+  - A cargo alias or `xtask` for build/run. Does not help plain `cargo run
+    --release`, which is what the owner uses.
+  - The app builds or fetches the bundle on first use of a web surface (with
+    progress shown), so only users who open a browser pay for it. The owner
+    notes they want the browser anyway, so the saving is theoretical for them.
   - Either way, keep `[web] host` / `$GHOSTREALM_WEB_HOST` as overrides.
+- Owner, verbatim:
+  > I definitely think that cargo build or cargo run, etc., should also be
+  > triggering the web browser build. I'm not actually sure why that's a
+  > separate build, to be honest. You might have to expand on that. Though I do,
+  > I guess I like the idea of it being a plugin that I could disable. But
+  > what's the point? I do actually want the web browser, so it might as well be
+  > in there. So yeah, we should absolutely make that part of the normal build
+  > process and maybe just like skip it if there's been no changes. We use the
+  > cached version if we don't need to build it.
+  >
+  > Why is the build command for the web module mise run web anyway? That
+  > doesn't really make sense to me. I've just been using cargo run dash dash
+  > release the whole time. Like, why is it mise rather than a Rust ecosystem
+  > command? I think patching the web build into the rest of the build command
+  > is the highest priority the next time we're touching web stuff. So we can do
+  > other stuff first, but when we get to web, fixing that is very important.
 - Reason: a feature that needs a separate manual build step looks broken.
 
 ---
 
 [2026-10-13T20:25+1300@e9617b8] PRIORITY: File and folder context menu (editor file name + file browser)
 
-- Requires: NO BLOCKERS for the menu itself; open questions below for the owner
+- Requires: NO BLOCKERS
 - Detail: One shared menu, opened by clicking the editor's file name and by
   right-clicking a file or directory in the file browser. Modelled on Zed's.
   The app's `Menu` (`window.rs`) only serves sidebar workspaces today; this
@@ -948,17 +1065,59 @@
     (no binding).
   - **Add to .gitignore** and **Add to .git/info/exclude**.
   - **Rename** and **Save Copy As**.
-  - **Delete** at the bottom, after a horizontal rule. Moves the file to the
-    Trash. No confirmation if the file is tracked by git (recoverable); confirm
+  - **Delete** at the bottom, after a horizontal rule, labelled "Delete".
+    Decided: it always moves the file to the Trash; there is no permanent
+    delete. No confirmation if the file is tracked by git (recoverable); confirm
     otherwise (`AppState::confirm`). In the editor it closes the editor like
     Cmd+W. This replaces the "Delete files (with confirmation)" entry's
-    design; that entry stays until the menu lands.
-- Open questions for the owner:
-  - **Trash or permanent Delete?** Trash is safer and supports "Put Back", but
-    needs a macOS call (`NSFileManager trashItem`) or a small dependency (e.g.
-    the `trash` crate). Permanent Delete has neither cost, nor a way back.
-  - **Permalinks** (a link to the file on the git host at the current commit):
-    the owner is unsure. Default: leave off.
+    design; that entry stays until the menu lands. The Trash call needs
+    `NSFileManager trashItem` on macOS or a small dependency (e.g. the `trash`
+    crate); pick one when building.
+- Not in the first menu: **GitHub permalinks** (a link to the file on GitHub
+  at the current commit, optionally with a line number); see "GitHub
+  permalinks".
+- Zed's menu, for reference: New File, New Folder | Reveal in Finder, Open in
+  Default App, Open in Terminal, Open Markdown Preview | Cut, Copy, Duplicate,
+  Paste, Undo, Redo | Copy Path, Copy Relative Path | Add to .gitignore, Add to
+  .git/info/exclude, Open File Permalink, Copy File Permalink | Rename, Trash,
+  Delete.
+- Owner, verbatim:
+  > The second image is Zed's context window. For when I right clicked a file,
+  > you know, I don't think it makes sense to have a new file new folder when
+  > you right click a file, but maybe if you're right clicking like a bit of
+  > empty space or when you're right clicking a directory that makes sense to
+  > me. Reveal and find, we've already mentioned. Open default app, I guess we
+  > could add for the file browser. Open in terminal, we could add only for the
+  > directories, I think. Open in Markdown preview, we don't need, I think,
+  > because obviously I want that integrated formatting anyway. Cut, copy,
+  > duplicate, paste, redo, and undo probably should have. Same with copy path
+  > and copy relative path. I'm not a fan of those hotkeys. Those are too
+  > complicated. I think command shift C for copy path, absolute path, that is.
+  > It should be the default. Copy relative path, we'll just leave that without
+  > a binding for now. Add to git ignore, add to git info exclude, I think we
+  > should. Add those to our context menu for both in the file editor when
+  > you're looking at the right click menu of the file name and to the file
+  > browser. I don't actually know what a permalink is, so either explain those
+  > to me or leave them off. Rename, obviously, I've already mentioned. They've
+  > also got trash and delete. Honestly, oh, or maybe you do want both because
+  > trash takes a while longer, doesn't it? Or maybe it needs a dependency.
+  > Double check that one with me. So some of these are things that you can act
+  > on already, and some of these are things that should probably be written
+  > down and explored further. But I think they're all definitely like higher
+  > priority things because they're all quality of life fixes.
+  >
+  > in the file editor, i want a context popup when clicking the file name to
+  > offer options like "rename", "save copy as", "delete" (to trash, not
+  > permanent - if in git, no confirm is fine. if not in git, confirm popup -
+  > deleting closes the editor like cmd + w), "show in file browser", "show in
+  > finder" (macos only). idk if i'm missing something. maybe split into
+  > sections with delete at the bottom, separated by a horizontal rule so it's
+  > hard to accidentally misclick. this kind of context popup should probably
+  > also show on right click of a file or directory in the file browser too.
+- Owner, verbatim (Trash vs Delete):
+  > Yes, I agree that we should just do trash only, but we'll call it delete
+  > because that's normal, but I don't see why we should fight the file system
+  > and cause trouble for ourselves.
 - Reason: owner review; file actions belong where the file is shown.
 
 ---
@@ -982,6 +1141,35 @@
   - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.
 - Reason: owner review; the file browser and editor overlap, and the choice
   decides several smaller features.
+- Owner, verbatim (the design):
+  > Actually maybe the editor and file browser should just be the same thing???
+  > I've also attached some pictures. One of them is how Claude Code shows a
+  > file browser and the document in a single tab. So you can see up the top
+  > left there, we've got a show hide for the file browser. And there's a filter
+  > or question mark to search in files box. And I just, I kind of like the way
+  > that the markdown file is rendered as well. Although I personally would have
+  > some changes there. I like to see which symbols are being used for the
+  > markdown formatting specifically. So I don't want like a clean document. I
+  > want like a formatted, or I, I want a document like this where it shows the
+  > formatting but at the same time the actual symbols are still part of the
+  > document and still editable. In any case, so yeah, I think maybe we're still
+  > gonna build on this idea of like maybe the file editor and the file browser
+  > should just be the same thing and they're different parts of the same thing.
+  > Or maybe like the file browser has different things that plug into it. Like
+  > we've already got our image preview and our audio preview. Maybe there's a
+  > text preview slash editor thing. And maybe it works out that way. I don't
+  > know. I don't think we should do this just yet. Just I want it there on the
+  > to-do, fairly high priority to work through this together and understand
+  > where we want to take this design.
+- Owner, verbatim (the pin):
+  > Add a pin icon to file browser. When pinned, open editor in new tab or
+  > split? When unpinned, open integrated editor (maybe it has a back button or
+  > a collapse/expand button for the file browser). maybe even pin left, pin
+  > right, unpin? Maybe that's how we do the previews for text files? we just
+  > stay focused on the browser?
+- Owner, verbatim (splits):
+  > Splits probably need an 'x' icon? And maybe also a split right/left/up/down
+  > button(s)?
 
 ---
 
@@ -993,6 +1181,10 @@
   that differ from their defaults. Needs config write-back and a diff of the
   file against the catalogue defaults.
 - Reason: owner review; the config file is the settings UI.
+- Owner, verbatim:
+  > Maybe a regenerate settings.toml command? / a cleanup command? / or a reset
+  > to default command (which maybe highlights which options are not default
+  > before resetting in a popup confirmation?)
 
 ---
 
@@ -1006,13 +1198,296 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] Decision: keybinding ids are quoted; per-scope tables would drop the quotes
+[2026-10-13T20:25+1300@e9617b8] Keybinding ids without quotes: flatten nested tables
 
-- Requires: a decision from the owner (a config format change)
+- Requires: NO BLOCKERS (small change; confirm in the decision session)
 - Detail: Action ids in `[keybindings]` are quoted (`"pane.close" = "cmd+w"`)
-  because the dotted ids would otherwise parse as TOML dotted keys. Dropping
-  the quotes means per-scope tables, e.g. `[keybindings.web]` with
-  `focus_url = "cmd+l"`. That also gives view-scoped bindings a home (plugin
-  follow-up (4)) but breaks existing config files, so it needs a migration or a
-  versioned format. Include it in the decision session below.
-- Reason: the owner asked why the ids are quoted; the answer is a trade-off, not a bug.
+  because TOML parses an unquoted dotted key as nested tables (`web` ->
+  `focus_url`). The owner asks to accept `web.focus_url = "cmd+l"` unquoted,
+  without per-scope tables.
+- Proposal: the loader flattens nested tables under `[keybindings]` back into
+  dotted ids. The quoted form, the unquoted dotted form, and a
+  `[keybindings.web]` table with `focus_url = "cmd+l"` then all work, with no
+  format break: existing files keep working, so no migration or versioned
+  format. The config checker and the config language server must treat the
+  three spellings the same.
+- Caveat: an id cannot be both a leaf and a prefix of another id (a `split`
+  command next to `split.leftright`); check the command ids and report a clash
+  as a config finding. Chords on the right stay quoted strings (they contain
+  `+` and may contain spaces).
+- Related: `[keybindings.<scope>]` tables can also give view-scoped bindings a
+  home (plugin follow-up (4)).
+- Owner, verbatim:
+  > Is it possible to just do web.focusurl without the speech marks, even
+  > without doing keybindings.web? Like, I don't see why you couldn't just fix
+  > the parser or something and not do that. That just seems dumb. There's no,
+  > like, special characters like a space that justify a set of quotation marks
+  > on the left hand side, I think. Though I think it makes sense for the chord
+  > on the right hand side.
+- Reason: the quotes are noise, not a technical requirement; the owner asked
+  why they are there.
+
+---
+
+> The entries below are from the owner's second review round (2026-10-13). The
+> owner asked that ideas be written down with what they actually said, so each
+> entry carries the verbatim quote (spoken, lightly cleaned of filler words).
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Media wrappers: image decoding and audio playback behind our own trait
+
+- Requires: NO BLOCKERS (pairs with "Reduce dependencies")
+- Detail: Wrap image decoding (today the `image` crate) and audio playback
+  (today `rodio`) in a trait or module of our own: a library layer the rest of
+  the code calls, so no other code touches the dependency directly. Reusable by
+  the file-browser preview, a future image/audio viewer plugin, and a possible
+  music-player pane, instead of each re-implementing the same code.
+- Detail: This is the decode/playback side. It is distinct from
+  `PaintCx::image`, which is the drawing side (a textured quad on the canvas).
+  A decoded image would pass from this layer into `PaintCx::image`.
+- Owner, verbatim:
+  > Oh, okay. I understand what's going on with one now. Just make sure that
+  > like image rendering and audio playing are kind of like library functions
+  > that we can call and they're hidden behind a trait or an interface or
+  > something. The idea there being obviously that if it's reusable, then we
+  > want to pull it out so that we can make it reusable rather than re-
+  > implementing the same code. Which I think is the opposite end of the same
+  > image API to draw on the canvas thing that you're talking about. Like that's
+  > a library function to draw on the canvas, right? Whereas I'm talking about a
+  > library function that wraps whatever the image dependency is or whatever the
+  > audio playback dependency is, etc. Just to protect the rest of the code base
+  > from that and make it reusable.
+- Reason: protect the codebase from the dependencies, make swapping or removing
+  one local (see "Reduce dependencies"), and make the code reusable.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] DISCUSSION: syntax highlighting direction
+
+- Requires: a design session with the owner; do not implement yet
+- Detail: Explore a generic tree-sitter highlighter. The owner's main languages:
+  Kotlin, Gradle (Kotlin DSL), Java; then Swift and Rust; then web languages.
+  Open: a hand-written highlighter per main language (languages gain keywords
+  over time, which a hand-written one must track), or a unified API for
+  identifying a language's keywords, possibly backed by tree-sitter.
+- Detail: Markdown keeps its own highlighter, because it renders, formats, and
+  shows the syntax at once ("PRIORITY: Markdown bold, italic, and underline in
+  the editor"). Other rich formats (HTML headers, bold) may want the same;
+  undecided, since HTML is far denser. TOML moves to tree-sitter only if that
+  beats the hand-written one.
+- Context: the shared `Token` vocabulary in `ghostrealm_core::highlight` mixes
+  generic categories (Key, String, Number, Comment) with Markdown-only ones
+  (Strong, Emphasis, Link, Url, Quote, Marker). With many languages it needs
+  general categories (keyword, type, function, operator, ..., like tree-sitter's
+  capture names). Bold and italic are styles, not colours, so the vocabulary may
+  split into syntax tokens and rich-text styles. That is the weak point of the
+  Markdown-specific labels the owner asked about; if Markdown stays a separate
+  highlighter, the split is what lets it still run through the same API.
+- Related: per-language comment tokens for the editor's comment toggle live in
+  the same per-language registry (see "Quality of life (owner review) — editor
+  and file browser polish"). Fenced code blocks in Markdown use these
+  highlighters.
+- Owner, verbatim:
+  > Oh, okay, I misunderstood you about highlighting in that they were the same
+  > thing. We might need to explore a generic syntax highlighter using tree
+  > sitter a bit more. Not implementing that just yet. So I'm thinking like my
+  > main languages, I might hard code one specifically for that language, unless
+  > there's a good reason why I shouldn't. Like I guess maybe the language
+  > evolves over time, so there's new keywords or something. Or we can make a
+  > unified API for like identifying which keywords there are. And then, yeah,
+  > maybe that does use tree sitter. Specifically for Markdown, though, I think
+  > Markdown deserves its own syntax highlighter just because of the way that I
+  > want it to both render and format and show the syntax all at the same time,
+  > which is a bit different. Oh, but you could argue that maybe we want that
+  > for other rich formats, such as HTML as well. At least for like headers and
+  > bold and whatnot. Then again, maybe not. HTML is far more complicated and
+  > far more dense. I'm not sure if you would use the tree sitter generic thing
+  > for Toml. Maybe. I don't see why you wouldn't. We'll think about that one
+  > more. It would have to be an improvement on the Toml one that's hard-coded,
+  > I think. My main language is Kotlin, so I would be looking at primarily
+  > doing like Kotlin, Gradle, Java, syntax highlighters, or maybe Swift and
+  > Rust because we do that a bit too. And then I guess there's also web. You're
+  > going to have to explain to me the weak point with markdown specific labels,
+  > I think. But it might not be a problem if we're keeping markdown separate
+  > because rendered markdown is its own kind of fancy thing, I think. Mind you,
+  > it's probably still running through the same API, isn't it? We can discuss
+  > more.
+- Reason: decide the highlighting architecture before adding many languages.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Build artifacts accumulate: keep only the latest
+
+- Requires: NO BLOCKERS
+- Detail: `target/` holds old copies of every build (about 19 GB: `debug/deps`
+  keeps hashed copies from earlier builds, ~12 GB; `incremental` ~3 GB). Keep
+  the latest artifacts, the compiler caches, and the downloaded dependencies;
+  drop the stale heavy copies. Options:
+  - A cleanup task that sweeps stale artifacts by age or toolchain, e.g.
+    `cargo-sweep`, or a small in-repo script or `xtask` run from `mise`.
+  - Cargo's unstable cache garbage collection (`-Zgc`); check whether it covers
+    the target directory before relying on it.
+  - Turn incremental compilation off for release builds.
+  Small; wanted soon.
+- Owner, verbatim:
+  > By the way, this is completely unrelated, but I've noticed that we aggregate
+  > quite a lot of build artifacts over time. Are we able to change that, like
+  > now-ish, to only keep the latest artifact and to always clean out the older
+  > stuff, like the older binary? Obviously, we want to keep the caches that
+  > will help us build faster and like the downloaded dependencies, but like the
+  > really heavy stuff that we're keeping multiple copies of, ideally we just
+  > want to keep one.
+- Reason: disk use grows without bound; the owner wants one copy of the heavy
+  artifacts.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Web — enable the Chromium sandbox
+
+- Requires: NO BLOCKERS
+- Detail: Decided (DECISION.md, Web surface / security): enable the sandbox, with
+  no runtime flag to turn it off (add one only if debugging ever needs it).
+  Work: link `cef_sandbox` into the macOS helper bundles (the host passes
+  `no_sandbox: 1`, `crates/web-host/src/main.rs`); on Linux use Chromium's
+  setuid or namespace sandbox. Verify pages still load and the helpers still
+  launch with the bundle layout. See
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 21.
+- Owner, verbatim:
+  > Definitely, I think, turn on the Chromium sandbox. I'm not even sure if we
+  > should have the ability to turn it off. If we need to turn it off in the
+  > future, maybe we can just program it to be able to turn off then. I don't
+  > think we need to have a flag or anything for this. No real advantage to
+  > turning it off, except for maybe debugging.
+- Reason: a renderer exploit otherwise runs with the user's rights; the browser
+  loads arbitrary pages and agents drive it.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Web — profiles: picker, human-only vs agent, per-workspace scope
+
+- Requires: a design session for the picker and the scope controls; the agent
+  channel → running app entry for the shared host
+- Detail: Decided: the profile moves out of `~/Library/Caches/ghostrealm/web` to
+  Application Support (DECISION.md, Web surface / profiles).
+- Detail: Profile model:
+  - A profile picker in the browser and the GUI.
+  - Human-only profiles that agents cannot reach structurally: the agent channel
+    has no path to their cookies or tokens. The isolation is enforced by the
+    host and channel, not by instructions.
+  - Agent profiles, shared between agents.
+  - A per-profile scope, set by the agent or the human: private to one
+    workspace, or shared across workspaces. Humans can scope their own profiles
+    the same way.
+- Detail: Chromium locks a profile to one process, so the host is owned by the
+  running app and agents connect through it ("Agent channel → the running app"),
+  not by each process spawning its own host. Replaces the one-shared-profile
+  leaning in [stack-review-findings-2.md](stack-review-findings-2.md) item 19.
+- Owner, verbatim:
+  > It sounds like we should move the profile to application support regardless.
+  > Given that we have multiple profile support, I actually think maybe we
+  > should take advantage of that. We should have a profile picker in the
+  > browser and like in the GUI. And there will be one profile that is human
+  > only. And we've got to make it so that it's impossible for the agent to
+  > access that. And then we can have multiple other profiles, but those other
+  > profiles, or single profile, and those can be agent controlled and shared
+  > between the agents. Maybe even shared between workspaces, maybe not shared
+  > between workspaces. Maybe there's some kind of privacy control that an agent
+  > can set. So an agent in one workspace can say, this is private to my
+  > workspace. No other workspace can dip into it. And maybe it can also say,
+  > oh, this is public. I can share this with other workspaces. And actually,
+  > maybe there shouldn't only be one human-only profile. Maybe the human also
+  > has the private to this workspace or shared among all workspaces option. But
+  > the human ones must be impossible to interact with via the agent. And the
+  > agent must not be able to get the tokens and stuff. We want this kind of
+  > isolation built in and structural, not markdown prayers or rules.
+- Reason: agents browse logged-in sites; the human's sessions must be
+  unreachable by construction.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] PRIORITY (web): isolated-world `web.eval`
+
+- Requires: NO BLOCKERS (a CEF render-process handler)
+- Detail: `web.eval` runs in the page's main JavaScript world, so a page can
+  redefine functions (`console.log`, `eval`, `JSON.stringify`) and lie to the
+  agent about what it finds. Run it in an isolated world, as Chrome extension
+  content scripts do; in CEF that needs a render-process handler. Priority:
+  high within the web work, after some quality-of-life items. See
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 18.
+- Context: an agent-driven browser is a prompt-injection and malicious-use risk.
+  The owner asked whether agents mostly browse localhost. They will often open
+  localhost dev servers, but also docs, GitHub, and search results, which are
+  arbitrary content, so the risk stands.
+- Owner, verbatim:
+  > Okay, it sounds like we need to put this isolated world thing on the to-do
+  > as a fairly high priority for the sake of security. High priority in terms
+  > of web stuff, although maybe some quality of life stuff will try and come
+  > before that. Mainly because agents can control the browsers and therefore
+  > there is clearly a prompt injection risk or a malicious use case risk.
+  > Having said that, we are most likely going to be running localhost stuff
+  > when we're doing stuff in the browser, right? Most of the time? Maybe not.
+  > I'm not sure, actually.
+- Reason: the agent must be able to trust what it reads back from a page.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Web — pop-ups: floating window for humans, hidden for agents
+
+- Requires: NO BLOCKERS
+- Detail: Decided (DECISION.md, UX principle / agent-operated surfaces).
+  Pop-ups currently load in place and lose `window.opener`, which breaks OAuth
+  and payment flows (`on_before_popup`, `crates/web-host/src/browser.rs`;
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 31).
+  - Human-triggered: open as a floating pop-up window on top of the whole app,
+    with the original tab kept alive. Fallback if that is not feasible: a new
+    tab.
+  - Agent-triggered: open in the background, hidden; never steal focus.
+- Detail: General principle: agent-operated browser or emulator activity runs in
+  the background and does not refocus or distract the human.
+- Owner, verbatim:
+  > Your recommendation about pop-ups makes sense. Could we keep that as like a
+  > pop-up window and still keep the original tab alive? If not, a new tab is
+  > fine, but I like the idea of a pop-up being a pop-up window that kind of
+  > sits on top of our entire application. Oh, but only if it's human
+  > controlled. If it's agent controlled and the agent is the one filling out
+  > the auth or whatever, prefer to hide it away. Like, it's really distracting
+  > when the agent keeps on refocusing on a browser to do things or an emulator
+  > to do things while I'm trying to do things as a human. So if you can do
+  > things in the background, then that's definitely a preference for agent
+  > operated stuff.
+- Reason: OAuth and payment pop-ups need `window.opener`; the human must not be
+  interrupted by agent work.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] Terminal: close the pane when the shell exits
+
+- Requires: NO BLOCKERS
+- Detail: Decided ([stack-review-findings.md](stack-review-findings.md) item 8):
+  close the pane when its shell exits with code 0. On a non-zero exit or a
+  signal, keep the pane with a banner ("exited with code N — press any key to
+  close"). A setting overrides the behaviour.
+- Owner, verbatim:
+  > For shell exit as number five, I think your recommendation is great. [The
+  > recommendation was: close the pane when the shell exits with code 0; keep it
+  > with a banner "exited with code N — press any key to close" on non-zero exit
+  > or a crash/signal; a setting to override.]
+- Reason: a dead pane left on screen after `exit` is clutter; a failure should
+  stay visible.
+
+---
+
+[2026-10-13T20:45+1300@6bc650f] GitHub permalinks
+
+- Requires: NO BLOCKERS (future idea; not now)
+- Detail: A "GitHub permalinks" action: a link to the file on GitHub at the
+  current commit, optionally with a line number. Zed has Open and Copy File
+  Permalink; it would join the file context menu ("File and folder context
+  menu") later. Name it "GitHub permalinks" in the UI so its meaning is clear.
+- Owner, verbatim:
+  > Oh, okay. About permalinks, we can write that down in the to do. We won't do
+  > it now, but it's a good idea to add GitHub permalinks in the future. And
+  > maybe we'll need to call it GitHub permalinks so that I actually know what
+  > [...] it's talking about.
+- Reason: owner asked for it recorded; shareable links to code.
