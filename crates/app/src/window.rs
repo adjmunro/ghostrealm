@@ -242,6 +242,9 @@ impl ApplicationHandler<UserEvent> for App {
                     state.end_press();
                     state.window.request_redraw();
                 }
+                // A button pressed before switching away is cancelled, not
+                // fired by a release that may arrive without its press.
+                state.armed_button = None;
             }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
