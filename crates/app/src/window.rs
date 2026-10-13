@@ -95,8 +95,9 @@ enum UserEvent {
     /// The background font loader finished; the full system-font DB is waiting on
     /// the channel and should be swapped in. Carries no data (the DB isn't `Copy`).
     FontsLoaded,
-    /// The system asked the app to quit (the app menu, the Dock, logout).
-    Quit,
+    /// The system asked the app to terminate (the app menu, the Dock, logout)
+    /// and is waiting for `about_to_wait` to answer.
+    Terminate,
 }
 
 pub fn run(command_line: Option<String>) -> Result<()> {
@@ -134,25 +135,47 @@ struct App {
 /// the system's quit request. The exact value is computed once per loop pass
 /// (`about_to_wait`); every event handler first assumes the worst, because an
 /// event (a keystroke) may edit a buffer and a quit request can arrive in the
-/// same pass before the exact value is refreshed. A wrong `true` only cancels
-/// the termination once: the app's own quit then exits at once when nothing is
-/// unsaved.
+/// same pass before the exact value is refreshed. A termination request that
+/// meets a `true` is held, and answered once the exact value is known (a wrong
+/// `true` is answered yes), so a stale flag never cancels a logout.
 #[derive(Clone, Default)]
-struct UnsavedFlag(Rc<Cell<bool>>);
+struct UnsavedFlag {
+    unsaved: Rc<Cell<bool>>,
+    /// A termination request is waiting for the exact value.
+    reply_due: Rc<Cell<bool>>,
+}
 
 impl UnsavedFlag {
     fn assume_unsaved(&self) {
-        self.0.set(true);
+        self.unsaved.set(true);
     }
 
     fn set(&self, unsaved: bool) {
-        self.0.set(unsaved);
+        self.unsaved.set(unsaved);
     }
 
     fn get(&self) -> bool {
-        self.0.get()
+        self.unsaved.get()
+    }
+
+    /// Hold a termination request until [`Self::settle`].
+    fn hold_termination(&self) {
+        self.reply_due.set(true);
+    }
+
+    /// With the exact value known, the answer to a held termination request:
+    /// `Some(true)` to go ahead, `Some(false)` to stay and ask. `None` when
+    /// none is held.
+    fn settle(&self, unsaved: bool) -> Option<bool> {
+        self.set(unsaved);
+        self.reply_due.take().then_some(!unsaved)
     }
 }
+
+#[cfg(target_os = "macos")]
+use crate::macos_quit::reply_to_terminate;
+#[cfg(not(target_os = "macos"))]
+fn reply_to_terminate(_go_ahead: bool) {}
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -181,10 +204,11 @@ impl ApplicationHandler<UserEvent> for App {
             let (proxy, unsaved) = (self.proxy.clone(), self.unsaved.clone());
             move || {
                 if !unsaved.get() {
-                    return true;
+                    return crate::macos_quit::Terminate::Now;
                 }
-                let _ = proxy.send_event(UserEvent::Quit);
-                false
+                unsaved.hold_termination();
+                let _ = proxy.send_event(UserEvent::Terminate);
+                crate::macos_quit::Terminate::Later
             }
         });
         match pollster::block_on(State::new(
@@ -217,16 +241,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // The full font DB is ready: swap it in for complete glyph fallback.
             UserEvent::FontsLoaded => state.upgrade_fonts(),
-            // Asked from outside the window (it may be minimised, or the app in
-            // the background): bring it forward to show any question.
-            UserEvent::Quit => {
-                state.request_quit();
-                if state.app.confirm().is_some() {
-                    state.window.set_minimized(false);
-                    state.window.focus_window();
-                }
-                state.window.request_redraw();
-            }
+            // Answered in `about_to_wait`, once the unsaved state is exact.
+            UserEvent::Terminate => {}
         }
     }
 
@@ -238,7 +254,21 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        self.unsaved.set(state.app.has_unsaved());
+        match self.unsaved.settle(state.app.has_unsaved()) {
+            Some(true) => reply_to_terminate(true),
+            // Asked from outside the window (it may be minimised, or the app
+            // in the background): bring it forward to show the question.
+            Some(false) => {
+                reply_to_terminate(false);
+                state.request_quit();
+                if state.app.confirm().is_some() {
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                }
+                state.window.request_redraw();
+            }
+            None => {}
+        }
         // Fire view timers (e.g. an editor's idle autosave) that came due while
         // the app sat idle.
         if state.fire_view_timers() {
@@ -4458,6 +4488,21 @@ mod tests {
         let shared = flag.clone();
         flag.set(false);
         assert!(!shared.get(), "the refresh is seen by the quit hook's clone");
+    }
+
+    #[test]
+    fn a_held_termination_is_answered_from_the_exact_unsaved_state() {
+        let flag = super::UnsavedFlag::default();
+        assert_eq!(flag.settle(true), None, "nothing is held");
+        // A stale `true`: nothing is unsaved after all, so go ahead.
+        flag.assume_unsaved();
+        flag.hold_termination();
+        assert_eq!(flag.settle(false), Some(true));
+        assert_eq!(flag.settle(false), None, "answered once");
+        // Really unsaved: stay and ask.
+        flag.hold_termination();
+        assert_eq!(flag.settle(true), Some(false));
+        assert!(flag.get());
     }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so
