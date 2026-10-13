@@ -118,3 +118,105 @@ Found reviewing `4981b3a..d5e17a2` (bracketed paste and mouse reporting
     backend test `paste_is_unwrapped_when_the_program_did_not_ask_for_brackets`
     locks in the raw behaviour. Decision needed: sanitise unbracketed pastes the
     same way?
+
+## Follow-up fixes (f59386c..e534aa0)
+
+Reviewed after these commits had reached `develop`. Found reviewing the
+follow-up fixes (`3f99752`, `8493dac`, `0cc6b0c`, `01572a4`, `e9617b8`,
+`55cc01c` and the commits around them). Each fix's test was revert-checked and
+fails without the fix. Line numbers are against `950b88a`.
+
+### Low–Medium
+
+#### 37. Legacy mouse encoding drops positions past column 223
+
+- Where: the position clamp in `encode_mouse`
+  ([`terminal-ghostty/src/lib.rs:432`](../crates/terminal-ghostty/src/lib.rs)),
+  from `3f99752`.
+- Repro: a program enables mode 1000 only (no 1006, 1005, 1015 or 1016) on a
+  300-column terminal. A press at column 201 is sent; the release at column 251
+  is not. The program sees the button held. Likely on full-screen 4K/5K panes.
+- Cause: the clamp pins the position to the grid edge, but the X10/normal
+  encoding cannot express columns or rows past 223, and libghostty drops the
+  event instead of clamping.
+- Fix: in the legacy format also clamp to 222 (0-based), as xterm does.
+  Straightforward.
+
+#### 38. A lost release leaks across views
+
+- Where: `on_click`
+  ([`window.rs:1357`](../crates/app/src/window.rs)) sets `mouse_capture = None`
+  without sending `Up`. `8493dac`'s synthetic release only covers a new press in
+  the same view.
+- Repro: lose a release in terminal A (switch apps mid-drag), then click
+  terminal B. A keeps `reporting == true` and the backend's `mouse_held`; in
+  mode 1002, hovering A encodes `Move`s as drags. The web view leaks `pressed`
+  the same way, and CEF never gets the `Up`.
+- Fix: in `on_click` / `begin_press`, if `mouse_capture` is still `Some` from an
+  unfinished press, send that view `Up` first. Straightforward.
+
+#### 39. A protocol-version mismatch retries forever
+
+- Where: `failed`
+  ([`plugins/web/mod.rs:141`](../crates/app/src/plugins/web/mod.rs)) schedules a
+  back-off capped at `RETRY_MAX` (60 s); `tick` (line 1021) respawns when it
+  expires. From `01572a4`, which drops a host that speaks another protocol
+  version.
+- Repro: open a web tab with a stale host bundle. The timers run for hidden
+  views too, so every 60 s, indefinitely, a full CEF cold start spawns and is
+  refused (CPU, battery).
+- Fix: treat a version mismatch as permanent: no auto-retry. Respawn only on
+  Reload, `web.new`, or a config or bundle change (for example the bundle's
+  mtime). Straightforward.
+
+### Low
+
+#### 40. The paste/mode-switch test sleeps a fixed 800 ms
+
+- Where: `paste_sees_a_mode_switch_still_queued_from_the_child`
+  ([`terminal-ghostty/tests/backend.rs:541`](../crates/terminal-ghostty/tests/backend.rs)),
+  from `0cc6b0c`.
+- Cause: the sleep stands in for "the child's mode switch reached the reader's
+  channel". Under load it can fail spuriously; it never passes wrongly.
+- Fix: a test-only hook (for example a bytes-queued count on the reader
+  channel) so the test waits deterministically.
+
+#### 41. Frame directory weak spots
+
+- Where: `frame_dir` and `private_dir`
+  ([`web/src/frame.rs:35`](../crates/web/src/frame.rs)), and the frame file
+  setup (`set_len` + `MmapMut::map_mut`, line 225).
+- Without `XDG_RUNTIME_DIR` (Linux), another user can pre-create
+  `/tmp/ghostrealm-<uid>`; `private_dir` then refuses it and the browser never
+  starts.
+- A stale `XDG_RUNTIME_DIR` inherited through `su` fails with no fallback.
+- On a full tmpfs, the sparse `set_len` succeeds and writing pixels through the
+  mapping SIGBUSes the host. `posix_fallocate` turns that into `ENOSPC`.
+- Frame files left in the old temp-dir location are never cleaned.
+- Decision needed (minor): on failure, fall back to a `mkdtemp`-style random
+  directory, or keep the fixed `<temp dir>/ghostrealm-<uid>` path and report
+  the error?
+
+#### 42. Hover nits
+
+- Where: `restrict` call site
+  ([`window.rs:3281`](../crates/app/src/window.rs)), from `e9617b8`.
+- `restrict` ignores `mouse_down`, so a modal opened from the keyboard
+  mid-press sends `Leave` mid-press. That contradicts the
+  [`event.rs`](../crates/app/src/plugin/event.rs) doc ("never during a press"),
+  and the web view sends CEF a leave without button flags. Fix: skip `restrict`
+  while `mouse_down`, or apply it on release.
+- Related, pre-existing: switching tab or workspace by keyboard leaves hover on
+  a view that is now hidden. Restrict hover to views painted that frame.
+
+### Informational
+
+#### 43. Image alpha blends in linear light
+
+- Where: [`images.rs`](../crates/app/src/images.rs) and
+  [`plugin/paint.rs`](../crates/app/src/plugin/paint.rs), from `55cc01c`.
+- Effect: premultiplying and mip-building in linear light is physically correct
+  and matches quads and text, but anti-aliased PNG edges look different from
+  browsers and image viewers, which blend in encoded space.
+- Decision needed: keep linear (current), or blend images in encoded space to
+  match browsers?

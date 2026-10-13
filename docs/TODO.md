@@ -784,7 +784,8 @@
 
 - Requires: a design (prompt the user about it)
 - Detail: Errors reach stderr only: a failed Save As, a refused open of an
-  unreadable or non-UTF-8 file, config load findings, web host failures. Design
+  unreadable or non-UTF-8 file, config load findings. (Web host failures are
+  shown in the web pane and reported by `web.new`.) Design
   where they show (toast, status line, inbox, settings status). See
   [stack-review-findings.md](stack-review-findings.md) item 5 (silent Save As and
   open failures) and [stack-review-findings-2.md](stack-review-findings-2.md)
