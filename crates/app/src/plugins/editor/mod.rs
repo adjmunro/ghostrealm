@@ -913,10 +913,12 @@ impl View for EditorView {
         Ok(())
     }
 
-    /// Agent input is typed at the cursor (one undo step).
+    /// Agent input goes in at the cursor as given (one undo step). It is
+    /// pasted, not typed: typing a lone bracket auto-closes or wraps, which
+    /// would make the result depend on how the input was chunked.
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         let text = String::from_utf8_lossy(bytes).into_owned();
-        self.buf.apply(Edit::Insert(text), &mut None::<String>);
+        self.buf.apply(Edit::Paste, &mut Some(text));
         self.note_edits();
         true
     }
@@ -1489,6 +1491,18 @@ mod tests {
         assert_eq!(v.buffer().lines, vec!["[f(x)]"], "a selection is wrapped");
         h.key(&mut v, cmd(Key::Char('z')));
         assert_eq!(v.buffer().lines, vec!["f(x)"]);
+    }
+
+    #[test]
+    fn agent_input_is_literal_text_whatever_its_chunks() {
+        let mut v = view_with("");
+        for chunk in ["f", "(", "x)"] {
+            v.write_input(chunk.as_bytes());
+        }
+        assert_eq!(v.buffer().lines, vec!["f(x)"], "no closer is added");
+        v.buf.select_all();
+        v.write_input(b"[");
+        assert_eq!(v.buffer().lines, vec!["["], "a selection is replaced, not wrapped");
     }
 
     #[test]
