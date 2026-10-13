@@ -31,17 +31,60 @@ const PREFIX: &str = "ghostrealm-web-";
 /// set, else `<temp dir>/ghostrealm-<uid>`. It is created mode 0700 and refused
 /// unless it is a directory this user owns that nobody else can access: in a
 /// shared temp dir another user could otherwise read frames or take their
-/// predictable names first.
+/// predictable names first. When that directory is refused or can't be made
+/// (another user pre-created it, a stale `XDG_RUNTIME_DIR` inherited through
+/// `su`), a fresh randomly named private directory in the temp dir is used.
 pub fn frame_dir() -> io::Result<PathBuf> {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR")
+    let preferred = match std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
     {
         Some(run) => run.join("ghostrealm"),
         None => std::env::temp_dir().join(format!("ghostrealm-{}", user_id())),
     };
-    private_dir(&dir)?;
-    Ok(dir)
+    frame_dir_in(&preferred, &std::env::temp_dir())
+}
+
+/// `preferred` if it is usable as a private directory, else a fresh private
+/// directory under `fallback_base`.
+fn frame_dir_in(preferred: &Path, fallback_base: &Path) -> io::Result<PathBuf> {
+    match private_dir(preferred) {
+        Ok(()) => Ok(preferred.to_path_buf()),
+        Err(_) => random_private_dir(fallback_base),
+    }
+}
+
+/// Create a new directory (mode 0700) named `ghostrealm-<uid>-<random>` in
+/// `base`, as `mkdtemp` does: creation fails if the name exists, so the
+/// directory is ours and was never planted.
+fn random_private_dir(base: &Path) -> io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut last = None;
+    for _ in 0..16 {
+        // RandomState is seeded from the OS per instance.
+        let n = std::collections::hash_map::RandomState::new().build_hasher().finish();
+        let dir = base.join(format!("ghostrealm-{}-{n:016x}", user_id()));
+        match create_private(&dir) {
+            Ok(()) => {
+                private_dir(&dir)?;
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("no free directory name")))
+}
+
+#[cfg(unix)]
+fn create_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir(dir)
 }
 
 #[cfg(unix)]
@@ -222,7 +265,7 @@ impl FrameWriter {
             .checked_mul(2)
             .and_then(|b| b.checked_add(HEADER))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
-        file.set_len(len as u64)?;
+        reserve(&file, len as u64)?;
         // SAFETY: the file is private to this writer (fresh, unique name) and is
         // never truncated while mapped.
         let map = unsafe { MmapMut::map_mut(&file)? };
@@ -231,6 +274,27 @@ impl FrameWriter {
         }
         Ok(())
     }
+}
+
+/// Size `file` to `len` bytes with its blocks allocated where the platform can
+/// (`posix_fallocate`), so a full tmpfs fails here with `ENOSPC` instead of
+/// raising SIGBUS when pixels are later written through the mapping.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn reserve(file: &std::fs::File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the duration of the call.
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+    match rc {
+        0 => Ok(()),
+        // The filesystem can't preallocate: fall back to a sparse file.
+        libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS => file.set_len(len),
+        e => Err(io::Error::from_raw_os_error(e)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+fn reserve(file: &std::fs::File, len: u64) -> io::Result<()> {
+    file.set_len(len)
 }
 
 impl Drop for FrameWriter {
@@ -313,6 +377,42 @@ mod tests {
         let d = std::env::temp_dir().join(format!("ghostrealm-frame-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_frame_dir_falls_back_to_a_fresh_private_one() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = tmpdir("fallback");
+        // Open to others: refused.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = frame_dir_in(&open, &base).unwrap();
+        assert_ne!(got, open);
+        assert!(got.starts_with(&base));
+        let meta = std::fs::metadata(&got).unwrap();
+        assert_eq!(meta.mode() & 0o077, 0, "private");
+        assert_eq!(meta.uid(), user_id());
+        // A missing parent (a stale XDG_RUNTIME_DIR) falls back too.
+        let stale = base.join("gone/ghostrealm");
+        assert!(frame_dir_in(&stale, &base).unwrap().starts_with(&base));
+        // Each fallback is a new directory.
+        assert_ne!(frame_dir_in(&open, &base).unwrap(), got);
+        // A usable preferred directory is kept.
+        let good = base.join("good");
+        assert_eq!(frame_dir_in(&good, &base).unwrap(), good);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[test]
+    fn the_frame_file_is_allocated_not_sparse() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmpdir("alloc");
+        let mut w = FrameWriter::new(&dir, "t");
+        let f = w.write(64, 64, &vec![1; 64 * 64 * 4]).unwrap();
+        let meta = std::fs::metadata(&f.path).unwrap();
+        assert!(meta.blocks() * 512 >= meta.len(), "blocks are reserved up front");
     }
 
     #[test]

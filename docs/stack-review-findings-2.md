@@ -131,22 +131,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low
 
-#### 41. Frame directory weak spots
-
-- Where: `frame_dir` and `private_dir`
-  ([`web/src/frame.rs:35`](../crates/web/src/frame.rs)), and the frame file
-  setup (`set_len` + `MmapMut::map_mut`, line 225).
-- Without `XDG_RUNTIME_DIR` (Linux), another user can pre-create
-  `/tmp/ghostrealm-<uid>`; `private_dir` then refuses it and the browser never
-  starts.
-- A stale `XDG_RUNTIME_DIR` inherited through `su` fails with no fallback.
-- On a full tmpfs, the sparse `set_len` succeeds and writing pixels through the
-  mapping SIGBUSes the host. `posix_fallocate` turns that into `ENOSPC`.
-- Frame files left in the old temp-dir location are never cleaned.
-- Decision needed (minor): on failure, fall back to a `mkdtemp`-style random
-  directory, or keep the fixed `<temp dir>/ghostrealm-<uid>` path and report
-  the error?
-
 #### 42. Hover nits
 
 - Where: `restrict` call site
