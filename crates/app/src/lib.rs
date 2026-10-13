@@ -13,6 +13,7 @@ pub mod plugin;
 pub mod plugins;
 pub mod row_cache;
 pub mod settings;
+pub mod syntax;
 pub mod tap;
 pub mod window;
 

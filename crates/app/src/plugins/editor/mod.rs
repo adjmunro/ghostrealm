@@ -1,5 +1,5 @@
 //! The text editor plugin: a minimal editable buffer with line numbers,
-//! soft-wrap, selection, and TOML highlighting. It claims any file path, so it
+//! soft-wrap, selection, and syntax highlighting. It claims any file path, so it
 //! is the fallback when no more specific plugin opens a file. A file with a
 //! language service shows its diagnostics and hover docs.
 
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
-use ghostrealm_core::highlight::toml::toml_row_spans;
+use ghostrealm_core::highlight::{self, Span, StateCache};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -22,6 +22,7 @@ use ghostrealm_lsp::Client;
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::{AppState, Pick};
+use crate::syntax;
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
@@ -198,6 +199,8 @@ pub struct EditorView {
     layout: Layout,
     /// The file's language service, if it has one.
     lang: Option<Lang>,
+    /// Where each line's syntax-highlight state starts.
+    hl_states: StateCache,
 }
 
 impl EditorView {
@@ -211,6 +214,7 @@ impl EditorView {
         let mut stats = Stats::new(waker);
         stats.fetch_head(buf.path.clone());
         EditorView {
+            hl_states: StateCache::default(),
             stats,
             seen_edits: buf.edits,
             buf,
@@ -533,12 +537,7 @@ impl View for EditorView {
         // Unwrapped rows hold their whole line, shaped once, drawn shifted left
         // by hscroll and clipped — moving the viewport rather than reshaping.
         let hscroll_px = e.hscroll as f32 * cw;
-        let highlight_toml = e
-            .path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|x| x.to_str())
-            .is_some_and(|x| x.eq_ignore_ascii_case("toml"));
+        let highlighter = e.path.as_deref().and_then(highlight::for_path);
         cx.fill(body, EDITOR_BG);
 
         // Visible visual rows: (logical line, text, start col, y).
@@ -610,11 +609,19 @@ impl View for EditorView {
         // Text, one cache-keyed row per visual row (wrapped sub-rows stay
         // cache-friendly), shaped within the frame's budget.
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
+        // A wrapped line's rows share one highlight pass.
+        let mut line_spans: Option<(usize, Vec<Span>)> = None;
         for (ln, text, start, y) in &vis {
-            let spans: Vec<(String, [u8; 3])> = if highlight_toml {
-                toml_row_spans(&self.buf.lines[*ln], *start, text.chars().count(), EDITOR_FG)
-            } else {
-                vec![(text.clone(), EDITOR_FG)]
+            let spans: Vec<(String, [u8; 3])> = match highlighter {
+                Some(h) => {
+                    if line_spans.as_ref().is_none_or(|(l, _)| l != ln) {
+                        let state = self.hl_states.state_in(h, &e.lines, e.edits, *ln);
+                        line_spans = Some((*ln, h.line(&e.lines[*ln], state).0));
+                    }
+                    let hl = &line_spans.as_ref().expect("set above").1;
+                    syntax::row_spans(&e.lines[*ln], hl, *start, text.chars().count(), EDITOR_FG)
+                }
+                None => vec![(text.clone(), EDITOR_FG)],
             };
             let key = cx.row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
             // Wide enough for the whole row, so layout is hscroll-independent.
