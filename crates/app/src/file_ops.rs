@@ -260,13 +260,16 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Whether `dir` is `src` or inside it, after resolving symlinks (`src`'s
-/// own last component isn't followed: a symlink is copied or moved as a link).
-/// Copying a folder into itself would recurse until the stack overflows.
+/// Whether `dir` is `src` or inside it, after resolving symlinks and the case
+/// a case-insensitive filesystem stores names in (`src` itself isn't followed
+/// when it is a symlink: that is copied or moved as a link). Copying a folder
+/// into itself would recurse until the path grows too long.
 fn inside_itself(src: &Path, dir: &Path) -> bool {
     let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let src = match (src.parent(), src.file_name()) {
-        (Some(parent), Some(name)) => real(parent).join(name),
+        (Some(parent), Some(name)) if src.symlink_metadata().is_ok_and(|m| m.is_symlink()) => {
+            real(parent).join(name)
+        }
         _ => real(src),
     };
     real(dir).starts_with(src)
@@ -714,6 +717,18 @@ pub mod tests {
         assert_eq!(names(&d.join("a/sub")), Vec::<String>::new(), "nothing was written");
         // A symlink itself is copied as a link, even into the folder it names.
         assert_eq!(copy_into(&d.join("link"), &d.join("a/sub")).unwrap(), d.join("a/sub/link"));
+    }
+
+    #[test]
+    fn a_folder_isnt_copied_into_itself_under_a_name_in_another_case() {
+        let d = tmpdir("ops-into-self-case");
+        std::fs::create_dir_all(d.join("Proj/sub")).unwrap();
+        if !d.join("PROJ").exists() {
+            return; // case-sensitive filesystem: another folder
+        }
+        assert!(copy_into(&d.join("PROJ"), &d.join("Proj/sub")).is_err());
+        assert!(move_into(&d.join("PROJ"), &d.join("Proj/sub")).is_err());
+        assert_eq!(names(&d.join("Proj/sub")), Vec::<String>::new(), "nothing was written");
     }
 
     #[cfg(unix)]
