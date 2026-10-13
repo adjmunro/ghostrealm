@@ -104,7 +104,10 @@ struct Shared {
     ready: bool,
     exited: bool,
     views: HashMap<u64, ViewState>,
-    /// Answers to `Text` / `Eval` requests, keyed by request id.
+    /// `Text` / `Eval` requests awaiting an answer: request id → page id.
+    /// Replies to anything else are dropped.
+    pending: HashMap<u64, u64>,
+    /// Answers to pending requests, keyed by request id.
     replies: HashMap<u64, Event>,
 }
 
@@ -245,8 +248,9 @@ impl WebHost {
 
     /// The main frame's visible text.
     pub fn text(&self, id: u64, timeout: Duration) -> Option<String> {
-        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let req = self.expect_reply(id);
         if !self.send(&Request::Text { id, req }) {
+            self.forget_reply(req);
             return None;
         }
         match self.wait_reply(req, timeout)? {
@@ -255,14 +259,18 @@ impl WebHost {
         }
     }
 
-    /// Evaluate `js` in the main frame. `Ok` carries the JSON-encoded value.
+    /// Evaluate `js` in the main frame. `Ok` carries the JSON-encoded value,
+    /// which the page can shape (see [`eval_wrapper`]).
+    ///
+    /// [`eval_wrapper`]: crate::protocol::eval_wrapper
     pub fn eval(&self, id: u64, js: &str, timeout: Duration) -> Result<String, String> {
-        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let req = self.expect_reply(id);
         if !self.send(&Request::Eval {
             id,
             req,
             js: js.to_string(),
         }) {
+            self.forget_reply(req);
             return Err("web host is not running".into());
         }
         match self.wait_reply(req, timeout) {
@@ -274,8 +282,24 @@ impl WebHost {
         }
     }
 
+    /// A fresh request id whose reply (about page `id`) will be kept.
+    fn expect_reply(&self, id: u64) -> u64 {
+        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        self.shared.0.lock().unwrap().pending.insert(req, id);
+        req
+    }
+
+    fn forget_reply(&self, req: u64) {
+        let mut s = self.shared.0.lock().unwrap();
+        s.pending.remove(&req);
+        s.replies.remove(&req);
+    }
+
+    /// The reply to `req`, or `None` on timeout or exit. Either way the request
+    /// is no longer pending, so a late reply is dropped.
     fn wait_reply(&self, req: u64, timeout: Duration) -> Option<Event> {
         let mut s = self.wait_until(timeout, |s| s.replies.contains_key(&req))?;
+        s.pending.remove(&req);
         s.replies.remove(&req)
     }
 
@@ -371,8 +395,13 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         Event::Closed { id } => {
             s.views.remove(&id);
         }
-        reply @ (Event::Text { req, .. } | Event::EvalResult { req, .. }) => {
-            s.replies.insert(req, reply);
+        reply @ (Event::Text { id, req, .. } | Event::EvalResult { id, req, .. }) => {
+            // Only a reply about the page the request named; a page that answers
+            // for another is ignored and the real answer still lands.
+            if s.pending.get(&req) == Some(&id) {
+                s.pending.remove(&req);
+                s.replies.insert(req, reply);
+            }
         }
     }
     cv.notify_all();
@@ -388,5 +417,35 @@ fn page_of(ev: &Event) -> Option<u64> {
         | Event::Cursor { id, .. }
         | Event::LoadError { id, .. } => Some(*id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_result(id: u64, req: u64, value: &str) -> Event {
+        Event::EvalResult {
+            id,
+            req,
+            ok: true,
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn only_replies_to_pending_requests_are_kept() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        shared.0.lock().unwrap().pending.insert(7, 2);
+        // Unsolicited, and claiming another page's request: dropped.
+        apply_event(&shared, eval_result(1, 99, "\"forged\""));
+        apply_event(&shared, eval_result(1, 7, "\"pwned\""));
+        assert!(shared.0.lock().unwrap().replies.is_empty());
+        // The real answer still lands; a second one for the same request doesn't.
+        apply_event(&shared, eval_result(2, 7, "2"));
+        apply_event(&shared, eval_result(2, 7, "\"again\""));
+        let s = shared.0.lock().unwrap();
+        assert_eq!(s.replies.get(&7), Some(&eval_result(2, 7, "2")));
+        assert!(s.pending.is_empty());
     }
 }

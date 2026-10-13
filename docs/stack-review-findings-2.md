@@ -34,24 +34,6 @@ carries no button, so only left clicks reach a page.
 
 ### High
 
-#### 18. A page can forge `web.eval` results and grow the app's memory without bound (confirmed)
-
-- Where: `on_console_message` ([`web-host/src/browser.rs:496`](../crates/web-host/src/browser.rs));
-  `EVAL_MARKER` / `parse_eval_message` ([`web/src/protocol.rs:236`](../crates/web/src/protocol.rs),
-  [`:254`](../crates/web/src/protocol.rs)); replies stored at
-  [`web/src/client.rs:375`](../crates/web/src/client.rs), taken by `wait_reply` (`:277`).
-- Repro: a page logs 5000 `EVAL_MARKER <n> 1 …` lines; `host.eval(2, "1+1")` on
-  another page returned the forged `"pwned"`; 4 × 64 MB payloads stayed in memory.
-- Cause: the marker is a public constant, so any `console.log` can produce a
-  reply; payloads have no size cap; replies are keyed by request number only and
-  stored whether or not anyone asked, and late replies are never removed.
-- Also: the wrapper runs in the page's main world, so a page can replace
-  `console.log`, `eval` or `JSON.stringify` and shape any result.
-- Fix: the client tracks outstanding `(id, req)`, drops anything else, and
-  forgets a request on timeout; the host marks each request with a random nonce,
-  caps payload length, and answers only requests it sent. Document that eval
-  results are page-controlled. Decision needed: evaluate in an isolated world?
-
 #### 19. A dead host is respawned on every paint and input, and its error is erased (confirmed)
 
 - Where: `HostSlot::host` ([`plugins/web/mod.rs:75`](../crates/app/src/plugins/web/mod.rs)),
@@ -135,6 +117,10 @@ carries no button, so only left clicks reach a page.
 
 ### Low
 
+18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
+    its result (by replacing `console.log`, `eval` or `JSON.stringify`); the
+    command's description says so. Decision needed: evaluate in an isolated
+    world instead?
 27. **Page frames can tear; the doc comment says otherwise.** `SharedFrame`
     ([`web/src/client.rs:73`](../crates/web/src/client.rs)) claims the worst case
     is a newer frame, but the two slots ([`web/src/frame.rs:50`](../crates/web/src/frame.rs))

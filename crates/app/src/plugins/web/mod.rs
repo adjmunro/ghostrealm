@@ -235,7 +235,8 @@ impl Plugin for WebPlugin {
             CommandMeta::new(
                 "web.eval",
                 "Web: Evaluate JavaScript",
-                "Run JavaScript in a web page (after it loads) and return its JSON-encoded result",
+                "Run JavaScript in a web page (after it loads) and return its JSON-encoded \
+                 result. It runs in the page's own context, so the page can change the result",
             )
             .arg(ArgSpec::required(
                 "js",

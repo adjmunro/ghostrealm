@@ -4,12 +4,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::raw::c_int;
+use std::time::{Duration, Instant};
 
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
     eval_wrapper, parse_eval_message, Cursor, EditAction, Event, KeyKind, MouseAction, MouseButton,
-    Request,
+    Request, MAX_EVAL_RESULT,
 };
 
 use crate::emit;
@@ -53,6 +54,83 @@ thread_local! {
     static BROWSERS: RefCell<HashMap<u64, Entry>> = RefCell::new(HashMap::new());
     /// Set once the app hung up: quit the message loop when the last browser closes.
     static QUITTING: Cell<bool> = const { Cell::new(false) };
+    /// Evals awaiting their result, by nonce.
+    static EVALS: RefCell<HashMap<String, PendingEval>> = RefCell::new(HashMap::new());
+}
+
+/// An eval the host started: only a result carrying its nonce, from its page,
+/// answers it.
+struct PendingEval {
+    id: u64,
+    req: u64,
+    started: Instant,
+}
+
+/// An eval whose promise hasn't settled by now is forgotten (the app gave up
+/// long before).
+const EVAL_TTL: Duration = Duration::from_secs(60);
+
+/// 128 random bits as hex, from the std hasher's per-process random keys.
+fn nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let half = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(n);
+        h.write_u64(salt);
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        );
+        h.finish()
+    };
+    format!("{:016x}{:016x}", half(0), half(1))
+}
+
+/// Start evaluating `js` in `frame` for request `req` of page `id`.
+fn start_eval(id: u64, req: u64, js: &str, frame: &Frame) {
+    let nonce = nonce();
+    EVALS.with_borrow_mut(|m| {
+        m.retain(|_, e| e.started.elapsed() < EVAL_TTL);
+        m.insert(
+            nonce.clone(),
+            PendingEval {
+                id,
+                req,
+                started: Instant::now(),
+            },
+        );
+    });
+    frame.execute_java_script(
+        Some(&CefString::from(eval_wrapper(&nonce, js).as_str())),
+        Some(&CefString::from("ghostrealm://eval")),
+        1,
+    );
+}
+
+/// A console message from page `id`: report it if it is the result of one of
+/// our evals on that page. Returns whether it was an eval result (forged or
+/// not), so it is kept out of the page's console.
+fn eval_result(id: u64, message: &str) -> bool {
+    let Some((nonce, ok, payload)) = parse_eval_message(message) else {
+        return false;
+    };
+    let pending = EVALS.with_borrow_mut(|m| match m.get(nonce) {
+        Some(e) if e.id == id => m.remove(nonce),
+        _ => None,
+    });
+    if let Some(e) = pending {
+        let (ok, value) = if payload.len() > MAX_EVAL_RESULT {
+            (false, format!("result too large ({} bytes, max {MAX_EVAL_RESULT})", payload.len()))
+        } else {
+            (ok, payload.to_string())
+        };
+        emit(&Event::EvalResult { id, req: e.req, ok, value });
+    }
+    true
 }
 
 /// Run one request (or, for `None`, the app's hang-up) on the UI thread.
@@ -161,11 +239,7 @@ pub fn handle(req: Option<Request>) {
             }),
         },
         Request::Eval { id, req, js } => match browser(id).and_then(|b| b.main_frame()) {
-            Some(frame) => frame.execute_java_script(
-                Some(&CefString::from(eval_wrapper(req, &js).as_str())),
-                Some(&CefString::from("ghostrealm://eval")),
-                1,
-            ),
+            Some(frame) => start_eval(id, req, &js, &frame),
             None => emit(&Event::EvalResult {
                 id,
                 req,
@@ -501,13 +575,7 @@ wrap_display_handler! {
             _source: Option<&CefString>,
             _line: c_int,
         ) -> c_int {
-            match parse_eval_message(&string(message)) {
-                Some((req, ok, value)) => {
-                    emit(&Event::EvalResult { id: self.id, req, ok, value });
-                    1
-                }
-                None => 0,
-            }
+            eval_result(self.id, &string(message)) as c_int
         }
     }
 }
@@ -581,6 +649,7 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            EVALS.with_borrow_mut(|m| m.retain(|_, e| e.id != self.id));
             let empty = BROWSERS.with_borrow_mut(|m| {
                 m.remove(&self.id);
                 m.is_empty()
@@ -659,7 +728,14 @@ wrap_string_visitor! {
 
 #[cfg(test)]
 mod tests {
-    use super::blit;
+    use super::{blit, nonce};
+
+    #[test]
+    fn nonces_are_long_and_distinct() {
+        let (a, b) = (nonce(), nonce());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn blit_clips_to_the_destination() {

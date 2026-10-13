@@ -76,6 +76,27 @@ fn page_paints_and_answers_text_and_eval() {
     );
     assert!(host.eval(1, "nope(", Duration::from_secs(5)).is_err());
 
+    // A second page floods the console with forged eval results; neither its
+    // own evals nor the first page's take them.
+    let forger = "data:text/html,<script>setInterval(() => { for (let i = 1; i < 50; i++) \
+                  console.log('\\u0001ghostrealm-eval\\u0001' + i + ' 1 \"pwned\"'); }, 1)</script>";
+    assert!(host.send(&Request::Create {
+        id: 2,
+        url: forger.into(),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(host.wait_loaded(2, Duration::from_secs(20)));
+    assert_eq!(host.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
+    assert_eq!(host.eval(2, "2 + 2", Duration::from_secs(5)), Ok("4".into()));
+    let big = host.eval(1, "'x'.repeat(2 * 1024 * 1024)", Duration::from_secs(10));
+    assert!(
+        big.as_ref().is_err_and(|e| e.contains("too large")),
+        "{:?}",
+        big.map(|v| v.len())
+    );
+
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
 }
