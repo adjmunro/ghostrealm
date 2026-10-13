@@ -31,11 +31,13 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// foreground command's process groups (either may ignore SIGHUP).
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// How often an otherwise idle worker checks whether the child has exited:
-/// nothing else wakes it when the exit brings no output (a background job
-/// still holds the PTY) or the reap trails the EOF. Faster once the output
-/// has ended, when the exit is due.
+/// Without `waitid` (not unix), how often an otherwise idle worker checks
+/// whether the child has exited: nothing else wakes it when the exit brings
+/// no output (a background job still holds the PTY) or the reap trails the
+/// EOF. Faster once the output has ended, when the exit is due.
+#[cfg(not(unix))]
 const EXIT_POLL: Duration = Duration::from_millis(500);
+#[cfg(not(unix))]
 const EXIT_POLL_AFTER_EOF: Duration = Duration::from_millis(50);
 
 /// Wakes the UI event loop after the worker publishes a change.
@@ -54,6 +56,8 @@ enum Cmd {
     Scroll(Scroll),
     /// The PTY reader forwarded output; drain + parse it.
     PtyReady,
+    /// The child exited (not yet reaped): refresh the lifecycle.
+    ChildExited,
     Shutdown,
 }
 
@@ -157,6 +161,14 @@ impl ThreadedTerminal {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("vt-worker died during startup")),
         };
+        #[cfg(unix)]
+        if let Some(pid) = child_pid {
+            let tx = cmd_tx.clone();
+            let _ = std::thread::Builder::new().name("vt-exit-waiter".into()).spawn(move || {
+                wait_for_exit(pid);
+                let _ = tx.send(Cmd::ChildExited);
+            });
+        }
 
         Ok(ThreadedTerminal {
             cmd_tx,
@@ -311,6 +323,37 @@ impl TerminalBackend for ThreadedTerminal {
     }
 }
 
+/// Block until the child `pid` has exited, leaving it unreaped (the worker
+/// reaps it, in `lifecycle`). Returns early if it can't wait (it was reaped
+/// already).
+#[cfg(unix)]
+fn wait_for_exit(pid: u32) {
+    let pid: libc::id_t = pid;
+    loop {
+        // SAFETY: waitid writes only the zeroed siginfo it is given.
+        let r = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
+/// How long the idle worker waits before checking for the child's exit:
+/// never on unix, where a waiter thread posts [`Cmd::ChildExited`].
+#[cfg(unix)]
+fn exit_poll_after(_term: &GhosttyTerminal, _lifecycle: Lifecycle) -> Option<Duration> {
+    None
+}
+
+#[cfg(not(unix))]
+fn exit_poll_after(term: &GhosttyTerminal, lifecycle: Lifecycle) -> Option<Duration> {
+    (lifecycle == Lifecycle::Running)
+        .then(|| if term.output_closed() { EXIT_POLL_AFTER_EOF } else { EXIT_POLL })
+}
+
 /// The worker's run loop: own the VT, apply commands, publish grids + meta.
 fn worker_loop(
     term: &mut GhosttyTerminal,
@@ -322,7 +365,7 @@ fn worker_loop(
     // Block until there's something to do, then drain the whole batch so a flood of
     // PtyReady/commands collapses into one pump + one publish. Exits when the last
     // handle drops (channel closed) or on `Shutdown`.
-    let mut exit_poll = Some(EXIT_POLL);
+    let mut exit_poll: Option<Duration> = None;
     loop {
         let first = if let Some(timeout) = exit_poll {
             match cmd_rx.recv_timeout(timeout) {
@@ -349,6 +392,7 @@ fn worker_loop(
             } => term.resize(cols, rows, cell_w, cell_h),
             Cmd::Scroll(s) => term.scroll(s),
             Cmd::PtyReady => pump = true,
+            Cmd::ChildExited => {}
             Cmd::Shutdown => shutdown = true,
         };
         if let Some(m) = first {
@@ -380,8 +424,7 @@ fn worker_loop(
             lifecycle: term.lifecycle(),
             foreground: term.foreground_group(),
         };
-        exit_poll = (new_meta.lifecycle == Lifecycle::Running)
-            .then(|| if term.output_closed() { EXIT_POLL_AFTER_EOF } else { EXIT_POLL });
+        exit_poll = exit_poll_after(term, new_meta.lifecycle);
         let meta_changed = {
             let mut m = shared.meta.lock().unwrap();
             let changed =
@@ -516,6 +559,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_waiter_leaves_the_child_to_reap() {
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.2; exit 3"]).spawn().unwrap();
+        let start = Instant::now();
+        wait_for_exit(child.id());
+        assert!(start.elapsed() >= Duration::from_millis(150), "it waited for the exit");
+        let status = child.try_wait().unwrap().expect("exited, and still ours to reap");
+        assert_eq!(status.code(), Some(3));
     }
 
     #[cfg(unix)]
