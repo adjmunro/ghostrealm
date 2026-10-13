@@ -241,8 +241,15 @@ impl GhosttyTerminal {
 
     /// Record the signal that ended the child, as its exit waiter saw it, so
     /// [`Terminal::lifecycle`] reports it whatever its number.
+    ///
+    /// A command can reach the worker after the child exited but before the
+    /// waiter reports, so `lifecycle` may already have stored a plain exit; a
+    /// signal then upgrades it.
     pub(crate) fn note_exit_signal(&mut self, signal: Option<i32>) {
         self.exit_signal = signal;
+        if let (Some(Lifecycle::Exited(_)), Some(signal)) = (self.exited, signal) {
+            self.exited = Some(Lifecycle::Signaled(signal));
+        }
     }
 
     /// The PTY's foreground process group (the running command, else the
@@ -700,6 +707,13 @@ impl TerminalBackend for GhosttyTerminal {
         if let Some(done) = self.exited {
             return done;
         }
+        // Read the signal before `try_wait` reaps the child: the waiter's
+        // report may not have arrived yet, and `portable_pty`'s status only
+        // knows signals below 32.
+        #[cfg(unix)]
+        if self.exit_signal.is_none() {
+            self.exit_signal = self.child.process_id().and_then(exit_signal_now);
+        }
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 let signal = self.exit_signal.or_else(|| status.signal().and_then(signal_number));
@@ -713,6 +727,37 @@ impl TerminalBackend for GhosttyTerminal {
             _ => Lifecycle::Running,
         }
     }
+}
+
+/// A `waitid` look at the child `pid` that leaves it unreaped: `Ok(None)` if
+/// it is still running (`nohang`), else `Ok(Some((si_code, si_status)))`.
+#[cfg(unix)]
+pub(crate) fn peek_exit(pid: u32, nohang: bool) -> std::io::Result<Option<(i32, i32)>> {
+    let flags = libc::WEXITED | libc::WNOWAIT | if nohang { libc::WNOHANG } else { 0 };
+    // SAFETY: waitid writes only the zeroed siginfo it is given.
+    let (r, info) = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags);
+        (r, info)
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: waitid filled the siginfo for a WEXITED report.
+    let (child, status) = unsafe { (info.si_pid(), info.si_status()) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let (child, status) = (info.si_pid, info.si_status);
+    // WNOHANG with nothing to report leaves the siginfo zeroed.
+    Ok((child != 0).then_some((info.si_code, status)))
+}
+
+/// The signal that killed the child `pid`, if it has exited that way and is
+/// not yet reaped.
+#[cfg(unix)]
+fn exit_signal_now(pid: u32) -> Option<i32> {
+    let (code, status) = peek_exit(pid, true).ok()??;
+    threaded::killed_by(code, status)
 }
 
 /// The number of the signal whose `strsignal` text is `description`: the only

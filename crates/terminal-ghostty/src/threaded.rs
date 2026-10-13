@@ -354,24 +354,11 @@ impl TerminalBackend for ThreadedTerminal {
 /// was reaped already).
 #[cfg(unix)]
 fn wait_for_exit(pid: u32) -> Option<i32> {
-    let pid: libc::id_t = pid;
     loop {
-        // SAFETY: waitid writes only the zeroed siginfo it is given.
-        let (r, info) = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            let r = libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT);
-            (r, info)
-        };
-        if r == 0 {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            // SAFETY: waitid filled si_status for a WEXITED report.
-            let status = unsafe { info.si_status() };
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let status = info.si_status;
-            return killed_by(info.si_code, status);
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return None;
+        match crate::peek_exit(pid, false) {
+            Ok(report) => return report.and_then(|(code, status)| killed_by(code, status)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
         }
     }
 }
@@ -380,7 +367,7 @@ fn wait_for_exit(pid: u32) -> Option<i32> {
 /// is a signal number only when the child was killed (`CLD_KILLED`) or dumped
 /// core (`CLD_DUMPED`), else its exit code.
 #[cfg(unix)]
-fn killed_by(si_code: i32, si_status: i32) -> Option<i32> {
+pub(crate) fn killed_by(si_code: i32, si_status: i32) -> Option<i32> {
     matches!(si_code, libc::CLD_KILLED | libc::CLD_DUMPED).then_some(si_status)
 }
 
@@ -629,6 +616,31 @@ mod tests {
         let mut exited = spawn("exit 9");
         assert_eq!(wait_for_exit(exited.id()), None, "an exit code is not a signal");
         exited.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_blocking_peek_sees_a_signal_death_without_reaping() {
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.3; kill -9 $$"]).spawn().unwrap();
+        assert_eq!(crate::peek_exit(child.id(), true).unwrap(), None, "still running");
+        std::thread::sleep(Duration::from_millis(800));
+        let (code, status) = crate::peek_exit(child.id(), true).unwrap().expect("exited");
+        assert_eq!(killed_by(code, status), Some(libc::SIGKILL));
+        assert!(child.try_wait().unwrap().is_some(), "still ours to reap");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_signal_report_upgrades_a_stored_plain_exit() {
+        let mut term = crate::GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("exit 1"))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while term.lifecycle() == Lifecycle::Running {
+            assert!(Instant::now() < deadline, "the exit was never noticed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(1)));
+        term.note_exit_signal(Some(40));
+        assert_eq!(term.lifecycle(), Lifecycle::Signaled(40));
     }
 
     #[cfg(unix)]
