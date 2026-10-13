@@ -1413,3 +1413,18 @@
   > machine.
 - Reason: CEF should stay current; check whether a new version breaks the build
   without leaving old copies behind.
+
+---
+
+[2026-10-14@1e8d150] Perf: file operations block the UI thread
+
+- Requires: NO BLOCKERS
+- Detail: The file context menu commands run on the UI thread (`file_ops.rs`,
+  `app_state/files.rs`):
+  - Duplicate and Paste (copy) copy a whole folder tree synchronously, so a big
+    folder freezes the window until it finishes.
+  - Delete's clean-check spawns `git` twice (tracked and untracked state) before
+    it decides whether to confirm.
+  - Cut-paste across filesystems does a copy then a remove, with the same cost.
+  Move them to a worker with a progress/completion event back to the UI thread.
+- Reason: the window should stay responsive during large copies and slow `git`.
