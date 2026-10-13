@@ -13,7 +13,10 @@ it; the rest come from reading the code.
 - Quitting (`CloseRequested`, [`window.rs:220`](../crates/app/src/window.rs))
   autosaves only when `autosave_on_unfocus = true`, and never saves pathless
   (scratch) buffers.
-- TODO.md only tracks a close confirmation for multi-pane workspaces.
+- TODO.md also tracks a close confirmation for multi-pane workspaces.
+- Tracked in TODO.md ("Quit/close confirmation for unsaved editor content"):
+  a Save and Quit / Cancel / Quit Without Saving dialog; opening a popup, menu,
+  or dialog does not count as losing focus for autosave.
 
 ### 5. Save As and open failures are silent
 
@@ -24,7 +27,8 @@ it; the rest come from reading the code.
   (`open_requested_file`, [`window.rs:1010`](../crates/app/src/window.rs);
   `open_config_editor`, `:838`).
 - The app has no user-visible error surface yet (no toast or status line).
-  Decision needed: where should errors like these show?
+  Tracked in TODO.md ("User-visible error surface"): it needs a design, and the
+  user wants to be prompted about it.
 
 ## Low
 

@@ -12,15 +12,20 @@ test reproduced it; the rest come from reading the code. Items marked
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
+   **Decided:** a TOML setting, boolean, default true (translate in full-screen
+   programs too). Tracked in TODO.md.
 14. **Missing `[keybindings]` binds nothing, silently** (`019dc17`). Files
     written before then carry the comment "If the whole section is empty, the
-    built-in defaults apply", which is now false. Decision needed: a missing
-    section means the defaults, or stays strict with a warning finding?
+    built-in defaults apply", which is now false. **Decided:** a missing or empty
+    `[keybindings]` binds nothing, deliberately, with no fallback to built-in
+    defaults: every binding is explicit in the user's file. See DECISION.md
+    (Config). Recommended bindings are tracked in TODO.md.
 15. **Load-time findings go only to stderr** (`load_or_create`,
     [`config.rs:470`](../crates/core/src/config.rs), `019dc17`). New clamps
     (`sidebar.width` min 40, `font_size` max 96, `double_tap_window_ms` max 2000)
     change existing files' behaviour silently when launched from Finder.
-    Decision needed: surface them how (inbox, toast, settings status)?
+    Decision needed: surface them how (inbox, toast, settings status)? Folded
+    into the "User-visible error surface" design in TODO.md.
 
 ## Web browser and file-browser preview
 
@@ -52,7 +57,9 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     (`~/Library/Caches/ghostrealm/web`), so a second process (another GUI, or
     `ghostrealm agent` running `web.new`) can't start its host; the pane says the
     profile is in use. Decision needed: share cookies and logins between the GUI
-    and the agent, or a profile per process?
+    and the agent, or a profile per process? Leaning towards one shared
+    ghostrealm profile (GUI and agent), isolated from other browsers on the
+    machine; not final.
 24. **A preview can block on a stuck mount.** `load`'s `metadata` call
     ([`plugins/file_browser/preview.rs:73`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
@@ -65,13 +72,15 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     image with fine detail comes out slightly dark. Fix: average in linear light.
 33. **Autoplay can start audio in a hidden tab.** `tick`
     ([`preview.rs:343`](../crates/app/src/plugins/file_browser/preview.rs)) runs
-    for hidden views, and only `paint` pauses. Decision needed: should hidden
-    audio keep playing? If not, clear `autoplay_at` and pause in `View::shown`.
+    for hidden views, and only `paint` pauses. **Decided:** the file
+    browser does not play audio while hidden; clear `autoplay_at` and pause in
+    `View::shown`. Tracked in TODO.md.
 34. **The preview follows hover.** Moving the mouse to the preview's controls
     crosses rows, switches the subject and pauses the track; in Browse mode,
     clicking an audio row opens the editor. Decision needed: follow the
     selection (as Finder does), pin to the chosen row, or hold the subject while
-    the pointer travels to the preview?
+    the pointer travels to the preview? The user will try the behaviour before
+    deciding; tracked in TODO.md.
 
 ## Terminal input
 
