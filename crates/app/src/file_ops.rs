@@ -198,11 +198,47 @@ fn copy_contents(mut from: &std::fs::File, mut to: &std::fs::File) -> std::io::R
     to.set_permissions(from.metadata()?.permissions())
 }
 
+/// What a non-directory source entry looked like just before it was copied. A
+/// move across volumes removes the original afterwards, and an entry whose
+/// stamp changed in between holds something the copy doesn't.
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: Option<u64>,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = Some(std::os::unix::fs::MetadataExt::ino(meta));
+        #[cfg(not(unix))]
+        let inode = None;
+        Stamp { len: meta.len(), modified: meta.modified().ok(), inode }
+    }
+}
+
+/// A source entry that was copied, with its [`Stamp`] from before the copy
+/// (none for a directory: removing one only works while it is empty).
+#[derive(Debug)]
+struct Copied {
+    path: PathBuf,
+    stamp: Option<Stamp>,
+}
+
+impl Copied {
+    /// Note `path` as it is now: call before copying it.
+    fn before_copy(path: &Path) -> Self {
+        let stamp = path.symlink_metadata().ok().filter(|m| !m.is_dir()).map(|m| Stamp::of(&m));
+        Copied { path: path.to_path_buf(), stamp }
+    }
+}
+
 /// Copy what is inside the directory `src` into the existing directory `dst`,
 /// then give `dst` the metadata of `src` (last, as the permissions may forbid
 /// writing into it). Every source entry copied is pushed onto `copied`, a
 /// directory after its contents.
-fn copy_children(src: &Path, dst: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
+fn copy_children(src: &Path, dst: &Path, copied: &mut Vec<Copied>) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         copy_recursive(&entry.path(), &dst.join(entry.file_name()), copied)?;
@@ -213,12 +249,13 @@ fn copy_children(src: &Path, dst: &Path, copied: &mut Vec<PathBuf>) -> Result<()
 
 /// Copy `src` (a file, or a directory with its contents) to `dst`, noting what
 /// was copied in `copied`.
-fn copy_recursive(src: &Path, dst: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
+fn copy_recursive(src: &Path, dst: &Path, copied: &mut Vec<Copied>) -> Result<()> {
+    let entry = Copied::before_copy(src);
     create_copy(src, dst)?;
     if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         copy_children(src, dst, copied)?;
     }
-    copied.push(src.to_path_buf());
+    copied.push(entry);
     Ok(())
 }
 
@@ -229,15 +266,16 @@ fn is_taken(e: &anyhow::Error) -> bool {
 
 /// Copy `src` to a free name in `dir`. A name another process takes between
 /// the check and the copy is skipped, never overwritten.
-fn copy_to_free(src: &Path, dir: &Path, name: &OsStr, copied: &mut Vec<PathBuf>) -> Result<PathBuf> {
+fn copy_to_free(src: &Path, dir: &Path, name: &OsStr, copied: &mut Vec<Copied>) -> Result<PathBuf> {
     loop {
         let dest = unique_dest(dir, name);
+        let entry = Copied::before_copy(src);
         match create_copy(src, &dest) {
             Ok(()) => {
                 if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
                     copy_children(src, &dest, copied)?;
                 }
-                copied.push(src.to_path_buf());
+                copied.push(entry);
                 return Ok(dest);
             }
             Err(e) if is_taken(&e) => continue,
@@ -319,18 +357,26 @@ pub struct Moved {
     pub dest: PathBuf,
     /// Whether part of the original is still in place: a move across
     /// filesystems copies, then removes what it copied, and leaves anything
-    /// added to the original since.
+    /// added to the original since, and any file changed since it was copied.
     pub source_left: bool,
 }
 
 /// Remove the source entries `copied` (in the order [`copy_recursive`] lists
-/// them: contents before their directory) and nothing else. A directory that
-/// still holds something not copied is left, with everything above it. Returns
-/// whether anything was left.
-fn remove_copied(copied: &[PathBuf]) -> Result<bool> {
+/// them: contents before their directory) and nothing else. A file whose size,
+/// modification time or inode changed since it was copied is left, and a
+/// directory that still holds something not copied is left, with everything
+/// above it. Returns whether anything was left.
+fn remove_copied(copied: &[Copied]) -> Result<bool> {
     let mut left = false;
-    for path in copied {
-        let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+    for Copied { path, stamp } in copied {
+        let now = path.symlink_metadata();
+        if let (Some(before), Ok(now)) = (stamp, &now) {
+            if *before != Stamp::of(now) {
+                left = true;
+                continue;
+            }
+        }
+        let is_dir = now.is_ok_and(|m| m.is_dir());
         let removed = if is_dir { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
         match removed {
             Ok(()) => {}
@@ -908,6 +954,31 @@ pub mod tests {
         assert!(!d.join("src/a").exists() && !d.join("src/sub/b").exists(), "copied files are removed");
         assert_eq!(std::fs::read_to_string(dest.join("sub/b")).unwrap(), "B");
         assert!(!dest.join("sub/new").exists());
+    }
+
+    #[test]
+    fn a_cross_volume_move_leaves_a_file_changed_since_it_was_copied() {
+        let d = tmpdir("ops-move-changed");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        for name in ["longer", "touched", "replaced", "same"] {
+            std::fs::write(d.join("src").join(name), "AA").unwrap();
+        }
+        let mut copied = Vec::new();
+        copy_to_free(&d.join("src"), &d.join("to"), OsStr::new("src"), &mut copied).unwrap();
+        // Written after the copy: a different size, a newer mtime at the same
+        // size, and a new file at the same path (another inode).
+        std::fs::write(d.join("src/longer"), "AAAA").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(d.join("src/touched")).unwrap().set_modified(future).unwrap();
+        std::fs::remove_file(d.join("src/replaced")).unwrap();
+        std::fs::write(d.join("src/replaced"), "BB").unwrap();
+        assert!(remove_copied(&copied).unwrap(), "something was left");
+        assert_eq!(std::fs::read_to_string(d.join("src/longer")).unwrap(), "AAAA");
+        assert!(d.join("src/touched").exists(), "a newer mtime keeps it");
+        assert_eq!(std::fs::read_to_string(d.join("src/replaced")).unwrap(), "BB");
+        assert!(!d.join("src/same").exists(), "an unchanged file is removed");
+        assert!(d.join("src").exists(), "the folder holding a changed file stays");
     }
 
     #[test]
