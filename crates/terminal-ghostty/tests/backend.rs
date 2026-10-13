@@ -531,3 +531,16 @@ fn positions_outside_the_grid_are_pinned_to_its_edge() {
         "\x1b[<64;1;10M"
     );
 }
+
+#[test]
+fn paste_sees_a_mode_switch_still_queued_from_the_child() {
+    let line = "stty -echo; printf '\\033[?2004h'; exec cat -v";
+    let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh(line))).expect("spawn backend");
+    // Let the child's mode switch reach the reader's channel, with no pump
+    // applying it to the terminal.
+    std::thread::sleep(Duration::from_millis(800));
+    term.paste("hi");
+    term.write_bytes(b"\r");
+    let row = wait_for_row(&mut term, "^[[201~");
+    assert_eq!(row, "^[[200~hi^[[201~", "{row:?}");
+}
