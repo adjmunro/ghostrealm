@@ -73,6 +73,10 @@ struct HostSlot {
     failures: u32,
     /// No host is spawned before this (after one exited).
     retry_at: Option<Instant>,
+    /// The host bundle speaks another protocol version: it is not respawned
+    /// until Reload, `web.new`, or a change to the bundle (its mtime differs
+    /// from the one recorded here).
+    refused: Option<Option<std::time::SystemTime>>,
     /// The host to run instead of discovering one.
     #[cfg(test)]
     exe: Option<std::path::PathBuf>,
@@ -91,19 +95,35 @@ impl HostSlot {
             // A host that failed is exiting, or can't be spoken to (another
             // protocol version): drop it, which asks it to exit.
             if !h.is_alive() || h.failure().is_some() {
+                let mismatch = h.protocol_mismatch();
                 let error = match h.failure() {
                     Some(e) => e,
                     None if ready => "the web host exited".into(),
                     None => "the web host exited while starting".into(),
                 };
                 self.host = None;
-                self.failed(error);
+                if mismatch {
+                    // Another spawn of the same bundle would be refused again.
+                    self.error = Some(error);
+                    self.retry_at = None;
+                    self.refused = Some(self.find_host().and_then(|p| bundle_stamp(&p)));
+                } else {
+                    self.failed(error);
+                }
             } else if ready {
                 self.failures = 0;
                 self.error = None;
             }
         }
-        if self.host.is_none() && self.retry_at.is_none_or(|t| Instant::now() >= t) {
+        if let Some(stamp) = self.refused {
+            if self.find_host().and_then(|p| bundle_stamp(&p)) != stamp {
+                self.refused = None;
+            }
+        }
+        if self.host.is_none()
+            && self.refused.is_none()
+            && self.retry_at.is_none_or(|t| Instant::now() >= t)
+        {
             self.retry_at = None;
             match self.find_host() {
                 None => {
@@ -148,12 +168,18 @@ impl HostSlot {
     /// Spawn on the next use, without waiting out the back-off.
     fn retry_now(&mut self) {
         self.retry_at = None;
+        self.refused = None;
     }
 
     /// When a host can next be spawned, while there is none.
     fn retry_at(&self) -> Option<Instant> {
         self.retry_at.filter(|_| self.host.is_none())
     }
+}
+
+/// When the host bundle at `exe` last changed.
+fn bundle_stamp(exe: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(exe).and_then(|m| m.modified()).ok()
 }
 
 pub struct WebPlugin {
@@ -225,6 +251,7 @@ impl Plugin for WebPlugin {
                     page.start = Some(u.to_string());
                 }
                 // Start the page now, so a host that can't run is reported here.
+                page.slot.borrow_mut().retry_now();
                 if let Err(e) = page.start() {
                     return Err(CmdError::Failed(format!(
                         "opened web surface {}, but {e}",
@@ -1174,6 +1201,41 @@ mod tests {
         h.paint(&mut v, RECT);
         assert!(v.slot.borrow().error.as_deref().is_some_and(|e| e.contains("out of date")));
         assert!(v.slot.borrow().host.is_none(), "the host is let go");
+    }
+
+    #[test]
+    fn a_protocol_mismatch_is_not_retried_until_reload_or_a_new_bundle() {
+        let (mut v, runs_file) =
+            stub_host("web-mismatch", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+        let mut h = Harness::new();
+        // Painting spawns the host, which reports the wrong protocol; poll
+        // until the slot has let go of it.
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.slot.borrow().refused.is_none() {
+            h.paint(&mut v, RECT);
+            assert!(Instant::now() < until, "the mismatch was never noticed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runs(&runs_file), 1);
+        assert!(v.deadline(&Default::default()).is_none(), "no timed retry");
+        // Even once any back-off would have expired.
+        v.slot.borrow_mut().retry_at = Some(Instant::now());
+        for _ in 0..5 {
+            h.paint(&mut v, RECT);
+            h.tick(&mut v, Instant::now());
+        }
+        assert_eq!(runs(&runs_file), 1, "not respawned");
+
+        // A rebuilt bundle (new mtime) is tried again.
+        let exe = v.slot.borrow().exe.clone().unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&exe).unwrap().set_modified(later).unwrap();
+        h.paint(&mut v, RECT);
+        let until = Instant::now() + Duration::from_secs(10);
+        while runs(&runs_file) < 2 {
+            assert!(Instant::now() < until, "a changed bundle respawns");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

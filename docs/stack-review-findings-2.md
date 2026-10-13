@@ -129,20 +129,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low–Medium
 
-#### 39. A protocol-version mismatch retries forever
-
-- Where: `failed`
-  ([`plugins/web/mod.rs:141`](../crates/app/src/plugins/web/mod.rs)) schedules a
-  back-off capped at `RETRY_MAX` (60 s); `tick` (line 1021) respawns when it
-  expires. From `01572a4`, which drops a host that speaks another protocol
-  version.
-- Repro: open a web tab with a stale host bundle. The timers run for hidden
-  views too, so every 60 s, indefinitely, a full CEF cold start spawns and is
-  refused (CPU, battery).
-- Fix: treat a version mismatch as permanent: no auto-retry. Respawn only on
-  Reload, `web.new`, or a config or bundle change (for example the bundle's
-  mtime). Straightforward.
-
 ### Low
 
 #### 40. The paste/mode-switch test sleeps a fixed 800 ms

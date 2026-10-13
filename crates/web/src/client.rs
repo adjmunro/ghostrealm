@@ -109,6 +109,8 @@ struct Shared {
     exited: bool,
     /// Why the host gave up, if it said.
     failure: Option<String>,
+    /// The failure is a protocol-version mismatch, which a retry cannot fix.
+    mismatch: bool,
     views: HashMap<u64, ViewState>,
     /// `Text` / `Eval` requests awaiting an answer: request id → page id.
     /// Replies to anything else are dropped.
@@ -249,6 +251,12 @@ impl WebHost {
     /// another protocol version.
     pub fn failure(&self) -> Option<String> {
         self.shared.0.lock().unwrap().failure.clone()
+    }
+
+    /// Whether the host speaks another protocol version (see
+    /// [`failure`](Self::failure)). Respawning the same bundle cannot fix it.
+    pub fn protocol_mismatch(&self) -> bool {
+        self.shared.0.lock().unwrap().mismatch
     }
 
     /// Block until the host reports CEF is initialised (or `timeout`, exit, or
@@ -452,6 +460,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
     match ev {
         Event::Ready { protocol } if protocol == PROTOCOL_VERSION => s.ready = true,
         Event::Ready { protocol } => {
+            s.mismatch = true;
             s.failure = Some(format!(
                 "the web host bundle is out of date (protocol {protocol}, this ghostrealm \
                  speaks {PROTOCOL_VERSION}); rebuild it with `mise run web`"
