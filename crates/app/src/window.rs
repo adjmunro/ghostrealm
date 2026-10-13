@@ -39,7 +39,7 @@ use crate::plugin::{
     Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::images::ImageRenderer;
-use crate::tap::TapDetector;
+use crate::tap::{HeldKey, TapDetector};
 
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
@@ -427,10 +427,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // into ~one render per frame instead of one per event.
                 state.on_scroll(delta);
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if state.closing_key.swallows(
+                    &event.physical_key,
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                ) => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 let toggled = state.handle_key_taps(&event);
                 if event.state == ElementState::Pressed {
+                    state.key_in_flight = Some(event.physical_key);
                     state.on_key(&event);
+                    state.key_in_flight = None;
                     state.mark_dirty();
                     state.window.request_redraw();
                 } else {
@@ -591,6 +599,11 @@ struct State {
     next_frame: Instant,
     /// Double-tap-Shift detector for the palette (IntelliJ "Search Everywhere").
     shift_taps: TapDetector,
+    /// The key whose press closed a terminal that had exited: its repeats are
+    /// dropped, not typed into the tab that takes over.
+    closing_key: HeldKey<winit::keyboard::PhysicalKey>,
+    /// The physical key of the press being handled, for `closing_key`.
+    key_in_flight: Option<winit::keyboard::PhysicalKey>,
     /// Double-tap-Ctrl detector for "Run Anything".
     ctrl_taps: TapDetector,
 }
@@ -913,6 +926,8 @@ impl State {
             frame_pending: false,
             next_frame: Instant::now(),
             shift_taps: TapDetector::new(double_tap_window),
+            closing_key: HeldKey::new(),
+            key_in_flight: None,
             ctrl_taps: TapDetector::new(double_tap_window),
         })
     }
@@ -1422,7 +1437,12 @@ impl State {
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
                 Request::Busy => self.app.mark_busy(sid),
-                Request::Close => self.app.close_surface_id(sid),
+                Request::Close => {
+                    if let Some(key) = self.key_in_flight {
+                        self.closing_key.hold(key);
+                    }
+                    self.app.close_surface_id(sid);
+                }
                 Request::FileMenu { target, at } => self.open_file_menu(target, at),
             }
         }

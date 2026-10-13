@@ -57,9 +57,62 @@ impl TapDetector {
     }
 }
 
+/// A key whose press already did its job and must not act twice: its
+/// auto-repeats are dropped until it is released or another key is pressed.
+/// A terminal's "press any key to close" arms it, so a held key doesn't also
+/// type into the tab that becomes active.
+pub struct HeldKey<K> {
+    key: Option<K>,
+}
+
+impl<K: PartialEq> HeldKey<K> {
+    pub fn new() -> Self {
+        HeldKey { key: None }
+    }
+
+    /// `key`'s press just acted: drop its repeats.
+    pub fn hold(&mut self, key: K) {
+        self.key = Some(key);
+    }
+
+    /// Whether this key event is a repeat to drop. A release of the held key,
+    /// or a fresh press of any key, ends the hold.
+    pub fn swallows(&mut self, key: &K, pressed: bool, repeat: bool) -> bool {
+        let Some(held) = &self.key else { return false };
+        if held == key && pressed && repeat {
+            return true;
+        }
+        if held == key && !pressed || pressed && !repeat {
+            self.key = None;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeats_of_the_held_key_are_dropped_until_it_is_released() {
+        let mut h = HeldKey::new();
+        assert!(!h.swallows(&'a', true, true), "nothing held yet");
+        h.hold('a');
+        assert!(h.swallows(&'a', true, true));
+        assert!(h.swallows(&'a', true, true));
+        assert!(!h.swallows(&'b', true, true), "another key's repeat is not ours");
+        assert!(h.swallows(&'a', true, true), "still held");
+        assert!(!h.swallows(&'a', false, false), "the release passes");
+        assert!(!h.swallows(&'a', true, true), "and ends the hold");
+    }
+
+    #[test]
+    fn a_fresh_press_of_another_key_ends_the_hold() {
+        let mut h = HeldKey::new();
+        h.hold('a');
+        assert!(!h.swallows(&'b', true, false), "a new key is delivered");
+        assert!(!h.swallows(&'a', true, true), "the hold is over");
+    }
 
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
