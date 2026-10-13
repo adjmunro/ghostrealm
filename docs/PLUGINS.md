@@ -125,9 +125,11 @@ into the overlay layer; it doesn't need to know.
   selected entry). `save_copy` backs Save Copy As. `files_changed(moved)` hears
   that the app created, copied, moved, renamed, or deleted files: a listing
   re-reads, a view of a moved file follows it (`file_ops::follow`).
-  `changed_on_disk(path)` hears that another program wrote a file (today only
-  the config file, which the app polls): a view showing it with no unsaved
-  changes re-reads it.
+  `changed_on_disk(path)` is asked, for each open view's `path`, to check
+  whether another program wrote the file (the app polls every 2 s while the
+  window is focused and on window focus): a view showing it with no unsaved
+  changes re-reads it; one with unsaved changes keeps them and marks itself.
+  It returns whether what the view shows changed.
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`

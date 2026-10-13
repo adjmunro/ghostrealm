@@ -116,11 +116,22 @@ impl AppState {
         }
     }
 
-    /// Tell every view that another program wrote the file at `path`.
-    pub fn changed_on_disk(&mut self, path: &Path) {
+    /// Tell every view that another program may have written the file at
+    /// `path`. Returns whether any view's content changed.
+    pub fn changed_on_disk(&mut self, path: &Path) -> bool {
+        self.views.values_mut().fold(false, |any, view| view.changed_on_disk(path) | any)
+    }
+
+    /// Have every view with a file check it against the disk
+    /// ([`View::changed_on_disk`]). Returns whether any view changed.
+    pub fn check_open_files(&mut self) -> bool {
+        let mut any = false;
         for view in self.views.values_mut() {
-            view.changed_on_disk(path);
+            if let Some(path) = view.path() {
+                any |= view.changed_on_disk(&path);
+            }
         }
+        any
     }
 
     /// Create the file or folder `name` in `dir`.
@@ -874,6 +885,21 @@ mod tests {
         s.changed_on_disk(&d.join("a.txt"));
         let lines = &s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines;
         assert_eq!(lines, &["B"]);
+    }
+
+    #[test]
+    fn checking_open_files_reloads_an_editor_whose_file_another_program_wrote() {
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let d = tmpdir("fm-check-open");
+        std::fs::write(d.join("a.txt"), "A\n").unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        assert!(!s.check_open_files());
+        std::fs::write(d.join("a.txt"), "Bee\n").unwrap();
+        assert!(s.check_open_files());
+        let lines = &s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines;
+        assert_eq!(lines, &["Bee"]);
+        assert!(!s.check_open_files(), "once");
     }
 
     #[test]

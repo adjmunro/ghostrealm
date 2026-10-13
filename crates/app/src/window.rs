@@ -302,7 +302,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if state.window_focused {
             if Instant::now() >= state.config_check_due {
-                state.check_config_file();
+                state.check_files();
             }
             let d = state.config_check_due;
             wake = Some(wake.map_or(d, |w| w.min(d)));
@@ -327,7 +327,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(true) => {
                 state.window_focused = true;
-                state.check_config_file();
+                state.check_files();
             }
             WindowEvent::Focused(false) => {
                 state.window_focused = false;
@@ -1002,25 +1002,21 @@ impl State {
     }
 
     /// Reload the config if the file changed outside the app since it was last
-    /// loaded. An editor showing it without unsaved changes re-reads it; one
-    /// with unsaved changes keeps them (saving them writes over the external
-    /// edit).
-    fn check_config_file(&mut self) {
+    /// loaded, and have open editors check their files: one without unsaved
+    /// changes re-reads its file, one with unsaved changes keeps them and is
+    /// marked (saving asks first).
+    fn check_files(&mut self) {
         self.config_check_due = Instant::now() + config_watch::POLL;
         let catalogue = self.catalogue.clone();
-        let app = &mut self.app;
         let mut changed = false;
         let loaded = self.config_watch.poll(|| {
             changed = true;
-            if let Some(path) = ghostrealm_core::config::config_path() {
-                app.changed_on_disk(&path);
-            }
             ghostrealm_core::config::load_or_create(&catalogue)
         });
         if let Some(cfg) = loaded {
             self.apply_config(cfg);
         }
-        if changed {
+        if changed | self.app.check_open_files() {
             self.window.request_redraw();
         }
     }

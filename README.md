@@ -52,6 +52,11 @@ first: Save and Quit / Cancel / Quit Without Saving (Save and Close / Close With
 Saving for closes). Enter saves, Esc cancels. A buffer with no file can't be saved
 there, so it offers only Cancel and the discard button.
 
+Every open editor checks its file the same way (modification time, size, and
+inode, every 2 s while the window is focused and when it gains focus). When another
+program wrote the file, an editor without unsaved edits re-reads it (as one undo
+step); one with unsaved edits keeps them and shows its file name in amber.
+
 Right-click a file or folder in the file browser (or empty space in it), or click
 an editor's file name in its ribbon, for the file menu: New File / New Folder (on a
 folder or empty space), Reveal in Finder, Show in File Browser (editor), Open in
@@ -108,7 +113,5 @@ its docs and bad entries are flagged. Saving hot-reloads it: a flagged entry is
 dropped (its default applies) or clamped into range, and a file that doesn't
 parse leaves the running config unchanged. An edit from another editor applies
 too: the focused window checks the file's modification time and size every 2 s
-and when it gains focus. The running config reloads, and so does an editor
-showing the file, unless it holds unsaved edits (those stay, and saving them
-writes over the other editor's change). `ghostrealm lsp config` serves the
-same checks and docs to any LSP-capable editor over stdio.
+and when it gains focus. The running config reloads. `ghostrealm lsp config`
+serves the same checks and docs to any LSP-capable editor over stdio.

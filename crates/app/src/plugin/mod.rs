@@ -251,10 +251,26 @@ pub trait View: Any {
     /// follows it.
     fn files_changed(&mut self, _moved: &[(PathBuf, PathBuf)]) {}
 
-    /// Another program wrote the file at `path`. A view showing it without
-    /// unsaved changes re-reads it, so a later save doesn't write stale text
-    /// over the new one.
-    fn changed_on_disk(&mut self, _path: &Path) {}
+    /// The file at `path` may have been written by another program. A view
+    /// showing it checks, and without unsaved changes re-reads it, so a later
+    /// save doesn't write stale text over the new one; with unsaved changes it
+    /// keeps them and marks itself. Returns whether what it shows changed.
+    fn changed_on_disk(&mut self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Whether writing the view's file now would overwrite a version it has
+    /// not seen: another program wrote the file since the view loaded or
+    /// wrote it.
+    fn disk_conflict(&self) -> bool {
+        false
+    }
+
+    /// Replace the view's content with its file as it is on disk, discarding
+    /// unsaved changes.
+    fn reload(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Raw input from the agent channel. Returns whether the view accepts it.
     fn write_input(&mut self, _bytes: &[u8]) -> bool {

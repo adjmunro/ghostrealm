@@ -517,7 +517,8 @@ impl EditorView {
         let font = Font::SANS.italic(e.modified);
         let name = cx.shape(&e.title(), font, name_clip.w);
         let name_w = name.width;
-        cx.place(name, r.x + pad, top, name_clip, theme::TEXT);
+        let name_color = if e.changed_on_disk { theme::WARN } else { theme::TEXT };
+        cx.place(name, r.x + pad, top, name_clip, name_color);
         // With a file, the name opens its menu.
         self.ribbon = Some(r);
         self.name_hit = e.path.is_some().then(|| {
@@ -525,7 +526,10 @@ impl EditorView {
             if cx.button(hit, BTN_NAME) {
                 cx.highlight(hit);
             }
-            cx.tooltip(hit, "File actions");
+            cx.tooltip(
+                hit,
+                if e.changed_on_disk { "Changed on disk since you opened it\nFile actions" } else { "File actions" },
+            );
             hit
         });
     }
@@ -971,11 +975,36 @@ impl View for EditorView {
     }
 
     /// Unsaved edits stay: they are the user's, and saving them is a choice.
-    fn changed_on_disk(&mut self, path: &Path) {
+    /// The buffer is marked instead, and saving asks first.
+    fn changed_on_disk(&mut self, path: &Path) -> bool {
         let ours = self.buf.path.as_deref().is_some_and(|p| crate::languages::same_file(p, path));
-        if ours && !self.buf.modified && self.buf.reload().unwrap_or(false) {
-            self.note_edits();
+        if !ours || !self.buf.disk_changed() {
+            return false;
         }
+        if self.buf.modified {
+            // Repaints the mark only the first time.
+            !std::mem::replace(&mut self.buf.changed_on_disk, true)
+        } else {
+            match self.buf.reload() {
+                Ok(true) => {
+                    self.note_edits();
+                    true
+                }
+                Ok(false) => false,
+                // Unreadable as text now: keep what's shown, flagged.
+                Err(_) => !std::mem::replace(&mut self.buf.changed_on_disk, true),
+            }
+        }
+    }
+
+    fn disk_conflict(&self) -> bool {
+        self.buf.disk_changed()
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        self.buf.reload()?;
+        self.note_edits();
+        Ok(())
     }
 
     fn save_as(&mut self, path: PathBuf) -> Result<()> {
@@ -1304,6 +1333,40 @@ mod tests {
         v.changed_on_disk(&path);
         assert_eq!(v.buffer().lines, ["a = 200"]);
         assert!(v.modified());
+    }
+
+    #[test]
+    fn any_file_changed_on_disk_reloads_when_unmodified_and_marks_when_modified() {
+        let dir = tmpdir("editor-on-disk-any");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        assert!(!v.changed_on_disk(&path), "untouched: nothing to do");
+        std::fs::write(&path, "one two\n").unwrap();
+        assert!(v.changed_on_disk(&path));
+        assert_eq!(v.buffer().lines, ["one two"]);
+        assert!(!v.buffer().changed_on_disk && !v.modified());
+        assert!(!v.changed_on_disk(&path), "taken once");
+
+        v.buffer_mut().insert_str("my ");
+        std::fs::write(&path, "one two three\n").unwrap();
+        assert!(v.changed_on_disk(&path), "the mark appears");
+        assert_eq!(v.buffer().lines, ["my one two"], "unsaved edits stay");
+        assert!(v.buffer().changed_on_disk && v.modified());
+        assert!(!v.changed_on_disk(&path), "marked once");
+        assert!(v.disk_conflict(), "and still a conflict");
+    }
+
+    #[test]
+    fn a_file_that_vanishes_is_neither_reloaded_nor_marked() {
+        let path = tmpdir("editor-on-disk-gone").join("f.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        v.buffer_mut().insert_str("b");
+        std::fs::remove_file(&path).unwrap();
+        assert!(!v.changed_on_disk(&path));
+        assert!(!v.buffer().changed_on_disk && !v.disk_conflict());
+        assert_eq!(v.buffer().lines, ["ba"]);
     }
 
     #[test]

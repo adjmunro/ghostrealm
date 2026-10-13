@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use ghostrealm_core::highlight::CommentSyntax;
 
+use crate::file_stamp::Stamp;
 use crate::plugin::text_edit::{
     closer_of, closes_before, opener_of, typed_char, word_left, word_right, word_span, Applied, Clipboard, Edit, Motion,
 };
@@ -30,6 +31,12 @@ pub struct EditorBuffer {
     pub path: Option<PathBuf>,
     /// Unsaved edits since the last load/save.
     pub modified: bool,
+    /// The file changed on disk while the buffer had unsaved edits, so the
+    /// edits were kept; cleared when the buffer loads or writes the file.
+    pub changed_on_disk: bool,
+    /// The file as of the last load or write; `None` for a scratch buffer or a
+    /// file that didn't exist then.
+    disk: Option<Stamp>,
     /// Monotonic count of text-changing edits, for the idle-autosave timer.
     pub edits: u64,
     /// The first line changed since a consumer last took this (`None` = none).
@@ -160,6 +167,8 @@ impl EditorBuffer {
             last_cursor: (0, 0),
             path: None,
             modified: false,
+            changed_on_disk: false,
+            disk: None,
             edits: 0,
             dirty_from: None,
             anchor: None,
@@ -172,6 +181,8 @@ impl EditorBuffer {
     /// Any other read error (not UTF-8, unreadable, a directory) fails: an
     /// empty buffer bound to the file would overwrite it on save.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
+        // Before reading: a write in between then shows as a change.
+        let disk = Stamp::of(&path);
         let lines = match std::fs::read_to_string(&path) {
             Ok(text) => split_lines(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![String::new()],
@@ -185,6 +196,8 @@ impl EditorBuffer {
             last_cursor: (0, 0),
             path: Some(path),
             modified: false,
+            changed_on_disk: false,
+            disk,
             edits: 0,
             dirty_from: None,
             anchor: None,
@@ -827,8 +840,14 @@ impl EditorBuffer {
     /// the text changed.
     pub fn reload(&mut self) -> std::io::Result<bool> {
         let Some(path) = &self.path else { return Ok(false) };
+        let disk = Stamp::of(path);
         let lines = split_lines(&std::fs::read_to_string(path)?);
+        self.disk = disk;
+        self.changed_on_disk = false;
         if lines == self.lines {
+            // Already what's on disk, whatever the history says.
+            self.history.saved_version = self.history.version;
+            self.modified = false;
             return Ok(false);
         }
         self.checkpoint(Step::Other);
@@ -845,6 +864,13 @@ impl EditorBuffer {
         self.dirty_from = Some(0);
         self.modified = false;
         Ok(true)
+    }
+
+    /// Whether another program wrote the file since the buffer loaded or wrote
+    /// it. A file that is gone is not a change: saving recreates it.
+    pub fn disk_changed(&self) -> bool {
+        let Some(now) = self.path.as_deref().and_then(Stamp::of) else { return false };
+        self.disk != Some(now)
     }
 
     /// Write the buffer to its path. Returns whether it had a path to save to.
@@ -879,6 +905,8 @@ impl EditorBuffer {
 
     fn write_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         std::fs::write(path, self.file_text())?;
+        self.disk = Stamp::of(path);
+        self.changed_on_disk = false;
         self.modified = false;
         // Typing after a save starts a new step, so undo can return here.
         self.history.saved_version = self.history.version;
