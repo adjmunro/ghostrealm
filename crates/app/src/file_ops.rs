@@ -122,27 +122,106 @@ pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
         .expect("an unused name")
 }
 
-/// Copy `src` (a file, or a directory with its contents) to `dst`.
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Create `dst` as a copy of the entry `src`: a file with its contents, a link,
+/// or an empty directory (its contents are [`copy_children`]'s). Fails with
+/// `AlreadyExists` rather than replacing whatever is at `dst`.
+fn create_copy(src: &Path, dst: &Path) -> Result<()> {
     let meta = src.symlink_metadata().with_context(|| format!("can't read {}", src.display()))?;
     if meta.is_dir() {
         std::fs::create_dir(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
-        }
     } else if meta.is_symlink() {
         #[cfg(unix)]
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
         #[cfg(not(unix))]
         std::fs::copy(src, dst)?;
     } else if meta.is_file() {
-        std::fs::copy(src, dst)?;
+        let mut from = std::fs::File::open(src)?;
+        let mut to = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.set_permissions(from.metadata()?.permissions())?;
     } else {
         // A pipe, socket, or device: opening one to read it can block forever.
         bail!("can't copy {}: not a regular file", src.display());
     }
     Ok(())
+}
+
+/// Copy what is inside the directory `src` into the existing directory `dst`.
+fn copy_children(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Copy `src` (a file, or a directory with its contents) to `dst`.
+fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+    create_copy(src, dst)?;
+    if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        copy_children(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Whether `e` is (or wraps) an `AlreadyExists` I/O error.
+fn is_taken(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == ErrorKind::AlreadyExists)
+}
+
+/// Copy `src` to a free name in `dir`. A name another process takes between
+/// the check and the copy is skipped, never overwritten.
+fn copy_to_free(src: &Path, dir: &Path, name: &OsStr) -> Result<PathBuf> {
+    loop {
+        let dest = unique_dest(dir, name);
+        match create_copy(src, &dest) {
+            Ok(()) => {
+                if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                    copy_children(src, &dest)?;
+                }
+                return Ok(dest);
+            }
+            Err(e) if is_taken(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Rename `from` to `to` unless something is already at `to`, in which case it
+/// fails with `AlreadyExists` and changes nothing. `std::fs::rename` would
+/// replace a file or an empty directory that appeared since the caller looked.
+/// Where the system has no atomic form of this, the check and the rename are
+/// separate steps.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))
+        };
+        let (f, t) = (c(from)?, c(to)?);
+        #[cfg(target_os = "macos")]
+        // SAFETY: both are valid NUL-terminated strings for the call's duration.
+        let rc = unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(target_os = "linux")]
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::renameat2(libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        // This filesystem or kernel can't do it: fall through to the plain way.
+        if !matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)) {
+            return Err(err);
+        }
+    }
+    if to.symlink_metadata().is_ok() {
+        return Err(ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
 }
 
 /// Whether `dir` is `src` or inside it, after resolving symlinks (`src`'s
@@ -163,9 +242,7 @@ pub fn copy_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     if inside_itself(src, dir) {
         bail!("can't copy a folder into itself");
     }
-    let dest = unique_dest(dir, name);
-    copy_recursive(src, &dest).with_context(|| format!("can't copy {}", src.display()))?;
-    Ok(dest)
+    copy_to_free(src, dir, name).with_context(|| format!("can't copy {}", src.display()))
 }
 
 /// Copy `src` next to itself. Returns the copy's path.
@@ -183,21 +260,25 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     if inside_itself(src, dir) {
         bail!("can't move a folder into itself");
     }
-    let dest = unique_dest(dir, name);
-    match std::fs::rename(src, &dest) {
-        Ok(()) => {}
-        // Across filesystems a rename isn't possible: copy, then remove.
-        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-            copy_recursive(src, &dest)?;
-            if src.is_dir() {
-                std::fs::remove_dir_all(src)?;
-            } else {
-                std::fs::remove_file(src)?;
+    loop {
+        let dest = unique_dest(dir, name);
+        match rename_noreplace(src, &dest) {
+            Ok(()) => return Ok(dest),
+            // Another process took the name since it was picked: pick again.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            // Across filesystems a rename isn't possible: copy, then remove.
+            Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+                let dest = copy_to_free(src, dir, name)?;
+                if src.is_dir() {
+                    std::fs::remove_dir_all(src)?;
+                } else {
+                    std::fs::remove_file(src)?;
+                }
+                return Ok(dest);
             }
+            Err(e) => return Err(e).with_context(|| format!("can't move {}", src.display())),
         }
-        Err(e) => return Err(e).with_context(|| format!("can't move {}", src.display())),
     }
-    Ok(dest)
 }
 
 /// Rename `path` to `name` within its folder. Fails if the name is taken.
@@ -206,11 +287,21 @@ pub fn rename(path: &Path, name: &str) -> Result<PathBuf> {
     if dest == path {
         return Ok(dest);
     }
-    if dest.symlink_metadata().is_ok() && !same_entry_recased(path, &dest) {
-        bail!("\u{201c}{name}\u{201d} already exists");
+    let taken = || anyhow::anyhow!("\u{201c}{name}\u{201d} already exists");
+    // The same entry under a name that differs in case is not "taken", and a
+    // no-replace rename would refuse it.
+    let result = if same_entry_recased(path, &dest) {
+        std::fs::rename(path, &dest)
+    } else if dest.symlink_metadata().is_ok() {
+        return Err(taken());
+    } else {
+        rename_noreplace(path, &dest)
+    };
+    match result {
+        Ok(()) => Ok(dest),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken()),
+        Err(e) => Err(e).with_context(|| format!("can't rename {}", path.display())),
     }
-    std::fs::rename(path, &dest).with_context(|| format!("can't rename {}", path.display()))?;
-    Ok(dest)
 }
 
 /// Whether `dest` names the entry `path` with only the case changed, as a
@@ -571,6 +662,46 @@ pub mod tests {
         if d.join("B.TXT").exists() {
             assert!(rename(&d.join("A.txt"), "B.txt").is_err(), "case-insensitive: b.txt is taken");
             assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "B");
+        }
+    }
+
+    #[test]
+    fn a_no_replace_rename_leaves_what_is_already_at_the_target() {
+        let d = tmpdir("ops-noreplace");
+        std::fs::write(d.join("a"), "A").unwrap();
+        std::fs::write(d.join("b"), "B").unwrap();
+        std::fs::create_dir(d.join("empty")).unwrap();
+        std::fs::create_dir(d.join("src")).unwrap();
+        let err = rename_noreplace(&d.join("a"), &d.join("b")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists, "a file");
+        assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "B");
+        assert_eq!(rename_noreplace(&d.join("src"), &d.join("empty")).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert!(d.join("src").is_dir(), "an empty folder isn't replaced either");
+        rename_noreplace(&d.join("a"), &d.join("c")).unwrap();
+        assert_eq!(names(&d), ["b", "c", "empty", "src"]);
+    }
+
+    #[test]
+    fn copies_never_replace_what_is_at_the_target() {
+        let d = tmpdir("ops-copy-excl");
+        std::fs::create_dir(d.join("dir")).unwrap();
+        std::fs::write(d.join("a"), "A").unwrap();
+        std::fs::write(d.join("b"), "B").unwrap();
+        assert!(copy_recursive(&d.join("a"), &d.join("b")).is_err());
+        assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "B");
+        assert!(copy_recursive(&d.join("dir"), &d.join("dir")).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("a", d.join("link")).unwrap();
+            assert!(copy_recursive(&d.join("link"), &d.join("b")).is_err());
+        }
+        // Permissions come along with the contents.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("a"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            copy_recursive(&d.join("a"), &d.join("a2")).unwrap();
+            assert_eq!(std::fs::metadata(d.join("a2")).unwrap().permissions().mode() & 0o777, 0o750);
         }
     }
 }

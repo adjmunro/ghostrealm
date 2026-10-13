@@ -25,6 +25,9 @@ unicode-width = "0.2"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
