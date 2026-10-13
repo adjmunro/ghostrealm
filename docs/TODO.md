@@ -62,9 +62,12 @@
 - Requires: NO BLOCKERS
 - Detail: DONE: drag to select terminal text (highlight), copy on release and via
   Cmd+C (arboard clipboard); mouse-wheel scrollback; the vtab right-click context
-  menu. Still to do: OSC mouse reporting — forward mouse events to TUI apps (vim,
-  htop, tmux) that enable mouse mode; needs the VT engine's mouse-mode state and
-  SGR mouse encoding. (Click-to-position is skipped — not meaningful for a shell.)
+  menu; mouse reporting to programs that enable tracking (left button, drag, hover,
+  vertical wheel; Shift keeps selection/scroll local). Still to do: the plugin API
+  delivers only the left button, so right/middle clicks and horizontal wheel are
+  never reported; alternate scroll (mode 1007: wheel -> arrow keys on the alternate
+  screen when tracking is off) is not implemented. (Click-to-position is skipped —
+  not meaningful for a shell.)
 - Reason: expected terminal UX; TUI apps want mouse events.
 
 ---
@@ -151,19 +154,6 @@
   VERIFY, then close. If a flood still causes reshape-bound jank, cap reshape work
   per frame (render partial, continue next frame).
 - Reason: a multiplexer must stay responsive under load.
-
----
-
-[2026-09-15@2e8e8c7] Editing keys — bracketed paste remains
-
-- Requires: NO BLOCKERS
-- Detail: DONE — terminal (785bf9a): Shift+Arrow grid selection (word with Option),
-  Option+Left/Right word motion (ESC-b/f), Cmd+Left/Right/Up/Down line motion, Cmd+C
-  copy, Cmd+V paste, Shift+Enter sends LF without a false busy dot (262af58). Editor
-  and every text field: `plugin::text_edit` (macOS motions, Shift selection,
-  word/line deletes, Cmd+A/C/X/V). REMAINING: bracketed-paste wrapping so a
-  multi-line terminal paste doesn't auto-execute each line.
-- Reason: expected editor behaviour; the muscle memory the user relies on.
 
 ---
 

@@ -80,6 +80,9 @@ into the overlay layer; it doesn't need to know.
   cursor goes; `Move` is hover, and `Leave` follows the last `Move` when the
   pointer moves on to another view, the app's chrome, or out of the window.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
+  `cx.mods` carries the modifiers held during `mouse` and `scroll` too (the
+  terminal forwards the pointer to a program that enabled mouse tracking unless
+  Shift is held).
 - `raw_key(&RawKey) -> bool`: every press *and release* with the platform event
   (physical key, unmodified character), before `key`; return true to take it.
   For views embedding an engine with its own key handling (the web view).
