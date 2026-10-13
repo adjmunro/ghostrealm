@@ -1445,6 +1445,21 @@ mod tests {
     }
 
     #[test]
+    fn typed_brackets_auto_close_wrap_and_step_over_through_the_key_path() {
+        let mut h = Harness::new();
+        let mut v = view_with("");
+        for c in "f(x)".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        assert_eq!(v.buffer().lines, vec!["f(x)"]);
+        h.key(&mut v, cmd(Key::Char('a')));
+        h.key(&mut v, press(Key::Char('[')));
+        assert_eq!(v.buffer().lines, vec!["[f(x)]"], "a selection is wrapped");
+        h.key(&mut v, cmd(Key::Char('z')));
+        assert_eq!(v.buffer().lines, vec!["f(x)"]);
+    }
+
+    #[test]
     fn highlight_state_follows_edits_reported_by_the_buffer() {
         let dir = tmpdir("editor-highlight-edits");
         let path = dir.join("doc.md");

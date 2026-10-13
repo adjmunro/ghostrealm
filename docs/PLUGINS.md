@@ -73,7 +73,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Text input: `plugin::text_edit` maps keys to edits through the platform's
   `Keymap` (`edit_for`) and applies them to a `LineEdit` (one line, cursor,
   selection); draw it with `text_field`. Every text input uses it, so they all
-  edit alike.
+  edit alike (typing `(`, `[`, or `{` over a selection wraps it; the editor also
+  auto-closes brackets, see `text_edit`'s docs).
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
 into the overlay layer; it doesn't need to know.

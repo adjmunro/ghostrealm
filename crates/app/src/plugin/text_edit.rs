@@ -22,6 +22,13 @@
 //! (where the text keeps history). Ctrl chords are never edits (Ctrl+arrows
 //! belong to macOS). Linux and Windows use Ctrl where macOS uses Option (words)
 //! and Cmd (the text's ends, select all, clipboard), and Home/End for lines.
+//!
+//! Brackets: typing `(`, `[`, or `{` over a selection wraps it in the pair and
+//! keeps the wrapped text selected (every text input; a paste never wraps). The
+//! editor goes further: an opening bracket with no selection inserts its closer
+//! after the cursor unless a word character follows; typing a closer when the
+//! same one comes next steps over it; Backspace between an empty pair removes
+//! both. Wrapping is its own undo step.
 
 use std::sync::OnceLock;
 
@@ -264,6 +271,42 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The closing bracket for an opening `(`, `[`, or `{`.
+pub fn closer_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+/// The opening bracket for a closing `)`, `]`, or `}`.
+pub fn opener_of(close: char) -> Option<char> {
+    match close {
+        ')' => Some('('),
+        ']' => Some('['),
+        '}' => Some('{'),
+        _ => None,
+    }
+}
+
+/// `s` as a single typed character, if it is one.
+pub fn typed_char(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// Whether auto-closing an opening bracket is welcome before `next` (the char
+/// after the cursor): not before a word character, where the bracket most
+/// likely stands alone (`(` typed in front of `foo`).
+pub fn closes_before(next: Option<char>) -> bool {
+    next.is_none_or(|c| !is_word(c))
+}
+
 /// The start of the word before `col`: skips non-word characters, then the word.
 pub fn word_left(chars: &[char], col: usize) -> usize {
     let mut i = col.min(chars.len());
@@ -444,6 +487,21 @@ impl LineEdit {
         self.cursor += clean.chars().count();
     }
 
+    /// Typing an opening bracket over a selection wraps it in the pair, keeping
+    /// the wrapped text selected. Returns whether it did.
+    fn wrap_selection(&mut self, open: char) -> bool {
+        let (Some(close), Some((s, e))) = (closer_of(open), self.selection()) else {
+            return false;
+        };
+        let (be, bs) = (self.byte_of(e), self.byte_of(s));
+        self.text.insert(be, close);
+        self.text.insert(bs, open);
+        let forward = self.cursor > self.anchor.unwrap_or(self.cursor);
+        let (inner_s, inner_e) = (s + 1, e + 1);
+        (self.anchor, self.cursor) = if forward { (Some(inner_s), inner_e) } else { (Some(inner_e), inner_s) };
+        true
+    }
+
     /// The column `motion` reaches from the cursor, or `None` if it leaves the
     /// line (↑/↓).
     fn target(&self, motion: Motion) -> Option<usize> {
@@ -502,7 +560,9 @@ impl LineEdit {
                 Applied::Changed
             }
             Edit::Insert(s) => {
-                self.insert(&s);
+                if !typed_char(&s).is_some_and(|c| self.wrap_selection(c)) {
+                    self.insert(&s);
+                }
                 Applied::Changed
             }
             Edit::SelectAll => {
@@ -549,6 +609,40 @@ mod tests {
 
     fn plain(key: Key) -> KeyPress {
         k(key, |_| {})
+    }
+
+    #[test]
+    fn a_bracket_typed_over_a_selection_wraps_it_in_a_line() {
+        let mut clip: Option<String> = None;
+        for (open, want) in [('(', "a(bc)d"), ('[', "a[bc]d"), ('{', "a{bc}d")] {
+            let mut e = LineEdit::new("abcd");
+            e.apply(Edit::Move { to: Motion::LineStart, select: false }, &mut clip);
+            e.apply(Edit::Move { to: Motion::Right, select: false }, &mut clip);
+            e.apply(Edit::Move { to: Motion::Right, select: true }, &mut clip);
+            e.apply(Edit::Move { to: Motion::Right, select: true }, &mut clip);
+            e.apply(Edit::Insert(open.to_string()), &mut clip);
+            assert_eq!(e.text(), want);
+            assert_eq!(e.selection(), Some((2, 4)), "the wrapped text stays selected");
+        }
+        // Without a selection a bracket is plain text, and so is any other character.
+        let mut e = LineEdit::new("ab");
+        e.apply(Edit::Insert("(".into()), &mut clip);
+        assert_eq!(e.text(), "ab(");
+        e.apply(Edit::SelectAll, &mut clip);
+        e.apply(Edit::Insert("x".into()), &mut clip);
+        assert_eq!(e.text(), "x", "other characters replace the selection");
+        // A closing bracket replaces it too, and a paste of "(" does not wrap.
+        let mut e = LineEdit::new("ab");
+        e.apply(Edit::SelectAll, &mut clip);
+        clip = Some("(".into());
+        e.apply(Edit::Paste, &mut clip);
+        assert_eq!(e.text(), "(");
+        // A backward selection wraps and keeps its direction.
+        let mut e = LineEdit::new("abc");
+        e.apply(Edit::Move { to: Motion::Left, select: true }, &mut clip);
+        e.apply(Edit::Insert("[".into()), &mut clip);
+        assert_eq!(e.text(), "ab[c]");
+        assert_eq!((e.cursor(), e.selection()), (3, Some((3, 4))));
     }
 
     #[test]

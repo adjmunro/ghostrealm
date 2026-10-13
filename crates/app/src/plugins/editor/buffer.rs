@@ -8,7 +8,9 @@
 
 use std::path::PathBuf;
 
-use crate::plugin::text_edit::{word_left, word_right, Applied, Clipboard, Edit, Motion};
+use crate::plugin::text_edit::{
+    closer_of, closes_before, opener_of, typed_char, word_left, word_right, Applied, Clipboard, Edit, Motion,
+};
 
 pub struct EditorBuffer {
     /// The text, one entry per line. Always at least one (possibly empty) line.
@@ -277,6 +279,68 @@ impl EditorBuffer {
         }
     }
 
+    /// Whether typing `s` wraps the selection in brackets.
+    fn wraps(&self, s: &str) -> bool {
+        typed_char(s).is_some_and(|c| closer_of(c).is_some()) && self.selection().is_some()
+    }
+
+    /// The char at `(row, col)`, if any.
+    fn char_at(&self, row: usize, col: usize) -> Option<char> {
+        self.lines.get(row)?.chars().nth(col)
+    }
+
+    /// Type `s`. A single bracket gets the editor's bracket handling: an
+    /// opening one wraps a selection, or else inserts its closer after the
+    /// cursor (unless a word character follows); a closing one moves over an
+    /// identical closer that follows. Anything else is inserted as is.
+    pub fn insert_typed(&mut self, s: &str) {
+        let Some(c) = typed_char(s) else {
+            return self.insert_str(s);
+        };
+        let (row, col) = self.cursor;
+        if let Some(close) = closer_of(c) {
+            if let Some(((sr, sc), (er, ec))) = self.selection() {
+                return self.wrap_selection(c, close, (sr, sc), (er, ec));
+            }
+            if closes_before(self.char_at(row, col)) {
+                self.insert_char(c);
+                let b = self.byte_of(row, col + 1);
+                self.lines[row].insert(b, close);
+                return;
+            }
+        } else if opener_of(c).is_some() && self.selection().is_none() && self.char_at(row, col) == Some(c) {
+            self.cursor.1 += 1;
+            return;
+        }
+        self.insert_str(s)
+    }
+
+    /// Surround the selection `start..end` with `open` and `close`, keeping the
+    /// wrapped text selected (in the direction it was).
+    fn wrap_selection(&mut self, open: char, close: char, start: (usize, usize), end: (usize, usize)) {
+        let forward = self.anchor.is_some_and(|a| a < self.cursor);
+        let b = self.byte_of(end.0, end.1);
+        self.lines[end.0].insert(b, close);
+        let b = self.byte_of(start.0, start.1);
+        self.lines[start.0].insert(b, open);
+        let inner_start = (start.0, start.1 + 1);
+        let inner_end = (end.0, end.1 + usize::from(start.0 == end.0));
+        let (anchor, cursor) = if forward { (inner_start, inner_end) } else { (inner_end, inner_start) };
+        (self.anchor, self.cursor) = (Some(anchor), cursor);
+        self.touch(start.0);
+    }
+
+    /// Whether the cursor sits between an opening bracket and its closer with
+    /// nothing in between (`(|)`).
+    fn in_empty_pair(&self) -> bool {
+        let (row, col) = self.cursor;
+        let before = col.checked_sub(1).and_then(|c| self.char_at(row, c));
+        match (before, self.char_at(row, col)) {
+            (Some(o), Some(c)) => closer_of(o) == Some(c),
+            _ => false,
+        }
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.delete_selection();
         let (row, col) = self.cursor;
@@ -311,6 +375,13 @@ impl EditorBuffer {
     /// Delete the selection, else the text between the cursor and `motion`.
     pub fn delete(&mut self, motion: Motion) {
         if self.delete_selection() {
+            return;
+        }
+        // Backspace between an empty pair removes both brackets.
+        if motion == Motion::Left && self.in_empty_pair() {
+            self.anchor = Some((self.cursor.0, self.cursor.1 + 1));
+            self.cursor.1 -= 1;
+            self.delete_selection();
             return;
         }
         let t = self.target(motion);
@@ -382,6 +453,9 @@ impl EditorBuffer {
     pub fn apply(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
         let edits = self.edits;
         let step = match &edit {
+            // Wrapping a selection in brackets is a step of its own: typing on
+            // doesn't merge into it.
+            Edit::Insert(s) if self.wraps(s) => Some(Step::Other),
             Edit::Insert(s) if s.chars().count() == 1 && s != "\n" => Some(Step::Typing),
             Edit::Delete(Motion::Left | Motion::Right) => Some(Step::Deleting),
             Edit::Insert(_) | Edit::Delete(_) | Edit::Cut | Edit::Paste => Some(Step::Other),
@@ -392,7 +466,7 @@ impl EditorBuffer {
             Edit::Move { to, select: true } => self.move_cursor_selecting(to),
             Edit::Move { to, select: false } => self.move_cursor(to),
             Edit::Delete(to) => self.delete(to),
-            Edit::Insert(s) => self.insert_str(&s),
+            Edit::Insert(s) => self.insert_typed(&s),
             Edit::SelectAll => self.select_all(),
             Edit::Copy => {
                 if let Some(t) = self.selected_text() {
@@ -744,6 +818,119 @@ mod tests {
         for c in text.chars() {
             e.apply(Edit::Insert(c.to_string()), &mut None::<String>);
         }
+    }
+
+    fn buffer_with(text: &str) -> EditorBuffer {
+        let mut e = EditorBuffer::scratch();
+        e.insert_str(text);
+        e.cursor = (0, 0);
+        e.anchor = None;
+        e.modified = false;
+        e
+    }
+
+    fn select(e: &mut EditorBuffer, from: (usize, usize), to: (usize, usize)) {
+        e.anchor = Some(from);
+        e.cursor = to;
+    }
+
+    #[test]
+    fn an_opening_bracket_inserts_its_closer_after_the_cursor() {
+        for (open, want) in [('(', "()"), ('[', "[]"), ('{', "{}")] {
+            let mut e = EditorBuffer::scratch();
+            typed(&mut e, &open.to_string());
+            assert_eq!(e.lines, vec![want]);
+            assert_eq!(e.cursor, (0, 1), "between the pair");
+        }
+        // Before whitespace, a closer, or the line's end it closes; before a word it doesn't.
+        let mut e = buffer_with("a b");
+        e.cursor = (0, 1);
+        typed(&mut e, "(");
+        assert_eq!(e.lines, vec!["a() b"]);
+        let mut e = buffer_with("foo");
+        typed(&mut e, "(");
+        assert_eq!(e.lines, vec!["(foo"], "a word follows");
+        let mut e = buffer_with("(x)");
+        e.cursor = (0, 2);
+        typed(&mut e, "[");
+        assert_eq!(e.lines, vec!["(x[])"]);
+        // Other characters, and a closing bracket with no twin after it, are plain.
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "a)");
+        assert_eq!(e.lines, vec!["a)"]);
+    }
+
+    #[test]
+    fn typing_the_closer_moves_over_it_and_backspace_removes_an_empty_pair() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "f(a[1])");
+        assert_eq!(e.lines, vec!["f(a[1])"]);
+        assert_eq!(e.cursor, (0, 7), "each closer was stepped over");
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "{(");
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec!["{}"], "the empty () goes together");
+        assert_eq!(e.cursor, (0, 1));
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec![""]);
+        // A pair with something in it deletes one char; mismatched pairs too.
+        let mut e = buffer_with("(a)");
+        e.cursor = (0, 2);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec!["()"]);
+        let mut e = buffer_with("(]");
+        e.cursor = (0, 1);
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec!["]"]);
+    }
+
+    #[test]
+    fn a_bracket_over_a_selection_wraps_it_across_lines() {
+        let mut e = buffer_with("ab\ncd");
+        select(&mut e, (0, 1), (1, 1));
+        typed(&mut e, "{");
+        assert_eq!(e.lines, vec!["a{b", "c}d"]);
+        assert_eq!(e.selection(), Some(((0, 2), (1, 1))), "the wrapped text stays selected");
+        // Typing a bracket again nests.
+        typed(&mut e, "(");
+        assert_eq!(e.lines, vec!["a{(b", "c)}d"]);
+        // A backward selection on one line.
+        let mut e = buffer_with("abcd");
+        select(&mut e, (0, 3), (0, 1));
+        typed(&mut e, "[");
+        assert_eq!(e.lines, vec!["a[bc]d"]);
+        assert_eq!((e.anchor, e.cursor), (Some((0, 4)), (0, 2)));
+        // A closing bracket just replaces the selection.
+        let mut e = buffer_with("abcd");
+        select(&mut e, (0, 1), (0, 3));
+        typed(&mut e, ")");
+        assert_eq!(e.lines, vec!["a)d"]);
+    }
+
+    #[test]
+    fn wrapping_and_auto_closing_each_undo_in_one_step() {
+        let mut e = buffer_with("abcd");
+        select(&mut e, (0, 1), (0, 3));
+        typed(&mut e, "(");
+        typed(&mut e, "x"); // typing on replaces the selection, a step apart from the wrap
+        e.undo();
+        assert_eq!(e.lines, vec!["a(bc)d"]);
+        e.undo();
+        assert_eq!(e.lines, vec!["abcd"], "the wrap is one step");
+        assert_eq!(e.selection(), Some(((0, 1), (0, 3))));
+
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "(");
+        assert_eq!(e.lines, vec!["()"]);
+        e.undo();
+        assert_eq!(e.lines, vec![""], "the pair is added and removed as one");
+        e.redo();
+        assert_eq!(e.lines, vec!["()"]);
+        // Backspacing the pair is one step as well.
+        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        assert_eq!(e.lines, vec![""]);
+        e.undo();
+        assert_eq!(e.lines, vec!["()"]);
     }
 
     #[test]

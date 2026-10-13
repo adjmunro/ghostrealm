@@ -794,16 +794,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] Brackets: wrap a selection, auto-close in the editor
-
-- Requires: NO BLOCKERS
-- Detail: Typing `(`, `[`, or `{` with a selection wraps the selection in the
-  pair. In the editor, typing an opening bracket inserts the closing one after
-  the cursor. Both apply to all three kinds.
-- Reason: requested editing behaviour.
-
----
-
 [2026-10-13T19:46+1300@d292715] Terminal: text-editing keys inside full-screen programs (decision pending)
 
 - Requires: a decision from the owner (see "Decision session")
