@@ -245,7 +245,7 @@ pub fn duration(path: &Path) -> Result<Option<Duration>, String> {
 mod tests {
     use super::*;
     use crate::plugin::testing::tmpdir;
-    use crate::plugins::file_browser::preview::tests::wav;
+    use crate::media::testing::wav;
 
     /// Needs an audio output device; plays silence. Run with `--ignored
     /// --test-threads 1` (two players opening the device at once can stall).

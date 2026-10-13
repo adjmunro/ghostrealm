@@ -1371,9 +1371,7 @@ mod tests {
     #[test]
     fn preview_draws_an_image() {
         let (d, mut v) = fixture();
-        image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255]))
-            .save(d.join("c.png"))
-            .unwrap();
+        std::fs::write(d.join("c.png"), crate::media::testing::png(4, 2, [0, 0, 255, 255])).unwrap();
         let mut h = Harness::new();
         h.paint(&mut v, WIDE);
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
@@ -1389,7 +1387,7 @@ mod tests {
     #[test]
     fn audio_preview_offers_play_without_autoplaying_when_off() {
         let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), preview::tests::wav(8000, 800)).unwrap();
+        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
         let mut h = Harness::new();
         h.cfg.file_browser.preview_autoplay = false;
         h.paint(&mut v, WIDE);
@@ -1405,7 +1403,7 @@ mod tests {
     /// A browser with the audio file `c.wav` previewed and autoplay pending.
     fn previewing_audio_with_autoplay() -> (Harness, FileBrowserView, PathBuf) {
         let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), preview::tests::wav(8000, 800)).unwrap();
+        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
         let mut h = Harness::new();
         h.cfg.file_browser.preview_autoplay = true;
         h.paint(&mut v, WIDE);
@@ -1428,7 +1426,7 @@ mod tests {
     #[test]
     fn audio_that_finishes_loading_in_a_hidden_view_does_not_autoplay() {
         let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), preview::tests::wav(8000, 800)).unwrap();
+        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
         let mut h = Harness::new();
         h.cfg.file_browser.preview_autoplay = true;
         h.paint(&mut v, WIDE);

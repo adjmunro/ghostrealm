@@ -667,8 +667,9 @@ pub fn ago(t: SystemTime) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::media::testing::wav;
     use crate::plugin::testing::tmpdir;
 
     #[test]
@@ -721,8 +722,7 @@ pub(crate) mod tests {
     #[test]
     fn images_decode_and_shrink_to_the_cap() {
         let d = tmpdir("preview-img");
-        let big = image::RgbaImage::from_pixel(IMAGE_MAX_SIDE * 2, 10, image::Rgba([255, 0, 0, 255]));
-        big.save(d.join("wide.png")).unwrap();
+        std::fs::write(d.join("wide.png"), media::testing::png(IMAGE_MAX_SIDE * 2, 10, [255, 0, 0, 255])).unwrap();
         let p = load(&d.join("wide.png"));
         assert_eq!(p.kind, "PNG image");
         let Content::Image { image, width, height } = p.content else { panic!("image") };
@@ -832,26 +832,6 @@ pub(crate) mod tests {
         assert_eq!(p.kind, "WAV audio");
         let Content::Audio { duration } = p.content else { panic!("audio") };
         assert_eq!(duration, Some(Duration::from_secs(2)));
-    }
-
-    /// A mono 16-bit PCM WAV of `frames` silent frames.
-    pub(crate) fn wav(rate: u32, frames: u32) -> Vec<u8> {
-        let data = frames * 2;
-        let mut v = Vec::new();
-        v.extend_from_slice(b"RIFF");
-        v.extend_from_slice(&(36 + data).to_le_bytes());
-        v.extend_from_slice(b"WAVEfmt ");
-        v.extend_from_slice(&16u32.to_le_bytes());
-        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        v.extend_from_slice(&1u16.to_le_bytes()); // mono
-        v.extend_from_slice(&rate.to_le_bytes());
-        v.extend_from_slice(&(rate * 2).to_le_bytes());
-        v.extend_from_slice(&2u16.to_le_bytes());
-        v.extend_from_slice(&16u16.to_le_bytes());
-        v.extend_from_slice(b"data");
-        v.extend_from_slice(&data.to_le_bytes());
-        v.resize(v.len() + data as usize, 0);
-        v
     }
 
     #[test]

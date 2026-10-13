@@ -4,3 +4,5 @@
 
 pub mod audio;
 pub mod image;
+#[cfg(test)]
+pub(crate) mod testing;
