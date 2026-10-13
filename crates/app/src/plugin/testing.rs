@@ -98,6 +98,16 @@ impl Harness {
         self.event(Mods::default(), |cx| view.mouse(cx, &ev))
     }
 
+    /// Like [`mouse`](Self::mouse) with `mods` held.
+    pub fn mouse_with(&self, view: &mut dyn View, mods: Mods, ev: MouseEvent) -> Outcome {
+        self.event(mods, |cx| view.mouse(cx, &ev))
+    }
+
+    /// Like [`scroll`](Self::scroll) with `mods` held.
+    pub fn scroll_with(&self, view: &mut dyn View, mods: Mods, pos: (f32, f32), dy: f32) -> Outcome {
+        self.event(mods, |cx| view.scroll(cx, pos, 0.0, dy))
+    }
+
     pub fn scroll(&self, view: &mut dyn View, pos: (f32, f32), dy: f32) -> Outcome {
         self.event(Mods::default(), |cx| view.scroll(cx, pos, 0.0, dy))
     }

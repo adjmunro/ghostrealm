@@ -10,7 +10,10 @@ use std::any::Any;
 
 use anyhow::Result;
 use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
-use ghostrealm_terminal::{Cell, Grid, Key, KeyPress, Lifecycle, Mods, Pumped, Scroll, TerminalBackend};
+use ghostrealm_terminal::{
+    Cell, Grid, Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton, MouseReport, Pumped, Scroll,
+    TerminalBackend,
+};
 use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 
 use crate::app_state::AppState;
@@ -35,6 +38,9 @@ const SCROLL_EASE_DIVISOR: i32 = 3;
 /// Cap on queued scroll lines, so flicking hard against the scrollback edge
 /// can't pile up a backlog a reverse flick would first have to unwind.
 const MAX_PENDING_SCROLL: i32 = 600;
+/// Most wheel notches reported to a mouse-tracking program for one scroll
+/// event, so a fling can't flood its input.
+const MAX_WHEEL_REPORTS: i32 = 10;
 /// Alpha of the block cursor drawn over the cell.
 const CURSOR_ALPHA: f32 = 0.6;
 
@@ -128,6 +134,9 @@ pub struct TerminalView {
     selection: Option<Selection>,
     /// The cell a press landed on; a selection starts only once it's dragged.
     press_cell: Option<(u16, u16)>,
+    /// The current press (and its drag and release) goes to the program as mouse
+    /// reports instead of driving the local selection.
+    reporting: bool,
     /// Sub-line wheel remainder (px) carried between events, so a slow drag
     /// isn't rounded to nothing and momentum tails aren't dropped.
     scroll_accum: f32,
@@ -147,6 +156,7 @@ impl TerminalView {
             cell: (DEFAULT_CELL_W as f32, DEFAULT_CELL_H as f32),
             selection: None,
             press_cell: None,
+            reporting: false,
             scroll_accum: 0.0,
             pending_scroll: 0,
         }
@@ -198,6 +208,30 @@ impl TerminalView {
         self.term.write_bytes(bytes);
     }
 
+    /// Paste `text`: bracketed if the program asked for it (see
+    /// [`TerminalBackend::paste`]).
+    fn paste(&mut self, text: &str) {
+        self.before_input();
+        self.term.paste(text);
+    }
+
+    /// Whether pointer input belongs to the program: it enabled mouse tracking
+    /// and Shift isn't held (Shift keeps selection and scrolling local).
+    fn forwards_mouse(&self, mods: Mods) -> bool {
+        !mods.shift && self.term.mouse_tracking()
+    }
+
+    /// Report a pointer event at physical-pixel `pos` to the program.
+    fn report_mouse(&mut self, action: MouseAction, button: Option<MouseButton>, mods: Mods, pos: (f32, f32)) {
+        let (cw, ch) = self.cell;
+        self.term.send_mouse(&MouseReport {
+            action,
+            button,
+            mods,
+            at: ((pos.0 - self.rect.x) / cw, (pos.1 - self.rect.y) / ch),
+        });
+    }
+
     fn copy_selection(&self, cx: &mut EventCx) {
         if let Some(sel) = self.selection.filter(|s| !s.is_empty()) {
             let text = selection_text(&self.grid, sel);
@@ -239,7 +273,7 @@ impl TerminalView {
         match k.key {
             Key::Char(c) if c.eq_ignore_ascii_case(&'c') => self.copy_selection(cx),
             Key::Char(c) if c.eq_ignore_ascii_case(&'v') => match cx.clipboard_text() {
-                Some(text) if !text.is_empty() => self.write(text.as_bytes()),
+                Some(text) if !text.is_empty() => self.paste(&text),
                 _ => return false,
             },
             _ => return false,
@@ -391,7 +425,26 @@ impl View for TerminalView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        let mods = cx.mods;
         match *event {
+            MouseEvent::Down { pos, .. } if self.forwards_mouse(mods) => {
+                self.reporting = true;
+                self.press_cell = None;
+                if self.selection.take().is_some() {
+                    cx.redraw();
+                }
+                self.report_mouse(MouseAction::Press, Some(MouseButton::Left), mods, pos);
+            }
+            MouseEvent::Drag { pos } if self.reporting => {
+                self.report_mouse(MouseAction::Motion, Some(MouseButton::Left), mods, pos);
+            }
+            MouseEvent::Up { pos, .. } if self.reporting => {
+                self.reporting = false;
+                self.report_mouse(MouseAction::Release, Some(MouseButton::Left), mods, pos);
+            }
+            MouseEvent::Move { pos } if self.forwards_mouse(mods) => {
+                self.report_mouse(MouseAction::Motion, None, mods, pos);
+            }
             // A press only records the anchor; a plain click never highlights.
             MouseEvent::Down { pos: (x, y), .. } => {
                 if self.selection.take().is_some() {
@@ -420,12 +473,20 @@ impl View for TerminalView {
         }
     }
 
-    fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), _dx: f32, dy: f32) {
+    fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
         let ch = cx.ui.cell_h;
         self.scroll_accum += dy;
         let lines = (self.scroll_accum / ch).trunc() as i32;
         self.scroll_accum -= lines as f32 * ch;
         if lines == 0 {
+            return;
+        }
+        // A program tracking the mouse gets the wheel as button 4/5 presses.
+        if self.forwards_mouse(cx.mods) {
+            let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+            for _ in 0..lines.abs().min(MAX_WHEEL_REPORTS) {
+                self.report_mouse(MouseAction::Press, Some(button), cx.mods, pos);
+            }
             return;
         }
         // Queue the motion instead of jumping: paint eases it out a bounded step
@@ -763,6 +824,92 @@ mod tests {
         h.key(&mut v, left);
         let sel = v.selection.expect("shift+left starts a selection");
         assert_eq!(sel.head.0 + 1, sel.anchor.0, "one cell left of the cursor");
+    }
+
+    /// A terminal whose program switched `modes` on, then echoes its input
+    /// through `cat -v` (control bytes show as `^[`, with `stty -echo` hiding
+    /// the tty's own echo).
+    fn echoing(modes: &str) -> TerminalView {
+        let v = running(&format!("stty -echo; printf '{modes}'; echo READY; exec cat -v"), "READY");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while modes.contains("1000") && !v.term.mouse_tracking() {
+            assert!(Instant::now() < deadline, "tracking never turned on");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        v
+    }
+
+    /// The screen's text, rows joined (the grid wraps long echoes), once it
+    /// contains `want`.
+    fn echoed(v: &mut TerminalView, want: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let screen = v.text().unwrap_or_default().replace('\n', "");
+            if screen.contains(want) {
+                return screen;
+            }
+            assert!(Instant::now() < deadline, "no {want:?} echoed, got {screen:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const SHIFT: Mods = Mods { shift: true, ctrl: false, alt: false, super_: false };
+
+    #[test]
+    fn paste_is_bracketed_only_when_the_program_asked() {
+        let mut v = echoing("\\033[?2004h");
+        v.paste("a\nb");
+        v.write(b"\r");
+        assert_eq!(echoed(&mut v, "^[[201~"), "READY^[[200~ab^[[201~");
+
+        let mut plain = echoing("");
+        plain.paste("raw\n");
+        assert_eq!(echoed(&mut plain, "raw"), "READYraw", "no markers without mode 2004");
+    }
+
+    #[test]
+    fn a_tracking_program_gets_press_drag_release_and_hover() {
+        let mut v = echoing("\\033[?1003h\\033[?1006h");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(5, 1) });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(5, 1), dragged: true });
+        h.mouse(&mut v, MouseEvent::Move { pos: cell(7, 3) });
+        v.write(b"\r");
+        let screen = echoed(&mut v, "^[[<35;8;4M");
+        assert_eq!(screen, "READY^[[<0;3;2M^[[<32;6;2M^[[<0;6;2m^[[<35;8;4M");
+        assert!(v.selection.is_none() && v.press_cell.is_none(), "nothing selected locally");
+    }
+
+    #[test]
+    fn the_wheel_goes_to_a_tracking_program_not_the_scrollback() {
+        let mut v = echoing("\\033[?1000h\\033[?1006h");
+        let h = Harness::new();
+        let out = h.scroll(&mut v, cell(1, 2), 2.0 * UI.cell_h);
+        assert!(!out.frame && v.pending_scroll == 0, "no local scroll");
+        h.scroll(&mut v, cell(1, 2), -UI.cell_h);
+        v.write(b"\r");
+        assert_eq!(echoed(&mut v, "^[[<65"), "READY^[[<64;2;3M^[[<64;2;3M^[[<65;2;3M");
+    }
+
+    #[test]
+    fn shift_keeps_the_mouse_local() {
+        let mut v = echoing("\\033[?1000h\\033[?1006h");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse_with(&mut v, SHIFT, MouseEvent::Down { pos: cell(0, 0), clicks: 1 });
+        assert_eq!(v.press_cell, Some((0, 0)), "a local press");
+        assert!(!v.reporting);
+        h.mouse_with(&mut v, SHIFT, MouseEvent::Drag { pos: cell(3, 0) });
+        assert!(v.selection.is_some(), "Shift+drag selects");
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 0), dragged: true });
+        let out = h.scroll_with(&mut v, SHIFT, cell(1, 1), 3.0 * UI.cell_h);
+        assert!(out.frame && v.pending_scroll == -3, "Shift+wheel scrolls the scrollback");
+        v.write(b"\r");
+        // Nothing was reported: only the empty line comes back.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!v.text().unwrap().contains("^[["), "{}", v.text().unwrap());
     }
 
     #[test]
