@@ -4,17 +4,12 @@
 //! gains focus.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+
+use crate::file_stamp::Stamp;
 
 /// How often the focused window checks the config file.
 pub const POLL: Duration = Duration::from_secs(2);
-
-/// What identifies one version of the file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
-    modified: Option<SystemTime>,
-    len: u64,
-}
 
 pub struct ConfigWatch {
     path: Option<PathBuf>,
@@ -31,8 +26,7 @@ impl ConfigWatch {
     }
 
     fn stamp(&self) -> Option<Stamp> {
-        let meta = std::fs::metadata(self.path.as_ref()?).ok()?;
-        Some(Stamp { modified: meta.modified().ok(), len: meta.len() })
+        Stamp::of(self.path.as_ref()?)
     }
 
     /// The file as it is now is the version the running config came from (the
@@ -69,6 +63,7 @@ impl ConfigWatch {
 mod tests {
     use super::*;
     use crate::plugin::testing::tmpdir;
+    use std::time::SystemTime;
 
     fn age(path: &std::path::Path, secs: u64) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
