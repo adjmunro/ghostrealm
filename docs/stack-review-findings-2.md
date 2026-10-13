@@ -72,3 +72,26 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     clicking an audio row opens the editor. Decision needed: follow the
     selection (as Finder does), pin to the chosen row, or hold the subject while
     the pointer travels to the preview?
+
+## Terminal input
+
+Found reviewing `4981b3a..d5e17a2` (bracketed paste and mouse reporting
+`df032a4`/`0cae15a`).
+
+### Low
+
+35. **Mouse reports go to the wrong row while the viewport is scrolled back.**
+    `report_mouse` ([`plugins/terminal.rs`](../crates/app/src/plugins/terminal.rs))
+    reports the pointer's cell in the scrolled viewport, but the program's screen
+    is the live one, so a click lands rows away from the pointer (Ghostty upstream
+    behaves the same). Decision needed: snap to the bottom on a reporting
+    press/wheel, or don't report while `viewport_active()` is false?
+36. **Unbracketed paste sends control bytes raw, and LF rather than CR**
+    (`GhosttyTerminal::encode_paste`,
+    [`terminal-ghostty/src/lib.rs`](../crates/terminal-ghostty/src/lib.rs)). A
+    paste into a program that didn't enable mode 2004 can carry ESC or other
+    control bytes as keystrokes, and a newline arrives as LF. xterm and Ghostty
+    strip the controls and convert LF to CR (`paste::encode(.., false, ..)`). The
+    backend test `paste_is_unwrapped_when_the_program_did_not_ask_for_brackets`
+    locks in the raw behaviour. Decision needed: sanitise unbracketed pastes the
+    same way?
