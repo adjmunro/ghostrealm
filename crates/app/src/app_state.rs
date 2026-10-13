@@ -2181,14 +2181,13 @@ mod tests {
             .with_shell_line("i=0; while [ $i -lt 80 ]; do echo line$i; i=$((i+1)); done; printf 'fatal: last'; exit 3");
         s.new_vtab().unwrap();
         let sid = s.focused_surface().unwrap();
-        let banner = "exited with code 3";
+        // The exit can be seen before the last output is read: wait for both.
+        let both = |t: &str| t.contains("exited with code 3") && t.contains("fatal: last");
         assert!(
-            pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))),
-            "{:?}",
-            s.surface_text(sid)
+            pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| both(&t))),
+            "the last line is kept:\n{}",
+            s.surface_text(sid).unwrap_or_default()
         );
-        let text = s.surface_text(sid).unwrap();
-        assert!(text.contains("fatal: last"), "the last line is kept:\n{text}");
     }
 
     #[test]
