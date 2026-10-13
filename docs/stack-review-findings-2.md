@@ -12,9 +12,7 @@ test reproduced it; the rest come from reading the code. Items marked
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-   Earlier decision: a TOML setting, boolean, default true (translate in
-   full-screen programs too).
-   **Revised, decision pending:** the owner wants the text-editing keys to do
+   **Decision pending:** the owner wants the text-editing keys to do
    the same thing inside Vim, not Vim's own meaning of the readline bytes. The
    proposal is a translation layer: in the alternate screen, send standard
    xterm key sequences (Option+Left -> `CSI 1;3D`, Cmd+Left -> Home) instead of
@@ -72,10 +70,9 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     and the agent, or a profile per process? Leaning towards one shared
     ghostrealm profile (GUI and agent), isolated from other browsers on the
     machine; not final.
-    **Decided:** the profile moves to Application Support, and the profile model
-    is human-only profiles agents cannot reach plus shareable agent profiles
-    with a per-workspace or shared scope. See DECISION.md (Web surface /
-    profiles) and TODO.md ("Web — profiles").
+    **Decided:** the profile moves to Application Support. Open design: the
+    profile model (picker, human-only vs agent, scope) — see TODO.md
+    ("Web — profiles").
 24. **A preview can block on a stuck mount.** `load`'s `metadata` call
     ([`plugins/file_browser/preview.rs:73`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or

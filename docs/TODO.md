@@ -430,8 +430,9 @@
   shaped span (glyphon `Attrs::weight`). (3) no header UI to SET the ext filter
   (`set_ext_filter` exists; git & recent have buttons) — add a control or an
   `ext:rs` query token. (4) date filter is a single "recent 7d" toggle — add an
-  explicit range. Modified time only: the owner suspects created time is not
-  useful (see "Quality of life (owner review) — editor and file browser
+  explicit range. Which time to filter by is open: the owner suspects modified
+  is the one wanted and created is not useful; created vs modified is a
+  separate question from the `date` view's rename (see "Quality of life (owner review) — editor and file browser
   polish" for the `date` view's rename). (5) recursive fuzzy walk caps at 20k
   entries; revisit for huge roots. (6) confirm nested `.gitignore` on a real repo.
 - Reason: the file-browser power tools; polish beyond the delivered basics.
@@ -488,7 +489,7 @@
   > you need to send all that information if none of those are being used, only
   > when they are being used. Also note that we need to add single grave and
   > triple grave code blocks. So single grave, obviously, like inline, and we've
-  > just got little squares versus triple grave where we've got like a full on
+  > just got little square versus triple grave where we've got like a full on
   > code block thing going on. And maybe a copy button. And maybe a run button
   > in the left gutter for individual commands that are actually runnable. Well,
   > I guess that only applies to shell flavored code blocks. Oh, and code blocks
@@ -712,9 +713,10 @@
   it as an MCP server (stdio shim that connects to that socket) so an agent in a
   terminal tab controls *this* window's workspaces, terminals, and web panes.
   Scope agent access per the existing "hide from agent" idea.
-- Web profiles: Chromium locks a profile to one process, so the web host is
-  owned by the running app and agents connect through this socket instead of
-  spawning their own host (see "Web — profiles").
+- Web profiles, proposal (a consequence of the profile lock, not an owner
+  decision): Chromium locks a profile to one process, so the web host would be
+  owned by the running app and agents would connect through this socket instead
+  of spawning their own host (see "Web — profiles").
 - Reason: agent control of the live UI is the point of the agent channel.
 
 ---
@@ -898,7 +900,7 @@
   - [stack-review-findings-2.md](stack-review-findings-2.md) items 15 (load-time
     findings), 24 (stuck mount), 34 (preview follows hover; the owner will try
     it first), 35 (mouse reports while scrolled back), 36 (unbracketed paste),
-    and its "To confirm" note.
+    and the "To confirm" note in [stack-review-findings.md](stack-review-findings.md).
   - The open design items: the profile scope controls and picker (TODO "Web —
     profiles"), syntax highlighting direction, editor and file browser as one
     surface.
@@ -989,7 +991,7 @@
     > I think the comment uncomment hotkey, for one, I think I need to change my
     > split hotkey, but I can do that. I think it needs to tie into the LSP
     > though, because different languages will have different comment formats. I
-    > don't know if standard LSP supports that.
+    > don't know if standard LSP support that.
 - Reason: owner review; small, visible rough edges.
 
 ---
@@ -1200,7 +1202,7 @@
 
 [2026-10-13T20:25+1300@e9617b8] Keybinding ids without quotes: flatten nested tables
 
-- Requires: NO BLOCKERS (small change; confirm in the decision session)
+- Requires: confirmation in the decision session (a small change)
 - Detail: Action ids in `[keybindings]` are quoted (`"pane.close" = "cmd+w"`)
   because TOML parses an unquoted dotted key as nested tables (`web` ->
   `focus_url`). The owner asks to accept `web.focus_url = "cmd+l"` unquoted,
@@ -1328,7 +1330,8 @@
     `cargo-sweep`, or a small in-repo script or `xtask` run from `mise`.
   - Cargo's unstable cache garbage collection (`-Zgc`); check whether it covers
     the target directory before relying on it.
-  - Turn incremental compilation off for release builds.
+  - Clear `target/debug/incremental` (~3 GB), which only dev builds use;
+    release builds already have incremental compilation off.
   Small; wanted soon.
 - Owner, verbatim:
   > By the way, this is completely unrelated, but I've noticed that we aggregate
@@ -1368,8 +1371,8 @@
 
 - Requires: a design session for the picker and the scope controls; the agent
   channel → running app entry for the shared host
-- Detail: Decided: the profile moves out of `~/Library/Caches/ghostrealm/web` to
-  Application Support (DECISION.md, Web surface / profiles).
+- Detail: Decided: the profile lives in Application Support, not
+  `~/Library/Caches/ghostrealm/web` (DECISION.md, Web surface / profiles).
 - Detail: Profile model:
   - A profile picker in the browser and the GUI.
   - Human-only profiles that agents cannot reach structurally: the agent channel
@@ -1379,10 +1382,11 @@
   - A per-profile scope, set by the agent or the human: private to one
     workspace, or shared across workspaces. Humans can scope their own profiles
     the same way.
-- Detail: Chromium locks a profile to one process, so the host is owned by the
-  running app and agents connect through it ("Agent channel → the running app"),
-  not by each process spawning its own host. Replaces the one-shared-profile
-  leaning in [stack-review-findings-2.md](stack-review-findings-2.md) item 19.
+- Proposal (a consequence of the profile lock, not an owner decision): Chromium
+  locks a profile to one process, so the host would be owned by the running app
+  and agents would connect through it ("Agent channel → the running app"),
+  not by each process spawning its own host. See
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 19.
 - Owner, verbatim:
   > It sounds like we should move the profile to application support regardless.
   > Given that we have multiple profile support, I actually think maybe we
@@ -1489,5 +1493,5 @@
   > Oh, okay. About permalinks, we can write that down in the to do. We won't do
   > it now, but it's a good idea to add GitHub permalinks in the future. And
   > maybe we'll need to call it GitHub permalinks so that I actually know what
-  > [...] it's talking about.
+  > [expletive removed] it's talking about.
 - Reason: owner asked for it recorded; shareable links to code.

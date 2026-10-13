@@ -81,7 +81,7 @@
 [2026-10-05T21:13+1300@04794e15]
 
 - Category: Web surface / embedded browser
-- Status: PARTLY SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (popups no longer open in place)
+- Status: PARTLY SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (pop-up handling)
 - Detail: Web pages render via CEF (`cef` crate, prebuilt CEF binary distribution) in a separate host process (`crates/web-host`), off-screen, with software compositing. Frames reach the app through shared-memory files and are drawn as textures in the app's own wgpu scene; input and commands go over a JSON-line pipe (`crates/web`).
 - Detail: One page per web surface — no in-browser tabs; popups and new-window links open in place. The pane/tab system provides tabs.
 - Detail: The app side is the `web` plugin (`crates/app/src/plugins/web/`). It draws pages through `PaintCx::image` and takes keys through `View::raw_key` (presses and releases with the physical key), both added to the plugin API for it.
@@ -133,16 +133,16 @@
 [2026-10-13T20:40+1300@e534aa0]
 
 - Category: Web surface / profiles
-- Detail: The web profile moves out of `~/Library/Caches/ghostrealm/web` to the platform's application-data directory (Application Support on macOS): cookies and logins are data, not a cache.
+- Detail: The web profile lives in the platform's application-data directory (Application Support on macOS), not in the cache directory: cookies and logins are data, not a cache.
 - Detail: Profile model (design, not yet built; TODO.md "Web — profiles"): a profile picker in the browser and the GUI; human-only profiles that agents cannot reach structurally (no cookies or tokens exposed, enforced by the host and agent channel, not by instructions); agent profiles shared between agents; a per-profile scope, set by the agent or the human, of private to one workspace or shared across workspaces.
-- Detail: Chromium locks a profile to one process, so the host is owned by the running app and agents connect through it (TODO.md "Agent channel → the running app"), rather than each process spawning its own host on a shared profile.
 - Reason: multiple profiles are available anyway; separating human from agent state gives the isolation. Owner, verbatim: "We want this kind of isolation built in and structural, not markdown prayers or rules."
+- Proposal (not decided; a consequence of the profile lock): Chromium locks a profile to one process, so the host would be owned by the running app and agents would connect through it (TODO.md "Agent channel → the running app"), rather than each process spawning its own host.
 
 ---
 
 [2026-10-13T20:40+1300@e534aa0]
 
 - Category: UX principle / agent-operated surfaces
-- Detail: Agent-operated activity (a browser, an emulator, a pop-up) runs in the background and never takes focus, raises a window, or switches the human's active pane or workspace. If it can be done hidden, it is done hidden.
-- Detail: Web pop-ups: when a human triggers one, it opens as a floating pop-up window above the whole app while the originating tab stays alive (fallback: a new tab), so `window.opener` and OAuth/payment flows work. When an agent triggers one, it opens hidden, in the background. This replaces "popups and new-window links open in place" in the web surface decision above.
+- Detail: Strong preference: agent-operated browser or emulator work happens in the background and does not refocus or distract the human. If it can be done in the background, it is.
+- Detail: Web pop-ups: when a human triggers one, it opens as a floating pop-up window above the whole app while the originating tab stays alive (fallback: a new tab), so `window.opener` and OAuth/payment flows work. When an agent triggers one, it opens hidden, in the background. Pop-ups do not open in place.
 - Reason: owner, verbatim: "it's really distracting when the agent keeps on refocusing on a browser to do things or an emulator to do things while I'm trying to do things as a human. So if you can do things in the background, then that's definitely a preference for agent operated stuff."
