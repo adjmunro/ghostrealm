@@ -55,10 +55,23 @@ impl AppState {
         self.views.get(&self.focused_surface()?)?.subject()
     }
 
+    /// A path argument: absolute as given, relative from the active
+    /// workspace's folder. Never from the process's own directory, which
+    /// nothing in the app shows (it is `/` when launched from Finder), and
+    /// which open views' paths wouldn't match.
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        let root = self.active().and_then(|vt| self.vtab_dir(vt));
+        Ok(root.context("the workspace has no folder for a relative path; give an absolute one")?.join(path))
+    }
+
     /// `path` as given, else the focused view's subject.
     fn subject_or(&self, path: Option<&str>) -> Result<PathBuf> {
         match path {
-            Some(p) => Ok(PathBuf::from(p)),
+            Some(p) => self.resolve(p),
             None => self.focused_subject().context("no file is focused; give a path"),
         }
     }
@@ -67,7 +80,7 @@ impl AppState {
     /// itself, or a file's), else the workspace's directory.
     fn dir_or(&self, dir: Option<&str>) -> Result<PathBuf> {
         if let Some(d) = dir {
-            return Ok(PathBuf::from(d));
+            return self.resolve(d);
         }
         let folder_of = |p: PathBuf| if p.is_dir() { Some(p) } else { p.parent().map(Path::to_path_buf) };
         let shown = self
@@ -834,5 +847,21 @@ mod tests {
         let d = tmpdir("fm-delete-missing");
         assert!(run(&mut s, "file.delete", &[("path", &d.join("nope"))]).is_err());
         assert!(s.confirm().is_none());
+    }
+
+    #[test]
+    fn relative_paths_are_taken_from_the_workspace_folder_not_the_apps() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-relative");
+        std::fs::write(d.join("x.txt"), "x\n").unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        assert!(run(&mut s, "file.rename", &[("path", Path::new("x.txt")), ("name", Path::new("y.txt"))]).is_err());
+        s.set_active_root_dir(&d);
+        let sid = open_editor(&mut s, &d.join("x.txt"));
+        run(&mut s, "file.rename", &[("path", Path::new("x.txt")), ("name", Path::new("y.txt"))]).unwrap();
+        assert!(d.join("y.txt").exists());
+        assert_eq!(editor_path(&s, sid), Some(d.join("y.txt")), "the editor follows");
+        run(&mut s, "file.new_file", &[("dir", Path::new("sub")), ("name", Path::new("n.txt"))]).unwrap();
+        assert!(d.join("sub/n.txt").exists());
     }
 }
