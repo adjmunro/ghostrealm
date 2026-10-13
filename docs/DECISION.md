@@ -100,7 +100,7 @@
 
 ---
 
-[2026-10-13T19:17+1300@37a844c7]
+[2026-10-13T19:17+1300@b804592e]
 
 - Category: Web surface / security
 - Status: OPEN RISK: undecided; see [stack-review-findings-2.md](stack-review-findings-2.md) item 21

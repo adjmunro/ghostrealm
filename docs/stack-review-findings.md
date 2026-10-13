@@ -9,7 +9,7 @@ it; the rest come from reading the code.
 ### 4. Unsaved editor content is dropped without autosave or a prompt
 
 - Closing an editor tab/pane/workspace drops the view
-  (`prune_orphan_surfaces_after`, [`app_state.rs:680`](../crates/app/src/app_state.rs)).
+  (`prune_orphan_surfaces_after`, [`app_state.rs:685`](../crates/app/src/app_state.rs)).
 - Quitting (`CloseRequested`, [`window.rs:220`](../crates/app/src/window.rs))
   autosaves only when `autosave_on_unfocus = true`, and never saves pathless
   (scratch) buffers.
@@ -18,11 +18,11 @@ it; the rest come from reading the code.
 ### 5. Save As and open failures are silent
 
 - A Save As error goes to stderr only, after the picker has closed
-  (`after_pick`, [`window.rs:1294`](../crates/app/src/window.rs)).
+  (`after_pick`, [`window.rs:1318`](../crates/app/src/window.rs)).
 - So does a file that won't open (not UTF-8, unreadable): clicking it in the
   file browser or opening the settings does nothing visible
-  (`open_requested_file`, [`window.rs:1002`](../crates/app/src/window.rs);
-  `open_config_editor`, `:830`).
+  (`open_requested_file`, [`window.rs:1010`](../crates/app/src/window.rs);
+  `open_config_editor`, `:838`).
 - The app has no user-visible error surface yet (no toast or status line).
   Decision needed: where should errors like these show?
 
