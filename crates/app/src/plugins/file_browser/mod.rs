@@ -1213,6 +1213,21 @@ mod tests {
     }
 
     #[test]
+    fn preview_paints_highlighted_text_rows() {
+        let (d, mut v) = fixture();
+        std::fs::write(d.join("b.md"), "# Title\n\n**bold** and `code`\n").unwrap();
+        let mut h = Harness::new();
+        h.paint(&mut v, WIDE);
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(1) });
+        h.paint(&mut v, WIDE);
+        await_preview(&h, &mut v, &d.join("b.md"));
+        let plain = h.paint(&mut v, WIDE).text.len();
+        let preview::Content::Text { spans, .. } = &v.preview.shown().unwrap().content else { panic!("text") };
+        assert_eq!(spans.len(), 3);
+        assert!(plain >= 3, "the lines are drawn, got {plain} text items");
+    }
+
+    #[test]
     fn preview_draws_an_image() {
         let (d, mut v) = fixture();
         image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255]))

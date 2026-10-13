@@ -26,7 +26,7 @@ pub fn color(token: Token, plain: [u8; 3]) -> [u8; 3] {
 /// highlight is `spans`; runs of one colour are coalesced. An empty range
 /// yields one empty span, so a blank row still has something to shape.
 pub fn row_spans(line: &str, spans: &[Span], start: usize, len: usize, plain: [u8; 3]) -> Vec<(String, [u8; 3])> {
-    let end = start + len;
+    let end = start.saturating_add(len);
     let mut token_at = spans.iter().peekable();
     let mut out: Vec<(String, [u8; 3])> = Vec::new();
     for (i, ch) in line.chars().enumerate().take(end).skip(start) {

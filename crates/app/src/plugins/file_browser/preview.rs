@@ -10,11 +10,13 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use ghostrealm_core::highlight::{self, Span};
 use ghostrealm_core::{Config, Rect};
 use glyphon::Family;
 
 use super::audio::{self, AudioPlayer};
 use crate::plugin::{rect_contains, theme, EventCx, Font, Image, PaintCx};
+use crate::syntax;
 
 /// Preview button ids, after the browser header's (see `View::button`).
 pub const BTN_PLAY: u32 = 10;
@@ -44,7 +46,9 @@ const AUDIO_EXTS: &[&str] = &["flac", "m4a", "mp3", "oga", "ogg", "wav"];
 #[derive(Clone)]
 pub enum Content {
     Dir { entries: usize },
-    Text { lines: Vec<String>, truncated: bool },
+    /// `spans` is each line's syntax highlight, empty for a file with no
+    /// highlighter.
+    Text { lines: Vec<String>, spans: Vec<Vec<Span>>, truncated: bool },
     /// `width` x `height` is the file's size; `image` may be downscaled.
     Image { image: Arc<Image>, width: u32, height: u32 },
     Audio { duration: Option<Duration> },
@@ -189,7 +193,8 @@ fn read_text(path: &Path) -> Result<Option<Content>, String> {
         let line = line.replace('\t', "    ");
         lines.push(line.chars().take(TEXT_MAX_COLS).collect());
     }
-    Ok(Some(Content::Text { lines, truncated }))
+    let spans = highlight::for_path(path).map(|h| highlight::highlight_lines(h, &lines)).unwrap_or_default();
+    Ok(Some(Content::Text { lines, spans, truncated }))
 }
 
 /// A worker that loads the latest requested preview, skipping requests that
@@ -488,7 +493,7 @@ impl PreviewPane {
         }
 
         match &p.content {
-            Content::Text { lines, truncated } => self.paint_text(cx, body, lines, *truncated),
+            Content::Text { lines, spans, truncated } => self.paint_text(cx, body, lines, spans, *truncated),
             Content::Image { image, .. } => {
                 // One image pixel per logical pixel at most: small images stay crisp.
                 let r = image.fit(body, scale);
@@ -505,7 +510,7 @@ impl PreviewPane {
         }
     }
 
-    fn paint_text(&mut self, cx: &mut PaintCx, body: Rect, lines: &[String], truncated: bool) {
+    fn paint_text(&mut self, cx: &mut PaintCx, body: Rect, lines: &[String], spans: &[Vec<Span>], truncated: bool) {
         let ch = cx.ui.cell_h;
         let count = lines.len() + usize::from(truncated);
         if count == 0 {
@@ -525,9 +530,17 @@ impl PreviewPane {
                 Some(l) => (l.as_str(), theme::TEXT),
                 None => ("\u{2026}", theme::DIM),
             };
-            let key = cx.row_key(std::iter::once((text, color)));
-            let spans = || vec![(text.to_string(), color)];
-            cx.budgeted_row(key, spans, body.x, top, body.w, body, color);
+            match spans.get(i) {
+                Some(hl) => {
+                    let row = syntax::row_spans(text, hl, 0, usize::MAX, color);
+                    let key = cx.row_key(row.iter().map(|(t, c)| (t.as_str(), *c)));
+                    cx.budgeted_row(key, || row, body.x, top, body.w, body, color);
+                }
+                None => {
+                    let key = cx.row_key(std::iter::once((text, color)));
+                    cx.budgeted_row(key, || vec![(text.to_string(), color)], body.x, top, body.w, body, color);
+                }
+            }
             i += 1;
         }
     }
@@ -647,12 +660,12 @@ pub(crate) mod tests {
         std::fs::write(d.join("a.rs"), "fn main() {\n\tx\n}\n").unwrap();
         let p = load(&d.join("a.rs"));
         assert_eq!(p.kind, "RS text");
-        let Content::Text { lines, truncated } = p.content else { panic!("text") };
+        let Content::Text { lines, truncated, .. } = p.content else { panic!("text") };
         assert_eq!(lines, vec!["fn main() {", "    x", "}"]);
         assert!(!truncated);
 
         std::fs::write(d.join("long.txt"), "x\n".repeat(TEXT_MAX_LINES + 5)).unwrap();
-        let Content::Text { lines, truncated } = load(&d.join("long.txt")).content else { panic!("text") };
+        let Content::Text { lines, truncated, .. } = load(&d.join("long.txt")).content else { panic!("text") };
         assert_eq!(lines.len(), TEXT_MAX_LINES);
         assert!(truncated);
 
@@ -661,6 +674,21 @@ pub(crate) mod tests {
         assert!(matches!(p.content, Content::Nothing));
         assert_eq!(p.kind, "BIN file");
         assert_eq!(p.size, Some(6));
+    }
+
+    #[test]
+    fn text_with_a_highlighter_carries_a_span_list_per_line() {
+        use ghostrealm_core::highlight::Token;
+        let d = tmpdir("preview-highlight");
+        std::fs::write(d.join("n.md"), "# Title\n```\n# code\n```\n").unwrap();
+        let Content::Text { lines, spans, .. } = load(&d.join("n.md")).content else { panic!("text") };
+        assert_eq!(spans.len(), lines.len());
+        assert_eq!(spans[0][0].token, Token::Marker, "heading");
+        assert_eq!(spans[2][0].token, Token::Code, "inside the fence");
+
+        std::fs::write(d.join("a.rs"), "fn main() {}\n").unwrap();
+        let Content::Text { spans, .. } = load(&d.join("a.rs")).content else { panic!("text") };
+        assert!(spans.is_empty(), "no highlighter for .rs");
     }
 
     #[test]
