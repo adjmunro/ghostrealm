@@ -18,7 +18,7 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input routing
   src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
   src/plugins/       first-party plugins: terminal, editor, file_browser
-crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree
+crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree, syntax highlighters
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam

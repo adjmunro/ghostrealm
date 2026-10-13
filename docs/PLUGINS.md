@@ -125,6 +125,20 @@ dropping the view shuts the service down, so it runs only while the file is
 open. First-party servers implement `ghostrealm_lsp::LanguageServer` and run
 in-process; external ones are spawned processes speaking LSP on stdio.
 
+## Syntax highlighting
+
+`ghostrealm_core::highlight` is a registry of `Highlighter`s keyed by file
+extension (`for_path`, `for_extension`; the list is `highlight::ALL`). A
+highlighter turns one line plus the `State` carried from the line before into
+contiguous `Span`s of palette-free `Token`s (`Comment`, `Heading`, `Key`,
+`Marker`, `Strong`, `Emphasis`, `Code`, `Link`, ...). `syntax::row_spans` maps
+them to colours (`syntax::color`) and slices them to a visual row, ready for
+`PaintCx::row`/`budgeted_row`. A view that edits text keeps a `StateCache` so a
+scrolled row knows its start state without re-highlighting the file; a view that
+reads a file once (the browser's preview) runs `highlight_lines` on its worker.
+To add a language, implement `Highlighter` in a module under `core/src/highlight/`
+and list it in `ALL`.
+
 ## Testing
 
 `plugin::testing::Harness` paints a view and delivers input with no window or

@@ -418,8 +418,6 @@
   - **autoplay toggle**: the preview's `autoplay` button is a per-pane override
     of `[file_browser] preview_autoplay`; write it back to the config instead,
     if that is the wanted behaviour.
-  - **text**: syntax highlighting once the highlighter lives in core (see the
-    syntax highlighting entry).
   - **wake, not poll**: the preview polls its loader on a 15 ms timer while a
     load is in flight. `View::refresh` (repaint without marking unread) would
     replace the poll once the loader wakes the UI (`OpenCx::waker`) and the
@@ -445,32 +443,33 @@
 
 ---
 
-[2026-09-29@6641e98] Plug-and-play syntax highlighting (+ Markdown)
+[2026-09-29@6641e98] Syntax highlighting — more languages
 
 - Requires: NO BLOCKERS
-- Detail: Today only TOML highlighting is hardcoded in the editor
-  (`plugins::editor::toml`). Extract a highlighter interface — a trait/registry
-  keyed by extension that turns a logical line (with some cross-line state, e.g.
-  inside a fenced block) into coloured spans — so file types are added as small
-  modules. Live in core (headless, testable) so the editor and the browser's
-  text-preview share it. Add **Markdown**; use the theme palette for colours (see
-  the Markdown-formatting entry). Later: consider LSP-backed semantic highlight,
-  but keep the simple rule-based path for the common case.
+- Detail: The registry (`ghostrealm_core::highlight`) has TOML and Markdown. Add
+  more as small `Highlighter` modules (JSON, YAML, Rust, shell, ...); each is one
+  line in `highlight::ALL`. Later: consider LSP-backed semantic highlight, but
+  keep the rule-based path for the common case. Markdown has no setext headings,
+  indented code, or YAML front matter (they need line-number or neighbouring-line
+  context).
 - Reason: expand language support over time as little modules; requested.
 
 ---
 
 [2026-09-29@6641e98] Markdown formatting in the editor
 
-- Requires: the syntax-highlighter interface above
-- Detail: Render Markdown with style while keeping it editable. Default to a
-  **mixed** style: `*italic*` shows italic AND keeps the asterisks; `**bold**`
-  shows bold AND keeps both markers; headers styled but the `#` still shown (a
-  green-ish `#` from the palette). A toggle button switches mixed ↔ fully-formatted
-  (markers hidden). Highlight links; a Markdown feature checks whether a link/image
-  target exists (local file on disk, or a reachable URL) and flags broken ones with
-  error feedback. Needs glyphon `Attrs::style(Italic)`/`weight(Bold)` per span and
-  inline error markers.
+- Requires: styled spans in the row cache (`row_cache::RowCache`, `PaintCx::row`,
+  `budgeted_row`): spans are `(String, [u8; 3])` and every row is shaped with one
+  monospace `Attrs`; italic/bold need a style on the span, in `row_key`, and in
+  `RowCache::ensure` (`Attrs::style(Italic)`/`weight(Bold)`).
+- Detail: The highlighter already marks `Token::Emphasis` / `Token::Strong` text
+  apart from its `Token::Marker`s, links (`Link` text, `Url` target) and
+  headings, and the editor colours them. Remaining: render **mixed** style (the
+  default) with the Emphasis italic and the Strong bold while the markers stay
+  visible. A toggle button switches mixed <-> fully-formatted (markers hidden;
+  needs cursor-column mapping over hidden text). A Markdown feature checks
+  whether a link/image target exists (a local file on disk; a reachable URL needs
+  a network decision) and flags broken ones with inline error markers.
 - Reason: nicer Markdown editing; requested.
 
 ---
@@ -561,8 +560,9 @@
 
 [2026-10-13@13e2bda] Editor — section outline (jump to a header)
 
-- Requires: per-language header extraction — a hook on the plug-and-play syntax
-  interface for simple formats; the LSP (document symbols) for code
+- Requires: per-language header extraction — a hook on the `Highlighter` trait
+  (`ghostrealm_core::highlight`) for simple formats; the LSP (document symbols)
+  for code
 - Detail: Not a minimap: a list of the file's section headers that jumps to one.
   Headers per language: TOML `[table]` / `[[array]]`, Markdown `#` headings, code
   symbols once an LSP is wired. Clicking a header scrolls so it sits mid-screen.
