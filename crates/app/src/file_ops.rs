@@ -218,10 +218,22 @@ pub fn relative_to(path: &Path, root: &Path) -> String {
 }
 
 /// The pattern that ignores `path` in the repository at `root`: anchored at the
-/// root (`/src/a.rs`), with a trailing `/` for a directory.
+/// root (`/src/a.rs`), with a trailing `/` for a directory (not a symlink to
+/// one: git sees that as an entry of its own). Glob characters, backslashes,
+/// and trailing spaces in names are escaped, so the line matches that entry
+/// only; a leading `#` or `!` needs nothing, as the `/` comes first.
 pub fn ignore_pattern(path: &Path, root: &Path) -> String {
-    let mut pattern = format!("/{}", relative_to(path, root));
-    if path.is_dir() {
+    let mut pattern = String::from("/");
+    for c in relative_to(path, root).chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    let spaces = pattern.len() - pattern.trim_end_matches(' ').len();
+    pattern.truncate(pattern.len() - spaces);
+    pattern.push_str(&"\\ ".repeat(spaces));
+    if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         pattern.push('/');
     }
     pattern
@@ -236,7 +248,9 @@ pub fn add_ignore_line(file: &Path, pattern: &str) -> Result<bool> {
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("can't read {}", file.display())),
     };
-    let bare = pattern.trim_start_matches('/');
+    // Trailing whitespace compares trimmed on both sides: git drops it from a
+    // line unless escaped, and an escaped one ends in `\`.
+    let bare = pattern.trim_start_matches('/').trim_end();
     if existing.lines().any(|l| l.trim().trim_start_matches('/') == bare) {
         return Ok(false);
     }
@@ -253,16 +267,23 @@ pub fn add_ignore_line(file: &Path, pattern: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The repository whose index would hold `path`: the one around its folder
+/// (a folder that is a repository of its own is still an entry of the one
+/// it sits in).
+fn containing_repo(path: &Path) -> Result<PathBuf> {
+    path.parent().and_then(git::repo_root).context("not in a git repository")
+}
+
 /// Ignore `path` in its repository's `.gitignore`. Returns whether it changed.
 pub fn add_to_gitignore(path: &Path) -> Result<bool> {
-    let root = git::repo_root(path).context("not in a git repository")?;
+    let root = containing_repo(path)?;
     add_ignore_line(&root.join(".gitignore"), &ignore_pattern(path, &root))
 }
 
 /// Ignore `path` in its repository's `.git/info/exclude`. Returns whether it
 /// changed.
 pub fn add_to_exclude(path: &Path) -> Result<bool> {
-    let root = git::repo_root(path).context("not in a git repository")?;
+    let root = containing_repo(path)?;
     let exclude = git::exclude_file(&root).context("can't locate .git/info/exclude")?;
     add_ignore_line(&exclude, &ignore_pattern(path, &root))
 }
@@ -435,5 +456,42 @@ pub mod tests {
         if git::repo_root(&loose).is_none() {
             assert!(add_to_gitignore(&loose.join("f")).is_err());
         }
+    }
+
+    #[test]
+    fn an_ignore_line_matches_only_its_own_entry_whatever_its_name() {
+        let d = tmpdir("ops-ignore-names");
+        if !git_ok(&d, &["init", "-q"]) {
+            return;
+        }
+        let ignored = |name: &str| git_ok(&d, &["check-ignore", "-q", "--no-index", "--", name]);
+        for name in ["*.rs", "a?", "[ab]", "back\\slash", "trail ", "#hash", "!bang"] {
+            std::fs::write(d.join(name), "").unwrap();
+        }
+        for other in ["x.rs", "ab", "a", "b", "trail"] {
+            std::fs::write(d.join(other), "").unwrap();
+        }
+        for name in ["*.rs", "a?", "[ab]", "back\\slash", "trail ", "#hash", "!bang"] {
+            assert!(add_to_gitignore(&d.join(name)).unwrap(), "{name:?}");
+            assert!(ignored(name), "{name:?} is ignored");
+            assert!(!add_to_gitignore(&d.join(name)).unwrap(), "{name:?} is already there");
+        }
+        for other in ["x.rs", "ab", "a", "b", "trail"] {
+            assert!(!ignored(other), "{other:?} isn't caught by another entry's line");
+        }
+        // A symlink to a folder is an entry of its own to git, not a folder.
+        std::fs::create_dir(d.join("real")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("real", d.join("link")).unwrap();
+            add_to_gitignore(&d.join("link")).unwrap();
+            assert!(ignored("link"));
+        }
+        // A repository nested in this one is ignored here, as a folder.
+        std::fs::create_dir(d.join("nested")).unwrap();
+        assert!(git_ok(&d.join("nested"), &["init", "-q"]));
+        assert!(add_to_gitignore(&d.join("nested")).unwrap());
+        assert!(ignored("nested"));
+        assert!(!d.join("nested/.gitignore").exists(), "not the nested repository's own file");
     }
 }
