@@ -142,10 +142,22 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `dir` is `src` or inside it, after resolving symlinks (`src`'s
+/// own last component isn't followed: a symlink is copied or moved as a link).
+/// Copying a folder into itself would recurse until the stack overflows.
+fn inside_itself(src: &Path, dir: &Path) -> bool {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let src = match (src.parent(), src.file_name()) {
+        (Some(parent), Some(name)) => real(parent).join(name),
+        _ => real(src),
+    };
+    real(dir).starts_with(src)
+}
+
 /// Copy `src` into `dir` under a free name. Returns the copy's path.
 pub fn copy_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     let name = src.file_name().context("nothing to copy")?;
-    if dir.starts_with(src) {
+    if inside_itself(src, dir) {
         bail!("can't copy a folder into itself");
     }
     let dest = unique_dest(dir, name);
@@ -165,7 +177,7 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     if src.parent() == Some(dir) {
         return Ok(src.to_path_buf());
     }
-    if dir.starts_with(src) {
+    if inside_itself(src, dir) {
         bail!("can't move a folder into itself");
     }
     let dest = unique_dest(dir, name);
@@ -493,5 +505,19 @@ pub mod tests {
         assert!(add_to_gitignore(&d.join("nested")).unwrap());
         assert!(ignored("nested"));
         assert!(!d.join("nested/.gitignore").exists(), "not the nested repository's own file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_isnt_copied_or_moved_into_itself_through_a_symlink() {
+        let d = tmpdir("ops-into-self");
+        std::fs::create_dir_all(d.join("a/sub")).unwrap();
+        std::fs::write(d.join("a/f.txt"), "F").unwrap();
+        std::os::unix::fs::symlink(d.join("a/sub"), d.join("link")).unwrap();
+        assert!(copy_into(&d.join("a"), &d.join("link")).is_err());
+        assert!(move_into(&d.join("a"), &d.join("link")).is_err());
+        assert_eq!(names(&d.join("a/sub")), Vec::<String>::new(), "nothing was written");
+        // A symlink itself is copied as a link, even into the folder it names.
+        assert_eq!(copy_into(&d.join("link"), &d.join("a/sub")).unwrap(), d.join("a/sub/link"));
     }
 }
