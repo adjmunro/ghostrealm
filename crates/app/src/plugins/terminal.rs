@@ -220,7 +220,9 @@ impl TerminalView {
     /// Whether pointer input belongs to the program: it enabled mouse tracking
     /// and Shift isn't held (Shift keeps selection and scrolling local).
     fn forwards_mouse(&self, mods: Mods) -> bool {
-        !mods.shift && self.term.mouse_tracking()
+        // Scrolled back, the pointer addresses history, not the program's live
+        // screen: selection and copy stay local and nothing is reported.
+        !mods.shift && self.term.mouse_tracking() && self.term.viewport_active()
     }
 
     /// Report a pointer event at physical-pixel `pos` to the program.
@@ -875,6 +877,34 @@ mod tests {
         // A fresh press clears it.
         h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 1 });
         assert!(v.selection.is_none());
+    }
+
+    #[test]
+    fn scrolled_back_the_mouse_selects_locally_instead_of_reporting() {
+        let mut v = running("printf '\\033[?1000h'; seq 1 100; sleep 3", "100");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !v.term.mouse_tracking() {
+            assert!(Instant::now() < deadline, "tracking never enabled");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        // Live: the press belongs to the program.
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1 });
+        assert!(v.reporting);
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(1, 1), dragged: false });
+
+        v.term.scroll(Scroll::Delta(-10));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while v.term.viewport_active() {
+            assert!(Instant::now() < deadline, "never scrolled back");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1 });
+        assert!(!v.reporting, "nothing is reported while scrolled back");
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 1) });
+        assert!(v.selection.is_some(), "the drag selects locally");
+        assert!(v.term.mouse_tracking(), "the program still tracks the mouse");
     }
 
     #[test]

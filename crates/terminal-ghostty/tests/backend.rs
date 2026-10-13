@@ -524,6 +524,20 @@ fn legacy_mouse_encoding_pins_columns_past_222() {
 }
 
 #[test]
+fn the_viewport_is_inactive_while_scrolled_back() {
+    let mut term = cat_v_with("\\033[?1000h", tracking);
+    for _ in 0..30 {
+        term.write_bytes(b"line\r");
+    }
+    let _ = wait_for_row(&mut term, "line");
+    assert!(term.viewport_active(), "live at first");
+    term.scroll(Scroll::Delta(-3));
+    assert!(!term.viewport_active(), "scrolled into history");
+    term.scroll(Scroll::Bottom);
+    assert!(term.viewport_active());
+}
+
+#[test]
 fn mouse_reports_reach_the_program() {
     let mut term = cat_v_with("\\033[?1000h\\033[?1006h", tracking);
     term.send_mouse(&report(MouseAction::Press, Some(MouseButton::Left), (2.5, 1.5)));

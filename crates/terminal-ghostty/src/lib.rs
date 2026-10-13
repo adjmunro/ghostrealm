@@ -586,6 +586,10 @@ impl TerminalBackend for GhosttyTerminal {
         self.term.is_mouse_tracking().unwrap_or(false)
     }
 
+    fn viewport_active(&self) -> bool {
+        self.term.viewport_active().unwrap_or(true)
+    }
+
     fn send_mouse(&mut self, report: &MouseReport) {
         if let Ok(bytes) = self.encode_mouse(report) {
             if !bytes.is_empty() {

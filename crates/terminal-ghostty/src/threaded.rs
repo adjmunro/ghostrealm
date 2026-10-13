@@ -71,6 +71,8 @@ struct Meta {
     lifecycle: Lifecycle,
     /// The program enabled mouse tracking.
     mouse_tracking: bool,
+    /// The viewport shows the live screen, not scrollback.
+    viewport_active: bool,
     /// The PTY's foreground process group, for a forced shutdown.
     foreground: Option<i32>,
 }
@@ -121,6 +123,7 @@ impl ThreadedTerminal {
                 busy: false,
                 lifecycle: Lifecycle::Running,
                 mouse_tracking: false,
+                viewport_active: true,
                 foreground: None,
             }),
             generation: AtomicU64::new(0),
@@ -278,6 +281,10 @@ impl TerminalBackend for ThreadedTerminal {
 
     fn mouse_tracking(&self) -> bool {
         self.shared.meta.lock().unwrap().mouse_tracking
+    }
+
+    fn viewport_active(&self) -> bool {
+        self.shared.meta.lock().unwrap().viewport_active
     }
 
     fn send_mouse(&mut self, report: &MouseReport) {
@@ -442,6 +449,7 @@ fn worker_loop(
             busy: term.is_busy(),
             lifecycle: term.lifecycle(),
             mouse_tracking: term.mouse_tracking(),
+            viewport_active: term.viewport_active(),
             foreground: term.foreground_group(),
         };
         exit_poll = exit_poll_after(term, new_meta.lifecycle);

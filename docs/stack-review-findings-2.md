@@ -103,13 +103,6 @@ Found reviewing `4981b3a..d5e17a2` (bracketed paste and mouse reporting
 
 ### Low
 
-35. **Mouse reports go to the wrong row while the viewport is scrolled back.**
-    `report_mouse` ([`plugins/terminal.rs`](../crates/app/src/plugins/terminal.rs))
-    reports the pointer's cell in the scrolled viewport, but the program's screen
-    is the live one, so a click lands rows away from the pointer (Ghostty upstream
-    behaves the same). Decided: never snap to the bottom (the owner may be
-    copying); while the viewport is scrolled back the mouse acts locally and is
-    not reported. Fix tracked in TODO.md.
 36. **Unbracketed paste sends control bytes raw, and LF rather than CR**
     (`GhosttyTerminal::encode_paste`,
     [`terminal-ghostty/src/lib.rs`](../crates/terminal-ghostty/src/lib.rs)). A

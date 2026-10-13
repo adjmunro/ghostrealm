@@ -247,6 +247,13 @@ pub trait TerminalBackend {
         false
     }
 
+    /// Whether the viewport shows the live screen (not scrolled back into
+    /// history). Pointer reports address the live screen, so they are only
+    /// meaningful while this holds.
+    fn viewport_active(&self) -> bool {
+        true
+    }
+
     /// Report a pointer event in whichever protocol the program selected. Does
     /// nothing unless [`mouse_tracking`](Self::mouse_tracking) is on and the
     /// tracking mode reports this kind of event.

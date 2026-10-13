@@ -910,8 +910,7 @@
     surface.
   Decided in the review rounds and no longer open: Chromium sandbox on, web
   profile location, pop-up handling, shell exit, Delete = Trash, GitHub
-  permalinks (future), the file-browser date view naming, terminal mouse
-  reports while scrolled back.
+  permalinks (future), the file-browser date view naming.
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -1517,22 +1516,6 @@
   > the bottom of the terminal or a file, etc. if it's long or if you have to
   > scroll.
 - Reason: owner request; long scrollback and files.
-
----
-
-[2026-10-14T00:02+1300@6007201] Terminal: mouse reports while scrolled back
-
-- Requires: NO BLOCKERS
-- Detail: Decided ([stack-review-findings-2.md](stack-review-findings-2.md)
-  item 35): never snap to the bottom. While the viewport is scrolled back, the
-  mouse acts locally (selection, copy) and nothing is reported to the program.
-  `report_mouse` in `plugins/terminal.rs` skips reporting when the viewport is
-  not live.
-- Owner, verbatim:
-  > no, why would the terminal scroll to the bottom when you change focus? That
-  > doesn't make sense. What if I'm trying to copy something?
-- Reason: reports land on the wrong row while scrolled back; the owner may be
-  copying.
 
 ---
 
