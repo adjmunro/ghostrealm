@@ -162,21 +162,33 @@ fn create_copy(src: &Path, dst: &Path) -> Result<()> {
 /// copies and then deletes the original, so anything not copied is lost.
 #[cfg(target_os = "macos")]
 fn copy_contents(from: &std::fs::File, to: &std::fs::File) -> std::io::Result<()> {
+    fcopyfile(from, to, libc::COPYFILE_DATA | libc::COPYFILE_METADATA)
+}
+
+/// `fcopyfile(3)` with `flags` from `from` to `to`.
+#[cfg(target_os = "macos")]
+fn fcopyfile(from: &std::fs::File, to: &std::fs::File, flags: u32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: both descriptors stay open for the call; a null state is allowed.
-    let rc = unsafe {
-        libc::fcopyfile(
-            from.as_raw_fd(),
-            to.as_raw_fd(),
-            std::ptr::null_mut(),
-            libc::COPYFILE_DATA | libc::COPYFILE_METADATA,
-        )
-    };
+    let rc = unsafe { libc::fcopyfile(from.as_raw_fd(), to.as_raw_fd(), std::ptr::null_mut(), flags) };
     if rc == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Give the directory `dst` the permissions of `src`, and on macOS its
+/// extended attributes, ACL and flags too, as for files.
+#[cfg(target_os = "macos")]
+fn copy_dir_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fcopyfile(&std::fs::File::open(src)?, &std::fs::File::open(dst)?, libc::COPYFILE_METADATA)
+}
+
+/// Give the directory `dst` the permissions of `src`.
+#[cfg(not(target_os = "macos"))]
+fn copy_dir_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(dst, src.symlink_metadata()?.permissions())
 }
 
 /// Fill `to` from `from`, with its permissions.
@@ -187,23 +199,26 @@ fn copy_contents(mut from: &std::fs::File, mut to: &std::fs::File) -> std::io::R
 }
 
 /// Copy what is inside the directory `src` into the existing directory `dst`,
-/// then give `dst` the permissions of `src` (last, as they may forbid writing
-/// into it).
-fn copy_children(src: &Path, dst: &Path) -> Result<()> {
+/// then give `dst` the metadata of `src` (last, as the permissions may forbid
+/// writing into it). Every source entry copied is pushed onto `copied`, a
+/// directory after its contents.
+fn copy_children(src: &Path, dst: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        copy_recursive(&entry.path(), &dst.join(entry.file_name()), copied)?;
     }
-    std::fs::set_permissions(dst, src.symlink_metadata()?.permissions())?;
+    copy_dir_metadata(src, dst)?;
     Ok(())
 }
 
-/// Copy `src` (a file, or a directory with its contents) to `dst`.
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Copy `src` (a file, or a directory with its contents) to `dst`, noting what
+/// was copied in `copied`.
+fn copy_recursive(src: &Path, dst: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
     create_copy(src, dst)?;
     if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        copy_children(src, dst)?;
+        copy_children(src, dst, copied)?;
     }
+    copied.push(src.to_path_buf());
     Ok(())
 }
 
@@ -214,14 +229,15 @@ fn is_taken(e: &anyhow::Error) -> bool {
 
 /// Copy `src` to a free name in `dir`. A name another process takes between
 /// the check and the copy is skipped, never overwritten.
-fn copy_to_free(src: &Path, dir: &Path, name: &OsStr) -> Result<PathBuf> {
+fn copy_to_free(src: &Path, dir: &Path, name: &OsStr, copied: &mut Vec<PathBuf>) -> Result<PathBuf> {
     loop {
         let dest = unique_dest(dir, name);
         match create_copy(src, &dest) {
             Ok(()) => {
                 if src.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-                    copy_children(src, &dest)?;
+                    copy_children(src, &dest, copied)?;
                 }
+                copied.push(src.to_path_buf());
                 return Ok(dest);
             }
             Err(e) if is_taken(&e) => continue,
@@ -288,7 +304,7 @@ pub fn copy_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     if inside_itself(src, dir) {
         bail!("can't copy a folder into itself");
     }
-    copy_to_free(src, dir, name).with_context(|| format!("can't copy {}", src.display()))
+    copy_to_free(src, dir, name, &mut Vec::new()).with_context(|| format!("can't copy {}", src.display()))
 }
 
 /// Copy `src` next to itself. Returns the copy's path.
@@ -296,12 +312,42 @@ pub fn duplicate(src: &Path) -> Result<PathBuf> {
     copy_into(src, src.parent().context("nothing to duplicate")?)
 }
 
+/// Where a moved entry went.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Moved {
+    /// The entry's new path.
+    pub dest: PathBuf,
+    /// Whether part of the original is still in place: a move across
+    /// filesystems copies, then removes what it copied, and leaves anything
+    /// added to the original since.
+    pub source_left: bool,
+}
+
+/// Remove the source entries `copied` (in the order [`copy_recursive`] lists
+/// them: contents before their directory) and nothing else. A directory that
+/// still holds something not copied is left, with everything above it. Returns
+/// whether anything was left.
+fn remove_copied(copied: &[PathBuf]) -> Result<bool> {
+    let mut left = false;
+    for path in copied {
+        let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+        let removed = if is_dir { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if is_dir && e.kind() == ErrorKind::DirectoryNotEmpty => left = true,
+            Err(e) => return Err(e).with_context(|| format!("can't remove {}", path.display())),
+        }
+    }
+    Ok(left)
+}
+
 /// Move `src` into `dir` under a free name. Moving into the folder it is
-/// already in changes nothing. Returns the new path.
-pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf> {
+/// already in changes nothing.
+pub fn move_into(src: &Path, dir: &Path) -> Result<Moved> {
     let name = src.file_name().context("nothing to move")?;
     if src.parent() == Some(dir) {
-        return Ok(src.to_path_buf());
+        return Ok(Moved { dest: src.to_path_buf(), source_left: false });
     }
     if inside_itself(src, dir) {
         bail!("can't move a folder into itself");
@@ -309,22 +355,24 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf> {
     loop {
         let dest = unique_dest(dir, name);
         match rename_noreplace(src, &dest) {
-            Ok(()) => return Ok(dest),
+            Ok(()) => return Ok(Moved { dest, source_left: false }),
             // Another process took the name since it was picked: pick again.
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             // Across filesystems a rename isn't possible: copy, then remove.
-            Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                let dest = copy_to_free(src, dir, name)?;
-                if src.is_dir() {
-                    std::fs::remove_dir_all(src)?;
-                } else {
-                    std::fs::remove_file(src)?;
-                }
-                return Ok(dest);
-            }
+            Err(e) if e.kind() == ErrorKind::CrossesDevices => return move_by_copy(src, dir, name),
             Err(e) => return Err(e).with_context(|| format!("can't move {}", src.display())),
         }
     }
+}
+
+/// Move `src` into `dir` as a copy followed by removing what was copied.
+/// Anything added to a folder while it was copied is not in the copy, so it is
+/// left where it is.
+fn move_by_copy(src: &Path, dir: &Path, name: &OsStr) -> Result<Moved> {
+    let mut copied = Vec::new();
+    let dest = copy_to_free(src, dir, name, &mut copied)?;
+    let source_left = remove_copied(&copied)?;
+    Ok(Moved { dest, source_left })
 }
 
 /// Rename `path` to `name` within its folder. Fails if the name is taken.
@@ -561,12 +609,12 @@ pub mod tests {
         let d = tmpdir("ops-move");
         std::fs::create_dir_all(d.join("to/deep")).unwrap();
         std::fs::write(d.join("a.txt"), "A").unwrap();
-        assert_eq!(move_into(&d.join("a.txt"), &d.join("to")).unwrap(), d.join("to/a.txt"));
+        assert_eq!(move_into(&d.join("a.txt"), &d.join("to")).unwrap().dest, d.join("to/a.txt"));
         assert!(!d.join("a.txt").exists());
-        assert_eq!(move_into(&d.join("to/a.txt"), &d.join("to")).unwrap(), d.join("to/a.txt"), "same folder: no-op");
+        assert_eq!(move_into(&d.join("to/a.txt"), &d.join("to")).unwrap().dest, d.join("to/a.txt"), "same folder: no-op");
         assert!(move_into(&d.join("to"), &d.join("to/deep")).is_err(), "not into itself");
         std::fs::write(d.join("a.txt"), "B").unwrap();
-        assert_eq!(move_into(&d.join("a.txt"), &d.join("to")).unwrap(), d.join("to/a copy.txt"), "a taken name");
+        assert_eq!(move_into(&d.join("a.txt"), &d.join("to")).unwrap().dest, d.join("to/a copy.txt"), "a taken name");
         assert_eq!(std::fs::read_to_string(d.join("to/a.txt")).unwrap(), "A", "nothing is overwritten");
     }
 
@@ -790,20 +838,20 @@ pub mod tests {
         std::fs::create_dir(d.join("dir")).unwrap();
         std::fs::write(d.join("a"), "A").unwrap();
         std::fs::write(d.join("b"), "B").unwrap();
-        assert!(copy_recursive(&d.join("a"), &d.join("b")).is_err());
+        assert!(copy_recursive(&d.join("a"), &d.join("b"), &mut Vec::new()).is_err());
         assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "B");
-        assert!(copy_recursive(&d.join("dir"), &d.join("dir")).is_err());
+        assert!(copy_recursive(&d.join("dir"), &d.join("dir"), &mut Vec::new()).is_err());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("a", d.join("link")).unwrap();
-            assert!(copy_recursive(&d.join("link"), &d.join("b")).is_err());
+            assert!(copy_recursive(&d.join("link"), &d.join("b"), &mut Vec::new()).is_err());
         }
         // Permissions come along with the contents.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(d.join("a"), std::fs::Permissions::from_mode(0o750)).unwrap();
-            copy_recursive(&d.join("a"), &d.join("a2")).unwrap();
+            copy_recursive(&d.join("a"), &d.join("a2"), &mut Vec::new()).unwrap();
             assert_eq!(std::fs::metadata(d.join("a2")).unwrap().permissions().mode() & 0o777, 0o750);
         }
     }
@@ -837,8 +885,52 @@ pub mod tests {
         let xattr = |args: &[&str]| std::process::Command::new("xattr").args(args).output().unwrap();
         let a = d.join("a");
         assert!(xattr(&["-w", "com.ghostrealm.test", "kept", a.to_str().unwrap()]).status.success());
-        copy_recursive(&a, &d.join("b")).unwrap();
+        copy_recursive(&a, &d.join("b"), &mut Vec::new()).unwrap();
         let read = xattr(&["-p", "com.ghostrealm.test", d.join("b").to_str().unwrap()]);
+        assert_eq!(String::from_utf8_lossy(&read.stdout).trim(), "kept");
+    }
+
+    #[test]
+    fn removing_what_a_cross_volume_move_copied_leaves_what_was_added_since() {
+        let d = tmpdir("ops-move-added");
+        std::fs::create_dir_all(d.join("src/sub")).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("src/a"), "A").unwrap();
+        std::fs::write(d.join("src/sub/b"), "B").unwrap();
+        let mut copied = Vec::new();
+        let dest = copy_to_free(&d.join("src"), &d.join("to"), OsStr::new("src"), &mut copied).unwrap();
+        // Arrives after the copy has passed: not in the copy.
+        std::fs::write(d.join("src/sub/new"), "N").unwrap();
+        std::fs::write(d.join("src/new-top"), "T").unwrap();
+        assert!(remove_copied(&copied).unwrap(), "something was left");
+        assert_eq!(std::fs::read_to_string(d.join("src/sub/new")).unwrap(), "N");
+        assert_eq!(std::fs::read_to_string(d.join("src/new-top")).unwrap(), "T");
+        assert!(!d.join("src/a").exists() && !d.join("src/sub/b").exists(), "copied files are removed");
+        assert_eq!(std::fs::read_to_string(dest.join("sub/b")).unwrap(), "B");
+        assert!(!dest.join("sub/new").exists());
+    }
+
+    #[test]
+    fn a_cross_volume_move_with_nothing_added_removes_the_whole_source() {
+        let d = tmpdir("ops-move-whole");
+        std::fs::create_dir_all(d.join("src/sub")).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("src/sub/b"), "B").unwrap();
+        let moved = move_by_copy(&d.join("src"), &d.join("to"), OsStr::new("src")).unwrap();
+        assert_eq!(moved, Moved { dest: d.join("to/src"), source_left: false });
+        assert!(!d.join("src").exists());
+        assert_eq!(std::fs::read_to_string(d.join("to/src/sub/b")).unwrap(), "B");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copied_folder_keeps_its_extended_attributes() {
+        let d = tmpdir("ops-dir-xattr");
+        std::fs::create_dir(d.join("a")).unwrap();
+        let xattr = |args: &[&str]| std::process::Command::new("xattr").args(args).output().unwrap();
+        assert!(xattr(&["-w", "com.ghostrealm.test", "kept", d.join("a").to_str().unwrap()]).status.success());
+        let copy = copy_into(&d.join("a"), &d).unwrap();
+        let read = xattr(&["-p", "com.ghostrealm.test", copy.to_str().unwrap()]);
         assert_eq!(String::from_utf8_lossy(&read.stdout).trim(), "kept");
     }
 }

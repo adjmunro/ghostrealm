@@ -128,22 +128,22 @@ impl AppState {
         self.file_clip = Some(FileClip { path: path.to_path_buf(), cut });
     }
 
-    /// Paste what Cut or Copy picked into `dir`. Returns the new path.
-    pub fn paste_into(&mut self, dir: &Path) -> Result<PathBuf> {
+    /// Paste what Cut or Copy picked into `dir`.
+    pub fn paste_into(&mut self, dir: &Path) -> Result<file_ops::Moved> {
         let clip = self.file_clip.clone().context("nothing to paste: Cut or Copy a file first")?;
         if !clip.path.exists() {
             bail!("{} is gone", clip.path.display());
         }
         if clip.cut {
-            let dest = file_ops::move_into(&clip.path, dir)?;
+            let moved = file_ops::move_into(&clip.path, dir)?;
             self.file_clip = None;
-            let moved = if dest == clip.path { Vec::new() } else { vec![(clip.path, dest.clone())] };
-            self.changed(&moved);
-            Ok(dest)
+            let renames = if moved.dest == clip.path { Vec::new() } else { vec![(clip.path, moved.dest.clone())] };
+            self.changed(&renames);
+            Ok(moved)
         } else {
             let dest = file_ops::copy_into(&clip.path, dir)?;
             self.changed(&[]);
-            Ok(dest)
+            Ok(file_ops::Moved { dest, source_left: false })
         }
     }
 
@@ -410,8 +410,9 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         .arg(dir_arg()),
         Box::new(|s: &mut AppState, a| {
             let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
-            let path = s.paste_into(&dir).map_err(failed)?;
-            Ok(CmdOutcome::msg(format!("pasted {}", path.display())))
+            let pasted = s.paste_into(&dir).map_err(failed)?;
+            let left = if pasted.source_left { "; the original wasn't fully removed: files added to it meanwhile remain" } else { "" };
+            Ok(CmdOutcome::msg(format!("pasted {}{left}", pasted.dest.display())))
         }),
     );
     r.register(
