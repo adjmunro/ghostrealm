@@ -18,17 +18,22 @@
 
 use std::io::{BufRead, Write};
 
-use ghostrealm_core::{Args, CommandMeta, Registry, SurfaceId, Value};
+use ghostrealm_core::{Args, CloseOnExit, CommandMeta, Registry, SurfaceId, Value};
 use serde_json::{json, Value as Json};
 
 use crate::app_state::{build_registry, AppState};
 
 /// Run the REPL until the input reaches EOF.
+///
+/// Exited terminals stay in the tree whatever the config says: the agent has to
+/// read a finished command's output with `get surface`, which a closed surface
+/// no longer answers.
 pub fn run<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
     mut state: AppState,
 ) -> anyhow::Result<()> {
+    state.set_close_on_exit(CloseOnExit::Never);
     let mut registry = build_registry();
     let mut line = String::new();
     loop {
@@ -238,22 +243,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_surface_whose_shell_exits_cleanly_leaves_the_tree() {
-        let mut state = AppState::new().with_shell_line("exit 0");
-        let mut registry = build_registry();
-        let new = handle(r#"{"op":"set","id":"workspace.new","args":{"dir":"/"}}"#, &mut state, &mut registry);
-        assert_eq!(new["ok"], json!(true), "{new:?}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let tree = loop {
-            let tree = handle(r#"{"op":"get","what":"tree"}"#, &mut state, &mut registry);
-            let tree = tree["tree"].as_str().unwrap().to_string();
-            if !tree.contains("surface ") || std::time::Instant::now() > deadline {
-                break tree;
+    /// A reader that hands out one request line per `read`, sleeping `pause`
+    /// before the lines named in `slow_before`, so background output can land.
+    struct Paced {
+        lines: std::collections::VecDeque<String>,
+        slow_before: Vec<usize>,
+        index: usize,
+        pause: std::time::Duration,
+    }
+
+    impl std::io::Read for Paced {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(line) = self.lines.pop_front() else { return Ok(0) };
+            if self.slow_before.contains(&self.index) {
+                std::thread::sleep(self.pause);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.index += 1;
+            let bytes = format!("{line}\n").into_bytes();
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn an_exited_terminal_stays_so_get_surface_reads_its_output() {
+        let mut state = AppState::new().with_shell_line("printf 'FINISHED'; exit 0");
+        state.new_vtab().unwrap();
+        let id = state.focused_surface().unwrap().0;
+        let reader = Paced {
+            lines: [
+                r#"{"op":"get","what":"tree"}"#.to_string(),
+                format!(r#"{{"op":"get","what":"surface","id":{id}}}"#),
+                r#"{"op":"get","what":"tree"}"#.to_string(),
+            ]
+            .into(),
+            slow_before: vec![1],
+            index: 0,
+            pause: std::time::Duration::from_millis(1500),
         };
-        assert!(!tree.contains("surface "), "the surface is gone:\n{tree}");
+        let mut out: Vec<u8> = Vec::new();
+        run(std::io::BufReader::new(reader), &mut out, state).expect("agent run");
+        let resps: Vec<Json> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let text = resps[1]["text"].as_str().unwrap_or_else(|| panic!("{:?}", resps[1]));
+        assert!(text.contains("FINISHED"), "the output stays readable:\n{text}");
+        assert!(resps[2]["tree"].as_str().unwrap().contains("surface "), "the surface is still in the tree");
     }
 
     #[test]
