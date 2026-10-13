@@ -469,7 +469,7 @@ impl View for TerminalView {
                 }
                 self.press_cell = None;
             }
-            MouseEvent::Move { .. } | MouseEvent::Leave { .. } => {}
+MouseEvent::Move { .. } | MouseEvent::Leave { .. } => {}
         }
     }
 
@@ -906,10 +906,10 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 0), dragged: true });
         let out = h.scroll_with(&mut v, SHIFT, cell(1, 1), 3.0 * UI.cell_h);
         assert!(out.frame && v.pending_scroll == -3, "Shift+wheel scrolls the scrollback");
-        v.write(b"\r");
-        // Nothing was reported: only the empty line comes back.
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!v.text().unwrap().contains("^[["), "{}", v.text().unwrap());
+        // Nothing was reported: only the marker comes back.
+        v.write(b"END\r");
+        let screen = echoed(&mut v, "END");
+        assert!(!screen.contains("^[["), "{screen}");
     }
 
     #[test]
