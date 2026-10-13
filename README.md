@@ -39,6 +39,7 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+Q | quit |
 | Cmd+S / Cmd+Shift+S | save / save as (editor; an unsaved buffer asks where) |
 | Cmd+Z / Cmd+Shift+Z | undo / redo (editor) |
+| Cmd+Shift+C | copy the focused file's absolute path |
 
 Text fields and the editor share macOS editing keys: Option+←/→ by word,
 Cmd+←/→ to the line's start/end, Cmd+↑/↓ to the start/end, Shift to select with
@@ -50,6 +51,18 @@ Quitting, or closing a tab, pane, or workspace, with unsaved editor changes asks
 first: Save and Quit / Cancel / Quit Without Saving (Save and Close / Close Without
 Saving for closes). Enter saves, Esc cancels. A buffer with no file can't be saved
 there, so it offers only Cancel and the discard button.
+
+Right-click a file or folder in the file browser (or empty space in it), or click
+an editor's file name in its ribbon, for the file menu: New File / New Folder (on a
+folder or empty space), Reveal in Finder, Show in File Browser (editor), Open in
+Default App, Open in Terminal (folders), Cut / Copy / Paste / Duplicate, Copy Path /
+Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclude
+(in a git repository), Rename, Save Copy As (editor), and Delete, last under a rule.
+Delete moves to the Trash (macOS only for now) and closes the file's editors; it asks
+first unless git tracks the file and it is unmodified. Names are asked for in the
+palette's argument prompt. Each item is also a `file.*` command (palette, agent, key
+bindings) acting on the focused file, or on its `path` argument. Cut and Copy keep the
+file inside the app: Paste works within ghostrealm, not with Finder.
 
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
 Click a sidebar row to switch vtab, a pane to focus it, a tab to switch it.

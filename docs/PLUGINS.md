@@ -106,11 +106,20 @@ into the overlay layer; it doesn't need to know.
   unread), `autosave(cfg)` (app blur/quit; the view decides whether it
   autosaves), `path`/`save_as` (Save As), `write_input`/`text`
   (agent channel).
+- File menu: `context_menu(pos)` is a right-click inside the view; a view with a
+  file or folder to act on files `Request::FileMenu { target, at }` (the file
+  browser on its rows and empty space, the editor on its ribbon; its file name
+  button files the same request). `subject` is the file or folder the `file.*`
+  commands act on when given no `path` (default: `path`; the browser's is its
+  selected entry). `save_copy` backs Save Copy As. `files_changed(moved)` hears
+  that the app created, copied, moved, renamed, or deleted files: a listing
+  re-reads, a view of a moved file follows it (`file_ops::follow`).
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
-  `SaveAs` (the picker asks where, then calls `save_as`).
+  `SaveAs` (the picker asks where, then calls `save_as`), `FileMenu` (open the
+  file menu on a target).
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules

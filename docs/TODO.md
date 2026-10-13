@@ -572,23 +572,6 @@
 
 ---
 
-[2026-10-05@9b31ef6] Delete files (with confirmation)
-
-- Requires: NO BLOCKERS
-- Detail: Nothing deletes files today. Add delete to the file browser (a row
-  context menu / Cmd+Backspace on the selection) behind `AppState::confirm`, moving
-  to the macOS Trash rather than unlinking. Owner review (2026-10-13): this
-  becomes the Delete item of the file context menu (see "File and folder
-  context menu"), with no confirmation for git-tracked files. Decided: Delete
-  always moves to the Trash; there is no permanent delete.
-- Owner, verbatim:
-  > Yes, I agree that we should just do trash only, but we'll call it delete
-  > because that's normal, but I don't see why we should fight the file system
-  > and cause trouble for ourselves.
-- Reason: requested alongside the replace confirmation.
-
----
-
 [2026-10-13@13e2bda] Editor — section outline (jump to a header)
 
 - Requires: per-language header extraction — a hook on the `Highlighter` trait
@@ -971,77 +954,32 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] PRIORITY: File and folder context menu (editor file name + file browser)
+[2026-10-14@7364079] File and folder context menu — remaining
 
-- Requires: NO BLOCKERS
-- Detail: One shared menu, opened by clicking the editor's file name and by
-  right-clicking a file or directory in the file browser. Modelled on Zed's.
-  The app's `Menu` (`window.rs`) only serves sidebar workspaces today; this
-  needs a menu usable by views. Items, grouped in sections:
-  - **New File / New Folder**: only on empty space or a directory, not on a file.
-  - **Open**: Reveal in Finder ("Show in Finder", macOS); Show in File Browser;
-    Open in Default App; Open in Terminal (directories only). No Markdown
-    Preview (Markdown is formatted in the editor instead; see the discussion
-    entry).
-  - **Edit**: Cut, Copy, Duplicate, Paste, Undo, Redo.
-  - **Copy Path** (absolute; bound to Cmd+Shift+C) and **Copy Relative Path**
-    (no binding).
-  - **Add to .gitignore** and **Add to .git/info/exclude**.
-  - **Rename** and **Save Copy As**.
-  - **Delete** at the bottom, after a horizontal rule, labelled "Delete".
-    Decided: it always moves the file to the Trash; there is no permanent
-    delete. No confirmation if the file is tracked by git (recoverable); confirm
-    otherwise (`AppState::confirm`). In the editor it closes the editor like
-    Cmd+W. This replaces the "Delete files (with confirmation)" entry's
-    design; that entry stays until the menu lands. The Trash call needs
-    `NSFileManager trashItem` on macOS or a small dependency (e.g. the `trash`
-    crate); pick one when building.
-- Not in the first menu: **GitHub permalinks** (a link to the file on GitHub
-  at the current commit, optionally with a line number); see "GitHub
-  permalinks".
-- Zed's menu, for reference: New File, New Folder | Reveal in Finder, Open in
-  Default App, Open in Terminal, Open Markdown Preview | Cut, Copy, Duplicate,
-  Paste, Undo, Redo | Copy Path, Copy Relative Path | Add to .gitignore, Add to
-  .git/info/exclude, Open File Permalink, Copy File Permalink | Rename, Trash,
-  Delete.
-- Owner, verbatim:
-  > The second image is Zed's context window. For when I right clicked a file,
-  > you know, I don't think it makes sense to have a new file new folder when
-  > you right click a file, but maybe if you're right clicking like a bit of
-  > empty space or when you're right clicking a directory that makes sense to
-  > me. Reveal and find, we've already mentioned. Open default app, I guess we
-  > could add for the file browser. Open in terminal, we could add only for the
-  > directories, I think. Open in Markdown preview, we don't need, I think,
-  > because obviously I want that integrated formatting anyway. Cut, copy,
-  > duplicate, paste, redo, and undo probably should have. Same with copy path
-  > and copy relative path. I'm not a fan of those hotkeys. Those are too
-  > complicated. I think command shift C for copy path, absolute path, that is.
-  > It should be the default. Copy relative path, we'll just leave that without
-  > a binding for now. Add to git ignore, add to git info exclude, I think we
-  > should. Add those to our context menu for both in the file editor when
-  > you're looking at the right click menu of the file name and to the file
-  > browser. I don't actually know what a permalink is, so either explain those
-  > to me or leave them off. Rename, obviously, I've already mentioned. They've
-  > also got trash and delete. Honestly, oh, or maybe you do want both because
-  > trash takes a while longer, doesn't it? Or maybe it needs a dependency.
-  > Double check that one with me. So some of these are things that you can act
-  > on already, and some of these are things that should probably be written
-  > down and explored further. But I think they're all definitely like higher
-  > priority things because they're all quality of life fixes.
-  >
-  > in the file editor, i want a context popup when clicking the file name to
-  > offer options like "rename", "save copy as", "delete" (to trash, not
-  > permanent - if in git, no confirm is fine. if not in git, confirm popup -
-  > deleting closes the editor like cmd + w), "show in file browser", "show in
-  > finder" (macos only). idk if i'm missing something. maybe split into
-  > sections with delete at the bottom, separated by a horizontal rule so it's
-  > hard to accidentally misclick. this kind of context popup should probably
-  > also show on right click of a file or directory in the file browser too.
-- Owner, verbatim (Trash vs Delete):
-  > Yes, I agree that we should just do trash only, but we'll call it delete
-  > because that's normal, but I don't see why we should fight the file system
-  > and cause trouble for ourselves.
-- Reason: owner review; file actions belong where the file is shown.
+- Requires: NO BLOCKERS (each item below is independent)
+- Detail: The menu exists (right-click in the file browser, the editor's file
+  name in its ribbon; README, PLUGINS.md). Not built:
+  - **Undo / Redo** of file operations (Zed's Edit section). Needs an operation
+    log with an inverse for create, duplicate, paste, rename, move, and Trash
+    (move back from the Trash). Left out rather than half-done.
+  - **Finder interop for Cut / Copy / Paste**: the file clipboard is the app's
+    own; the system pasteboard (file URLs) would let Paste work with Finder.
+  - **Delete on other platforms**: only macOS moves to the Trash
+    (`NSFileManager trashItemAtURL`); elsewhere it reports "not supported" and
+    never deletes permanently. The `trash` crate or the freedesktop spec would
+    cover Linux.
+  - **Editor tabs**: the menu opens from the single-tab ribbon's file name; with a
+    tab strip the file name is a tab, which has no file menu yet.
+  - **Cmd+Backspace** on the file browser's selection to delete (from the old
+    "Delete files" entry).
+  - New File / New Folder create the entry and do not open it.
+  - Failures (name taken, nothing to paste, Trash refused) reach stderr only;
+    see "User-visible error surface".
+  - The Delete check (`git status`, `git ls-files`) blocks the UI thread for the
+    click; fine for a menu action, slow in a huge repository.
+- Not in the menu: **GitHub permalinks** (see "GitHub permalinks"), Open
+  Markdown Preview (Markdown is formatted in the editor).
+- Reason: the first menu covers the owner's list; these are the edges.
 
 ---
 
