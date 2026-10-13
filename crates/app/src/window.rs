@@ -626,10 +626,16 @@ enum MenuAction {
     Close,
 }
 
-/// A right-click context menu over a sidebar vtab.
+/// What a context menu's actions apply to.
+#[derive(Clone)]
+enum MenuTarget {
+    /// A workspace in the sidebar.
+    Vtab(ghostrealm_core::VtabId),
+}
+
+/// A right-click context menu.
 struct Menu {
-    /// The vtab the actions apply to.
-    target: ghostrealm_core::VtabId,
+    target: MenuTarget,
     /// Where the menu was opened (physical px); the panel is clamped on-screen.
     anchor: (f32, f32),
     items: Vec<(String, MenuAction)>,
@@ -1629,7 +1635,7 @@ impl State {
         items.push(("Set directory…".into(), MenuAction::SetDir));
         items.push(("Close workspace".into(), MenuAction::Close));
         self.menu = Some(Menu {
-            target,
+            target: MenuTarget::Vtab(target),
             anchor: (x, y),
             items,
             hover: None,
@@ -1651,7 +1657,7 @@ impl State {
             m.rows
                 .iter()
                 .position(|r| rect_contains(*r, x, y))
-                .map(|i| (m.items[i].1, m.target))
+                .map(|i| (m.items[i].1, m.target.clone()))
         });
         self.menu = None;
         if let Some((action, target)) = hit {
@@ -1676,7 +1682,8 @@ impl State {
         }
     }
 
-    fn apply_menu_action(&mut self, action: MenuAction, target: ghostrealm_core::VtabId) {
+    fn apply_menu_action(&mut self, action: MenuAction, target: MenuTarget) {
+        let MenuTarget::Vtab(target) = target;
         match action {
             MenuAction::MarkRead | MenuAction::Dismiss => {
                 self.app.tree.set_status(target, TabStatus::Read)
