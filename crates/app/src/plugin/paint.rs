@@ -16,7 +16,7 @@ use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style,
 use winit::window::CursorIcon;
 
 use super::{rect_contains, theme, UiMetrics};
-use crate::row_cache::RowCache;
+use crate::row_cache::{RowCache, RunStyle};
 
 /// Shape at least this many missed rows per frame regardless of the time budget,
 /// so a backlog always makes forward progress even on an already-slow frame.
@@ -451,23 +451,24 @@ impl TextKit {
         key: u64,
         pos: (i32, i32),
         shape_w: f32,
+        styles: &[RunStyle],
         spans: impl FnOnce() -> Vec<(String, [u8; 3])>,
     ) -> u64 {
         let (m, lh) = (self.metrics, self.line_h);
         let place_key = if self.row_cache.buffer(key).is_some() {
             // Hit: no shaping, just refresh recency.
-            self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &[]);
+            self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &[], &[]);
             key
         } else if self.shaped < MIN_SHAPES_PER_FRAME || Instant::now() < self.shape_deadline {
             let spans = spans();
-            self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &spans);
+            self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &spans, styles);
             self.shaped += 1;
             key
         } else {
             self.deferred = true;
             match self.prev_rows.get(&pos).copied() {
                 Some(prev) if self.row_cache.buffer(prev).is_some() => {
-                    self.row_cache.ensure(prev, &mut self.font_system, m, shape_w, lh, &[]);
+                    self.row_cache.ensure(prev, &mut self.font_system, m, shape_w, lh, &[], &[]);
                     prev
                 }
                 _ => key,
@@ -521,6 +522,21 @@ pub struct Shaped {
     idx: usize,
     /// The shaped (advance) width in physical pixels.
     pub width: f32,
+}
+
+/// The per-span styles of a row passed to the row-drawing calls: one
+/// [`RunStyle`] per span, and the monospace cell width the decorations measure
+/// spans with. A row with no styled span passes [`NONE`](Self::NONE), which
+/// carries nothing and costs nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct RowStyles<'a> {
+    pub runs: &'a [RunStyle],
+    pub cell_w: f32,
+}
+
+impl RowStyles<'_> {
+    /// An unstyled row.
+    pub const NONE: RowStyles<'static> = RowStyles { runs: &[], cell_w: 0.0 };
 }
 
 /// What a view paints with. Everything is in physical pixels.
@@ -718,6 +734,16 @@ impl<'a> PaintCx<'a> {
         self.text.row_cache.row_key(cells)
     }
 
+    /// [`row_key`](Self::row_key) for a row with per-span `styles`; with none
+    /// (`RowStyles::NONE`) it is the same key.
+    pub fn row_key_styled<'k>(
+        &self,
+        cells: impl Iterator<Item = (&'k str, [u8; 3])>,
+        styles: RowStyles,
+    ) -> u64 {
+        self.text.row_cache.row_key_styled(cells, styles.runs)
+    }
+
     /// Draw a monospace row of coloured `spans` through the row cache (shaped
     /// once per distinct content, reused across frames and positions). Always
     /// shaped this frame — for rows few enough never to stall a frame.
@@ -734,7 +760,7 @@ impl<'a> PaintCx<'a> {
         let key = self.row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
         let (m, lh) = (self.text.metrics, self.text.line_h);
         let kit = &mut *self.text;
-        kit.row_cache.ensure(key, &mut kit.font_system, m, shape_w, lh, spans);
+        kit.row_cache.ensure(key, &mut kit.font_system, m, shape_w, lh, spans, &[]);
         self.push_text(TextItem {
             src: TextSrc::Row(key),
             left,
@@ -761,7 +787,29 @@ impl<'a> PaintCx<'a> {
         clip: Rect,
         color: [u8; 3],
     ) {
-        let place_key = self.text.budgeted_key(key, (clip.x as i32, top as i32), shape_w, spans);
+        self.budgeted_row_styled(key, spans, RowStyles::NONE, left, top, shape_w, clip, color);
+    }
+
+    /// [`budgeted_row`](Self::budgeted_row) for a row with styled spans:
+    /// `styles` (from [`row_key_styled`](Self::row_key_styled)'s key) picks the
+    /// bold/italic faces and draws underlines and `BOX` backgrounds as quads.
+    /// `RowStyles::NONE` is the unstyled path and adds no work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn budgeted_row_styled(
+        &mut self,
+        key: u64,
+        spans: impl FnOnce() -> Vec<(String, [u8; 3])>,
+        styles: RowStyles,
+        left: f32,
+        top: f32,
+        shape_w: f32,
+        clip: Rect,
+        color: [u8; 3],
+    ) {
+        if !styles.runs.is_empty() {
+            return self.styled_row(key, spans(), styles, left, top, shape_w, clip, color);
+        }
+        let place_key = self.text.budgeted_key(key, (clip.x as i32, top as i32), shape_w, &[], spans);
         self.push_text(TextItem {
             src: TextSrc::Row(place_key),
             left,
@@ -769,6 +817,56 @@ impl<'a> PaintCx<'a> {
             bounds: bounds(clip),
             color,
         });
+    }
+
+    /// The styled branch of [`budgeted_row_styled`](Self::budgeted_row_styled).
+    #[allow(clippy::too_many_arguments)]
+    fn styled_row(
+        &mut self,
+        key: u64,
+        spans: Vec<(String, [u8; 3])>,
+        styles: RowStyles,
+        left: f32,
+        top: f32,
+        shape_w: f32,
+        clip: Rect,
+        color: [u8; 3],
+    ) {
+        self.decorate(&spans, styles, left, top, clip);
+        let place_key =
+            self.text.budgeted_key(key, (clip.x as i32, top as i32), shape_w, styles.runs, || spans);
+        self.push_text(TextItem {
+            src: TextSrc::Row(place_key),
+            left,
+            top,
+            bounds: bounds(clip),
+            color,
+        });
+    }
+
+    /// The quads under a styled row: a tinted box behind `BOX` spans and a thin
+    /// line under `UNDERLINE` spans, each as wide as its characters at the
+    /// styles' cell width, clipped to `clip`.
+    fn decorate(&mut self, spans: &[(String, [u8; 3])], styles: RowStyles, left: f32, top: f32, clip: Rect) {
+        let (line_h, size) = (self.text.line_h, self.text.metrics.font_size);
+        let thick = (size / 14.0).round().max(1.0);
+        let mut x = left;
+        for ((text, color), style) in spans.iter().zip(styles.runs) {
+            let w = text.chars().count() as f32 * styles.cell_w;
+            let (x0, x1) = (x.max(clip.x), (x + w).min(clip.x + clip.w));
+            x += w;
+            if x1 <= x0 {
+                continue;
+            }
+            if style.contains(RunStyle::BOX) {
+                let r = Rect { x: x0, y: top + 1.0, w: x1 - x0, h: (line_h - 2.0).max(1.0) };
+                self.fill_alpha(r, theme::CODE_BG, theme::CODE_BG_ALPHA);
+            }
+            if style.contains(RunStyle::UNDERLINE) {
+                let r = Rect { x: x0, y: top + line_h - 2.0 * thick, w: x1 - x0, h: thick };
+                self.fill_alpha(r, *color, 1.0);
+            }
+        }
     }
 
     /// Paint `f` above every pane's content (a view's popups): its quads and

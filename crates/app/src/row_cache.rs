@@ -17,7 +17,54 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Wrap};
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
+
+/// How one span of a row is drawn beyond its colour. Rows carry styles only
+/// when some span uses one: a plain row passes an empty `&[RunStyle]` and
+/// shapes, keys, and draws exactly as an unstyled row.
+///
+/// Bold and italic pick the face (the shaper falls back to the nearest weight,
+/// and skews an italic when the family has no italic face). Underline and `BOX`
+/// are not part of the shaped text; the row drawer paints them as quads, so they
+/// do not change the shaping but are still part of the key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RunStyle(u8);
+
+impl RunStyle {
+    pub const PLAIN: RunStyle = RunStyle(0);
+    pub const BOLD: RunStyle = RunStyle(1);
+    pub const ITALIC: RunStyle = RunStyle(2);
+    pub const UNDERLINE: RunStyle = RunStyle(4);
+    /// A tinted box behind the span (inline code).
+    pub const BOX: RunStyle = RunStyle(8);
+
+    pub fn contains(self, other: RunStyle) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn is_plain(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The span's glyph attributes: `attrs` with this style's face applied.
+    fn apply(self, mut attrs: Attrs<'static>) -> Attrs<'static> {
+        if self.contains(RunStyle::BOLD) {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        if self.contains(RunStyle::ITALIC) {
+            attrs = attrs.style(Style::Italic);
+        }
+        attrs
+    }
+}
+
+impl std::ops::BitOr for RunStyle {
+    type Output = RunStyle;
+
+    fn bitor(self, rhs: RunStyle) -> RunStyle {
+        RunStyle(self.0 | rhs.0)
+    }
+}
 
 /// One shaped row and when it was last used.
 struct Slot {
@@ -91,17 +138,33 @@ impl RowCache {
     /// generation. Cheap — hashes cell data in place, allocating no span strings,
     /// so a cache *hit* costs only the hash (no reshape, no span building).
     pub fn row_key<'a>(&self, cells: impl Iterator<Item = (&'a str, [u8; 3])>) -> u64 {
+        self.row_key_styled(cells, &[])
+    }
+
+    /// [`row_key`](Self::row_key) for a row whose spans carry `styles` (one per
+    /// span, or empty for a plain row). An empty `styles` hashes exactly as
+    /// `row_key` does, so plain rows keep their keys.
+    pub fn row_key_styled<'a>(
+        &self,
+        cells: impl Iterator<Item = (&'a str, [u8; 3])>,
+        styles: &[RunStyle],
+    ) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.metrics_gen.hash(&mut h);
         for (text, fg) in cells {
             text.hash(&mut h);
             fg.hash(&mut h);
         }
+        if !styles.is_empty() {
+            styles.hash(&mut h);
+        }
         h.finish()
     }
 
     /// Ensure a shaped buffer for `key` exists, shaping `spans` on a miss. `width`
     /// bounds the layout box (for clipping), `metrics`/`line_h` set the row height.
+    /// `styles` is empty (a plain row) or one [`RunStyle`] per span.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure(
         &mut self,
         key: u64,
@@ -110,6 +173,7 @@ impl RowCache {
         width: f32,
         line_h: f32,
         spans: &[(String, [u8; 3])],
+        styles: &[RunStyle],
     ) {
         if let Some(&idx) = self.map.get(&key) {
             let now = self.tick();
@@ -148,13 +212,15 @@ impl RowCache {
         buf.set_wrap(Wrap::None);
         buf.set_size(Some(width.max(1.0)), Some(line_h));
         buf.set_rich_text(
-            spans.iter().map(|(t, c)| {
-                (
-                    t.as_str(),
-                    Attrs::new()
-                        .family(Family::Monospace)
-                        .color(Color::rgb(c[0], c[1], c[2])),
-                )
+            spans.iter().enumerate().map(|(i, (t, c))| {
+                let attrs = Attrs::new()
+                    .family(Family::Monospace)
+                    .color(Color::rgb(c[0], c[1], c[2]));
+                let attrs = match styles.get(i) {
+                    Some(st) => st.apply(attrs),
+                    None => attrs,
+                };
+                (t.as_str(), attrs)
             }),
             &Attrs::new().family(Family::Monospace),
             shaping,
@@ -218,16 +284,61 @@ mod tests {
 
         cache.begin_frame(0);
         let k = key(&cache, "hello world");
-        cache.ensure(k, &mut fs, m, 400.0, 18.0, &span("hello world", [200, 200, 200]));
+        cache.ensure(k, &mut fs, m, 400.0, 18.0, &span("hello world", [200, 200, 200]), &[]);
         cache.end_frame();
         assert_eq!(cache.stats(), (0, 1), "first sighting is a miss");
 
         // Next frame, same content -> hit, no reshape.
         cache.begin_frame(0);
         let k = key(&cache, "hello world");
-        cache.ensure(k, &mut fs, m, 400.0, 18.0, &span("hello world", [200, 200, 200]));
+        cache.ensure(k, &mut fs, m, 400.0, 18.0, &span("hello world", [200, 200, 200]), &[]);
         cache.end_frame();
         assert_eq!(cache.stats(), (1, 1), "identical content should hit");
+    }
+
+    const GREY: [u8; 3] = [200, 200, 200];
+
+    #[test]
+    fn a_plain_row_keeps_its_key_and_styles_change_it() {
+        let cache = RowCache::new(8);
+        let cells = || [("ab", GREY), ("cd", [1, 2, 3])].into_iter();
+        let plain = cache.row_key(cells());
+        assert_eq!(plain, cache.row_key_styled(cells(), &[]), "no styles hashes as before");
+        let bold = cache.row_key_styled(cells(), &[RunStyle::PLAIN, RunStyle::BOLD]);
+        let italic = cache.row_key_styled(cells(), &[RunStyle::PLAIN, RunStyle::ITALIC]);
+        let under = cache.row_key_styled(cells(), &[RunStyle::PLAIN, RunStyle::UNDERLINE]);
+        let boxed = cache.row_key_styled(cells(), &[RunStyle::PLAIN, RunStyle::BOX]);
+        let both = cache.row_key_styled(cells(), &[RunStyle::PLAIN, RunStyle::BOLD | RunStyle::ITALIC]);
+        let keys = [plain, bold, italic, under, boxed, both];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Which span is styled matters too.
+        let first = cache.row_key_styled(cells(), &[RunStyle::BOLD, RunStyle::PLAIN]);
+        assert_ne!(first, bold);
+    }
+
+    /// The weight the row's first shaped glyph was requested at.
+    fn first_weight(cache: &RowCache, key: u64) -> glyphon::Weight {
+        cache.buffer(key).unwrap().layout_runs().next().unwrap().glyphs[0].font_weight
+    }
+
+    #[test]
+    fn bold_reaches_the_shaped_glyphs() {
+        let mut fs = FontSystem::new();
+        let m = Metrics::new(15.0, 18.0);
+        let mut cache = RowCache::new(16);
+        cache.begin_frame(0);
+        let spans = span("abc", GREY);
+        let plain = cache.row_key(std::iter::once(("abc", GREY)));
+        cache.ensure(plain, &mut fs, m, 400.0, 18.0, &spans, &[]);
+        let styles = [RunStyle::BOLD | RunStyle::ITALIC];
+        let styled = cache.row_key_styled(std::iter::once(("abc", GREY)), &styles);
+        cache.ensure(styled, &mut fs, m, 400.0, 18.0, &spans, &styles);
+        assert_eq!(first_weight(&cache, plain), glyphon::Weight::NORMAL);
+        assert_eq!(first_weight(&cache, styled), glyphon::Weight::BOLD);
     }
 
     #[test]
@@ -245,7 +356,7 @@ mod tests {
             for r in 0..rows {
                 let line = format!("line {}", top + r);
                 let k = key(&cache, &line);
-                cache.ensure(k, &mut fs, m, 600.0, 18.0, &span(&line, [200, 200, 200]));
+                cache.ensure(k, &mut fs, m, 600.0, 18.0, &span(&line, [200, 200, 200]), &[]);
             }
             cache.end_frame();
         }
@@ -264,12 +375,12 @@ mod tests {
         let mut cache = RowCache::new(256);
         cache.begin_frame(0);
         let k = key(&cache, "abc");
-        cache.ensure(k, &mut fs, Metrics::new(15.0, 18.0), 400.0, 18.0, &span("abc", [1, 2, 3]));
+        cache.ensure(k, &mut fs, Metrics::new(15.0, 18.0), 400.0, 18.0, &span("abc", [1, 2, 3]), &[]);
         cache.end_frame();
 
         cache.begin_frame(1); // new metrics generation
         let k = key(&cache, "abc");
-        cache.ensure(k, &mut fs, Metrics::new(20.0, 24.0), 400.0, 24.0, &span("abc", [1, 2, 3]));
+        cache.ensure(k, &mut fs, Metrics::new(20.0, 24.0), 400.0, 24.0, &span("abc", [1, 2, 3]), &[]);
         cache.end_frame();
         assert_eq!(cache.stats(), (0, 2), "a metrics change must not hit stale shaping");
     }
@@ -286,7 +397,7 @@ mod tests {
         for i in 0..8 {
             let s = format!("row{i}");
             let k = key(&cache, &s);
-            cache.ensure(k, &mut fs, m, 400.0, 18.0, &span(&s, [9, 9, 9]));
+            cache.ensure(k, &mut fs, m, 400.0, 18.0, &span(&s, [9, 9, 9]), &[]);
         }
         cache.end_frame();
         assert_eq!(cache.map.len(), 8, "this-frame rows are never evicted");
@@ -297,7 +408,7 @@ mod tests {
         for i in [6, 7] {
             let s = format!("row{i}");
             let k = key(&cache, &s);
-            cache.ensure(k, &mut fs, m, 400.0, 18.0, &span(&s, [9, 9, 9]));
+            cache.ensure(k, &mut fs, m, 400.0, 18.0, &span(&s, [9, 9, 9]), &[]);
         }
         cache.end_frame();
         assert!(
@@ -311,7 +422,7 @@ mod tests {
         let before = cache.stats();
         cache.begin_frame(0);
         let k0 = key(&cache, "row0");
-        cache.ensure(k0, &mut fs, m, 400.0, 18.0, &span("row0", [9, 9, 9]));
+        cache.ensure(k0, &mut fs, m, 400.0, 18.0, &span("row0", [9, 9, 9]), &[]);
         cache.end_frame();
         assert_eq!(cache.stats().1, before.1 + 1, "evicted row0 must miss on return");
     }

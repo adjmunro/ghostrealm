@@ -29,3 +29,7 @@ pub const TOOLTIP_BG: [u8; 3] = [44, 44, 54];
 /// A text field's border and typed text.
 pub const INPUT_BORDER: [u8; 3] = [80, 80, 95];
 pub const INPUT_TEXT: [u8; 3] = [225, 225, 235];
+/// Code in Markdown (an inline span's box, a fenced block's rows): this colour
+/// at [`CODE_BG_ALPHA`] over the editor background.
+pub const CODE_BG: [u8; 3] = [255, 255, 255];
+pub const CODE_BG_ALPHA: f32 = 0.07;
