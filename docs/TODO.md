@@ -1275,33 +1275,6 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Build artifacts accumulate: keep only the latest
-
-- Requires: NO BLOCKERS
-- Detail: `target/` holds old copies of every build (about 19 GB: `debug/deps`
-  keeps hashed copies from earlier builds, ~12 GB; `incremental` ~3 GB). Keep
-  the latest artifacts, the compiler caches, and the downloaded dependencies;
-  drop the stale heavy copies. Options:
-  - A cleanup task that sweeps stale artifacts by age or toolchain, e.g.
-    `cargo-sweep`, or a small in-repo script or `xtask` run from `mise`.
-  - Cargo's unstable cache garbage collection (`-Zgc`); check whether it covers
-    the target directory before relying on it.
-  - Clear `target/debug/incremental` (~3 GB), which only dev builds use;
-    release builds already have incremental compilation off.
-  Small; wanted soon.
-- Owner, verbatim:
-  > By the way, this is completely unrelated, but I've noticed that we aggregate
-  > quite a lot of build artifacts over time. Are we able to change that, like
-  > now-ish, to only keep the latest artifact and to always clean out the older
-  > stuff, like the older binary? Obviously, we want to keep the caches that
-  > will help us build faster and like the downloaded dependencies, but like the
-  > really heavy stuff that we're keeping multiple copies of, ideally we just
-  > want to keep one.
-- Reason: disk use grows without bound; the owner wants one copy of the heavy
-  artifacts.
-
----
-
 [2026-10-13T20:45+1300@6bc650f] Web — enable the Chromium sandbox
 
 - Requires: NO BLOCKERS

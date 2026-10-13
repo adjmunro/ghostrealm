@@ -18,6 +18,10 @@ mise exec -- cargo run -- dump 'ls -la /'   # headless: print a grid as text
 mise exec -- cargo test           # 44 tests
 ```
 
+Cargo never removes superseded build artifacts: `mise run clean-stale` frees
+them (`-- --dry-run` lists what would go). Dev builds keep line tables only; set
+`CARGO_PROFILE_DEV_DEBUG=true` for full debug info.
+
 Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 `LIBGHOSTTY_VT_SYS_CPU=native` for local builds.
 

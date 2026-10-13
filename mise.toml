@@ -12,3 +12,9 @@ run = [
     "cargo build -p ghostrealm-web-host --features bundle --bins",
     "cargo run -p ghostrealm-web-host --features bundle --bin ghostrealm-web-bundle",
 ]
+
+# Remove build artifacts that a newer build superseded (Cargo never does).
+# `mise run clean-stale -- --dry-run` lists what would go; see
+# scripts/clean-stale.rs for what is kept. Run it when no build is in progress.
+[tasks.clean-stale]
+run = "rustc -O --edition 2021 scripts/clean-stale.rs -o target/clean-stale && target/clean-stale"
