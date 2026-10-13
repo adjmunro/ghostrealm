@@ -28,9 +28,8 @@ Found reviewing `8a77896..d34d7fa` (the web browser `0c67045`/`35e68b9`/`04794e1
 and the file-browser preview `3f58197`/`b6e3944`/`d34d7fa`). Line numbers are
 against `d23ace3`.
 
-Lost when the browser was rebased (`465b076` → `04794e1`): item 37.
-Right and middle clicks were lost too: `MouseEvent` carries no button, so only
-left clicks reach a page.
+Right and middle clicks were lost when the browser was rebased (`465b076` →
+`04794e1`): `MouseEvent` carries no button, so only left clicks reach a page.
 
 ### High
 
@@ -77,7 +76,3 @@ left clicks reach a page.
 35. **Stale stamps.** DECISION.md and TODO.md stamp the preview entries
     `@0c5b05d7` and the browser entries `@e175cf0d`/`@e175cf0`, which predate the
     rebase.
-37. **A page that is never painted is never hidden.** `WebView` starts with
-    `sent_visible: true` ([`plugins/web/mod.rs:362`](../crates/app/src/plugins/web/mod.rs)),
-    so a page opened by the agent in a background tab renders (and wakes the
-    app) until it is first shown and hidden.

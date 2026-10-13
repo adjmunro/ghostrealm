@@ -394,6 +394,9 @@ pub struct WebView {
     /// Size last sent: physical `(width, height)` and scale.
     sent_size: Option<(u32, u32, f32)>,
     sent_focus: bool,
+    /// The view is on screen (painted, and not since hidden). A page starts
+    /// hidden, so one opened in the background doesn't render.
+    on_screen: bool,
     sent_visible: bool,
     /// The URL bar while it is being edited.
     url_edit: Option<LineEdit>,
@@ -423,6 +426,7 @@ impl WebView {
             last_url: String::new(),
             sent_size: None,
             sent_focus: false,
+            on_screen: false,
             sent_visible: true,
             url_edit: None,
             state: ViewState::default(),
@@ -469,7 +473,16 @@ impl WebView {
             }
             self.created_in = generation;
             self.sent_focus = false;
+            // Pages are created visible.
             self.sent_visible = true;
+            if !self.on_screen
+                && host.send(&HostRequest::Visible {
+                    id: self.page,
+                    visible: false,
+                })
+            {
+                self.sent_visible = false;
+            }
         }
         match req {
             Some(r) => host.send(&r),
@@ -566,6 +579,20 @@ impl WebView {
         }
         self.state = v;
         changed
+    }
+
+    /// Tell the host whether the page is on screen.
+    fn sync_visible(&mut self) {
+        let visible = self.on_screen;
+        if visible != self.sent_visible
+            && self.created_in != 0
+            && self.send(Some(HostRequest::Visible {
+                id: self.page,
+                visible,
+            }))
+        {
+            self.sent_visible = visible;
+        }
     }
 
     /// Tell the host whether the page has keyboard focus (not while the URL bar
@@ -736,7 +763,9 @@ impl View for WebView {
                 }));
             }
         }
+        self.on_screen = true;
         let alive = self.send(None);
+        self.sync_visible();
         // Reload also retries a host that couldn't start.
         let reloadable = alive || self.slot.borrow().error.is_some();
         self.refresh_state();
@@ -954,15 +983,8 @@ impl View for WebView {
     }
 
     fn shown(&mut self, visible: bool) {
-        if visible != self.sent_visible
-            && self.created_in != 0
-            && self.send(Some(HostRequest::Visible {
-                id: self.page,
-                visible,
-            }))
-        {
-            self.sent_visible = visible;
-        }
+        self.on_screen = visible;
+        self.sync_visible();
     }
 
     fn refresh(&mut self) -> bool {
@@ -1092,6 +1114,36 @@ mod tests {
         assert_eq!(runs(&runs_file), 2, "Reload respawns");
         let next = v.deadline(&Default::default()).expect("still backing off");
         assert!(next - Instant::now() > RETRY_FIRST, "backs off further");
+    }
+
+    /// The requests the stub host has read, once `ok` holds for them.
+    fn requests(path: &std::path::Path, ok: impl Fn(&str) -> bool) -> String {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if ok(&got) {
+                return got;
+            }
+            assert!(Instant::now() < until, "requests so far: {got}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_page_starts_hidden_until_painted() {
+        let (mut v, runs) = stub_host("web-hidden", "cat > \"$0.requests\"");
+        let log = runs.with_file_name("host.sh.requests");
+        // Created without being painted (as `web.new` from the agent does).
+        assert!(v.send(None));
+        let got = requests(&log, |s| s.contains(r#""op":"visible""#));
+        assert!(got.contains(r#""op":"create""#), "{got}");
+        assert!(got.contains(r#""visible":false"#), "{got}");
+        assert!(!v.sent_visible);
+
+        Harness::new().paint(&mut v, RECT);
+        requests(&log, |s| s.contains(r#""visible":true"#));
+        v.shown(false);
+        requests(&log, |s| s.matches(r#""visible":false"#).count() == 2);
     }
 
     #[test]
