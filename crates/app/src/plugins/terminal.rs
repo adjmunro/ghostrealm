@@ -426,6 +426,14 @@ impl View for TerminalView {
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
         let mods = cx.mods;
+        // A release can be lost (the window lost focus mid-drag, say), which
+        // would leave the program believing the button is still held. A new
+        // press first closes the old one.
+        if let MouseEvent::Down { pos, .. } = *event {
+            if std::mem::take(&mut self.reporting) {
+                self.report_mouse(MouseAction::Release, Some(MouseButton::Left), mods, pos);
+            }
+        }
         match *event {
             MouseEvent::Down { pos, .. } if self.forwards_mouse(mods) => {
                 self.reporting = true;
@@ -469,7 +477,13 @@ impl View for TerminalView {
                 }
                 self.press_cell = None;
             }
-MouseEvent::Move { .. } | MouseEvent::Leave { .. } => {}
+            MouseEvent::Move { .. } => {}
+            // A reported drag continues when the pointer leaves the pane: the
+            // button is still held, so the program keeps getting motion (pinned
+            // to the grid edge by the backend) until the release, as in xterm.
+            // Hover is not reported outside the pane, so Leave itself is not
+            // forwarded.
+            MouseEvent::Leave { .. } => {}
         }
     }
 
@@ -905,6 +919,21 @@ mod tests {
         v.selection = Some(Selection { anchor: (0, 0), head: (3, 0) });
         h.scroll(&mut v, cell(1, 2), UI.cell_h);
         assert!(v.selection.is_none());
+    }
+
+    #[test]
+    fn a_new_press_releases_one_whose_release_was_lost() {
+        let mut v = echoing("\\033[?1000h\\033[?1006h");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1 });
+        // No Up arrives.
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(4, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 1), dragged: false });
+        assert!(!v.reporting);
+        v.write(b"\r");
+        let screen = echoed(&mut v, "^[[<0;5;2m");
+        assert_eq!(screen, "READY^[[<0;3;2M^[[<0;5;2m^[[<0;5;2M^[[<0;5;2m");
     }
 
     #[test]
