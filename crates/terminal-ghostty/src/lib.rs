@@ -88,7 +88,7 @@ pub struct GhosttyTerminal {
     cell_w: u32,
     cell_h: u32,
     /// Cached once the child is observed to have exited.
-    exited: Option<Option<i32>>,
+    exited: Option<Lifecycle>,
     /// The reader thread signalled EOF (child's PTY closed).
     reader_done: bool,
     /// Grid changed since the last `snapshot()`; lets the app skip re-snapshotting
@@ -686,16 +686,36 @@ impl TerminalBackend for GhosttyTerminal {
     }
 
     fn lifecycle(&mut self) -> Lifecycle {
-        if let Some(code) = self.exited {
-            return Lifecycle::Exited(code);
+        if let Some(done) = self.exited {
+            return done;
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
-                let code = Some(status.exit_code() as i32);
-                self.exited = Some(code);
-                Lifecycle::Exited(code)
+                let done = match status.signal().and_then(signal_number) {
+                    Some(signal) => Lifecycle::Signaled(signal),
+                    None => Lifecycle::Exited(Some(status.exit_code() as i32)),
+                };
+                self.exited = Some(done);
+                done
             }
             _ => Lifecycle::Running,
         }
     }
+}
+
+/// The number of the signal whose `strsignal` text is `description`: the only
+/// form of it `portable_pty`'s exit status keeps.
+#[cfg(unix)]
+fn signal_number(description: &str) -> Option<i32> {
+    (1..32).find(|&n| {
+        // SAFETY: strsignal returns a NUL-terminated string (or null) that
+        // stays valid until the next strsignal call on this thread.
+        let text = unsafe { libc::strsignal(n) };
+        !text.is_null() && unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy() == description
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_number(_description: &str) -> Option<i32> {
+    None
 }

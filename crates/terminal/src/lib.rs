@@ -143,6 +143,15 @@ pub enum Lifecycle {
     Running,
     /// Exited with the given code, if one was reported.
     Exited(Option<i32>),
+    /// Killed by this signal number.
+    Signaled(i32),
+}
+
+impl Lifecycle {
+    /// Whether the child is gone, by exit or by signal.
+    pub fn has_exited(self) -> bool {
+        self != Lifecycle::Running
+    }
 }
 
 /// A backend-neutral key. Printable input arrives as [`Key::Char`] (with the

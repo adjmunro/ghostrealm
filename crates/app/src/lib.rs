@@ -24,7 +24,7 @@ pub mod window;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ghostrealm_terminal::{Lifecycle, TerminalBackend};
+use ghostrealm_terminal::TerminalBackend;
 use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
 
 /// Dispatch the CLI:
@@ -77,7 +77,7 @@ fn dump(command_line: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         term.pump();
-        if let Lifecycle::Exited(_) = term.lifecycle() {
+        if term.lifecycle().has_exited() {
             std::thread::sleep(Duration::from_millis(30));
             term.pump();
             break;

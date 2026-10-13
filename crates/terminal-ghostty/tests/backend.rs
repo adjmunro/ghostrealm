@@ -20,7 +20,7 @@ fn pump_until_exit(term: &mut GhosttyTerminal, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         term.pump();
-        if let Lifecycle::Exited(_) = term.lifecycle() {
+        if term.lifecycle().has_exited() {
             std::thread::sleep(Duration::from_millis(30));
             term.pump();
             return;
@@ -294,11 +294,18 @@ fn detects_child_exit() {
             "expected exit code 7, got {code:?}. Next steps: check child.try_wait() \
              and ExitStatus::exit_code() mapping in lifecycle()."
         ),
-        Lifecycle::Running => panic!(
-            "child reported Running after `exit 7`. Next steps: ensure the slave fd is dropped \
+        other @ (Lifecycle::Running | Lifecycle::Signaled(_)) => panic!(
+            "child reported {other:?} after `exit 7`. Next steps: ensure the slave fd is dropped \
              after spawn so the child can exit, and that try_wait() is polled."
         ),
     }
+}
+
+#[test]
+fn detects_child_killed_by_a_signal() {
+    let mut term = GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("kill -9 $$"))).expect("spawn backend");
+    pump_until_exit(&mut term, Duration::from_secs(5));
+    assert_eq!(term.lifecycle(), Lifecycle::Signaled(9));
 }
 
 #[test]

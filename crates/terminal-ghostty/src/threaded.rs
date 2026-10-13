@@ -216,7 +216,7 @@ impl Drop for ThreadedTerminal {
                 }
                 worker.is_finished()
             };
-            let exited = || matches!(shared.meta.lock().unwrap().lifecycle, Lifecycle::Exited(_));
+            let exited = || shared.meta.lock().unwrap().lifecycle.has_exited();
             if finished(SHUTDOWN_GRACE) {
                 return;
             }
