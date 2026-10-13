@@ -40,6 +40,15 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   last frame's row and the frame is re-requested). Use `budgeted_row` for bulk
   content (terminal grid, editor text) and build the key with `row_key` from your
   cells so a cache hit costs no allocation.
+- Styled rows: `budgeted_row_styled` takes `RowStyles { runs, cell_w }`, one
+  `RunStyle` (`BOLD`, `ITALIC`, `UNDERLINE`, `BOX`, combined with `|`) per span,
+  keyed with `row_key_styled`. Bold/italic pick the face at shaping (cosmic-text
+  uses the nearest weight, and skews an italic when the family has none);
+  underline and `BOX` (a tinted background) are quads drawn under the glyphs,
+  `cell_w` per char. A row with no styled span passes `RowStyles::NONE`
+  (`budgeted_row` does): it keys, shapes, and draws as before and carries no
+  style data. Build `runs` only for rows that use a style
+  (`syntax::styled_row_spans` returns it empty otherwise).
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).
@@ -138,7 +147,11 @@ highlighter turns one line plus the `State` carried from the line before into
 contiguous `Span`s of palette-free `Token`s (`Comment`, `Heading`, `Key`,
 `Marker`, `Strong`, `Emphasis`, `Code`, `Link`, ...). `syntax::row_spans` maps
 them to colours (`syntax::color`) and slices them to a visual row, ready for
-`PaintCx::row`/`budgeted_row`. A view that edits text keeps a `StateCache` (only
+`PaintCx::row`/`budgeted_row`; `syntax::styled_row_spans` also maps them to
+`RunStyle`s (Strong/Heading bold, Emphasis italic, Link underline, Code boxed).
+`Highlighter::block` marks rows drawn as a block (a fenced code block), which the
+editor tints; Markdown carries a fence's language in its state and highlights the
+body with that language's line-local highlighter. A view that edits text keeps a `StateCache` (only
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a
 `SpanCache` so lines still on screen aren't re-highlighted each frame. A view that

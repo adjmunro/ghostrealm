@@ -453,35 +453,32 @@
 
 ---
 
-[2026-09-29@6641e98] PRIORITY: Markdown bold, italic, and underline in the editor
+[2026-09-29@6641e98] Markdown rich text — follow-ups
 
-- Requires: a style per span, carried through the whole row path. The row cache
-  (`row_cache::RowCache`) shapes each row with one monospace `Attrs`, and spans
-  are `(String, [u8; 3])` (text, colour) only. Needed: a style per segment in
-  `row_key`, `RowCache::ensure` (`Attrs::style(Italic)` / `weight(Bold)`), shaping,
-  and the `PaintCx::row` / `budgeted_row` API; underline quads drawn under the
-  span; bold and italic font faces.
-- Detail: The highlighter already marks `Token::Emphasis` / `Token::Strong` text
-  apart from its `Token::Marker`s, links (`Link` text, `Url` target) and
-  headings, and the editor colours them. Remaining: render **mixed** style (the
-  default) with the Emphasis italic and the Strong bold while the markers stay
-  visible, and support underline. A toggle button switches mixed <-> fully-formatted
-  (markers hidden; needs cursor-column mapping over hidden text). A Markdown
-  feature checks whether a link/image target exists (a local file on disk; a
-  reachable URL needs a network decision) and flags broken ones with inline error
-  markers. Owner review (2026-10-13) restates the target: Markdown shown
-  formatted with the markup symbols still visible and editable (the mixed mode).
-- Efficiency: carry style data only for the rows and segments that use it; a
-  row with no bold, italic, or underline keeps the single-style path and sends
-  nothing extra.
-- Code spans: inline code (one backtick) is drawn as a small boxed or
-  background-tinted span. A fenced block (three backticks) is drawn as a full
-  block with a copy button and, for shell-flavoured blocks, a run button in the
-  left gutter for each runnable command. The block uses the syntax highlighter
-  (and maybe an LSP) for the language named after the opening fence; see
-  "DISCUSSION: syntax highlighting direction".
-- Links: internal and external links are styled with the same machinery. Look
-  and feel to discuss later.
+- Requires: NO BLOCKERS
+- Detail: DONE: **mixed** mode. Strong/headings bold, emphasis italic, link text
+  underlined, inline code in a tinted box, fenced blocks on a full-width tint
+  with the body highlighted in the fence's language (a line-local highlighter
+  such as `toml`); the markers stay visible, editable, and dimmed. The style
+  rides in `RunStyle`s per span through the row cache and `PaintCx`
+  (PLUGINS.md); rows with no styled span carry none. Remaining:
+  - A toggle button switches mixed <-> fully-formatted (markers hidden; needs
+    cursor-column mapping over hidden text).
+  - A Markdown feature checks whether a link/image target exists (a local file
+    on disk; a reachable URL needs a network decision) and flags broken ones
+    with inline error markers.
+  - Code blocks: a copy button and, for shell-flavoured blocks, a run button in
+    the left gutter for each runnable command; an LSP for the fence's language;
+    highlighting a fence in a stateful language (Markdown in Markdown) needs
+    the inner state carried too; see "DISCUSSION: syntax highlighting
+    direction".
+  - Links: look and feel (colours) of internal and external links, to discuss.
+  - Nesting: the highlighter gives each char one token, so emphasis inside
+    strong (or a link or heading) loses the outer style; needs a token set per
+    char, or style flags on spans.
+  - The file browser's preview colours Markdown but does not draw the styles.
+  - Bold has no synthetic fallback: a monospace family without a bold face
+    shows the nearest weight (italic is skewed by the shaper).
 - Owner, verbatim:
   > Okay, yeah, I still really want the bold and italics and markdown, so we
   > better plumb that. Try and make it efficient, though. Like, I don't think
@@ -1081,8 +1078,7 @@
     back button, or collapse/expand of the browser). Maybe pin left / pin right
     / unpin. Maybe text previews keep focus on the browser.
   - **Markdown**: shown formatted, with the markup symbols still visible and
-    editable. This is the "mixed" mode in "PRIORITY: Markdown bold, italic, and
-    underline in the editor"; highlighting already exists.
+    editable. This is the "mixed" mode in "Markdown rich text — follow-ups"; the mixed mode is done.
   - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.
 - Reason: owner review; the file browser and editor overlap, and the choice
   decides several smaller features.
@@ -1217,8 +1213,7 @@
   over time, which a hand-written one must track), or a unified API for
   identifying a language's keywords, possibly backed by tree-sitter.
 - Detail: Markdown keeps its own highlighter, because it renders, formats, and
-  shows the syntax at once ("PRIORITY: Markdown bold, italic, and underline in
-  the editor"). Other rich formats (HTML headers, bold) may want the same;
+  shows the syntax at once ("Markdown rich text — follow-ups"). Other rich formats (HTML headers, bold) may want the same;
   undecided, since HTML is far denser. TOML moves to tree-sitter only if that
   beats the hand-written one.
 - Context: the shared `Token` vocabulary in `ghostrealm_core::highlight` mixes
@@ -1417,8 +1412,7 @@
 [2026-10-14T00:02+1300@6007201] Markdown: embedded files (`![alt](path)`)
 
 - Requires: NO BLOCKERS (reuses "Media wrappers: image decoding and audio
-  playback behind our own trait"; sibling of "PRIORITY: Markdown bold, italic,
-  and underline in the editor")
+  playback behind our own trait"; sibling of "Markdown rich text — follow-ups")
 - Detail: The Markdown renderer embeds files with the GitHub image syntax,
   `![alt](path)`: a link with a leading `!`.
   - Images render in place; video and audio are possible, through the media
