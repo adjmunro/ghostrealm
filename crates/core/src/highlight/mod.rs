@@ -6,6 +6,7 @@
 //! modules registered in [`ALL`] and found by file extension.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
@@ -57,6 +58,12 @@ pub trait Highlighter: Sync {
     /// Lowercase file extensions (no dot) this highlighter claims.
     fn extensions(&self) -> &'static [&'static str];
 
+    /// Whether a line's classification depends on the lines before it. When
+    /// false, every line enters with state 0 and no [`StateCache`] is needed.
+    fn carries_state(&self) -> bool {
+        true
+    }
+
     /// Classify `line` entering with `state`. The spans are contiguous from
     /// char 0 to the line's end (none for an empty line). Also returns the
     /// state the next line enters with.
@@ -104,12 +111,18 @@ pub fn runs(tokens: &[Token]) -> Vec<Span> {
 
 /// The state each line of an edited document starts in, computed on demand
 /// and kept across edits so only changed lines are re-highlighted.
+///
+/// Report where edits land with [`Self::dirty_from`] so a new edit count only
+/// re-checks lines from there on; without a report the whole prefix is
+/// re-checked (a hash per line).
 #[derive(Default)]
 pub struct StateCache {
     entries: Vec<Entry>,
     /// The first `verified` entries match the document at edit count `edits`.
     verified: usize,
     edits: Option<u64>,
+    /// The first line changed since the last edit count seen, if reported.
+    dirty: Option<usize>,
     highlighter: &'static str,
 }
 
@@ -126,6 +139,11 @@ fn hash_line(line: &str) -> u64 {
 }
 
 impl StateCache {
+    /// Lines before `row` are unchanged by the edits since the last query.
+    pub fn dirty_from(&mut self, row: usize) {
+        self.dirty = Some(self.dirty.map_or(row, |d| d.min(row)));
+    }
+
     /// The state `line` of `lines` (at edit count `edits`) enters with. Cheap
     /// when asked in ascending order within one edit count.
     pub fn state_in(&mut self, h: &dyn Highlighter, lines: &[String], edits: u64, line: usize) -> State {
@@ -136,7 +154,7 @@ impl StateCache {
         }
         if self.edits != Some(edits) {
             self.edits = Some(edits);
-            self.verified = 0;
+            self.verified = self.verified.min(self.dirty.take().unwrap_or(0));
         }
         self.entries.truncate(lines.len());
         self.verified = self.verified.min(self.entries.len());
@@ -158,6 +176,27 @@ impl StateCache {
             0 => 0,
             w => self.entries[w - 1].state_out,
         }
+    }
+}
+
+/// Spans of recently seen `(line, entering state)` pairs, so lines that are
+/// still on screen aren't re-highlighted every frame.
+#[derive(Default)]
+pub struct SpanCache {
+    map: HashMap<(u64, State), Vec<Span>>,
+    highlighter: &'static str,
+}
+
+/// Entries kept before the cache starts over (a screenful is far fewer).
+const SPAN_CACHE_CAP: usize = 4096;
+
+impl SpanCache {
+    pub fn spans(&mut self, h: &dyn Highlighter, line: &str, state: State) -> &[Span] {
+        if self.highlighter != h.name() || self.map.len() >= SPAN_CACHE_CAP {
+            self.highlighter = h.name();
+            self.map.clear();
+        }
+        self.map.entry((hash_line(line), state)).or_insert_with(|| h.line(line, state).0)
     }
 }
 
@@ -240,5 +279,69 @@ mod tests {
         // Lines past the end clamp.
         let end = cache.state_in(h, &lines, 2, 99);
         assert_eq!(end, h.line(lines.last().unwrap(), *full(&lines).last().unwrap()).1);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts how many lines it is asked to classify.
+    struct Counting(AtomicUsize);
+
+    impl Highlighter for Counting {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn line(&self, _line: &str, state: State) -> (Vec<Span>, State) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            (vec![Span { start: 0, end: 1, token: Token::Plain }], state)
+        }
+    }
+
+    #[test]
+    fn a_dirty_hint_limits_the_lines_rechecked_after_an_edit() {
+        let h = Counting(AtomicUsize::new(0));
+        let mut lines: Vec<String> = (0..1000).map(|i| format!("line {i}")).collect();
+        let mut cache = StateCache::default();
+        cache.state_in(&h, &lines, 0, 999);
+        assert_eq!(h.0.swap(0, Ordering::Relaxed), 999, "first pass");
+
+        lines[900] = "edited".into();
+        cache.dirty_from(900);
+        cache.state_in(&h, &lines, 1, 999);
+        assert_eq!(h.0.swap(0, Ordering::Relaxed), 1, "only the edited line is classified again");
+
+        // Without a hint the prefix is re-verified by hash, never trusted.
+        lines[10] = "edited".into();
+        cache.state_in(&h, &lines, 2, 999);
+        assert_eq!(h.0.swap(0, Ordering::Relaxed), 1);
+        // A hint is the minimum over the edits since the last query.
+        lines[20] = "again".into();
+        lines[30] = "again".into();
+        cache.dirty_from(30);
+        cache.dirty_from(20);
+        cache.state_in(&h, &lines, 3, 999);
+        assert_eq!(h.0.swap(0, Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn span_cache_classifies_each_line_state_pair_once() {
+        let h = Counting(AtomicUsize::new(0));
+        let mut cache = SpanCache::default();
+        for _ in 0..3 {
+            assert_eq!(cache.spans(&h, "a", 0).len(), 1);
+            cache.spans(&h, "b", 0);
+            cache.spans(&h, "a", 1);
+        }
+        assert_eq!(h.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn only_stateful_highlighters_need_a_state_cache() {
+        assert!(!for_extension("toml").unwrap().carries_state());
+        assert!(for_extension("md").unwrap().carries_state());
     }
 }

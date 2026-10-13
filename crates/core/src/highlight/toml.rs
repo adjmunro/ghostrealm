@@ -15,6 +15,10 @@ impl Highlighter for Toml {
         &["toml"]
     }
 
+    fn carries_state(&self) -> bool {
+        false
+    }
+
     fn line(&self, line: &str, _state: State) -> (Vec<Span>, State) {
         (runs(&tokens(line)), 0)
     }
