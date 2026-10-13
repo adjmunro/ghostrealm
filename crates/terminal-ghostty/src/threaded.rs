@@ -177,9 +177,10 @@ impl ThreadedTerminal {
 
 /// Dropping returns at once (it runs on the UI thread). A reaper thread waits
 /// for the worker; if it is stuck, the reaper sends the child SIGHUP after
-/// [`SHUTDOWN_GRACE`], then SIGKILL to its and the foreground command's
-/// process groups after [`KILL_GRACE`]. A child already seen to exit isn't
-/// signalled (its pid may be reused); the reaper then leaves the worker be.
+/// [`SHUTDOWN_GRACE`], then after [`KILL_GRACE`] SIGKILLs the child's process
+/// group and the foreground command's (checked to still be in the child's
+/// session). A child already seen to exit isn't signalled (its pid may be
+/// reused), but a foreground command left holding the PTY still is.
 impl Drop for ThreadedTerminal {
     fn drop(&mut self) {
         self.send(Cmd::Shutdown);
@@ -196,26 +197,35 @@ impl Drop for ThreadedTerminal {
                 worker.is_finished()
             };
             let exited = || matches!(shared.meta.lock().unwrap().lifecycle, Lifecycle::Exited(_));
-            if finished(SHUTDOWN_GRACE) || exited() {
+            if finished(SHUTDOWN_GRACE) {
                 return;
             }
-            let _ = killer.kill();
-            if finished(KILL_GRACE) || exited() {
+            if !exited() {
+                let _ = killer.kill();
+            }
+            if finished(KILL_GRACE) {
                 return;
             }
             let foreground = shared.meta.lock().unwrap().foreground;
-            force_kill(pid, foreground);
+            force_kill(pid, !exited(), foreground);
         };
         let _ = std::thread::Builder::new().name("vt-reaper".into()).spawn(reap);
     }
 }
 
-/// SIGKILL the process groups of the child (`pid` leads its own) and of the
-/// foreground command.
+/// SIGKILL the process group of the child `pid` (it leads its own), if
+/// `kill_child`, and the `foreground` group if it is still in the child's
+/// session: the group was read earlier and may since have gone, its id reused.
 #[cfg(unix)]
-fn force_kill(pid: Option<u32>, foreground: Option<i32>) {
-    let groups = pid.and_then(|p| i32::try_from(p).ok()).into_iter().chain(foreground);
-    for group in groups.filter(|g| *g > 1) {
+fn force_kill(pid: Option<u32>, kill_child: bool, foreground: Option<i32>) {
+    let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1) else {
+        return;
+    };
+    // SAFETY: getsid only reads a process's session id.
+    let in_session = |group: i32| unsafe { libc::getsid(group) } == pid;
+    let foreground = foreground.filter(|g| *g > 1 && *g != pid && in_session(*g));
+    let child = kill_child.then_some(pid);
+    for group in child.into_iter().chain(foreground) {
         // SAFETY: killpg only sends a signal.
         unsafe {
             libc::killpg(group, libc::SIGKILL);
@@ -225,7 +235,7 @@ fn force_kill(pid: Option<u32>, foreground: Option<i32>) {
 
 /// The killer's TerminateProcess is already forceful.
 #[cfg(not(unix))]
-fn force_kill(_pid: Option<u32>, _foreground: Option<i32>) {}
+fn force_kill(_pid: Option<u32>, _kill_child: bool, _foreground: Option<i32>) {}
 
 impl TerminalBackend for ThreadedTerminal {
     fn resize(&mut self, cols: u16, rows: u16, cell_w_px: u32, cell_h_px: u32) {
@@ -506,6 +516,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_foreground_group_is_killed_without_the_child() {
+        // Job control gives `sleep` its own foreground group in the shell's
+        // session; killing it lets the shell carry on.
+        let cmd = sh("set -m; sleep 30; printf FG-GONE; sleep 30");
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(cmd), None).unwrap();
+        let pid = term.child_pid.unwrap() as i32;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let group = loop {
+            term.resize(40, 10, 8, 16); // wakes the worker to refresh its meta
+            std::thread::sleep(Duration::from_millis(20));
+            match term.shared.meta.lock().unwrap().foreground {
+                Some(g) if g != pid => break g,
+                _ => assert!(Instant::now() < deadline, "no foreground job"),
+            }
+        };
+        force_kill(term.child_pid, false, Some(group));
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !(0..10).any(|r| row_text(&term.snapshot(), r).contains("FG-GONE")) {
+            assert!(Instant::now() < deadline, "the foreground job survived");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(term.lifecycle(), Lifecycle::Running, "the shell lives on");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_foreground_group_outside_the_session_is_not_killed() {
+        use std::os::unix::process::CommandExt;
+        let term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(sh("sleep 30")), None).unwrap();
+        // A process group the shell's session never held.
+        let mut other = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let group = other.id() as i32;
+        force_kill(term.child_pid, false, Some(group));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(other.try_wait().unwrap().is_none(), "an unrelated group survives");
+        let _ = other.kill();
+        let _ = other.wait();
     }
 
     #[test]
