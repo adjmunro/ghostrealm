@@ -26,7 +26,7 @@ test reproduced it; the rest come from reading the code. Items marked
 
 Found reviewing `8a77896..d34d7fa` (the web browser `0c67045`/`35e68b9`/`04794e1`
 and the file-browser preview `3f58197`/`b6e3944`/`d34d7fa`). Line numbers are
-against `d23ace3`.
+against `6611d14`.
 
 Right and middle clicks were lost when the browser was rebased (`465b076` →
 `04794e1`): `MouseEvent` carries no button, so only left clicks reach a page.
@@ -35,7 +35,7 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
 
 #### 21. Chromium runs without its sandbox
 
-- Where: `no_sandbox: 1` ([`web-host/src/main.rs:87`](../crates/web-host/src/main.rs)),
+- Where: `no_sandbox: 1` ([`web-host/src/main.rs:113`](../crates/web-host/src/main.rs)),
   for every process. Recorded in DECISION.md as an open risk.
 - Effect: a renderer exploit runs with the user's full rights (files, SSH keys,
   and the app's shells).
@@ -58,13 +58,13 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     blocks the loader on a dead network mount. Decision needed: a thread or
     timeout per request?
 31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
-    [`browser.rs:559`](../crates/web-host/src/browser.rs)), which breaks OAuth and
+    [`browser.rs:626`](../crates/web-host/src/browser.rs)), which breaks OAuth and
     payment popup flows. Decision needed: open them as a new tab in the pane?
 32. **Image mips average sRGB-encoded values** (`halve`,
     [`plugin/paint.rs:266`](../crates/app/src/plugin/paint.rs)), so a shrunk
     image with fine detail comes out slightly dark. Fix: average in linear light.
 33. **Autoplay can start audio in a hidden tab.** `tick`
-    ([`preview.rs:293`](../crates/app/src/plugins/file_browser/preview.rs)) runs
+    ([`preview.rs:338`](../crates/app/src/plugins/file_browser/preview.rs)) runs
     for hidden views, and only `paint` pauses. Decision needed: should hidden
     audio keep playing? If not, clear `autoplay_at` and pause in `View::shown`.
 34. **The preview follows hover.** Moving the mouse to the preview's controls
