@@ -236,6 +236,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.app.autosave_all(&state.cfg) {
                     state.reload_config();
                 }
+                // The release of a press held across the focus loss may never
+                // arrive; left held, hover could never be withdrawn.
+                if state.mouse_down {
+                    state.end_press();
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::Resized(size) => {
                 state.resize(size.width, size.height);
@@ -4326,6 +4332,13 @@ mod tests {
         h.left_window(true);
         h.entered();
         assert_eq!(h.released(), None, "back inside before release");
+
+        // A press whose release was lost keeps hover until it is ended.
+        let hidden = |_: SurfaceId| false;
+        h.set(a);
+        assert_eq!(h.restrict(true, hidden), None);
+        assert_eq!(h.released(), None);
+        assert_eq!(h.restrict(false, hidden), a, "withdrawn once the press has ended");
     }
 
     #[test]
