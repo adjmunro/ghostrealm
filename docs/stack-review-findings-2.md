@@ -34,18 +34,6 @@ carries no button, so only left clicks reach a page.
 
 ### High
 
-#### 20. The host can outlive the app and hold the profile lock (confirmed)
-
-- Where: [`web-host/src/main.rs:86`](../crates/web-host/src/main.rs) (settings,
-  message loop, `shutdown`), `shut_down` ([`browser.rs:293`](../crates/web-host/src/browser.rs)).
-- Found: an orphaned host (parent pid 1) alive for 4 hours, holding the profile.
-- Cause (inferred): a second launch against the same profile reaches
-  `on_already_running_app_relaunch`, which is unhandled, so CEF opens its own
-  Chrome-style browser that isn't in `BROWSERS`; `shut_down` never sees it close
-  and the message loop never quits.
-- Fix: handle `on_already_running_app_relaunch` (return 1); exit from a
-  watchdog once stdin hits EOF and shutdown hasn't finished within a timeout.
-
 #### 21. Chromium runs without its sandbox
 
 - Where: `no_sandbox: 1` ([`web-host/src/main.rs:87`](../crates/web-host/src/main.rs)),

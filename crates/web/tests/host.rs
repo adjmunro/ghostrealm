@@ -3,26 +3,12 @@
 //!
 //! Needs the bundled host (`mise run web`); skipped when it isn't built.
 
-use std::path::PathBuf;
+mod common;
+
 use std::time::{Duration, Instant};
 
-use ghostrealm_web::client::{HOST_ENV, HOST_NAME};
+use common::host_exe;
 use ghostrealm_web::{Request, WebHost};
-
-fn host_exe() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os(HOST_ENV) {
-        return Some(PathBuf::from(p));
-    }
-    // Test binaries live in target/<profile>/deps; the bundle sits in target/<profile>.
-    let profile_dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let mac = profile_dir.join(format!("{HOST_NAME}.app/Contents/MacOS/{HOST_NAME}"));
-    let linux = profile_dir.join(HOST_NAME).join(HOST_NAME);
-    [mac, linux].into_iter().find(|p| p.is_file())
-}
 
 #[test]
 fn page_paints_and_answers_text_and_eval() {

@@ -194,6 +194,11 @@ impl WebHost {
         !self.shared.0.lock().unwrap().exited
     }
 
+    /// The host's process id.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     /// Whether the host has reported CEF initialised.
     pub fn is_ready(&self) -> bool {
         self.shared.0.lock().unwrap().ready

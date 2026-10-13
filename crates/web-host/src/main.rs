@@ -21,6 +21,10 @@ use ghostrealm_web::protocol::{Event, Request};
 /// Overrides the profile directory (cookies, cache, local storage).
 const CACHE_ENV: &str = "GHOSTREALM_WEB_CACHE";
 
+/// How long closing the browsers may take after the app hangs up before the
+/// host exits anyway, so a stalled CEF shutdown never leaves it running.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 static STDOUT: Mutex<()> = Mutex::new(());
 
 /// Write one event line to stdout.
@@ -146,6 +150,9 @@ fn serve_stdin() {
                 }
             }
             post_task(ThreadId::UI, Some(&mut RequestTask::new(None)));
+            std::thread::sleep(SHUTDOWN_GRACE);
+            eprintln!("ghostrealm-web-host: shutdown stalled; exiting");
+            std::process::exit(0);
         })
         .expect("spawn request reader");
 }
@@ -193,6 +200,17 @@ wrap_browser_process_handler! {
         fn on_context_initialized(&self) {
             emit(&Event::Ready);
             serve_stdin();
+        }
+
+        /// Another host started on this profile. Handling it stops CEF opening
+        /// a browser window of its own here (which nothing would ever close);
+        /// the other host reports the profile in use and exits.
+        fn on_already_running_app_relaunch(
+            &self,
+            _command_line: Option<&mut CommandLine>,
+            _current_directory: Option<&CefString>,
+        ) -> std::os::raw::c_int {
+            1
         }
     }
 }
