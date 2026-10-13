@@ -446,21 +446,24 @@
 
 ---
 
-[2026-09-29@6641e98] Markdown formatting in the editor
+[2026-09-29@6641e98] PRIORITY: Markdown bold, italic, and underline in the editor
 
-- Requires: styled spans in the row cache (`row_cache::RowCache`, `PaintCx::row`,
-  `budgeted_row`): spans are `(String, [u8; 3])` and every row is shaped with one
-  monospace `Attrs`; italic/bold need a style on the span, in `row_key`, and in
-  `RowCache::ensure` (`Attrs::style(Italic)`/`weight(Bold)`).
+- Requires: a style per span, carried through the whole row path. The row cache
+  (`row_cache::RowCache`) shapes each row with one monospace `Attrs`, and spans
+  are `(String, [u8; 3])` (text, colour) only. Needed: a style per segment in
+  `row_key`, `RowCache::ensure` (`Attrs::style(Italic)` / `weight(Bold)`), shaping,
+  and the `PaintCx::row` / `budgeted_row` API; underline quads drawn under the
+  span; bold and italic font faces.
 - Detail: The highlighter already marks `Token::Emphasis` / `Token::Strong` text
   apart from its `Token::Marker`s, links (`Link` text, `Url` target) and
   headings, and the editor colours them. Remaining: render **mixed** style (the
   default) with the Emphasis italic and the Strong bold while the markers stay
-  visible. A toggle button switches mixed <-> fully-formatted (markers hidden;
-  needs cursor-column mapping over hidden text). A Markdown feature checks
-  whether a link/image target exists (a local file on disk; a reachable URL needs
-  a network decision) and flags broken ones with inline error markers.
-- Reason: nicer Markdown editing; requested.
+  visible, and support underline. A toggle button switches mixed <-> fully-formatted
+  (markers hidden; needs cursor-column mapping over hidden text). A Markdown
+  feature checks whether a link/image target exists (a local file on disk; a
+  reachable URL needs a network decision) and flags broken ones with inline error
+  markers.
+- Reason: nicer Markdown editing; requested, and wanted soon.
 
 ---
 
@@ -728,3 +731,107 @@
 - Detail: The host is spawned on first use and lives until the app quits. Close it
   (stdin EOF) a little after the last web surface closes; it respawns on demand.
 - Reason: an idle Chromium browser + GPU process hold a few hundred MB.
+
+---
+
+[2026-10-13T19:46+1300@d292715] PRIORITY: User-visible error surface
+
+- Requires: a design (prompt the user about it)
+- Detail: Errors reach stderr only: a failed Save As, a refused open of an
+  unreadable or non-UTF-8 file, config load findings, web host failures. Design
+  where they show (toast, status line, inbox, settings status). See
+  [stack-review-findings.md](stack-review-findings.md) item 5 (silent Save As and
+  open failures) and [stack-review-findings-2.md](stack-review-findings-2.md)
+  item 15 (load-time findings go only to stderr).
+- Reason: the user cannot see why an action did nothing.
+
+---
+
+[2026-10-13T19:46+1300@d292715] PRIORITY: Quit/close confirmation for unsaved editor content
+
+- Requires: NO BLOCKERS
+- Detail: Quitting (and closing an editor tab, pane, or workspace) with unsaved
+  editor content opens a dialog with "Save and Quit", "Cancel", and "Quit
+  Without Saving". Opening the dialog, or any popup or context menu, must not
+  count as losing focus: autosave-on-unfocus must not fire when focus moves to a
+  popup, menu, or dialog. See [stack-review-findings.md](stack-review-findings.md)
+  item 4 (unsaved content dropped without autosave or a prompt).
+- Reason: unsaved content is lost without warning today.
+
+---
+
+[2026-10-13T19:46+1300@d292715] Brackets: wrap a selection, auto-close in the editor
+
+- Requires: NO BLOCKERS
+- Detail: Typing `(`, `[`, or `{` with a selection wraps the selection in the
+  pair. In the editor, typing an opening bracket inserts the closing one after
+  the cursor. Both apply to all three kinds.
+- Reason: requested editing behaviour.
+
+---
+
+[2026-10-13T19:46+1300@d292715] Terminal: setting for text-editing key translation in full-screen programs
+
+- Requires: NO BLOCKERS
+- Detail: Add a TOML setting (boolean, default true) that controls whether the
+  text-editing key translations (Option/Cmd word and line motions and deletes,
+  sent as readline/emacs bytes) still apply while a full-screen program
+  (alternate screen) is running, e.g. vim. See
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 7.
+- Reason: decided in the findings review; some full-screen programs want the raw
+  keys.
+
+---
+
+[2026-10-13T19:46+1300@d292715] File browser: preview audio stops when its view is hidden
+
+- Requires: NO BLOCKERS
+- Detail: Preview audio stops or pauses when the file browser's view is hidden
+  (another tab or workspace). The file browser does not play in the background:
+  clear `autoplay_at` and pause in `View::shown`/hide. See
+  [stack-review-findings-2.md](stack-review-findings-2.md) item 33. Idea, not
+  committed: a dedicated music-player pane that keeps playing.
+- Reason: autoplay can start audio in a hidden tab today.
+
+---
+
+[2026-10-13T19:46+1300@d292715] File browser: should the preview follow hover?
+
+- Requires: the user tries the behaviour before deciding
+- Detail: Decide whether the preview follows hover, the selection, or a pinned
+  row. See [stack-review-findings-2.md](stack-review-findings-2.md) item 34.
+- Reason: moving the pointer to the preview's controls crosses rows and switches
+  the subject.
+
+---
+
+[2026-10-13T19:46+1300@d292715] Reduce dependencies
+
+- Requires: NO BLOCKERS (later work, not now)
+- Detail: Audit the dependency tree (`image`, `rodio`, `cef`,
+  `lsp-types`/`lsp-server`, `crossbeam-channel`, `toml`, `libc`, ...) and replace
+  with small in-house implementations where reasonable.
+- Reason: fewer external dependencies to carry and update.
+
+---
+
+[2026-10-13T19:46+1300@d292715] Keybindings: recommended defaults
+
+- Requires: NO BLOCKERS
+- Detail: Keep a list of recommended bindings per command. Later, add a way to
+  inject a recommended binding into the user's config on request (e.g. from the
+  palette or the shortcuts sheet). Never automatic: `[keybindings]` binds only
+  what the file lists.
+- Reason: with no built-in fallback, users need a way to discover and add the
+  recommended chords.
+
+---
+
+[2026-10-13T19:46+1300@d292715] Decision session: open "Decision needed" items
+
+- Requires: a session with the user
+- Detail: Go through the open "Decision needed" items in
+  [stack-review-findings.md](stack-review-findings.md) and
+  [stack-review-findings-2.md](stack-review-findings-2.md), and the decision items
+  in this file. Check the decisions are consistent with each other.
+- Reason: several decisions are pending and may interact.
