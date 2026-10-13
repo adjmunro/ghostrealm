@@ -267,7 +267,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
         width: width.max(1),
         height: height.max(1),
         scale: if scale > 0.0 { scale } else { 1.0 },
-        frames: FrameWriter::for_page(std::env::temp_dir(), id),
+        frames: FrameWriter::for_page(crate::frame_dir(), id),
         page: Vec::new(),
         page_w: 0,
         page_h: 0,

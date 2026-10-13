@@ -27,6 +27,59 @@ const HEADER: usize = 64;
 /// Frame files are `<PREFIX><host pid>-<page id>-<generation>.bgra`.
 const PREFIX: &str = "ghostrealm-web-";
 
+/// The directory frame files go in: `$XDG_RUNTIME_DIR/ghostrealm` when that is
+/// set, else `<temp dir>/ghostrealm-<uid>`. It is created mode 0700 and refused
+/// unless it is a directory this user owns that nobody else can access: in a
+/// shared temp dir another user could otherwise read frames or take their
+/// predictable names first.
+pub fn frame_dir() -> io::Result<PathBuf> {
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(run) => run.join("ghostrealm"),
+        None => std::env::temp_dir().join(format!("ghostrealm-{}", user_id())),
+    };
+    private_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn user_id() -> u32 {
+    0
+}
+
+/// Create `dir` (mode 0700) if it is missing, and check that it is a real
+/// directory (not a symlink) owned by this user with no access for others.
+#[cfg(unix)]
+fn private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() || meta.uid() != user_id() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory private to this user", dir.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 /// Remove frame files in `dir` left by hosts that are no longer `running`
 /// (a host that crashed can't remove its own).
 pub fn remove_stale(dir: &Path, running: impl Fn(u32) -> bool) {
@@ -370,6 +423,33 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(std::fs::read(&target).unwrap(), b"keep", "the symlink's target is untouched");
         assert!(!std::fs::symlink_metadata(&f.path).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_frame_dir_must_be_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmpdir("dir");
+        let fresh = base.join("fresh");
+        let _ = std::fs::remove_dir(&fresh);
+        private_dir(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "created private");
+        private_dir(&fresh).expect("an existing private dir is reused");
+
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_dir(&open).is_err(), "others can read it");
+
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(private_dir(&link).is_err(), "a symlink, even to a private dir");
+
+        // Another user's directory: root owns `/`.
+        assert!(private_dir(Path::new("/")).is_err());
+        assert!(frame_dir().unwrap().is_dir());
     }
 
     #[test]

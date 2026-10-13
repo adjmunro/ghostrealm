@@ -11,9 +11,9 @@ mod browser;
 mod mac;
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use cef::*;
 use ghostrealm_web::protocol::{Event, Request};
@@ -26,6 +26,15 @@ const CACHE_ENV: &str = "GHOSTREALM_WEB_CACHE";
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 static STDOUT: Mutex<()> = Mutex::new(());
+
+/// Where frame files go ([`ghostrealm_web::frame::frame_dir`]), set before CEF
+/// starts.
+static FRAME_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// The frame file directory.
+pub fn frame_dir() -> &'static Path {
+    FRAME_DIR.get().expect("frame dir is set before CEF starts")
+}
 
 /// Write one event line to stdout.
 pub fn emit(event: &Event) {
@@ -106,7 +115,12 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
-    ghostrealm_web::frame::remove_stale(&std::env::temp_dir(), running);
+    let frames = match ghostrealm_web::frame::frame_dir() {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("no directory for page frames: {e}")),
+    };
+    ghostrealm_web::frame::remove_stale(&frames, running);
+    let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
     let settings = Settings {

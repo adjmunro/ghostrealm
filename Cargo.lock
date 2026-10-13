@@ -1227,6 +1227,7 @@ name = "ghostrealm-web"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",
