@@ -575,8 +575,9 @@ impl EditorBuffer {
     /// Comment out the selected lines (the cursor's line without a selection),
     /// or uncomment them when every non-blank one is already commented, using
     /// `syntax`: its line token on each non-blank line at the least indent, else
-    /// its block tokens around the first and last non-blank lines. A selection
-    /// ending at column 0 of a later line leaves that line out. One undo step.
+    /// its block tokens around the first and last non-blank lines (or off each
+    /// line that is a block comment of its own). A selection ending at column
+    /// 0 of a later line leaves that line out. One undo step.
     /// Returns whether the text changed (not when blank or the language has
     /// no comment syntax).
     pub fn toggle_comment(&mut self, syntax: CommentSyntax) -> bool {
@@ -644,25 +645,58 @@ impl EditorBuffer {
         let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
             return;
         };
+        // Lines commented one by one: unwrapping the first and last as one
+        // block would leave their inner tokens behind (`a -->`, `<!-- b`).
+        let each = rows.len() > 1 && rows.iter().all(|&r| self.only_block_on(open, close, r));
+        if each {
+            for r in rows {
+                self.unwrap_block(open, close, r, r);
+            }
+        } else if self.block_wrapped(open, close, top, bottom) {
+            self.unwrap_block(open, close, top, bottom);
+        } else {
+            let end = self.lines[bottom].trim_end().chars().count();
+            self.insert_at(bottom, end, &format!(" {close}"));
+            self.insert_at(top, self.indent_of(top), &format!("{open} "));
+        }
+    }
+
+    /// Whether `open` starts row `top` (after its indent) and `close` ends row
+    /// `bottom`, as two distinct tokens.
+    fn block_wrapped(&self, open: &str, close: &str, top: usize, bottom: usize) -> bool {
+        let start = self.indent_of(top);
+        let head = &self.lines[top][self.byte_of(top, start)..];
+        let tail = self.lines[bottom].trim_end();
+        head.starts_with(open)
+            && tail.ends_with(close)
+            && (top != bottom || tail.chars().count() - start >= open.chars().count() + close.chars().count())
+    }
+
+    /// Whether row `r` is one block comment, with no closer inside it.
+    fn only_block_on(&self, open: &str, close: &str, r: usize) -> bool {
+        if !self.block_wrapped(open, close, r, r) {
+            return false;
+        }
+        let at = self.byte_of(r, self.indent_of(r));
+        let tail = self.lines[r].trim_end();
+        !tail[at + open.len()..tail.len() - close.len()].contains(close)
+    }
+
+    /// Remove the block tokens [`Self::block_wrapped`] found, with the space
+    /// inside each.
+    fn unwrap_block(&mut self, open: &str, close: &str, top: usize, bottom: usize) {
         let (open_w, close_w) = (open.chars().count(), close.chars().count());
         let start = self.indent_of(top);
         let end = self.lines[bottom].trim_end().chars().count();
         let at = self.byte_of(top, start);
-        let head = &self.lines[top][at..];
         let tail = self.lines[bottom].trim_end();
-        let wraps = head.starts_with(open)
-            && tail.ends_with(close)
-            && (top != bottom || tail.chars().count() - start >= open_w + close_w);
-        if wraps {
-            // The closer first, so the opener's column stays valid on a shared line.
-            let pad = usize::from(tail[..tail.len() - close.len()].ends_with(' ') && (top != bottom || end - close_w > start + open_w));
-            self.remove_at(bottom, end - close_w - pad, close_w + pad);
-            let space = usize::from(self.lines[top][at + open.len()..].starts_with(' '));
-            self.remove_at(top, start, open_w + space);
-        } else {
-            self.insert_at(bottom, end, &format!(" {close}"));
-            self.insert_at(top, start, &format!("{open} "));
-        }
+        // The closer first, so the opener's column stays valid on a shared line.
+        let pad = usize::from(
+            tail[..tail.len() - close.len()].ends_with(' ') && (top != bottom || end - close_w > start + open_w),
+        );
+        self.remove_at(bottom, end - close_w - pad, close_w + pad);
+        let space = usize::from(self.lines[top][at + open.len()..].starts_with(' '));
+        self.remove_at(top, start, open_w + space);
     }
 
     /// Insert `text` at `(row, col)`, moving the cursor and anchor along.
@@ -1138,6 +1172,11 @@ mod tests {
         let mut e = buffer_with("<!--x-->");
         e.toggle_comment(HTML);
         assert_eq!(e.lines, vec!["x"]);
+        // Lines commented one by one are uncommented one by one.
+        let mut e = buffer_with("<!-- a -->\n\n  <!-- b -->");
+        select(&mut e, (0, 0), (2, 12));
+        assert!(e.toggle_comment(HTML));
+        assert_eq!(e.lines, vec!["a", "", "  b"]);
     }
 
     #[test]
