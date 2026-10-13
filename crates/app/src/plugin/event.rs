@@ -37,7 +37,7 @@ pub struct RawKey<'a> {
 }
 
 /// Something a view asks the app to do once the current call returns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// Open this file beside/in the view's pane, per `[file_browser] open_in`,
     /// with whichever plugin claims the path.
@@ -51,6 +51,11 @@ pub enum Request {
     ///
     /// [`View::save_as`]: super::View::save_as
     SaveAs,
+    /// Open the file and folder context menu on `target` at `at` (physical px).
+    FileMenu {
+        target: crate::file_menu::FileTarget,
+        at: (f32, f32),
+    },
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,

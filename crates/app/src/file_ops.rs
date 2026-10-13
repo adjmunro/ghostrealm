@@ -198,6 +198,16 @@ pub fn rename(path: &Path, name: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
+/// Where `path` is now, given that each `(from, to)` of `moved` was moved:
+/// `to` itself when `path` is `from`, or the same place inside `to`. `None`
+/// when none of them held it.
+pub fn follow(path: &Path, moved: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    moved.iter().find_map(|(from, to)| {
+        let rest = path.strip_prefix(from).ok()?;
+        Some(if rest.as_os_str().is_empty() { to.clone() } else { to.join(rest) })
+    })
+}
+
 /// `path` relative to `root`, with `/` separators. A path outside `root` is
 /// returned whole.
 pub fn relative_to(path: &Path, root: &Path) -> String {
@@ -262,11 +272,13 @@ pub mod tests {
     use super::*;
     use crate::plugin::testing::tmpdir;
     use std::cell::RefCell;
+    use std::rc::Rc;
 
-    /// A [`System`] that records what it was asked and touches nothing.
+    /// A [`System`] that records what it was asked (in `calls`, which the test
+    /// keeps a handle on) and touches nothing but the entry it "trashes".
     #[derive(Default)]
     pub struct FakeSystem {
-        pub calls: RefCell<Vec<String>>,
+        pub calls: Rc<RefCell<Vec<String>>>,
         pub fail_trash: bool,
     }
 
@@ -368,6 +380,15 @@ pub mod tests {
         assert!(rename(&d.join("c.txt"), "x/y.txt").is_err(), "nested");
         assert_eq!(rename(&d.join("c.txt"), "c.txt").unwrap(), d.join("c.txt"), "unchanged");
         assert_eq!(names(&d), ["b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn moved_paths_are_followed_without_a_trailing_slash() {
+        let moved = [(PathBuf::from("/w/a"), PathBuf::from("/w/b"))];
+        assert_eq!(follow(Path::new("/w/a"), &moved), Some(PathBuf::from("/w/b")));
+        assert_eq!(follow(Path::new("/w/a/x/y.rs"), &moved), Some(PathBuf::from("/w/b/x/y.rs")));
+        assert_eq!(follow(Path::new("/w/ab"), &moved), None);
+        assert_eq!(follow(Path::new("/w/a"), &[]), None);
     }
 
     #[test]

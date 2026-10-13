@@ -98,6 +98,10 @@ impl Harness {
         self.event(Mods::default(), |cx| view.mouse(cx, &ev))
     }
 
+    pub fn context_menu(&self, view: &mut dyn View, pos: (f32, f32)) -> Outcome {
+        self.event(Mods::default(), |cx| view.context_menu(cx, pos))
+    }
+
     /// Like [`mouse`](Self::mouse) with `mods` held.
     pub fn mouse_with(&self, view: &mut dyn View, mods: Mods, ev: MouseEvent) -> Outcome {
         self.event(mods, |cx| view.mouse(cx, &ev))

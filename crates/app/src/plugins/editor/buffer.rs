@@ -859,10 +859,21 @@ impl EditorBuffer {
         Ok(())
     }
 
-    fn write_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    /// Write the buffer to `path`, leaving its file, unsaved state, and
+    /// history as they are.
+    pub fn save_copy(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.file_text())
+    }
+
+    /// The text as written to a file: lines joined, ending in a newline.
+    fn file_text(&self) -> String {
         let mut text = self.lines.join("\n");
         text.push('\n');
-        std::fs::write(path, text)?;
+        text
+    }
+
+    fn write_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.file_text())?;
         self.modified = false;
         // Typing after a save starts a new step, so undo can return here.
         self.history.saved_version = self.history.version;

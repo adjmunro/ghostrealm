@@ -254,6 +254,12 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        // Text a command put aside for the system clipboard.
+        if let Some(text) = state.app.take_clipboard_text() {
+            if let Some(cb) = state.clipboard.as_mut() {
+                let _ = cb.set_text(text);
+            }
+        }
         match self.unsaved.settle(state.app.has_unsaved()) {
             Some(true) => reply_to_terminate(true),
             // Asked from outside the window (it may be minimised, or the app
@@ -1401,6 +1407,7 @@ impl State {
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
                 Request::Busy => self.app.mark_busy(sid),
+                Request::FileMenu { .. } => {}
             }
         }
     }
@@ -1434,7 +1441,9 @@ impl State {
 
     /// Go ahead with the open confirmation's action without saving.
     fn discard_confirm(&mut self) {
-        self.app.discard_confirm();
+        if let Err(e) = self.app.discard_confirm() {
+            eprintln!("ghostrealm: {e:#}");
+        }
         self.dirty = true;
         self.exit_if_quitting();
     }
@@ -2196,6 +2205,7 @@ impl State {
             Pick::ActiveRoot => "Set workspace directory",
             Pick::OpenWith(_) => "Open file",
             Pick::SaveAs(_) => "Save as",
+            Pick::SaveCopy(_) => "Save copy as",
         };
         let Some(view) = self.app.picker_mut() else {
             return;
@@ -2230,8 +2240,8 @@ impl State {
         let choice = view.choice();
         let verb = match purpose {
             Pick::OpenWith(_) => "Open",
-            Pick::SaveAs(_) if choice.as_ref().is_some_and(|p| p.exists()) => "Replace",
-            Pick::SaveAs(_) => "Save",
+            Pick::SaveAs(_) | Pick::SaveCopy(_) if choice.as_ref().is_some_and(|p| p.exists()) => "Replace",
+            Pick::SaveAs(_) | Pick::SaveCopy(_) => "Save",
             Pick::NewWorkspace | Pick::ActiveRoot => "Use",
         };
         let confirm = match &choice {

@@ -1,0 +1,838 @@
+//! The file commands (`file.*`) behind the file and folder context menu, and
+//! the same actions for "the focused file" from the palette and the agent
+//! channel. Each acts on a path argument, else on the focused view's
+//! [`subject`](crate::plugin::View::subject).
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry};
+
+use super::{AppState, Confirm, Confirmed, SurfaceId};
+use crate::file_menu::{self, FileAction, FileTarget, MenuEntry, MenuEnv};
+use crate::file_ops;
+use crate::plugins::editor;
+use crate::plugins::file_browser::{self, FileBrowserView};
+use crate::plugins::terminal;
+
+/// What Cut or Copy picked, for Paste.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileClip {
+    pub path: PathBuf,
+    /// Cut: pasting moves the entry instead of copying it.
+    pub cut: bool,
+}
+
+impl AppState {
+    /// Use `system` for the Trash, the file manager, and default apps.
+    pub fn with_system(mut self, system: Box<dyn file_ops::System>) -> Self {
+        self.system = system;
+        self
+    }
+
+    /// The file menu for `target`.
+    pub fn file_menu(&self, target: &FileTarget) -> Vec<MenuEntry> {
+        let env = MenuEnv {
+            in_git: git::repo_root(&target.path).is_some(),
+            can_paste: self.file_clip.is_some(),
+            reveal: cfg!(target_os = "macos"),
+        };
+        file_menu::entries(target, env)
+    }
+
+    /// What Cut or Copy last picked.
+    pub fn file_clip(&self) -> Option<&FileClip> {
+        self.file_clip.as_ref()
+    }
+
+    /// The text a command wants on the system clipboard, once.
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.clipboard_out.take()
+    }
+
+    /// The file or folder the focused view is about.
+    pub fn focused_subject(&self) -> Option<PathBuf> {
+        self.views.get(&self.focused_surface()?)?.subject()
+    }
+
+    /// `path` as given, else the focused view's subject.
+    fn subject_or(&self, path: Option<&str>) -> Result<PathBuf> {
+        match path {
+            Some(p) => Ok(PathBuf::from(p)),
+            None => self.focused_subject().context("no file is focused; give a path"),
+        }
+    }
+
+    /// `dir` as given, else the folder of the focused subject (a folder
+    /// itself, or a file's), else the workspace's directory.
+    fn dir_or(&self, dir: Option<&str>) -> Result<PathBuf> {
+        if let Some(d) = dir {
+            return Ok(PathBuf::from(d));
+        }
+        let folder_of = |p: PathBuf| if p.is_dir() { Some(p) } else { p.parent().map(Path::to_path_buf) };
+        let shown = self
+            .focused_surface()
+            .and_then(|sid| self.views.get(&sid))
+            .and_then(|v| v.downcast_ref::<FileBrowserView>())
+            .map(|b| b.tree().root().to_path_buf());
+        self.focused_subject()
+            .and_then(folder_of)
+            .or(shown)
+            .or_else(|| self.active().and_then(|vt| self.vtab_dir(vt)))
+            .context("no folder to use; give a dir")
+    }
+
+    /// Tell every view that files changed (`moved`: each `(from, to)`).
+    pub(super) fn changed(&mut self, moved: &[(PathBuf, PathBuf)]) {
+        for view in self.views.values_mut() {
+            view.files_changed(moved);
+        }
+        if let Some(clip) = &mut self.file_clip {
+            if let Some(path) = file_ops::follow(&clip.path, moved) {
+                clip.path = path;
+            }
+        }
+    }
+
+    /// Create the file or folder `name` in `dir`.
+    pub fn new_entry(&mut self, dir: &Path, name: &str, folder: bool) -> Result<PathBuf> {
+        let path = if folder { file_ops::create_dir(dir, name)? } else { file_ops::create_file(dir, name)? };
+        self.changed(&[]);
+        Ok(path)
+    }
+
+    /// Remember `path` for Paste; `cut` moves it there instead of copying.
+    pub fn clip_file(&mut self, path: &Path, cut: bool) {
+        self.file_clip = Some(FileClip { path: path.to_path_buf(), cut });
+    }
+
+    /// Paste what Cut or Copy picked into `dir`. Returns the new path.
+    pub fn paste_into(&mut self, dir: &Path) -> Result<PathBuf> {
+        let clip = self.file_clip.clone().context("nothing to paste: Cut or Copy a file first")?;
+        if !clip.path.exists() {
+            bail!("{} is gone", clip.path.display());
+        }
+        if clip.cut {
+            let dest = file_ops::move_into(&clip.path, dir)?;
+            self.file_clip = None;
+            let moved = if dest == clip.path { Vec::new() } else { vec![(clip.path, dest.clone())] };
+            self.changed(&moved);
+            Ok(dest)
+        } else {
+            let dest = file_ops::copy_into(&clip.path, dir)?;
+            self.changed(&[]);
+            Ok(dest)
+        }
+    }
+
+    /// Copy `path` next to itself. Returns the copy.
+    pub fn duplicate_path(&mut self, path: &Path) -> Result<PathBuf> {
+        let dest = file_ops::duplicate(path)?;
+        self.changed(&[]);
+        Ok(dest)
+    }
+
+    /// Rename `path` to `name`; views of it follow. Returns the new path.
+    pub fn rename_path(&mut self, path: &Path, name: &str) -> Result<PathBuf> {
+        let dest = file_ops::rename(path, name)?;
+        if dest != path {
+            self.changed(&[(path.to_path_buf(), dest.clone())]);
+        }
+        Ok(dest)
+    }
+
+    /// The directory relative paths are taken from: the active workspace's,
+    /// else `path`'s repository, else the current directory.
+    fn relative_root(&self, path: &Path) -> PathBuf {
+        self.active()
+            .and_then(|vt| self.vtab_dir(vt))
+            .filter(|root| path.starts_with(root))
+            .or_else(|| git::repo_root(path))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    /// Put `path` (relative to the workspace root when `relative`) on the
+    /// clipboard. Returns the text.
+    pub fn copy_path_text(&mut self, path: &Path, relative: bool) -> String {
+        let text = if relative {
+            file_ops::relative_to(path, &self.relative_root(path))
+        } else {
+            path.to_string_lossy().into_owned()
+        };
+        self.clipboard_out = Some(text.clone());
+        text
+    }
+
+    /// Add `path` to its repository's `.gitignore` (or `.git/info/exclude`).
+    /// Returns whether the file changed.
+    pub fn ignore_path(&mut self, path: &Path, exclude: bool) -> Result<bool> {
+        let changed = if exclude { file_ops::add_to_exclude(path)? } else { file_ops::add_to_gitignore(path)? };
+        self.changed(&[]);
+        Ok(changed)
+    }
+
+    /// Open a terminal in `dir` (a file's folder).
+    pub fn open_terminal_at(&mut self, path: &Path) -> Result<()> {
+        let dir = if path.is_dir() { path } else { path.parent().context("no folder")? };
+        self.open_plugin_in_focused_at(terminal::ID, Some(dir.to_path_buf()))
+    }
+
+    /// Show `path` in a file browser of the active workspace (focusing it), or
+    /// in a new one.
+    pub fn show_in_browser(&mut self, path: &Path) -> Result<()> {
+        let vt = self.active().context("no workspace")?;
+        let found = self.tree.vtab(vt).and_then(|v| {
+            v.panes().into_iter().find_map(|p| {
+                let i = p.surfaces.iter().position(|s| self.views.get(&s.id).is_some_and(|v| v.plugin() == file_browser::ID))?;
+                Some((p.id, i, p.surfaces[i].id))
+            })
+        });
+        let sid = match found {
+            Some((pane, index, sid)) => {
+                if let Some(v) = self.tree.vtab_mut(vt) {
+                    v.focused_pane = pane;
+                    if let Some(p) = v.pane_mut(pane) {
+                        p.active = index;
+                    }
+                }
+                sid
+            }
+            None => {
+                self.open_plugin_in_focused(file_browser::ID)?;
+                self.focused_surface().context("the file browser didn't open")?
+            }
+        };
+        let browser = self
+            .views
+            .get_mut(&sid)
+            .and_then(|v| v.downcast_mut::<FileBrowserView>())
+            .context("the file browser didn't open")?;
+        browser.reveal(path);
+        Ok(())
+    }
+
+    /// The editor surface showing `path`, the focused one if several do.
+    fn editor_of(&self, path: &Path) -> Option<SurfaceId> {
+        let shows = |sid: &SurfaceId| {
+            self.views.get(sid).is_some_and(|v| v.plugin() == editor::ID && v.path().as_deref() == Some(path))
+        };
+        self.focused_surface().filter(shows).or_else(|| {
+            self.tree
+                .vtabs()
+                .iter()
+                .flat_map(|v| v.panes())
+                .flat_map(|p| p.surfaces.iter().map(|s| s.id))
+                .find(shows)
+        })
+    }
+
+    /// Ask where to save a copy of the editor showing `path`.
+    pub fn save_copy_of(&mut self, path: &Path) -> Result<()> {
+        let sid = self.editor_of(path).with_context(|| format!("{} isn't open in an editor", path.display()))?;
+        self.open_save_copy(sid);
+        Ok(())
+    }
+
+    /// The surfaces whose views show `path` or something inside it.
+    fn surfaces_under(&self, path: &Path) -> Vec<SurfaceId> {
+        self.tree
+            .vtabs()
+            .iter()
+            .flat_map(|v| v.panes())
+            .flat_map(|p| p.surfaces.iter().map(|s| s.id))
+            .filter(|sid| self.views.get(sid).and_then(|v| v.path()).is_some_and(|p| p.starts_with(path)))
+            .collect()
+    }
+
+    /// Delete `path`: move it to the Trash and close the views of it. Asks
+    /// first unless git holds a copy of everything there (tracked and
+    /// unmodified); a view with unsaved changes asks the way closing does.
+    pub fn delete_path(&mut self, path: &Path) -> Result<()> {
+        if path.symlink_metadata().is_err() {
+            bail!("{} doesn't exist", path.display());
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let unsaved: Vec<SurfaceId> = if self.guard_unsaved {
+            self.surfaces_under(path).into_iter().filter(|s| self.views.get(s).is_some_and(|v| v.modified())).collect()
+        } else {
+            Vec::new()
+        };
+        if !unsaved.is_empty() {
+            let (message, save, can_save) = self.unsaved_question(&unsaved);
+            self.confirm = Some(Confirm {
+                message: format!("{message} Move \u{201c}{name}\u{201d} to the Trash?"),
+                accept: can_save.then_some("Save and Delete"),
+                discard: Some("Delete Without Saving"),
+                then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save },
+            });
+        } else if !git::is_tracked_clean(path) {
+            self.confirm = Some(Confirm {
+                message: format!("Move \u{201c}{name}\u{201d} to the Trash?"),
+                accept: Some("Delete"),
+                discard: None,
+                then: Confirmed::Trash(path.to_path_buf()),
+            });
+        } else {
+            self.trash_now(path)?;
+        }
+        Ok(())
+    }
+
+    /// Move `path` to the Trash and close the views of it.
+    pub(super) fn trash_now(&mut self, path: &Path) -> Result<()> {
+        let open = self.surfaces_under(path);
+        self.system.trash(path).with_context(|| format!("can't move {} to the Trash", path.display()))?;
+        for sid in open {
+            let place = self.tree.vtabs().iter().find_map(|v| {
+                v.panes().into_iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
+            });
+            if let Some((vt, pane)) = place {
+                self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid));
+            }
+        }
+        self.changed(&[]);
+        Ok(())
+    }
+}
+
+fn failed(e: anyhow::Error) -> CmdError {
+    CmdError::Failed(format!("{e:#}"))
+}
+
+fn path_arg() -> ArgSpec {
+    ArgSpec::optional("path", ArgKind::Str, "the file or folder (the focused one unless given)")
+}
+
+fn dir_arg() -> ArgSpec {
+    ArgSpec::optional("dir", ArgKind::Str, "the folder (the focused file's folder unless given)")
+}
+
+/// Register the `file.*` commands.
+pub(super) fn register(r: &mut Registry<AppState>) {
+    let mut path_command = |action: FileAction, description: &'static str, run: fn(&mut AppState, &Path) -> Result<String>| {
+        r.register(
+            CommandMeta::new(action.command(), action.title(), description).arg(path_arg()),
+            Box::new(move |s: &mut AppState, a| {
+                let path = s.subject_or(a.opt_str("path")).map_err(failed)?;
+                let msg = run(s, &path).map_err(failed)?;
+                Ok(if msg.is_empty() { CmdOutcome::ok() } else { CmdOutcome::msg(msg) })
+            }),
+        );
+    };
+    path_command(FileAction::Reveal, "Show a file or folder in the system file manager", |s, p| {
+        s.system.reveal(p).map(|()| String::new())
+    });
+    path_command(FileAction::OpenDefault, "Open a file or folder with its default application", |s, p| {
+        s.system.open_default(p).map(|()| String::new())
+    });
+    path_command(FileAction::OpenInTerminal, "Open a new terminal in a folder (a file's folder)", |s, p| {
+        s.open_terminal_at(p).map(|()| String::new())
+    });
+    path_command(FileAction::ShowInBrowser, "Show a file in a file browser", |s, p| {
+        s.show_in_browser(p).map(|()| String::new())
+    });
+    path_command(FileAction::Cut, "Cut a file or folder, to move it with Paste", |s, p| {
+        s.clip_file(p, true);
+        Ok(String::new())
+    });
+    path_command(FileAction::Copy, "Copy a file or folder, to copy it with Paste", |s, p| {
+        s.clip_file(p, false);
+        Ok(String::new())
+    });
+    path_command(FileAction::Duplicate, "Copy a file or folder next to itself", |s, p| {
+        s.duplicate_path(p).map(|d| format!("duplicated to {}", d.display()))
+    });
+    path_command(FileAction::CopyPath, "Copy a file's absolute path to the clipboard", |s, p| {
+        Ok(s.copy_path_text(p, false))
+    });
+    path_command(FileAction::CopyRelativePath, "Copy a file's path relative to the workspace root", |s, p| {
+        Ok(s.copy_path_text(p, true))
+    });
+    path_command(FileAction::AddToGitignore, "Add a file or folder to its repository's .gitignore", |s, p| {
+        s.ignore_path(p, false).map(|changed| if changed { "added".into() } else { "already ignored".into() })
+    });
+    path_command(FileAction::AddToExclude, "Add a file or folder to its repository's .git/info/exclude", |s, p| {
+        s.ignore_path(p, true).map(|changed| if changed { "added".into() } else { "already excluded".into() })
+    });
+    path_command(FileAction::SaveCopyAs, "Save a copy of an open editor's file to a file chosen in a picker", |s, p| {
+        s.save_copy_of(p).map(|()| String::new())
+    });
+    path_command(
+        FileAction::Delete,
+        "Move a file or folder to the Trash, asking first unless git holds a copy; closes its editors",
+        |s, p| s.delete_path(p).map(|()| String::new()),
+    );
+
+    for (action, folder, description) in [
+        (FileAction::NewFile, false, "Create an empty file in a folder"),
+        (FileAction::NewFolder, true, "Create a folder in a folder"),
+    ] {
+        r.register(
+            CommandMeta::new(action.command(), action.title(), description)
+                .arg(ArgSpec::required("name", ArgKind::Str, "the new name"))
+                .arg(dir_arg()),
+            Box::new(move |s: &mut AppState, a| {
+                let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
+                let path = s.new_entry(&dir, a.get_str("name")?, folder).map_err(failed)?;
+                Ok(CmdOutcome::msg(format!("created {}", path.display())))
+            }),
+        );
+    }
+    r.register(
+        CommandMeta::new(
+            FileAction::Paste.command(),
+            FileAction::Paste.title(),
+            "Paste the cut or copied file or folder into a folder",
+        )
+        .arg(dir_arg()),
+        Box::new(|s: &mut AppState, a| {
+            let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
+            let path = s.paste_into(&dir).map_err(failed)?;
+            Ok(CmdOutcome::msg(format!("pasted {}", path.display())))
+        }),
+    );
+    r.register(
+        CommandMeta::new(FileAction::Rename.command(), FileAction::Rename.title(), "Rename a file or folder")
+            .arg(ArgSpec::required("name", ArgKind::Str, "the new name"))
+            .arg(path_arg()),
+        Box::new(|s: &mut AppState, a| {
+            let path = s.subject_or(a.opt_str("path")).map_err(failed)?;
+            let path = s.rename_path(&path, a.get_str("name")?).map_err(failed)?;
+            Ok(CmdOutcome::msg(format!("renamed to {}", path.display())))
+        }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use ghostrealm_core::{Args, Value};
+
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::app_state::{build_registry, Pick};
+    use crate::file_ops::tests::FakeSystem;
+    use crate::file_menu::{Kind, Origin};
+    use crate::plugin::testing::tmpdir;
+    use crate::plugin::View;
+    use crate::plugins::editor::EditorView;
+
+    type Calls = Rc<RefCell<Vec<String>>>;
+
+    fn app_with(fail_trash: bool) -> (AppState, Calls) {
+        let calls = Calls::default();
+        let system = FakeSystem { calls: calls.clone(), fail_trash };
+        let mut s = AppState::new().with_shell_line("sleep 1").with_system(Box::new(system));
+        s.new_empty_vtab();
+        (s, calls)
+    }
+
+    fn app() -> (AppState, Calls) {
+        app_with(false)
+    }
+
+    fn run(s: &mut AppState, id: &str, args: &[(&str, &Path)]) -> Result<CmdOutcome, CmdError> {
+        let mut a = Args::new();
+        for (k, v) in args {
+            a.insert(k, Value::Str(v.to_string_lossy().into_owned()));
+        }
+        build_registry().execute(id, &a, s)
+    }
+
+    fn open_editor(s: &mut AppState, path: &Path) -> SurfaceId {
+        s.open_path_with_in_focused(editor::ID, path).unwrap();
+        s.focused_surface().unwrap()
+    }
+
+    fn editor_path(s: &AppState, sid: SurfaceId) -> Option<PathBuf> {
+        s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).and_then(|e| e.buffer().path.clone())
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().is_ok_and(|o| o.status.success())
+    }
+
+    /// A repository holding `tracked.txt`, committed; `None` without git.
+    fn repo(tag: &str) -> Option<PathBuf> {
+        let d = tmpdir(tag);
+        if !git_ok(&d, &["init", "-q"]) {
+            return None;
+        }
+        std::fs::write(d.join("tracked.txt"), "t\n").unwrap();
+        assert!(git_ok(&d, &["add", "-A"]));
+        assert!(git_ok(
+            &d,
+            &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "c"]
+        ));
+        Some(d)
+    }
+
+    #[test]
+    fn every_menu_action_is_a_registered_command() {
+        let r = build_registry();
+        for a in [
+            FileAction::NewFile, FileAction::NewFolder, FileAction::Reveal, FileAction::ShowInBrowser,
+            FileAction::OpenDefault, FileAction::OpenInTerminal, FileAction::Cut, FileAction::Copy,
+            FileAction::Paste, FileAction::Duplicate, FileAction::CopyPath, FileAction::CopyRelativePath,
+            FileAction::AddToGitignore, FileAction::AddToExclude, FileAction::Rename, FileAction::SaveCopyAs,
+            FileAction::Delete,
+        ] {
+            assert!(r.contains(a.command()), "{}", a.command());
+        }
+        assert_eq!(ghostrealm_core::Config::default().binding("cmd+shift+c").as_deref(), Some("file.copy_path"));
+    }
+
+    #[test]
+    fn the_menu_offers_paste_once_something_is_cut_or_copied_and_ignores_only_in_git() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-menu");
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        let target = FileTarget { path: d.join("a.txt"), kind: Kind::File, origin: Origin::Browser };
+        let has = |s: &AppState, a| s.file_menu(&target).contains(&MenuEntry::Item(a));
+        assert!(!has(&s, FileAction::Paste));
+        run(&mut s, "file.copy", &[("path", &d.join("a.txt"))]).unwrap();
+        assert!(has(&s, FileAction::Paste));
+        if git::repo_root(&d).is_none() {
+            assert!(!has(&s, FileAction::AddToGitignore), "not in a repository");
+        }
+        if let Some(r) = repo("fm-menu-git") {
+            let t = FileTarget { path: r.join("tracked.txt"), ..target };
+            assert!(s.file_menu(&t).contains(&MenuEntry::Item(FileAction::AddToGitignore)));
+        }
+    }
+
+    #[test]
+    fn new_files_and_folders_are_created_in_the_given_folder() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-new");
+        run(&mut s, "file.new_file", &[("dir", &d), ("name", Path::new("a.txt"))]).unwrap();
+        run(&mut s, "file.new_folder", &[("dir", &d), ("name", Path::new("sub"))]).unwrap();
+        assert!(d.join("a.txt").is_file() && d.join("sub").is_dir());
+        assert!(run(&mut s, "file.new_file", &[("dir", &d), ("name", Path::new("a.txt"))]).is_err(), "exists");
+        assert!(run(&mut s, "file.new_file", &[("dir", &d), ("name", Path::new("x/y"))]).is_err(), "nested name");
+        // A menu target maps to the command's arguments: a file's folder, a folder itself.
+        let file = FileTarget { path: d.join("a.txt"), kind: Kind::File, origin: Origin::Editor };
+        assert_eq!(FileAction::Paste.args(&file).get_str("dir").unwrap(), d.to_str().unwrap());
+        assert_eq!(FileAction::Delete.args(&file).get_str("path").unwrap(), d.join("a.txt").to_str().unwrap());
+    }
+
+    #[test]
+    fn new_entries_default_to_the_focused_files_folder() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-new-default");
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        open_editor(&mut s, &d.join("a.txt"));
+        let args = Args::new().with("name", Value::Str("b.txt".into()));
+        build_registry().execute("file.new_file", &args, &mut s).unwrap();
+        assert!(d.join("b.txt").is_file());
+    }
+
+    #[test]
+    fn duplicate_copy_and_cut_paste_work_on_the_filesystem() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-paste");
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        run(&mut s, "file.duplicate", &[("path", &d.join("a.txt"))]).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("a copy.txt")).unwrap(), "A");
+        // Copy then paste twice: the clipboard keeps the file.
+        run(&mut s, "file.copy", &[("path", &d.join("a.txt"))]).unwrap();
+        run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert!(d.join("to/a.txt").is_file() && d.join("to/a copy.txt").is_file() && d.join("a.txt").is_file());
+        // Cut then paste moves it, once.
+        run(&mut s, "file.cut", &[("path", &d.join("a copy.txt"))]).unwrap();
+        run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert!(!d.join("a copy.txt").exists());
+        assert!(d.join("to/a copy 2.txt").is_file(), "a taken name gets a suffix");
+        assert!(run(&mut s, "file.paste", &[("dir", &d.join("to"))]).is_err(), "the cut was spent");
+        assert!(s.file_clip().is_none());
+    }
+
+    #[test]
+    fn pasting_with_nothing_cut_or_copied_says_so() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-paste-empty");
+        let err = run(&mut s, "file.paste", &[("dir", &d)]).unwrap_err();
+        assert!(err.to_string().contains("nothing to paste"), "{err}");
+    }
+
+    #[test]
+    fn renaming_an_open_file_repoints_its_editor_and_a_folder_its_contents() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-rename");
+        std::fs::create_dir(d.join("dir")).unwrap();
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        std::fs::write(d.join("dir/in.txt"), "I").unwrap();
+        let a = open_editor(&mut s, &d.join("a.txt"));
+        let inner = open_editor(&mut s, &d.join("dir/in.txt"));
+        run(&mut s, "file.rename", &[("path", &d.join("a.txt")), ("name", Path::new("b.txt"))]).unwrap();
+        assert!(d.join("b.txt").is_file() && !d.join("a.txt").exists());
+        assert_eq!(editor_path(&s, a), Some(d.join("b.txt")));
+        s.pump_all();
+        assert_eq!(s.tree.vtabs()[0].panes()[0].surfaces[0].title, "b.txt", "the tab follows");
+        run(&mut s, "file.rename", &[("path", &d.join("dir")), ("name", Path::new("renamed"))]).unwrap();
+        assert_eq!(editor_path(&s, inner), Some(d.join("renamed/in.txt")));
+        // A taken name changes nothing.
+        assert!(run(&mut s, "file.rename", &[("path", &d.join("b.txt")), ("name", Path::new("renamed"))]).is_err());
+        assert_eq!(editor_path(&s, a), Some(d.join("b.txt")));
+        // The renamed editor saves to the new place.
+        let v = s.view_mut(a).and_then(|v| v.downcast_mut::<EditorView>()).unwrap();
+        v.buffer_mut().insert_str("x");
+        assert!(v.buffer_mut().save().unwrap());
+        assert!(std::fs::read_to_string(d.join("b.txt")).unwrap().starts_with('x'));
+        assert!(!d.join("a.txt").exists());
+    }
+
+    #[test]
+    fn cut_paste_of_an_open_file_repoints_its_editor() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-cut-open");
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let a = open_editor(&mut s, &d.join("a.txt"));
+        run(&mut s, "file.cut", &[("path", &d.join("a.txt"))]).unwrap();
+        run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert_eq!(editor_path(&s, a), Some(d.join("to/a.txt")));
+    }
+
+    #[test]
+    fn copy_path_puts_the_absolute_or_workspace_relative_path_on_the_clipboard() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-copy-path");
+        std::fs::create_dir(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a.rs"), "").unwrap();
+        s.set_active_root_dir(&d);
+        let file = d.join("src/a.rs");
+        run(&mut s, "file.copy_path", &[("path", &file)]).unwrap();
+        assert_eq!(s.take_clipboard_text().as_deref(), file.to_str());
+        assert_eq!(s.take_clipboard_text(), None, "taken once");
+        run(&mut s, "file.copy_relative_path", &[("path", &file)]).unwrap();
+        assert_eq!(s.take_clipboard_text().as_deref(), Some("src/a.rs"));
+        // With no path, the focused editor's file.
+        open_editor(&mut s, &file);
+        build_registry().execute("file.copy_path", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.take_clipboard_text().as_deref(), file.to_str());
+    }
+
+    #[test]
+    fn copy_path_with_nothing_focused_fails_clearly() {
+        let (mut s, _) = app();
+        let err = build_registry().execute("file.copy_path", &Args::new(), &mut s).unwrap_err();
+        assert!(err.to_string().contains("no file is focused"), "{err}");
+    }
+
+    #[test]
+    fn ignore_commands_append_to_gitignore_and_the_exclude_file_without_duplicating() {
+        let Some(r) = repo("fm-ignore") else { return };
+        let (mut s, _) = app();
+        std::fs::create_dir(r.join("out")).unwrap();
+        std::fs::write(r.join("out/x"), "").unwrap();
+        for _ in 0..2 {
+            run(&mut s, "file.add_to_gitignore", &[("path", &r.join("out"))]).unwrap();
+            run(&mut s, "file.add_to_git_exclude", &[("path", &r.join("tracked.txt"))]).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(r.join(".gitignore")).unwrap(), "/out/\n");
+        let exclude = std::fs::read_to_string(r.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|l| *l == "/tracked.txt").count(), 1);
+        let loose = tmpdir("fm-ignore-loose");
+        std::fs::write(loose.join("f"), "").unwrap();
+        if git::repo_root(&loose).is_none() {
+            assert!(run(&mut s, "file.add_to_gitignore", &[("path", &loose.join("f"))]).is_err());
+        }
+    }
+
+    #[test]
+    fn reveal_and_open_default_go_through_the_system() {
+        let (mut s, calls) = app();
+        let d = tmpdir("fm-system");
+        std::fs::write(d.join("a.txt"), "").unwrap();
+        run(&mut s, "file.reveal", &[("path", &d.join("a.txt"))]).unwrap();
+        run(&mut s, "file.open_default", &[("path", &d.join("a.txt"))]).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [format!("reveal {}", d.join("a.txt").display()), format!("open {}", d.join("a.txt").display())]
+        );
+    }
+
+    #[test]
+    fn open_in_terminal_starts_a_terminal_in_the_folder() {
+        let mut s = AppState::new().with_shell_line("pwd; sleep 2");
+        s.new_empty_vtab();
+        let d = tmpdir("fm-terminal").join("here-dir");
+        std::fs::create_dir_all(&d).unwrap();
+        run(&mut s, "file.open_in_terminal", &[("path", &d)]).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert_eq!(s.view(sid).map(|v| v.plugin()), Some(terminal::ID));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while Instant::now() < deadline && !text.contains("here-dir") {
+            text = s.surface_text(sid).unwrap_or_default();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(text.contains("here-dir"), "the shell started in the folder; got:\n{text}");
+        // A file means its folder.
+        let f = d.join("f.txt");
+        std::fs::write(&f, "").unwrap();
+        run(&mut s, "file.open_in_terminal", &[("path", &f)]).unwrap();
+        assert_ne!(s.focused_surface(), Some(sid), "another terminal");
+    }
+
+    #[test]
+    fn show_in_file_browser_opens_one_on_the_file_then_reuses_it() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-show");
+        std::fs::create_dir_all(d.join("deep/er")).unwrap();
+        std::fs::write(d.join("deep/er/f.txt"), "").unwrap();
+        s.set_active_root_dir(&d);
+        let editor = open_editor(&mut s, &d.join("deep/er/f.txt"));
+        run(&mut s, "file.show_in_browser", &[("path", &d.join("deep/er/f.txt"))]).unwrap();
+        let browser = s.focused_surface().unwrap();
+        assert_ne!(browser, editor);
+        let view = s.view(browser).and_then(|v| v.downcast_ref::<FileBrowserView>()).unwrap();
+        assert_eq!(view.subject(), Some(d.join("deep/er/f.txt")), "selected");
+        assert!(view.tree().is_expanded(&d.join("deep")) && view.tree().is_expanded(&d.join("deep/er")));
+        // Focus elsewhere, ask again: the same browser comes back, no new tab.
+        let vt = s.active().unwrap();
+        let pane = s.tree.vtab(vt).unwrap().focused_pane;
+        s.tree.vtab_mut(vt).unwrap().pane_mut(pane).unwrap().active = 0;
+        let before = s.tree.surface_count();
+        run(&mut s, "file.show_in_browser", &[("path", &d.join("deep/er/f.txt"))]).unwrap();
+        assert_eq!(s.tree.surface_count(), before);
+        assert_eq!(s.focused_surface(), Some(browser));
+    }
+
+    #[test]
+    fn save_copy_as_writes_a_copy_and_leaves_the_buffer_alone() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-copy-as");
+        std::fs::write(d.join("a.txt"), "A\n").unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("edit ");
+        run(&mut s, "file.save_copy_as", &[("path", &d.join("a.txt"))]).unwrap();
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy(sid)));
+        s.confirm_picker_with(d.join("sub/copy.txt")).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("sub/copy.txt")).unwrap(), "edit A\n", "the unsaved text");
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "A\n", "the original is untouched");
+        assert_eq!(editor_path(&s, sid), Some(d.join("a.txt")), "not re-pointed");
+        assert!(s.view(sid).unwrap().modified(), "still unsaved");
+        // Copying onto an existing file asks first, even onto the buffer's own.
+        run(&mut s, "file.save_copy_as", &[("path", &d.join("a.txt"))]).unwrap();
+        assert_eq!(s.confirm_picker_with(d.join("a.txt")).unwrap(), None);
+        assert!(s.confirm().is_some());
+        // Only an open editor can be copied.
+        assert!(run(&mut s, "file.save_copy_as", &[("path", &d.join("nope.txt"))]).is_err());
+    }
+
+    #[test]
+    fn deleting_an_untracked_file_confirms_then_trashes_it_and_closes_its_editor() {
+        let (mut s, calls) = app();
+        let d = tmpdir("fm-delete");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        open_editor(&mut s, &d.join("a.txt"));
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        let c = s.confirm().expect("not in git: ask first");
+        assert_eq!(c.accept, Some("Delete"));
+        assert!(c.message.contains("a.txt"));
+        assert!(d.join("a.txt").exists() && calls.borrow().is_empty(), "nothing yet");
+        s.cancel_confirm();
+        assert!(d.join("a.txt").exists());
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        s.accept_confirm().unwrap();
+        assert_eq!(*calls.borrow(), [format!("trash {}", d.join("a.txt").display())]);
+        assert!(!d.join("a.txt").exists());
+        assert_eq!(s.views().count(), 0, "the editor closed like Cmd+W");
+        assert!(s.confirm().is_none());
+    }
+
+    #[test]
+    fn deleting_a_tracked_unmodified_file_needs_no_confirmation() {
+        let Some(r) = repo("fm-delete-git") else { return };
+        let (mut s, calls) = app();
+        open_editor(&mut s, &r.join("tracked.txt"));
+        run(&mut s, "file.delete", &[("path", &r.join("tracked.txt"))]).unwrap();
+        assert!(s.confirm().is_none());
+        assert_eq!(*calls.borrow(), [format!("trash {}", r.join("tracked.txt").display())]);
+        assert_eq!(s.views().count(), 0);
+    }
+
+    #[test]
+    fn deleting_a_tracked_file_with_changes_or_a_folder_with_untracked_files_confirms() {
+        let Some(r) = repo("fm-delete-dirty") else { return };
+        let (mut s, calls) = app();
+        std::fs::write(r.join("tracked.txt"), "changed\n").unwrap();
+        run(&mut s, "file.delete", &[("path", &r.join("tracked.txt"))]).unwrap();
+        assert!(s.confirm().is_some(), "modified");
+        s.cancel_confirm();
+        std::fs::write(r.join("tracked.txt"), "t\n").unwrap();
+        std::fs::create_dir(r.join("sub")).unwrap();
+        std::fs::write(r.join("sub/new.txt"), "n").unwrap();
+        run(&mut s, "file.delete", &[("path", &r.join("sub"))]).unwrap();
+        assert!(s.confirm().is_some(), "untracked");
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_folder_closes_the_editors_inside_it() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-delete-dir");
+        std::fs::create_dir(d.join("dir")).unwrap();
+        std::fs::write(d.join("dir/a.txt"), "A").unwrap();
+        std::fs::write(d.join("keep.txt"), "K").unwrap();
+        open_editor(&mut s, &d.join("dir/a.txt"));
+        open_editor(&mut s, &d.join("keep.txt"));
+        run(&mut s, "file.delete", &[("path", &d.join("dir"))]).unwrap();
+        s.accept_confirm().unwrap();
+        assert!(!d.join("dir").exists());
+        let open: Vec<_> = s.views().filter_map(|(_, v)| v.path()).collect();
+        assert_eq!(open, [d.join("keep.txt")]);
+    }
+
+    #[test]
+    fn deleting_a_file_with_unsaved_changes_asks_the_unsaved_question() {
+        let calls = Calls::default();
+        let mut s = AppState::new()
+            .with_unsaved_guard()
+            .with_shell_line("sleep 1")
+            .with_system(Box::new(FakeSystem { calls: calls.clone(), fail_trash: false }));
+        s.new_empty_vtab();
+        let d = tmpdir("fm-delete-unsaved");
+        std::fs::write(d.join("a.txt"), "A\n").unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        let c = s.confirm().unwrap();
+        assert_eq!((c.accept, c.discard), (Some("Save and Delete"), Some("Delete Without Saving")));
+        assert!(c.message.contains("unsaved changes"));
+        s.cancel_confirm();
+        assert!(calls.borrow().is_empty() && s.view(sid).is_some(), "Cancel changes nothing");
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        s.discard_confirm().unwrap();
+        assert_eq!(*calls.borrow(), [format!("trash {}", d.join("a.txt").display())]);
+        assert!(s.view(sid).is_none(), "closed without saving");
+    }
+
+    #[test]
+    fn a_failing_trash_keeps_the_file_and_its_editor() {
+        let (mut s, calls) = app_with(true);
+        let d = tmpdir("fm-delete-fail");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        let err = s.accept_confirm().unwrap_err();
+        assert!(format!("{err:#}").contains("no Trash here"), "{err:#}");
+        assert!(d.join("a.txt").exists() && s.view(sid).is_some() && calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn deleting_something_missing_fails_without_asking() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-delete-missing");
+        assert!(run(&mut s, "file.delete", &[("path", &d.join("nope"))]).is_err());
+        assert!(s.confirm().is_none());
+    }
+}

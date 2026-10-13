@@ -168,6 +168,10 @@ pub trait View: Any {
     /// if the cursor leaves the view. `Move` is hover with no button held.
     fn mouse(&mut self, _cx: &mut EventCx, _event: &MouseEvent) {}
 
+    /// A right-click at `pos` inside the view. A view with a context menu
+    /// files [`Request::FileMenu`].
+    fn context_menu(&mut self, _cx: &mut EventCx, _pos: (f32, f32)) {}
+
     /// Wheel/trackpad scroll over the view, in physical pixels. Positive `dy`
     /// means the content should move down (reveal what is above).
     fn scroll(&mut self, _cx: &mut EventCx, _pos: (f32, f32), _dx: f32, _dy: f32) {}
@@ -225,10 +229,27 @@ pub trait View: Any {
         None
     }
 
+    /// The file or folder the view is about, for the file commands that act on
+    /// "the focused file": its [`path`](Self::path), unless it knows better
+    /// (the file browser's selected entry).
+    fn subject(&self) -> Option<PathBuf> {
+        self.path()
+    }
+
     /// Write the view to `path` and make it the view's file (Save As).
     fn save_as(&mut self, _path: PathBuf) -> Result<()> {
         anyhow::bail!("{} views can't be saved", self.plugin())
     }
+
+    /// Write the view to `path` and leave it showing its own file (Save Copy As).
+    fn save_copy(&mut self, _path: PathBuf) -> Result<()> {
+        anyhow::bail!("{} views can't be saved", self.plugin())
+    }
+
+    /// Files changed on disk by the app itself (new, moved, renamed): `moved`
+    /// lists each `(from, to)`. A listing re-reads; a view showing a moved file
+    /// follows it.
+    fn files_changed(&mut self, _moved: &[(PathBuf, PathBuf)]) {}
 
     /// Raw input from the agent channel. Returns whether the view accepts it.
     fn write_input(&mut self, _bytes: &[u8]) -> bool {

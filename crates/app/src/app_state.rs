@@ -20,11 +20,15 @@ use ghostrealm_core::{
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
+use crate::file_ops::{HostSystem, System};
 use crate::languages::same_file;
 use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor;
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
+
+mod files;
+pub use files::FileClip;
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
@@ -50,6 +54,8 @@ pub enum Pick {
     OpenWith(&'static str),
     /// Save this surface's view to a file ([`View::save_as`]).
     SaveAs(SurfaceId),
+    /// Save a copy of this surface's view to a file ([`View::save_copy`]).
+    SaveCopy(SurfaceId),
 }
 
 impl Pick {
@@ -58,7 +64,7 @@ impl Pick {
         match self {
             Pick::ActiveRoot | Pick::NewWorkspace => Mode::PickDir,
             Pick::OpenWith(_) => Mode::PickFile,
-            Pick::SaveAs(_) => Mode::Save,
+            Pick::SaveAs(_) | Pick::SaveCopy(_) => Mode::Save,
         }
     }
 }
@@ -85,6 +91,11 @@ enum Confirmed {
     Pick(std::path::PathBuf),
     /// Leave, after saving `save` (accept) or without saving (discard).
     Unsaved { what: Leave, save: Vec<SurfaceId> },
+    /// Move this path to the Trash.
+    Trash(std::path::PathBuf),
+    /// Move this path to the Trash, after saving `save` (accept) or without
+    /// saving (discard) the open views of it.
+    UnsavedTrash { path: std::path::PathBuf, save: Vec<SurfaceId> },
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -138,6 +149,12 @@ pub struct AppState {
     /// The vtab most recently auto-read by dwell, and when — for the unfocus grace
     /// (leaving too soon after an auto-read reverts it to unread).
     last_auto_read: Option<(VtabId, Instant)>,
+    /// The Trash, the file manager, and the default apps.
+    system: Box<dyn System>,
+    /// The file Cut or Copy picked, for Paste.
+    file_clip: Option<FileClip>,
+    /// Text a command wants on the system clipboard, until the window takes it.
+    clipboard_out: Option<String>,
 }
 
 impl AppState {
@@ -159,6 +176,9 @@ impl AppState {
             default_dir: None,
             focus_started: Instant::now(),
             last_auto_read: None,
+            system: Box::new(HostSystem),
+            file_clip: None,
+            clipboard_out: None,
         }
     }
 
@@ -509,6 +529,16 @@ impl AppState {
     /// Ask where to save surface `sid`'s view: the picker, beside the view's
     /// file and named after it when it has one.
     pub fn open_save_as(&mut self, sid: SurfaceId) {
+        self.open_save_dialog(sid, Pick::SaveAs(sid));
+    }
+
+    /// Ask where to save a copy of surface `sid`'s view ([`Self::open_save_as`]
+    /// without re-pointing the view).
+    pub fn open_save_copy(&mut self, sid: SurfaceId) {
+        self.open_save_dialog(sid, Pick::SaveCopy(sid));
+    }
+
+    fn open_save_dialog(&mut self, sid: SurfaceId, purpose: Pick) {
         let file = self.view(sid).and_then(|v| v.path());
         let root = file
             .as_deref()
@@ -519,7 +549,7 @@ impl AppState {
         if let Some(name) = file.as_deref().and_then(Path::file_name) {
             browser.set_name(name.to_string_lossy());
         }
-        self.picker = Some((browser, Pick::SaveAs(sid)));
+        self.picker = Some((browser, purpose));
     }
 
     /// Close the floating picker.
@@ -545,21 +575,21 @@ impl AppState {
             return Ok(Vec::new());
         }
         match self.confirm.take() {
+            Some(Confirm { then: Confirmed::Trash(path), .. }) => {
+                self.trash_now(&path)?;
+                Ok(Vec::new())
+            }
+            Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
+                self.save_views(&save)?;
+                self.trash_now(&path)?;
+                Ok(Vec::new())
+            }
             Some(Confirm { then: Confirmed::Pick(path), .. }) => {
                 Ok(self.finish_picker(path)?.into_iter().collect())
             }
             Some(Confirm { then: Confirmed::Unsaved { what, save }, .. }) => {
                 // Nothing is closed unless every save worked.
-                let mut written = Vec::new();
-                for sid in save {
-                    let view = self
-                        .views
-                        .get_mut(&sid)
-                        .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
-                    let Some(path) = view.path() else { continue };
-                    view.save_as(path.clone())?;
-                    written.push(path);
-                }
+                let written = self.save_views(&save)?;
                 self.perform(what);
                 Ok(written)
             }
@@ -567,15 +597,33 @@ impl AppState {
         }
     }
 
+    /// Save each of `surfaces` to its own file. Returns the files written.
+    fn save_views(&mut self, surfaces: &[SurfaceId]) -> Result<Vec<std::path::PathBuf>> {
+        let mut written = Vec::new();
+        for sid in surfaces {
+            let view = self
+                .views
+                .get_mut(sid)
+                .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+            let Some(path) = view.path() else { continue };
+            view.save_as(path.clone())?;
+            written.push(path);
+        }
+        Ok(written)
+    }
+
     /// Go ahead with the confirmed action without its saving. Does nothing
     /// unless the question has a discard button.
-    pub fn discard_confirm(&mut self) {
+    pub fn discard_confirm(&mut self) -> Result<()> {
         if !self.confirm.as_ref().is_some_and(|c| c.discard.is_some()) {
-            return;
+            return Ok(());
         }
-        if let Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) = self.confirm.take() {
-            self.perform(what);
+        match self.confirm.take() {
+            Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
+            Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
+            _ => {}
         }
+        Ok(())
     }
 
     /// Ask before closing or quitting over unsaved changes ([`Self::confirm`]).
@@ -617,9 +665,10 @@ impl AppState {
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
-        if let Some((_, Pick::SaveAs(sid))) = &self.picker {
+        if let Some((_, Pick::SaveAs(sid) | Pick::SaveCopy(sid))) = &self.picker {
             let own = self.view(*sid).and_then(|v| v.path());
-            if path.is_file() && own.as_deref() != Some(path.as_path()) {
+            let copy = matches!(self.picker, Some((_, Pick::SaveCopy(_))));
+            if path.is_file() && (copy || own.as_deref() != Some(path.as_path())) {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.confirm = Some(Confirm {
                     message: format!("\u{201c}{name}\u{201d} already exists. Replace it?"),
@@ -653,6 +702,15 @@ impl AppState {
                 if let Some(t) = view.title() {
                     self.tree.set_surface_title(sid, t, false);
                 }
+                return Ok(Some(path));
+            }
+            Pick::SaveCopy(sid) => {
+                let view = self
+                    .views
+                    .get_mut(&sid)
+                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+                view.save_copy(path.clone())?;
+                self.changed(&[]);
                 return Ok(Some(path));
             }
         }
@@ -844,11 +902,27 @@ impl AppState {
     /// with no file has nowhere to save silently, so with one among them there
     /// is no save button.
     fn ask_unsaved(&mut self, what: Leave, unsaved: Vec<SurfaceId>) {
+        let (message, save, can_save) = self.unsaved_question(&unsaved);
+        let (accept, discard) = match what {
+            Leave::Quit => ("Save and Quit", "Quit Without Saving"),
+            _ => ("Save and Close", "Close Without Saving"),
+        };
+        self.confirm = Some(Confirm {
+            message,
+            accept: can_save.then_some(accept),
+            discard: Some(discard),
+            then: Confirmed::Unsaved { what, save },
+        });
+    }
+
+    /// The unsaved-changes message for `unsaved`, the surfaces that can be
+    /// saved to their file, and whether all of them can.
+    fn unsaved_question(&self, unsaved: &[SurfaceId]) -> (String, Vec<SurfaceId>, bool) {
         let (save, scratch): (Vec<_>, Vec<_>) = unsaved
             .iter()
             .copied()
             .partition(|id| self.views.get(id).and_then(|v| v.path()).is_some());
-        let subject = match unsaved.as_slice() {
+        let subject = match unsaved {
             [one] => {
                 let name = self.views.get(one).and_then(|v| v.title()).unwrap_or_default();
                 format!("\u{201c}{name}\u{201d} has")
@@ -859,16 +933,7 @@ impl AppState {
         if !scratch.is_empty() {
             message.push_str(" A buffer with no file can't be saved here and would be lost.");
         }
-        let (accept, discard) = match what {
-            Leave::Quit => ("Save and Quit", "Quit Without Saving"),
-            _ => ("Save and Close", "Close Without Saving"),
-        };
-        self.confirm = Some(Confirm {
-            message,
-            accept: scratch.is_empty().then_some(accept),
-            discard: Some(discard),
-            then: Confirmed::Unsaved { what, save },
-        });
+        (message, save, scratch.is_empty())
     }
 
     /// Leave `what`: remove it from the tree and drop the views of surfaces
@@ -1405,6 +1470,7 @@ pub fn build_registry() -> Registry<AppState> {
         }),
     );
 
+    files::register(&mut r);
     for plugin in crate::plugins::builtin() {
         plugin.register_commands(&mut r);
     }
@@ -2143,7 +2209,7 @@ mod tests {
 
         // Close without saving: the tab goes, the file is untouched.
         s.close_focused_surface();
-        s.discard_confirm();
+        s.discard_confirm().unwrap();
         assert!(s.confirm().is_none() && s.view(sid).is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
 
@@ -2164,7 +2230,7 @@ mod tests {
         s.cancel_confirm();
         assert!(s.view(sid).is_some());
         s.close_focused_pane();
-        s.discard_confirm();
+        s.discard_confirm().unwrap();
         assert!(s.view(sid).is_none());
 
         // Another pane's modified view doesn't count for this pane.
@@ -2179,7 +2245,7 @@ mod tests {
         s.split_focused(Axis::LeftRight).unwrap();
         s.close_active_vtab();
         assert!(s.confirm().is_some());
-        s.discard_confirm();
+        s.discard_confirm().unwrap();
         assert_eq!(s.tree.vtabs().len(), 0);
 
         let (mut s, _, _) = edited(&dir, "c.txt");
@@ -2218,7 +2284,7 @@ mod tests {
         assert!(!s.quitting());
 
         s.request_quit();
-        s.discard_confirm();
+        s.discard_confirm().unwrap();
         assert!(s.quitting());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
 
@@ -2261,7 +2327,7 @@ mod tests {
         assert!(c.message.contains("no file"), "{}", c.message);
         assert_eq!(s.accept_confirm().unwrap(), Vec::<std::path::PathBuf>::new());
         assert!(s.confirm().is_some() && s.view(sid).is_some(), "Enter does nothing");
-        s.discard_confirm();
+        s.discard_confirm().unwrap();
         assert!(s.view(sid).is_none());
 
         // An untouched scratch buffer closes at once.

@@ -22,6 +22,7 @@ use ghostrealm_lsp::Client;
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::{AppState, Pick};
+use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::syntax;
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
@@ -53,6 +54,7 @@ const TAB_WIDTH: usize = 4;
 const BTN_WRAP: u32 = 0;
 const BTN_AUTOSAVE: u32 = 1;
 const BTN_STAT: u32 = 2;
+const BTN_NAME: u32 = 3;
 /// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -213,6 +215,10 @@ pub struct EditorView {
     seen_edits: u64,
     last_edit_at: Option<Instant>,
     layout: Layout,
+    /// The ribbon's file name and the ribbon itself, as last painted (none
+    /// under a tab strip or without a file): they open the file menu.
+    name_hit: Option<Rect>,
+    ribbon: Option<Rect>,
     /// The file's language service, if it has one.
     lang: Option<Lang>,
     /// Where each line's syntax-highlight state starts.
@@ -248,6 +254,8 @@ impl EditorView {
                 wrap_cols: usize::MAX,
             },
             lang: None,
+            name_hit: None,
+            ribbon: None,
         }
     }
 
@@ -378,6 +386,16 @@ impl EditorView {
         }
     }
 
+    /// Ask the app for the file menu of this editor's file at `at`.
+    fn open_file_menu(&self, cx: &mut EventCx, at: (f32, f32)) {
+        if let Some(path) = self.buf.path.clone() {
+            cx.request(Request::FileMenu {
+                target: FileTarget { path, kind: TargetKind::File, origin: Origin::Editor },
+                at,
+            });
+        }
+    }
+
     /// Close the hover popup. Returns whether one was showing.
     fn dismiss_popup(&mut self) -> bool {
         self.lang.as_mut().is_some_and(Lang::dismiss)
@@ -497,7 +515,19 @@ impl EditorView {
         let e = &self.buf;
         let name_clip = Rect { x: r.x, y: r.y, w: (sb.x - r.x).max(0.0), h: r.h };
         let font = Font::SANS.italic(e.modified);
-        cx.label(&e.title(), font, r.x + pad, top, name_clip, theme::TEXT);
+        let name = cx.shape(&e.title(), font, name_clip.w);
+        let name_w = name.width;
+        cx.place(name, r.x + pad, top, name_clip, theme::TEXT);
+        // With a file, the name opens its menu.
+        self.ribbon = Some(r);
+        self.name_hit = e.path.is_some().then(|| {
+            let hit = Rect { x: r.x, y: r.y, w: (name_w + pad * 2.0).min(name_clip.w), h: r.h };
+            if cx.button(hit, BTN_NAME) {
+                cx.highlight(hit);
+            }
+            cx.tooltip(hit, "File actions");
+            hit
+        });
     }
 }
 
@@ -556,6 +586,7 @@ impl View for EditorView {
         let wrap = self.wrap_on(cx.cfg);
         // Without a tab strip, the filename gets a ribbon of its own.
         let mut body = rect;
+        (self.ribbon, self.name_hit) = (None, None);
         if !cx.tab_strip {
             let ribbon_h = ch + 6.0 * scale;
             self.paint_ribbon(cx, Rect { h: ribbon_h, ..rect }, wrap);
@@ -845,8 +876,20 @@ impl View for EditorView {
         }
     }
 
+    fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
+        if self.ribbon.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
+            self.open_file_menu(cx, pos);
+        }
+    }
+
     fn button(&mut self, cx: &mut EventCx, id: u32) {
         match id {
+            BTN_NAME => {
+                if let Some(hit) = self.name_hit {
+                    self.open_file_menu(cx, (hit.x, hit.y + hit.h));
+                }
+                return;
+            }
             BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
             BTN_STAT => self.stats.cycle(),
             BTN_AUTOSAVE => {
@@ -909,6 +952,24 @@ impl View for EditorView {
 
     /// Creates missing parent directories, so a typed `sub/name` works. The
     /// old file's language service doesn't apply to the new one, so it stops.
+    fn save_copy(&mut self, path: PathBuf) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(self.buf.save_copy(&path)?)
+    }
+
+    /// A file that moved is followed; its language service was started for
+    /// the old path, so it stops.
+    fn files_changed(&mut self, moved: &[(PathBuf, PathBuf)]) {
+        let Some(to) = self.buf.path.as_deref().and_then(|p| crate::file_ops::follow(p, moved)) else {
+            return;
+        };
+        self.buf.path = Some(to.clone());
+        self.lang = None;
+        self.stats.fetch_head(Some(to));
+    }
+
     fn save_as(&mut self, path: PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1151,6 +1212,65 @@ mod tests {
         assert_eq!(v.stats.shown(), stats::Stat::Lines);
         h.button(&mut v, BTN_STAT);
         assert_eq!(v.stats.shown(), stats::Stat::Words);
+    }
+
+    #[test]
+    fn the_ribbons_file_name_opens_the_file_menu_and_so_does_a_right_click_on_the_ribbon() {
+        let path = tmpdir("editor-menu").join("f.txt");
+        std::fs::write(&path, "x
+").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        let mut h = Harness::new();
+        let name = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_NAME).expect("a name button").0;
+        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Editor };
+        let out = h.button(&mut v, BTN_NAME);
+        assert_eq!(out.requests, [Request::FileMenu { target: target.clone(), at: (name.x, name.y + name.h) }]);
+        // Right-click anywhere on the ribbon; not on the text.
+        let at = (RECT.w - 2.0, 3.0);
+        let out = h.context_menu(&mut v, at);
+        assert_eq!(out.requests, [Request::FileMenu { target, at }]);
+        assert!(h.context_menu(&mut v, (50.0, 100.0)).requests.is_empty(), "text has no menu");
+        // Hovering the name highlights it (the button convention).
+        let quads = |h: &Harness| h.frame.bg.len() + h.frame.top.len();
+        h.cursor = (name.x + 1.0, name.y + 1.0);
+        h.paint(&mut v, RECT);
+        let hovered = quads(&h);
+        h.cursor = (-1.0, -1.0);
+        h.paint(&mut v, RECT);
+        assert!(hovered > quads(&h), "hover adds a highlight quad");
+    }
+
+    #[test]
+    fn a_scratch_buffer_or_a_tab_strip_has_no_file_menu() {
+        let mut v = view_with("x");
+        let mut h = Harness::new();
+        let frame = h.paint(&mut v, RECT);
+        assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_NAME), "no file, no menu");
+        assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty());
+        let path = tmpdir("editor-menu-strip").join("f.txt");
+        std::fs::write(&path, "x
+").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        paint_in_strip(&mut h, &mut v);
+        assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty(), "the tab strip has no ribbon");
+    }
+
+    #[test]
+    fn a_moved_file_is_followed_and_a_copy_leaves_the_buffer_alone() {
+        let dir = tmpdir("editor-moved");
+        let old = dir.join("a.txt");
+        std::fs::write(&old, "x
+").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(old.clone()).unwrap());
+        v.files_changed(&[(dir.join("other"), dir.join("elsewhere"))]);
+        assert_eq!(v.path(), Some(old.clone()), "unrelated moves don't matter");
+        v.buffer_mut().insert_str("edit ");
+        v.save_copy(dir.join("sub/copy.txt")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("sub/copy.txt")).unwrap(), "edit x
+");
+        assert!(v.modified() && v.path() == Some(old.clone()));
+        v.files_changed(&[(old, dir.join("b.txt"))]);
+        assert_eq!(v.path(), Some(dir.join("b.txt")));
     }
 
     #[test]

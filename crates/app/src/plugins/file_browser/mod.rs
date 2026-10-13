@@ -28,6 +28,7 @@ use ghostrealm_terminal::{Key, KeyPress};
 use glyphon::Family;
 
 use crate::app_state::AppState;
+use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
@@ -183,6 +184,8 @@ pub struct FileBrowserView {
     preview_on: Option<bool>,
     /// The last paint showed the preview.
     preview_shown: bool,
+    /// Scroll the chosen entry into view at the next paint.
+    reveal_chosen: bool,
 }
 
 impl FileBrowserView {
@@ -204,6 +207,7 @@ impl FileBrowserView {
             preview: PreviewPane::default(),
             preview_on: None,
             preview_shown: false,
+            reveal_chosen: false,
         }
     }
 
@@ -224,6 +228,24 @@ impl FileBrowserView {
     /// Set the file name [`Mode::Save`] saves under.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name.set_text(name);
+    }
+
+    /// Show `path` selected: expand the folders down to it when it is under
+    /// the root, else make its folder the root.
+    pub fn reveal(&mut self, path: &Path) {
+        self.tree.set_query("");
+        let root = self.tree.root().to_path_buf();
+        if path.starts_with(&root) {
+            for dir in path.ancestors().skip(1).take_while(|d| d.starts_with(&root) && *d != root) {
+                if !self.tree.is_expanded(dir) {
+                    self.tree.toggle_dir(dir);
+                }
+            }
+        } else if let Some(parent) = path.parent() {
+            self.tree.set_root(parent);
+        }
+        self.chosen = Some(path.to_path_buf());
+        self.reveal_chosen = true;
     }
 
     /// Take the tree's query into the input when the tree changed it (navigation
@@ -581,6 +603,11 @@ impl View for FileBrowserView {
                 self.chosen = None;
             }
         }
+        if std::mem::take(&mut self.reveal_chosen) {
+            if let Some(i) = rows.iter().position(|r| !r.is_category && Some(&r.path) == self.chosen.as_ref()) {
+                self.scroll = (i as f32 * row_h - (list.h - row_h) * 0.5).max(0.0);
+            }
+        }
         let max_scroll = (rows.len() as f32 * row_h - list.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let filtering = !query.is_empty();
@@ -785,6 +812,45 @@ impl View for FileBrowserView {
             }
             MouseEvent::Drag { .. } | MouseEvent::Up { .. } | MouseEvent::Leave { .. } => {}
         }
+    }
+
+    fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
+        if self.mode != Mode::Browse || !rect_contains(self.list, pos.0, pos.1) {
+            return;
+        }
+        let target = match self.row_at(pos.0, pos.1) {
+            Some((_, row)) if row.is_category => return,
+            Some((idx, row)) => {
+                self.sel = Some(idx);
+                self.chosen = Some(row.path.clone());
+                let kind = if row.is_dir { TargetKind::Dir } else { TargetKind::File };
+                FileTarget { path: row.path, kind, origin: Origin::Browser }
+            }
+            None => FileTarget {
+                path: self.tree.root().to_path_buf(),
+                kind: TargetKind::Empty,
+                origin: Origin::Browser,
+            },
+        };
+        cx.request(Request::FileMenu { target, at: pos });
+        cx.redraw();
+    }
+
+    /// The selected entry.
+    fn subject(&self) -> Option<PathBuf> {
+        self.chosen.clone().filter(|_| self.mode == Mode::Browse)
+    }
+
+    /// Re-read the listings; follow a moved selection or root.
+    fn files_changed(&mut self, moved: &[(PathBuf, PathBuf)]) {
+        let follow = |p: &Path| crate::file_ops::follow(p, moved);
+        if let Some(root) = follow(self.tree.root()) {
+            self.tree.set_root(root);
+        }
+        if let Some(chosen) = self.chosen.as_deref().and_then(follow) {
+            self.chosen = Some(chosen);
+        }
+        self.tree.refresh();
     }
 
     fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
@@ -1135,6 +1201,75 @@ mod tests {
         h.paint(&mut v, RECT);
         let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
         assert_eq!(out.requests, vec![Request::OpenFile(d.join("b.txt"))]);
+    }
+
+    #[test]
+    fn a_right_click_opens_the_file_menu_on_the_row_or_the_empty_space() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let menu = |h: &Harness, v: &mut FileBrowserView, pos: (f32, f32)| h.context_menu(v, pos).requests;
+        let target = |path: PathBuf, kind, ()| FileTarget { path, kind, origin: Origin::Browser };
+        let at = row_centre(0);
+        assert_eq!(
+            menu(&h, &mut v, at),
+            [Request::FileMenu { target: target(d.join("adir"), TargetKind::Dir, ()), at }]
+        );
+        assert_eq!(v.subject(), Some(d.join("adir")), "the row is selected");
+        let at = row_centre(1);
+        assert_eq!(
+            menu(&h, &mut v, at),
+            [Request::FileMenu { target: target(d.join("b.txt"), TargetKind::File, ()), at }]
+        );
+        let at = (50.0, 250.0);
+        assert_eq!(
+            menu(&h, &mut v, at),
+            [Request::FileMenu { target: target(d.clone(), TargetKind::Empty, ()), at }],
+            "below the rows: the folder shown"
+        );
+        // Outside the list (the header), and in a picker, there is no menu.
+        assert!(menu(&h, &mut v, (50.0, 3.0)).is_empty());
+        let mut picker = FileBrowserView::picker(d, Mode::PickFile);
+        h.paint(&mut picker, RECT);
+        assert!(menu(&h, &mut picker, row_centre(0)).is_empty());
+    }
+
+    #[test]
+    fn changed_files_are_re_read_and_a_moved_selection_or_root_is_followed() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        std::fs::write(d.join("new.txt"), "").unwrap();
+        assert!(!v.text().unwrap().contains("new.txt"), "listings are cached");
+        v.files_changed(&[]);
+        h.paint(&mut v, RECT);
+        assert!(v.text().unwrap().contains("new.txt"));
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        let chosen = v.subject().unwrap();
+        v.files_changed(&[(chosen.clone(), d.join("renamed.txt"))]);
+        assert_eq!(v.subject(), Some(d.join("renamed.txt")));
+        let moved = d.with_file_name("moved-root");
+        v.files_changed(&[(d.clone(), moved.clone())]);
+        assert_eq!(v.tree().root(), moved);
+    }
+
+    #[test]
+    fn reveal_expands_the_folders_down_to_a_file_and_selects_it() {
+        let d = tmpdir("fb-reveal");
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/b/f.txt"), "").unwrap();
+        let mut v = FileBrowserView::new(d.clone());
+        v.reveal(&d.join("a/b/f.txt"));
+        assert!(v.tree().is_expanded(&d.join("a")) && v.tree().is_expanded(&d.join("a/b")));
+        assert_eq!(v.subject(), Some(d.join("a/b/f.txt")));
+        // A file outside the root makes its folder the root.
+        let other = tmpdir("fb-reveal-other");
+        std::fs::write(other.join("g.txt"), "").unwrap();
+        v.reveal(&other.join("g.txt"));
+        assert_eq!(v.tree().root(), other);
+        assert_eq!(v.subject(), Some(other.join("g.txt")));
+        Harness::new().paint(&mut v, RECT);
+        assert!(v.text().unwrap().contains("g.txt"));
     }
 
     #[test]
