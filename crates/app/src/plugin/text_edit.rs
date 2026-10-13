@@ -337,6 +337,36 @@ pub fn word_right(chars: &[char], col: usize) -> usize {
     i
 }
 
+/// The run of same-class characters (word characters, whitespace, or other
+/// punctuation) containing `at`, as a `(start, end)` column range: what a
+/// double-click selects. `at` past the end counts as the last character.
+/// `None` for empty text.
+pub fn word_span(chars: &[char], at: usize) -> Option<(usize, usize)> {
+    if chars.is_empty() {
+        return None;
+    }
+    let class = |c: char| {
+        if is_word(c) {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let at = at.min(chars.len() - 1);
+    let k = class(chars[at]);
+    let mut start = at;
+    while start > 0 && class(chars[start - 1]) == k {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < chars.len() && class(chars[end]) == k {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 /// Where copy/cut/paste go: the system clipboard (through an [`EventCx`] or the
 /// app's handle), or a private string.
 pub trait Clipboard {

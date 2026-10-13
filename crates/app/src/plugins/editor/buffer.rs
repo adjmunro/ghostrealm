@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use ghostrealm_core::highlight::CommentSyntax;
 
 use crate::plugin::text_edit::{
-    closer_of, closes_before, opener_of, typed_char, word_left, word_right, Applied, Clipboard, Edit, Motion,
+    closer_of, closes_before, opener_of, typed_char, word_left, word_right, word_span, Applied, Clipboard, Edit, Motion,
 };
 
 pub struct EditorBuffer {
@@ -211,28 +211,7 @@ impl EditorBuffer {
             Some(l) => l.chars().collect(),
             None => return,
         };
-        if chars.is_empty() {
-            return;
-        }
-        let at = col.min(chars.len() - 1);
-        let class = |c: char| {
-            if c.is_alphanumeric() || c == '_' {
-                0
-            } else if c.is_whitespace() {
-                1
-            } else {
-                2
-            }
-        };
-        let k = class(chars[at]);
-        let mut start = at;
-        while start > 0 && class(chars[start - 1]) == k {
-            start -= 1;
-        }
-        let mut end = at + 1;
-        while end < chars.len() && class(chars[end]) == k {
-            end += 1;
-        }
+        let Some((start, end)) = word_span(&chars, col) else { return };
         self.anchor = Some((row, start));
         self.cursor = (row, end);
     }
