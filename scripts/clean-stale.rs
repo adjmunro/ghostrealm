@@ -38,6 +38,7 @@
 //! build it with `rustc -O --edition 2021 scripts/clean-stale.rs`. Options:
 //! `--dry-run`/`-n` (remove nothing), `--verbose`/`-v` (list each path),
 //! `--keep N`, `--target-dir DIR`, `--lockfile FILE`.
+//! Its tests run with `rustc --test --edition 2021 scripts/clean-stale.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -177,7 +178,7 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
     // identity -> units sharing it. Build-script runs are decided after the
     // build-script compiles they belong to.
     let mut groups: HashMap<String, (usize, Vec<Unit>)> = HashMap::new();
-    let mut runs: Vec<(Unit, Option<String>)> = Vec::new();
+    let mut runs: Vec<(Unit, Vec<String>)> = Vec::new();
     // fingerprint hash -> `.fingerprint/` directory of each build-script compile.
     let mut scripts: HashMap<String, String> = HashMap::new();
     for e in read_dir(&dir.join(".fingerprint")) {
@@ -190,7 +191,7 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
         let Some((kind, json, built)) = fingerprint_json(&e.path()) else { continue };
         let unit = Unit { package: package.to_string(), hash: hash.to_string(), kind: kind.clone(), built };
         if kind.starts_with("run-build-script-") {
-            runs.push((unit, script_fingerprint(&json)));
+            runs.push((unit, script_fingerprints(&json)));
             continue;
         }
         let source = dep_info_source(by_hash.get(hash), &dir.join("build").join(&dir_name));
@@ -221,9 +222,11 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
 
     // A build-script run (whose `out/` may hold a large download) goes with the
     // compile it ran: the run's fingerprint records the compile's fingerprint
-    // hash. A run whose compile is gone is superseded only once another run of
-    // the package has a compile that stays; otherwise it is left alone.
-    let compile_of = |fp: &Option<String>| fp.as_ref().and_then(|h| scripts.get(h));
+    // hash (among those of the runs it reads `links` metadata from, which are
+    // not compiles). A run whose compile is gone is superseded only once
+    // another run of the package has a compile that stays; otherwise it is
+    // left alone.
+    let compile_of = |fps: &Vec<String>| fps.iter().find_map(|h| scripts.get(h));
     let current: HashSet<String> = runs
         .iter()
         .filter(|(_, fp)| compile_of(fp).is_some_and(|c| !removed.contains(c)))
@@ -276,16 +279,26 @@ fn remove_unit(dir: &Path, unit: &Unit, by_hash: &HashMap<String, Vec<PathBuf>>,
     paths.iter().map(|p| remove(p, opts)).sum()
 }
 
-/// The fingerprint hash, as `.fingerprint/` stores it (16 hex digits of the
-/// little-endian `u64`), of the build-script compile a run's fingerprint JSON
-/// depends on: `"deps":[[<id>,"build_script_build",<public>,<hash>]]`.
-fn script_fingerprint(json: &str) -> Option<String> {
-    let rest = &json[json.find("\"build_script_build\",")?..];
-    let rest = &rest[rest.find(',')? + 1..];
-    let rest = &rest[rest.find(',')? + 1..];
-    let digits = &rest[..rest.find(|c: char| !c.is_ascii_digit())?];
-    let n: u64 = digits.parse().ok()?;
-    Some(n.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect())
+/// The fingerprint hashes, as `.fingerprint/` stores them (16 hex digits of
+/// the little-endian `u64`), of the `build_script_build` units a run's
+/// fingerprint JSON depends on: `"deps":[[<id>,"build_script_build",<public>,<hash>],...]`.
+/// One is the run's own build-script compile; the others are the runs of
+/// `links` dependencies (whose metadata it reads), in no particular order.
+fn script_fingerprints(json: &str) -> Vec<String> {
+    let mut hashes = Vec::new();
+    let mut rest = json;
+    while let Some(i) = rest.find("\"build_script_build\",") {
+        rest = &rest[i + 1..];
+        let hash = (|| {
+            let r = &rest[rest.find(',')? + 1..];
+            let r = &r[r.find(',')? + 1..];
+            let digits = &r[..r.find(|c: char| !c.is_ascii_digit())?];
+            let n: u64 = digits.parse().ok()?;
+            Some(n.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect())
+        })();
+        hashes.extend(hash);
+    }
+    hashes
 }
 
 fn read_dir(dir: &Path) -> Vec<fs::DirEntry> {
@@ -370,4 +383,49 @@ fn disk_size(path: &Path, meta: &fs::Metadata) -> u64 {
 
 fn human(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fingerprint directory `<package>-<hash>` with `<kind>.json` and, for a
+    /// build-script compile, the hash file a run's dependency names it by.
+    fn unit(dir: &Path, name: &str, kind: &str, json: &str, script_hash: Option<u64>) {
+        let fp = dir.join(".fingerprint").join(name);
+        fs::create_dir_all(&fp).unwrap();
+        fs::write(fp.join(format!("{kind}.json")), json).unwrap();
+        if let Some(h) = script_hash {
+            let hex: String = h.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            fs::write(fp.join(kind), hex).unwrap();
+        }
+        fs::create_dir_all(dir.join("build").join(name)).unwrap();
+    }
+
+    #[test]
+    fn a_run_goes_with_its_compile_whatever_order_its_links_deps_come_in() {
+        let dir = std::env::temp_dir().join(format!("clean-stale-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let compile = |features: &str| format!(r#"{{"features":"{features}","target":1,"deps":[]}}"#);
+        // Two configurations of `pkg`, each a compile and its run. The run of
+        // one lists a `links` dependency's run before its own compile.
+        unit(&dir, "pkg-00000000000000a1", "build-script-build-script-build", &compile("a"), Some(11));
+        unit(&dir, "pkg-00000000000000b1", "build-script-build-script-build", &compile("b"), Some(22));
+        let run = |deps: &str| format!(r#"{{"features":"","target":0,"deps":[{deps}],"local":[]}}"#);
+        let kind = "run-build-script-build-script-build";
+        unit(&dir, "pkg-00000000000000a2", kind, &run(r#"[1,"build_script_build",false,11]"#), None);
+        unit(
+            &dir,
+            "pkg-00000000000000b2",
+            kind,
+            &run(r#"[0,"build_script_build",false,99],[1,"build_script_build",false,22]"#),
+            None,
+        );
+        let mut lock = Lock::default();
+        lock.dirs.insert("pkg-1.0.0".into());
+        let t = clean_profile(&dir, &lock, &Opts { dry_run: false, verbose: false, keep: 3 });
+        assert_eq!(t.removed, 0);
+        assert!(dir.join("build/pkg-00000000000000b2").is_dir(), "the run's output stays");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
