@@ -1889,6 +1889,31 @@ mod tests {
     }
 
     #[test]
+    fn toggle_comment_comments_the_focused_editors_lines_per_its_language() {
+        use ghostrealm_core::Args;
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("app-toggle-comment");
+        let toml = dir.join("a.toml");
+        std::fs::write(&toml, "a = 1\nb = 2\n").unwrap();
+        s.new_empty_vtab();
+        s.open_path_with_in_focused(editor::ID, &toml).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let lines = |s: &AppState| s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap().buffer().lines.clone();
+
+        r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap();
+        assert_eq!(lines(&s), ["# a = 1", "b = 2"]);
+        r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap();
+        assert_eq!(lines(&s), ["a = 1", "b = 2"]);
+
+        // A file whose language has no comment syntax reports it and stays as it was.
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, "x").unwrap();
+        s.open_path_with_in_focused(editor::ID, &txt).unwrap();
+        assert!(r.execute("editor.toggle_comment", &Args::new(), &mut s).is_err());
+    }
+
+    #[test]
     fn save_as_over_another_file_asks_first() {
         let mut s = AppState::new();
         let dir = crate::plugin::testing::tmpdir("app-replace");

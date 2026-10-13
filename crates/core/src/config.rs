@@ -343,6 +343,7 @@ fn default_bindings() -> HashMap<&'static str, &'static str> {
         ("cmd+]", "pane.focus_next"),
         ("cmd+[", "pane.focus_prev"),
         ("cmd+l", "web.focus_url"),
+        ("cmd+/", "editor.toggle_comment"),
     ])
 }
 
@@ -567,6 +568,13 @@ mod tests {
         );
         assert_eq!(normalize_chord("command+t").as_deref(), Some("cmd+t"));
         assert_eq!(normalize_chord("ctrl").as_deref(), None); // no key
+    }
+
+    #[test]
+    fn a_new_config_file_binds_the_comment_toggle_and_a_missing_section_binds_nothing() {
+        assert!(default_file().contains("\"editor.toggle_comment\" = \"cmd+/\""));
+        let (cfg, _) = parse("[tabs]\n", &cat());
+        assert_eq!(cfg.unwrap().binding("cmd+/"), None, "defaults are file text, never implicit");
     }
 
     #[test]

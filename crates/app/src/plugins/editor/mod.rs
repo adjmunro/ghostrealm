@@ -116,6 +116,22 @@ impl Plugin for EditorPlugin {
         );
         r.register(
             CommandMeta::new(
+                "editor.toggle_comment",
+                "Toggle Comment",
+                "Comment or uncomment the selected lines of the focused editor, per the file's language",
+            ),
+            Box::new(move |s: &mut AppState, _| {
+                let editor = s
+                    .focused_surface()
+                    .and_then(|sid| s.view_mut(sid))
+                    .and_then(|v| v.downcast_mut::<EditorView>())
+                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                editor.toggle_comment().map_err(|e| CmdError::Failed(e.into()))?;
+                Ok(CmdOutcome::ok())
+            }),
+        );
+        r.register(
+            CommandMeta::new(
                 "editor.save_as",
                 "Save As…",
                 "Save the focused editor to a file chosen in a picker",
@@ -332,6 +348,22 @@ impl EditorView {
         }
         if let Some(lang) = &mut self.lang {
             lang.sync(&self.buf.lines, self.buf.edits);
+        }
+    }
+
+    /// Comment or uncomment the selected lines per the file's language
+    /// ([`highlight::Highlighter::comment`]). Returns `Err` when the file has no
+    /// comment syntax.
+    pub fn toggle_comment(&mut self) -> Result<(), &'static str> {
+        let syntax = self.buf.path.as_deref().and_then(highlight::for_path).map(|h| h.comment());
+        match syntax {
+            Some(syntax) if syntax != highlight::CommentSyntax::default() => {
+                if self.buf.toggle_comment(syntax) {
+                    self.note_edits();
+                }
+                Ok(())
+            }
+            _ => Err("this file's language has no comment syntax"),
         }
     }
 
@@ -1446,7 +1478,7 @@ mod tests {
 
     #[test]
     fn typed_brackets_auto_close_wrap_and_step_over_through_the_key_path() {
-        let mut h = Harness::new();
+        let h = Harness::new();
         let mut v = view_with("");
         for c in "f(x)".chars() {
             h.key(&mut v, press(Key::Char(c)));

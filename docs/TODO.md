@@ -904,24 +904,15 @@
   - **Split drag handle**: when draggable split handles are built, centre them
     on the border between panes (see "Splits — discoverability, draggable resize
     handles, ratios"). No drag handles exist yet.
-  - **Cmd+/ toggles comments** in the editor (comment/uncomment the selected
-    lines, per language). There is no comment toggle today. Cmd+/ is not a
-    built-in default (defaults are Cmd+D / Cmd+Shift+D for splits), but the
-    owner's own `config.toml` binds `split.leftright` to `cmd+/` (and
-    `split.topbottom` to `cmd+shift+/`), which would shadow the editor. The
-    owner will move their own split bindings; app chords take precedence over
-    the focused view.
-  - **Comment syntax is per language.** Standard LSP has no comment-toggle
-    request and carries no comment-syntax information. Editors keep it in
-    per-language configuration (VS Code's `language-configuration.json`
-    `lineComment` / `blockComment`) or derive it from tree-sitter. So the line
-    and block comment tokens belong in a per-language metadata registry beside
-    the highlighters (see "DISCUSSION: syntax highlighting direction").
-    Owner, verbatim:
-    > I think the comment uncomment hotkey, for one, I think I need to change my
-    > split hotkey, but I can do that. I think it needs to tie into the LSP
-    > though, because different languages will have different comment formats. I
-    > don't know if standard LSP support that.
+  - **Cmd+/ comment toggle: remaining.** `editor.toggle_comment` exists and a
+    new config file binds it to `cmd+/` (`Highlighter::comment` holds each
+    language's tokens). Only languages with a highlighter have comment syntax
+    (TOML, Markdown); each new highlighter in "Syntax highlighting — more
+    languages" must declare its own. Inside a Markdown fence the toggle still
+    uses Markdown's tokens, not the fence language's. The owner's own
+    `config.toml` binds `split.leftright` to `cmd+/` (and `split.topbottom` to
+    `cmd+shift+/`), which shadows it: app chords take precedence over the
+    focused view, so the owner moves those.
 - Reason: owner review; small, visible rough edges.
 
 ---
@@ -1215,8 +1206,7 @@
   Markdown-specific labels the owner asked about; if Markdown stays a separate
   highlighter, the split is what lets it still run through the same API.
 - Related: per-language comment tokens for the editor's comment toggle live in
-  the same per-language registry (see "Quality of life (owner review) — editor
-  and file browser polish"). Fenced code blocks in Markdown use these
+  the same per-language registry (`Highlighter::comment`). Fenced code blocks in Markdown use these
   highlighters.
 - Owner, verbatim:
   > Oh, okay, I misunderstood you about highlighting in that they were the same
