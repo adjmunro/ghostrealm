@@ -1,8 +1,9 @@
-//! macOS reserves ⇧⌘/ (⌘?) for "Show Help menu": AppKit consumes its key-down
-//! as a menu key equivalent before the window sees it, so only the key-up
-//! reaches winit. A local event monitor runs before that dispatch; it hands the
-//! key-down straight to winit's content view, so the chord reaches the app's
-//! keybindings like any other.
+//! macOS reserves some chords for menu items: AppKit consumes their key-down
+//! as a menu key equivalent before the window sees it, so winit gets at most
+//! the key-up (⇧⌘/, "Show Help menu") or nothing (⌘Q, which ends the process
+//! without a close request). A local event monitor runs before that dispatch;
+//! it hands the key-down straight to winit's content view, so the chord reaches
+//! the app like any other.
 
 use std::ptr::NonNull;
 
@@ -13,7 +14,7 @@ use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSV
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
-/// Route the system-reserved Help chord to `window`'s view for the life of the
+/// Route the system-reserved chords to `window`'s view for the life of the
 /// app. Call once, on the main thread, after the window exists.
 pub fn route_reserved_chords(window: &Window) {
     let Ok(handle) = window.window_handle() else {
@@ -43,15 +44,17 @@ pub fn route_reserved_chords(window: &Window) {
     std::mem::forget(monitor);
 }
 
-/// ⌘? — Shift+/ on layouts where `?` is shifted `/` — with no Ctrl/Option.
+/// ⌘? (Shift+/ on layouts where `?` is shifted `/`) or ⌘Q, with no Ctrl/Option.
 fn is_reserved_chord(ev: &NSEvent) -> bool {
     if ev.r#type() != NSEventType::KeyDown {
         return false;
     }
     let flags = ev.modifierFlags() & NSEventModifierFlags::DeviceIndependentFlagsMask;
-    let want = NSEventModifierFlags::Command | NSEventModifierFlags::Shift;
-    if flags & !NSEventModifierFlags::CapsLock != want {
+    let flags = flags & !NSEventModifierFlags::CapsLock;
+    let Some(key) = ev.charactersIgnoringModifiers().map(|s| s.to_string()) else {
         return false;
-    }
-    ev.charactersIgnoringModifiers().is_some_and(|s| s.to_string() == "?")
+    };
+    let help = NSEventModifierFlags::Command | NSEventModifierFlags::Shift;
+    (flags == help && key == "?")
+        || (flags == NSEventModifierFlags::Command && key.eq_ignore_ascii_case("q"))
 }
