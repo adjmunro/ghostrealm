@@ -456,9 +456,7 @@ impl FsTree {
         let prefix = git(&["rev-parse", "--show-prefix"]);
         let map = match (status, prefix) {
             (Some(status), Some(prefix)) => {
-                // Bytes, not text: a non-UTF-8 root must still match.
-                let prefix = prefix.strip_suffix(b"\n").unwrap_or(&prefix);
-                parse_porcelain_z(&status, prefix)
+                parse_porcelain_z(&status, repo_prefix(&prefix))
                     .into_iter()
                     .map(|(rel, st)| (self.root.join(rel), st))
                     .collect()
@@ -987,6 +985,12 @@ fn size_bucket(size: u64) -> (i64, &'static str) {
     }
 }
 
+/// The root's path in its repo from `git rev-parse --show-prefix` output, as
+/// bytes, not text: a non-UTF-8 root must still match.
+fn repo_prefix(out: &[u8]) -> &[u8] {
+    out.strip_suffix(b"\n").unwrap_or(out)
+}
+
 /// Parse `git status --porcelain -z --no-renames` output: each entry is
 /// `XY <path>\0`, the path verbatim (unquoted) and relative to the repo's top
 /// level. Keeps the entries under `prefix` (the root's path in the repo, with
@@ -1030,8 +1034,10 @@ mod tests {
             vec![(PathBuf::from("a b.txt"), modified), (PathBuf::from("caf\u{e9}/new.txt"), untracked)]
         );
         assert_eq!(parse_porcelain_z(out, b"").len(), 3);
-        let latin1 = parse_porcelain_z(b" M d\xff/x\0", b"d\xff/");
-        assert_eq!(latin1, vec![(PathBuf::from("x"), modified)], "a non-UTF-8 prefix matches");
+        let prefix = repo_prefix(b"d\xff/\n");
+        assert_eq!(prefix, b"d\xff/", "a non-UTF-8 prefix stays bytes");
+        let latin1 = parse_porcelain_z(b" M d\xff/x\0", prefix);
+        assert_eq!(latin1, vec![(PathBuf::from("x"), modified)]);
     }
 
     #[test]
