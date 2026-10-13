@@ -529,7 +529,9 @@ fn the_viewport_is_inactive_while_scrolled_back() {
     for _ in 0..30 {
         term.write_bytes(b"line\r");
     }
-    let _ = wait_for_row(&mut term, "line");
+    // Only once the last line is shown has the rest gone into scrollback.
+    term.write_bytes(b"end\r");
+    let _ = wait_for_row(&mut term, "end");
     assert!(term.viewport_active(), "live at first");
     term.scroll(Scroll::Delta(-3));
     assert!(!term.viewport_active(), "scrolled into history");
