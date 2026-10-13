@@ -32,16 +32,29 @@ pub fn repo_root(path: &Path) -> Option<PathBuf> {
 /// Whether everything at `path` is tracked by git and unmodified, so a copy
 /// survives in the repository (a file: tracked and clean; a directory: it
 /// holds tracked files and nothing untracked, ignored, or changed). `false`
-/// outside a repository or when git isn't available.
+/// outside a repository, when git isn't available, for a directory holding a
+/// repository (its history would go with it), and for entries git is told to
+/// overlook (assume-unchanged, skip-worktree) or that are submodules, since
+/// `git status` doesn't vouch for those. The status is asked with the
+/// untracked, ignored, and submodule settings spelled out, so the user's
+/// config can't hide anything.
 pub fn is_tracked_clean(path: &Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    let is_dir = meta.is_dir();
+    if is_dir && path.join(".git").symlink_metadata().is_ok() {
+        return false;
+    }
     let (Some(dir), Some(name)) = (
-        if path.is_dir() { Some(path) } else { path.parent() },
-        if path.is_dir() { Some(Path::new(".")) } else { path.file_name().map(Path::new) },
+        if is_dir { Some(path) } else { path.parent() },
+        if is_dir { Some(Path::new(".")) } else { path.file_name().map(Path::new) },
     ) else {
         return false;
     };
     let git = |args: &[&str]| {
         Command::new("git")
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -51,8 +64,21 @@ pub fn is_tracked_clean(path: &Path) -> bool {
             .ok()
             .filter(|o| o.status.success())
     };
-    let tracked = git(&["ls-files", "-z"]).is_some_and(|o| !o.stdout.is_empty());
-    tracked && git(&["status", "--porcelain", "--ignored"]).is_some_and(|o| o.stdout.is_empty())
+    // `-v -s`: "<tag> <mode> <object> <stage>\t<path>"; `H` is a plain cached
+    // entry, and mode 160000 a submodule.
+    let tracked = git(&["ls-files", "-v", "-s", "-z"]).is_some_and(|o| {
+        let entries: Vec<&[u8]> = o.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()).collect();
+        !entries.is_empty() && entries.iter().all(|e| e.starts_with(b"H ") && !e[2..].starts_with(b"160000 "))
+    });
+    tracked
+        && git(&[
+            "status",
+            "--porcelain",
+            "--ignored=traditional",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .is_some_and(|o| o.stdout.is_empty())
 }
 
 /// The repository's `info/exclude` file (it may not exist yet). Asks git, as
@@ -134,6 +160,33 @@ mod tests {
         std::fs::write(dir.join("ignored.log"), "x").unwrap();
         assert!(!is_tracked_clean(&dir.join("ignored.log")), "ignored files aren't in the repository");
         assert!(!is_tracked_clean(Path::new("/no/such/file")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_git_would_not_restore_counts_as_clean() {
+        let Some(dir) = init_repo("hidden") else { return };
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+        commit_all(&dir);
+        assert!(is_tracked_clean(&dir.join("sub")));
+        // Config that hides untracked files from `git status`.
+        assert!(git(&dir, &["config", "status.showUntrackedFiles", "no"]));
+        std::fs::write(dir.join("sub/new.txt"), "n").unwrap();
+        assert!(!is_tracked_clean(&dir.join("sub")), "an untracked file, hidden by config");
+        // Changes git is told not to look at.
+        assert!(git(&dir, &["update-index", "--assume-unchanged", "b.txt"]));
+        std::fs::write(dir.join("b.txt"), "changed\n").unwrap();
+        assert!(!is_tracked_clean(&dir.join("b.txt")), "assume-unchanged");
+        assert!(git(&dir, &["update-index", "--skip-worktree", "c.txt"]));
+        std::fs::write(dir.join("c.txt"), "changed\n").unwrap();
+        assert!(!is_tracked_clean(&dir.join("c.txt")), "skip-worktree");
+        // A folder holding a repository holds its history too.
+        std::fs::remove_file(dir.join("sub/new.txt")).unwrap();
+        assert!(is_tracked_clean(&dir.join("sub")));
+        assert!(!is_tracked_clean(&dir), "the repository itself");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
