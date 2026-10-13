@@ -95,6 +95,7 @@
 
 - Category: Dependencies / media preview
 - Detail: Images decode with `image` (still formats only: bmp, gif, ico, jpeg, png, tiff, webp; no rayon). Audio plays through `rodio` (cpal output + symphonia decoders: flac, mp3, mp4/aac, vorbis, wav; no recording).
+- Detail: Both sit behind traits of our own in `crate::media` (`ImageDecoder`, `AudioBackend`); a module in the app crate rather than a crate, as only the app uses it and it holds no app types, so splitting it out later is a move. Nothing outside `media::image::image_crate` and `media::audio::rodio_backend` names `image` or `rodio`.
 - Detail: Images reach the GPU through `PaintCx::image` (the textured-quad path web pages draw through), not through a per-view GPU surface.
 - Detail: Workspace `rust-version` is 1.88 (`image` needs it; `wgpu` already needed 1.87).
 - Reason: pure-Rust decoders keep the build free of system media libraries on macOS. On Linux, cpal needs the ALSA development headers (`libasound2-dev`) to build.

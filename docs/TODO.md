@@ -817,9 +817,9 @@
 - Requires: NO BLOCKERS (later work, not now)
 - Detail: Audit the dependency tree (`image`, `rodio`, `cef`,
   `lsp-types`/`lsp-server`, `crossbeam-channel`, `toml`, `libc`, ...) and replace
-  with small in-house implementations where reasonable. Wrapping `image` and
-  `rodio` behind our own module comes first and makes either swap local: see
-  "Media wrappers: image decoding and audio playback behind our own trait".
+  with small in-house implementations where reasonable. `image` and `rodio` are
+  wrapped by `crate::media` (`ImageDecoder`, `AudioBackend`), so replacing
+  either is local to `media::image::image_crate` / `media::audio::rodio_backend`.
 - Reason: fewer external dependencies to carry and update.
 
 ---
@@ -1083,34 +1083,6 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Media wrappers: image decoding and audio playback behind our own trait
-
-- Requires: NO BLOCKERS (pairs with "Reduce dependencies")
-- Detail: Wrap image decoding (today the `image` crate) and audio playback
-  (today `rodio`) in a trait or module of our own: a library layer the rest of
-  the code calls, so no other code touches the dependency directly. Reusable by
-  the file-browser preview, a future image/audio viewer plugin, and a possible
-  music-player pane, instead of each re-implementing the same code.
-- Detail: This is the decode/playback side. It is distinct from
-  `PaintCx::image`, which is the drawing side (a textured quad on the canvas).
-  A decoded image would pass from this layer into `PaintCx::image`.
-- Owner, verbatim:
-  > Oh, okay. I understand what's going on with one now. Just make sure that
-  > like image rendering and audio playing are kind of like library functions
-  > that we can call and they're hidden behind a trait or an interface or
-  > something. The idea there being obviously that if it's reusable, then we
-  > want to pull it out so that we can make it reusable rather than re-
-  > implementing the same code. Which I think is the opposite end of the same
-  > image API to draw on the canvas thing that you're talking about. Like that's
-  > a library function to draw on the canvas, right? Whereas I'm talking about a
-  > library function that wraps whatever the image dependency is or whatever the
-  > audio playback dependency is, etc. Just to protect the rest of the code base
-  > from that and make it reusable.
-- Reason: protect the codebase from the dependencies, make swapping or removing
-  one local (see "Reduce dependencies"), and make the code reusable.
-
----
-
 [2026-10-13T20:45+1300@6bc650f] DISCUSSION: syntax highlighting direction
 
 - Requires: a design session with the owner; do not implement yet
@@ -1300,8 +1272,8 @@
 
 [2026-10-14T00:02+1300@6007201] Markdown: embedded files (`![alt](path)`)
 
-- Requires: NO BLOCKERS (reuses "Media wrappers: image decoding and audio
-  playback behind our own trait"; sibling of "Markdown rich text — follow-ups")
+- Requires: NO BLOCKERS (reuses `crate::media`, the image decode and
+  audio playback wrappers; sibling of "Markdown rich text — follow-ups")
 - Detail: The Markdown renderer embeds files with the GitHub image syntax,
   `![alt](path)`: a link with a leading `!`.
   - Images render in place; video and audio are possible, through the media

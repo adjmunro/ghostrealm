@@ -59,6 +59,13 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   it shrinks smoothly) and opt out of blending (`opaque`). `Image` is a decoded
   one: `Image::from_rgba` builds its mips, so call it on a worker; pass its
   `id()` as the version, and `fit` it to keep its aspect ratio.
+- Decoding and playback are `crate::media`, not `PaintCx`: `media::image::decode`
+  (file to upright RGBA, shrunk to a cap; hand the pixels to `Image::from_rgba`)
+  and `media::audio::AudioPlayer` (a thread that owns the output device and
+  closes it when idle). Both go through traits (`ImageDecoder`, `AudioBackend`),
+  and only `media::image::image_crate` and `media::audio::rodio_backend` name
+  the `image` and `rodio` crates. A view that shows or plays a file calls these
+  and never the crates; tests that need a PNG, GIF or WAV use `media::testing`.
 - Cursor: `cursor(rect, icon)` shows a mouse cursor while `rect` is hovered (a
   link's pointer, a text field's I-beam).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
