@@ -36,12 +36,11 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
 #### 21. Chromium runs without its sandbox
 
 - Where: `no_sandbox: 1` ([`web-host/src/main.rs:87`](../crates/web-host/src/main.rs)),
-  for every process. Not recorded in DECISION.md.
+  for every process. Recorded in DECISION.md as an open risk.
 - Effect: a renderer exploit runs with the user's full rights (files, SSH keys,
   and the app's shells).
 - Decision needed: ship before sandboxing, or enable it (`cef_sandbox` in the
-  macOS helpers, the setuid/namespace sandbox on Linux)? At minimum record the
-  trade-off.
+  macOS helpers, the setuid/namespace sandbox on Linux)?
 
 ### Low
 

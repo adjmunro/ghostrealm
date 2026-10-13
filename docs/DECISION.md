@@ -97,3 +97,13 @@
 - Detail: Images reach the GPU through `PaintCx::image` (the textured-quad path web pages draw through), not through a per-view GPU surface.
 - Detail: Workspace `rust-version` is 1.88 (`image` needs it; `wgpu` already needed 1.87).
 - Reason: pure-Rust decoders keep the build free of system media libraries on macOS. On Linux, cpal needs the ALSA development headers (`libasound2-dev`) to build.
+
+---
+
+[2026-10-13T19:17+1300@37a844c7]
+
+- Category: Web surface / security
+- Status: OPEN RISK: undecided; see [stack-review-findings-2.md](stack-review-findings-2.md) item 21
+- Detail: The web host runs Chromium with its sandbox off for every process (`no_sandbox: 1` in `crates/web-host/src/main.rs`). A renderer exploit runs with the user's rights: their files, SSH keys, and the app's shells.
+- Detail: Enabling it needs `cef_sandbox` linked into the macOS helper bundles, and Chromium's setuid or namespace sandbox on Linux.
+- Reason: recorded so the trade-off is visible; whether to ship the browser before sandboxing it is not yet decided.
