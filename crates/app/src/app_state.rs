@@ -304,8 +304,14 @@ impl AppState {
 
     /// Give an existing (empty) surface a fresh view from plugin `id`.
     fn materialize_plugin(&mut self, sid: SurfaceId, vt: VtabId, id: &str) -> Result<()> {
+        let cwd = self.resolve_cwd(vt);
+        self.materialize_plugin_at(sid, id, cwd)
+    }
+
+    /// [`Self::materialize_plugin`], starting in `cwd`.
+    fn materialize_plugin_at(&mut self, sid: SurfaceId, id: &str, cwd: Option<std::path::PathBuf>) -> Result<()> {
         let cx = OpenCx {
-            cwd: self.resolve_cwd(vt),
+            cwd,
             command: self.shell_line.clone(),
             waker: self.waker.clone(),
             languages: self.languages.clone(),
@@ -331,6 +337,12 @@ impl AppState {
     /// Open plugin `id` in the focused pane: fill the active empty slot in place
     /// when there is one (the picker), otherwise add a new tab.
     pub fn open_plugin_in_focused(&mut self, id: &str) -> Result<()> {
+        self.open_plugin_in_focused_at(id, None)
+    }
+
+    /// [`Self::open_plugin_in_focused`], starting in `cwd` (else the
+    /// workspace's directory).
+    pub fn open_plugin_in_focused_at(&mut self, id: &str, cwd: Option<std::path::PathBuf>) -> Result<()> {
         let Some((vt, pane)) = self.focused_pane() else {
             return Ok(());
         };
@@ -339,7 +351,8 @@ impl AppState {
             _ => self.tree.add_surface(vt, pane),
         };
         if let Some(sid) = target {
-            self.materialize_plugin(sid, vt, id)?;
+            let cwd = cwd.or_else(|| self.resolve_cwd(vt));
+            self.materialize_plugin_at(sid, id, cwd)?;
         }
         Ok(())
     }
