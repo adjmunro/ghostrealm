@@ -65,11 +65,13 @@ pub struct HeldKey<K> {
     key: Option<K>,
 }
 
-impl<K: PartialEq> HeldKey<K> {
-    pub fn new() -> Self {
+impl<K> Default for HeldKey<K> {
+    fn default() -> Self {
         HeldKey { key: None }
     }
+}
 
+impl<K: PartialEq> HeldKey<K> {
     /// `key`'s press just acted: drop its repeats.
     pub fn hold(&mut self, key: K) {
         self.key = Some(key);
@@ -95,7 +97,7 @@ mod tests {
 
     #[test]
     fn repeats_of_the_held_key_are_dropped_until_it_is_released() {
-        let mut h = HeldKey::new();
+        let mut h = HeldKey::default();
         assert!(!h.swallows(&'a', true, true), "nothing held yet");
         h.hold('a');
         assert!(h.swallows(&'a', true, true));
@@ -108,7 +110,7 @@ mod tests {
 
     #[test]
     fn a_fresh_press_of_another_key_ends_the_hold() {
-        let mut h = HeldKey::new();
+        let mut h = HeldKey::default();
         h.hold('a');
         assert!(!h.swallows(&'b', true, false), "a new key is delivered");
         assert!(!h.swallows(&'a', true, true), "the hold is over");

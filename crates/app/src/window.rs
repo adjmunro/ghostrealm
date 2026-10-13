@@ -926,7 +926,7 @@ impl State {
             frame_pending: false,
             next_frame: Instant::now(),
             shift_taps: TapDetector::new(double_tap_window),
-            closing_key: HeldKey::new(),
+            closing_key: HeldKey::default(),
             key_in_flight: None,
             ctrl_taps: TapDetector::new(double_tap_window),
         })
