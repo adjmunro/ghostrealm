@@ -2227,17 +2227,19 @@ impl State {
             Layer::Overlay,
             PICKER_SID,
         );
-        // The message wraps; size the panel to its lines.
+        // Shaped text doesn't wrap: break the message into lines that fit, and
+        // size the panel to them.
         let text_w = pw - pad * 2.0;
-        let natural = cx.shape(&confirm.message, Family::SansSerif, f32::MAX).width;
-        let lines = (natural / text_w).ceil().clamp(1.0, 4.0);
-        let ph = ch * lines + bh + pad * 3.0;
+        let lines = wrap_words(&confirm.message, text_w, |s| cx.shape(s, Family::SansSerif, f32::MAX).width);
+        let ph = ch * lines.len() as f32 + bh + pad * 3.0;
         let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
         let panel = Rect { x: px, y: py, w: pw, h: ph };
         cx.fill(panel, cx.chrome.background);
         cx.border(panel, cx.chrome.accent);
-        let msg = cx.shape(&confirm.message, Family::SansSerif, text_w);
-        cx.place(msg, px + pad, py + pad, panel, theme::TITLE);
+        for (i, line) in lines.iter().enumerate() {
+            let msg = cx.shape(line, Family::SansSerif, text_w);
+            cx.place(msg, px + pad, py + pad + ch * i as f32, panel, theme::TITLE);
+        }
 
         let by = py + ph - pad - bh;
         let mut right = px + pw - pad;
@@ -3966,6 +3968,27 @@ struct Placement {
     color: [u8; 3],
 }
 
+/// Break `text` at spaces into lines no wider than `max_w` as `width_of`
+/// measures them. A word wider than that gets a line of its own.
+fn wrap_words(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        if line.is_empty() {
+            line.push_str(word);
+            continue;
+        }
+        let candidate = format!("{line} {word}");
+        if width_of(&candidate) <= max_w {
+            line = candidate;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_string()));
+        }
+    }
+    lines.push(line);
+    lines
+}
+
 fn attrs_for<'a>(color: [u8; 3]) -> Attrs<'a> {
     Attrs::new()
         .family(Family::Monospace)
@@ -4394,11 +4417,27 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 mod tests {
     use super::{
         build_quad_pipeline, glyph_x, input_shift, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, Hover, QuadInstance,
+        workspace_rect_for, wrap_words, Hover, QuadInstance,
     };
     use ghostrealm_core::{Rect, Side, SurfaceId};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    /// A confirmation's message is drawn as lines that each fit the panel, so
+    /// none of it (such as the warning that a buffer would be lost) is cut off.
+    #[test]
+    fn a_message_breaks_into_lines_that_fit() {
+        let width = |s: &str| s.chars().count() as f32 * 10.0;
+        let msg = "2 buffers have unsaved changes. A buffer with no file can't be saved here and would be lost.";
+        let lines = wrap_words(msg, 300.0, width);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines.iter().all(|l| width(l) <= 300.0), "{lines:?}");
+        assert_eq!(lines.join(" "), msg, "every word, in order");
+        // A word too wide for the panel gets its own line rather than an empty one.
+        let long = "x".repeat(40);
+        assert_eq!(wrap_words(&format!("a {long} b"), 300.0, width), ["a", long.as_str(), "b"]);
+        assert_eq!(wrap_words("", 300.0, width), [""]);
+    }
 
     /// Each view that had hover hears `Leave` once: when the pointer moves to
     /// another view, a modal takes the pointer, or the pointer leaves the
