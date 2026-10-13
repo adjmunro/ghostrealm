@@ -261,14 +261,25 @@ impl FrameWriter {
             }
             r => r?,
         };
-        let len = bytes
-            .checked_mul(2)
-            .and_then(|b| b.checked_add(HEADER))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
-        reserve(&file, len as u64)?;
-        // SAFETY: the file is private to this writer (fresh, unique name) and is
-        // never truncated while mapped.
-        let map = unsafe { MmapMut::map_mut(&file)? };
+        // The name is ours now: any failure below must not leave the file
+        // behind, as the next frame would make another one.
+        let mapped = (|| {
+            let len = bytes
+                .checked_mul(2)
+                .and_then(|b| b.checked_add(HEADER))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+            reserve(&file, len as u64)?;
+            // SAFETY: the file is private to this writer (fresh, unique name)
+            // and is never truncated while mapped.
+            unsafe { MmapMut::map_mut(&file) }
+        })();
+        let map = match mapped {
+            Ok(map) => map,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        };
         if let Some((old, _)) = self.current.replace((path, map)) {
             let _ = std::fs::remove_file(old);
         }
@@ -570,6 +581,16 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["ghostrealm-web-200-3-2.bgra", "ghostrealm-web-x-1-1.bgra", "other.bgra"]);
+    }
+
+    #[test]
+    fn a_frame_file_that_cannot_be_sized_is_not_left_behind() {
+        let dir = tmpdir("leak");
+        let mut w = FrameWriter::new(&dir, "l");
+        // Beyond any address space: sizing or mapping fails.
+        assert!(w.grow(1 << 46).is_err());
+        assert!(w.grow(1 << 46).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]
