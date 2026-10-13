@@ -26,10 +26,11 @@ test reproduced it; the rest come from reading the code. Items marked
 
 Found reviewing `8a77896..d34d7fa` (the web browser `0c67045`/`35e68b9`/`04794e1`
 and the file-browser preview `3f58197`/`b6e3944`/`d34d7fa`). Line numbers are
-against `d23ace3`. Item 20's cause is partly inferred.
+against `d23ace3`.
 
-Lost when the browser was rebased (`465b076` → `04794e1`): items 30, 36 and 37. Right and middle clicks were lost too: `MouseEvent`
-carries no button, so only left clicks reach a page.
+Lost when the browser was rebased (`465b076` → `04794e1`): items 36 and 37.
+Right and middle clicks were lost too: `MouseEvent` carries no button, so only
+left clicks reach a page.
 
 ### High
 
@@ -58,7 +59,6 @@ carries no button, so only left clicks reach a page.
     ([`plugins/file_browser/preview.rs:69`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
     timeout per request?
-30. **`web.new` reports success when no host can start** ([`plugins/web/mod.rs:165`](../crates/app/src/plugins/web/mod.rs)).
 31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
     [`browser.rs:559`](../crates/web-host/src/browser.rs)), which breaks OAuth and
     payment popup flows. Decision needed: open them as a new tab in the pane?

@@ -222,6 +222,14 @@ impl Plugin for WebPlugin {
                 if let Some(u) = a.opt_str("url") {
                     page.start = Some(u.to_string());
                 }
+                // Start the page now, so a host that can't run is reported here.
+                if !page.send(None) {
+                    return Err(CmdError::Failed(format!(
+                        "opened web surface {}, but {}",
+                        sid.0,
+                        page.no_host()
+                    )));
+                }
                 Ok(CmdOutcome::msg(format!("opened web surface {}", sid.0)))
             }),
         );
@@ -1177,6 +1185,18 @@ mod tests {
         let e = v.url_edit.as_ref().unwrap();
         assert_eq!(e.text(), "rust");
         assert!(e.selection().is_some(), "selected for retyping");
+    }
+
+    #[test]
+    fn web_new_reports_a_host_that_cant_start() {
+        let _ = hostless();
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let r = crate::app_state::build_registry().execute("web.new", &Args::new(), &mut s);
+        let Err(CmdError::Failed(msg)) = r else {
+            panic!("web.new succeeded without a host");
+        };
+        assert!(msg.contains("opened web surface"), "{msg}");
     }
 
     #[test]
