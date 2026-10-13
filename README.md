@@ -36,6 +36,7 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+D / Cmd+Shift+D | split left-right / top-bottom |
 | Cmd+] / Cmd+[ | focus next / previous pane |
 | Cmd+, | open the config file |
+| Cmd+Q | quit |
 | Cmd+S / Cmd+Shift+S | save / save as (editor; an unsaved buffer asks where) |
 | Cmd+Z / Cmd+Shift+Z | undo / redo (editor) |
 
@@ -44,6 +45,11 @@ Cmd+←/→ to the line's start/end, Cmd+↑/↓ to the start/end, Shift to sele
 any of them; Option/Cmd+Backspace delete a word / to the line's start; Cmd+A/C/X/V.
 Linux and Windows use Ctrl for words and the clipboard, and Home/End for lines. In
 the terminal, the same word/line motions and deletes send readline keys.
+
+Quitting, or closing a tab, pane, or workspace, with unsaved editor changes asks
+first: Save and Quit / Cancel / Quit Without Saving (Save and Close / Close Without
+Saving for closes). Enter saves, Esc cancels. A buffer with no file can't be saved
+there, so it offers only Cancel and the discard button.
 
 Cmd is reserved for app shortcuts; every other key goes to the focused terminal.
 Click a sidebar row to switch vtab, a pane to focus it, a tab to switch it.

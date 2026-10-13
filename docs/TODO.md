@@ -797,19 +797,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] PRIORITY: Quit/close confirmation for unsaved editor content
-
-- Requires: NO BLOCKERS
-- Detail: Quitting (and closing an editor tab, pane, or workspace) with unsaved
-  editor content opens a dialog with "Save and Quit", "Cancel", and "Quit
-  Without Saving". Opening the dialog, or any popup or context menu, must not
-  count as losing focus: autosave-on-unfocus must not fire when focus moves to a
-  popup, menu, or dialog. See [stack-review-findings.md](stack-review-findings.md)
-  item 4 (unsaved content dropped without autosave or a prompt).
-- Reason: unsaved content is lost without warning today.
-
----
-
 [2026-10-13T19:46+1300@d292715] Brackets: wrap a selection, auto-close in the editor
 
 - Requires: NO BLOCKERS

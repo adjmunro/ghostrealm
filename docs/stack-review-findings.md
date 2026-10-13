@@ -6,18 +6,6 @@ it; the rest come from reading the code.
 
 ## Medium
 
-### 4. Unsaved editor content is dropped without autosave or a prompt
-
-- Closing an editor tab/pane/workspace drops the view
-  (`prune_orphan_surfaces_after`, [`app_state.rs:685`](../crates/app/src/app_state.rs)).
-- Quitting (`CloseRequested`, [`window.rs:220`](../crates/app/src/window.rs))
-  autosaves only when `autosave_on_unfocus = true`, and never saves pathless
-  (scratch) buffers.
-- TODO.md also tracks a close confirmation for multi-pane workspaces.
-- Tracked in TODO.md ("Quit/close confirmation for unsaved editor content"):
-  a Save and Quit / Cancel / Quit Without Saving dialog; opening a popup, menu,
-  or dialog does not count as losing focus for autosave.
-
 ### 5. Save As and open failures are silent
 
 - A Save As error goes to stderr only, after the picker has closed
