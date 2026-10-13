@@ -104,8 +104,13 @@ fn floor_char_boundary(text: &str, mut i: usize) -> usize {
 /// are where RFC 3986 allows them in a path (unreserved, sub-delimiters, `:`,
 /// `@`, `/`) and percent-encoded otherwise, so a non-UTF-8 path round-trips.
 pub fn file_uri(path: &Path) -> Uri {
+    uri_of_path_bytes(&path_bytes(path))
+}
+
+/// A `file://` URI for a path already in URI form (`/`-separated, absolute).
+fn uri_of_path_bytes(path: &[u8]) -> Uri {
     let mut s = String::from("file://");
-    for &b in path_bytes(path).iter() {
+    for &b in path {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 s.push(b as char)
@@ -128,7 +133,20 @@ fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
 
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
-    path.to_string_lossy().into_owned().into_bytes().into()
+    windows_uri_path(&path.to_string_lossy()).into_bytes().into()
+}
+
+/// A Windows path in URI form: `/` separators, and a drive letter after a
+/// leading `/` (`C:\a\b` → `/C:/a/b`); else the drive would read as a host.
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_uri_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let drive = path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
+    if drive {
+        format!("/{path}")
+    } else {
+        path
+    }
 }
 
 /// The decoded path bytes of a `file:` URI (any authority dropped), or `None`
@@ -196,6 +214,13 @@ mod tests {
         assert_eq!(uri.as_str(), "file:///Users/me/my%20config/ghost%23realm.toml");
         let uri = file_uri(Path::new("/a/b@c:d/e;f=g(1)+h,i!.toml"));
         assert_eq!(uri.as_str(), "file:///a/b@c:d/e;f=g(1)+h,i!.toml", "path characters stay");
+    }
+
+    #[test]
+    fn windows_paths_become_file_uris() {
+        let uri = uri_of_path_bytes(windows_uri_path(r"C:\a b\x.toml").as_bytes());
+        assert_eq!(uri.as_str(), "file:///C:/a%20b/x.toml");
+        assert_eq!(file_path_bytes(&uri).unwrap(), b"/C:/a b/x.toml");
     }
 
     #[cfg(unix)]
