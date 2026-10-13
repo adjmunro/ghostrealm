@@ -316,6 +316,24 @@ impl AppState {
         Ok(())
     }
 
+    /// Open plugin `id` in pane `pane` of workspace `vt`, focusing that pane
+    /// first so the result lands there and not in the previously focused pane.
+    pub fn open_plugin_in_pane(
+        &mut self,
+        vt: VtabId,
+        pane: ghostrealm_core::tree::PaneId,
+        id: &str,
+    ) -> Result<()> {
+        let Some(v) = self.tree.vtab_mut(vt) else {
+            return Ok(());
+        };
+        if v.pane_mut(pane).is_none() {
+            return Ok(());
+        }
+        v.focused_pane = pane;
+        self.open_plugin_in_focused(id)
+    }
+
     /// Registered plugins, in picker order.
     pub fn plugins(&self) -> &[Box<dyn Plugin>] {
         &self.plugins
@@ -1306,6 +1324,30 @@ mod tests {
         // The new (focused) pane is empty — it opens on the picker, no terminal.
         let focused = v.panes().into_iter().find(|p| p.id == v.focused_pane).unwrap();
         assert!(focused.surfaces.is_empty(), "a new split opens empty");
+    }
+
+    #[test]
+    fn picker_options_open_in_the_clicked_pane() {
+        let mut s = AppState::new();
+        let vt = s.new_empty_vtab();
+        let left = s.tree.vtab(vt).unwrap().focused_pane;
+        s.split_focused(Axis::LeftRight).unwrap();
+        let right = s.tree.vtab(vt).unwrap().focused_pane;
+        assert_ne!(left, right);
+
+        s.open_plugin_in_pane(vt, left, editor::ID).unwrap();
+        let v = s.tree.vtab(vt).unwrap();
+        assert_eq!(v.focused_pane, left, "the clicked pane takes focus");
+        let pane_surfaces = |id| v.panes().into_iter().find(|p| p.id == id).unwrap().surfaces.len();
+        assert_eq!(pane_surfaces(left), 1);
+        assert_eq!(pane_surfaces(right), 0, "the previously focused pane stays empty");
+    }
+
+    #[test]
+    fn picker_options_are_ordered_with_the_web_browser_last() {
+        let s = AppState::new();
+        let titles: Vec<_> = s.plugins().iter().filter(|p| p.pickable()).map(|p| p.title()).collect();
+        assert_eq!(titles, ["Terminal", "File browser", "New File", "Web browser"]);
     }
 
     #[test]

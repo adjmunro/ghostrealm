@@ -927,28 +927,6 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — new workspace and "nothing open" pane
-
-- Requires: NO BLOCKERS
-- Detail:
-  - **Opens in the wrong pane**: clicking an option on a "nothing open" pane
-    opens it in the *focused* pane, not the clicked one (the button press is
-    armed and suppresses the pane focus that a plain click applies). Open in the
-    clicked pane, or make the click move focus to it first.
-  - **Focus highlight**: the focused-pane border is drawn only after a view
-    paints, so a focused "nothing open" pane never gets it. Draw it for empty
-    panes too.
-  - **Order and labels**: the options are numbered by plugin registration order
-    (Terminal, File browser, Web browser, Editor). Want the web browser as #4,
-    so the editor moves to #3. Label the editor option "New File" instead of
-    "Editor".
-  - **Shortcuts on the page**: the page shows only the `pane.close` chord (as
-    Cmd+W). Show the split chords too (`split.leftright`, `split.topbottom`),
-    looked up from `[keybindings]` the same way.
-- Reason: owner review; the empty pane is the first thing a new split shows.
-
----
-
 [2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — editor and file browser polish
 
 - Requires: NO BLOCKERS

@@ -14,7 +14,7 @@ pub fn builtin() -> Vec<Box<dyn Plugin>> {
     vec![
         Box::new(terminal::TerminalPlugin),
         Box::new(file_browser::FileBrowserPlugin),
-        Box::new(web::WebPlugin::new()),
         Box::new(editor::EditorPlugin),
+        Box::new(web::WebPlugin::new()),
     ]
 }

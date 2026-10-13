@@ -576,8 +576,8 @@ enum ButtonAction {
     CloseSurface(VtabId, PaneId, SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
-    /// Open a plugin's content in the focused pane (the "nothing open" picker).
-    OpenPlugin(&'static str),
+    /// Open a plugin's content in the given pane (the "nothing open" picker).
+    OpenPlugin(VtabId, PaneId, &'static str),
     /// A button a view registered while painting: (owning surface, view-local id).
     View(SurfaceId, u32),
     /// Confirm / cancel the floating picker.
@@ -1132,8 +1132,8 @@ impl State {
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
-            ButtonAction::OpenPlugin(id) => {
-                if let Err(e) = self.app.open_plugin_in_focused(id) {
+            ButtonAction::OpenPlugin(vt, pane, id) => {
+                if let Err(e) = self.app.open_plugin_in_pane(vt, pane, id) {
                     eprintln!("ghostrealm: open {id}: {e:#}");
                 }
             }
@@ -1914,15 +1914,25 @@ impl State {
             .collect()
     }
 
-    /// Draw the empty-workspace ("nothing open") screen in `rect`: a heading, a
-    /// numbered button per pickable plugin, and a close hint. Buttons open that
-    /// plugin in the focused (empty) pane.
-    fn build_empty_pane(&mut self, frame: &mut Frame, rect: Rect) {
+    /// Draw the empty-pane ("nothing open") screen in `rect`: a heading, a
+    /// numbered button per pickable plugin, and shortcut hints. Buttons open
+    /// that plugin in pane `pane` of workspace `vt`.
+    fn build_empty_pane(&mut self, frame: &mut Frame, rect: Rect, vt: Option<VtabId>, pane: PaneId) {
         let options = self.pickable_plugins();
-        let hint = match self.cfg.binding_for("pane.close") {
+        let mut hints: Vec<String> = [
+            ("split.leftright", "splits left/right"),
+            ("split.topbottom", "splits top/bottom"),
+        ]
+        .into_iter()
+        .filter_map(|(cmd, what)| {
+            let chord = self.cfg.binding_for(cmd)?;
+            Some(format!("{}  {what}", pretty_chord(&chord)))
+        })
+        .collect();
+        hints.push(match self.cfg.binding_for("pane.close") {
             Some(c) => format!("{}  closes this workspace", pretty_chord(&c)),
             None => "Close this workspace from the palette".to_string(),
-        };
+        });
         let ui = self.ui();
         let (scale, ch) = (ui.scale, ui.cell_h);
         // The buttons here are the app's (pushed to `self.buttons`), so the
@@ -1947,7 +1957,7 @@ impl State {
         let gap = 8.0 * scale;
         let heading_gap = 18.0 * scale;
         let hint_gap = 20.0 * scale;
-        let total = ch + heading_gap + n * btn_h + (n - 1.0) * gap + hint_gap + ch;
+        let total = ch + heading_gap + n * btn_h + (n - 1.0) * gap + hint_gap + hints.len() as f32 * ch;
         let centre = rect.x + rect.w * 0.5;
         let bx = centre - btn_w * 0.5;
         let pad = 12.0 * scale;
@@ -1968,13 +1978,18 @@ impl State {
             let color = if hovered { theme::LABEL_HOVER } else { theme::LABEL };
             let text = format!("{}   {label}", (i + 1) % 10);
             cx.label(&text, Font::SANS, bx + pad, y + (btn_h - ch) * 0.5, hit, color);
-            self.buttons.push((hit, ButtonAction::OpenPlugin(id)));
+            if let Some(vt) = vt {
+                self.buttons.push((hit, ButtonAction::OpenPlugin(vt, pane, id)));
+            }
             y += btn_h + gap;
         }
 
         y += hint_gap - gap;
-        let hint = cx.shape(&hint, Font::SANS, rect.w);
-        cx.place(hint, centre - hint.width * 0.5, y, rect, EMPTY_HINT);
+        for hint in hints {
+            let hint = cx.shape(&hint, Font::SANS, rect.w);
+            cx.place(hint, centre - hint.width * 0.5, y, rect, EMPTY_HINT);
+            y += ch;
+        }
     }
 
     /// Draw the floating picker overlay: a dim backdrop and a centred
@@ -3447,18 +3462,20 @@ impl State {
                 }
             }
 
-            let Some((active_sid, _, _)) = pr.surfaces.iter().find(|(_, _, a)| *a) else {
-                // No surface in this pane: draw the "nothing open" screen.
-                self.build_empty_pane(&mut frame, *term);
+            // No surface, or an empty tab: draw the "nothing open" screen.
+            let active_sid = pr
+                .surfaces
+                .iter()
+                .find(|(_, _, a)| *a)
+                .map(|(s, _, _)| *s)
+                .filter(|s| !self.app.surface_is_empty(*s));
+            let Some(sid) = active_sid else {
+                self.build_empty_pane(&mut frame, *term, active_vt, pr.id);
+                if pr.focused && multi_pane {
+                    push_border(&mut frame.top, pr.rect, sw, sh, self.chrome.accent);
+                }
                 continue;
             };
-            let sid = *active_sid;
-
-            // An empty tab shows the picker; a file browser tab shows the file browser.
-            if self.app.surface_is_empty(sid) {
-                self.build_empty_pane(&mut frame, *term);
-                continue;
-            }
             if let Some(view) = self.app.view_mut(sid) {
                 // The view paints everything below the strip; it sizes itself
                 // (e.g. resizes its PTY) from the rect it gets.

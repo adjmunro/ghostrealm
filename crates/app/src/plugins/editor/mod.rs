@@ -65,7 +65,7 @@ impl Plugin for EditorPlugin {
     }
 
     fn title(&self) -> &'static str {
-        "Editor"
+        "New File"
     }
 
     fn open(&self, cx: &OpenCx) -> Result<Box<dyn View>> {
