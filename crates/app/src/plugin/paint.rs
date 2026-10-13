@@ -194,7 +194,7 @@ pub struct Image {
 impl Image {
     /// An image from `width` x `height` straight-alpha RGBA8 pixels (what the
     /// `image` crate decodes to), premultiplied in linear light before its mips
-    /// are built.
+    /// are built. A zero width or height gives one transparent pixel.
     pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Arc<Image> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "RGBA8 size");
@@ -208,7 +208,13 @@ impl Image {
                 }
             }
         }
-        let (width, height) = (width.max(1), height.max(1));
+        // An empty image is one transparent pixel, so it still has a size to fit.
+        let (width, height) = if width == 0 || height == 0 {
+            rgba = vec![0; 4];
+            (1, 1)
+        } else {
+            (width, height)
+        };
         let mut mips: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         let (mut w, mut h) = (width, height);
         while w > 1 || h > 1 {
@@ -808,6 +814,16 @@ mod tests {
         let r = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         assert_eq!(img.fit(r, 1.0), Rect { x: 48.0, y: 49.0, w: 5.0, h: 2.0 }, "never upscaled");
         assert_eq!(img.fit(r, f32::MAX), Rect { x: 0.0, y: 30.0, w: 100.0, h: 40.0 });
+    }
+
+    #[test]
+    fn an_empty_image_is_one_transparent_pixel() {
+        for (w, h) in [(0, 5), (5, 0), (0, 0)] {
+            let img = Image::from_rgba(w, h, Vec::new());
+            assert_eq!((img.width(), img.height()), (1, 1));
+            assert_eq!(img.bgra().unwrap(), &[0, 0, 0, 0]);
+            assert!(img.mips().is_empty());
+        }
     }
 
     /// Mips average in linear light: a black-and-white checkerboard shrinks to
