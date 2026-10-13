@@ -128,7 +128,11 @@ pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
 fn create_copy(src: &Path, dst: &Path) -> Result<()> {
     let meta = src.symlink_metadata().with_context(|| format!("can't read {}", src.display()))?;
     if meta.is_dir() {
-        std::fs::create_dir(dst)?;
+        let mut builder = std::fs::DirBuilder::new();
+        // Owner-only until `copy_children` gives it the source's permissions.
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dst)?;
     } else if meta.is_symlink() {
         #[cfg(unix)]
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
@@ -182,12 +186,15 @@ fn copy_contents(mut from: &std::fs::File, mut to: &std::fs::File) -> std::io::R
     to.set_permissions(from.metadata()?.permissions())
 }
 
-/// Copy what is inside the directory `src` into the existing directory `dst`.
+/// Copy what is inside the directory `src` into the existing directory `dst`,
+/// then give `dst` the permissions of `src` (last, as they may forbid writing
+/// into it).
 fn copy_children(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
     }
+    std::fs::set_permissions(dst, src.symlink_metadata()?.permissions())?;
     Ok(())
 }
 
@@ -798,6 +805,27 @@ pub mod tests {
             std::fs::set_permissions(d.join("a"), std::fs::Permissions::from_mode(0o750)).unwrap();
             copy_recursive(&d.join("a"), &d.join("a2")).unwrap();
             assert_eq!(std::fs::metadata(d.join("a2")).unwrap().permissions().mode() & 0o777, 0o750);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_folder_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("ops-dir-mode");
+        std::fs::create_dir_all(d.join("private/inner")).unwrap();
+        std::fs::write(d.join("private/inner/f"), "F").unwrap();
+        // Read-only: set last, after its contents are in.
+        std::fs::set_permissions(d.join("private/inner"), std::fs::Permissions::from_mode(0o511)).unwrap();
+        std::fs::set_permissions(d.join("private"), std::fs::Permissions::from_mode(0o711)).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        let copy = copy_into(&d.join("private"), &d.join("to")).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&copy), 0o711);
+        assert_eq!(mode(&copy.join("inner")), 0o511);
+        assert_eq!(std::fs::read_to_string(copy.join("inner/f")).unwrap(), "F");
+        for dir in [d.join("private/inner"), copy.join("inner")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
