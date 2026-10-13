@@ -279,43 +279,63 @@ mod tests {
         );
     }
 
-    /// While the writer keeps overwriting both slots, every read that succeeds
-    /// is one whole frame.
+    /// Readers hold on to a frame while the writer keeps overwriting both
+    /// slots, so the writer rewrites that frame's slot under reads in progress
+    /// (more readers than cores get preempted mid-copy): those reads fail rather
+    /// than return a torn or newer frame.
     #[test]
     fn a_read_never_returns_a_torn_frame() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Mutex;
         let dir = tmpdir("torn");
         let (w, h) = (256u32, 256u32);
+        let len = (w * h * 4) as usize;
+        // Frame `seq` is filled with `seq % 4`, which tells it from the frames
+        // written to its slot after it.
+        let frames: Vec<Vec<u8>> = (0..4).map(|n| vec![n; len]).collect();
         let mut writer = FrameWriter::new(&dir, "t");
-        let first = writer.write(w, h, &vec![0; (w * h * 4) as usize]).unwrap();
+        let first = writer.write(w, h, &frames[1]).unwrap();
         let reader = FrameReader::open(&first.path).unwrap();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let latest = std::sync::Arc::new(std::sync::Mutex::new(first.clone()));
-        let t = {
-            let (stop, latest) = (stop.clone(), latest.clone());
-            std::thread::spawn(move || {
-                let mut n = 1u8;
+        let (stop, latest) = (AtomicBool::new(false), Mutex::new(first));
+        let (ok, gone, torn) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let readers = std::thread::available_parallelism().map_or(4, |n| n.get()) * 2;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut seq = 2;
                 while !stop.load(Ordering::Relaxed) {
-                    let f = writer.write(w, h, &vec![n; (w * h * 4) as usize]).unwrap();
+                    let f = writer.write(w, h, &frames[seq % 4]).unwrap();
                     *latest.lock().unwrap() = f;
-                    n = n.wrapping_add(1);
+                    seq += 1;
                 }
-            })
-        };
-        let (mut ok, mut gone) = (0, 0);
-        let mut px = Vec::new();
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        while std::time::Instant::now() < until {
-            let f = latest.lock().unwrap().clone();
-            if reader.read(f.slot, f.seq, w, h, &mut px) {
-                assert!(px.iter().all(|b| *b == px[0]), "torn frame {}", f.seq);
-                ok += 1;
-            } else {
-                gone += 1;
+            });
+            let readers: Vec<_> = (0..readers)
+                .map(|_| {
+                    s.spawn(|| {
+                        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                        let mut px = Vec::new();
+                        while std::time::Instant::now() < until {
+                            // Re-read one frame until its slot is rewritten.
+                            let f = latest.lock().unwrap().clone();
+                            while reader.read(f.slot, f.seq, w, h, &mut px) {
+                                if px != frames[f.seq as usize % 4] {
+                                    torn.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            gone.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for r in readers {
+                r.join().unwrap();
             }
-        }
-        stop.store(true, Ordering::Relaxed);
-        t.join().unwrap();
-        assert!(ok > 0, "some reads succeed ({gone} overwritten)");
+            stop.store(true, Ordering::Relaxed);
+        });
+        let (ok, gone, torn) = (ok.into_inner(), gone.into_inner(), torn.into_inner());
+        assert_eq!(torn, 0, "wrong frames returned ({ok} right, {gone} overwritten)");
+        assert!(ok > 0, "some reads succeed");
+        assert!(gone > 0, "some reads raced the writer");
     }
 
     #[cfg(unix)]
