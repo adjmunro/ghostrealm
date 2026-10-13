@@ -318,12 +318,17 @@ impl AppState {
 
     /// Open plugin `id` in pane `pane` of workspace `vt`, focusing that pane
     /// first so the result lands there and not in the previously focused pane.
+    /// Does nothing when `vt` is no longer the active workspace (the press that
+    /// armed the button may predate a workspace switch).
     pub fn open_plugin_in_pane(
         &mut self,
         vt: VtabId,
         pane: ghostrealm_core::tree::PaneId,
         id: &str,
     ) -> Result<()> {
+        if self.active() != Some(vt) {
+            return Ok(());
+        }
         let Some(v) = self.tree.vtab_mut(vt) else {
             return Ok(());
         };
@@ -1341,6 +1346,19 @@ mod tests {
         let pane_surfaces = |id| v.panes().into_iter().find(|p| p.id == id).unwrap().surfaces.len();
         assert_eq!(pane_surfaces(left), 1);
         assert_eq!(pane_surfaces(right), 0, "the previously focused pane stays empty");
+    }
+
+    #[test]
+    fn a_picker_option_for_a_workspace_that_is_no_longer_active_does_nothing() {
+        let mut s = AppState::new();
+        let first = s.new_empty_vtab();
+        let pane = s.tree.vtab(first).unwrap().focused_pane;
+        let second = s.new_empty_vtab();
+        assert_eq!(s.active(), Some(second));
+
+        s.open_plugin_in_pane(first, pane, editor::ID).unwrap();
+        assert!(s.views.is_empty(), "nothing opened anywhere");
+        assert_eq!(s.focused_surface(), None);
     }
 
     #[test]
