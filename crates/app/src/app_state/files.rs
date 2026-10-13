@@ -33,7 +33,7 @@ impl AppState {
     /// The file menu for `target`.
     pub fn file_menu(&self, target: &FileTarget) -> Vec<MenuEntry> {
         let env = MenuEnv {
-            in_git: git::repo_root(&target.path).is_some(),
+            in_git: file_ops::containing_repo(&target.path).is_ok(),
             can_paste: self.file_clip.is_some(),
             reveal: cfg!(target_os = "macos"),
         };
@@ -513,8 +513,13 @@ mod tests {
             assert!(!has(&s, FileAction::AddToGitignore), "not in a repository");
         }
         if let Some(r) = repo("fm-menu-git") {
-            let t = FileTarget { path: r.join("tracked.txt"), ..target };
+            let t = FileTarget { path: r.join("tracked.txt"), ..target.clone() };
             assert!(s.file_menu(&t).contains(&MenuEntry::Item(FileAction::AddToGitignore)));
+            // The repository's own folder is an entry of whatever holds it.
+            if git::repo_root(r.parent().unwrap()).is_none() {
+                let t = FileTarget { path: r.clone(), kind: Kind::Dir, ..target };
+                assert!(!s.file_menu(&t).contains(&MenuEntry::Item(FileAction::AddToGitignore)));
+            }
         }
     }
 

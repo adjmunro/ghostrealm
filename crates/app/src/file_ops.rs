@@ -305,7 +305,7 @@ pub fn add_ignore_line(file: &Path, pattern: &str) -> Result<bool> {
 /// The repository whose index would hold `path`: the one around its folder
 /// (a folder that is a repository of its own is still an entry of the one
 /// it sits in).
-fn containing_repo(path: &Path) -> Result<PathBuf> {
+pub fn containing_repo(path: &Path) -> Result<PathBuf> {
     path.parent().and_then(git::repo_root).context("not in a git repository")
 }
 
