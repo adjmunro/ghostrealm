@@ -931,12 +931,6 @@
 
 - Requires: NO BLOCKERS
 - Detail:
-  - **Ribbon word count**: the stats tooltip reads "Click for words"
-    (`stats.rs`, `Stats::tip`); want "Click for wordcount". Also: the stats text
-    and the autosave icon overlap in padding/margin; give them a gap.
-  - **File-browser ribbon padding**: reduce the padding on the ribbon's option
-    toggles (`preview`, `hidden`, `.gitignore`, git filter, view); each hit
-    area is its label plus `pad` on both sides, which reads as too wide.
   - **File-browser date view**: the grouped view is labelled `date` and does
     not say what it represents. Rename it to "Modified". It still lists every
     file, grouped by modification time; it is not a filter and hides nothing

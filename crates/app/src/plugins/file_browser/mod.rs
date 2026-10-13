@@ -451,16 +451,19 @@ impl FileBrowserView {
         // directory picker never lists.
         let file_only = |id: u32| id == BTN_GIT || id == BTN_VIEW || id == BTN_PREVIEW;
         let dirs_only = self.mode == Mode::PickDir;
+        // Each toggle's hit area is its label plus `tpad` on both sides; the
+        // areas tile, so the padding is also the gap between labels.
+        let tpad = 5.0 * scale;
         let mut right = rect.x + rect.w - pad;
         for (label, on, id) in toggles.into_iter().filter(|t| !(dirs_only && file_only(t.2))) {
             let w = label.chars().count() as f32 * cx.ui.cell_w;
-            let hit = Rect { x: right - w - pad, y: rect.y, w: w + pad * 2.0, h: header_h };
+            let hit = Rect { x: right - w - tpad, y: rect.y, w: w + tpad * 2.0, h: header_h };
             if cx.button(hit, id) {
                 cx.highlight(hit);
             }
             let color = if on { theme::LABEL_HOVER } else { theme::DIM };
-            cx.label(label, Family::SansSerif, right - w - pad * 0.5, hy, hit, color);
-            right -= w + pad * 2.0;
+            cx.label(label, Family::SansSerif, hit.x + tpad * 0.5, hy, hit, color);
+            right -= w + tpad * 2.0;
         }
 
         // The input field fills the space between.

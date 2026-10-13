@@ -437,13 +437,13 @@ impl EditorView {
         cx.tooltip(ab, self.autosave_tip(cx.cfg));
         let disk = if has_file && self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
         paint_floppy(cx, ab, FLOPPY * ch, disk);
-        // The statistic (click to cycle), right-aligned against the disk.
+        // The statistic (click to cycle), right-aligned against the disk's
+        // whole button (not just the glyph), so their hit areas never overlap.
         self.stats.poll();
         let spans = self.stats.spans(&self.buf);
         let stat = cx.shape_spans(&spans, Font::SANS, r.w);
         let gap = 6.0 * cx.ui.scale;
-        let disk_left = ab.x + (ab.w - FLOPPY * ch) * 0.5;
-        let stat_left = disk_left - gap - stat.width;
+        let stat_left = ab.x - gap - stat.width;
         let sb = Rect { x: stat_left - gap, y: r.y, w: stat.width + gap * 2.0, h: r.h };
         if cx.button(sb, BTN_STAT) {
             cx.highlight(sb);
@@ -1074,15 +1074,14 @@ mod tests {
     }
 
     #[test]
-    fn the_statistic_sits_against_the_disk_and_cycles_on_click() {
+    fn the_statistic_ends_where_the_disk_button_begins_and_cycles_on_click() {
         let mut v = view_with("one two");
         v.buf.path = Some(tmpdir("editor-stat").join("f.txt"));
         let mut h = Harness::new();
         let buttons = h.paint(&mut v, RECT).view_buttons.clone();
         let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
         let (stat, disk) = (at(BTN_STAT), at(BTN_AUTOSAVE));
-        let disk_left = disk.x + (disk.w - FLOPPY * UI.cell_h) * 0.5;
-        assert!((stat.x + stat.w - disk_left).abs() < 1.0, "right edge meets the disk");
+        assert!((stat.x + stat.w - disk.x).abs() < 1.0, "hit areas abut, never overlap");
         assert_eq!(v.stats.shown(), stats::Stat::Lines);
         h.button(&mut v, BTN_STAT);
         assert_eq!(v.stats.shown(), stats::Stat::Words);

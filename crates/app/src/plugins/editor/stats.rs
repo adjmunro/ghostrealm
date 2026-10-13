@@ -24,7 +24,7 @@ impl Stat {
     fn label(self) -> &'static str {
         match self {
             Stat::Lines => "lines",
-            Stat::Words => "words",
+            Stat::Words => "wordcount",
             Stat::Bytes => "bytes",
             Stat::Changes => "changes since the last commit",
         }
@@ -238,7 +238,7 @@ mod tests {
         b.insert_str("hello big\nworld");
         let mut s = Stats::new(None);
         assert_eq!(text(s.spans(&b)), "2 lines");
-        assert_eq!(s.tip(), "Click for words");
+        assert_eq!(s.tip(), "Click for wordcount");
         s.cycle();
         assert_eq!(text(s.spans(&b)), "3 words");
         s.cycle();
