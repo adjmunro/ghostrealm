@@ -218,17 +218,8 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = &mut self.state else { return };
         match event {
             WindowEvent::CloseRequested => {
-                // Snappy quit: hide the window for instant visual feedback, then
-                // exit the process outright. Graceful teardown (the wgpu/Metal
-                // device drop) is synchronous and can stall for seconds —
-                // sometimes long enough that macOS marks the app unresponsive.
-                // Exiting lets the OS reclaim threads and fds; the closing PTY
-                // masters SIGHUP the child shells, exactly as closing any
-                // terminal does. Flush unsaved editors first (each view's
-                // autosave setting decides).
-                let _ = state.app.autosave_all(&state.cfg);
-                state.window.set_visible(false);
-                std::process::exit(0);
+                state.request_quit();
+                state.window.request_redraw();
             }
             WindowEvent::Focused(false) => {
                 // App lost focus: autosave editors (switching to another app), and
@@ -595,6 +586,7 @@ enum ButtonAction {
     /// Accept / cancel the open confirmation.
     ConfirmAccept,
     ConfirmCancel,
+    ConfirmDiscard,
 }
 
 impl State {
@@ -689,7 +681,7 @@ impl State {
                 }
             })
         };
-        let mut app = AppState::new();
+        let mut app = AppState::new().with_unsaved_guard();
         let has_command = command_line.is_some();
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
@@ -1105,7 +1097,10 @@ impl State {
                 action,
                 ButtonAction::PickerConfirm | ButtonAction::PickerCancel | ButtonAction::View(PICKER_SID, _)
             );
-            let asking = matches!(action, ButtonAction::ConfirmAccept | ButtonAction::ConfirmCancel);
+            let asking = matches!(
+                action,
+                ButtonAction::ConfirmAccept | ButtonAction::ConfirmCancel | ButtonAction::ConfirmDiscard
+            );
             if (confirm && !asking) || (picker && !confirm && !modal) {
                 continue;
             }
@@ -1153,6 +1148,7 @@ impl State {
             ButtonAction::PickerCancel => self.app.close_picker(),
             ButtonAction::ConfirmAccept => self.accept_confirm(),
             ButtonAction::ConfirmCancel => self.app.cancel_confirm(),
+            ButtonAction::ConfirmDiscard => self.discard_confirm(),
         }
         self.dirty = true;
         true
@@ -1332,8 +1328,50 @@ impl State {
 
     /// Go ahead with the open confirmation's action.
     fn accept_confirm(&mut self) {
-        let done = self.app.accept_confirm();
-        self.after_pick(done);
+        match self.app.accept_confirm() {
+            Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
+            Err(e) => eprintln!("ghostrealm: save: {e:#}"),
+        }
+        self.dirty = true;
+        self.exit_if_quitting();
+    }
+
+    /// Go ahead with the open confirmation's action without saving.
+    fn discard_confirm(&mut self) {
+        self.app.discard_confirm();
+        self.dirty = true;
+        self.exit_if_quitting();
+    }
+
+    /// Ask to quit: straight away when nothing is unsaved, else after the
+    /// confirmation. Editors autosave first, as their setting says; the
+    /// confirmation covers what that left unsaved.
+    fn request_quit(&mut self) {
+        if self.app.confirm().is_some() {
+            return;
+        }
+        if self.app.autosave_all(&self.cfg) {
+            self.reload_config();
+        }
+        // Palette and menus swallow the confirmation's buttons.
+        self.palette = None;
+        self.menu = None;
+        self.app.request_quit();
+        self.dirty = true;
+        self.exit_if_quitting();
+    }
+
+    /// Exit the process once a quit has been agreed. Hides the window first
+    /// for instant visual feedback, then exits outright: graceful teardown
+    /// (the wgpu/Metal device drop) is synchronous and can stall for seconds,
+    /// sometimes long enough that macOS marks the app unresponsive. Exiting
+    /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
+    /// child shells, exactly as closing any terminal does.
+    fn exit_if_quitting(&mut self) {
+        if self.app.quitting() {
+            self.window.set_visible(false);
+            std::process::exit(0);
+        }
     }
 
     /// Follow up a picker action: hot-reload a written config, report failure.
@@ -2121,7 +2159,7 @@ impl State {
     }
 
     /// Draw the open confirmation: a dim backdrop and a centred panel with the
-    /// question above [Cancel] [<accept>].
+    /// question above [<discard>] [Cancel] [<accept>], right-aligned.
     fn build_confirm(&mut self, frame: &mut Frame) {
         let Some(confirm) = self.app.confirm().cloned() else {
             return;
@@ -2132,10 +2170,22 @@ impl State {
         let pad = 12.0 * scale;
         frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let bh = ch + 8.0 * scale;
-        let pw = (sw * 0.4).clamp(320.0 * scale, 520.0 * scale).min((sw - 40.0 * scale).max(1.0));
-        let ph = ch + bh + pad * 3.0;
-        let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
-        let panel = Rect { x: px, y: py, w: pw, h: ph };
+        // Right to left: the primary button, Cancel, then the discard button.
+        let buttons: Vec<(&'static str, ButtonAction, bool)> = [
+            confirm.accept.map(|l| (l, ButtonAction::ConfirmAccept, true)),
+            Some(("Cancel", ButtonAction::ConfirmCancel, false)),
+            confirm.discard.map(|l| (l, ButtonAction::ConfirmDiscard, false)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let button_w = |label: &str| label.chars().count() as f32 * self.ui().cell_w + pad * 2.0;
+        let buttons_w: f32 = buttons.iter().map(|(l, ..)| button_w(l) + pad).sum::<f32>() - pad;
+        let max_w = (sw - 40.0 * scale).max(1.0);
+        let pw = (sw * 0.4)
+            .clamp(320.0 * scale, 520.0 * scale)
+            .max(buttons_w + pad * 2.0)
+            .min(max_w);
         let ui = self.ui();
         let mut cx = PaintCx::new(
             &self.cfg,
@@ -2147,18 +2197,21 @@ impl State {
             Layer::Overlay,
             PICKER_SID,
         );
+        // The message wraps; size the panel to its lines.
+        let text_w = pw - pad * 2.0;
+        let natural = cx.shape(&confirm.message, Family::SansSerif, f32::MAX).width;
+        let lines = (natural / text_w).ceil().clamp(1.0, 4.0);
+        let ph = ch * lines + bh + pad * 3.0;
+        let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
+        let panel = Rect { x: px, y: py, w: pw, h: ph };
         cx.fill(panel, cx.chrome.background);
         cx.border(panel, cx.chrome.accent);
-        let msg = cx.shape(&confirm.message, Family::SansSerif, pw - pad * 2.0);
+        let msg = cx.shape(&confirm.message, Family::SansSerif, text_w);
         cx.place(msg, px + pad, py + pad, panel, theme::TITLE);
 
-        // [Cancel] [<accept>], right-aligned; the accept button is primary.
         let by = py + ph - pad - bh;
         let mut right = px + pw - pad;
-        for (label, action, primary) in [
-            (confirm.accept, ButtonAction::ConfirmAccept, true),
-            ("Cancel", ButtonAction::ConfirmCancel, false),
-        ] {
+        for (label, action, primary) in buttons {
             let w = label.chars().count() as f32 * ui.cell_w;
             let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
             let hov = cx.hovered(hit);
@@ -2730,7 +2783,8 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
-        // A confirmation owns the keyboard: Enter accepts, Escape cancels. A held
+        // A confirmation owns the keyboard: Enter accepts (the save button, when
+        // it has one), Escape cancels. A held
         // key's repeats are ignored, so the Enter that asked can't also answer.
         if self.app.confirm().is_some() {
             if event.repeat {
@@ -2743,6 +2797,16 @@ impl State {
             }
             self.dirty = true;
             return;
+        }
+        // Cmd+Q quits (macOS routes it here instead of ending the process, so
+        // unsaved changes get asked about).
+        if self.mods.super_ && !self.mods.shift && !self.mods.alt && !self.mods.ctrl {
+            if let WKey::Character(s) = base_key(event) {
+                if s.eq_ignore_ascii_case("q") {
+                    self.request_quit();
+                    return;
+                }
+            }
         }
         // The picker, when open, owns the keyboard: Escape cancels,
         // Cmd+Enter confirms, everything else drives its file browser.

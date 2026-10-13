@@ -68,8 +68,13 @@ impl Pick {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Confirm {
     pub message: String,
-    /// The accept button's label: it names the action ("Replace").
-    pub accept: &'static str,
+    /// The accept button's label: it names the action ("Replace"). `None` when
+    /// the question has no safe way to go ahead, leaving only Cancel and
+    /// `discard`.
+    pub accept: Option<&'static str>,
+    /// A third button that goes ahead without doing what `accept` does
+    /// ("Quit Without Saving").
+    pub discard: Option<&'static str>,
     then: Confirmed,
 }
 
@@ -78,11 +83,15 @@ pub struct Confirm {
 enum Confirmed {
     /// Finish the picker with this path.
     Pick(std::path::PathBuf),
+    /// Leave, after saving `save` (accept) or without saving (discard).
+    Unsaved { what: Leave, save: Vec<SurfaceId> },
 }
 
-/// Part of the tree a close removes.
+/// What leaving gives up: part of the tree, or the whole app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leave {
+    /// The app exits.
+    Quit,
     /// One surface (tab) in a pane.
     Surface(VtabId, PaneId, SurfaceId),
     /// A pane and every surface in it.
@@ -102,6 +111,12 @@ pub struct AppState {
     picker: Option<(FileBrowserView, Pick)>,
     /// The open confirmation, if any.
     confirm: Option<Confirm>,
+    /// Whether closing or quitting asks first when a view has unsaved changes.
+    /// The GUI turns it on; the agent channel and headless runs close at once,
+    /// since nobody is there to answer.
+    guard_unsaved: bool,
+    /// An accepted quit is waiting for the window to exit.
+    quitting: bool,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -133,6 +148,8 @@ impl AppState {
             plugins: crate::plugins::builtin(),
             picker: None,
             confirm: None,
+            guard_unsaved: false,
+            quitting: false,
             shell_line: None,
             waker: None,
             languages: None,
@@ -508,12 +525,61 @@ impl AppState {
         self.confirm = None;
     }
 
-    /// Go ahead with the confirmed action. Returns the file written, if any.
-    pub fn accept_confirm(&mut self) -> Result<Option<std::path::PathBuf>> {
-        match self.confirm.take() {
-            Some(Confirm { then: Confirmed::Pick(path), .. }) => self.finish_picker(path),
-            None => Ok(None),
+    /// Go ahead with the confirmed action. Returns the files written. A
+    /// question with no accept button stays open.
+    pub fn accept_confirm(&mut self) -> Result<Vec<std::path::PathBuf>> {
+        if self.confirm.as_ref().is_some_and(|c| c.accept.is_none()) {
+            return Ok(Vec::new());
         }
+        match self.confirm.take() {
+            Some(Confirm { then: Confirmed::Pick(path), .. }) => {
+                Ok(self.finish_picker(path)?.into_iter().collect())
+            }
+            Some(Confirm { then: Confirmed::Unsaved { what, save }, .. }) => {
+                // Nothing is closed unless every save worked.
+                let mut written = Vec::new();
+                for sid in save {
+                    let view = self
+                        .views
+                        .get_mut(&sid)
+                        .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+                    let Some(path) = view.path() else { continue };
+                    view.save_as(path.clone())?;
+                    written.push(path);
+                }
+                self.perform(what);
+                Ok(written)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Go ahead with the confirmed action without its saving. Does nothing
+    /// unless the question has a discard button.
+    pub fn discard_confirm(&mut self) {
+        if !self.confirm.as_ref().is_some_and(|c| c.discard.is_some()) {
+            return;
+        }
+        if let Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) = self.confirm.take() {
+            self.perform(what);
+        }
+    }
+
+    /// Ask before closing or quitting over unsaved changes ([`Self::confirm`]).
+    pub fn with_unsaved_guard(mut self) -> Self {
+        self.guard_unsaved = true;
+        self
+    }
+
+    /// Leave the app, asking first when views have unsaved changes.
+    /// [`Self::quitting`] says when it is time to exit.
+    pub fn request_quit(&mut self) {
+        self.leave(Leave::Quit);
+    }
+
+    /// Whether a quit has been agreed and the window should exit.
+    pub fn quitting(&self) -> bool {
+        self.quitting
     }
 
     /// Confirm the picker with its browser's choice, then close it. With no
@@ -539,7 +605,8 @@ impl AppState {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.confirm = Some(Confirm {
                     message: format!("\u{201c}{name}\u{201d} already exists. Replace it?"),
-                    accept: "Replace",
+                    accept: Some("Replace"),
+                    discard: None,
                     then: Confirmed::Pick(path),
                 });
                 return Ok(None);
@@ -721,15 +788,79 @@ impl AppState {
         self.leave(Leave::Surface(vtab, pane, surface));
     }
 
-    /// Take `what` out of the tree.
+    /// Leave `what`, after asking when a view in it has unsaved changes.
     fn leave(&mut self, what: Leave) {
+        if self.guard_unsaved {
+            let unsaved = self.unsaved_in(what);
+            if !unsaved.is_empty() {
+                self.ask_unsaved(what, unsaved);
+                return;
+            }
+        }
         self.perform(what);
     }
 
-    /// Remove `what` from the tree, then drop the views of surfaces that no
-    /// longer exist.
+    /// The surfaces `what` removes, in tree order.
+    fn surfaces_in(&self, what: Leave) -> Vec<SurfaceId> {
+        let vtabs: Vec<&_> = match what {
+            Leave::Surface(_, _, sid) => return vec![sid],
+            Leave::Quit => self.tree.vtabs().iter().collect(),
+            Leave::Pane(vt, _) | Leave::Vtab(vt) => self.tree.vtab(vt).into_iter().collect(),
+        };
+        vtabs
+            .into_iter()
+            .flat_map(|v| v.panes())
+            .filter(|p| !matches!(what, Leave::Pane(_, pane) if pane != p.id))
+            .flat_map(|p| p.surfaces.iter().map(|s| s.id))
+            .collect()
+    }
+
+    /// The surfaces `what` removes whose views have unsaved changes.
+    fn unsaved_in(&self, what: Leave) -> Vec<SurfaceId> {
+        let mut ids = self.surfaces_in(what);
+        ids.retain(|id| self.views.get(id).is_some_and(|v| v.modified()));
+        ids
+    }
+
+    /// Open the save / cancel / discard question for leaving `what`. A view
+    /// with no file has nowhere to save silently, so with one among them there
+    /// is no save button.
+    fn ask_unsaved(&mut self, what: Leave, unsaved: Vec<SurfaceId>) {
+        let (save, scratch): (Vec<_>, Vec<_>) = unsaved
+            .iter()
+            .copied()
+            .partition(|id| self.views.get(id).and_then(|v| v.path()).is_some());
+        let subject = match unsaved.as_slice() {
+            [one] => {
+                let name = self.views.get(one).and_then(|v| v.title()).unwrap_or_default();
+                format!("\u{201c}{name}\u{201d} has")
+            }
+            many => format!("{} buffers have", many.len()),
+        };
+        let mut message = format!("{subject} unsaved changes.");
+        if !scratch.is_empty() {
+            message.push_str(" A buffer with no file can't be saved here and would be lost.");
+        }
+        let (accept, discard) = match what {
+            Leave::Quit => ("Save and Quit", "Quit Without Saving"),
+            _ => ("Save and Close", "Close Without Saving"),
+        };
+        self.confirm = Some(Confirm {
+            message,
+            accept: scratch.is_empty().then_some(accept),
+            discard: Some(discard),
+            then: Confirmed::Unsaved { what, save },
+        });
+    }
+
+    /// Leave `what`: remove it from the tree and drop the views of surfaces
+    /// that no longer exist, or flag the quit.
     fn perform(&mut self, what: Leave) {
         self.prune_orphan_surfaces_after(|s| match what {
+            Leave::Quit => {
+                s.quitting = true;
+                false
+            }
             Leave::Surface(vt, pane, sid) => s.tree.close_surface(vt, pane, sid),
             Leave::Pane(vt, pane) => s.tree.close_pane(vt, pane),
             Leave::Vtab(vt) => s.tree.close_vtab(vt),
@@ -1768,14 +1899,14 @@ mod tests {
 
         s.open_save_as(sid);
         assert_eq!(s.confirm_picker_with(theirs.clone()).unwrap(), None);
-        assert_eq!(s.confirm().map(|c| c.accept), Some("Replace"));
+        assert_eq!(s.confirm().and_then(|c| c.accept), Some("Replace"));
         assert!(s.picker_open(), "the picker waits behind the question");
         s.cancel_confirm();
         assert!(s.picker_open() && s.confirm().is_none());
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs", "nothing written");
 
         s.confirm_picker_with(theirs.clone()).unwrap();
-        assert_eq!(s.accept_confirm().unwrap(), Some(theirs.clone()));
+        assert_eq!(s.accept_confirm().unwrap(), vec![theirs.clone()]);
         assert!(!s.picker_open());
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine\n");
     }
@@ -1916,5 +2047,209 @@ mod tests {
             "surface grid should capture child output within the timeout, got:\n{text}\n\
              Next steps: check spawn_surface wiring and pump/snapshot in surface_text."
         );
+    }
+
+    /// A guarded state with one workspace whose focused pane has `name` open
+    /// in `dir` (containing "old\n") and edited.
+    fn edited(dir: &Path, name: &str) -> (AppState, SurfaceId, std::path::PathBuf) {
+        let mut s = AppState::new().with_unsaved_guard();
+        s.new_empty_vtab();
+        let file = dir.join(name);
+        std::fs::write(&file, "old\n").unwrap();
+        s.open_path_with_in_focused(editor::ID, &file).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"new"));
+        assert!(s.view(sid).unwrap().modified());
+        (s, sid, file)
+    }
+
+    fn surface_count(s: &AppState) -> usize {
+        s.tree.vtabs().iter().flat_map(|v| v.panes()).map(|p| p.surfaces.len()).sum()
+    }
+
+    #[test]
+    fn closing_an_unmodified_view_asks_nothing() {
+        let dir = crate::plugin::testing::tmpdir("close-clean");
+        let mut s = AppState::new().with_unsaved_guard();
+        s.new_empty_vtab();
+        s.open_path_with_in_focused(editor::ID, &dir.join("new.txt")).unwrap();
+        assert!(!s.view(s.focused_surface().unwrap()).unwrap().modified());
+        s.close_focused_surface();
+        assert!(s.confirm().is_none());
+        assert_eq!(surface_count(&s), 0);
+        s.request_quit();
+        assert!(s.confirm().is_none() && s.quitting());
+    }
+
+    #[test]
+    fn closing_a_modified_tab_asks_and_each_button_decides() {
+        let dir = crate::plugin::testing::tmpdir("close-tab");
+        // Cancel: nothing closes, nothing is written.
+        let (mut s, sid, file) = edited(&dir, "a.txt");
+        s.close_focused_surface();
+        let c = s.confirm().expect("a modified view asks first");
+        assert_eq!(
+            (c.accept, c.discard),
+            (Some("Save and Close"), Some("Close Without Saving"))
+        );
+        assert!(c.message.contains("a.txt"), "{}", c.message);
+        s.cancel_confirm();
+        assert!(s.view(sid).is_some());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        // Close without saving: the tab goes, the file is untouched.
+        s.close_focused_surface();
+        s.discard_confirm();
+        assert!(s.confirm().is_none() && s.view(sid).is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        // Save and close: the file is written, then the tab goes.
+        let (mut s, sid, file) = edited(&dir, "b.txt");
+        s.close_focused_surface();
+        assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
+        assert!(s.view(sid).is_none());
+    }
+
+    #[test]
+    fn closing_a_pane_or_workspace_asks_when_any_view_in_it_is_modified() {
+        let dir = crate::plugin::testing::tmpdir("close-pane");
+        let (mut s, sid, _) = edited(&dir, "a.txt");
+        s.close_focused_pane();
+        assert!(s.confirm().is_some(), "closing the pane drops its modified tab");
+        s.cancel_confirm();
+        assert!(s.view(sid).is_some());
+        s.close_focused_pane();
+        s.discard_confirm();
+        assert!(s.view(sid).is_none());
+
+        // Another pane's modified view doesn't count for this pane.
+        let (mut s, sid, _) = edited(&dir, "b.txt");
+        s.split_focused(Axis::LeftRight).unwrap();
+        assert_ne!(s.focused_surface(), Some(sid));
+        s.close_focused_pane();
+        assert!(s.confirm().is_none(), "the new pane is empty");
+        assert!(s.view(sid).is_some());
+
+        // The workspace closes every pane in it, from the command or by id.
+        s.split_focused(Axis::LeftRight).unwrap();
+        s.close_active_vtab();
+        assert!(s.confirm().is_some());
+        s.discard_confirm();
+        assert_eq!(s.tree.vtabs().len(), 0);
+
+        let (mut s, _, _) = edited(&dir, "c.txt");
+        let vt = s.active().unwrap();
+        s.new_empty_vtab();
+        s.close_vtab(vt);
+        assert!(s.confirm().is_some());
+        s.cancel_confirm();
+        assert_eq!(s.tree.vtabs().len(), 2);
+    }
+
+    #[test]
+    fn closing_the_last_tab_of_an_empty_pane_cascades_without_asking_about_others() {
+        let dir = crate::plugin::testing::tmpdir("close-cascade");
+        let (mut s, sid, _) = edited(&dir, "a.txt");
+        s.split_focused(Axis::LeftRight).unwrap();
+        s.close_focused_surface(); // the empty split pane
+        assert!(s.confirm().is_none());
+        assert!(s.view(sid).is_some());
+    }
+
+    #[test]
+    fn quitting_asks_over_any_workspace_and_exits_only_when_agreed() {
+        let dir = crate::plugin::testing::tmpdir("quit");
+        let (mut s, _, file) = edited(&dir, "a.txt");
+        s.new_empty_vtab(); // the modified view is in a background workspace
+        s.request_quit();
+        let c = s.confirm().expect("asks");
+        assert_eq!(
+            (c.accept, c.discard),
+            (Some("Save and Quit"), Some("Quit Without Saving"))
+        );
+        assert!(!s.quitting());
+        s.cancel_confirm();
+        assert!(!s.quitting());
+
+        s.request_quit();
+        s.discard_confirm();
+        assert!(s.quitting());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        let (mut s, _, file) = edited(&dir, "b.txt");
+        s.request_quit();
+        assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
+        assert!(s.quitting());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_view_open_and_does_not_quit() {
+        let dir = crate::plugin::testing::tmpdir("save-fails");
+        for quit in [false, true] {
+            let (mut s, sid, file) = edited(&dir, if quit { "q.txt" } else { "c.txt" });
+            // A directory in the file's place makes the write fail.
+            std::fs::remove_file(&file).unwrap();
+            std::fs::create_dir(&file).unwrap();
+            if quit {
+                s.request_quit();
+            } else {
+                s.close_focused_surface();
+            }
+            assert!(s.accept_confirm().is_err());
+            assert!(s.view(sid).is_some_and(|v| v.modified()), "still open, still unsaved");
+            assert!(!s.quitting());
+        }
+    }
+
+    #[test]
+    fn a_modified_scratch_buffer_can_only_be_cancelled_or_discarded() {
+        let mut s = AppState::new().with_unsaved_guard();
+        s.new_empty_vtab();
+        s.open_plugin_in_focused(editor::ID).unwrap();
+        let sid = s.focused_surface().unwrap();
+        s.views.get_mut(&sid).unwrap().write_input(b"x");
+        s.close_focused_surface();
+        let c = s.confirm().expect("asks");
+        assert_eq!((c.accept, c.discard), (None, Some("Close Without Saving")));
+        assert!(c.message.contains("no file"), "{}", c.message);
+        assert_eq!(s.accept_confirm().unwrap(), Vec::<std::path::PathBuf>::new());
+        assert!(s.confirm().is_some() && s.view(sid).is_some(), "Enter does nothing");
+        s.discard_confirm();
+        assert!(s.view(sid).is_none());
+
+        // An untouched scratch buffer closes at once.
+        s.open_plugin_in_focused(editor::ID).unwrap();
+        s.close_focused_surface();
+        assert!(s.confirm().is_none());
+    }
+
+    #[test]
+    fn the_agent_channel_closes_without_asking() {
+        let dir = crate::plugin::testing::tmpdir("close-agent");
+        let (mut s, sid, _) = edited(&dir, "a.txt");
+        s.guard_unsaved = false;
+        s.close_focused_surface();
+        assert!(s.confirm().is_none() && s.view(sid).is_none());
+    }
+
+    #[test]
+    fn asking_does_not_autosave() {
+        let dir = crate::plugin::testing::tmpdir("ask-no-autosave");
+        let (mut s, _, file) = edited(&dir, "a.txt");
+        // Autosave on unfocus is on, but a dialog (or the picker over it) is
+        // not the app losing focus: nothing writes until the user answers.
+        let mut cfg = Config::default();
+        cfg.editor.autosave_on_unfocus = true;
+        s.close_focused_surface();
+        s.open_save_as(s.focused_surface().unwrap());
+        assert!(s.confirm().is_some() && s.picker_open());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+        s.cancel_confirm();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+        // Losing the window to another app still autosaves.
+        assert!(!s.autosave_all(&cfg));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
     }
 }
