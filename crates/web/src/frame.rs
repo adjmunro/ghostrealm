@@ -33,7 +33,8 @@ const PREFIX: &str = "ghostrealm-web-";
 /// shared temp dir another user could otherwise read frames or take their
 /// predictable names first. When that directory is refused or can't be made
 /// (another user pre-created it, a stale `XDG_RUNTIME_DIR` inherited through
-/// `su`), a fresh randomly named private directory in the temp dir is used.
+/// `su`), a fresh randomly named private directory in the temp dir is used;
+/// [`remove_stale_dirs`] clears those after their host is gone.
 pub fn frame_dir() -> io::Result<PathBuf> {
     let preferred = match std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -54,8 +55,8 @@ fn frame_dir_in(preferred: &Path, fallback_base: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// Create a new directory (mode 0700) named `ghostrealm-<uid>-<random>` in
-/// `base`, as `mkdtemp` does: creation fails if the name exists, so the
+/// Create a new directory (mode 0700) named `ghostrealm-<uid>-<pid>-<random>`
+/// in `base`, as `mkdtemp` does: creation fails if the name exists, so the
 /// directory is ours and was never planted.
 fn random_private_dir(base: &Path) -> io::Result<PathBuf> {
     use std::hash::{BuildHasher, Hasher};
@@ -63,7 +64,7 @@ fn random_private_dir(base: &Path) -> io::Result<PathBuf> {
     for _ in 0..16 {
         // RandomState is seeded from the OS per instance.
         let n = std::collections::hash_map::RandomState::new().build_hasher().finish();
-        let dir = base.join(format!("ghostrealm-{}-{n:016x}", user_id()));
+        let dir = base.join(format!("ghostrealm-{}-{}-{n:016x}", user_id(), std::process::id()));
         match create_private(&dir) {
             Ok(()) => {
                 private_dir(&dir)?;
@@ -144,6 +145,56 @@ pub fn remove_stale(dir: &Path, running: impl Fn(u32) -> bool) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Clear the fallback frame directories ([`frame_dir`]) that earlier hosts left
+/// in `base`: for each `ghostrealm-<uid>-<pid>-<random>` directory this user
+/// owns, private (mode 0700), whose host is no longer `running`, remove its
+/// frame files and then the directory. A running host's directory is not
+/// touched, nor is anything not matching that name and ownership.
+pub fn remove_stale_dirs(base: &Path, running: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let uid = user_id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("ghostrealm-")) else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        let [owner, pid, _random] = parts[..] else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let dir = entry.path();
+        if owner != uid || running(pid) || private_dir_exists(&dir).is_err() {
+            continue;
+        }
+        remove_stale(&dir, |_| false);
+        // Fails, and so keeps the directory, if anything else is in it.
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+/// Whether `dir` exists as a real directory private to this user, without
+/// creating it.
+#[cfg(unix)]
+fn private_dir_exists(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_dir() && meta.uid() == user_id() && meta.mode() & 0o777 == 0o700 {
+        Ok(())
+    } else {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[cfg(not(unix))]
+fn private_dir_exists(dir: &Path) -> io::Result<()> {
+    std::fs::symlink_metadata(dir).map(|_| ())
 }
 
 /// Bytes in a `width x height` BGRA frame, or `None` if that overflows (the
@@ -591,6 +642,42 @@ mod tests {
         assert!(w.grow(1 << 46).is_err());
         assert!(w.grow(1 << 46).is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_dirs_of_dead_hosts_are_cleared() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmpdir("sweep");
+        let uid = user_id();
+        let make = |name: String, mode: u32, files: &[&str]| {
+            let d = base.join(name);
+            std::fs::create_dir(&d).unwrap();
+            for f in files {
+                std::fs::write(d.join(f), b"").unwrap();
+            }
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+            d
+        };
+        let dead = make(format!("ghostrealm-{uid}-100-aa"), 0o700, &["ghostrealm-web-100-1-1.bgra"]);
+        let live = make(format!("ghostrealm-{uid}-200-bb"), 0o700, &["ghostrealm-web-200-1-1.bgra"]);
+        let live_empty = make(format!("ghostrealm-{uid}-200-cc"), 0o700, &[]);
+        let foreign_file = make(format!("ghostrealm-{uid}-100-dd"), 0o700, &["notes.txt"]);
+        let open = make(format!("ghostrealm-{uid}-100-ee"), 0o755, &[]);
+        let other_user = make(format!("ghostrealm-{}-100-ff", uid + 1), 0o700, &[]);
+        let preferred = make(format!("ghostrealm-{uid}"), 0o700, &[]);
+        remove_stale_dirs(&base, |pid| pid == 200);
+        assert!(!dead.exists(), "dead host's dir and frames are removed");
+        assert!(live.join("ghostrealm-web-200-1-1.bgra").exists());
+        assert!(live_empty.exists());
+        assert!(foreign_file.join("notes.txt").exists(), "unknown files keep the dir");
+        for kept in [&open, &other_user, &preferred] {
+            assert!(kept.exists(), "{} is not ours to remove", kept.display());
+        }
+        // A fallback dir is named after its host.
+        let mine = random_private_dir(&base).unwrap();
+        remove_stale_dirs(&base, |pid| pid == std::process::id());
+        assert!(mine.exists());
     }
 
     #[test]

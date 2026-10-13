@@ -120,6 +120,7 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("no directory for page frames: {e}")),
     };
     ghostrealm_web::frame::remove_stale(&frames, running);
+    ghostrealm_web::frame::remove_stale_dirs(&std::env::temp_dir(), running);
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
