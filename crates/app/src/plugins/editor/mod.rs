@@ -1014,13 +1014,16 @@ mod tests {
     fn a_modal_closes_the_popup() {
         let mut h = Harness::new();
         let mut v = attached("word\n");
+        h.cursor = at(0, 1);
         paint_in_strip(&mut h, &mut v);
         settle(&mut v);
         h.mouse(&mut v, MouseEvent::Move { pos: at(0, 1) });
         let due = v.deadline(&h.cfg).unwrap();
         h.tick(&mut v, due);
         settle(&mut v);
-        assert!(popup_text(&v).is_some());
+        paint_in_strip(&mut h, &mut v);
+        assert!(popup_text(&v).is_some(), "a plain repaint keeps it");
+        assert!(!h.frame.overlay_text.is_empty());
         h.modal = true;
         paint_in_strip(&mut h, &mut v);
         assert_eq!(popup_text(&v), None);
