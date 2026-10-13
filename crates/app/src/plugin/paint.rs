@@ -832,9 +832,18 @@ impl<'a> PaintCx<'a> {
         clip: Rect,
         color: [u8; 3],
     ) {
-        self.decorate(&spans, styles, left, top, clip);
-        let place_key =
-            self.text.budgeted_key(key, (clip.x as i32, top as i32), shape_w, styles.runs, || spans);
+        let place_key = self.text.budgeted_key(
+            key,
+            (clip.x as i32, top as i32),
+            shape_w,
+            styles.runs,
+            || spans.clone(),
+        );
+        // A row deferred by the shaping budget shows other (or no) text this
+        // frame; its decorations would sit under the wrong glyphs.
+        if place_key == key && self.text.row_cache.buffer(key).is_some() {
+            self.decorate(&spans, styles, left, top, clip);
+        }
         self.push_text(TextItem {
             src: TextSrc::Row(place_key),
             left,
@@ -898,6 +907,31 @@ impl<'a> PaintCx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::testing::{Harness, UI};
+
+    #[test]
+    fn a_styled_row_deferred_by_the_shaping_budget_draws_no_decorations() {
+        let mut h = Harness::new();
+        // No time budget: only the guaranteed minimum of rows shape.
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::ZERO);
+        let clip = Rect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 };
+        let runs = [RunStyle::UNDERLINE];
+        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        let rows = MIN_SHAPES_PER_FRAME + 4;
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            for i in 0..rows {
+                let text = format!("row {i}");
+                let key = cx.row_key_styled(std::iter::once((text.as_str(), [200; 3])), styles);
+                let top = i as f32 * UI.cell_h;
+                cx.budgeted_row_styled(key, || vec![(text.clone(), [200; 3])], styles, 0.0, top, 100.0, clip, [200; 3]);
+            }
+        }
+        assert!(h.text.finish_paint(), "some rows were deferred");
+        assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
 
     #[test]
     fn image_is_bgra_with_a_mip_chain_and_fits_a_rect() {
