@@ -80,6 +80,17 @@ enum Confirmed {
     Pick(std::path::PathBuf),
 }
 
+/// Part of the tree a close removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leave {
+    /// One surface (tab) in a pane.
+    Surface(VtabId, PaneId, SurfaceId),
+    /// A pane and every surface in it.
+    Pane(VtabId, PaneId),
+    /// A workspace and everything in it.
+    Vtab(VtabId),
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// Each surface's content. A surface without a view is "empty" — it shows
@@ -671,7 +682,7 @@ impl AppState {
 
     pub fn close_focused_pane(&mut self) {
         if let Some((vt, pane)) = self.focused_pane() {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_pane(vt, pane));
+            self.leave(Leave::Pane(vt, pane));
         }
     }
 
@@ -685,33 +696,44 @@ impl AppState {
             return;
         };
         if let Some(sid) = self.focused_surface() {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vt, pane, sid));
+            self.leave(Leave::Surface(vt, pane, sid));
             return;
         }
         // Empty pane: collapse the split if there are siblings, else close the vtab.
         let sole = self.tree.vtab(vt).map(|v| v.panes().len() <= 1).unwrap_or(true);
-        if sole {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt));
-        } else {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_pane(vt, pane));
-        }
+        self.leave(if sole { Leave::Vtab(vt) } else { Leave::Pane(vt, pane) });
     }
 
     pub fn close_active_vtab(&mut self) {
         if let Some(vt) = self.active() {
-            self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(vt));
+            self.leave(Leave::Vtab(vt));
         }
     }
 
     /// Close a specific vtab by id (e.g. from the sidebar context menu).
     pub fn close_vtab(&mut self, id: VtabId) {
-        self.prune_orphan_surfaces_after(|s| s.tree.close_vtab(id));
+        self.leave(Leave::Vtab(id));
     }
 
     /// Close one surface (htab) within a pane; the tree collapses the pane, and
     /// then the vtab, if that was its last surface.
     pub fn close_surface(&mut self, vtab: VtabId, pane: PaneId, surface: SurfaceId) {
-        self.prune_orphan_surfaces_after(|s| s.tree.close_surface(vtab, pane, surface));
+        self.leave(Leave::Surface(vtab, pane, surface));
+    }
+
+    /// Take `what` out of the tree.
+    fn leave(&mut self, what: Leave) {
+        self.perform(what);
+    }
+
+    /// Remove `what` from the tree, then drop the views of surfaces that no
+    /// longer exist.
+    fn perform(&mut self, what: Leave) {
+        self.prune_orphan_surfaces_after(|s| match what {
+            Leave::Surface(vt, pane, sid) => s.tree.close_surface(vt, pane, sid),
+            Leave::Pane(vt, pane) => s.tree.close_pane(vt, pane),
+            Leave::Vtab(vt) => s.tree.close_vtab(vt),
+        });
     }
 
     /// Run a tree mutation, then drop terminals whose surfaces no longer exist.
