@@ -381,8 +381,13 @@ fn fast_scroll_stress_does_not_panic() {
 /// echoes its input through `cat -v`, so control bytes show as `^[`. Waits
 /// until the VT has processed the switch (`ready` is true).
 fn cat_v_with(modes: &str, ready: impl Fn(&GhosttyTerminal) -> bool) -> GhosttyTerminal {
+    cat_v_sized(40, modes, ready)
+}
+
+/// [`cat_v_with`] on a terminal `cols` wide.
+fn cat_v_sized(cols: u16, modes: &str, ready: impl Fn(&GhosttyTerminal) -> bool) -> GhosttyTerminal {
     let line = format!("stty -echo; printf '{modes}'; exec cat -v");
-    let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh(&line))).expect("spawn backend");
+    let mut term = GhosttyTerminal::spawn(cols, 10, 8, 16, Some(sh(&line))).expect("spawn backend");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready(&term) {
         assert!(Instant::now() < deadline, "the child never enabled {modes:?}");
@@ -504,6 +509,18 @@ fn legacy_mouse_encoding_is_used_without_sgr() {
     let press = report(MouseAction::Press, Some(MouseButton::Left), (2.5, 1.5));
     // CSI M, then 32+button, 32+col+1, 32+row+1.
     assert_eq!(term.encode_mouse(&press).unwrap(), b"\x1b[M #\"");
+}
+
+#[test]
+fn legacy_mouse_encoding_pins_columns_past_222() {
+    // 300 columns, mode 1000 only: the one-byte format cannot express column 251.
+    let mut term = cat_v_sized(300, "\\033[?1000h", tracking);
+    let left = Some(MouseButton::Left);
+    let press = report(MouseAction::Press, left, (200.5, 1.5));
+    assert!(!term.encode_mouse(&press).unwrap().is_empty());
+    let release = report(MouseAction::Release, left, (250.5, 1.5));
+    // CSI M, button 3 (release) + 32, column 223 + 32 (pinned), row 2 + 32.
+    assert_eq!(term.encode_mouse(&release).unwrap(), b"\x1b[M#\xff\"");
 }
 
 #[test]

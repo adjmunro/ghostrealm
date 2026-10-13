@@ -429,9 +429,16 @@ impl GhosttyTerminal {
         // can arrive from outside it. Pin the position to the last pixel of the
         // grid, as xterm does, so no event is dropped as out-of-bounds while its
         // matching press or release is sent.
+        // The legacy (X10/normal) format has one byte per coordinate, so it can
+        // express cells 0..=222 only and libghostty drops anything beyond that
+        // rather than clamping; xterm pins to 222 there too.
+        let legacy = ![Mode::UTF8_MOUSE, Mode::SGR_MOUSE, Mode::URXVT_MOUSE, Mode::SGR_PIXELS_MOUSE]
+            .iter()
+            .any(|m| self.term.mode(*m).unwrap_or(false));
+        let (max_cols, max_rows) = if legacy { (cols.min(223), rows.min(223)) } else { (cols, rows) };
         let at = (
-            report.at.0.clamp(0.0, (cols as f32 - 1.0 / cw as f32).max(0.0)),
-            report.at.1.clamp(0.0, (rows as f32 - 1.0 / ch as f32).max(0.0)),
+            report.at.0.clamp(0.0, (max_cols as f32 - 1.0 / cw as f32).max(0.0)),
+            report.at.1.clamp(0.0, (max_rows as f32 - 1.0 / ch as f32).max(0.0)),
         );
         let bit = report.button.map_or(0, button_bit);
         match report.action {

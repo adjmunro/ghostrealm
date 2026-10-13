@@ -129,20 +129,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low–Medium
 
-#### 37. Legacy mouse encoding drops positions past column 223
-
-- Where: the position clamp in `encode_mouse`
-  ([`terminal-ghostty/src/lib.rs:432`](../crates/terminal-ghostty/src/lib.rs)),
-  from `3f99752`.
-- Repro: a program enables mode 1000 only (no 1006, 1005, 1015 or 1016) on a
-  300-column terminal. A press at column 201 is sent; the release at column 251
-  is not. The program sees the button held. Likely on full-screen 4K/5K panes.
-- Cause: the clamp pins the position to the grid edge, but the X10/normal
-  encoding cannot express columns or rows past 223, and libghostty drops the
-  event instead of clamping.
-- Fix: in the legacy format also clamp to 222 (0-based), as xterm does.
-  Straightforward.
-
 #### 38. A lost release leaks across views
 
 - Where: `on_click`
