@@ -131,16 +131,6 @@ fails without the fix. Line numbers are against `950b88a`.
 
 ### Low
 
-#### 40. The paste/mode-switch test sleeps a fixed 800 ms
-
-- Where: `paste_sees_a_mode_switch_still_queued_from_the_child`
-  ([`terminal-ghostty/tests/backend.rs:541`](../crates/terminal-ghostty/tests/backend.rs)),
-  from `0cc6b0c`.
-- Cause: the sleep stands in for "the child's mode switch reached the reader's
-  channel". Under load it can fail spuriously; it never passes wrongly.
-- Fix: a test-only hook (for example a bytes-queued count on the reader
-  channel) so the test waits deterministically.
-
 #### 41. Frame directory weak spots
 
 - Where: `frame_dir` and `private_dir`

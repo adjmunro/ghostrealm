@@ -12,6 +12,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use anyhow::{Context, Result};
@@ -70,6 +72,8 @@ pub struct GhosttyTerminal {
     child: Box<dyn Child + Send + Sync>,
     /// Raw child output, forwarded from the reader thread.
     rx: Receiver<Vec<u8>>,
+    /// Bytes the reader thread has put on `rx` so far (applied or not).
+    forwarded: Arc<AtomicUsize>,
     /// Bytes the VT engine wants written back to the child (query replies),
     /// pushed by the `on_pty_write` callback during `vt_write`.
     pty_out: Rc<RefCell<VecDeque<u8>>>,
@@ -140,6 +144,8 @@ impl GhosttyTerminal {
         let writer = pair.master.take_writer().context("take writer")?;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&forwarded);
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
@@ -157,6 +163,7 @@ impl GhosttyTerminal {
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
+                            counter.fetch_add(n, Ordering::SeqCst);
                             wake();
                         }
                         Err(_) => break,
@@ -195,6 +202,7 @@ impl GhosttyTerminal {
             writer,
             child,
             rx,
+            forwarded,
             pty_out,
             encoder,
             mouse_encoder,
@@ -206,6 +214,13 @@ impl GhosttyTerminal {
             reader_done: false,
             dirty: true,
         })
+    }
+
+    /// Bytes of child output the reader thread has queued for `pump`
+    /// so far, applied or not. Lets a test wait for output to arrive without
+    /// applying it.
+    pub fn output_forwarded(&self) -> usize {
+        self.forwarded.load(Ordering::SeqCst)
     }
 
     /// Whether the child's side of the PTY has closed (its output ended).
