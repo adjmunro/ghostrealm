@@ -78,13 +78,15 @@ impl<K: PartialEq> HeldKey<K> {
     }
 
     /// Whether this key event is a repeat to drop. A release of the held key,
-    /// or a fresh press of any key, ends the hold.
-    pub fn swallows(&mut self, key: &K, pressed: bool, repeat: bool) -> bool {
+    /// or a fresh press of any other key, ends the hold. Pressing a modifier
+    /// (`modifier_only`) does not: it starts a chord, not a new key press, and
+    /// the held key may still be down.
+    pub fn swallows(&mut self, key: &K, pressed: bool, repeat: bool, modifier_only: bool) -> bool {
         let Some(held) = &self.key else { return false };
         if held == key && pressed && repeat {
             return true;
         }
-        if held == key && !pressed || pressed && !repeat {
+        if held == key && !pressed || pressed && !repeat && !modifier_only {
             self.key = None;
         }
         false
@@ -98,22 +100,30 @@ mod tests {
     #[test]
     fn repeats_of_the_held_key_are_dropped_until_it_is_released() {
         let mut h = HeldKey::default();
-        assert!(!h.swallows(&'a', true, true), "nothing held yet");
+        assert!(!h.swallows(&'a', true, true, false), "nothing held yet");
         h.hold('a');
-        assert!(h.swallows(&'a', true, true));
-        assert!(h.swallows(&'a', true, true));
-        assert!(!h.swallows(&'b', true, true), "another key's repeat is not ours");
-        assert!(h.swallows(&'a', true, true), "still held");
-        assert!(!h.swallows(&'a', false, false), "the release passes");
-        assert!(!h.swallows(&'a', true, true), "and ends the hold");
+        assert!(h.swallows(&'a', true, true, false));
+        assert!(h.swallows(&'a', true, true, false));
+        assert!(!h.swallows(&'b', true, true, false), "another key's repeat is not ours");
+        assert!(h.swallows(&'a', true, true, false), "still held");
+        assert!(!h.swallows(&'a', false, false, false), "the release passes");
+        assert!(!h.swallows(&'a', true, true, false), "and ends the hold");
     }
 
     #[test]
     fn a_fresh_press_of_another_key_ends_the_hold() {
         let mut h = HeldKey::default();
         h.hold('a');
-        assert!(!h.swallows(&'b', true, false), "a new key is delivered");
-        assert!(!h.swallows(&'a', true, true), "the hold is over");
+        assert!(!h.swallows(&'b', true, false, false), "a new key is delivered");
+        assert!(!h.swallows(&'a', true, true, false), "the hold is over");
+    }
+
+    #[test]
+    fn pressing_a_modifier_does_not_end_the_hold() {
+        let mut h = HeldKey::default();
+        h.hold('a');
+        assert!(!h.swallows(&'s', true, false, true), "the modifier is delivered");
+        assert!(h.swallows(&'a', true, true, false), "the held key's repeats still drop");
     }
 
     fn at(base: Instant, ms: u64) -> Instant {

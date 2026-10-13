@@ -432,6 +432,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &event.physical_key,
                     event.state == ElementState::Pressed,
                     event.repeat,
+                    is_modifier_key(&event.logical_key),
                 ) => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 let toggled = state.handle_key_taps(&event);
@@ -4183,6 +4184,17 @@ struct Placement {
 
 /// Break `text` at spaces into lines no wider than `max_w` as `width_of`
 /// measures them. A word wider than that gets a line of its own.
+/// Whether `key` is a modifier (or lock) key, which makes no text of its own.
+fn is_modifier_key(key: &WKey) -> bool {
+    use NamedKey::*;
+    matches!(
+        key,
+        WKey::Named(
+            Shift | Control | Alt | AltGraph | Super | Meta | Hyper | CapsLock | NumLock | ScrollLock | Fn | FnLock
+        )
+    )
+}
+
 fn wrap_words(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
