@@ -33,7 +33,7 @@ pub fn run<R: BufRead, W: Write>(
     mut output: W,
     mut state: AppState,
 ) -> anyhow::Result<()> {
-    state.set_close_on_exit(CloseOnExit::Never);
+    keep_exited(&mut state);
     let mut registry = build_registry();
     let mut line = String::new();
     loop {
@@ -51,6 +51,11 @@ pub fn run<R: BufRead, W: Write>(
         output.flush()?;
     }
     Ok(())
+}
+
+/// Keep exited terminals in the tree whatever the config says (see [`run`]).
+fn keep_exited(state: &mut AppState) {
+    state.set_close_on_exit(CloseOnExit::Never);
 }
 
 fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -> Json {
@@ -248,7 +253,7 @@ mod tests {
         let mut state = AppState::new().with_shell_line("printf 'FINISHED'; exit 0");
         state.new_vtab().unwrap();
         let id = state.focused_surface().unwrap().0;
-        state.set_close_on_exit(CloseOnExit::Never);
+        keep_exited(&mut state);
         let mut registry = build_registry();
         let mut ask = |state: &mut AppState, req: &str| handle(req, state, &mut registry);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
