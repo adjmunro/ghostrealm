@@ -361,7 +361,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.cursor = (position.x as f32, position.y as f32);
                 let mut redraw = false;
                 if state.palette.is_some() {
-                    redraw |= state.palette_hover();
+                    redraw |= if state.palette_selecting { state.palette_drag() } else { state.palette_hover() };
                 } else if state.menu.is_some() {
                     redraw |= state.menu_hover();
                 } else if state.mouse_down {
@@ -407,6 +407,7 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                state.palette_release();
                 if !state.fire_menu() {
                     state.fire_button();
                 }
@@ -516,6 +517,11 @@ struct State {
     /// Last-rendered palette result rows: (row rect, result index, command id),
     /// for click/hover hit-testing. Rebuilt each frame the palette is open.
     palette_rows: Vec<(Rect, usize, String)>,
+    /// The palette's input line as last drawn: its rect, the x where its text
+    /// (prefix included) starts after scrolling, and the prefix's byte length.
+    palette_line: Option<(Rect, f32, usize)>,
+    /// A left press that began in the palette's input line is selecting text.
+    palette_selecting: bool,
     /// Text buffers for the sidebar's vtab names (drawn in the main text pass).
     sidebar_buffers: Vec<Buffer>,
     /// Text buffers for pane tab-strip labels (drawn in the main text pass).
@@ -879,6 +885,8 @@ impl State {
                 h: 0.0,
             },
             palette_rows: Vec::new(),
+            palette_line: None,
+            palette_selecting: false,
             sidebar_buffers: Vec::new(),
             strip_buffers: Vec::new(),
             menu: None,
@@ -1827,6 +1835,9 @@ impl State {
     /// A click while the palette is open: run a clicked result, or dismiss when
     /// the click lands outside the panel.
     fn palette_click(&mut self) {
+        if self.palette_press() {
+            return;
+        }
         let (x, y) = self.cursor;
         if let Some(id) = self
             .palette_rows
@@ -1843,6 +1854,63 @@ impl State {
             self.palette = None;
         }
         self.dirty = true;
+    }
+
+    /// The palette's input line across the panel, as laid out this frame.
+    fn palette_line_rect(&self) -> Rect {
+        let p = self.palette_panel;
+        Rect { x: p.x, y: p.y + 10.0 * self.scale, w: p.w, h: self.cell_h }
+    }
+
+    /// The caret column nearest `x` on the palette's input line, and the column
+    /// of the character under it.
+    fn palette_cols(&self, x: f32) -> Option<(usize, usize)> {
+        let (_, left, prefix) = self.palette_line?;
+        let buf = self.palette_buffers.first()?;
+        let input = &self.palette.as_ref()?.input;
+        let edge = |col: usize| left + glyph_x(buf, prefix + input.byte_of(col));
+        let len = input.text().chars().count();
+        Some((nearest_caret(len, x, edge), char_under(len, x, edge)))
+    }
+
+    /// A press on the palette's input line selects text there; whether it
+    /// began on the line.
+    fn palette_press(&mut self) -> bool {
+        let (x, y) = self.cursor;
+        let on_line = self.palette_line.is_some_and(|(r, ..)| rect_contains(r, x, y));
+        if !on_line {
+            return false;
+        }
+        let clicks = self.count_click();
+        if let (Some((caret, over)), Some(p)) = (self.palette_cols(x), self.palette.as_mut()) {
+            p.input.press(caret, over, clicks, self.mods.shift);
+            self.palette_selecting = true;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The pointer moved with the button held from the palette's input line.
+    fn palette_drag(&mut self) -> bool {
+        let Some((caret, _)) = self.palette_cols(self.cursor.0) else { return false };
+        match self.palette.as_mut() {
+            Some(p) if p.input.cursor() != caret => {
+                p.input.drag_to(caret);
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The button went up: end a selection begun on the palette's input line.
+    fn palette_release(&mut self) {
+        if std::mem::take(&mut self.palette_selecting) {
+            if let Some(p) = self.palette.as_mut() {
+                p.input.release();
+            }
+            self.dirty = true;
+        }
     }
 
     /// Hover over a palette result highlights it. Returns whether the selection
@@ -3456,6 +3524,7 @@ impl State {
                 });
             }
             let left = self.scroll_palette_input(&mut placements, text_x, text_w, prefix.len(), &input);
+            self.palette_line = Some((self.palette_line_rect(), left, prefix.len()));
             let clip = (text_x, text_x + text_w);
             self.palette_caret(quads, (sw, sh), (left, panel_y + pad), clip, prefix.len(), &input);
             return placements;
@@ -3538,6 +3607,7 @@ impl State {
             });
         }
         let left = self.scroll_palette_input(&mut placements, text_x, text_w, prefix.len(), &input);
+        self.palette_line = Some((self.palette_line_rect(), left, prefix.len()));
         let clip = (text_x, text_x + text_w);
         self.palette_caret(quads, (sw, sh), (left, panel_y + pad), clip, prefix.len(), &input);
         placements
@@ -4274,6 +4344,19 @@ fn input_shift(caret_x: f32, caret_w: f32, width: f32) -> f32 {
     (caret_x + caret_w - width).max(0.0)
 }
 
+/// The caret column in `0..=len` whose position `edge(col)` is nearest `x`.
+fn nearest_caret(len: usize, x: f32, edge: impl Fn(usize) -> f32) -> usize {
+    (0..=len)
+        .min_by(|&a, &b| (edge(a) - x).abs().total_cmp(&(edge(b) - x).abs()))
+        .unwrap_or(0)
+}
+
+/// The column of the character whose cell contains `x` (the nearest one when
+/// `x` is off either end); 0 for empty text.
+fn char_under(len: usize, x: f32, edge: impl Fn(usize) -> f32) -> usize {
+    (0..len).rev().find(|&col| edge(col) <= x).unwrap_or(0)
+}
+
 /// The x offset (px) where the glyph at byte `byte` of `buf`'s first line
 /// starts, or the line's end past its last glyph.
 fn glyph_x(buf: &Buffer, byte: usize) -> f32 {
@@ -4641,12 +4724,27 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_quad_pipeline, glyph_x, input_shift, measure_cell, rect_contains, sidebar_rect_for,
+        build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
         workspace_rect_for, wrap_words, Hover, QuadInstance,
     };
     use ghostrealm_core::{Rect, Side, SurfaceId};
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_palette_pointer_maps_to_carets_and_characters() {
+        // Cells 10 px wide starting at x = 100.
+        let edge = |col: usize| 100.0 + col as f32 * 10.0;
+        assert_eq!(nearest_caret(5, 100.0, edge), 0);
+        assert_eq!(nearest_caret(5, 104.0, edge), 0);
+        assert_eq!(nearest_caret(5, 106.0, edge), 1);
+        assert_eq!(nearest_caret(5, 20.0, edge), 0, "left of the line");
+        assert_eq!(nearest_caret(5, 900.0, edge), 5, "right of the text");
+        assert_eq!(char_under(5, 106.0, edge), 0);
+        assert_eq!(char_under(5, 112.0, edge), 1);
+        assert_eq!(char_under(5, 900.0, edge), 4, "the last character");
+        assert_eq!(char_under(0, 900.0, edge), 0);
+    }
 
     #[test]
     fn an_event_makes_the_cached_unsaved_flag_pessimistic_until_the_next_refresh() {

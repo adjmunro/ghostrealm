@@ -561,17 +561,6 @@
 
 ---
 
-[2026-10-05@9b31ef6] Mouse selection in single-line text fields
-
-- Requires: NO BLOCKERS
-- Detail: `LineEdit` fields (palette, file-browser filter, Save As name) edit by
-  keyboard only. Click to place the cursor, drag / Shift+click / double-click to
-  select — the editor already maps clicks to positions; fields need their glyph
-  geometry from the last paint.
-- Reason: fields should take the mouse like the editor does.
-
----
-
 [2026-10-13@13e2bda] Editor — section outline (jump to a header)
 
 - Requires: per-language header extraction — a hook on the `Highlighter` trait

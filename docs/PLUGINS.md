@@ -82,7 +82,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   selection); draw it with `text_field`. Every text input uses it, so they all
   edit alike (typing `(`, `[`, or `{` over a selection wraps it, unless the
   field opts out with `LineEdit::with_plain_brackets`; the editor also
-  auto-closes brackets, see `text_edit`'s docs).
+  auto-closes brackets, see `text_edit`'s docs). `text_field` returns the
+  `FieldGeom` it drew; keep it in a `widgets::FieldMouse`, paint it each frame
+  (`painted`, or `clear` while the field takes no input), and pass mouse events
+  to `FieldMouse::event` first: click, drag, Shift+click, double-click (word),
+  and triple-click (all) then edit the `LineEdit` like the editor's.
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
 into the overlay layer; it doesn't need to know.
