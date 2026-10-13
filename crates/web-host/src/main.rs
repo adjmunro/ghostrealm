@@ -47,6 +47,21 @@ fn fail(error: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Whether process `pid` exists.
+fn running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Profile directory: `$GHOSTREALM_WEB_CACHE`, else the platform cache dir.
 fn cache_dir() -> PathBuf {
     if let Some(p) = std::env::var_os(CACHE_ENV) {
@@ -91,6 +106,7 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
+    ghostrealm_web::frame::remove_stale(&std::env::temp_dir(), running);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
     let settings = Settings {

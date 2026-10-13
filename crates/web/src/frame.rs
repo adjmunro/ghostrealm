@@ -24,6 +24,32 @@ use std::sync::atomic::{fence, AtomicU64, Ordering};
 /// Bytes before the first slot: a sequence word per slot, padded.
 const HEADER: usize = 64;
 
+/// Frame files are `<PREFIX><host pid>-<page id>-<generation>.bgra`.
+const PREFIX: &str = "ghostrealm-web-";
+
+/// Remove frame files in `dir` left by hosts that are no longer `running`
+/// (a host that crashed can't remove its own).
+pub fn remove_stale(dir: &Path, running: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.ends_with(".bgra"))
+            .and_then(|n| n.strip_prefix(PREFIX))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !running(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Slot `slot`'s sequence word in a mapping starting at `base`.
 ///
 /// # Safety
@@ -54,6 +80,12 @@ pub struct WrittenFrame {
 }
 
 impl FrameWriter {
+    /// The writer for page `id` of this host process, creating its files in
+    /// `dir`.
+    pub fn for_page(dir: impl Into<PathBuf>, id: u64) -> Self {
+        Self::new(dir, format!("{PREFIX}{}-{id}", std::process::id()))
+    }
+
     /// Frame files are created in `dir` as `<prefix>-<generation>.bgra`.
     pub fn new(dir: impl Into<PathBuf>, prefix: impl Into<String>) -> Self {
         FrameWriter {
@@ -105,12 +137,24 @@ impl FrameWriter {
         let path = self
             .dir
             .join(format!("{}-{}.bgra", self.prefix, self.generation));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let open = || {
+            let mut o = OpenOptions::new();
+            o.read(true).write(true).create_new(true);
+            // Pages can show private content: only this user may read frames.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            o.open(&path)
+        };
+        // A new file, never one already there (nor through a symlink planted
+        // under the name). A leftover from an earlier process with this pid is
+        // removed once.
+        let file = match open() {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&path)?;
+                open()?
+            }
+            r => r?,
+        };
         file.set_len((HEADER + bytes * 2) as u64)?;
         // SAFETY: the file is private to this writer (fresh, unique name) and is
         // never truncated while mapped.
@@ -272,6 +316,42 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         t.join().unwrap();
         assert!(ok > 0, "some reads succeed ({gone} overwritten)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_files_are_private_and_never_reused_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("private");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("p-1.bgra")).unwrap();
+        let mut w = FrameWriter::new(&dir, "p");
+        let f = w.write(1, 1, &[1; 4]).unwrap();
+        let mode = std::fs::metadata(&f.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep", "the symlink's target is untouched");
+        assert!(!std::fs::symlink_metadata(&f.path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn stale_frame_files_of_dead_hosts_are_removed() {
+        let dir = tmpdir("stale");
+        for name in [
+            "ghostrealm-web-100-1-1.bgra",
+            "ghostrealm-web-200-3-2.bgra",
+            "ghostrealm-web-x-1-1.bgra",
+            "other.bgra",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        remove_stale(&dir, |pid| pid == 200);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["ghostrealm-web-200-3-2.bgra", "ghostrealm-web-x-1-1.bgra", "other.bgra"]);
     }
 
     #[test]

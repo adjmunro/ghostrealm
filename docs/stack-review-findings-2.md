@@ -59,11 +59,6 @@ carries no button, so only left clicks reach a page.
     ([`plugins/file_browser/preview.rs:69`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
     timeout per request?
-28. **Frame files are world-readable on Linux and leak on a crash.** `grow`
-    ([`frame.rs:78`](../crates/web/src/frame.rs)) creates them `0644` in the
-    shared temp dir, follows symlinks, and doesn't use `create_new`; a crashed
-    host leaves them behind. Fix: `0600` + `create_new`, and remove stale ones
-    when the host starts.
 29. **Cmd+L.** Configs written before the `web.focus_url` binding have no Cmd+L,
     and `page_chord` ([`plugins/web/mod.rs:556`](../crates/app/src/plugins/web/mod.rs))
     doesn't handle it, so it does nothing. With the binding, Cmd+L while editing

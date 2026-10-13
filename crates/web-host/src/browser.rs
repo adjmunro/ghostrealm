@@ -263,12 +263,11 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
         resize(id, width, height, scale);
         return;
     }
-    let prefix = format!("ghostrealm-web-{}-{id}", std::process::id());
     let view: SharedView = std::rc::Rc::new(RefCell::new(View {
         width: width.max(1),
         height: height.max(1),
         scale: if scale > 0.0 { scale } else { 1.0 },
-        frames: FrameWriter::new(std::env::temp_dir(), prefix),
+        frames: FrameWriter::for_page(std::env::temp_dir(), id),
         page: Vec::new(),
         page_w: 0,
         page_h: 0,
