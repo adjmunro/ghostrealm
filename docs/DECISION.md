@@ -107,3 +107,13 @@
 - Detail: The web host runs Chromium with its sandbox off for every process (`no_sandbox: 1` in `crates/web-host/src/main.rs`). A renderer exploit runs with the user's rights: their files, SSH keys, and the app's shells.
 - Detail: Enabling it needs `cef_sandbox` linked into the macOS helper bundles, and Chromium's setuid or namespace sandbox on Linux.
 - Reason: recorded so the trade-off is visible; whether to ship the browser before sandboxing it is not yet decided.
+
+---
+
+[2026-10-13T19:46+1300@45031372]
+
+- Category: Config / keybindings
+- Detail: A missing or empty `[keybindings]` section binds nothing, deliberately. There is no fallback to built-in defaults: every binding is explicit in the user's file.
+- Detail: Config files generated before this carry the comment "If the whole section is empty, the built-in defaults apply"; it is no longer true (relevant to a future migration note).
+- Detail: Recommended bindings are kept as a list per command and added to the user's file only on request (TODO.md), never automatically.
+- Reason: the user's file is the only source of bindings; nothing is bound implicitly.
