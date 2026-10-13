@@ -383,8 +383,15 @@ pub fn relative_to(path: &Path, root: &Path) -> String {
 /// root (`/src/a.rs`), with a trailing `/` for a directory (not a symlink to
 /// one: git sees that as an entry of its own). Glob characters, backslashes,
 /// and trailing spaces in names are escaped, so the line matches that entry
-/// only; a leading `#` or `!` needs nothing, as the `/` comes first.
-pub fn ignore_pattern(path: &Path, root: &Path) -> String {
+/// only; a leading `#` or `!` needs nothing, as the `/` comes first. Fails for
+/// a path no line can spell: one that isn't UTF-8, or holds a line break (git
+/// splits the line there, and drops a `\r` before its end).
+pub fn ignore_pattern(path: &Path, root: &Path) -> Result<String> {
+    let rel = path.strip_prefix(root).context("not inside the repository")?;
+    let rel = rel.to_str().context("an ignore line can't name a path that isn't UTF-8")?;
+    if rel.contains(['\n', '\r']) {
+        bail!("an ignore line can't name a path with a line break in it");
+    }
     let mut pattern = String::from("/");
     for c in relative_to(path, root).chars() {
         if matches!(c, '*' | '?' | '[' | ']' | '\\') {
@@ -398,7 +405,7 @@ pub fn ignore_pattern(path: &Path, root: &Path) -> String {
     if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         pattern.push('/');
     }
-    pattern
+    Ok(pattern)
 }
 
 /// Add `pattern` as a line of the ignore file `file`, creating it (and its
@@ -439,7 +446,7 @@ pub fn containing_repo(path: &Path) -> Result<PathBuf> {
 /// Ignore `path` in its repository's `.gitignore`. Returns whether it changed.
 pub fn add_to_gitignore(path: &Path) -> Result<bool> {
     let root = containing_repo(path)?;
-    add_ignore_line(&root.join(".gitignore"), &ignore_pattern(path, &root))
+    add_ignore_line(&root.join(".gitignore"), &ignore_pattern(path, &root)?)
 }
 
 /// Ignore `path` in its repository's `.git/info/exclude`. Returns whether it
@@ -447,7 +454,7 @@ pub fn add_to_gitignore(path: &Path) -> Result<bool> {
 pub fn add_to_exclude(path: &Path) -> Result<bool> {
     let root = containing_repo(path)?;
     let exclude = git::exclude_file(&root).context("can't locate .git/info/exclude")?;
-    add_ignore_line(&exclude, &ignore_pattern(path, &root))
+    add_ignore_line(&exclude, &ignore_pattern(path, &root)?)
 }
 
 #[cfg(test)]
@@ -655,6 +662,44 @@ pub mod tests {
         assert!(add_to_gitignore(&d.join("nested")).unwrap());
         assert!(ignored("nested"));
         assert!(!d.join("nested/.gitignore").exists(), "not the nested repository's own file");
+    }
+
+    #[test]
+    fn a_name_no_ignore_line_can_hold_is_refused() {
+        let d = tmpdir("ops-ignore-eol");
+        if !git_ok(&d, &["init", "-q"]) {
+            return;
+        }
+        let ignored = |name: &str| git_ok(&d, &["check-ignore", "-q", "--no-index", "--", name]);
+        // Git ends a line at `\n` and drops a `\r` before it: `/a\nb` would
+        // ignore `a` and every `b`, `/a\r` the file `a`.
+        for name in ["a\nb", "a\r"] {
+            std::fs::write(d.join(name), "").unwrap();
+        }
+        std::fs::create_dir(d.join("sub")).unwrap();
+        for other in ["a", "b", "sub/b"] {
+            std::fs::write(d.join(other), "").unwrap();
+        }
+        for name in ["a\nb", "a\r"] {
+            assert!(add_to_gitignore(&d.join(name)).is_err(), "{name:?}");
+            assert!(add_to_exclude(&d.join(name)).is_err(), "{name:?}");
+        }
+        for other in ["a", "b", "sub/b"] {
+            assert!(!ignored(other), "{other:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_isnt_utf8_is_refused_for_an_ignore_line() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmpdir("ops-ignore-bytes");
+        if !git_ok(&d, &["init", "-q"]) {
+            return;
+        }
+        let name = d.join(OsStr::from_bytes(b"a\xff"));
+        std::fs::write(&name, "").unwrap();
+        assert!(add_to_gitignore(&name).is_err());
     }
 
     #[cfg(unix)]
