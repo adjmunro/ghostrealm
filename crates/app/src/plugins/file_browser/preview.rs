@@ -260,6 +260,8 @@ pub struct PreviewPane {
     poll_at: Option<Instant>,
     /// When autoplay starts the shown audio.
     autoplay_at: Option<Instant>,
+    /// The view is off screen: nothing plays and nothing autoplays.
+    hidden: bool,
     /// When to redraw the playback position.
     progress_at: Option<Instant>,
     /// This pane's autoplay override; `None` follows `[file_browser] preview_autoplay`.
@@ -282,6 +284,7 @@ impl Default for PreviewPane {
             shown: None,
             poll_at: None,
             autoplay_at: None,
+            hidden: false,
             progress_at: None,
             autoplay: None,
             audio: None,
@@ -321,6 +324,33 @@ impl PreviewPane {
         }
     }
 
+    /// The view came on screen or left it. Leaving pauses a playing track and
+    /// cancels a pending autoplay; coming back resumes nothing, so a track
+    /// never starts without the user seeing the view.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.hidden = !visible;
+        if visible {
+            return;
+        }
+        self.autoplay_at = None;
+        self.progress_at = None;
+        if let Some(a) = self.audio.as_ref().filter(|a| a.status().playing) {
+            a.pause();
+        }
+    }
+
+    /// Use `player` for playback.
+    #[cfg(test)]
+    pub fn install_player(&mut self, player: AudioPlayer) {
+        self.audio = Some(player);
+    }
+
+    /// The audio player's state, once one exists.
+    #[cfg(test)]
+    pub fn audio_status(&self) -> Option<audio::Status> {
+        self.audio.as_ref().map(AudioPlayer::status)
+    }
+
     /// The preview drawn now.
     #[cfg(test)]
     pub fn shown(&self) -> Option<&Preview> {
@@ -345,7 +375,7 @@ impl PreviewPane {
             self.poll_at = Some(now + POLL_EVERY);
             let ready = self.loader.as_ref().and_then(Loader::take);
             if let Some(p) = ready.filter(|p| Some(&p.path) == self.wanted.as_ref()) {
-                if matches!(p.content, Content::Audio { .. }) && self.autoplay_on(cx.cfg) {
+                if matches!(p.content, Content::Audio { .. }) && self.autoplay_on(cx.cfg) && !self.hidden {
                     self.autoplay_at = Some(now + AUTOPLAY_AFTER);
                 }
                 self.shown = Some(p);

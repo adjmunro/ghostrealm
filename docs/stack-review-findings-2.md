@@ -84,11 +84,6 @@ Right and middle clicks were lost when the browser was rebased (`465b076` →
     the app with the original tab kept alive (fallback: a new tab); an
     agent-triggered popup opens hidden in the background. See DECISION.md
     (UX principle / agent-operated surfaces); work tracked in TODO.md.
-33. **Autoplay can start audio in a hidden tab.** `tick`
-    ([`preview.rs:343`](../crates/app/src/plugins/file_browser/preview.rs)) runs
-    for hidden views, and only `paint` pauses. **Decided:** the file
-    browser does not play audio while hidden; clear `autoplay_at` and pause in
-    `View::shown`. Tracked in TODO.md.
 34. **The preview follows hover.** Moving the mouse to the preview's controls
     crosses rows, switches the subject and pauses the track; in Browse mode,
     clicking an audio row opens the editor. Decision needed: follow the

@@ -802,18 +802,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] File browser: preview audio stops when its view is hidden
-
-- Requires: NO BLOCKERS
-- Detail: Preview audio stops or pauses when the file browser's view is hidden
-  (another tab or workspace). The file browser does not play in the background:
-  clear `autoplay_at` and pause in `View::shown`/hide. See
-  [stack-review-findings-2.md](stack-review-findings-2.md) item 33. Idea, not
-  committed: a dedicated music-player pane that keeps playing.
-- Reason: autoplay can start audio in a hidden tab today.
-
----
-
 [2026-10-13T19:46+1300@d292715] File browser: should the preview follow hover?
 
 - Requires: the user tries the behaviour before deciding

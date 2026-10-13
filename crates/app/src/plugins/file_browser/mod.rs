@@ -899,6 +899,10 @@ impl View for FileBrowserView {
         self.preview.tick(cx, now);
     }
 
+    fn shown(&mut self, visible: bool) {
+        self.preview.set_visible(visible);
+    }
+
     fn text(&mut self) -> Option<String> {
         let mut out = format!("{}\n", self.tree.root().display());
         for r in self.tree.rows() {
@@ -1397,6 +1401,57 @@ mod tests {
         let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
         assert!(ids.contains(&preview::BTN_PLAY) && ids.contains(&preview::BTN_AUTOPLAY));
         assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled: no autoplay");
+    }
+
+    /// A browser with the audio file `c.wav` previewed and autoplay pending.
+    fn previewing_audio_with_autoplay() -> (Harness, FileBrowserView, PathBuf) {
+        let (d, mut v) = fixture();
+        std::fs::write(d.join("c.wav"), preview::tests::wav(8000, 800)).unwrap();
+        let mut h = Harness::new();
+        h.cfg.file_browser.preview_autoplay = true;
+        h.paint(&mut v, WIDE);
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
+        h.paint(&mut v, WIDE);
+        await_preview(&h, &mut v, &d.join("c.wav"));
+        (h, v, d.join("c.wav"))
+    }
+
+    #[test]
+    fn hiding_the_view_cancels_a_pending_autoplay_and_showing_it_does_not_restore_it() {
+        let (h, mut v, _) = previewing_audio_with_autoplay();
+        assert!(v.deadline(&h.cfg).is_some(), "autoplay is pending");
+        v.shown(false);
+        assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled while hidden");
+        v.shown(true);
+        assert_eq!(v.deadline(&h.cfg), None, "not re-armed on return");
+    }
+
+    #[test]
+    fn audio_that_finishes_loading_in_a_hidden_view_does_not_autoplay() {
+        let (d, mut v) = fixture();
+        std::fs::write(d.join("c.wav"), preview::tests::wav(8000, 800)).unwrap();
+        let mut h = Harness::new();
+        h.cfg.file_browser.preview_autoplay = true;
+        h.paint(&mut v, WIDE);
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
+        h.paint(&mut v, WIDE);
+        v.shown(false);
+        await_preview(&h, &mut v, &d.join("c.wav"));
+        assert_eq!(v.deadline(&h.cfg), None, "no autoplay armed while hidden");
+    }
+
+    #[test]
+    fn hiding_the_view_pauses_a_playing_track_and_showing_it_leaves_it_paused() {
+        let (h, mut v, wav) = previewing_audio_with_autoplay();
+        let player = audio::AudioPlayer::new();
+        player.play(&wav);
+        v.preview.install_player(player);
+        assert!(v.preview.audio_status().is_some_and(|s| s.playing));
+        v.shown(false);
+        assert!(v.preview.audio_status().is_some_and(|s| !s.playing), "paused on hide");
+        v.shown(true);
+        assert!(v.preview.audio_status().is_some_and(|s| !s.playing), "not resumed on show");
+        assert_eq!(v.deadline(&h.cfg), None);
     }
 
     #[test]
