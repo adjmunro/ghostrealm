@@ -34,6 +34,15 @@ pub fn emit(event: &Event) {
     let _ = out.write_all(&line).and_then(|_| out.flush());
 }
 
+/// Report why the host can't run, to the app and to stderr.
+fn fail(error: &str) -> ExitCode {
+    eprintln!("ghostrealm-web-host: {error}");
+    emit(&Event::Failed {
+        error: error.to_string(),
+    });
+    ExitCode::FAILURE
+}
+
 /// Profile directory: `$GHOSTREALM_WEB_CACHE`, else the platform cache dir.
 fn cache_dir() -> PathBuf {
     if let Some(p) = std::env::var_os(CACHE_ENV) {
@@ -58,10 +67,7 @@ fn main() -> ExitCode {
         let exe = std::env::current_exe().expect("current exe");
         let loader = library_loader::LibraryLoader::new(&exe, false);
         if !loader.load() {
-            eprintln!(
-                "ghostrealm-web-host: cannot load the CEF framework (run from the app bundle)"
-            );
-            return ExitCode::FAILURE;
+            return fail("cannot load the CEF framework (run the host from its app bundle)");
         }
         loader
     };
@@ -101,8 +107,21 @@ fn main() -> ExitCode {
         std::ptr::null_mut(),
     ) != 1
     {
-        eprintln!("ghostrealm-web-host: CEF failed to initialise");
-        return ExitCode::FAILURE;
+        let code = get_exit_code();
+        let in_use = [
+            sys::cef_resultcode_t::CEF_RESULT_CODE_PROFILE_IN_USE,
+            sys::cef_resultcode_t::CEF_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED,
+        ]
+        .iter()
+        .any(|c| *c as i32 == code);
+        return fail(&if in_use {
+            format!(
+                "the web profile {} is in use by another ghostrealm process",
+                cache.display()
+            )
+        } else {
+            format!("CEF failed to initialise (exit code {code})")
+        });
     }
     run_message_loop();
     shutdown();

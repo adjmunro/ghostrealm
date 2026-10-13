@@ -103,6 +103,8 @@ impl SharedFrame {
 struct Shared {
     ready: bool,
     exited: bool,
+    /// Why the host gave up, if it said.
+    failure: Option<String>,
     views: HashMap<u64, ViewState>,
     /// `Text` / `Eval` requests awaiting an answer: request id → page id.
     /// Replies to anything else are dropped.
@@ -190,6 +192,16 @@ impl WebHost {
     /// Whether the host process is still running.
     pub fn is_alive(&self) -> bool {
         !self.shared.0.lock().unwrap().exited
+    }
+
+    /// Whether the host has reported CEF initialised.
+    pub fn is_ready(&self) -> bool {
+        self.shared.0.lock().unwrap().ready
+    }
+
+    /// Why the host gave up, if it said before exiting.
+    pub fn failure(&self) -> Option<String> {
+        self.shared.0.lock().unwrap().failure.clone()
     }
 
     /// Block until the host reports CEF is initialised (or `timeout`/exit).
@@ -395,6 +407,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         Event::Closed { id } => {
             s.views.remove(&id);
         }
+        Event::Failed { error } => s.failure = Some(error),
         reply @ (Event::Text { id, req, .. } | Event::EvalResult { id, req, .. }) => {
             // Only a reply about the page the request named; a page that answers
             // for another is ignored and the real answer still lands.

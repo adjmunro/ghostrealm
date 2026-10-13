@@ -14,7 +14,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
@@ -54,6 +54,10 @@ const LOAD_WAIT: Duration = Duration::from_secs(15);
 const REPLY_WAIT: Duration = Duration::from_secs(5);
 /// Behind a page whose frame hasn't arrived (or lags a resize).
 const PAGE_BG: [u8; 3] = [255, 255, 255];
+/// After the host exits, the next spawn waits this long, doubling with each
+/// exit in a row up to [`RETRY_MAX`] (Reload retries at once).
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// The host process, shared by every web view.
 #[derive(Default)]
@@ -62,8 +66,16 @@ struct HostSlot {
     /// Bumped each time a host is spawned; a view whose page was created in an
     /// older host recreates it.
     generation: u64,
-    /// Why there is no host, shown in every web view.
+    /// Why there is no (ready) host, shown in every web view. Cleared once a
+    /// host reports ready.
     error: Option<String>,
+    /// Host exits since one was last ready.
+    failures: u32,
+    /// No host is spawned before this (after one exited).
+    retry_at: Option<Instant>,
+    /// The host to run instead of discovering one.
+    #[cfg(test)]
+    exe: Option<std::path::PathBuf>,
     /// `[web]`, refreshed from the live config on every paint.
     cfg: ghostrealm_core::Web,
     waker: Option<Waker>,
@@ -71,19 +83,27 @@ struct HostSlot {
 }
 
 impl HostSlot {
-    /// The running host, spawning it if needed.
+    /// The running host, spawning it if needed (but not while backing off
+    /// after an exit).
     fn host(&mut self) -> Option<&mut WebHost> {
-        if self.host.as_ref().is_some_and(|h| !h.is_alive()) {
-            self.host = None;
-            self.error = Some("the web host exited".into());
+        if let Some(h) = &self.host {
+            let ready = h.is_ready();
+            if !h.is_alive() {
+                let error = match h.failure() {
+                    Some(e) => e,
+                    None if ready => "the web host exited".into(),
+                    None => "the web host exited while starting".into(),
+                };
+                self.host = None;
+                self.failed(error);
+            } else if ready {
+                self.failures = 0;
+                self.error = None;
+            }
         }
-        if self.host.is_none() {
-            let explicit = self
-                .cfg
-                .host
-                .as_deref()
-                .and_then(ghostrealm_core::config::expand_tilde);
-            match ghostrealm_web::find_host(explicit.as_deref()) {
+        if self.host.is_none() && self.retry_at.is_none_or(|t| Instant::now() >= t) {
+            self.retry_at = None;
+            match self.find_host() {
                 None => {
                     self.error = Some(
                         "web host not found: build it with `mise run web`, or set [web] host"
@@ -94,13 +114,43 @@ impl HostSlot {
                     Ok(h) => {
                         self.host = Some(h);
                         self.generation += 1;
-                        self.error = None;
                     }
-                    Err(e) => self.error = Some(format!("{e:#}")),
+                    Err(e) => self.failed(format!("{e:#}")),
                 },
             }
         }
         self.host.as_mut()
+    }
+
+    fn find_host(&self) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(exe) = &self.exe {
+            return Some(exe.clone());
+        }
+        let explicit = self
+            .cfg
+            .host
+            .as_deref()
+            .and_then(ghostrealm_core::config::expand_tilde);
+        ghostrealm_web::find_host(explicit.as_deref())
+    }
+
+    /// The host exited or couldn't start: show why, and back off.
+    fn failed(&mut self, error: String) {
+        let wait = RETRY_FIRST.saturating_mul(1 << self.failures.min(6)).min(RETRY_MAX);
+        self.failures += 1;
+        self.error = Some(error);
+        self.retry_at = Some(Instant::now() + wait);
+    }
+
+    /// Spawn on the next use, without waiting out the back-off.
+    fn retry_now(&mut self) {
+        self.retry_at = None;
+    }
+
+    /// When a host can next be spawned, while there is none.
+    fn retry_at(&self) -> Option<Instant> {
+        self.retry_at.filter(|_| self.host.is_none())
     }
 }
 
@@ -454,7 +504,9 @@ impl WebView {
         self.navigation(HostRequest::Forward { id: self.page })
     }
 
+    /// Reload the page; retries a host that exited without waiting.
     pub fn reload(&mut self) -> Result<(), String> {
+        self.slot.borrow_mut().retry_now();
         self.navigation(HostRequest::Reload { id: self.page })
     }
 
@@ -663,6 +715,8 @@ impl View for WebView {
             }
         }
         let alive = self.send(None);
+        // Reload also retries a host that couldn't start.
+        let reloadable = alive || self.slot.borrow().error.is_some();
         self.refresh_state();
         self.sync_focus(cx.focused);
 
@@ -673,7 +727,7 @@ impl View for WebView {
         for (glyph, enabled, id, tip) in [
             ("\u{2190}", self.state.can_back, BTN_BACK, "Back"),
             ("\u{2192}", self.state.can_forward, BTN_FORWARD, "Forward"),
-            ("\u{21bb}", alive, BTN_RELOAD, "Reload"),
+            ("\u{21bb}", reloadable, BTN_RELOAD, "Reload"),
         ] {
             let hit = Rect {
                 x,
@@ -728,7 +782,7 @@ impl View for WebView {
 
         // The page.
         let error = self.slot.borrow().error.clone();
-        match error.filter(|_| !alive) {
+        match error {
             Some(err) => {
                 cx.fill(body, cx.chrome.background);
                 let s = cx.shape(&err, Family::SansSerif, (body.w - pad * 2.0).max(1.0));
@@ -878,6 +932,18 @@ impl View for WebView {
         self.refresh_state()
     }
 
+    /// While the host is backing off after an exit: when to try again.
+    fn deadline(&self, _cfg: &ghostrealm_core::Config) -> Option<Instant> {
+        self.slot.borrow().retry_at()
+    }
+
+    fn tick(&mut self, cx: &mut EventCx, now: Instant) {
+        if self.slot.borrow().retry_at().is_some_and(|t| now >= t) {
+            self.send(None);
+            cx.redraw();
+        }
+    }
+
     /// The page's address, title, and visible text, once it has loaded.
     fn text(&mut self) -> Option<String> {
         let read = self.with_host(|h, id| {
@@ -928,6 +994,83 @@ mod tests {
         *(view as Box<dyn Any>).downcast::<WebView>().unwrap()
     }
 
+    /// A view whose host is `script` (a shell script standing in for the real
+    /// one), and the file the script appends a line to each time it starts.
+    fn stub_host(tag: &str, script: &str) -> (WebView, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::plugin::testing::tmpdir(tag);
+        let exe = dir.join("host.sh");
+        let runs = dir.join("runs");
+        std::fs::write(
+            &exe,
+            format!("#!/bin/sh\necho run >> '{}'\n{script}\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = WebPlugin::new();
+        plugin.slot.borrow_mut().exe = Some(exe);
+        let view = plugin.open(&OpenCx::default()).unwrap();
+        (*(view as Box<dyn Any>).downcast::<WebView>().unwrap(), runs)
+    }
+
+    fn runs(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path).map_or(0, |s| s.lines().count())
+    }
+
+    /// Wait for the stub host to exit.
+    fn wait_exit(v: &WebView) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.slot.borrow().host.as_ref().is_some_and(|h| h.is_alive()) {
+            assert!(Instant::now() < until, "stub host never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_host_that_dies_is_not_respawned_until_reload_or_the_backoff() {
+        let (mut v, runs_file) = stub_host(
+            "web-respawn",
+            r#"echo '{"ev":"failed","error":"the web profile is in use"}'; exit 1"#,
+        );
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        wait_exit(&v);
+        for _ in 0..5 {
+            h.paint(&mut v, RECT);
+            h.mouse(&mut v, MouseEvent::Move { pos: (50.0, 200.0) });
+        }
+        assert_eq!(runs(&runs_file), 1, "painting and input don't respawn");
+        assert_eq!(
+            v.slot.borrow().error.as_deref(),
+            Some("the web profile is in use"),
+            "the host's reason is shown"
+        );
+        let retry = v.deadline(&Default::default()).expect("a retry is scheduled");
+        assert!(retry > Instant::now());
+
+        // Reload retries at once; a second failure backs off longer.
+        let _ = v.reload();
+        wait_exit(&v);
+        h.paint(&mut v, RECT);
+        assert_eq!(runs(&runs_file), 2, "Reload respawns");
+        let next = v.deadline(&Default::default()).expect("still backing off");
+        assert!(next - Instant::now() > RETRY_FIRST, "backs off further");
+    }
+
+    #[test]
+    fn a_host_that_exits_before_ready_keeps_its_error_shown() {
+        let (mut v, _) = stub_host("web-early-exit", "exit 0");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        wait_exit(&v);
+        h.paint(&mut v, RECT);
+        assert_eq!(
+            v.slot.borrow().error.as_deref(),
+            Some("the web host exited while starting")
+        );
+        assert!(h.frame.images.is_empty());
+    }
+
     const RECT: Rect = Rect {
         x: 0.0,
         y: 0.0,
@@ -950,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_registers_reload_but_not_disabled_history_buttons() {
+    fn toolbar_registers_reload_to_retry_but_not_disabled_history_buttons() {
         let mut v = hostless();
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -960,8 +1103,8 @@ mod tests {
             "{ids:?}"
         );
         assert!(
-            !ids.contains(&BTN_RELOAD),
-            "no reload without a host: {ids:?}"
+            ids.contains(&BTN_RELOAD),
+            "reload retries a host that couldn't start: {ids:?}"
         );
     }
 

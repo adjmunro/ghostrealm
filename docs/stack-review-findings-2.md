@@ -34,19 +34,6 @@ carries no button, so only left clicks reach a page.
 
 ### High
 
-#### 19. A dead host is respawned on every paint and input, and its error is erased (confirmed)
-
-- Where: `HostSlot::host` ([`plugins/web/mod.rs:75`](../crates/app/src/plugins/web/mod.rs)),
-  reached from `WebView::send(None)` on every paint (`:664`); the error shows only
-  while `!alive` (`:730`).
-- Repro: a second ghostrealm process (another GUI, or `ghostrealm agent` running
-  `web.new`) uses the same profile (`~/Library/Caches/ghostrealm/web`); its host
-  dies at startup, and every frame spawns another.
-- Fix: back off after an exit (retry on an explicit Reload, or after a growing
-  delay) and keep showing why the host exited before it was ready. Decision
-  needed: profile policy (share cookies and logins between the GUI and the
-  agent, or a profile per process?).
-
 #### 20. The host can outlive the app and hold the profile lock (confirmed)
 
 - Where: [`web-host/src/main.rs:86`](../crates/web-host/src/main.rs) (settings,
@@ -121,6 +108,11 @@ carries no button, so only left clicks reach a page.
     its result (by replacing `console.log`, `eval` or `JSON.stringify`); the
     command's description says so. Decision needed: evaluate in an isolated
     world instead?
+19. **Every ghostrealm process shares one web profile**
+    (`~/Library/Caches/ghostrealm/web`), so a second process (another GUI, or
+    `ghostrealm agent` running `web.new`) can't start its host; the pane says the
+    profile is in use. Decision needed: share cookies and logins between the GUI
+    and the agent, or a profile per process?
 27. **Page frames can tear; the doc comment says otherwise.** `SharedFrame`
     ([`web/src/client.rs:73`](../crates/web/src/client.rs)) claims the worst case
     is a newer frame, but the two slots ([`web/src/frame.rs:50`](../crates/web/src/frame.rs))

@@ -229,6 +229,10 @@ pub enum Event {
     Closed {
         id: u64,
     },
+    /// The host can't serve requests and is about to exit.
+    Failed {
+        error: String,
+    },
 }
 
 /// The console-message prefix the host's eval wrapper logs results under,
