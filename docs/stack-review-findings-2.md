@@ -44,8 +44,6 @@ carries no button, so only left clicks reach a page.
   macOS helpers, the setuid/namespace sandbox on Linux)? At minimum record the
   trade-off.
 
-### Medium
-
 ### Low
 
 18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
@@ -82,12 +80,9 @@ carries no button, so only left clicks reach a page.
 31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
     [`browser.rs:559`](../crates/web-host/src/browser.rs)), which breaks OAuth and
     payment popup flows. Decision needed: open them as a new tab in the pane?
-32. **Transparent edges darken (halos).** `from_rgba` / `halve`
-    ([`plugin/paint.rs:192`](../crates/app/src/plugin/paint.rs)) average straight
-    alpha, and the GPU filters it and blends with `ALPHA_BLENDING`
-    ([`images.rs:117`](../crates/app/src/images.rs), shader `:400`). Fix:
-    premultiply in `from_rgba` before the mips and blend premultiplied; opaque
-    sources are unaffected. Minor: mips average sRGB-encoded values.
+32. **Image mips average sRGB-encoded values** (`halve`,
+    [`plugin/paint.rs:266`](../crates/app/src/plugin/paint.rs)), so a shrunk
+    image with fine detail comes out slightly dark. Fix: average in linear light.
 33. **Autoplay can start audio in a hidden tab.** `tick`
     ([`preview.rs:293`](../crates/app/src/plugins/file_browser/preview.rs)) runs
     for hidden views, and only `paint` pauses. Decision needed: should hidden

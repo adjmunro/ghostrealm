@@ -156,8 +156,10 @@ pub struct TextItem {
     pub color: [u8; 3],
 }
 
-/// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded
-/// with straight alpha (what a web engine or an image decoder produces).
+/// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded,
+/// with premultiplied alpha (what a web engine produces; [`Image::from_rgba`]
+/// premultiplies decoded pixels). Premultiplied pixels filter and blend without
+/// dark fringes where opaque meets transparent.
 pub trait ImageSource {
     /// `(width, height)` in physical pixels.
     fn size(&self) -> (u32, u32);
@@ -188,12 +190,18 @@ pub struct Image {
 
 impl Image {
     /// An image from `width` x `height` straight-alpha RGBA8 pixels (what the
-    /// `image` crate decodes to).
+    /// `image` crate decodes to), premultiplied before its mips are built.
     pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Arc<Image> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "RGBA8 size");
         for px in rgba.chunks_exact_mut(4) {
             px.swap(0, 2);
+            let a = px[3] as u32;
+            if a != 255 {
+                for c in &mut px[..3] {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
         }
         let (width, height) = (width.max(1), height.max(1));
         let mut mips: Vec<(u32, u32, Vec<u8>)> = Vec::new();
@@ -765,12 +773,14 @@ mod tests {
 
     #[test]
     fn image_is_bgra_with_a_mip_chain_and_fits_a_rect() {
-        let img = Image::from_rgba(5, 2, [1, 2, 3, 4].repeat(5 * 2));
-        assert_eq!(&img.bgra().unwrap()[..4], &[3, 2, 1, 4], "RGBA becomes BGRA");
+        let img = Image::from_rgba(5, 2, [1, 2, 3, 255].repeat(5 * 2));
+        assert_eq!(&img.bgra().unwrap()[..4], &[3, 2, 1, 255], "RGBA becomes BGRA");
         let sizes: Vec<(u32, u32)> = img.mips().iter().map(|(w, h, _)| (*w, *h)).collect();
         assert_eq!(sizes, vec![(2, 1), (1, 1)]);
         assert!(img.mips().iter().all(|(w, h, px)| px.len() == (*w * *h * 4) as usize));
-        assert_eq!(&img.mips()[1].2, &[3, 2, 1, 4], "a solid colour averages to itself");
+        assert_eq!(&img.mips()[1].2, &[3, 2, 1, 255], "a solid colour averages to itself");
+        let half = Image::from_rgba(1, 1, vec![200, 100, 50, 128]);
+        assert_eq!(half.bgra().unwrap(), &[25, 50, 100, 128], "alpha is premultiplied");
         let r = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         assert_eq!(img.fit(r, 1.0), Rect { x: 48.0, y: 49.0, w: 5.0, h: 2.0 }, "never upscaled");
         assert_eq!(img.fit(r, f32::MAX), Rect { x: 0.0, y: 30.0, w: 100.0, h: 40.0 });

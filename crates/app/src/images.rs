@@ -114,7 +114,8 @@ impl ImageRenderer {
                 entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // Sources are premultiplied (see `ImageSource`).
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -554,19 +555,45 @@ mod tests {
     }
 
     /// A BGRA image lands at its position, channels in order, clipped to its
-    /// clip rect, and nothing outside. An opaque source's alpha is ignored.
+    /// clip rect, and nothing outside. An opaque source's alpha is ignored: its
+    /// pixels land exactly as given, whatever is under them.
     #[test]
     fn image_draws_at_its_position_clipped() {
         pollster::block_on(async {
             // A 32x32 blue (BGRA, alpha 0) image at (0, 0), clipped to its left half.
             let blue = Arc::new(Solid([255u8, 0, 0, 0].repeat(32 * 32), 32));
             let it = item(0, blue, rect(0.0, 0.0, 32.0, 32.0), rect(0.0, 0.0, 16.0, 32.0));
+            // Over a white square, an opaque frame with half alpha in its pixels.
+            let white = Arc::new(Solid([255u8; 4].repeat(16 * 16), 16));
+            let under = item(1, white, rect(32.0, 32.0, 16.0, 16.0), rect(0.0, 0.0, 64.0, 64.0));
+            let frame = Arc::new(Solid([10u8, 20, 30, 128].repeat(16 * 16), 16));
+            let over = item(2, frame, rect(32.0, 32.0, 16.0, 16.0), rect(0.0, 0.0, 64.0, 64.0));
             let (device, queue) = gpu().await;
             let mut r = ImageRenderer::new(&device, FORMAT);
-            let data = render(&device, &queue, &mut r, &[it], &[]);
+            let data = render(&device, &queue, &mut r, &[it, under, over], &[]);
             assert_eq!(px(&data, 8, 8), [0, 0, 255], "inside: blue, as RGBA");
             assert_eq!(px(&data, 24, 8), [0, 0, 0], "inside the image but outside its clip");
-            assert_eq!(px(&data, 48, 48), [0, 0, 0], "outside the image");
+            assert_eq!(px(&data, 56, 8), [0, 0, 0], "outside the image");
+            assert_eq!(px(&data, 40, 40), [30, 20, 10], "an opaque source draws its pixels as given");
+        });
+    }
+
+    /// Magnified, the boundary between an opaque and a transparent pixel fades
+    /// out the opaque colour instead of darkening toward the transparent
+    /// pixel's (black) colour.
+    #[test]
+    fn transparent_edges_have_no_dark_fringe() {
+        pollster::block_on(async {
+            let white = Arc::new(Solid([255u8; 4].repeat(DIM as usize * DIM as usize), DIM));
+            let full = rect(0.0, 0.0, DIM as f32, DIM as f32);
+            // Opaque white beside transparent black, stretched over the target.
+            let edge = Image::from_rgba(2, 1, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+            let base = [item(0, white, full, full), item(1, edge, full, full)];
+            let (device, queue) = gpu().await;
+            let mut r = ImageRenderer::new(&device, FORMAT);
+            let data = render(&device, &queue, &mut r, &base, &[]);
+            let mid = px(&data, DIM / 2, 8);
+            assert!(mid.iter().all(|c| *c >= 250), "white over white stays white, got {mid:?}");
         });
     }
 

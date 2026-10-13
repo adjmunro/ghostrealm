@@ -43,8 +43,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).
-- Images: `image(id, version, source, rect, clip)` draws BGRA pixels from an
-  `ImageSource` stretched over `rect`, over the layer's fills and under its
+- Images: `image(id, version, source, rect, clip)` draws BGRA pixels
+  (premultiplied alpha) from an `ImageSource` stretched over `rect`, over the layer's fills and under its
   text. The app keeps a texture per `(view, id)` and re-uploads only when
   `version` changes (the web view's page frames). A source may supply mips (so
   it shrinks smoothly) and opt out of blending (`opaque`). `Image` is a decoded
