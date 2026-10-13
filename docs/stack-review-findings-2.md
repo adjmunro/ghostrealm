@@ -57,14 +57,6 @@ carries no button, so only left clicks reach a page.
 - Fix: reject `w == 0 || h == 0` as `Content::Error`; catch a panic in `load`;
   stop polling once the loader is gone.
 
-#### 23. Writing to a host that doesn't read blocks the UI thread (confirmed)
-
-- Where: `WebHost::send` ([`web/src/client.rs:171`](../crates/web/src/client.rs)),
-  a blocking `write_all` under a mutex, called from paint, mouse and key handlers.
-- Effect: once the 64 KiB pipe fills (a host stuck in CEF), the whole app
-  freezes, shells included.
-- Fix: a writer thread behind a bounded queue; drop mouse moves when it is full.
-
 #### 24. A FIFO or device node hangs the preview loader (confirmed)
 
 - Where: `load` → `read_text` ([`preview.rs:109`](../crates/app/src/plugins/file_browser/preview.rs),

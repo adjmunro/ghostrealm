@@ -1,7 +1,7 @@
 //! App-side handle to the web host process: spawns it, sends [`Request`]s, and
 //! tracks per-browser state from the [`Event`] stream on a reader thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::frame::FrameReader;
-use crate::protocol::{Cursor, Event, Request};
+use crate::protocol::{Cursor, Event, MouseAction, Request};
 
 /// Executable name of the host (and of its macOS bundle, `<name>.app`).
 pub const HOST_NAME: &str = "ghostrealm-web-host";
@@ -113,11 +113,26 @@ struct Shared {
     replies: HashMap<u64, Event>,
 }
 
+/// Requests waiting for the writer thread, so a host that stops reading never
+/// blocks the caller (the UI thread).
+#[derive(Default)]
+struct Outbox {
+    queue: VecDeque<Request>,
+    /// The app is done with the host: write what is queued, then close stdin.
+    closed: bool,
+    /// A write failed: the host has gone.
+    broken: bool,
+}
+
+/// Requests that may wait for a host that isn't reading. Past this, mouse
+/// moves and wheel steps are dropped and other requests are refused.
+const OUTBOX_MAX: usize = 1024;
+
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
 pub struct WebHost {
     child: Option<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
+    outbox: Arc<(Mutex<Outbox>, Condvar)>,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     next_req: AtomicU64,
     readers: HashMap<u64, Arc<FrameReader>>,
@@ -163,29 +178,51 @@ impl WebHost {
                 }
             })
             .context("spawn web host reader")?;
+        let outbox: Arc<(Mutex<Outbox>, Condvar)> = Arc::default();
+        let writer_outbox = outbox.clone();
+        std::thread::Builder::new()
+            .name("web-host-requests".into())
+            .spawn(move || write_requests(stdin, &writer_outbox))
+            .context("spawn web host writer")?;
         Ok(WebHost {
             child: Some(child),
-            stdin: Mutex::new(Some(stdin)),
+            outbox,
             shared,
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
         })
     }
 
-    /// Send a request. Returns false if the host has gone away.
+    /// Queue a request for the host; never blocks on the pipe. A mouse move
+    /// replaces one still queued for the same page. Returns false if the host
+    /// has gone away, or isn't reading and the queue is full (a dropped mouse
+    /// move or wheel step still returns true).
     pub fn send(&self, req: &Request) -> bool {
-        let Ok(mut line) = serde_json::to_vec(req) else {
-            return false;
-        };
-        line.push(b'\n');
-        let mut guard = self.stdin.lock().unwrap();
-        let Some(stdin) = guard.as_mut() else {
-            return false;
-        };
-        if stdin.write_all(&line).and_then(|_| stdin.flush()).is_err() {
-            *guard = None;
+        let (lock, cv) = &*self.outbox;
+        let mut o = lock.lock().unwrap();
+        if o.broken || o.closed {
             return false;
         }
+        let (moving, lossy) = match req {
+            Request::Mouse { id, action, .. } => (
+                (*action == MouseAction::Move).then_some(*id),
+                matches!(action, MouseAction::Move | MouseAction::Wheel { .. }),
+            ),
+            _ => (None, false),
+        };
+        if let (Some(id), Some(Request::Mouse { id: last, action: MouseAction::Move, .. })) =
+            (moving, o.queue.back())
+        {
+            if *last == id {
+                *o.queue.back_mut().expect("checked") = req.clone();
+                return true;
+            }
+        }
+        if o.queue.len() >= OUTBOX_MAX {
+            return lossy;
+        }
+        o.queue.push_back(req.clone());
+        cv.notify_one();
         true
     }
 
@@ -342,9 +379,12 @@ impl WebHost {
 
 impl Drop for WebHost {
     fn drop(&mut self) {
-        // EOF on stdin asks the host to close its browsers and exit; reap it off
-        // this thread so a slow shutdown never blocks the caller.
-        self.stdin.lock().unwrap().take();
+        // EOF on stdin (once the queue is written) asks the host to close its
+        // browsers and exit; reap it off this thread so a slow shutdown never
+        // blocks the caller.
+        let (lock, cv) = &*self.outbox;
+        lock.lock().unwrap().closed = true;
+        cv.notify_one();
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -361,6 +401,36 @@ impl Drop for WebHost {
                 let _ = child.kill();
                 let _ = child.wait();
             });
+    }
+}
+
+/// The writer thread: write queued requests to the host's stdin until the app
+/// is done with it (then close it) or the host goes away.
+fn write_requests(mut stdin: ChildStdin, outbox: &(Mutex<Outbox>, Condvar)) {
+    let (lock, cv) = outbox;
+    let mut buf = Vec::new();
+    loop {
+        {
+            let mut o = lock.lock().unwrap();
+            while o.queue.is_empty() && !o.closed {
+                o = cv.wait(o).unwrap();
+            }
+            if o.queue.is_empty() {
+                return;
+            }
+            buf.clear();
+            for req in o.queue.drain(..) {
+                if serde_json::to_writer(&mut buf, &req).is_ok() {
+                    buf.push(b'\n');
+                }
+            }
+        }
+        if stdin.write_all(&buf).and_then(|_| stdin.flush()).is_err() {
+            let mut o = lock.lock().unwrap();
+            o.broken = true;
+            o.queue.clear();
+            return;
+        }
     }
 }
 
@@ -441,6 +511,76 @@ fn page_of(ev: &Event) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that starts but never reads its stdin fills the pipe; sending
+    /// still returns at once, coalescing moves and refusing past the cap.
+    #[cfg(unix)]
+    #[test]
+    fn sending_to_a_host_that_doesnt_read_never_blocks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ghostrealm-web-stuck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("stuck.sh");
+        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = WebHost::spawn(&exe, None).unwrap();
+        let mouse = |x, action| Request::Mouse {
+            id: 1,
+            x,
+            y: 0,
+            mods: 0,
+            action,
+        };
+        let key = Request::Eval {
+            id: 1,
+            req: 0,
+            js: "x".repeat(1000),
+        };
+        let start = Instant::now();
+        // Far more than the pipe holds.
+        for i in 0..5_000 {
+            assert!(host.send(&key) || i > 100, "refused before the pipe could fill");
+            host.send(&mouse(i, MouseAction::Move));
+        }
+        assert!(start.elapsed() < Duration::from_secs(2), "send blocked");
+        {
+            let o = host.outbox.0.lock().unwrap();
+            assert_eq!(o.queue.len(), OUTBOX_MAX, "the queue stays bounded");
+        }
+        assert!(!host.send(&key), "a full queue refuses requests");
+        assert!(host.send(&mouse(0, MouseAction::Wheel { dx: 0, dy: 1 })), "wheel steps are dropped");
+        assert!(host.send(&mouse(7, MouseAction::Move)), "moves are dropped or coalesced");
+        let pid = host.pid().unwrap();
+        drop(host);
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_mouse_move_is_replaced_by_the_next() {
+        let outbox: (Mutex<Outbox>, Condvar) = Default::default();
+        let host = WebHost {
+            child: None,
+            outbox: Arc::new(outbox),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+        };
+        let mv = |id, x| Request::Mouse {
+            id,
+            x,
+            y: 0,
+            mods: 0,
+            action: MouseAction::Move,
+        };
+        for x in 0..10 {
+            assert!(host.send(&mv(1, x)));
+        }
+        assert!(host.send(&mv(2, 0)));
+        assert!(host.send(&mv(2, 5)));
+        let q: Vec<Request> = host.outbox.0.lock().unwrap().queue.iter().cloned().collect();
+        assert_eq!(q, vec![mv(1, 9), mv(2, 5)]);
+    }
 
     fn eval_result(id: u64, req: u64, value: &str) -> Event {
         Event::EvalResult {
