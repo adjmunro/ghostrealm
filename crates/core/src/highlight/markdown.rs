@@ -3,6 +3,15 @@
 //! block quotes, thematic breaks. Line-local apart from fences; the
 //! constructs that need a neighbouring line (setext headings, indented code,
 //! multi-line emphasis) are not recognised.
+//!
+//! A fence opened after a list marker or `>` is recognised; it ends at its
+//! closing fence, or at the first non-blank line that leaves the container
+//! (no indent for a list item, no `>` for a quote). Containers are not
+//! tracked beyond that, so a fence in a nested list closes at the same rules.
+//!
+//! Inline work per line is bounded: nesting stops at [`MAX_DEPTH`], and after
+//! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
+//! unmarked, so a pathological line costs a bounded number of scans.
 
 use super::{runs, Highlighter, Span, State, Token};
 
@@ -25,14 +34,38 @@ impl Highlighter for Markdown {
     }
 }
 
-/// The state while inside a fence: its length and whether it is `~` (a fence
-/// is at least 3 long, so the state is never 0).
-fn fence_state(ch: char, len: usize) -> State {
-    ((len as State) << 1) | State::from(ch == '~')
+/// How deep inline markup nests (emphasis in a link in emphasis ...).
+const MAX_DEPTH: usize = 32;
+/// How many openers (`[`, `*`, `<`, a backtick run) may find no closer on a
+/// line before the rest of it is left unmarked. Each failure is a scan to the
+/// line's end.
+const MAX_FAILED: u32 = 32;
+
+/// What a fence sits inside, which decides where an unclosed one ends.
+const TOP: State = 0;
+const LIST: State = 1;
+const QUOTE: State = 2;
+
+/// The state while inside a fence: its length, whether it is `~`, and its
+/// container (a fence is at least 3 long, so the state is never 0).
+fn fence_state(ch: char, len: usize, container: State) -> State {
+    ((len as State) << 3) | (container << 1) | State::from(ch == '~')
 }
 
-fn fence_of(state: State) -> (char, usize) {
-    (if state & 1 == 1 { '~' } else { '`' }, (state >> 1) as usize)
+fn fence_of(state: State) -> (char, usize, State) {
+    (if state & 1 == 1 { '~' } else { '`' }, (state >> 3) as usize, (state >> 1) & 3)
+}
+
+/// An opening fence at `p`: the fence char and run length, if the run is 3 or
+/// more and (for backticks) the info string holds no backtick.
+fn fence_at(c: &[char], p: usize) -> Option<(char, usize)> {
+    let first = *c.get(p)?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = run_of(c, p, first);
+    let info = &c[p + run..];
+    (run >= 3 && !(first == '`' && info.contains(&'`'))).then_some((first, run))
 }
 
 fn fill(tok: &mut [Token], from: usize, to: usize, t: Token) {
@@ -55,32 +88,51 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
     let n = c.len();
     let indent = run_of(c, 0, ' ');
     if state != 0 {
-        let (fc, flen) = fence_of(state);
-        let run = if indent <= 3 { run_of(c, indent, fc) } else { 0 };
-        if run >= flen && blank(&c[indent + run..]) {
-            fill(tok, 0, n, Token::Marker);
-            return 0;
+        let (fc, flen, container) = fence_of(state);
+        let quoted = c.get(indent) == Some(&'>');
+        let left = !blank(c)
+            && match container {
+                LIST => indent == 0 && !quoted,
+                QUOTE => !quoted,
+                _ => false,
+            };
+        if !left {
+            // Skip the container's prefix (indent, `>`), then look for the closer.
+            let mut p = 0;
+            if container != TOP {
+                loop {
+                    p += run_of(c, p, ' ');
+                    if c.get(p) != Some(&'>') {
+                        break;
+                    }
+                    tok[p] = Token::Marker;
+                    p += 1;
+                }
+            } else if indent <= 3 {
+                p = indent;
+            }
+            let run = run_of(c, p, fc);
+            if run >= flen && blank(&c[p + run..]) && (container != TOP || indent <= 3) {
+                fill(tok, p, n, Token::Marker);
+                return 0;
+            }
+            fill(tok, p, n, Token::Code);
+            return state;
         }
-        fill(tok, 0, n, Token::Code);
-        return state;
     }
     if indent <= 3 && indent < n {
         let first = c[indent];
-        if first == '`' || first == '~' {
-            let run = run_of(c, indent, first);
-            let info = &c[indent + run..];
-            if run >= 3 && !(first == '`' && info.contains(&'`')) {
-                fill(tok, indent, indent + run, Token::Marker);
-                fill(tok, indent + run, n, Token::Key);
-                return fence_state(first, run);
-            }
+        if let Some((fc, run)) = fence_at(c, indent) {
+            fill(tok, indent, indent + run, Token::Marker);
+            fill(tok, indent + run, n, Token::Key);
+            return fence_state(fc, run, TOP);
         }
         if first == '#' {
             let hashes = run_of(c, indent, '#');
             if hashes <= 6 && (indent + hashes == n || c[indent + hashes] == ' ') {
                 fill(tok, indent, indent + hashes, Token::Marker);
                 fill(tok, indent + hashes, n, Token::Heading);
-                inline(c, indent + hashes, n, tok);
+                inline_line(c, indent + hashes, n, tok);
                 return 0;
             }
         }
@@ -126,8 +178,16 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
             }
         }
     }
+    if base == Token::Quote || item > 0 {
+        let at = p + run_of(c, p, ' ').min(3);
+        if let Some((fc, run)) = fence_at(c, at) {
+            fill(tok, at, at + run, Token::Marker);
+            fill(tok, at + run, n, Token::Key);
+            return fence_state(fc, run, if item > 0 { LIST } else { QUOTE });
+        }
+    }
     fill(tok, p, n, base);
-    inline(c, p, n, tok);
+    inline_line(c, p, n, tok);
     0
 }
 
@@ -233,11 +293,15 @@ fn bare_url(c: &[char], i: usize, to: usize) -> Option<usize> {
     while end < to && !c[end].is_whitespace() && !matches!(c[end], '<' | '>' | '"') {
         end += 1;
     }
+    let mut opens = c[i..end].iter().filter(|x| **x == '(').count();
+    let mut closes = c[i..end].iter().filter(|x| **x == ')').count();
     while end > i + scheme {
         let last = c[end - 1];
-        let unbalanced_paren = last == ')' && c[i..end].iter().filter(|x| **x == '(').count() < c[i..end].iter().filter(|x| **x == ')').count();
+        let unbalanced_paren = last == ')' && opens < closes;
         if matches!(last, '.' | ',' | ';' | ':' | '!' | '?') || unbalanced_paren {
             end -= 1;
+            closes -= usize::from(last == ')');
+            opens -= usize::from(last == '(');
         } else {
             break;
         }
@@ -245,11 +309,24 @@ fn bare_url(c: &[char], i: usize, to: usize) -> Option<usize> {
     (end > i + scheme).then_some(end)
 }
 
+/// Failed openers so far on this line (see [`MAX_FAILED`]).
+struct Budget(u32);
+
+impl Budget {
+    fn spent(&self) -> bool {
+        self.0 >= MAX_FAILED
+    }
+}
+
+fn inline_line(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
+    inline(c, from, to, 0, &mut Budget(0), tok);
+}
+
 /// Classify the inline markup in `c[from..to]`. Unmarked text keeps whatever
 /// `tok` already holds (its block's colour).
-fn inline(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
+fn inline(c: &[char], from: usize, to: usize, depth: usize, budget: &mut Budget, tok: &mut [Token]) {
     let mut i = from;
-    while i < to {
+    while i < to && !budget.spent() {
         match c[i] {
             '\\' => i += 2,
             '`' => {
@@ -261,7 +338,10 @@ fn inline(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
                         fill(tok, close, close + run, Token::Marker);
                         i = close + run;
                     }
-                    None => i += run,
+                    None => {
+                        budget.0 += 1;
+                        i += run;
+                    }
                 }
             }
             ch @ ('*' | '_') => {
@@ -276,10 +356,15 @@ fn inline(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
                         fill(tok, i, i + run, Token::Marker);
                         fill(tok, i + run, close, t);
                         fill(tok, close, close + run, Token::Marker);
-                        inline(c, i + run, close, tok);
+                        if depth < MAX_DEPTH {
+                            inline(c, i + run, close, depth + 1, budget, tok);
+                        }
                         i = close + run;
                     }
-                    None => i += run,
+                    None => {
+                        budget.0 += u32::from(opens);
+                        i += run;
+                    }
                 }
             }
             '!' | '[' => {
@@ -295,7 +380,9 @@ fn inline(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
                             tok[i] = Token::Marker;
                         }
                         fill(tok, open + 1, l.text_end, Token::Link);
-                        inline(c, open + 1, l.text_end, tok);
+                        if depth < MAX_DEPTH {
+                            inline(c, open + 1, l.text_end, depth + 1, budget, tok);
+                        }
                         for at in [open, l.text_end, l.target_open, l.target_close] {
                             tok[at] = Token::Marker;
                         }
@@ -303,7 +390,10 @@ fn inline(c: &[char], from: usize, to: usize, tok: &mut [Token]) {
                         fill(tok, l.url_end, l.target_close, Token::String);
                         i = l.target_close + 1;
                     }
-                    None => i = open + 1,
+                    None => {
+                        budget.0 += 1;
+                        i = open + 1;
+                    }
                 }
             }
             '<' => match autolink(c, i, to) {
@@ -355,13 +445,16 @@ fn link(c: &[char], open: usize, to: usize) -> Option<LinkAt> {
     Some(LinkAt { text_end, target_open, target_close, url_end })
 }
 
-/// The `>` closing an autolink `<scheme://...>` or `<mailto:...>` at `i`.
+/// The `>` closing an autolink `<scheme://...>` or `<mailto:...>` at `i`. The
+/// scheme is checked first, and the scan stops at whitespace or another `<`,
+/// so a stray `<` costs a prefix compare.
 fn autolink(c: &[char], i: usize, to: usize) -> Option<usize> {
-    let close = (i + 1..to).find(|k| c[*k] == '>')?;
-    let body: String = c[i + 1..close].iter().collect();
-    let ok = !body.chars().any(char::is_whitespace)
-        && (body.starts_with("http://") || body.starts_with("https://") || body.starts_with("mailto:"));
-    ok.then_some(close)
+    let starts = |s: &str| s.chars().enumerate().all(|(k, x)| c.get(i + 1 + k) == Some(&x));
+    if !(starts("http://") || starts("https://") || starts("mailto:")) {
+        return None;
+    }
+    let close = (i + 1..to).find(|k| c[*k].is_whitespace() || matches!(c[*k], '<' | '>'))?;
+    (c[close] == '>').then_some(close)
 }
 
 #[cfg(test)]
@@ -564,10 +657,93 @@ mod tests {
         }
     }
 
+    /// Highlight `line` and fail if it takes longer than a linear pass could.
+    fn bounded(line: &str) {
+        let start = std::time::Instant::now();
+        let (spans, _) = Markdown.line(line, 0);
+        assert_eq!(spans.last().map(|s| s.end), Some(line.chars().count()));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn deeply_nested_links_and_emphasis_do_not_overflow_the_stack() {
+        let k = 20_000;
+        bounded(&format!("{}x{}", "[".repeat(k), "](u)".repeat(k)));
+        bounded(&format!("{}x{}", "*a ".repeat(k), "*".repeat(k)));
+        bounded(&format!("{}x{}", "_(".repeat(k), ")_".repeat(k)));
+        // Within the depth limit, nesting is still marked.
+        let toks = lex("[a [b](u) c](v)");
+        assert!(toks.contains(&run("b", Link)));
+    }
+
+    #[test]
+    fn openers_without_closers_cost_a_bounded_scan_each() {
+        let n = 100_000;
+        bounded(&"[".repeat(n));
+        bounded(&"<".repeat(n));
+        bounded(&"<http://".repeat(n / 8));
+        bounded(&"*a".repeat(n / 2));
+        bounded(&"_a ".repeat(n / 3));
+        bounded(&"`".repeat(n / 2).replace("``", "`a"));
+        bounded(&format!("http://x{}", ")".repeat(n)));
+        bounded(&"![".repeat(n / 2));
+    }
+
+    #[test]
+    fn markup_after_many_stray_openers_is_left_alone() {
+        let line = format!("{}`code`", "*a ".repeat(40));
+        assert!(!lex(&line).contains(&run("code", Code)), "past the budget");
+        // A few strays still leave later markup highlighted.
+        assert!(lex("*a [ b ( c `code`").contains(&run("code", Code)));
+    }
+
+    #[test]
+    fn a_fence_opened_after_a_list_marker_ends_at_its_indented_closer() {
+        let lines = ["- ```js", "  let x = 1;", "  ```", "# Heading after list", "text *em*"];
+        let mut state = 0;
+        let mut out = Vec::new();
+        for l in lines {
+            let (t, next) = lex_in(l, state);
+            out.push(t);
+            state = next;
+        }
+        assert_eq!(out[0], vec![run("-", Marker), run(" ", Plain), run("```", Marker), run("js", Key)]);
+        assert_eq!(out[1], vec![run("  ", Plain), run("let x = 1;", Code)]);
+        assert_eq!(out[2], vec![run("  ", Plain), run("```", Marker)]);
+        assert_eq!(out[3][0], run("#", Marker), "the heading is a heading");
+        assert!(out[4].contains(&run("em", Emphasis)), "so is the emphasis");
+        assert_eq!(state, 0);
+    }
+
+    #[test]
+    fn a_fence_in_a_quote_follows_the_quote_prefix() {
+        let (open, s) = lex_in("> ```", 0);
+        assert_eq!(open, vec![run("> ```", Marker)]);
+        let (body, s) = lex_in("> # code", s);
+        assert_eq!(body, vec![run(">", Marker), run(" ", Plain), run("# code", Code)]);
+        assert_ne!(s, 0);
+        assert_eq!(lex_in("> ```", s).1, 0);
+        // A line outside the quote ends the fence without a closer.
+        let (_, s) = lex_in("> ```", 0);
+        let (after, s) = lex_in("# out", s);
+        assert_eq!(after[0], run("#", Marker));
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn an_unclosed_list_fence_ends_where_the_list_does_and_keeps_blank_lines() {
+        let (_, s) = lex_in("1. ```", 0);
+        let (blank_line, s) = lex_in("", s);
+        assert!(blank_line.is_empty());
+        assert_ne!(s, 0, "a blank line stays inside");
+        assert_ne!(lex_in("   more", s).1, 0, "indented lines stay inside");
+        assert_eq!(lex_in("not indented", s).1, 0);
+    }
+
     #[test]
     fn every_line_of_up_to_four_markup_characters_is_classified_without_panic() {
         let alphabet: Vec<char> = "*_`[]()!<>#-~:ha ".chars().collect();
-        let fenced = fence_state('`', 3);
+        let fenced = fence_state('`', 3, TOP);
         let mut layer = vec![String::new()];
         for _ in 0..4 {
             layer = layer
