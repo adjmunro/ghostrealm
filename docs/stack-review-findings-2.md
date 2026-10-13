@@ -46,15 +46,6 @@ carries no button, so only left clicks reach a page.
 
 ### Medium
 
-#### 25. The audio device stays open after playback ends (confirmed)
-
-- Where: `run` / `start` ([`plugins/file_browser/audio.rs:96`](../crates/app/src/plugins/file_browser/audio.rs),
-  `:164`) keep the output device for the thread's life.
-- Effect: macOS holds a `PreventUserIdleSystemSleep` assertion for as long as
-  the view lives.
-- Fix: drop the device once playback finishes or pauses (after a short grace);
-  reopen it on Play.
-
 ### Low
 
 18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
