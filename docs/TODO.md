@@ -1345,17 +1345,3 @@
   - Cut-paste across filesystems does a copy then a remove, with the same cost.
   Move them to a worker with a progress/completion event back to the UI thread.
 - Reason: the window should stay responsive during large copies and slow `git`.
-
----
-
-[2026-10-14@7035bcb] Exit banner covers the last row when it has text
-
-- Requires: NO BLOCKERS
-- Detail: A kept terminal (`[terminal] close_on_exit`) draws the "exited ... press
-  any key to close" banner on the first blank row from the cursor down. When the
-  grid is full, that is the last row, and the banner covers its text (the agent's
-  surface text still has it). The VT has no API to write into the terminal
-  without the program's output, so the banner is an overlay; fix by reserving a
-  row below the grid (resize the PTY one row shorter once the shell exits) or by
-  writing the banner into the VT.
-- Reason: no output should be hidden by the banner.
