@@ -116,12 +116,6 @@ impl AppState {
         }
     }
 
-    /// Tell every view that another program may have written the file at
-    /// `path`. Returns whether any view's content changed.
-    pub fn changed_on_disk(&mut self, path: &Path) -> bool {
-        self.views.values_mut().fold(false, |any, view| view.changed_on_disk(path) | any)
-    }
-
     /// Have every view with a file check it against the disk
     /// ([`View::changed_on_disk`]). Returns whether any view changed.
     pub fn check_open_files(&mut self) -> bool {
@@ -872,19 +866,6 @@ mod tests {
         assert!(!d.join("dir").exists());
         let open: Vec<_> = s.views().filter_map(|(_, v)| v.path()).collect();
         assert_eq!(open, [d.join("keep.txt")]);
-    }
-
-    #[test]
-    fn a_file_changed_on_disk_reaches_its_editor() {
-        let mut s = AppState::new().with_shell_line("sleep 1");
-        s.new_empty_vtab();
-        let d = tmpdir("fm-on-disk");
-        std::fs::write(d.join("a.txt"), "A\n").unwrap();
-        let sid = open_editor(&mut s, &d.join("a.txt"));
-        std::fs::write(d.join("a.txt"), "B\n").unwrap();
-        s.changed_on_disk(&d.join("a.txt"));
-        let lines = &s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines;
-        assert_eq!(lines, &["B"]);
     }
 
     #[test]
