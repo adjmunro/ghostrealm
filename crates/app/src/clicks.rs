@@ -37,6 +37,11 @@ impl ClickCounter {
         self.last = Some((c.at, c.pos, clicks));
         clicks
     }
+
+    /// A press went elsewhere: the next one starts a new multi-click.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
 }
 
 #[cfg(test)]
@@ -54,5 +59,8 @@ mod tests {
         assert_eq!(c.count(&at(200, (13.0, 6.0))), 3);
         assert_eq!(c.count(&at(700, (13.0, 6.0))), 1, "too late");
         assert_eq!(c.count(&at(750, (20.0, 6.0))), 1, "too far");
+        assert_eq!(c.count(&at(800, (20.0, 6.0))), 2);
+        c.reset();
+        assert_eq!(c.count(&at(850, (20.0, 6.0))), 1, "after a press elsewhere");
     }
 }

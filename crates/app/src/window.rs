@@ -1474,11 +1474,14 @@ impl State {
     /// its split to halves on a double-click. Returns whether it took the press.
     fn press_divider(&mut self) -> bool {
         let Some(hit) = self.divider_under_cursor() else {
+            self.dividers.missed();
             return false;
         };
         self.release_lost_press();
-        let clicks = self.count_click();
-        if self.dividers.press(&mut self.app.tree, hit, self.cursor, clicks) == Press::Grabbed {
+        // Not part of a pane's multi-click; dividers count their own.
+        self.clicks.reset();
+        let click = self.click();
+        if self.dividers.press(&mut self.app.tree, hit, &click) == Press::Grabbed {
             self.begin_press();
         }
         self.dirty = true;

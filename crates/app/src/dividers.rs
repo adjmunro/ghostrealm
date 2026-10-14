@@ -1,7 +1,8 @@
 //! Split dividers under the mouse: the one the pointer is over, the one being
-//! dragged, and a double-click to reset a split. Geometry and click counts are
-//! passed in, so the press/drag/release flow is testable without a window.
+//! dragged, and a double-click to reset a split. Geometry and time are passed
+//! in, so the press/drag/release flow is testable without a window.
 
+use crate::clicks::{Click, ClickCounter};
 use ghostrealm_core::{Axis, Divider, PaneId, Rect, SplitPath, Tree, Vtab, VtabId};
 
 /// Dragging a divider leaves each pane at least this many columns / rows.
@@ -36,6 +37,9 @@ pub struct Dividers {
     hover: Option<(VtabId, SplitPath)>,
     /// The divider being dragged with the left button.
     drag: Option<Drag>,
+    /// Presses on dividers, counted apart from other presses: a click in a
+    /// pane next to a divider is not half of a double-click on it.
+    clicks: ClickCounter,
 }
 
 /// A divider being dragged: which split, and where along its strip it was
@@ -69,17 +73,23 @@ impl Dividers {
         true
     }
 
-    /// A left press on divider `d` of `vt`, the `clicks`th of a multi-click:
-    /// grab it to drag, or reset its split to halves on a double-click.
-    pub fn press(&mut self, tree: &mut Tree, (vt, d): (VtabId, Divider), p: (f32, f32), clicks: u32) -> Press {
-        if clicks >= 2 {
+    /// A left press, `click`, on divider `d` of `vt`: grab it to drag, or reset
+    /// its split to halves on a double-click.
+    pub fn press(&mut self, tree: &mut Tree, (vt, d): (VtabId, Divider), click: &Click) -> Press {
+        if self.clicks.count(click) >= 2 {
             tree.set_ratio(vt, &d.path, 0.5);
             return Press::Reset;
         }
-        let grab = d.grab_offset(p);
+        let grab = d.grab_offset(click.pos);
         let panes = tree.vtab(vt).map(pane_ids).unwrap_or_default();
         self.drag = Some(Drag { vt, path: d.path, grab, panes });
         Press::Grabbed
+    }
+
+    /// A left press that missed the dividers: the next press on one starts a
+    /// new multi-click.
+    pub fn missed(&mut self) {
+        self.clicks.reset();
     }
 
     /// The pointer moved to `p` with a divider grabbed: resize its split.
@@ -156,8 +166,83 @@ fn dragged_ratio(divider: &Divider, grab: f32, pointer: (f32, f32), cell: (f32, 
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_divider, dragged_ratio, pane_ids, pane_min, Drag, Frame};
-    use ghostrealm_core::{Axis, Rect, Tree};
+    use super::{dragged_divider, dragged_ratio, pane_ids, pane_min, under, Dividers, Drag, Frame, Press};
+    use crate::clicks::Click;
+    use ghostrealm_core::{Axis, PaneId, Rect, Tree, VtabId};
+    use std::time::{Duration, Instant};
+
+    /// 806x606: 800 px for two side-by-side panes, the strip at x = 400..406.
+    const FRAME: Frame = Frame { workspace: Rect { x: 0.0, y: 0.0, w: 806.0, h: 606.0 }, gap: 6.0, slop: 3.0, cell: (10.0, 20.0) };
+
+    fn side_by_side() -> (Tree, VtabId, PaneId) {
+        let mut t = Tree::new();
+        let (vt, left, _) = t.add_vtab("w");
+        t.split(vt, left, Axis::LeftRight).unwrap();
+        (t, vt, left)
+    }
+
+    fn width(t: &Tree, vt: VtabId, pane: PaneId) -> f32 {
+        t.vtab(vt).unwrap().layout(FRAME.workspace, FRAME.gap).into_iter().find(|(p, _)| *p == pane).unwrap().1.w
+    }
+
+    /// A press at `pos`, `ms` after the first, with a 400 ms double-click.
+    fn click(t0: Instant, ms: u64, pos: (f32, f32)) -> Click {
+        Click { at: t0 + Duration::from_millis(ms), pos, window: Duration::from_millis(400), slop: 4.0 }
+    }
+
+    #[test]
+    fn a_press_on_a_divider_drags_it_until_the_release() {
+        let (mut t, vt, left) = side_by_side();
+        let mut d = Dividers::default();
+        let t0 = Instant::now();
+        let at = (403.0, 300.0);
+        let hit = under(&t, &FRAME, at).expect("on the divider");
+        assert!(d.hover(Some(&hit)));
+        assert_eq!(d.press(&mut t, hit, &click(t0, 0, at)), Press::Grabbed);
+        assert!(d.drag(&mut t, &FRAME, (203.0, 300.0)));
+        assert_eq!(width(&t, vt, left), 200.0, "the grabbed spot stays under the pointer");
+        let (lit, dragging) = d.highlight(&t, &FRAME).expect("lit while dragged");
+        assert_eq!((lit.strip.x, dragging), (200.0, true));
+        assert!(d.release());
+        assert!(!d.drag(&mut t, &FRAME, (603.0, 300.0)), "let go");
+        assert_eq!(width(&t, vt, left), 200.0);
+        assert!(!d.release(), "nothing held");
+    }
+
+    #[test]
+    fn a_double_click_on_a_divider_resets_its_split_to_halves() {
+        let (mut t, vt, left) = side_by_side();
+        t.set_ratio(vt, &[], 0.25);
+        let mut d = Dividers::default();
+        let t0 = Instant::now();
+        let at = (203.0, 300.0);
+        let hit = under(&t, &FRAME, at).expect("on the divider");
+        assert_eq!(d.press(&mut t, hit, &click(t0, 0, at)), Press::Grabbed);
+        assert!(d.release());
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert_eq!(d.press(&mut t, hit, &click(t0, 150, at)), Press::Reset);
+        assert_eq!(width(&t, vt, left), 400.0);
+        assert!(!d.dragging(), "a reset grabs nothing");
+    }
+
+    #[test]
+    fn a_press_elsewhere_between_two_on_a_divider_is_no_double_click() {
+        let (mut t, vt, left) = side_by_side();
+        t.set_ratio(vt, &[], 0.25);
+        let mut d = Dividers::default();
+        let t0 = Instant::now();
+        let at = (203.0, 300.0);
+        // A pane click beside the divider, then a press on it.
+        d.missed();
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert_eq!(d.press(&mut t, hit, &click(t0, 100, at)), Press::Grabbed);
+        assert!(d.release());
+        // A press on it, a pane click, and another press on it.
+        d.missed();
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert_eq!(d.press(&mut t, hit, &click(t0, 200, at)), Press::Grabbed);
+        assert_eq!(width(&t, vt, left), 200.0, "the split kept its ratio");
+    }
 
     #[test]
     fn dragging_a_divider_resizes_its_split_down_to_a_few_cells() {
