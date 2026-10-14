@@ -287,7 +287,9 @@ pub trait TerminalBackend {
         }
     }
 
-    /// Build a snapshot of the current grid for rendering.
+    /// A copy of the current grid. A peek: it leaves
+    /// [`needs_snapshot`](Self::needs_snapshot) alone, so an occasional reader
+    /// (the agent) can't hide a change from the render path.
     fn snapshot(&mut self) -> Grid;
 
     /// Snapshot into an existing [`Grid`], reusing its allocations (cell strings,
@@ -298,8 +300,8 @@ pub trait TerminalBackend {
         *out = self.snapshot();
     }
 
-    /// Whether the grid changed since the last [`snapshot`](Self::snapshot) and
-    /// so needs re-snapshotting. Backends that cannot tell return `true`
+    /// Whether the grid changed since the last
+    /// [`snapshot_into`](Self::snapshot_into) and so needs re-snapshotting. Backends that cannot tell return `true`
     /// (always re-snapshot).
     fn needs_snapshot(&self) -> bool {
         true

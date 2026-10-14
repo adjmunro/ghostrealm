@@ -368,6 +368,16 @@ impl GhosttyTerminal {
         Ok(())
     }
 
+    /// [`Self::build_into`], or a blank grid of the VT's size if that fails.
+    fn fill(&mut self, out: &mut Grid) {
+        if let Err(e) = self.build_into(out) {
+            eprintln!("ghostrealm: snapshot failed: {e:#}");
+            let cols = self.term.cols().unwrap_or(0);
+            let rows = self.term.rows().unwrap_or(0);
+            *out = Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0]);
+        }
+    }
+
     fn map_key(key: Key) -> vtkey::Key {
         match key {
             Key::Char(_) => vtkey::Key::Unidentified,
@@ -670,18 +680,13 @@ impl TerminalBackend for GhosttyTerminal {
 
     fn snapshot(&mut self) -> Grid {
         let mut g = Grid::empty();
-        self.snapshot_into(&mut g);
+        self.fill(&mut g);
         g
     }
 
     fn snapshot_into(&mut self, out: &mut Grid) {
         self.dirty = false;
-        if let Err(e) = self.build_into(out) {
-            eprintln!("ghostrealm: snapshot failed: {e:#}");
-            let cols = self.term.cols().unwrap_or(0);
-            let rows = self.term.rows().unwrap_or(0);
-            *out = Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0]);
-        }
+        self.fill(out);
     }
 
     fn title(&self) -> Option<String> {

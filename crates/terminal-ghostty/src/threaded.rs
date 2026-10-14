@@ -326,12 +326,11 @@ impl TerminalBackend for ThreadedTerminal {
     }
 
     fn snapshot(&mut self) -> Grid {
-        // Peek (don't consume) so repeated callers (the agent) keep seeing output.
-        let gen = self.shared.generation.load(Ordering::Acquire);
+        // Peek (don't consume) so repeated callers (the agent) keep seeing
+        // output, and the paint path still takes the grid it hasn't drawn.
         if let Some(grid) = self.shared.grid.lock().unwrap().clone() {
             self.last_grid = grid;
         }
-        self.last_snapshot_gen = gen;
         self.last_grid.clone()
     }
 
@@ -753,5 +752,19 @@ mod tests {
         let mut g = Grid::empty();
         term.snapshot_into(&mut g);
         assert!(!term.needs_snapshot(), "snapshot consumes the pending generation");
+    }
+
+    #[test]
+    fn a_peek_leaves_the_grid_pending_for_the_paint_path() {
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(sh("printf X; sleep 2")), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !row_text(&term.snapshot(), 0).contains('X') {
+            assert!(Instant::now() < deadline, "no output");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(term.needs_snapshot(), "a peek doesn't consume the pending grid");
+        let mut g = Grid::empty();
+        term.snapshot_into(&mut g);
+        assert_eq!(row_text(&g, 0), "X");
     }
 }
