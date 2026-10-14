@@ -1,0 +1,58 @@
+//! Multi-click counting for mouse presses. Time and position are passed in,
+//! so the counting is testable without real timing.
+
+use std::time::{Duration, Instant};
+
+/// One left press, as a multi-click counter sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Click {
+    pub at: Instant,
+    pub pos: (f32, f32),
+    /// The longest gap after the last press that still continues it.
+    pub window: Duration,
+    /// How far from the last press it may land and still continue it.
+    pub slop: f32,
+}
+
+/// Counts presses that follow each other quickly at about the same spot.
+#[derive(Debug, Default)]
+pub struct ClickCounter {
+    /// The last press (time, position, click count).
+    last: Option<(Instant, (f32, f32), u32)>,
+}
+
+impl ClickCounter {
+    /// Count `c` as the next of a multi-click when it follows the last press
+    /// within its window and slop; else it starts a new one (1).
+    pub fn count(&mut self, c: &Click) -> u32 {
+        let (x, y) = c.pos;
+        let clicks = match self.last {
+            Some((t, (px, py), n))
+                if c.at.duration_since(t) < c.window && (x - px).abs() <= c.slop && (y - py).abs() <= c.slop =>
+            {
+                n + 1
+            }
+            _ => 1,
+        };
+        self.last = Some((c.at, c.pos, clicks));
+        clicks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Click, ClickCounter};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn quick_presses_at_one_spot_count_up_and_a_late_or_distant_one_starts_over() {
+        let t0 = Instant::now();
+        let at = |ms, pos| Click { at: t0 + Duration::from_millis(ms), pos, window: Duration::from_millis(400), slop: 4.0 };
+        let mut c = ClickCounter::default();
+        assert_eq!(c.count(&at(0, (10.0, 10.0))), 1);
+        assert_eq!(c.count(&at(100, (13.0, 6.0))), 2, "within the slop");
+        assert_eq!(c.count(&at(200, (13.0, 6.0))), 3);
+        assert_eq!(c.count(&at(700, (13.0, 6.0))), 1, "too late");
+        assert_eq!(c.count(&at(750, (20.0, 6.0))), 1, "too far");
+    }
+}
