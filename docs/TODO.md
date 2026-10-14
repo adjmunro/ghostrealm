@@ -224,16 +224,14 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Splits — discoverability, draggable resize handles, ratios
+[2026-09-15@2e8e8c7] Splits — discoverability, close and split buttons
 
 - Requires: NO BLOCKERS
 - Detail: (1) Split commands are hard to find (buried below the palette fold) — add
-  default keybindings and surface them. (2) Draggable split handles to resize panes
-  with the mouse. (3) A split currently halves the *current* pane; want free
-  resizing (including small panes) rather than a fixed half. (4) Owner review
-  (2026-10-13): centre the handle on the border between the panes. (5) A close
-  "x" on a pane and split right/left/up/down buttons (owner's words in
-  "DISCUSSION: editor and file browser as one surface").
+  default keybindings and surface them. (2) A close "x" on a pane and split
+  right/left/up/down buttons (owner's words in "DISCUSSION: editor and file
+  browser as one surface"). Resize handles and free ratios are done; split
+  ratios are not saved between runs (nothing in the workspace tree is).
 - Reason: expected tiling UX.
 
 ---
@@ -851,9 +849,6 @@
 
 - Requires: NO BLOCKERS
 - Detail:
-  - **Split drag handle**: when draggable split handles are built, centre them
-    on the border between panes (see "Splits — discoverability, draggable resize
-    handles, ratios"). No drag handles exist yet.
   - **Cmd+/ comment toggle: remaining.** `editor.toggle_comment` exists and a
     new config file binds it to `cmd+/` (`Highlighter::comment` holds each
     language's tokens). Only languages with a highlighter have comment syntax
