@@ -347,6 +347,10 @@ impl View for TerminalView {
             && !self.term.alt_screen()
         {
             self.banner_reserved = true;
+            // The shrink scrolls the output up under a viewport-relative
+            // selection.
+            self.selection = None;
+            self.press_cell = None;
         }
         // Resize the PTY only when the cell grid (or cell size) changes.
         let rows = if self.banner_reserved { (pane_rows - 1).max(1) } else { pane_rows };
@@ -1090,6 +1094,30 @@ mod tests {
         assert_eq!(lines.len(), 10, "nine grid rows and the banner: {text:?}");
         assert_eq!(lines[8], "last-row");
         assert_eq!(lines[9], banner());
+    }
+
+    #[test]
+    fn giving_up_a_row_drops_the_selection() {
+        let mut v = running("printf go; read x; seq 1 12; printf last-row; stty -echo; read y", "go");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        v.write_input(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while selection_text(&v.grid, row_sel(9)) != "last-row" {
+            assert!(Instant::now() < deadline, "no full grid");
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(0, 9), clicks: 3, button: MouseButton::Left });
+        assert!(v.selection.is_some());
+        v.write_input(b"\n");
+        while v.grid.size.rows != 9 {
+            assert!(Instant::now() < deadline, "the grid never gave up a row");
+            v.text();
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(v.selection, None, "its row moved");
     }
 
     #[test]
