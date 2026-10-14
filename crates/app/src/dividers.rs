@@ -133,8 +133,8 @@ impl Dividers {
         frame.resize(tree, drag.vt, &divider.path, divider.ratio_at(p, drag.grab))
     }
 
-    /// The left button went up: let go of the divider. Returns whether one was
-    /// held.
+    /// The press ended (its release, or a new press of any button before it):
+    /// let go of the divider. Returns whether one was held.
     pub fn release(&mut self) -> bool {
         self.drag.take().is_some()
     }

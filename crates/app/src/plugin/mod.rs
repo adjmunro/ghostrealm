@@ -163,9 +163,12 @@ pub trait View: Any {
         false
     }
 
-    /// Left-button mouse input. `Down` arrives for a press inside the view (after
-    /// the app focused its pane); `Drag` and `Up` follow for that same press even
-    /// if the cursor leaves the view. `Move` is hover with no button held.
+    /// Mouse input. `Down` arrives for a press inside the view (after the app
+    /// focused its pane); `Drag` and `Up` follow for that same press even if the
+    /// cursor leaves the view. Each carries the press's `button` (left, middle,
+    /// or right; a right press comes before [`View::context_menu`]); a view
+    /// that handles only the left button returns early on
+    /// [`MouseEvent::is_other_button`]. `Move` is hover with no button held.
     fn mouse(&mut self, _cx: &mut EventCx, _event: &MouseEvent) {}
 
     /// A right-click at `pos` inside the view. A view with a context menu
