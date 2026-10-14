@@ -436,6 +436,18 @@ fn worker_loop(
             term.pump();
         }
 
+        // Publish a fresh grid if anything changed, recycling the previous
+        // (possibly unconsumed) mailbox grid as the next scratch buffer.
+        let mut published = false;
+        if term.needs_snapshot() {
+            term.snapshot_into(&mut scratch);
+            let fresh = std::mem::replace(&mut scratch, Grid::empty());
+            let prev = shared.grid.lock().unwrap().replace(fresh);
+            scratch = prev.unwrap_or_else(Grid::empty);
+            shared.generation.fetch_add(1, Ordering::Release);
+            published = true;
+        }
+
         // Refresh cheap meta (title/busy/lifecycle); wake the UI on any change.
         let new_meta = Meta {
             title: term.title(),
@@ -453,21 +465,6 @@ fn worker_loop(
             *m = new_meta;
             changed
         };
-
-        // Publish a fresh grid if anything changed, recycling the previous
-        // (possibly unconsumed) mailbox grid as the next scratch buffer. After
-        // the meta, so a reader never pairs a grid with older meta (an
-        // alternate-screen grid with `alt_screen` still false).
-        let mut published = false;
-        if term.needs_snapshot() {
-            term.snapshot_into(&mut scratch);
-            let fresh = std::mem::replace(&mut scratch, Grid::empty());
-            let prev = shared.grid.lock().unwrap().replace(fresh);
-            scratch = prev.unwrap_or_else(Grid::empty);
-            shared.generation.fetch_add(1, Ordering::Release);
-            published = true;
-        }
-
         if published || meta_changed {
             if let Some(w) = ui_waker {
                 w();
