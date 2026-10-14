@@ -1359,26 +1359,3 @@
   row below the grid (resize the PTY one row shorter once the shell exits) or by
   writing the banner into the VT.
 - Reason: no output should be hidden by the banner.
-
----
-
-[2026-10-14@7141218] PRIORITY (review): split handles — unreviewed fixes and leftovers
-
-- Requires: NO BLOCKERS
-- Detail: `develop` stops at `fc2a3e6`. Above it on `feat/split-handles`,
-  `1cfb44d` (a divider drag lets go when a pane closes under it) and `7141218`
-  (doc comment) still need a fresh review before `develop` advances. Leftovers
-  from that branch's review:
-  - A lost release without a focus change keeps `divider_drag` alive, so moves
-    keep resizing until the next release: clear it in `release_lost_press`.
-  - `count_click` is shared with pane clicks, so a pane click near a divider
-    press can reset that split to 50/50 (and the reverse counts as a
-    double-click). Give divider presses their own click counting.
-  - After undoing past a reload and redoing back, `changed_on_disk` stays set,
-    so the tab stays amber until the next save or reload.
-  - `divider_hover` and the post-drag highlight can name a stale divider until
-    the pointer moves after a tree change.
-  - The 4-row minimum counts the pane's tab strip; nested panes can go below the
-    8-column minimum because only the dragged split's children are clamped.
-  - The press/drag/release flow in the window `State` has no test.
-- Reason: the review rule — `develop` only advances over reviewed commits.
