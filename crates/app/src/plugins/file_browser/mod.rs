@@ -15,6 +15,7 @@
 pub(crate) mod preview;
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -31,6 +32,7 @@ use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
+    Waker,
 };
 use preview::PreviewPane;
 
@@ -73,7 +75,7 @@ impl Plugin for FileBrowserPlugin {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        Ok(Box::new(FileBrowserView::new(root)))
+        Ok(Box::new(FileBrowserView::new(root).with_waker(cx.waker.clone())))
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
@@ -215,6 +217,13 @@ impl FileBrowserView {
             field: FieldMouse::default(),
             name_field: FieldMouse::default(),
         }
+    }
+
+    /// Wake the UI with `waker` when background work (the git filter's
+    /// status) finishes.
+    pub fn with_waker(mut self, waker: Option<Waker>) -> Self {
+        self.tree.set_waker(waker);
+        self
     }
 
     /// A browser for the floating picker, choosing per `mode`.
@@ -469,12 +478,21 @@ impl FileBrowserView {
 
         // Toggles on the right, right to left.
         let t = &self.tree;
+        // An ellipsis on the git controls while their status loads.
+        let loading = |label: &'static str, git: bool| -> Cow<'static, str> {
+            if git && t.git_status_loading() {
+                format!("{label}\u{2026}").into()
+            } else {
+                label.into()
+            }
+        };
+        let git_on = t.git_filter() != GitFilter::All;
         let toggles = [
-            ("preview", self.preview_shown, BTN_PREVIEW),
-            ("hidden", t.show_hidden(), BTN_HIDDEN),
-            (".gitignore", t.show_gitignored(), BTN_IGNORED),
-            (t.git_filter().label(), t.git_filter() != GitFilter::All, BTN_GIT),
-            (t.view().label(), t.view() != FsView::Tree, BTN_VIEW),
+            ("preview".into(), self.preview_shown, BTN_PREVIEW),
+            ("hidden".into(), t.show_hidden(), BTN_HIDDEN),
+            (".gitignore".into(), t.show_gitignored(), BTN_IGNORED),
+            (loading(t.git_filter().label(), git_on), git_on, BTN_GIT),
+            (loading(t.view().label(), t.view() == FsView::GitStatus), t.view() != FsView::Tree, BTN_VIEW),
         ];
         // The git filter, grouped views, and preview act on files, which a
         // directory picker never lists.
@@ -491,7 +509,7 @@ impl FileBrowserView {
                 cx.highlight(hit);
             }
             let color = if on { theme::LABEL_HOVER } else { theme::DIM };
-            cx.label(label, Family::SansSerif, hit.x + tpad * 0.5, hy, hit, color);
+            cx.label(&label, Family::SansSerif, hit.x + tpad * 0.5, hy, hit, color);
             right -= w + tpad * 2.0;
         }
 
@@ -910,6 +928,10 @@ impl View for FileBrowserView {
             _ => return,
         }
         cx.redraw();
+    }
+
+    fn refresh(&mut self) -> bool {
+        self.tree.poll()
     }
 
     fn deadline(&self, _cfg: &Config) -> Option<Instant> {
@@ -1397,6 +1419,37 @@ mod tests {
         let out = h.button(&mut v, BTN_HIDDEN);
         assert!(out.redraw);
         assert_eq!(v.tree().show_hidden(), !before);
+    }
+
+    #[test]
+    fn the_git_filter_applies_once_its_status_arrives_from_the_worker() {
+        let d = tmpdir("fb-git-async");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        std::fs::write(d.join("clean.txt"), "x").unwrap();
+        std::fs::write(d.join("changed.txt"), "x").unwrap();
+        assert!(git(&["add", "-A"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
+        std::fs::write(d.join("changed.txt"), "y").unwrap();
+        let (tx, woken) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let waker: Waker = std::sync::Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        });
+        let mut v = FileBrowserView::new(d.clone()).with_waker(Some(waker));
+        let h = Harness::new();
+        h.button(&mut v, BTN_GIT);
+        let before = v.text().unwrap();
+        assert!(!before.contains("changed.txt"), "no status yet, so nothing passes:\n{before}");
+        assert!(v.tree().git_status_loading());
+        woken.recv_timeout(std::time::Duration::from_secs(10)).expect("the worker wakes the UI");
+        assert!(v.refresh(), "the arrived status repaints");
+        let after = v.text().unwrap();
+        assert!(after.contains("changed.txt") && !after.contains("clean.txt"), "{after}");
     }
 
     /// Wider than the default `preview_min_width` (900).

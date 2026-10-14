@@ -537,7 +537,8 @@ impl AppState {
             Pick::NewWorkspace => self.default_root(),
             _ => self.picker_root(),
         };
-        self.picker = Some((FileBrowserView::picker(root, purpose.mode()), purpose));
+        let browser = FileBrowserView::picker(root, purpose.mode()).with_waker(self.waker.clone());
+        self.picker = Some((browser, purpose));
     }
 
     /// Where the picker starts: the active workspace's dir, else the app
@@ -575,7 +576,7 @@ impl AppState {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.picker_root());
-        let mut browser = FileBrowserView::picker(root, Mode::Save);
+        let mut browser = FileBrowserView::picker(root, Mode::Save).with_waker(self.waker.clone());
         if let Some(name) = file.as_deref().and_then(Path::file_name) {
             browser.set_name(name.to_string_lossy());
         }
@@ -1259,6 +1260,9 @@ impl AppState {
         }
         for (id, title) in titles {
             self.tree.set_surface_title(id, title, false);
+        }
+        if let Some((picker, _)) = &mut self.picker {
+            changed |= picker.refresh();
         }
         // A terminal whose shell exited closes the way Close would.
         for sid in finished {

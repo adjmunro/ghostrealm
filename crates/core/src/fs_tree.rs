@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::fuzzy;
@@ -42,6 +44,47 @@ struct GitState {
     modified: bool,
     /// Not tracked by git.
     untracked: bool,
+}
+
+/// Git state per absolute path.
+type GitMap = HashMap<PathBuf, GitState>;
+
+/// Called from a worker thread when it has a result waiting (the GUI wakes its
+/// event loop).
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+/// A thread that runs `git status` for the newest requested root, skipping
+/// requests superseded while it was busy. Each request and result carries the
+/// tree's git generation, so a result for an older listing is recognisable.
+/// The thread ends once the tree drops its end.
+struct GitWorker {
+    requests: Sender<(u64, PathBuf)>,
+    results: Receiver<(u64, GitMap)>,
+}
+
+impl GitWorker {
+    fn spawn(waker: Option<Waker>) -> Self {
+        let (requests, inbox) = mpsc::channel::<(u64, PathBuf)>();
+        let (outbox, results) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("git-status".into())
+            .spawn(move || {
+                while let Ok(mut request) = inbox.recv() {
+                    while let Ok(newer) = inbox.try_recv() {
+                        request = newer;
+                    }
+                    let (generation, root) = request;
+                    if outbox.send((generation, git_status_map(&root))).is_err() {
+                        return;
+                    }
+                    if let Some(wake) = &waker {
+                        wake();
+                    }
+                }
+            })
+            .expect("spawn git-status worker");
+        GitWorker { requests, results }
+    }
 }
 
 /// The git-status filter for a file browser view.
@@ -173,9 +216,21 @@ pub struct FsTree {
     recent: Option<Duration>,
     /// Show only files with this extension (lowercase, no dot); directories pass.
     ext: Option<String>,
-    /// Git status per absolute path, built lazily when a git filter is active;
-    /// cleared when the root changes or on refresh.
-    git_status: Option<HashMap<PathBuf, GitState>>,
+    /// Git status per absolute path, from the worker, with the generation it
+    /// was run for. Built lazily when a git filter or the git view is on. A
+    /// refresh or a new root keeps it until the next result replaces it: its
+    /// paths are absolute, so for the few milliseconds it is out of date it
+    /// is stale, never wrong about another file.
+    git_status: Option<(u64, GitMap)>,
+    /// Bumped by a refresh or a new root: the status of an older generation is
+    /// out of date.
+    git_generation: u64,
+    /// The generation last sent to the worker.
+    git_requested: Option<u64>,
+    /// Started on the first request.
+    git_worker: Option<GitWorker>,
+    /// Wakes the UI when a git status arrives.
+    waker: Option<Waker>,
     /// Memoised flattened rows; recomputed only when `dirty`.
     rows_cache: Vec<FileRow>,
     dirty: bool,
@@ -198,6 +253,10 @@ impl FsTree {
             recent: None,
             ext: None,
             git_status: None,
+            git_generation: 0,
+            git_requested: None,
+            git_worker: None,
+            waker: None,
             rows_cache: Vec::new(),
             dirty: true,
         }
@@ -207,13 +266,22 @@ impl FsTree {
         &self.root
     }
 
+    /// Call `waker` (from a worker thread) when a git status arrives, so the
+    /// UI can [`poll`](Self::poll) and repaint.
+    pub fn set_waker(&mut self, waker: Option<Waker>) {
+        self.waker = waker;
+        // The worker holds the waker it started with.
+        self.git_worker = None;
+        self.git_requested = None;
+    }
+
     /// Navigate to a new root directory, resetting expand state and cache.
     pub fn set_root(&mut self, root: impl Into<PathBuf>) {
         self.root = root.into();
         self.expanded.clear();
         self.cache.clear();
         self.walk_cache = None;
-        self.git_status = None;
+        self.git_generation += 1;
         self.query.clear();
         self.dirty = true;
     }
@@ -293,8 +361,36 @@ impl FsTree {
     pub fn refresh(&mut self) {
         self.cache.clear();
         self.walk_cache = None;
-        self.git_status = None;
+        self.git_generation += 1;
         self.dirty = true;
+    }
+
+    /// Take a git status the worker finished. Returns whether the rows change.
+    pub fn poll(&mut self) -> bool {
+        let Some(worker) = &self.git_worker else { return false };
+        let mut arrived = false;
+        while let Ok((generation, map)) = worker.results.try_recv() {
+            if self.git_status.as_ref().is_none_or(|(g, _)| generation > *g) {
+                self.git_status = Some((generation, map));
+                arrived = true;
+            }
+        }
+        if arrived && self.uses_git() {
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether a git filter or the git view is on and its git status is not
+    /// in yet for the current listing.
+    pub fn git_status_loading(&self) -> bool {
+        self.uses_git() && self.git_status.as_ref().is_none_or(|(g, _)| *g != self.git_generation)
+    }
+
+    /// Whether the rows depend on git status.
+    fn uses_git(&self) -> bool {
+        self.git_filter != GitFilter::All || self.view == FsView::GitStatus
     }
 
     pub fn view(&self) -> FsView {
@@ -357,9 +453,10 @@ impl FsTree {
     /// of the root and its expanded descendants; in filter mode it is a flat,
     /// score-ranked list of matches walked from the root.
     pub fn rows(&mut self) -> &[FileRow] {
+        self.poll();
         if self.dirty {
-            if self.git_filter != GitFilter::All || self.view == FsView::GitStatus {
-                self.ensure_git_status();
+            if self.uses_git() {
+                self.request_git_status();
             }
             self.rows_cache = if self.view != FsView::Tree {
                 // Grouped views ignore the query; the view IS the navigation.
@@ -428,42 +525,29 @@ impl FsTree {
     fn git_state(&self, path: &Path) -> GitState {
         self.git_status
             .as_ref()
-            .and_then(|m| m.get(path))
+            .and_then(|(_, m)| m.get(path))
             .copied()
             .unwrap_or_default()
     }
 
-    /// Run `git status` for the repo containing the root and record a per-path
-    /// state. A non-repo (or git failure) yields an empty map.
-    fn ensure_git_status(&mut self) {
-        if self.git_status.is_some() {
+    /// Ask the worker for the current generation's git status, unless already
+    /// asked. Until it arrives the rows use the last status (none at first).
+    /// `git status --untracked-files=all` on a big repository, or one with a
+    /// big untracked folder, takes long enough to stall a frame.
+    fn request_git_status(&mut self) {
+        if self.git_requested == Some(self.git_generation)
+            || self.git_status.as_ref().is_some_and(|(g, _)| *g == self.git_generation)
+        {
             return;
         }
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.root)
-                .args(args)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| o.stdout)
-        };
-        // Porcelain paths are relative to the repo's top level; the prefix maps
-        // them under the root without comparing absolute paths (which a
-        // symlinked root would spell differently).
-        let status = git(&["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"]);
-        let prefix = git(&["rev-parse", "--show-prefix"]);
-        let map = match (status, prefix) {
-            (Some(status), Some(prefix)) => {
-                parse_porcelain_z(&status, repo_prefix(&prefix))
-                    .into_iter()
-                    .map(|(rel, st)| (self.root.join(rel), st))
-                    .collect()
-            }
-            _ => HashMap::new(),
-        };
-        self.git_status = Some(map);
+        let waker = self.waker.clone();
+        let worker = self.git_worker.get_or_insert_with(|| GitWorker::spawn(waker));
+        if worker.requests.send((self.git_generation, self.root.clone())).is_ok() {
+            self.git_requested = Some(self.git_generation);
+        } else {
+            // The worker is gone: the next request starts another.
+            self.git_worker = None;
+        }
     }
 
     /// Whether the current input reads as a path (drives autocomplete/navigation)
@@ -721,6 +805,10 @@ impl FsTree {
     /// the file filters. Expanded categories list their files, with same-named files
     /// disambiguated by a dim ancestor prefix.
     fn grouped_rows(&self, view: FsView) -> Vec<FileRow> {
+        // Until the first status arrives every file would read as unchanged.
+        if view == FsView::GitStatus && self.git_status.is_none() {
+            return Vec::new();
+        }
         let files: Vec<&WalkEntry> = self
             .walk_cache
             .as_deref()
@@ -985,6 +1073,34 @@ fn size_bucket(size: u64) -> (i64, &'static str) {
     }
 }
 
+/// Run `git status` for the repository holding `root` and record each changed
+/// or untracked file's state, by absolute path under `root`. A non-repository
+/// (or a git failure) yields an empty map. Runs on the git-status worker.
+fn git_status_map(root: &Path) -> GitMap {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+    };
+    // Porcelain paths are relative to the repo's top level; the prefix maps
+    // them under the root without comparing absolute paths (which a
+    // symlinked root would spell differently).
+    let status = git(&["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"]);
+    let prefix = git(&["rev-parse", "--show-prefix"]);
+    match (status, prefix) {
+        (Some(status), Some(prefix)) => parse_porcelain_z(&status, repo_prefix(&prefix))
+            .into_iter()
+            .map(|(rel, st)| (root.join(rel), st))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
 /// The root's path in its repo from `git rev-parse --show-prefix` output, as
 /// bytes, not text: a non-UTF-8 root must still match.
 fn repo_prefix(out: &[u8]) -> &[u8] {
@@ -1056,10 +1172,107 @@ mod tests {
         fs::create_dir(d.join("new dir")).unwrap();
         fs::write(d.join("new dir").join("n.txt"), "x").unwrap();
 
-        let mut t = FsTree::new(&d);
-        t.ensure_git_status();
-        assert!(t.git_state(&d.join("a b.txt")).modified);
-        assert!(t.git_state(&d.join("new dir").join("n.txt")).untracked);
+        let map = git_status_map(&d);
+        assert!(map[&d.join("a b.txt")].modified);
+        assert!(map[&d.join("new dir").join("n.txt")].untracked);
+    }
+
+    /// A repository in a fresh temp dir with `clean.txt` committed and
+    /// `changed.txt` committed then modified; `None` without git.
+    fn repo_with_a_change() -> Option<PathBuf> {
+        let d = tmpdir();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return None;
+        }
+        fs::write(d.join("clean.txt"), "x").unwrap();
+        fs::write(d.join("changed.txt"), "x").unwrap();
+        assert!(git(&["add", "-A"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
+        fs::write(d.join("changed.txt"), "y").unwrap();
+        Some(d)
+    }
+
+    fn file_names(t: &mut FsTree) -> Vec<String> {
+        t.rows().iter().filter(|r| !r.is_dir).map(|r| r.name.clone()).collect()
+    }
+
+    /// A tree whose waker reports on the returned channel.
+    fn tree_with_waker(d: &Path) -> (FsTree, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let mut t = FsTree::new(d);
+        t.set_waker(Some(Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        })));
+        (t, rx)
+    }
+
+    #[test]
+    fn git_status_arrives_from_the_worker_and_the_filter_applies_then() {
+        let Some(d) = repo_with_a_change() else { return };
+        let (mut t, woken) = tree_with_waker(&d);
+        t.cycle_git_filter();
+        assert_eq!(t.git_filter(), GitFilter::Modified);
+        assert!(file_names(&mut t).is_empty(), "no git state yet: no file passes");
+        assert!(t.git_status_loading());
+        woken.recv_timeout(Duration::from_secs(10)).expect("the worker wakes the UI");
+        assert!(t.poll(), "the status changes the rows");
+        assert!(!t.git_status_loading());
+        assert_eq!(file_names(&mut t), ["changed.txt"]);
+        assert!(!t.poll(), "taken once");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_last_git_status_until_the_new_one_arrives() {
+        let Some(d) = repo_with_a_change() else { return };
+        let (mut t, woken) = tree_with_waker(&d);
+        t.cycle_git_filter();
+        t.rows();
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(file_names(&mut t), ["changed.txt"]);
+        fs::write(d.join("clean.txt"), "changed too").unwrap();
+        t.refresh();
+        assert_eq!(file_names(&mut t), ["changed.txt"], "the old status shows meanwhile, no blank list");
+        assert!(t.git_status_loading());
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(t.poll());
+        assert_eq!(file_names(&mut t), ["changed.txt", "clean.txt"]);
+    }
+
+    #[test]
+    fn the_git_view_lists_nothing_until_the_first_status_arrives() {
+        let Some(d) = repo_with_a_change() else { return };
+        let (mut t, woken) = tree_with_waker(&d);
+        t.set_view(FsView::GitStatus);
+        assert!(t.rows().is_empty(), "not every file as Unchanged");
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        t.poll();
+        let cats: Vec<String> = t.rows().iter().map(|r| r.key.clone()).collect();
+        assert_eq!(cats, ["Modified", "Unchanged"]);
+    }
+
+    #[test]
+    fn git_status_requests_coalesce_and_stale_results_are_superseded() {
+        let Some(d) = repo_with_a_change() else { return };
+        let (mut t, _woken) = tree_with_waker(&d);
+        t.cycle_git_filter();
+        for _ in 0..5 {
+            t.rows();
+            t.refresh();
+        }
+        t.rows();
+        let generation = t.git_generation;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while t.git_status_loading() {
+            assert!(std::time::Instant::now() < until, "the newest request was answered");
+            std::thread::sleep(Duration::from_millis(5));
+            t.poll();
+        }
+        assert_eq!(t.git_status.as_ref().map(|(g, _)| *g), Some(generation));
+        assert_eq!(file_names(&mut t), ["changed.txt"]);
     }
 
     fn tmpdir() -> PathBuf {
