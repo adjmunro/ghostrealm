@@ -335,9 +335,10 @@ impl View for TerminalView {
         let cols = ((rect.w / cw).floor() as u16).max(1);
         let pane_rows = ((rect.h / ch).floor() as u16).max(1);
         // An ended shell's output with no blank row left for the banner gives
-        // up the pane's last row, judged on a grid already at the pane's size.
-        // Shrinking drops the top row from a one-row pane or the alternate
-        // screen (no scrollback), so those keep the banner over the last row.
+        // up the pane's last row, judged on the live screen (scrolled back,
+        // the grid is history with no cursor) at the pane's size. Shrinking
+        // drops the top row from a one-row pane or the alternate screen (no
+        // scrollback), so those keep the banner over the last row.
         let sized = (self.grid.size.cols, self.grid.size.rows) == (cols, pane_rows);
         if self.exit.is_some()
             && !self.banner_reserved
@@ -345,6 +346,7 @@ impl View for TerminalView {
             && sized
             && banner_row(&self.grid).is_none()
             && !self.term.alt_screen()
+            && self.term.viewport_active()
         {
             self.banner_reserved = true;
             // The shrink scrolls the output up under a viewport-relative
@@ -1138,6 +1140,22 @@ mod tests {
         assert_eq!(drawn_on(&h, 0), ["1"], "nothing scrolled away");
         assert_eq!(drawn_on(&h, 8), ["9"]);
         assert_eq!(drawn_on(&h, 9), [banner()]);
+    }
+
+    #[test]
+    fn scrolled_back_history_does_not_take_the_banner_row() {
+        let (mut v, mut h) = exited_after(RECT, "seq 1 30; printf 'end\\n\\n\\n'", "end", 10);
+        let live = selection_text(&v.grid, row_sel(0));
+        v.term.scroll(Scroll::Delta(-15));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while v.term.viewport_active() || selection_text(&v.grid, row_sel(0)) == live {
+            assert!(Instant::now() < deadline, "the viewport never scrolled back");
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h.paint(&mut v, RECT);
+        assert!(!v.banner_reserved, "the live screen has a blank row for the banner");
+        assert_eq!(v.geom.map(|g| g.1), Some(10));
     }
 
     #[test]
