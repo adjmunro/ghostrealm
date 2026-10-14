@@ -210,6 +210,22 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_whose_release_was_lost_lets_go_at_the_next_press() {
+        let (mut t, vt, left) = side_by_side();
+        let mut d = Dividers::default();
+        let at = (403.0, 300.0);
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert_eq!(d.press(&mut t, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
+        assert!(d.drag(&mut t, &FRAME, (303.0, 300.0)));
+        // No release; the next press, in a pane, lets go first (the window's
+        // `release_lost_press`).
+        assert!(d.release());
+        d.missed();
+        assert!(!d.drag(&mut t, &FRAME, (603.0, 300.0)), "moves no longer resize");
+        assert_eq!(width(&t, vt, left), 300.0);
+    }
+
+    #[test]
     fn a_double_click_on_a_divider_resets_its_split_to_halves() {
         let (mut t, vt, left) = side_by_side();
         t.set_ratio(vt, &[], 0.25);

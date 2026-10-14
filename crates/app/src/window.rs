@@ -411,6 +411,7 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                state.release_lost_press();
                 // A close button arms on press and fires on release (so it can be
                 // cancelled); a press on the empty title-bar strip drags the window;
                 // other clicks act on press as before.
@@ -1477,7 +1478,6 @@ impl State {
             self.dividers.missed();
             return false;
         };
-        self.release_lost_press();
         // Not part of a pane's multi-click; dividers count their own.
         self.clicks.reset();
         let click = self.click();
@@ -1680,18 +1680,21 @@ impl State {
         self.clicks.count(&c)
     }
 
-    /// A release can be lost (the window lost focus mid-drag, say). The view
-    /// still holding that press hears its `Up` before a new one starts, so it
-    /// does not keep reporting a held button.
+    /// A release can be lost (the window lost focus mid-drag, say). Before a
+    /// new press starts, the view still holding the old one hears its `Up` and
+    /// a divider still grabbed is let go, so neither keeps acting on a button
+    /// no longer held.
     fn release_lost_press(&mut self) {
         if let Some(sid) = self.mouse_capture.take() {
             let (pos, dragged) = (self.cursor, self.dragging);
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
         }
+        if self.dividers.release() {
+            self.dirty = true;
+        }
     }
 
     fn on_click(&mut self) {
-        self.release_lost_press();
         // A confirmation takes only its buttons (they arm on press).
         if self.app.confirm().is_some() {
             return;
