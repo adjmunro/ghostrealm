@@ -19,4 +19,4 @@ pub use config::{Chrome, CloseOnExit, Config, Inbox, LineNumbers, Side, Web};
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
-pub use tree::{Axis, Node, Pane, PaneId, Rect, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};
+pub use tree::{Axis, Divider, Node, Pane, PaneId, Rect, SplitPath, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};
