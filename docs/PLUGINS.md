@@ -98,12 +98,16 @@ into the overlay layer; it doesn't need to know.
   (Cmd+, and `[keybindings]`) and any open overlay. Unbound Cmd chords arrive with
   `mods.super_` set; return `false` to ignore. Nothing falls through to another
   view.
-- `mouse(&MouseEvent)`: `Down { clicks }` (the app focuses the pane first and
-  counts double-clicks), then `Drag`/`Up { dragged }` for that press wherever the
-  cursor goes; `Move` is hover, and `Leave` follows the last `Move` when the
-  pointer moves on to another view or the app's chrome, a modal (palette, menu,
-  confirmation, picker) takes the pointer, or the pointer leaves the window
-  (on release, if a press was held).
+- `mouse(&MouseEvent)`: `Down { clicks, button }` (the app focuses the pane
+  first and counts double-clicks per button), then `Drag`/`Up { dragged }` for
+  that press wherever the cursor goes; `Move` is hover, and `Leave` follows the
+  last `Move` when the pointer moves on to another view or the app's chrome, a
+  modal (palette, menu, confirmation, picker) takes the pointer, or the pointer
+  leaves the window (on release, if a press was held). Right and middle presses
+  arrive too (a right press before `context_menu`), outside the tab strip; a
+  view that handles only the left button returns early on
+  `event.is_other_button()`. A new press of any button first ends a press
+  still held.
 - `scroll(pos, dx, dy)`: physical pixels; positive `dy` reveals content above.
   `cx.mods` carries the modifiers held during `mouse` and `scroll` too (the
   terminal forwards the pointer to a program that enabled mouse tracking unless

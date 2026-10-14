@@ -3,9 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-/// One left press, as a multi-click counter sees it.
+use crate::plugin::MouseButton;
+
+/// One press, as a multi-click counter sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct Click {
+    pub button: MouseButton,
     pub at: Instant,
     pub pos: (f32, f32),
     /// The longest gap after the last press that still continues it.
@@ -14,27 +17,32 @@ pub struct Click {
     pub slop: f32,
 }
 
-/// Counts presses that follow each other quickly at about the same spot.
+/// Counts presses of one button that follow each other quickly at about the
+/// same spot.
 #[derive(Debug, Default)]
 pub struct ClickCounter {
-    /// The last press (time, position, click count).
-    last: Option<(Instant, (f32, f32), u32)>,
+    /// The last press (button, time, position, click count).
+    last: Option<(MouseButton, Instant, (f32, f32), u32)>,
 }
 
 impl ClickCounter {
-    /// Count `c` as the next of a multi-click when it follows the last press
-    /// within its window and slop; else it starts a new one (1).
+    /// Count `c` as the next of a multi-click when it follows the last press,
+    /// of the same button, within its window and slop; else it starts a new
+    /// one (1).
     pub fn count(&mut self, c: &Click) -> u32 {
         let (x, y) = c.pos;
         let clicks = match self.last {
-            Some((t, (px, py), n))
-                if c.at.duration_since(t) < c.window && (x - px).abs() <= c.slop && (y - py).abs() <= c.slop =>
+            Some((b, t, (px, py), n))
+                if b == c.button
+                    && c.at.duration_since(t) < c.window
+                    && (x - px).abs() <= c.slop
+                    && (y - py).abs() <= c.slop =>
             {
                 n + 1
             }
             _ => 1,
         };
-        self.last = Some((c.at, c.pos, clicks));
+        self.last = Some((c.button, c.at, c.pos, clicks));
         clicks
     }
 
@@ -47,12 +55,19 @@ impl ClickCounter {
 #[cfg(test)]
 mod tests {
     use super::{Click, ClickCounter};
+    use crate::plugin::MouseButton;
     use std::time::{Duration, Instant};
 
     #[test]
     fn quick_presses_at_one_spot_count_up_and_a_late_or_distant_one_starts_over() {
         let t0 = Instant::now();
-        let at = |ms, pos| Click { at: t0 + Duration::from_millis(ms), pos, window: Duration::from_millis(400), slop: 4.0 };
+        let at = |ms, pos| Click {
+            button: MouseButton::Left,
+            at: t0 + Duration::from_millis(ms),
+            pos,
+            window: Duration::from_millis(400),
+            slop: 4.0,
+        };
         let mut c = ClickCounter::default();
         assert_eq!(c.count(&at(0, (10.0, 10.0))), 1);
         assert_eq!(c.count(&at(100, (13.0, 6.0))), 2, "within the slop");
@@ -62,5 +77,23 @@ mod tests {
         assert_eq!(c.count(&at(800, (20.0, 6.0))), 2);
         c.reset();
         assert_eq!(c.count(&at(850, (20.0, 6.0))), 1, "after a press elsewhere");
+    }
+
+    #[test]
+    fn a_press_of_another_button_starts_over() {
+        let t0 = Instant::now();
+        let at = |ms, button| Click {
+            button,
+            at: t0 + Duration::from_millis(ms),
+            pos: (10.0, 10.0),
+            window: Duration::from_millis(400),
+            slop: 4.0,
+        };
+        let mut c = ClickCounter::default();
+        assert_eq!(c.count(&at(0, MouseButton::Left)), 1);
+        assert_eq!(c.count(&at(50, MouseButton::Right)), 1, "a right press after a left one");
+        assert_eq!(c.count(&at(100, MouseButton::Right)), 2);
+        assert_eq!(c.count(&at(150, MouseButton::Middle)), 1);
+        assert_eq!(c.count(&at(200, MouseButton::Left)), 1);
     }
 }

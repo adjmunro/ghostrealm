@@ -208,7 +208,13 @@ mod tests {
 
     /// A press at `pos`, `ms` after the first, with a 400 ms double-click.
     fn click(t0: Instant, ms: u64, pos: (f32, f32)) -> Click {
-        Click { at: t0 + Duration::from_millis(ms), pos, window: Duration::from_millis(400), slop: 4.0 }
+        Click {
+            button: crate::plugin::MouseButton::Left,
+            at: t0 + Duration::from_millis(ms),
+            pos,
+            window: Duration::from_millis(400),
+            slop: 4.0,
+        }
     }
 
     #[test]

@@ -343,7 +343,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // The release of a press held across the focus loss may never
                 // arrive; left held, hover could never be withdrawn.
                 if state.mouse_down {
-                    state.end_press();
+                    state.end_press(state.press_button);
                     state.window.request_redraw();
                 }
                 // A button pressed before switching away is cancelled, not
@@ -423,7 +423,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // grabbed a split divider
                 } else {
                     state.on_click();
-                    state.begin_press();
+                    state.begin_press(MouseButton::Left);
                 }
                 state.window.request_redraw();
             }
@@ -436,7 +436,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !state.fire_menu() {
                     state.fire_button();
                 }
-                state.end_press();
+                state.end_press(MouseButton::Left);
                 state.window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -444,7 +444,26 @@ impl ApplicationHandler<UserEvent> for App {
                 button: WinitButton::Right,
                 ..
             } => {
+                state.release_lost_press();
                 state.on_right_click();
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: WinitButton::Middle,
+                ..
+            } => {
+                state.release_lost_press();
+                state.press_view(MouseButton::Middle);
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: button @ (WinitButton::Right | WinitButton::Middle),
+                ..
+            } => {
+                let button = if button == WinitButton::Right { MouseButton::Right } else { MouseButton::Middle };
+                state.end_press(button);
                 state.window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -596,14 +615,16 @@ struct State {
     window_focused: bool,
     /// When the focused window next checks the config file.
     config_check_due: Instant,
-    /// Left presses, for counting double-clicks.
+    /// Presses, for counting double-clicks.
     clicks: ClickCounter,
-    /// The view the current left press landed on; it gets the press's drag and
+    /// The view the current press landed on; it gets the press's drag and
     /// release wherever the cursor goes.
     mouse_capture: Option<SurfaceId>,
+    /// The button of the current press: only its release ends the press.
+    press_button: MouseButton,
     /// Whether the workspace sidebar is collapsed (session-only, like soft-wrap).
     sidebar_hidden: bool,
-    /// Left mouse button is held (a press in progress).
+    /// A mouse button is held (a press in progress).
     mouse_down: bool,
     /// Whether the current press has moved enough to count as a drag.
     dragging: bool,
@@ -943,6 +964,7 @@ impl State {
             config_check_due: Instant::now() + config_watch::POLL,
             clicks: ClickCounter::default(),
             mouse_capture: None,
+            press_button: MouseButton::Left,
             sidebar_hidden: false,
             mouse_down: false,
             dragging: false,
@@ -1484,7 +1506,7 @@ impl State {
         self.clicks.reset();
         let (click, frame) = (self.click(), self.divider_frame());
         if self.dividers.press(&mut self.app.tree, &frame, hit, &click) == Press::Grabbed {
-            self.begin_press();
+            self.begin_press(MouseButton::Left);
         }
         self.dirty = true;
         true
@@ -1669,16 +1691,22 @@ impl State {
         self.dirty = true;
     }
 
-    /// The left press at the cursor now, for counting multi-clicks
+    /// A left press at the cursor now, for counting multi-clicks
     /// (`[input] double_click_ms`).
     fn click(&self) -> Click {
-        Click { at: Instant::now(), pos: self.cursor, window: self.double_click_window(), slop: 4.0 * self.scale }
+        Click {
+            button: MouseButton::Left,
+            at: Instant::now(),
+            pos: self.cursor,
+            window: self.double_click_window(),
+            slop: 4.0 * self.scale,
+        }
     }
 
-    /// Count this left press as the next of a multi-click when it follows the
-    /// last one quickly at about the same spot.
-    fn count_click(&mut self) -> u32 {
-        let c = self.click();
+    /// Count this press of `button` as the next of a multi-click when it
+    /// follows the last one quickly at about the same spot.
+    fn count_click(&mut self, button: MouseButton) -> u32 {
+        let c = Click { button, ..self.click() };
         self.clicks.count(&c)
     }
 
@@ -1688,8 +1716,8 @@ impl State {
     /// no longer held.
     fn release_lost_press(&mut self) {
         if let Some(sid) = self.mouse_capture.take() {
-            let (pos, dragged) = (self.cursor, self.dragging);
-            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button: MouseButton::Left }));
+            let (pos, dragged, button) = (self.cursor, self.dragging, self.press_button);
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button }));
         }
         if self.dividers.release() {
             self.dirty = true;
@@ -1707,7 +1735,7 @@ impl State {
             let pos = self.cursor;
             match self.picker_panel {
                 Some(panel) if rect_contains(panel, pos.0, pos.1) => {
-                    let clicks = self.count_click();
+                    let clicks = self.count_click(MouseButton::Left);
                     self.view_event(PICKER_SID, |v, cx| {
                         v.mouse(cx, &MouseEvent::Down { pos, clicks, button: MouseButton::Left })
                     });
@@ -1737,43 +1765,12 @@ impl State {
             }
             return;
         }
-        let workspace = self.workspace_rect();
-        let Some(vt) = self.app.tree.active_vtab() else {
+        let Some(PaneHit { vt, pid, rect, n, active_sid }) = self.pane_under_cursor() else {
             return;
         };
-        // (pane id, rect, surface count) of the pane under the cursor.
-        let hit = self.app.tree.vtab(vt).and_then(|vtab| {
-            vtab.layout(workspace, DIVIDER)
-                .into_iter()
-                .find_map(|(pid, r)| {
-                    if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
-                        let n = vtab
-                            .panes()
-                            .into_iter()
-                            .find(|p| p.id == pid)
-                            .map(|p| p.surfaces.len());
-                        n.map(|n| (pid, r, n))
-                    } else {
-                        None
-                    }
-                })
-        });
-        let Some((pid, rect, n)) = hit else { return };
-
-        let active_sid = self
-            .app
-            .tree
-            .vtab(vt)
-            .and_then(|v| v.panes().into_iter().find(|p| p.id == pid))
-            .and_then(|p| p.active_surface().map(|s| s.id));
 
         // A click in a visible tab strip switches the pane's active surface.
-        let strip_h = if self.strip_shown(n) {
-            self.strip_height()
-        } else {
-            0.0
-        };
-        if strip_h > 0.0 && y < rect.y + strip_h {
+        if self.in_strip(rect, n, y) {
             let tab_w = rect.w / n.max(1) as f32;
             let idx = (((x - rect.x) / tab_w).floor() as usize).min(n - 1);
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
@@ -1785,7 +1782,7 @@ impl State {
             if let Some(vtab) = self.app.tree.vtab_mut(vt) {
                 vtab.focused_pane = pid;
             }
-            let clicks = self.count_click();
+            let clicks = self.count_click(MouseButton::Left);
             let pos = (x, y);
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Down { pos, clicks, button: MouseButton::Left }));
             self.mouse_capture = Some(sid);
@@ -1798,6 +1795,60 @@ impl State {
         self.dirty = true;
     }
 
+    /// The pane under the cursor in the active workspace (not over the
+    /// sidebar).
+    fn pane_under_cursor(&self) -> Option<PaneHit> {
+        let (x, y) = self.cursor;
+        if self.in_sidebar(x) {
+            return None;
+        }
+        let vt = self.app.tree.active_vtab()?;
+        let vtab = self.app.tree.vtab(vt)?;
+        let (pid, rect) = vtab
+            .layout(self.workspace_rect(), DIVIDER)
+            .into_iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)?;
+        let pane = vtab.panes().into_iter().find(|p| p.id == pid)?;
+        Some(PaneHit {
+            vt,
+            pid,
+            rect,
+            n: pane.surfaces.len(),
+            active_sid: pane.active_surface().map(|s| s.id),
+        })
+    }
+
+    /// Whether `y` is in the tab strip of a pane at `rect` holding `n`
+    /// surfaces (false when the pane shows no strip).
+    fn in_strip(&self, rect: Rect, n: usize, y: f32) -> bool {
+        self.strip_shown(n) && y < rect.y + self.strip_height()
+    }
+
+    /// A right or middle press: the view whose content is under the cursor
+    /// takes it, its pane focused first, as with a left press. Returns
+    /// whether a view took it.
+    fn press_view(&mut self, button: MouseButton) -> bool {
+        if self.app.confirm().is_some() || self.app.picker_open() || self.palette.is_some() || self.menu.is_some() {
+            return false;
+        }
+        let pos = self.cursor;
+        let Some(PaneHit { vt, pid, rect, n, active_sid }) = self.pane_under_cursor() else {
+            return false;
+        };
+        let Some(sid) = active_sid.filter(|s| !self.in_strip(rect, n, pos.1) && self.app.view(*s).is_some()) else {
+            return false;
+        };
+        if let Some(vtab) = self.app.tree.vtab_mut(vt) {
+            vtab.focused_pane = pid;
+        }
+        let clicks = self.count_click(button);
+        self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Down { pos, clicks, button }));
+        self.mouse_capture = Some(sid);
+        self.begin_press(button);
+        self.dirty = true;
+        true
+    }
+
     /// Right-click opens a context menu over the sidebar vtab under the cursor.
     fn on_right_click(&mut self) {
         // Modal overlays keep the pointer; a context menu would open beneath them.
@@ -1808,6 +1859,9 @@ impl State {
         let (x, y) = self.cursor;
         self.menu = None;
         if !self.in_sidebar(x) {
+            // The view hears the press itself (a web page's own menu), then
+            // is asked for its context menu.
+            self.press_view(MouseButton::Right);
             if let Some(sid) = self.surface_under_cursor().filter(|s| self.app.view(*s).is_some()) {
                 self.view_event(sid, |v, cx| v.context_menu(cx, (x, y)));
             }
@@ -2018,7 +2072,7 @@ impl State {
         if !on_line {
             return false;
         }
-        let clicks = self.count_click();
+        let clicks = self.count_click(MouseButton::Left);
         if let (Some((caret, over)), Some(p)) = (self.palette_cols(x), self.palette.as_mut()) {
             p.input.press(caret, over, clicks, self.mods.shift);
             self.palette_selecting = true;
@@ -2147,14 +2201,15 @@ impl State {
         !due.is_empty()
     }
 
-    /// Start tracking a left press (for the drag threshold and release). No-op
-    /// while an overlay owns input.
-    fn begin_press(&mut self) {
+    /// Start tracking a press of `button` (for the drag threshold and
+    /// release). No-op while an overlay owns input.
+    fn begin_press(&mut self, button: MouseButton) {
         if self.palette.is_some() || self.menu.is_some() {
             return;
         }
         self.dragging = false;
         self.mouse_down = true;
+        self.press_button = button;
         self.press_px = self.cursor;
     }
 
@@ -2173,14 +2228,19 @@ impl State {
             }
             self.dragging = true;
         }
+        let button = self.press_button;
         match self.mouse_capture {
-            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos, button: MouseButton::Left })),
+            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos, button })),
             None => false,
         }
     }
 
-    /// Finish a press: the view that took it gets the release.
-    fn end_press(&mut self) {
+    /// `button` was released: finish the press, if it was that button's (the
+    /// view that took it gets the release).
+    fn end_press(&mut self, button: MouseButton) {
+        if self.mouse_down && button != self.press_button {
+            return;
+        }
         self.mouse_down = false;
         if self.dividers.release() {
             self.dirty = true;
@@ -2188,7 +2248,7 @@ impl State {
         let dragged = std::mem::take(&mut self.dragging);
         if let Some(sid) = self.mouse_capture.take() {
             let pos = self.cursor;
-            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button: MouseButton::Left }));
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button }));
         }
         let left = self.hover.released();
         self.send_leave(left);
@@ -4806,6 +4866,16 @@ fn build_quad_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wg
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// The pane under the cursor, as [`State::pane_under_cursor`] finds it.
+struct PaneHit {
+    vt: VtabId,
+    pid: PaneId,
+    rect: Rect,
+    /// How many surfaces the pane holds.
+    n: usize,
+    active_sid: Option<SurfaceId>,
 }
 
 /// Which view has the pointer's hover, so the view sent the last `Move` gets
