@@ -1937,6 +1937,26 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_background_surface_still_marks_it_unread() {
+        let mut s = AppState::new().with_shell_line("sleep 0.15; printf DONE; sleep 3");
+        let a = s.new_vtab().unwrap();
+        let b = s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        s.focus_vtab(a);
+        s.pump_all();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !s.surface_text(sid).unwrap_or_default().contains("DONE") {
+            assert!(Instant::now() < deadline, "no output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s.pump_all();
+        assert!(
+            matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
+            "an agent read must not hide the output from the inbox"
+        );
+    }
+
+    #[test]
     fn mark_unread_command_sets_unread() {
         let mut s = AppState::new().with_shell_line("sleep 2");
         let vt = s.new_vtab().unwrap();

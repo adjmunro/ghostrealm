@@ -636,10 +636,11 @@ impl View for TerminalView {
     }
 
     fn text(&mut self) -> Option<String> {
-        self.term.pump();
+        // A peek: new output and the exit stay news for `pump`, which drives
+        // the redraw and the inbox's unread mark.
         let grid = self.term.snapshot();
-        self.observe_exit();
-        let banner = self.exit.map(exit_banner);
+        let exit = self.exit.or(Some(self.term.lifecycle()).filter(|l| l.has_exited()));
+        let banner = exit.map(exit_banner);
         let banner_row = banner_row(&grid);
         let mut out = String::new();
         for row in 0..grid.size.rows {
@@ -1046,6 +1047,7 @@ mod tests {
         // The exit can be seen before the last output is read: wait for both.
         while !v.text().unwrap_or_default().contains(want) || v.exit().is_none() {
             assert!(Instant::now() < deadline, "`{script}` never exited with {want:?}");
+            v.pump(usize::MAX);
             std::thread::sleep(Duration::from_millis(20));
         }
         loop {
@@ -1086,6 +1088,21 @@ mod tests {
     }
 
     #[test]
+    fn reading_the_text_leaves_the_output_and_the_exit_for_pump() {
+        let mut v = running("stty -echo; printf ready; read x", "ready");
+        assert!(v.pump(usize::MAX).changed, "the output `text` showed is still new to `pump`");
+        v.write_input(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !v.text().unwrap_or_default().contains(&banner()) {
+            assert!(Instant::now() < deadline, "the exit never showed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(v.exit(), None, "`text` left the exit unobserved");
+        assert!(v.pump(usize::MAX).changed, "the exit is new to `pump`");
+        assert!(v.exit().is_some());
+    }
+
+    #[test]
     fn a_full_grid_keeps_its_last_row_above_the_banner() {
         let (mut v, h) = exited_after(RECT, "seq 1 12; printf last-row", "last-row", 9);
         assert_eq!(v.geom.map(|g| g.1), Some(9), "the pane's last row is left for the banner");
@@ -1115,7 +1132,7 @@ mod tests {
         v.write_input(b"\n");
         while v.grid.size.rows != 9 {
             assert!(Instant::now() < deadline, "the grid never gave up a row");
-            v.text();
+            v.pump(usize::MAX);
             h.paint(&mut v, RECT);
             std::thread::sleep(Duration::from_millis(20));
         }
