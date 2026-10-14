@@ -4,16 +4,33 @@
 //! [`subject`](crate::plugin::View::subject).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry};
 
 use super::{AppState, Confirm, Confirmed, SurfaceId};
+use crate::file_jobs::{self, Done, FileJob, Output};
 use crate::file_menu::{self, FileAction, FileTarget, MenuEntry, MenuEnv};
 use crate::file_ops;
 use crate::plugins::editor;
 use crate::plugins::file_browser::{self, FileBrowserView};
 use crate::plugins::terminal;
+
+/// How long a file command waits for its job on the worker before returning.
+/// A job done by then is applied before the command returns, as if it ran on
+/// the UI thread, so a quick paste or Delete shows no frame in between; a
+/// slower one is applied when it finishes.
+pub(super) const INLINE_WAIT: Duration = Duration::from_millis(30);
+
+/// How a file job that finished after its command returned turned out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReport {
+    /// The command it did the work of (`file.paste`).
+    pub command: &'static str,
+    /// What the command would have said, or why it failed.
+    pub result: Result<String, String>,
+}
 
 /// What Cut or Copy picked, for Paste.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,30 +157,118 @@ impl AppState {
         self.file_clip = Some(FileClip { path: path.to_path_buf(), cut });
     }
 
-    /// Paste what Cut or Copy picked into `dir`.
-    pub fn paste_into(&mut self, dir: &Path) -> Result<file_ops::Moved> {
+    /// Paste what Cut or Copy picked into `dir`, on the file worker. A cut
+    /// is spent at once, so a second Paste finds nothing to paste; it comes
+    /// back if the move fails. Returns what the paste says.
+    pub fn paste_into(&mut self, dir: &Path) -> Result<String> {
         let clip = self.file_clip.clone().context("nothing to paste: Cut or Copy a file first")?;
         if !clip.path.exists() {
             bail!("{} is gone", clip.path.display());
         }
         if clip.cut {
-            let moved = file_ops::move_into(&clip.path, dir)?;
             self.file_clip = None;
-            let renames = if moved.dest == clip.path { Vec::new() } else { vec![(clip.path, moved.dest.clone())] };
-            self.changed(&renames);
-            Ok(moved)
-        } else {
-            let dest = file_ops::copy_into(&clip.path, dir)?;
-            self.changed(&[]);
-            Ok(file_ops::Moved { dest, source_left: false })
+        }
+        self.run_file_job(FileJob::Paste { src: clip.path, dir: dir.to_path_buf(), cut: clip.cut })
+    }
+
+    /// Copy `path` next to itself, on the file worker. Returns what the
+    /// duplicate says.
+    pub fn duplicate_path(&mut self, path: &Path) -> Result<String> {
+        self.run_file_job(FileJob::Duplicate { src: path.to_path_buf() })
+    }
+
+    /// Wait for file jobs this long before a command returns (tests use zero
+    /// to see every job finish in the background).
+    #[cfg(test)]
+    pub(crate) fn with_file_job_wait(mut self, wait: Duration) -> Self {
+        self.file_job_wait = wait;
+        self
+    }
+
+    /// Give `job` to the file worker and wait up to [`INLINE_WAIT`] for it,
+    /// applying it (and any job before it) if it finishes. Returns what the
+    /// command says: the job's outcome, or that it is running.
+    fn run_file_job(&mut self, job: FileJob) -> Result<String> {
+        let started = job.started();
+        let id = self.file_jobs.submit(job);
+        let deadline = Instant::now() + self.file_job_wait;
+        while let Some(done) = self.file_jobs.take_until(deadline) {
+            if done.id == id {
+                return self.apply_file_job(done);
+            }
+            self.report_file_job(done);
+        }
+        Ok(started)
+    }
+
+    /// Apply the file jobs that finished. Returns whether any did.
+    pub fn poll_file_jobs(&mut self) -> bool {
+        let mut any = false;
+        while let Some(done) = self.file_jobs.try_take() {
+            self.report_file_job(done);
+            any = true;
+        }
+        any
+    }
+
+    /// Block until every file job has finished, and apply them. For callers
+    /// with no event loop to wake (the agent channel, tests).
+    pub fn wait_file_jobs(&mut self) {
+        for done in self.file_jobs.wait_all() {
+            self.report_file_job(done);
         }
     }
 
-    /// Copy `path` next to itself. Returns the copy.
-    pub fn duplicate_path(&mut self, path: &Path) -> Result<PathBuf> {
-        let dest = file_ops::duplicate(path)?;
-        self.changed(&[]);
-        Ok(dest)
+    /// Whether every file job has finished.
+    pub fn file_jobs_idle(&self) -> bool {
+        self.file_jobs.idle()
+    }
+
+    /// A handle on the unfinished file jobs, for a quit to wait on.
+    pub fn file_jobs_pending(&self) -> file_jobs::Pending {
+        self.file_jobs.pending()
+    }
+
+    /// The outcomes of file jobs that finished after their command returned.
+    pub fn take_file_reports(&mut self) -> Vec<FileReport> {
+        std::mem::take(&mut self.file_reports)
+    }
+
+    fn report_file_job(&mut self, done: Done) {
+        let command = done.job.command();
+        let result = self.apply_file_job(done).map_err(|e| format!("{e:#}"));
+        self.file_reports.push(FileReport { command, result });
+    }
+
+    /// Bring the views up to date with a finished job. Returns what its
+    /// command says.
+    fn apply_file_job(&mut self, done: Done) -> Result<String> {
+        match (done.job, done.result) {
+            (FileJob::Paste { src, cut: true, .. }, Ok(Output::Moved(moved))) => {
+                let renames = if moved.dest == src { Vec::new() } else { vec![(src, moved.dest.clone())] };
+                self.changed(&renames);
+                Ok(pasted_message(&moved))
+            }
+            (FileJob::Paste { src, cut: true, .. }, Err(e)) => {
+                // The cut wasn't spent; unless something else was cut or
+                // copied since, it can be pasted again.
+                self.file_clip.get_or_insert(FileClip { path: src, cut: true });
+                Err(e)
+            }
+            (FileJob::Paste { .. }, Ok(Output::Copied(dest))) => {
+                self.changed(&[]);
+                Ok(pasted_message(&file_ops::Moved { dest, source_left: false }))
+            }
+            (FileJob::Duplicate { .. }, Ok(Output::Copied(dest))) => {
+                self.changed(&[]);
+                Ok(format!("duplicated to {}", dest.display()))
+            }
+            (FileJob::DeleteCheck { path }, Ok(Output::Clean(clean))) => {
+                self.delete_checked(&path, clean).map(|()| String::new())
+            }
+            (_, Err(e)) => Err(e),
+            (job, Ok(output)) => bail!("{} produced {output:?}", job.command()),
+        }
     }
 
     /// Rename `path` to `name`; views of it follow. Returns the new path.
@@ -282,25 +387,35 @@ impl AppState {
     /// Delete `path`: move it to the Trash and close the views of it. Asks
     /// first unless git holds a copy of everything there (tracked and
     /// unmodified); a view with unsaved changes asks the way closing does.
-    pub fn delete_path(&mut self, path: &Path) -> Result<()> {
+    /// The git check runs on the file worker. Returns what the command says.
+    pub fn delete_path(&mut self, path: &Path) -> Result<String> {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
         }
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let unsaved: Vec<SurfaceId> = if self.guard_unsaved {
-            self.surfaces_under(path).into_iter().filter(|s| self.views.get(s).is_some_and(|v| v.modified())).collect()
-        } else {
-            Vec::new()
-        };
+        let unsaved = self.unsaved_under(path);
         if !unsaved.is_empty() {
-            let (message, save, can_save) = self.unsaved_question(&unsaved);
-            self.confirm = Some(Confirm {
-                message: format!("{message} Move \u{201c}{name}\u{201d} to the Trash?"),
-                accept: can_save.then_some("Save and Delete"),
-                discard: Some("Delete Without Saving"),
-                then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save },
-            });
-        } else if !git::is_tracked_clean(path) {
+            self.ask_unsaved_trash(path, &unsaved);
+            return Ok(String::new());
+        }
+        self.run_file_job(FileJob::DeleteCheck { path: path.to_path_buf() })
+    }
+
+    /// Finish a Delete once git said whether it holds a copy of `path`
+    /// (`clean`). What changed during the check counts: the entry must still
+    /// be there, a view of it edited meanwhile asks about its unsaved
+    /// changes, and a question opened meanwhile (a quit) isn't replaced.
+    fn delete_checked(&mut self, path: &Path, clean: bool) -> Result<()> {
+        if path.symlink_metadata().is_err() {
+            bail!("{} doesn't exist", path.display());
+        }
+        if self.confirm.is_some() {
+            bail!("didn't delete {}: another question is open", path.display());
+        }
+        let unsaved = self.unsaved_under(path);
+        if !unsaved.is_empty() {
+            self.ask_unsaved_trash(path, &unsaved);
+        } else if !clean {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
             self.confirm = Some(Confirm {
                 message: format!("Move \u{201c}{name}\u{201d} to the Trash?"),
                 accept: Some("Delete"),
@@ -311,6 +426,27 @@ impl AppState {
             self.trash_now(path)?;
         }
         Ok(())
+    }
+
+    /// The surfaces showing `path` or something in it with unsaved changes
+    /// (none when closing doesn't ask about them).
+    fn unsaved_under(&self, path: &Path) -> Vec<SurfaceId> {
+        if !self.guard_unsaved {
+            return Vec::new();
+        }
+        self.surfaces_under(path).into_iter().filter(|s| self.views.get(s).is_some_and(|v| v.modified())).collect()
+    }
+
+    /// Ask whether to save `unsaved` (views of `path`) before trashing it.
+    fn ask_unsaved_trash(&mut self, path: &Path, unsaved: &[SurfaceId]) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let (message, save, can_save) = self.unsaved_question(unsaved);
+        self.confirm = Some(Confirm {
+            message: format!("{message} Move \u{201c}{name}\u{201d} to the Trash?"),
+            accept: can_save.then_some("Save and Delete"),
+            discard: Some("Delete Without Saving"),
+            then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save },
+        });
     }
 
     /// Move `path` to the Trash and close the views of it.
@@ -381,9 +517,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         s.clip_file(p, false);
         Ok(String::new())
     });
-    path_command(FileAction::Duplicate, "Copy a file or folder next to itself", |s, p| {
-        s.duplicate_path(p).map(|d| format!("duplicated to {}", d.display()))
-    });
+    path_command(FileAction::Duplicate, "Copy a file or folder next to itself", |s, p| s.duplicate_path(p));
     path_command(FileAction::CopyPath, "Copy a file's absolute path to the clipboard", |s, p| {
         Ok(s.copy_path_text(p, false))
     });
@@ -402,7 +536,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
     path_command(
         FileAction::Delete,
         "Move a file or folder to the Trash, asking first unless git holds a copy; closes its editors",
-        |s, p| s.delete_path(p).map(|()| String::new()),
+        |s, p| s.delete_path(p),
     );
 
     for (action, folder, description) in [
@@ -429,8 +563,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         .arg(dir_arg()),
         Box::new(|s: &mut AppState, a| {
             let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
-            let pasted = s.paste_into(&dir).map_err(failed)?;
-            Ok(CmdOutcome::msg(pasted_message(&pasted)))
+            Ok(CmdOutcome::msg(s.paste_into(&dir).map_err(failed)?))
         }),
     );
     r.register(
@@ -476,7 +609,19 @@ mod tests {
         app_with(false)
     }
 
+    /// Run command `id` and wait for its file job, as the agent channel does:
+    /// a job's failure is the command's.
     fn run(s: &mut AppState, id: &str, args: &[(&str, &Path)]) -> Result<CmdOutcome, CmdError> {
+        let out = start(s, id, args)?;
+        s.wait_file_jobs();
+        match s.take_file_reports().into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>() {
+            Ok(messages) => Ok(messages.into_iter().next_back().map_or(out, CmdOutcome::msg)),
+            Err(e) => Err(CmdError::Failed(e)),
+        }
+    }
+
+    /// Run command `id`, leaving its file job running.
+    fn start(s: &mut AppState, id: &str, args: &[(&str, &Path)]) -> Result<CmdOutcome, CmdError> {
         let mut a = Args::new();
         for (k, v) in args {
             a.insert(k, Value::Str(v.to_string_lossy().into_owned()));
@@ -941,6 +1086,147 @@ mod tests {
         assert_eq!(editor_path(&s, sid), Some(d.join("y.txt")), "the editor follows");
         run(&mut s, "file.new_file", &[("dir", Path::new("sub")), ("name", Path::new("n.txt"))]).unwrap();
         assert!(d.join("sub/n.txt").exists());
+    }
+
+    /// An app whose file commands never wait for their job: each finishes
+    /// in the background and is applied by a pump.
+    fn app_in_background() -> (AppState, Calls) {
+        let calls = Calls::default();
+        let system = FakeSystem { calls: calls.clone(), fail_trash: false };
+        let mut s = AppState::new()
+            .with_shell_line("sleep 1")
+            .with_system(Box::new(system))
+            .with_file_job_wait(Duration::ZERO);
+        s.new_empty_vtab();
+        (s, calls)
+    }
+
+    /// Pump `s` as the event loop does until a file job's outcome arrives.
+    fn pump_until_reported(s: &mut AppState) -> Vec<FileReport> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            s.pump_all();
+            let reports = s.take_file_reports();
+            if !reports.is_empty() {
+                return reports;
+            }
+            assert!(Instant::now() < deadline, "no file job finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn browser_text(s: &mut AppState, sid: SurfaceId) -> String {
+        s.view_mut(sid).unwrap().text().unwrap()
+    }
+
+    #[test]
+    fn a_big_paste_finishes_in_the_background_and_the_browser_then_shows_it() {
+        let (mut s, _) = app_in_background();
+        let d = tmpdir("fm-bg-paste");
+        crate::file_jobs::tests::big_tree(&d.join("src"), 200);
+        std::fs::create_dir(d.join("to")).unwrap();
+        s.set_active_root_dir(d.join("to"));
+        s.open_plugin_in_focused(file_browser::ID).unwrap();
+        let browser = s.focused_surface().unwrap();
+        assert!(!browser_text(&mut s, browser).contains("src"));
+        run(&mut s, "file.copy", &[("path", &d.join("src"))]).unwrap();
+        let out = start(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert_eq!(out.message, Some(format!("pasting into {}", d.join("to").display())));
+        assert!(!browser_text(&mut s, browser).contains("src"), "nothing is applied before a pump");
+        let reports = pump_until_reported(&mut s);
+        assert_eq!(
+            reports,
+            [FileReport { command: "file.paste", result: Ok(format!("pasted {}", d.join("to/src").display())) }]
+        );
+        assert!(browser_text(&mut s, browser).contains("src"), "the listing re-read once it finished");
+        let copied = walkdir_count(&d.join("to/src"));
+        assert_eq!(copied, 200);
+    }
+
+    fn walkdir_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| if p.is_dir() { walkdir_count(&p) } else { 1 })
+            .sum()
+    }
+
+    #[test]
+    fn the_delete_check_runs_in_the_background_and_decides_as_before() {
+        let Some(r) = repo("fm-bg-delete") else { return };
+        let (mut s, calls) = app_in_background();
+        // Tracked and unmodified: trashed without asking, once the check is in.
+        start(&mut s, "file.delete", &[("path", &r.join("tracked.txt"))]).unwrap();
+        assert!(s.confirm().is_none() && calls.borrow().is_empty(), "nothing before the check is in");
+        assert_eq!(pump_until_reported(&mut s)[0].result, Ok(String::new()));
+        assert!(s.confirm().is_none());
+        assert_eq!(*calls.borrow(), [format!("trash {}", r.join("tracked.txt").display())]);
+        // Untracked: asks, with the same question.
+        std::fs::write(r.join("new.txt"), "n").unwrap();
+        start(&mut s, "file.delete", &[("path", &r.join("new.txt"))]).unwrap();
+        assert!(s.confirm().is_none());
+        pump_until_reported(&mut s);
+        let c = s.confirm().expect("untracked: ask first");
+        assert_eq!((c.accept, c.discard), (Some("Delete"), None));
+        assert!(c.message.contains("new.txt"));
+        assert_eq!(calls.borrow().len(), 1, "nothing more trashed");
+    }
+
+    #[test]
+    fn a_delete_check_that_finishes_under_another_question_deletes_nothing() {
+        let (mut s, calls) = app_in_background();
+        let d = tmpdir("fm-bg-delete-asked");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        std::fs::write(d.join("b.txt"), "B").unwrap();
+        start(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        start(&mut s, "file.delete", &[("path", &d.join("b.txt"))]).unwrap();
+        s.wait_file_jobs();
+        let reports = s.take_file_reports();
+        assert_eq!(reports[0].result, Ok(String::new()));
+        let err = reports[1].result.as_ref().unwrap_err();
+        assert!(err.contains("another question is open"), "{err}");
+        assert!(s.confirm().unwrap().message.contains("a.txt"), "the first question stays");
+        assert!(d.join("b.txt").exists() && calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_cut_is_spent_at_once_and_comes_back_if_the_move_fails() {
+        let (mut s, _) = app_in_background();
+        let d = tmpdir("fm-bg-cut");
+        std::fs::create_dir_all(d.join("dir/sub")).unwrap();
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        run(&mut s, "file.cut", &[("path", &d.join("a.txt"))]).unwrap();
+        start(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        assert!(s.file_clip().is_none());
+        let err = start(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap_err();
+        assert!(err.to_string().contains("nothing to paste"), "{err}");
+        s.wait_file_jobs();
+        assert!(d.join("to/a.txt").is_file() && !d.join("a.txt").exists());
+        // Into itself: refused on the worker, and the cut is back.
+        run(&mut s, "file.cut", &[("path", &d.join("dir"))]).unwrap();
+        assert!(run(&mut s, "file.paste", &[("dir", &d.join("dir/sub"))]).is_err());
+        assert_eq!(s.file_clip(), Some(&FileClip { path: d.join("dir"), cut: true }));
+    }
+
+    #[test]
+    fn closing_the_editor_of_a_file_being_moved_is_harmless() {
+        let (mut s, _) = app_in_background();
+        let d = tmpdir("fm-bg-close");
+        std::fs::create_dir(d.join("to")).unwrap();
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        std::fs::write(d.join("b.txt"), "B").unwrap();
+        let a = open_editor(&mut s, &d.join("a.txt"));
+        let b = open_editor(&mut s, &d.join("b.txt"));
+        run(&mut s, "file.cut", &[("path", &d.join("a.txt"))]).unwrap();
+        start(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        run(&mut s, "file.cut", &[("path", &d.join("b.txt"))]).unwrap();
+        start(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
+        s.close_surface_id(a);
+        s.wait_file_jobs();
+        assert!(d.join("to/a.txt").is_file() && d.join("to/b.txt").is_file());
+        assert!(s.view(a).is_none());
+        assert_eq!(editor_path(&s, b), Some(d.join("to/b.txt")), "the open one follows");
     }
 
     #[test]

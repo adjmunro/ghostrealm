@@ -20,6 +20,7 @@ use ghostrealm_core::{
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
+use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
 use crate::languages::same_file;
 use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
@@ -28,7 +29,7 @@ use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 
 mod files;
-pub use files::FileClip;
+pub use files::{FileClip, FileReport};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
@@ -179,6 +180,14 @@ pub struct AppState {
     file_clip: Option<FileClip>,
     /// Text a command wants on the system clipboard, until the window takes it.
     clipboard_out: Option<String>,
+    /// The worker running file commands' copies, moves, and git checks.
+    file_jobs: FileJobs,
+    /// How long a file command waits for its job before leaving it to the
+    /// worker ([`files::INLINE_WAIT`]).
+    file_job_wait: Duration,
+    /// Outcomes of file jobs that finished after their command returned,
+    /// until the window (or the agent channel) takes them.
+    file_reports: Vec<FileReport>,
 }
 
 impl AppState {
@@ -204,6 +213,9 @@ impl AppState {
             system: Box::new(HostSystem),
             file_clip: None,
             clipboard_out: None,
+            file_jobs: FileJobs::default(),
+            file_job_wait: files::INLINE_WAIT,
+            file_reports: Vec::new(),
         }
     }
 
@@ -258,6 +270,7 @@ impl AppState {
     /// Wake `f` whenever any surface produces output (the GUI passes a closure
     /// that pokes its event loop). Terminals spawned after this call use it.
     pub fn with_waker(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.file_jobs.set_waker(Some(f.clone()));
         self.waker = Some(f);
         self
     }
@@ -1235,7 +1248,7 @@ impl AppState {
     /// has queued output and should be pumped again promptly.
     pub fn pump_all_budgeted(&mut self, budget: usize) -> (bool, bool) {
         let active = self.tree.active_vtab();
-        let mut changed = false;
+        let mut changed = self.poll_file_jobs();
         let mut more = false;
         let mut titles: Vec<(SurfaceId, String)> = Vec::new();
         let mut changed_surfaces: Vec<SurfaceId> = Vec::new();

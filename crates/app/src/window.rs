@@ -268,6 +268,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = cb.set_text(text);
             }
         }
+        // File operations that failed after their command returned.
+        for report in state.app.take_file_reports() {
+            if let Err(e) = report.result {
+                eprintln!("ghostrealm: {}: {e}", report.command);
+            }
+        }
         match self.unsaved.settle(state.app.has_unsaved()) {
             // After this handler returns: terminating inside it would re-enter winit.
             Some(true) => reply_to_terminate_later(true),
@@ -3871,9 +3877,16 @@ impl State {
     fn render(&mut self) -> Result<()> {
         // Drain a bounded slice of child output; anything past the budget is left
         // for the next frame so a flood can't stretch one frame indefinitely.
+        let asking = self.app.confirm().is_some();
         let (changed, more) = self.app.pump_all_budgeted(PUMP_BUDGET);
         if changed {
             self.dirty = true;
+        }
+        // A file job that finished asked a question (Delete): the palette and
+        // menus would swallow its buttons.
+        if !asking && self.app.confirm().is_some() {
+            self.palette = None;
+            self.menu = None;
         }
         self.frame_pending = more;
         self.next_frame = Instant::now() + FRAME_INTERVAL;

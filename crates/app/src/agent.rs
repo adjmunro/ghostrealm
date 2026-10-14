@@ -3,7 +3,8 @@
 //!
 //! - `{"op":"help"}`                         → all command metas + arg schemas
 //! - `{"op":"search","query":"split"}`       → matching command ids + scores
-//! - `{"op":"set","id":"...","args":{...}}`  → run a command
+//! - `{"op":"set","id":"...","args":{...}}`  → run a command (a file command
+//!   replies once its copy, move, or git check is done)
 //! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces
 //! - `{"op":"get","what":"surface","id":N}`  → a surface's content as text (a web
 //!   page: its address, title, and text once loaded)
@@ -83,9 +84,18 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
                 Ok(a) => a,
                 Err(e) => return json!({ "ok": false, "error": e }),
             };
-            match registry.execute(id, &args, state) {
-                Ok(out) => json!({ "ok": true, "message": out.message }),
-                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            let ran = registry.execute(id, &args, state);
+            // A file command's work on the file worker finishes before the
+            // reply, which carries its outcome.
+            state.wait_file_jobs();
+            let finished = state.take_file_reports().into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>();
+            match (ran, finished) {
+                (Err(e), _) => json!({ "ok": false, "error": e.to_string() }),
+                (Ok(_), Err(e)) => json!({ "ok": false, "error": e }),
+                (Ok(out), Ok(messages)) => {
+                    let message = messages.into_iter().rfind(|m| !m.is_empty()).or(out.message);
+                    json!({ "ok": true, "message": message })
+                }
             }
         }
         "get" => {
