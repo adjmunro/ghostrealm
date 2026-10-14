@@ -114,18 +114,16 @@ impl Dividers {
 
     /// The divider to draw highlighted (hovered, or dragged: `true`).
     pub fn highlight(&self, tree: &Tree, frame: &Frame) -> Option<(Divider, bool)> {
-        let (vt, divider, dragging) = match (&self.drag, &self.hover) {
-            (Some(d), _) => (d.vt, dragged_divider(tree, d, frame)?, true),
-            (None, Some((vt, path))) => {
-                let d = tree.vtab(*vt)?.dividers(frame.workspace, frame.gap).into_iter().find(|d| &d.path == path)?;
-                (*vt, d, false)
-            }
-            (None, None) => return None,
-        };
-        if tree.active_vtab() != Some(vt) {
+        if let Some(drag) = &self.drag {
+            let shown = tree.active_vtab() == Some(drag.vt);
+            return dragged_divider(tree, drag, frame).filter(|_| shown).map(|d| (d, true));
+        }
+        let (vt, path) = self.hover.as_ref()?;
+        if tree.active_vtab() != Some(*vt) {
             return None;
         }
-        Some((divider, dragging))
+        let d = tree.vtab(*vt)?.dividers(frame.workspace, frame.gap).into_iter().find(|d| &d.path == path)?;
+        Some((d, false))
     }
 }
 
@@ -303,6 +301,35 @@ mod tests {
         let root = t.vtab(vt).unwrap().dividers(frame.workspace, frame.gap).remove(0);
         assert_eq!((root.path, root.axis), (vec![], Axis::TopBottom), "the path now names the other split");
         assert_eq!(dragged_divider(&t, &drag, &frame), None);
+    }
+
+    #[test]
+    fn the_hover_follows_the_layout_under_the_pointer() {
+        let (mut t, vt, left) = side_by_side();
+        let mut d = Dividers::default();
+        let at = (403.0, 300.0);
+        assert!(d.hover(under(&t, &FRAME, at).as_ref()));
+        assert_eq!(d.highlight(&t, &FRAME).map(|(h, dragging)| (h.strip.x, dragging)), Some((400.0, false)));
+        // The split moves away from the pointer: refreshed, nothing is lit.
+        t.set_ratio(vt, &[], 0.25);
+        assert!(d.hover(under(&t, &FRAME, at).as_ref()));
+        assert_eq!(d.highlight(&t, &FRAME), None);
+        // Split again under the pointer: the new divider is the one lit.
+        let right = t.vtab(vt).unwrap().panes()[1].id;
+        t.split(vt, right, Axis::TopBottom).unwrap();
+        t.set_ratio(vt, &[], 0.5);
+        let at = (600.0, 303.0);
+        assert!(d.hover(under(&t, &FRAME, at).as_ref()));
+        assert_eq!(d.highlight(&t, &FRAME).map(|(h, _)| (h.path, h.axis)), Some((vec![true], Axis::TopBottom)));
+        // A drag let go away from its divider: the hover is the pointer's again.
+        let at = (403.0, 100.0);
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert!(d.press(&mut t, hit, &click(Instant::now(), 0, at)) == Press::Grabbed);
+        assert!(d.drag(&mut t, &FRAME, (-500.0, 100.0)));
+        assert!(d.release());
+        assert!(d.hover(under(&t, &FRAME, (-500.0, 100.0)).as_ref()));
+        assert_eq!(d.highlight(&t, &FRAME), None);
+        assert!(width(&t, vt, left) < 400.0);
     }
 
     #[test]

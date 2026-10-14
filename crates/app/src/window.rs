@@ -3840,6 +3840,10 @@ impl State {
         if !self.dirty {
             return Ok(());
         }
+        // The layout may have changed since the pointer last moved (a split, a
+        // close, a drag let go): light the divider under it now.
+        let over = self.divider_under_cursor();
+        self.dividers.hover(over.as_ref());
 
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
         let workspace = self.workspace_rect();
