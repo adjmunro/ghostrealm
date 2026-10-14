@@ -699,12 +699,13 @@ impl AppState {
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
-            Some(Confirm { then: Confirmed::DiskConflict { sid, rest, then }, .. }) => {
+            // The reloaded text is new to the user: the close or quit that
+            // asked stops, and so does the saving of the other views.
+            Some(Confirm { then: Confirmed::DiskConflict { sid, .. }, .. }) => {
                 self.views
                     .get_mut(&sid)
                     .ok_or_else(|| anyhow::anyhow!("the view to reload has closed"))?
                     .reload()?;
-                return self.save_views(&rest, then);
             }
             _ => {}
         }
@@ -2533,13 +2534,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
         assert!(s.view(sid).is_none(), "closed after the write");
 
-        // Reload: the disk version is kept, then it closes.
+        // Reload: the disk version is shown and the close stops.
         let (mut s, sid, file) = conflicted(&dir, "b.txt");
         s.close_focused_surface();
         s.accept_confirm().unwrap();
         s.discard_confirm().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
-        assert!(s.view(sid).is_none());
+        assert_eq!(lines(&s, sid), ["theirs"]);
+        assert!(!s.view(sid).unwrap().modified());
+        assert!(s.confirm().is_none());
 
         // Cancel: stays open, unsaved.
         let (mut s, sid, file) = conflicted(&dir, "c.txt");
