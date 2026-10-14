@@ -169,6 +169,22 @@ impl UnsavedFlag {
         self.reply_due.set(true);
     }
 
+    /// Whether a termination request is waiting for an answer.
+    fn termination_held(&self) -> bool {
+        self.reply_due.get()
+    }
+
+    /// [`Self::settle`], except that with nothing to ask, a held request
+    /// waits (`None`) until the file worker is idle (`jobs_idle`): going
+    /// ahead would cut a running copy off half done.
+    fn settle_after_jobs(&self, unsaved: bool, jobs_idle: bool) -> Option<bool> {
+        if unsaved || jobs_idle {
+            self.settle(unsaved)
+        } else {
+            None
+        }
+    }
+
     /// With the exact value known, the answer to a held termination request:
     /// `Some(true)` to go ahead, `Some(false)` to stay and ask. `None` when
     /// none is held.
@@ -207,18 +223,6 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
         crate::macos_keys::route_reserved_chords(&window);
-        #[cfg(target_os = "macos")]
-        crate::macos_quit::intercept_terminate({
-            let (proxy, unsaved) = (self.proxy.clone(), self.unsaved.clone());
-            move || {
-                if !unsaved.get() {
-                    return crate::macos_quit::Terminate::Now;
-                }
-                unsaved.hold_termination();
-                let _ = proxy.send_event(UserEvent::Terminate);
-                crate::macos_quit::Terminate::Later
-            }
-        });
         match pollster::block_on(State::new(
             window,
             self.command_line.clone(),
@@ -226,6 +230,21 @@ impl ApplicationHandler<UserEvent> for App {
             self.wake_pending.clone(),
         )) {
             Ok(s) => {
+                // Held while something would be lost: unsaved changes (the app
+                // asks), or a file operation still running (cut off half done).
+                #[cfg(target_os = "macos")]
+                crate::macos_quit::intercept_terminate({
+                    let (proxy, unsaved) = (self.proxy.clone(), self.unsaved.clone());
+                    let jobs = s.app.file_jobs_pending();
+                    move || {
+                        if !unsaved.get() && jobs.idle() {
+                            return crate::macos_quit::Terminate::Now;
+                        }
+                        unsaved.hold_termination();
+                        let _ = proxy.send_event(UserEvent::Terminate);
+                        crate::macos_quit::Terminate::Later
+                    }
+                });
                 s.window.request_redraw();
                 self.state = Some(s);
             }
@@ -262,6 +281,8 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        // An agreed quit waiting on the file worker exits once it is idle.
+        state.exit_if_quitting();
         // Text a command put aside for the system clipboard.
         if let Some(text) = state.app.take_clipboard_text() {
             if let Some(cb) = state.clipboard.as_mut() {
@@ -274,7 +295,14 @@ impl ApplicationHandler<UserEvent> for App {
                 eprintln!("ghostrealm: {}: {e}", report.command);
             }
         }
-        match self.unsaved.settle(state.app.has_unsaved()) {
+        // A termination waiting on the file worker hides the window, as a
+        // quit does; the worker's wake brings the loop back here. One with
+        // unsaved changes asks first, so the window stays.
+        let (unsaved, jobs_idle) = (state.app.has_unsaved(), state.app.file_jobs_idle());
+        if !unsaved && !jobs_idle && self.unsaved.termination_held() {
+            state.window.set_visible(false);
+        }
+        match self.unsaved.settle_after_jobs(unsaved, jobs_idle) {
             // After this handler returns: terminating inside it would re-enter winit.
             Some(true) => reply_to_terminate_later(true),
             // Asked from outside the window (it may be minimised, or the app
@@ -1679,11 +1707,16 @@ impl State {
     /// (the wgpu/Metal device drop) is synchronous and can stall for seconds,
     /// sometimes long enough that macOS marks the app unresponsive. Exiting
     /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
-    /// child shells, exactly as closing any terminal does.
+    /// child shells, exactly as closing any terminal does. A file operation
+    /// still running (a copy) finishes first, with the window hidden: exiting
+    /// would leave it half done. `about_to_wait` calls back here once the
+    /// worker's wake arrives.
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
-            std::process::exit(0);
+            if self.app.file_jobs_idle() {
+                std::process::exit(0);
+            }
         }
     }
 
@@ -5030,6 +5063,18 @@ mod tests {
         flag.hold_termination();
         assert_eq!(flag.settle(true), Some(false));
         assert!(flag.get());
+    }
+
+    #[test]
+    fn a_held_termination_with_nothing_to_ask_waits_for_running_file_operations() {
+        let flag = super::UnsavedFlag::default();
+        flag.hold_termination();
+        assert_eq!(flag.settle_after_jobs(false, false), None, "a copy is running");
+        assert!(flag.termination_held());
+        assert_eq!(flag.settle_after_jobs(false, true), Some(true), "done: go ahead");
+        // Unsaved changes ask at once; the quit they lead to waits instead.
+        flag.hold_termination();
+        assert_eq!(flag.settle_after_jobs(true, false), Some(false));
     }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so
