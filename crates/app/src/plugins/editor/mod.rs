@@ -317,7 +317,7 @@ impl EditorView {
         if !self.buf.modified || self.buf.path.is_none() {
             return None;
         }
-        if self.buf.disk_changed() {
+        if self.buf.conflicted() {
             self.buf.changed_on_disk = true;
             return None;
         }
@@ -415,7 +415,7 @@ impl EditorView {
             cx.request(Request::SaveAs);
             return;
         };
-        if self.buf.disk_changed() {
+        if self.buf.conflicted() {
             cx.request(Request::SaveConflict);
             return;
         }
@@ -996,6 +996,7 @@ impl View for EditorView {
             // Repaints the mark only the first time.
             !std::mem::replace(&mut self.buf.changed_on_disk, true)
         } else {
+            let marked = self.buf.changed_on_disk;
             match self.buf.reload() {
                 Ok(true) => {
                     self.note_edits();
@@ -1003,13 +1004,13 @@ impl View for EditorView {
                 }
                 Ok(false) => false,
                 // Unreadable as text now: keep what's shown, flagged.
-                Err(_) => !std::mem::replace(&mut self.buf.changed_on_disk, true),
+                Err(_) => !marked,
             }
         }
     }
 
     fn disk_conflict(&self) -> bool {
-        self.buf.disk_changed()
+        self.buf.conflicted()
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -1552,6 +1553,46 @@ mod tests {
         assert_eq!(v.autosave(&h.cfg), None, "nor on quit or app blur");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's\n");
         assert!(v.modified() && v.buffer().changed_on_disk, "still unsaved, and marked");
+    }
+
+    #[test]
+    fn undoing_past_a_reload_conflicts_with_the_file_it_never_saw() {
+        let dir = tmpdir("editor-undo-reload");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        std::fs::write(&path, "new\n").unwrap();
+        assert!(v.changed_on_disk(&path));
+        assert_eq!(v.buffer().lines, ["new"]);
+        v.buffer_mut().undo();
+        assert_eq!(v.buffer().lines, ["old"]);
+        assert!(v.modified() && v.buffer().changed_on_disk && v.disk_conflict());
+        let h = Harness::new();
+        assert_eq!(v.save_if_modified(), None, "autosave skips it");
+        assert_eq!(v.autosave(&h.cfg), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
+        assert_eq!(out.requests, vec![Request::SaveConflict], "an explicit save asks");
+        // Redoing back to the reloaded text is the file again.
+        v.buffer_mut().redo();
+        assert!(!v.modified() && !v.disk_conflict());
+    }
+
+    #[test]
+    fn a_file_that_turns_unreadable_is_checked_once_and_blocks_autosave() {
+        let dir = tmpdir("editor-unreadable");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "text\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(v.changed_on_disk(&path), "the mark appears");
+        assert_eq!(v.buffer().lines, ["text"], "the text is kept");
+        assert!(v.buffer().changed_on_disk && !v.modified());
+        assert!(!v.buffer().disk_changed(), "the new version counts as seen");
+        assert!(!v.changed_on_disk(&path), "and is not read again");
+        v.buffer_mut().insert_str("x");
+        assert_eq!(v.save_if_modified(), None, "autosave would write over it");
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, 0x00]);
     }
 
     #[test]

@@ -128,6 +128,8 @@ struct Snapshot {
     anchor: Option<(usize, usize)>,
     auto_closers: AutoClosers,
     version: u64,
+    /// The text predates a reload that no save has followed.
+    stale: bool,
 }
 
 /// Undo/redo as whole-buffer snapshots.
@@ -142,6 +144,9 @@ struct History {
     version: u64,
     next_version: u64,
     saved_version: u64,
+    /// The current text is not based on the file as the buffer last read it:
+    /// undo went back past a reload, or the file became unreadable.
+    stale: bool,
 }
 
 impl History {
@@ -152,6 +157,14 @@ impl History {
         if self.undo.len() > MAX_UNDO {
             let excess = self.undo.len() - MAX_UNDO;
             self.undo.drain(..excess);
+        }
+    }
+
+    /// Mark the current text and every remembered one stale, or none.
+    fn set_stale(&mut self, stale: bool) {
+        self.stale = stale;
+        for s in self.undo.iter_mut().chain(&mut self.redo) {
+            s.stale = stale;
         }
     }
 }
@@ -580,6 +593,7 @@ impl EditorBuffer {
             anchor: self.anchor,
             auto_closers: self.auto_closers.clone(),
             version: self.history.version,
+            stale: self.history.stale,
         }
     }
 
@@ -619,10 +633,13 @@ impl EditorBuffer {
         self.cursor = s.cursor;
         self.anchor = s.anchor;
         self.history.version = s.version;
+        self.history.stale = s.stale;
         self.history.run = None;
         self.edits = self.edits.wrapping_add(1);
         self.dirty_from = Some(0);
         self.modified = s.version != self.history.saved_version;
+        // The file changed under this text: saving it asks.
+        self.changed_on_disk |= s.stale;
     }
 
     /// Step back to the state before the last undo step.
@@ -836,14 +853,23 @@ impl EditorBuffer {
 
     /// Replace the text with its file's as it is on disk now (another program
     /// wrote it), as one undo step; the buffer is then unmodified, and undoing
-    /// the step returns to the old text as an unsaved edit. Returns whether
-    /// the text changed.
+    /// the step returns to the old text as an unsaved edit that saving asks
+    /// about. Returns whether the text changed. A file that can't be read as
+    /// text keeps the buffer, marked changed on disk, and counts as seen, so
+    /// the next check doesn't read it again.
     pub fn reload(&mut self) -> std::io::Result<bool> {
         let Some(path) = &self.path else { return Ok(false) };
-        let disk = Stamp::of(path);
-        let lines = split_lines(&std::fs::read_to_string(path)?);
-        self.disk = disk;
+        self.disk = Stamp::of(path);
+        let lines = match std::fs::read_to_string(path) {
+            Ok(text) => split_lines(&text),
+            Err(e) => {
+                self.changed_on_disk = true;
+                self.history.set_stale(true);
+                return Err(e);
+            }
+        };
         self.changed_on_disk = false;
+        self.history.stale = false;
         if lines == self.lines {
             // Already what's on disk, whatever the history says.
             self.history.saved_version = self.history.version;
@@ -854,6 +880,11 @@ impl EditorBuffer {
         self.history.committed();
         self.history.run = None;
         self.history.saved_version = self.history.version;
+        // Remembered texts predate the reload; undoing to one leaves it
+        // differing from a file it never saw.
+        for s in &mut self.history.undo {
+            s.stale = true;
+        }
         self.lines = lines;
         let row = self.cursor.0.min(self.lines.len() - 1);
         self.cursor = (row, self.cursor.1.min(self.line_len(row)));
@@ -871,6 +902,14 @@ impl EditorBuffer {
     pub fn disk_changed(&self) -> bool {
         let Some(now) = self.path.as_deref().and_then(Stamp::of) else { return false };
         self.disk != Some(now)
+    }
+
+    /// Whether writing the buffer now could lose what is on disk: the file
+    /// changed since the buffer read it ([`Self::disk_changed`]), or the text
+    /// isn't based on the file as it was last read (undo went back past a
+    /// reload, or the file became unreadable).
+    pub fn conflicted(&self) -> bool {
+        self.history.stale || self.disk_changed()
     }
 
     /// Write the buffer to its path. Returns whether it had a path to save to.
@@ -907,6 +946,7 @@ impl EditorBuffer {
         std::fs::write(path, self.file_text())?;
         self.disk = Stamp::of(path);
         self.changed_on_disk = false;
+        self.history.set_stale(false);
         self.modified = false;
         // Typing after a save starts a new step, so undo can return here.
         self.history.saved_version = self.history.version;
