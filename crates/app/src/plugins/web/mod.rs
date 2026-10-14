@@ -33,7 +33,8 @@ use winit::window::CursorIcon;
 use crate::app_state::AppState;
 use crate::plugin::text_edit::{Edit, LineEdit};
 use crate::plugin::{
-    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, ImageSource, MouseEvent, OpenCx, PaintCx, Plugin,
+    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, ImageSource, MouseButton, MouseEvent, OpenCx, PaintCx,
+    Plugin,
     RawKey, View, Waker,
 };
 
@@ -435,8 +436,9 @@ pub struct WebView {
     /// Layout from the last paint, for mouse hit-testing.
     url_box: Rect,
     body: Rect,
-    /// A left press on the page is held (drags go to the page).
-    pressed: Option<u32>,
+    /// A press on the page is held (drags go to the page): its button and
+    /// click count.
+    pressed: Option<(PageButton, u32)>,
     hovering: bool,
 }
 
@@ -741,6 +743,23 @@ impl Drop for WebView {
     }
 }
 
+fn page_button(b: MouseButton) -> PageButton {
+    match b {
+        MouseButton::Left => PageButton::Left,
+        MouseButton::Middle => PageButton::Middle,
+        MouseButton::Right => PageButton::Right,
+    }
+}
+
+/// The modifier flag telling the page `b` is held.
+fn held_flag(b: PageButton) -> u32 {
+    match b {
+        PageButton::Left => mods::LEFT_MOUSE,
+        PageButton::Middle => mods::MIDDLE_MOUSE,
+        PageButton::Right => mods::RIGHT_MOUSE,
+    }
+}
+
 fn cursor_icon(c: Cursor) -> CursorIcon {
     match c {
         Cursor::Default | Cursor::None => CursorIcon::Default,
@@ -962,13 +981,13 @@ impl View for WebView {
                 return;
             }
         }
-        if event.is_other_button() {
-            return;
-        }
         let flags = keys::modifier_flags(cx.mods);
         match *event {
-            MouseEvent::Down { pos, clicks, .. } => {
+            MouseEvent::Down { pos, clicks, button } => {
                 if rect_contains(self.url_box, pos.0, pos.1) {
+                    if button != MouseButton::Left {
+                        return;
+                    }
                     if self.url_edit.is_none() {
                         self.edit_url();
                         self.url_field.hold(pos);
@@ -983,25 +1002,19 @@ impl View for WebView {
                     cx.redraw();
                 }
                 self.sync_focus(true);
-                self.pressed = Some(clicks);
-                let action = MouseAction::Down {
-                    button: PageButton::Left,
-                    count: clicks,
-                };
-                self.mouse_to_page(pos, mods::LEFT_MOUSE, flags, action);
+                let button = page_button(button);
+                self.pressed = Some((button, clicks));
+                let action = MouseAction::Down { button, count: clicks };
+                self.mouse_to_page(pos, held_flag(button), flags, action);
             }
             MouseEvent::Drag { pos, .. } => {
-                if self.pressed.is_some() {
-                    self.mouse_to_page(pos, mods::LEFT_MOUSE, flags, MouseAction::Move);
+                if let Some((button, _)) = self.pressed {
+                    self.mouse_to_page(pos, held_flag(button), flags, MouseAction::Move);
                 }
             }
             MouseEvent::Up { pos, .. } => {
-                if let Some(count) = self.pressed.take() {
-                    let action = MouseAction::Up {
-                        button: PageButton::Left,
-                        count,
-                    };
-                    self.mouse_to_page(pos, 0, flags, action);
+                if let Some((button, count)) = self.pressed.take() {
+                    self.mouse_to_page(pos, 0, flags, MouseAction::Up { button, count });
                 }
             }
             MouseEvent::Move { pos } => {
@@ -1107,7 +1120,6 @@ impl View for WebView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::MouseButton;
     use crate::plugin::testing::{cmd, press, Harness};
     use ghostrealm_web::protocol::PROTOCOL_VERSION;
 
@@ -1281,6 +1293,48 @@ mod tests {
         requests(&log, |s| s.contains(r#""visible":true"#));
         v.shown(false);
         requests(&log, |s| s.matches(r#""visible":false"#).count() == 2);
+    }
+
+    /// The mouse requests in the stub host's log.
+    fn mouse_requests(log: &str) -> Vec<(u32, MouseAction)> {
+        log.lines()
+            .filter_map(|l| match serde_json::from_str(l) {
+                Ok(HostRequest::Mouse { mods, action, .. }) => Some((mods, action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn right_and_middle_presses_reach_the_page_with_their_button_held() {
+        let (mut v, runs) = stub_host("web-buttons", "cat > \"$0.requests\"");
+        let log = runs.with_file_name("host.sh.requests");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let (a, b) = ((v.body.x + 10.0, v.body.y + 10.0), (v.body.x + 30.0, v.body.y + 10.0));
+        let url = (v.url_box.x + 4.0, v.url_box.y + 4.0);
+        let (right, middle) = (MouseButton::Right, MouseButton::Middle);
+        h.mouse(&mut v, MouseEvent::Down { pos: url, clicks: 1, button: right });
+        h.mouse(&mut v, MouseEvent::Up { pos: url, dragged: false, button: right });
+        assert!(v.url_edit.is_none(), "a right press doesn't edit the URL");
+        h.mouse(&mut v, MouseEvent::Down { pos: a, clicks: 2, button: right });
+        h.mouse(&mut v, MouseEvent::Drag { pos: b, button: right });
+        h.mouse(&mut v, MouseEvent::Up { pos: b, dragged: true, button: right });
+        h.mouse(&mut v, MouseEvent::Down { pos: a, clicks: 1, button: middle });
+        h.mouse(&mut v, MouseEvent::Up { pos: a, dragged: false, button: middle });
+
+        let got = requests(&log, |s| mouse_requests(s).len() == 5);
+        let (r, m) = (PageButton::Right, PageButton::Middle);
+        assert_eq!(
+            mouse_requests(&got),
+            [
+                (mods::RIGHT_MOUSE, MouseAction::Down { button: r, count: 2 }),
+                (mods::RIGHT_MOUSE, MouseAction::Move),
+                (0, MouseAction::Up { button: r, count: 2 }),
+                (mods::MIDDLE_MOUSE, MouseAction::Down { button: m, count: 1 }),
+                (0, MouseAction::Up { button: m, count: 1 }),
+            ]
+        );
     }
 
     #[test]
