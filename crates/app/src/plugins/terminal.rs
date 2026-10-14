@@ -11,8 +11,8 @@ use std::any::Any;
 use anyhow::Result;
 use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
 use ghostrealm_terminal::{
-    Cell, Grid, Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton, MouseReport, Pumped, Scroll,
-    TerminalBackend,
+    Cell, Grid, Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton as ReportButton, MouseReport, Pumped,
+    Scroll, TerminalBackend,
 };
 use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 
@@ -246,7 +246,7 @@ impl TerminalView {
     }
 
     /// Report a pointer event at physical-pixel `pos` to the program.
-    fn report_mouse(&mut self, action: MouseAction, button: Option<MouseButton>, mods: Mods, pos: (f32, f32)) {
+    fn report_mouse(&mut self, action: MouseAction, button: Option<ReportButton>, mods: Mods, pos: (f32, f32)) {
         let (cw, ch) = self.cell;
         self.term.send_mouse(&MouseReport {
             action,
@@ -465,13 +465,16 @@ impl View for TerminalView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        if event.is_other_button() {
+            return;
+        }
         let mods = cx.mods;
         // A release can be lost (the window lost focus mid-drag, say), which
         // would leave the program believing the button is still held. A new
         // press first closes the old one.
         if let MouseEvent::Down { pos, .. } = *event {
             if std::mem::take(&mut self.reporting) {
-                self.report_mouse(MouseAction::Release, Some(MouseButton::Left), mods, pos);
+                self.report_mouse(MouseAction::Release, Some(ReportButton::Left), mods, pos);
             }
         }
         match *event {
@@ -481,20 +484,20 @@ impl View for TerminalView {
                 if self.selection.take().is_some() {
                     cx.redraw();
                 }
-                self.report_mouse(MouseAction::Press, Some(MouseButton::Left), mods, pos);
+                self.report_mouse(MouseAction::Press, Some(ReportButton::Left), mods, pos);
             }
-            MouseEvent::Drag { pos } if self.reporting => {
-                self.report_mouse(MouseAction::Motion, Some(MouseButton::Left), mods, pos);
+            MouseEvent::Drag { pos, .. } if self.reporting => {
+                self.report_mouse(MouseAction::Motion, Some(ReportButton::Left), mods, pos);
             }
             MouseEvent::Up { pos, .. } if self.reporting => {
                 self.reporting = false;
-                self.report_mouse(MouseAction::Release, Some(MouseButton::Left), mods, pos);
+                self.report_mouse(MouseAction::Release, Some(ReportButton::Left), mods, pos);
             }
             MouseEvent::Move { pos } if self.forwards_mouse(mods) => {
                 self.report_mouse(MouseAction::Motion, None, mods, pos);
             }
             // A press only records the anchor; a plain click never highlights.
-            MouseEvent::Down { pos: (x, y), clicks } => {
+            MouseEvent::Down { pos: (x, y), clicks, .. } => {
                 if self.selection.take().is_some() {
                     cx.redraw();
                 }
@@ -513,7 +516,7 @@ impl View for TerminalView {
                     cx.redraw();
                 }
             }
-            MouseEvent::Drag { pos: (x, y) } => {
+            MouseEvent::Drag { pos: (x, y), .. } => {
                 let (Some(anchor), Some(head)) = (self.press_cell, self.cell_at(x, y)) else {
                     return;
                 };
@@ -550,7 +553,7 @@ impl View for TerminalView {
         }
         // A program tracking the mouse gets the wheel as button 4/5 presses.
         if self.forwards_mouse(cx.mods) {
-            let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+            let button = if lines > 0 { ReportButton::WheelUp } else { ReportButton::WheelDown };
             for _ in 0..lines.abs().min(MAX_WHEEL_REPORTS) {
                 self.report_mouse(MouseAction::Press, Some(button), cx.mods, pos);
             }
@@ -851,6 +854,7 @@ fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::MouseButton;
     use ghostrealm_terminal::{CellAttrs, Cursor, GridSize};
 
     fn grid_of(rows: &[&str]) -> Grid {
@@ -987,14 +991,14 @@ mod tests {
         let mut v = running("printf 'hello world'; sleep 2", "hello world");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(0, 0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(0, 0), clicks: 1, button: MouseButton::Left });
         assert!(v.selection.is_none(), "a press alone selects nothing");
-        let out = h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 0) });
+        let out = h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 0), button: MouseButton::Left });
         assert!(out.redraw);
         assert_eq!(selection_text(&v.grid, v.selection.unwrap()), "hello");
-        h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 0), dragged: true });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 0), dragged: true, button: MouseButton::Left });
         // A fresh press clears it.
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 1, button: MouseButton::Left });
         assert!(v.selection.is_none());
     }
 
@@ -1009,9 +1013,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         // Live: the press belongs to the program.
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1, button: MouseButton::Left });
         assert!(v.reporting);
-        h.mouse(&mut v, MouseEvent::Up { pos: cell(1, 1), dragged: false });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(1, 1), dragged: false, button: MouseButton::Left });
 
         v.term.scroll(Scroll::Delta(-10));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1019,9 +1023,9 @@ mod tests {
             assert!(Instant::now() < deadline, "never scrolled back");
             std::thread::sleep(Duration::from_millis(15));
         }
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1, button: MouseButton::Left });
         assert!(!v.reporting, "nothing is reported while scrolled back");
-        h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 1) });
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 1), button: MouseButton::Left });
         assert!(v.selection.is_some(), "the drag selects locally");
         assert!(v.term.mouse_tracking(), "the program still tracks the mouse");
     }
@@ -1051,7 +1055,7 @@ mod tests {
         let mut v = running("printf 'a b c'; sleep 2", "a b c");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 2, button: MouseButton::Left });
         let sel = v.selection.unwrap();
         assert!(!sel.is_empty(), "one cell, but chosen as a whole");
         assert_eq!(selection_text(&v.grid, sel), "b");
@@ -1062,7 +1066,7 @@ mod tests {
         let mut v = running("printf 'hello world'; sleep 2", "hello world");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 3 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 0), clicks: 3, button: MouseButton::Left });
         assert_eq!(selection_text(&v.grid, v.selection.unwrap()), "hello world");
     }
 
@@ -1071,7 +1075,7 @@ mod tests {
         let mut v = running("printf 'hello world'; sleep 2", "hello world");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(7, 0), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(7, 0), clicks: 2, button: MouseButton::Left });
         assert_eq!(selection_text(&v.grid, v.selection.unwrap()), "world");
     }
 
@@ -1148,9 +1152,9 @@ mod tests {
         let mut v = echoing("\\033[?1003h\\033[?1006h");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Drag { pos: cell(5, 1) });
-        h.mouse(&mut v, MouseEvent::Up { pos: cell(5, 1), dragged: true });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(5, 1), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(5, 1), dragged: true, button: MouseButton::Left });
         h.mouse(&mut v, MouseEvent::Move { pos: cell(7, 3) });
         v.write(b"\r");
         let screen = echoed(&mut v, "^[[<35;8;4M");
@@ -1183,10 +1187,10 @@ mod tests {
         let mut v = echoing("\\033[?1000h\\033[?1006h");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1, button: MouseButton::Left });
         // No Up arrives.
-        h.mouse(&mut v, MouseEvent::Down { pos: cell(4, 1), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 1), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(4, 1), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 1), dragged: false, button: MouseButton::Left });
         assert!(!v.reporting);
         v.write(b"\r");
         let screen = echoed(&mut v, "^[[<0;5;2m");
@@ -1198,12 +1202,12 @@ mod tests {
         let mut v = echoing("\\033[?1000h\\033[?1006h");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse_with(&mut v, SHIFT, MouseEvent::Down { pos: cell(0, 0), clicks: 1 });
+        h.mouse_with(&mut v, SHIFT, MouseEvent::Down { pos: cell(0, 0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.press_cell, Some((0, 0)), "a local press");
         assert!(!v.reporting);
-        h.mouse_with(&mut v, SHIFT, MouseEvent::Drag { pos: cell(3, 0) });
+        h.mouse_with(&mut v, SHIFT, MouseEvent::Drag { pos: cell(3, 0), button: MouseButton::Left });
         assert!(v.selection.is_some(), "Shift+drag selects");
-        h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 0), dragged: true });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 0), dragged: true, button: MouseButton::Left });
         let out = h.scroll_with(&mut v, SHIFT, cell(1, 1), 3.0 * UI.cell_h);
         assert!(out.frame && v.pending_scroll == -3, "Shift+wheel scrolls the scrollback");
         // Nothing was reported: only the marker comes back.

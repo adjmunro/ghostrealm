@@ -86,8 +86,11 @@ impl FieldMouse {
     /// field's wherever the pointer goes. `extend` is Shift.
     pub fn event(&mut self, edit: &mut LineEdit, event: &MouseEvent, extend: bool) -> bool {
         let Some(g) = self.geom.get() else { return false };
+        if event.is_other_button() {
+            return false;
+        }
         match *event {
-            MouseEvent::Down { pos, clicks } if g.contains(pos) => {
+            MouseEvent::Down { pos, clicks, .. } if g.contains(pos) => {
                 self.pressed = true;
                 self.origin = None;
                 edit.press(g.caret_at(pos.0), g.char_at(pos.0), clicks, extend);
@@ -98,7 +101,7 @@ impl FieldMouse {
                 self.origin = None;
                 false
             }
-            MouseEvent::Drag { pos } if self.pressed => {
+            MouseEvent::Drag { pos, .. } if self.pressed => {
                 if let Some(from) = self.origin.take() {
                     edit.press(g.caret_at(from.0), g.char_at(from.0), 1, false);
                 }

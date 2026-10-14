@@ -25,7 +25,7 @@ use glyphon::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -36,8 +36,8 @@ use crate::file_menu::{FileAction, FileTarget, MenuEntry};
 use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseEvent, Outcome, PaintCx, RawKey, Request,
-    Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
+    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseButton, MouseEvent, Outcome, PaintCx, RawKey,
+    Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
@@ -408,7 +408,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
+                button: WinitButton::Left,
                 ..
             } => {
                 state.release_lost_press();
@@ -429,7 +429,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
-                button: MouseButton::Left,
+                button: WinitButton::Left,
                 ..
             } => {
                 state.palette_release();
@@ -441,7 +441,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Right,
+                button: WinitButton::Right,
                 ..
             } => {
                 state.on_right_click();
@@ -1689,7 +1689,7 @@ impl State {
     fn release_lost_press(&mut self) {
         if let Some(sid) = self.mouse_capture.take() {
             let (pos, dragged) = (self.cursor, self.dragging);
-            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button: MouseButton::Left }));
         }
         if self.dividers.release() {
             self.dirty = true;
@@ -1709,7 +1709,7 @@ impl State {
                 Some(panel) if rect_contains(panel, pos.0, pos.1) => {
                     let clicks = self.count_click();
                     self.view_event(PICKER_SID, |v, cx| {
-                        v.mouse(cx, &MouseEvent::Down { pos, clicks })
+                        v.mouse(cx, &MouseEvent::Down { pos, clicks, button: MouseButton::Left })
                     });
                     self.mouse_capture = Some(PICKER_SID);
                 }
@@ -1787,7 +1787,7 @@ impl State {
             }
             let clicks = self.count_click();
             let pos = (x, y);
-            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Down { pos, clicks }));
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Down { pos, clicks, button: MouseButton::Left }));
             self.mouse_capture = Some(sid);
             self.dirty = true;
             return;
@@ -2174,7 +2174,7 @@ impl State {
             self.dragging = true;
         }
         match self.mouse_capture {
-            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos })),
+            Some(sid) => self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Drag { pos, button: MouseButton::Left })),
             None => false,
         }
     }
@@ -2188,7 +2188,7 @@ impl State {
         let dragged = std::mem::take(&mut self.dragging);
         if let Some(sid) = self.mouse_capture.take() {
             let pos = self.cursor;
-            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
+            self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button: MouseButton::Left }));
         }
         let left = self.hover.released();
         self.send_leave(left);

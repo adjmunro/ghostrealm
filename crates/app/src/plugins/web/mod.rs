@@ -24,7 +24,7 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 use ghostrealm_web::protocol::mods;
 use ghostrealm_web::{
-    Cursor, EditAction, MouseAction, MouseButton, Request as HostRequest, SharedFrame, ViewState,
+    Cursor, EditAction, MouseAction, MouseButton as PageButton, Request as HostRequest, SharedFrame, ViewState,
     WebHost,
 };
 use glyphon::Family;
@@ -962,9 +962,12 @@ impl View for WebView {
                 return;
             }
         }
+        if event.is_other_button() {
+            return;
+        }
         let flags = keys::modifier_flags(cx.mods);
         match *event {
-            MouseEvent::Down { pos, clicks } => {
+            MouseEvent::Down { pos, clicks, .. } => {
                 if rect_contains(self.url_box, pos.0, pos.1) {
                     if self.url_edit.is_none() {
                         self.edit_url();
@@ -982,12 +985,12 @@ impl View for WebView {
                 self.sync_focus(true);
                 self.pressed = Some(clicks);
                 let action = MouseAction::Down {
-                    button: MouseButton::Left,
+                    button: PageButton::Left,
                     count: clicks,
                 };
                 self.mouse_to_page(pos, mods::LEFT_MOUSE, flags, action);
             }
-            MouseEvent::Drag { pos } => {
+            MouseEvent::Drag { pos, .. } => {
                 if self.pressed.is_some() {
                     self.mouse_to_page(pos, mods::LEFT_MOUSE, flags, MouseAction::Move);
                 }
@@ -995,7 +998,7 @@ impl View for WebView {
             MouseEvent::Up { pos, .. } => {
                 if let Some(count) = self.pressed.take() {
                     let action = MouseAction::Up {
-                        button: MouseButton::Left,
+                        button: PageButton::Left,
                         count,
                     };
                     self.mouse_to_page(pos, 0, flags, action);
@@ -1104,6 +1107,7 @@ impl View for WebView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::MouseButton;
     use crate::plugin::testing::{cmd, press, Harness};
     use ghostrealm_web::protocol::PROTOCOL_VERSION;
 
@@ -1341,6 +1345,7 @@ mod tests {
             MouseEvent::Down {
                 pos: (b.x + 4.0, b.y + 4.0),
                 clicks: 1,
+                button: MouseButton::Left,
             },
         );
         assert!(
@@ -1372,12 +1377,12 @@ mod tests {
         let y = g.rect.y + g.rect.h * 0.5;
         let cell = |col: usize| g.left + (col as f32 + 0.5) * g.cell_w;
         let edge = |col: usize| g.left + col as f32 * g.cell_w;
-        h.mouse(&mut v, MouseEvent::Down { pos: (edge(1), y), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(3), y) });
-        h.mouse(&mut v, MouseEvent::Up { pos: (edge(3), y), dragged: true });
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(1), y), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(3), y), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(3), y), dragged: true, button: MouseButton::Left });
         assert!(v.url_edit.is_some(), "still editing");
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((1, 3)));
-        h.mouse(&mut v, MouseEvent::Down { pos: (cell(7), y), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos: (cell(7), y), clicks: 2, button: MouseButton::Left });
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((5, 9)), "`lang`");
     }
 
@@ -1391,15 +1396,15 @@ mod tests {
         let y = g.rect.y + g.rect.h * 0.5;
         let edge = |col: usize| g.left + col as f32 * g.cell_w;
         // A plain click selects the whole address.
-        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: (edge(2), y), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(2), y), dragged: false, button: MouseButton::Left });
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((0, 21)));
         // A drag from a press on the idle bar selects what it covers.
         v.url_edit = None;
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(6), y) });
-        h.mouse(&mut v, MouseEvent::Up { pos: (edge(6), y), dragged: true });
+        h.mouse(&mut v, MouseEvent::Down { pos: (edge(2), y), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: (edge(6), y), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: (edge(6), y), dragged: true, button: MouseButton::Left });
         assert_eq!(v.url_edit.as_ref().unwrap().selection(), Some((2, 6)));
     }
 

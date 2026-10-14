@@ -756,13 +756,16 @@ impl View for FileBrowserView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        if event.is_other_button() {
+            return;
+        }
         let extend = cx.mods.shift;
         if self.field.event(&mut self.input, event, extend) || self.name_field.event(&mut self.name, event, extend) {
             cx.redraw();
             return;
         }
         match *event {
-            MouseEvent::Down { pos: (x, y), clicks } => {
+            MouseEvent::Down { pos: (x, y), clicks, .. } => {
                 if self.preview_shown && self.preview.contains((x, y)) {
                     self.preview.mouse_down(cx, (x, y));
                     return;
@@ -978,6 +981,7 @@ fn move_highlight(sel: &mut Option<usize>, count: usize, delta: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::MouseButton;
     use crate::plugin::testing::{press, tmpdir, Harness, UI};
 
     /// The browser's rect in these tests, and the centre of list row `i` in it.
@@ -1077,7 +1081,7 @@ mod tests {
             !ids.contains(&BTN_GIT) && !ids.contains(&BTN_VIEW) && !ids.contains(&BTN_PREVIEW),
             "no file-only toggles"
         );
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         let rows: Vec<PathBuf> = v.tree_mut().rows().iter().map(|r| r.path.clone()).collect();
         assert_eq!(rows, vec![d.join("adir")], "expanded adir shows no inner.txt; no b.txt");
     }
@@ -1088,9 +1092,9 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let pos = row_centre(0);
-        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
         assert!(v.tree().is_expanded(&d.join("adir")), "a click expands in place");
-        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2, button: MouseButton::Left });
         assert_eq!(v.tree().root(), d.join("adir"), "a double-click enters");
         assert_eq!(v.chosen, None, "the entered directory is shown, not selected");
     }
@@ -1102,7 +1106,7 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert_eq!(v.choice(), Some(d.clone()), "with nothing selected, the shown directory");
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.choice(), Some(d.join("adir")), "a click selects without entering");
         assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
         // Hover and arrows leave the selection alone.
@@ -1120,13 +1124,13 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert_eq!(v.choice(), None, "nothing selected yet");
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.choice(), None, "a directory is never the chosen file");
         h.paint(&mut v, RECT); // adir expanded: b.txt moves to row 2
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1 });
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1, button: MouseButton::Left });
         assert!(out.requests.is_empty(), "a click only selects");
         assert_eq!(v.choice(), Some(d.join("b.txt")));
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 2 });
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 2, button: MouseButton::Left });
         assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
     }
 
@@ -1168,7 +1172,7 @@ mod tests {
         }
         assert_eq!(v.tree().query(), "", "typing edits the name, not the filter");
         assert_eq!(v.choice(), Some(d.join("new.md")), "into the shown directory");
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.choice(), Some(d.join("adir").join("new.md")), "into the selected one");
         h.key(&mut v, press(Key::Backspace));
         let (_, out) = h.key(&mut v, press(Key::Enter));
@@ -1222,28 +1226,28 @@ mod tests {
         h.paint(&mut v, RECT);
         let g = v.name_field.geom().expect("the name field is live");
         // Click places the cursor between two cells; typing lands there.
-        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: false, button: MouseButton::Left });
         h.key(&mut v, press(Key::Char('X')));
         assert_eq!(v.name.text(), "draftX one.txt");
         // Drag selects; typing replaces the selection.
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 0), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Drag { pos: edge_at(g, 5) });
-        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: true });
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 0), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: edge_at(g, 5), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 5), dragged: true, button: MouseButton::Left });
         h.key(&mut v, press(Key::Char('n')));
         assert_eq!(v.name.text(), "nX one.txt");
         // Double-click selects the word, triple-click all.
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 2, button: MouseButton::Left });
         assert_eq!(v.name.selection(), Some((3, 6)), "`one`");
-        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 3 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 3), clicks: 3, button: MouseButton::Left });
         assert_eq!(v.name.selection(), Some((0, 10)));
         // Shift+click extends from the anchor.
         let shift = ghostrealm_terminal::Mods { shift: true, ..Default::default() };
-        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 1), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 1), dragged: false });
-        h.mouse_with(&mut v, shift, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: edge_at(g, 1), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: edge_at(g, 1), dragged: false, button: MouseButton::Left });
+        h.mouse_with(&mut v, shift, MouseEvent::Down { pos: edge_at(g, 5), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.name.selection(), Some((1, 5)));
     }
 
@@ -1258,9 +1262,9 @@ mod tests {
         h.paint(&mut v, WIDE);
         let g = v.field.geom().expect("the filter is live");
         assert_eq!(v.input.text(), "ab");
-        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 0), clicks: 2 });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell_at(g, 0), clicks: 2, button: MouseButton::Left });
         assert_eq!(v.input.selection(), Some((0, 2)));
-        h.mouse(&mut v, MouseEvent::Up { pos: cell_at(g, 0), dragged: false });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell_at(g, 0), dragged: false, button: MouseButton::Left });
         assert_eq!(v.input.selection(), Some((0, 2)), "the release keeps the word");
         // A save dialog types into the name, so its header field is inert.
         let mut save = FileBrowserView::picker(v.tree().root().to_path_buf(), Mode::Save);
@@ -1275,10 +1279,10 @@ mod tests {
         v.set_name("draft.txt");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
         assert!(out.requests.is_empty(), "a click only takes the name");
         assert_eq!(v.choice(), Some(d.join("b.txt")));
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 2 });
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 2, button: MouseButton::Left });
         assert_eq!(out.requests, vec![Request::Pick(d.join("b.txt"))]);
     }
 
@@ -1287,7 +1291,7 @@ mod tests {
         let (d, mut v) = fixture();
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.chosen, Some(d.join("b.txt")), "a browser selects files too");
         assert_eq!(v.choice(), None, "a browser picks nothing");
         v.tree_mut().set_root(d.join("adir"));
@@ -1300,7 +1304,7 @@ mod tests {
         let (d, mut v) = fixture();
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
         assert_eq!(out.requests, vec![Request::OpenFile(d.join("b.txt"))]);
     }
 
@@ -1345,7 +1349,7 @@ mod tests {
         v.files_changed(&[]);
         h.paint(&mut v, RECT);
         assert!(v.text().unwrap().contains("new.txt"));
-        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
         let chosen = v.subject().unwrap();
         v.files_changed(&[(chosen.clone(), d.join("renamed.txt"))]);
         assert_eq!(v.subject(), Some(d.join("renamed.txt")));

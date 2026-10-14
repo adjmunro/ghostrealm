@@ -815,11 +815,14 @@ impl View for EditorView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        if event.is_other_button() {
+            return;
+        }
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         match *event {
             // A press moves the cursor and anchors a potential selection; one only
             // shows once the cursor is dragged away.
-            MouseEvent::Down { pos: (x, y), clicks } => {
+            MouseEvent::Down { pos: (x, y), clicks, .. } => {
                 self.dismiss_popup();
                 self.buf.end_undo_run();
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
@@ -837,7 +840,7 @@ impl View for EditorView {
                     cx.redraw();
                 }
             }
-            MouseEvent::Drag { pos: (x, y) } => {
+            MouseEvent::Drag { pos: (x, y), .. } => {
                 if let Some(p) = self.pos_at(x, y, cw, ch) {
                     if self.buf.cursor != p {
                         self.buf.cursor = p;
@@ -1062,6 +1065,7 @@ impl View for EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::MouseButton;
     use crate::plugin::testing::{cmd, press, tmpdir, Harness, UI};
     use crate::plugin::TextSrc;
 
@@ -1411,14 +1415,14 @@ mod tests {
         let mut v = view_with("hello world\nsecond");
         let mut h = Harness::new();
         paint_in_strip(&mut h, &mut v);
-        h.mouse(&mut v, MouseEvent::Down { pos: at(1, 3), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(1, 3), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.buffer().cursor, (1, 3));
-        h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 5) });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: true });
+        h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 5), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: true, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some(" world\nsec"));
         // A plain click clears it.
-        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 1), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 1), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 1), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 1), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selection(), None);
     }
 
@@ -1427,8 +1431,8 @@ mod tests {
         let mut v = view_with("hello world");
         let mut h = Harness::new();
         paint_in_strip(&mut h, &mut v);
-        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 7), clicks: 2 });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 7), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 7), clicks: 2, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 7), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
     }
 
@@ -1439,8 +1443,8 @@ mod tests {
         paint_in_strip(&mut h, &mut v);
         let (x, y) = at(0, 10); // the `d` ending "world"
         let pos = (x + UI.cell_w * 0.75, y);
-        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2 });
-        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
     }
 
@@ -1449,8 +1453,8 @@ mod tests {
         let mut v = view_with("one two\nthree");
         let mut h = Harness::new();
         paint_in_strip(&mut h, &mut v);
-        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 5), clicks: 3 });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 5), clicks: 3, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("one two"));
     }
 
@@ -1461,8 +1465,8 @@ mod tests {
         v.buf.hscroll = 50;
         let mut h = Harness::new();
         paint_in_strip(&mut h, &mut v);
-        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 3), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: false });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 3), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().cursor, (0, 2));
         h.key(&mut v, press(Key::Backspace));
         assert_eq!(v.buffer().lines[0], "a");
@@ -1476,9 +1480,9 @@ mod tests {
         for c in "abc".chars() {
             h.key(&mut v, press(Key::Char(c)));
         }
-        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 0), clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 3) });
-        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: true });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 0), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 3), button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: true, button: MouseButton::Left });
         h.key(&mut v, press(Key::Char('x')));
         assert_eq!(v.buffer().lines, vec!["x"]);
         h.key(&mut v, cmd(Key::Char('z')));
@@ -1492,7 +1496,7 @@ mod tests {
         let mut v = view_with(&long);
         let mut h = Harness::new();
         paint_in_strip(&mut h, &mut v);
-        h.mouse(&mut v, MouseEvent::Down { pos: at(1, 2), clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Down { pos: at(1, 2), clicks: 1, button: MouseButton::Left });
         let (line, col) = v.buffer().cursor;
         assert_eq!(line, 0, "the second visual row is still line 0");
         assert!(col > 40, "column continues past the wrap: {col}");

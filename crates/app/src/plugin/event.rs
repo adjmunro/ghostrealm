@@ -7,23 +7,49 @@ use ghostrealm_terminal::{KeyPress, Mods};
 
 use super::UiMetrics;
 
-/// Left-button mouse input, in physical pixels.
+/// A mouse button a press is made with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Mouse input, in physical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MouseEvent {
-    /// A press inside the view. `clicks` counts quick successive presses at about
-    /// the same spot (2 = double-click), per `[input] double_click_ms`.
-    Down { pos: (f32, f32), clicks: u32 },
-    /// The button is held and the cursor moved past the drag threshold since the
+    /// A press inside the view. `clicks` counts quick successive presses of
+    /// `button` at about the same spot (2 = double-click), per
+    /// `[input] double_click_ms`.
+    Down { pos: (f32, f32), clicks: u32, button: MouseButton },
+    /// `button` is held and the cursor moved past the drag threshold since the
     /// `Down` (delivered for the rest of that press, wherever the cursor goes).
-    Drag { pos: (f32, f32) },
-    /// The press ended. `dragged` says whether any `Drag` preceded it.
-    Up { pos: (f32, f32), dragged: bool },
+    Drag { pos: (f32, f32), button: MouseButton },
+    /// The press of `button` ended. `dragged` says whether any `Drag` preceded
+    /// it.
+    Up { pos: (f32, f32), dragged: bool, button: MouseButton },
     /// Hover with no button held.
     Move { pos: (f32, f32) },
     /// The pointer, last hovering this view, moved on to something else
     /// (another view, the app's chrome, a modal, or out of the window; never
     /// during a press): drop hover state. `pos` is where it went.
     Leave { pos: (f32, f32) },
+}
+
+impl MouseEvent {
+    /// The button of a press (`Down`, `Drag`, `Up`); `None` for hover.
+    pub fn button(&self) -> Option<MouseButton> {
+        match *self {
+            Self::Down { button, .. } | Self::Drag { button, .. } | Self::Up { button, .. } => Some(button),
+            Self::Move { .. } | Self::Leave { .. } => None,
+        }
+    }
+
+    /// Whether this is a press of a button other than the left (views that
+    /// handle only the left button ignore these).
+    pub fn is_other_button(&self) -> bool {
+        self.button().is_some_and(|b| b != MouseButton::Left)
+    }
 }
 
 /// A key event as the platform reported it — presses and releases, with the
