@@ -18,7 +18,7 @@ use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 
 use crate::app_state::AppState;
 use crate::plugin::text_edit::{Action, Keymap, Motion};
-use crate::plugin::{EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View};
+use crate::plugin::{EventCx, MouseButton, MouseEvent, OpenCx, PaintCx, Plugin, Request, View};
 
 pub const ID: &str = "terminal";
 
@@ -136,9 +136,9 @@ pub struct TerminalView {
     selection: Option<Selection>,
     /// The cell a press landed on; a selection starts only once it's dragged.
     press_cell: Option<(u16, u16)>,
-    /// The current press (and its drag and release) goes to the program as mouse
-    /// reports instead of driving the local selection.
-    reporting: bool,
+    /// The button of the current press when it (and its drag and release) goes
+    /// to the program as mouse reports instead of driving the local selection.
+    reporting: Option<ReportButton>,
     /// Sub-line wheel remainder (px) carried between events, so a slow drag
     /// isn't rounded to nothing and momentum tails aren't dropped.
     scroll_accum: f32,
@@ -161,7 +161,7 @@ impl TerminalView {
             cell: (DEFAULT_CELL_W as f32, DEFAULT_CELL_H as f32),
             selection: None,
             press_cell: None,
-            reporting: false,
+            reporting: None,
             scroll_accum: 0.0,
             pending_scroll: 0,
             exit: None,
@@ -465,37 +465,40 @@ impl View for TerminalView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
-        if event.is_other_button() {
-            return;
-        }
         let mods = cx.mods;
         // A release can be lost (the window lost focus mid-drag, say), which
         // would leave the program believing the button is still held. A new
         // press first closes the old one.
         if let MouseEvent::Down { pos, .. } = *event {
-            if std::mem::take(&mut self.reporting) {
-                self.report_mouse(MouseAction::Release, Some(ReportButton::Left), mods, pos);
+            if let Some(held) = self.reporting.take() {
+                self.report_mouse(MouseAction::Release, Some(held), mods, pos);
             }
         }
         match *event {
-            MouseEvent::Down { pos, .. } if self.forwards_mouse(mods) => {
-                self.reporting = true;
-                self.press_cell = None;
-                if self.selection.take().is_some() {
-                    cx.redraw();
+            MouseEvent::Down { pos, button, .. } if self.forwards_mouse(mods) => {
+                let button = report_button(button);
+                self.reporting = Some(button);
+                // Only the left button drives the local selection.
+                if button == ReportButton::Left {
+                    self.press_cell = None;
+                    if self.selection.take().is_some() {
+                        cx.redraw();
+                    }
                 }
-                self.report_mouse(MouseAction::Press, Some(ReportButton::Left), mods, pos);
+                self.report_mouse(MouseAction::Press, Some(button), mods, pos);
             }
-            MouseEvent::Drag { pos, .. } if self.reporting => {
-                self.report_mouse(MouseAction::Motion, Some(ReportButton::Left), mods, pos);
+            MouseEvent::Drag { pos, .. } if self.reporting.is_some() => {
+                self.report_mouse(MouseAction::Motion, self.reporting, mods, pos);
             }
-            MouseEvent::Up { pos, .. } if self.reporting => {
-                self.reporting = false;
-                self.report_mouse(MouseAction::Release, Some(ReportButton::Left), mods, pos);
+            MouseEvent::Up { pos, .. } if self.reporting.is_some() => {
+                let held = self.reporting.take();
+                self.report_mouse(MouseAction::Release, held, mods, pos);
             }
             MouseEvent::Move { pos } if self.forwards_mouse(mods) => {
                 self.report_mouse(MouseAction::Motion, None, mods, pos);
             }
+            // The local selection is the left button's.
+            _ if event.is_other_button() => {}
             // A press only records the anchor; a plain click never highlights.
             MouseEvent::Down { pos: (x, y), clicks, .. } => {
                 if self.selection.take().is_some() {
@@ -638,6 +641,14 @@ impl View for TerminalView {
 
 /// The row the exit banner takes: the first blank one from the cursor's down,
 /// if any.
+fn report_button(b: MouseButton) -> ReportButton {
+    match b {
+        MouseButton::Left => ReportButton::Left,
+        MouseButton::Middle => ReportButton::Middle,
+        MouseButton::Right => ReportButton::Right,
+    }
+}
+
 fn banner_row(grid: &Grid) -> Option<u16> {
     (grid.cursor.row..grid.size.rows).find(|&r| row_content_len(grid, r) == 0)
 }
@@ -854,7 +865,6 @@ fn selection_row_span(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::MouseButton;
     use ghostrealm_terminal::{CellAttrs, Cursor, GridSize};
 
     fn grid_of(rows: &[&str]) -> Grid {
@@ -1014,7 +1024,7 @@ mod tests {
         }
         // Live: the press belongs to the program.
         h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1, button: MouseButton::Left });
-        assert!(v.reporting);
+        assert!(v.reporting.is_some());
         h.mouse(&mut v, MouseEvent::Up { pos: cell(1, 1), dragged: false, button: MouseButton::Left });
 
         v.term.scroll(Scroll::Delta(-10));
@@ -1024,7 +1034,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 1), clicks: 1, button: MouseButton::Left });
-        assert!(!v.reporting, "nothing is reported while scrolled back");
+        assert!(v.reporting.is_none(), "nothing is reported while scrolled back");
         h.mouse(&mut v, MouseEvent::Drag { pos: cell(4, 1), button: MouseButton::Left });
         assert!(v.selection.is_some(), "the drag selects locally");
         assert!(v.term.mouse_tracking(), "the program still tracks the mouse");
@@ -1163,6 +1173,43 @@ mod tests {
     }
 
     #[test]
+    fn a_tracking_program_gets_right_and_middle_presses_and_drags() {
+        let mut v = echoing("\\033[?1003h\\033[?1006h");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let sel = Some(Selection { anchor: (0, 0), head: (3, 0), explicit: false });
+        v.selection = sel;
+        let (right, middle) = (MouseButton::Right, MouseButton::Middle);
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(2, 1), clicks: 1, button: right });
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(5, 1), button: right });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(5, 1), dragged: true, button: right });
+        h.mouse(&mut v, MouseEvent::Down { pos: cell(1, 2), clicks: 1, button: middle });
+        h.mouse(&mut v, MouseEvent::Drag { pos: cell(3, 2), button: middle });
+        h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 2), dragged: true, button: middle });
+        assert!(v.reporting.is_none());
+        assert_eq!(v.selection, sel, "the selection is the left button's");
+        v.write(b"\r");
+        let screen = echoed(&mut v, "^[[<1;4;3m");
+        assert_eq!(screen, "READY^[[<2;3;2M^[[<34;6;2M^[[<2;6;2m^[[<1;2;3M^[[<33;4;3M^[[<1;4;3m");
+    }
+
+    #[test]
+    fn right_and_middle_presses_leave_the_local_selection_alone() {
+        let mut v = echoing("");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let sel = Some(Selection { anchor: (0, 0), head: (3, 0), explicit: false });
+        v.selection = sel;
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            h.mouse(&mut v, MouseEvent::Down { pos: cell(5, 1), clicks: 2, button });
+            h.mouse(&mut v, MouseEvent::Drag { pos: cell(7, 1), button });
+            h.mouse(&mut v, MouseEvent::Up { pos: cell(7, 1), dragged: true, button });
+        }
+        assert_eq!(v.selection, sel);
+        assert!(v.press_cell.is_none() && v.reporting.is_none());
+    }
+
+    #[test]
     fn the_wheel_goes_to_a_tracking_program_not_the_scrollback() {
         let mut v = echoing("\\033[?1000h\\033[?1006h");
         let h = Harness::new();
@@ -1191,7 +1238,7 @@ mod tests {
         // No Up arrives.
         h.mouse(&mut v, MouseEvent::Down { pos: cell(4, 1), clicks: 1, button: MouseButton::Left });
         h.mouse(&mut v, MouseEvent::Up { pos: cell(4, 1), dragged: false, button: MouseButton::Left });
-        assert!(!v.reporting);
+        assert!(v.reporting.is_none());
         v.write(b"\r");
         let screen = echoed(&mut v, "^[[<0;5;2m");
         assert_eq!(screen, "READY^[[<0;3;2M^[[<0;5;2m^[[<0;5;2M^[[<0;5;2m");
@@ -1204,7 +1251,7 @@ mod tests {
         h.paint(&mut v, RECT);
         h.mouse_with(&mut v, SHIFT, MouseEvent::Down { pos: cell(0, 0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.press_cell, Some((0, 0)), "a local press");
-        assert!(!v.reporting);
+        assert!(v.reporting.is_none());
         h.mouse_with(&mut v, SHIFT, MouseEvent::Drag { pos: cell(3, 0), button: MouseButton::Left });
         assert!(v.selection.is_some(), "Shift+drag selects");
         h.mouse(&mut v, MouseEvent::Up { pos: cell(3, 0), dragged: true, button: MouseButton::Left });
