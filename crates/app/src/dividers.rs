@@ -115,8 +115,7 @@ impl Dividers {
     /// The divider to draw highlighted (hovered, or dragged: `true`).
     pub fn highlight(&self, tree: &Tree, frame: &Frame) -> Option<(Divider, bool)> {
         if let Some(drag) = &self.drag {
-            let shown = tree.active_vtab() == Some(drag.vt);
-            return dragged_divider(tree, drag, frame).filter(|_| shown).map(|d| (d, true));
+            return dragged_divider(tree, drag, frame).map(|d| (d, true));
         }
         let (vt, path) = self.hover.as_ref()?;
         if tree.active_vtab() != Some(*vt) {
@@ -139,9 +138,12 @@ fn pane_ids(v: &Vtab) -> Vec<PaneId> {
     v.panes().into_iter().map(|p| p.id).collect()
 }
 
-/// The divider `drag` holds, laid out in `frame`; none once its vtab closed or
-/// its panes changed.
+/// The divider `drag` holds, laid out in `frame`; none once its vtab closed,
+/// went out of view, or its panes changed.
 fn dragged_divider(tree: &Tree, drag: &Drag, frame: &Frame) -> Option<Divider> {
+    if tree.active_vtab() != Some(drag.vt) {
+        return None;
+    }
     let v = tree.vtab(drag.vt)?;
     if pane_ids(v) != drag.panes {
         return None;
@@ -301,6 +303,21 @@ mod tests {
         let root = t.vtab(vt).unwrap().dividers(frame.workspace, frame.gap).remove(0);
         assert_eq!((root.path, root.axis), (vec![], Axis::TopBottom), "the path now names the other split");
         assert_eq!(dragged_divider(&t, &drag, &frame), None);
+    }
+
+    #[test]
+    fn a_drag_lets_go_when_its_vtab_goes_out_of_view() {
+        let (mut t, vt, left) = side_by_side();
+        let mut d = Dividers::default();
+        let at = (403.0, 300.0);
+        let hit = under(&t, &FRAME, at).unwrap();
+        assert_eq!(d.press(&mut t, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
+        t.add_vtab("other");
+        assert!(d.drag(&mut t, &FRAME, (203.0, 300.0)));
+        assert!(!d.dragging() && d.highlight(&t, &FRAME).is_none());
+        t.focus_vtab(vt);
+        assert!(!d.drag(&mut t, &FRAME, (203.0, 300.0)), "not picked up again");
+        assert_eq!(width(&t, vt, left), 400.0);
     }
 
     #[test]
