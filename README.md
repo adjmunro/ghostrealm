@@ -55,12 +55,13 @@ there, so it offers only Cancel and the discard button.
 Every open editor checks its file the same way (modification time, size, and
 inode, every 2 s while the window is focused and when it gains focus). When another
 program wrote the file, an editor without unsaved edits re-reads it (as one undo
-step); one with unsaved edits keeps them and shows its file name in amber. Saving a file
+step); one with unsaved edits keeps them and shows its file name in amber (in the tab strip too). Saving a file
 that changed on disk since the editor loaded or wrote it (Cmd+S, Save and Quit, Save
 and Close) asks first: Overwrite / Reload (discards your edits, loads the disk
 version and stops the close or quit; one undo step brings the edits back) / Cancel;
 there Enter cancels. Autosave never asks and never
-overwrites such a file: it skips it and the buffer stays modified. Saving a file that
+overwrites such a file: it skips it and the buffer stays modified. Undoing back past
+a reload, or a file that became unreadable as text, counts the same way. Saving a file that
 was deleted on disk recreates it without asking.
 
 Right-click a file or folder in the file browser (or empty space in it), or click

@@ -3858,9 +3858,12 @@ impl State {
                     }
                     // Italic when the tab's view has unsaved changes.
                     let unsaved = self.app.view(*sid).is_some_and(|v| v.modified());
+                    // Amber when the file changed on disk under unsaved edits.
+                    let changed = self.app.view(*sid).is_some_and(|v| v.marked_changed_on_disk());
+                    let title_color = if changed { theme::WARN } else { [220, 220, 230] };
                     let mut title_attrs = Attrs::new()
                         .family(Family::SansSerif)
-                        .color(Color::rgb(220, 220, 230));
+                        .color(Color::rgb(title_color[0], title_color[1], title_color[2]));
                     if unsaved {
                         title_attrs = title_attrs.style(Style::Italic);
                     }
@@ -3885,7 +3888,7 @@ impl State {
                             right: close_x as i32,
                             bottom: (pr.rect.y + *strip_h) as i32,
                         },
-                        color: [220, 220, 230],
+                        color: title_color,
                     });
                     strip_idx += 1;
                     // Close ('×') button for this tab.

@@ -130,12 +130,14 @@ into the overlay layer; it doesn't need to know.
   whether another program wrote the file (the app polls every 2 s while the
   window is focused and on window focus): a view showing it with no unsaved
   changes re-reads it; one with unsaved changes keeps them and marks itself.
-  It returns whether what the view shows changed. `disk_conflict` says writing
-  the file now would overwrite a version the view hasn't seen (the file changed
-  since the view loaded or wrote it; a deleted file is not one), and `reload`
-  replaces the content with the disk version. The app asks Overwrite / Reload /
-  Cancel before a Save and Close / Save and Quit writes such a view and when a
-  view files `Request::SaveConflict`; autosave (`autosave`, idle, blur) must
+  It returns whether what the view shows changed; `marked_changed_on_disk`
+  says it marked itself (the tab title shows amber). `disk_conflict` says
+  writing the file now would overwrite a version the view hasn't seen (the file
+  changed since the view loaded or wrote it, or its text predates a reload; a
+  deleted file is not one), and `reload` replaces the content with the disk
+  version. The app asks Overwrite / Reload / Cancel before a Save and Close /
+  Save and Quit writes such a view and when a view files
+  `Request::SaveConflict`; Reload stops the close or quit. Autosave (`autosave`, idle, blur) must
   skip a view with a `disk_conflict` rather than ask.
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),

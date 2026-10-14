@@ -259,6 +259,12 @@ pub trait View: Any {
         false
     }
 
+    /// The view is marked as differing from its file on disk (the tab title
+    /// shows amber).
+    fn marked_changed_on_disk(&self) -> bool {
+        false
+    }
+
     /// Whether writing the view's file now would overwrite a version it has
     /// not seen: another program wrote the file since the view loaded or
     /// wrote it.

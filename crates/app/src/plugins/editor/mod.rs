@@ -1009,6 +1009,10 @@ impl View for EditorView {
         }
     }
 
+    fn marked_changed_on_disk(&self) -> bool {
+        self.buf.changed_on_disk
+    }
+
     fn disk_conflict(&self) -> bool {
         self.buf.conflicted()
     }
@@ -1365,6 +1369,7 @@ mod tests {
         assert!(v.changed_on_disk(&path), "the mark appears");
         assert_eq!(v.buffer().lines, ["my one two"], "unsaved edits stay");
         assert!(v.buffer().changed_on_disk && v.modified());
+        assert!(v.marked_changed_on_disk(), "the tab strip shows it too");
         assert!(!v.changed_on_disk(&path), "marked once");
         assert!(v.disk_conflict(), "and still a conflict");
     }
