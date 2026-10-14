@@ -307,8 +307,8 @@ pub trait TerminalBackend {
     }
 
     /// Whether the grid changed since the last
-    /// [`snapshot_into`](Self::snapshot_into) and so needs re-snapshotting. Backends that cannot tell return `true`
-    /// (always re-snapshot).
+    /// [`snapshot_into`](Self::snapshot_into) and so needs re-snapshotting.
+    /// Backends that cannot tell return `true` (always re-snapshot).
     fn needs_snapshot(&self) -> bool {
         true
     }
