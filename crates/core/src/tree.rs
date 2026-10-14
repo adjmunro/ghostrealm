@@ -100,58 +100,11 @@ impl Node {
                 ratio,
                 first,
                 second,
-            } => match axis {
-                Axis::LeftRight => {
-                    let avail = (rect.w - gap).max(0.0);
-                    let fw = (avail * ratio).max(0.0);
-                    let sw = (avail - fw).max(0.0);
-                    first.layout_into(
-                        Rect {
-                            x: rect.x,
-                            y: rect.y,
-                            w: fw,
-                            h: rect.h,
-                        },
-                        gap,
-                        out,
-                    );
-                    second.layout_into(
-                        Rect {
-                            x: rect.x + fw + gap,
-                            y: rect.y,
-                            w: sw,
-                            h: rect.h,
-                        },
-                        gap,
-                        out,
-                    );
-                }
-                Axis::TopBottom => {
-                    let avail = (rect.h - gap).max(0.0);
-                    let fh = (avail * ratio).max(0.0);
-                    let sh = (avail - fh).max(0.0);
-                    first.layout_into(
-                        Rect {
-                            x: rect.x,
-                            y: rect.y,
-                            w: rect.w,
-                            h: fh,
-                        },
-                        gap,
-                        out,
-                    );
-                    second.layout_into(
-                        Rect {
-                            x: rect.x,
-                            y: rect.y + fh + gap,
-                            w: rect.w,
-                            h: sh,
-                        },
-                        gap,
-                        out,
-                    );
-                }
-            },
+            } => {
+                let (a, _, b) = split_rects(*axis, *ratio, rect, gap);
+                first.layout_into(a, gap, out);
+                second.layout_into(b, gap, out);
+            }
         }
     }
 
@@ -234,6 +187,33 @@ impl Node {
                     (None, None) => None,
                 }
             }
+        }
+    }
+}
+
+/// Divide `rect` for a split: the first child, the divider strip of width
+/// `gap`, and the second child. The children share what the strip leaves.
+fn split_rects(axis: Axis, ratio: f32, rect: Rect, gap: f32) -> (Rect, Rect, Rect) {
+    match axis {
+        Axis::LeftRight => {
+            let avail = (rect.w - gap).max(0.0);
+            let fw = (avail * ratio).max(0.0);
+            let sw = (avail - fw).max(0.0);
+            (
+                Rect { x: rect.x, y: rect.y, w: fw, h: rect.h },
+                Rect { x: rect.x + fw, y: rect.y, w: gap, h: rect.h },
+                Rect { x: rect.x + fw + gap, y: rect.y, w: sw, h: rect.h },
+            )
+        }
+        Axis::TopBottom => {
+            let avail = (rect.h - gap).max(0.0);
+            let fh = (avail * ratio).max(0.0);
+            let sh = (avail - fh).max(0.0);
+            (
+                Rect { x: rect.x, y: rect.y, w: rect.w, h: fh },
+                Rect { x: rect.x, y: rect.y + fh, w: rect.w, h: gap },
+                Rect { x: rect.x, y: rect.y + fh + gap, w: rect.w, h: sh },
+            )
         }
     }
 }
