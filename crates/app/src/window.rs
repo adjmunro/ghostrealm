@@ -4650,7 +4650,6 @@ fn sidebar_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
     }
 }
 
-/// The workspace rect (everything the sidebar doesn't occupy) for `side`.
 /// A divider being dragged: which split, and where along its strip it was
 /// grabbed.
 struct DividerDrag {
@@ -4698,6 +4697,7 @@ fn dragged_ratio(divider: &Divider, grab: f32, pointer: (f32, f32), cell: (f32, 
     divider.ratio_at(pointer, grab, pane_min(divider.axis, cell.0, cell.1))
 }
 
+/// The workspace rect (everything the sidebar doesn't occupy) for `side`.
 fn workspace_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
     let x = match side {
         Side::Left => width,
