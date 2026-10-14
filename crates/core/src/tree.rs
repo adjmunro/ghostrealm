@@ -294,14 +294,20 @@ impl Divider {
         (self.along(p) - (self.strip_start() + self.strip_len() * 0.5)).abs()
     }
 
+    /// The strip widened by `slop` on both sides: where a pointer grabs it.
+    pub fn grab_rect(&self, slop: f32) -> Rect {
+        let s = self.strip;
+        match self.axis {
+            Axis::LeftRight => Rect { x: s.x - slop, w: s.w + 2.0 * slop, ..s },
+            Axis::TopBottom => Rect { y: s.y - slop, h: s.h + 2.0 * slop, ..s },
+        }
+    }
+
     /// Whether `p` is on the strip or within `slop` of either side of it (and
     /// within the split's extent along the strip).
     pub fn grabs(&self, slop: f32, p: (f32, f32)) -> bool {
-        let across = match self.axis {
-            Axis::LeftRight => (self.span.y, self.span.h, p.1),
-            Axis::TopBottom => (self.span.x, self.span.w, p.0),
-        };
-        self.off_centre(p) <= self.strip_len() * 0.5 + slop && across.2 >= across.0 && across.2 < across.0 + across.1
+        let r = self.grab_rect(slop);
+        p.0 >= r.x && p.0 < r.x + r.w && p.1 >= r.y && p.1 < r.y + r.h
     }
 
     /// Where along the strip `p` grabbed it (to keep that spot under the
@@ -914,6 +920,8 @@ mod tests {
         assert_eq!((ds[0].path.clone(), ds[0].axis), (vec![], Axis::LeftRight));
         assert_eq!(ds[0].strip, Rect { x: 400.0, y: 0.0, w: 4.0, h: 604.0 });
         assert_eq!(ds[0].span, WS);
+        assert_eq!(ds[0].grab_rect(3.0), Rect { x: 397.0, y: 0.0, w: 10.0, h: 604.0 }, "centred on the gap");
+        assert_eq!(ds[1].grab_rect(3.0), Rect { x: 404.0, y: 297.0, w: 400.0, h: 10.0 });
         assert_eq!((ds[1].path.clone(), ds[1].axis), (vec![true], Axis::TopBottom));
         assert_eq!(ds[1].strip, Rect { x: 404.0, y: 300.0, w: 400.0, h: 4.0 });
         assert_eq!(ds[1].span, Rect { x: 404.0, y: 0.0, w: 400.0, h: 604.0 });
