@@ -1609,14 +1609,18 @@ impl State {
         clicks
     }
 
-    fn on_click(&mut self) {
-        // A release can be lost (the window lost focus mid-drag, say). The view
-        // still holding that press hears its `Up` before this one starts, so it
-        // does not keep reporting a held button.
+    /// A release can be lost (the window lost focus mid-drag, say). The view
+    /// still holding that press hears its `Up` before a new one starts, so it
+    /// does not keep reporting a held button.
+    fn release_lost_press(&mut self) {
         if let Some(sid) = self.mouse_capture.take() {
             let (pos, dragged) = (self.cursor, self.dragging);
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged }));
         }
+    }
+
+    fn on_click(&mut self) {
+        self.release_lost_press();
         // A confirmation takes only its buttons (they arm on press).
         if self.app.confirm().is_some() {
             return;
