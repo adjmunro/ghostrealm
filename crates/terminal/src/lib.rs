@@ -263,6 +263,12 @@ pub trait TerminalBackend {
         true
     }
 
+    /// Whether the program switched to the alternate screen, which keeps no
+    /// scrollback.
+    fn alt_screen(&self) -> bool {
+        false
+    }
+
     /// Report a pointer event in whichever protocol the program selected. Does
     /// nothing unless [`mouse_tracking`](Self::mouse_tracking) is on and the
     /// tracking mode reports this kind of event.

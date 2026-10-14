@@ -420,6 +420,16 @@ fn wait_for_row(term: &mut GhosttyTerminal, want: &str) -> String {
     }
 }
 
+#[test]
+fn reports_the_alternate_screen() {
+    let mut term = cat_v_with("", |_| true);
+    term.write_bytes(b"x\r");
+    wait_for_row(&mut term, "x");
+    assert!(!term.alt_screen(), "the primary screen");
+    // Waits for the switch to show.
+    cat_v_with("\\033[?1049h", |t| t.alt_screen());
+}
+
 fn bracketed_on(t: &GhosttyTerminal) -> bool {
     t.encode_paste("x").is_ok_and(|b| b.starts_with(b"\x1b[200~"))
 }

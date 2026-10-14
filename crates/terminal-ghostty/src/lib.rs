@@ -27,6 +27,7 @@ use libghostty_vt::mouse as vtmouse;
 use libghostty_vt::paste as vtpaste;
 use libghostty_vt::terminal::Mode;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::screen::Screen;
 use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::Terminal;
@@ -616,6 +617,10 @@ impl TerminalBackend for GhosttyTerminal {
 
     fn viewport_active(&self) -> bool {
         self.term.viewport_active().unwrap_or(true)
+    }
+
+    fn alt_screen(&self) -> bool {
+        self.term.active_screen().is_ok_and(|s| s == Screen::Alternate)
     }
 
     fn send_mouse(&mut self, report: &MouseReport) {
