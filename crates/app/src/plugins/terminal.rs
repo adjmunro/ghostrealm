@@ -324,7 +324,10 @@ impl View for TerminalView {
         }
         // Resize the PTY only when the cell grid (or cell size) changes.
         let cols = ((rect.w / cw).floor() as u16).max(1);
-        let rows = ((rect.h / ch).floor() as u16).max(1);
+        let pane_rows = ((rect.h / ch).floor() as u16).max(1);
+        // Once the shell has ended, the grid gives up the pane's last row so
+        // the banner always has one below the output.
+        let rows = if self.exit.is_some() { (pane_rows - 1).max(1) } else { pane_rows };
         let geom = (cols, rows, cw.round() as u32, ch.round() as u32);
         if self.geom != Some(geom) {
             self.term.resize(cols, rows, geom.2, geom.3);
@@ -338,8 +341,11 @@ impl View for TerminalView {
         }
 
         let banner = self.exit.map(exit_banner);
-        // With no blank row to take, the banner covers the last one on screen.
-        let banner_row = banner_row(&self.grid).unwrap_or(self.grid.size.rows.saturating_sub(1));
+        // With no blank row to take, the banner takes the one below the grid,
+        // once the grid has been resized to leave it.
+        let banner_row = banner
+            .as_ref()
+            .and(banner_row(&self.grid).or(Some(self.grid.size.rows).filter(|&r| r < pane_rows)));
         let grid = &self.grid;
         cx.fill(rect, grid.default_bg);
         if let Some(sel) = self.selection {
@@ -363,6 +369,9 @@ impl View for TerminalView {
                     }
                 }
             }
+            if Some(row) == banner_row {
+                continue;
+            }
             // Keyed over the inked prefix only: trailing blanks neither cost
             // shaping nor split otherwise-identical rows in the cache. The key
             // hashes cells in place; spans are built only on a miss.
@@ -372,14 +381,14 @@ impl View for TerminalView {
                 None => ("", grid.default_fg),
             }));
             let top = rect.y + row as f32 * ch;
-            if let Some(text) = banner.as_deref().filter(|_| row == banner_row) {
-                let line = Rect { x: rect.x, y: top, w: rect.w, h: ch };
-                cx.fill_alpha(line, cx.chrome.accent, 0.35);
-                let key = cx.row_key(std::iter::once((text, grid.default_fg)));
-                cx.budgeted_row(key, || vec![(text.to_string(), grid.default_fg)], rect.x, top, rect.w, rect, grid.default_fg);
-                continue;
-            }
             cx.budgeted_row(key, || row_spans(grid, row), rect.x, top, rect.w, rect, grid.default_fg);
+        }
+        if let (Some(text), Some(row)) = (banner.as_deref(), banner_row) {
+            let top = rect.y + row as f32 * ch;
+            let line = Rect { x: rect.x, y: top, w: rect.w, h: ch };
+            cx.fill_alpha(line, cx.chrome.accent, 0.35);
+            let key = cx.row_key(std::iter::once((text, grid.default_fg)));
+            cx.budgeted_row(key, || vec![(text.to_string(), grid.default_fg)], rect.x, top, rect.w, rect, grid.default_fg);
         }
         if grid.cursor.visible && banner.is_none() {
             let fg = grid
@@ -648,8 +657,8 @@ fn report_button(b: MouseButton) -> ReportButton {
     }
 }
 
-/// The row the exit banner takes: the first blank one from the cursor's down,
-/// if any.
+/// The first blank row from the cursor's down, which the exit banner takes.
+/// With none, the banner goes below the grid.
 fn banner_row(grid: &Grid) -> Option<u16> {
     (grid.cursor.row..grid.size.rows).find(|&r| row_content_len(grid, r) == 0)
 }
@@ -995,6 +1004,56 @@ mod tests {
         assert_eq!(out.requests, vec![Request::Busy]);
         let (used, out) = h.key(&mut v, cmd(Key::Char('q')));
         assert!(!used && out.requests.is_empty());
+    }
+
+    /// Paint a view running `sh -c "printf go; read x; <script>"` at [`RECT`]
+    /// (10 rows), run the script, and paint until the grid reflects its exit
+    /// and its output shows `want`.
+    fn exited_after(script: &str, want: &str) -> (TerminalView, Harness) {
+        let mut v = running(&format!("printf go; read x; {script}"), "go");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        v.write_input(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The exit can be seen before the last output is read: wait for both.
+        while !v.text().unwrap_or_default().contains(want) || v.exit().is_none() {
+            assert!(Instant::now() < deadline, "`{script}` never exited with {want:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while v.grid.size.rows != 9 {
+            assert!(Instant::now() < deadline, "the grid never gave up a row");
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h.paint(&mut v, RECT);
+        (v, h)
+    }
+
+    #[test]
+    fn a_full_grid_keeps_its_last_row_above_the_banner() {
+        let (mut v, mut h) = exited_after("seq 1 12; printf last-row", "last-row");
+        assert_eq!(v.geom.map(|g| g.1), Some(9), "the pane's last row is left for the banner");
+        assert_eq!(banner_row(&v.grid), None, "no blank row below the cursor");
+        let tops: Vec<f32> = h.paint(&mut v, RECT).text.iter().map(|t| t.top).collect();
+        assert!(tops.contains(&(8.0 * UI.cell_h)), "the last grid row is drawn: {tops:?}");
+        assert!(tops.contains(&(9.0 * UI.cell_h)), "the banner is drawn below it: {tops:?}");
+        let text = v.text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 10, "nine grid rows and the banner: {text:?}");
+        assert_eq!(lines[8], "last-row");
+        assert_eq!(lines[9], exit_banner(Lifecycle::Exited(Some(0))));
+    }
+
+    #[test]
+    fn a_short_output_has_the_banner_on_the_row_below_it() {
+        let (mut v, mut h) = exited_after("echo hi", "hi");
+        assert_eq!(banner_row(&v.grid), Some(2), "the output stayed put");
+        let tops: Vec<f32> = h.paint(&mut v, RECT).text.iter().map(|t| t.top).collect();
+        assert_eq!(tops.len(), 9, "the banner takes a grid row: {tops:?}");
+        assert_eq!(tops.last(), Some(&(2.0 * UI.cell_h)), "the banner is drawn on row 2: {tops:?}");
+        let text = v.text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(&lines[..3], ["go", "hi", &exit_banner(Lifecycle::Exited(Some(0)))]);
     }
 
     #[test]
