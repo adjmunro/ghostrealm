@@ -84,6 +84,15 @@ pub struct Confirm {
     then: Confirmed,
 }
 
+impl Confirm {
+    /// Whether Enter cancels instead of accepting (and Cancel is drawn as the
+    /// primary button): accepting would write over another program's version
+    /// of a file, which a stray Enter must not do.
+    pub fn enter_cancels(&self) -> bool {
+        matches!(self.then, Confirmed::DiskConflict { .. })
+    }
+}
+
 /// What accepting a [`Confirm`] does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirmed {
@@ -587,6 +596,16 @@ impl AppState {
     /// Dismiss the confirmation; what asked for it stays as it was.
     pub fn cancel_confirm(&mut self) {
         self.confirm = None;
+    }
+
+    /// Answer the confirmation as Enter does: accept, or cancel when
+    /// [`Confirm::enter_cancels`]. Returns the files written.
+    pub fn enter_confirm(&mut self) -> Result<Vec<std::path::PathBuf>> {
+        if self.confirm.as_ref().is_some_and(Confirm::enter_cancels) {
+            self.cancel_confirm();
+            return Ok(Vec::new());
+        }
+        self.accept_confirm()
     }
 
     /// Go ahead with the confirmed action. Returns the files written. A
@@ -2436,6 +2455,35 @@ mod tests {
 
     fn lines(s: &AppState, sid: SurfaceId) -> Vec<String> {
         s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines.clone()
+    }
+
+    #[test]
+    fn enter_saves_at_the_unsaved_question_but_never_overwrites_a_changed_file() {
+        let dir = crate::plugin::testing::tmpdir("conflict-enter");
+        // Unsaved changes: Enter saves.
+        let (mut s, sid, file) = edited(&dir, "a.txt");
+        s.close_focused_surface();
+        assert!(!s.confirm().unwrap().enter_cancels());
+        assert_eq!(s.enter_confirm().unwrap(), vec![file.clone()]);
+        assert!(s.view(sid).is_none());
+
+        // A changed file: the Enter that saves reaches the changed-file
+        // question, and a second Enter cancels it.
+        let (mut s, sid, file) = conflicted(&dir, "b.txt");
+        s.close_focused_surface();
+        assert!(s.enter_confirm().unwrap().is_empty());
+        assert!(s.confirm().unwrap().enter_cancels());
+        assert!(s.enter_confirm().unwrap().is_empty());
+        assert!(s.confirm().is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+        assert!(s.view(sid).unwrap().modified());
+
+        // Likewise for an explicit save.
+        s.ask_disk_conflict(sid);
+        assert!(s.enter_confirm().unwrap().is_empty());
+        assert!(s.confirm().is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+        assert_eq!(lines(&s, sid), ["newold"]);
     }
 
     #[test]

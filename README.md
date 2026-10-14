@@ -58,7 +58,7 @@ program wrote the file, an editor without unsaved edits re-reads it (as one undo
 step); one with unsaved edits keeps them and shows its file name in amber. Saving a file
 that changed on disk since the editor loaded or wrote it (Cmd+S, Save and Quit, Save
 and Close) asks first: Overwrite / Reload (discards your edits, loads the disk
-version; one undo step brings them back) / Cancel. Autosave never asks and never
+version; one undo step brings them back) / Cancel; there Enter cancels. Autosave never asks and never
 overwrites such a file: it skips it and the buffer stays modified. Saving a file that
 was deleted on disk recreates it without asking.
 

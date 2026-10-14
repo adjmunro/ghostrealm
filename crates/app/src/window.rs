@@ -1523,7 +1523,14 @@ impl State {
 
     /// Go ahead with the open confirmation's action.
     fn accept_confirm(&mut self) {
-        match self.app.accept_confirm() {
+        let done = self.app.accept_confirm();
+        self.after_confirm(done);
+    }
+
+    /// Follow up an answered confirmation: hot-reload a written config, report
+    /// a failed save, and exit if it was a quit.
+    fn after_confirm(&mut self, done: Result<Vec<std::path::PathBuf>>) {
+        match done {
             Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
             Err(e) => eprintln!("ghostrealm: save: {e:#}"),
         }
@@ -2499,10 +2506,12 @@ impl State {
         let pad = 12.0 * scale;
         frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let bh = ch + 8.0 * scale;
-        // Right to left: the primary button, Cancel, then the discard button.
+        // Right to left: accept, Cancel, then the discard button. The primary
+        // one is what Enter presses.
+        let cancels = confirm.enter_cancels();
         let buttons: Vec<(&'static str, ButtonAction, bool)> = [
-            confirm.accept.map(|l| (l, ButtonAction::ConfirmAccept, true)),
-            Some(("Cancel", ButtonAction::ConfirmCancel, false)),
+            confirm.accept.map(|l| (l, ButtonAction::ConfirmAccept, !cancels)),
+            Some(("Cancel", ButtonAction::ConfirmCancel, cancels)),
             confirm.discard.map(|l| (l, ButtonAction::ConfirmDiscard, false)),
         ]
         .into_iter()
@@ -3147,15 +3156,19 @@ impl State {
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
-        // A confirmation owns the keyboard: Enter accepts (the save button, when
-        // it has one), Escape cancels. A held
+        // A confirmation owns the keyboard: Enter presses the primary button
+        // (the save button, when it has one; Cancel over a file changed on
+        // disk), Escape cancels. A held
         // key's repeats are ignored, so the Enter that asked can't also answer.
         if self.app.confirm().is_some() {
             if event.repeat {
                 return;
             }
             match &event.logical_key {
-                WKey::Named(NamedKey::Enter) => self.accept_confirm(),
+                WKey::Named(NamedKey::Enter) => {
+                    let done = self.app.enter_confirm();
+                    self.after_confirm(done);
+                }
                 WKey::Named(NamedKey::Escape) => self.app.cancel_confirm(),
                 _ => {}
             }
