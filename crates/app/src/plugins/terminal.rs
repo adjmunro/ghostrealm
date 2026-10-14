@@ -639,8 +639,7 @@ impl View for TerminalView {
     }
 }
 
-/// The row the exit banner takes: the first blank one from the cursor's down,
-/// if any.
+/// The button a tracking program hears for a press of `b`.
 fn report_button(b: MouseButton) -> ReportButton {
     match b {
         MouseButton::Left => ReportButton::Left,
@@ -649,6 +648,8 @@ fn report_button(b: MouseButton) -> ReportButton {
     }
 }
 
+/// The row the exit banner takes: the first blank one from the cursor's down,
+/// if any.
 fn banner_row(grid: &Grid) -> Option<u16> {
     (grid.cursor.row..grid.size.rows).find(|&r| row_content_len(grid, r) == 0)
 }
