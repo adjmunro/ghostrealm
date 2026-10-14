@@ -169,10 +169,13 @@ impl Node {
         };
         let (a, b) = (along(first.min_size(gap, min)), along(second.min_size(gap, min)));
         let avail = along((rect.w, rect.h)) - gap;
-        *ratio = if avail <= 0.0 || a + b > avail {
+        // With room for just the minimums, rounding can put `lo` a hair above
+        // `hi` (a nested split laid out at exactly its minimum, say).
+        let (lo, hi) = (a / avail, 1.0 - b / avail);
+        *ratio = if avail <= 0.0 || a + b > avail || lo > hi {
             if a + b > 0.0 { a / (a + b) } else { 0.5 }
         } else {
-            ratio.clamp(a / avail, 1.0 - b / avail)
+            ratio.clamp(lo, hi)
         };
         let (ra, _, rb) = split_rects(*axis, *ratio, rect, gap);
         first.fit(ra, gap, min);
@@ -1102,6 +1105,62 @@ mod tests {
         assert!(t.resize_split(vt, &[], 0.75, WS, 4.0, &min));
         assert!(near(width_of(&t, vt, right), 50.0), "still at its minimum");
         assert!(near(width_of(&t, vt, middle), 200.0 - 4.0 - 50.0));
+    }
+
+    #[test]
+    fn a_split_laid_out_at_exactly_its_minimums_fits_without_panicking() {
+        // (top / (b / (c | d))) / e: dragging the root to each end leaves the
+        // nested splits exactly their minimums plus the gap.
+        let mut t = Tree::new();
+        let (vt, top, _) = t.add_vtab("a");
+        let (e, _) = t.split(vt, top, Axis::TopBottom).unwrap();
+        let (b, _) = t.split(vt, top, Axis::TopBottom).unwrap();
+        let (c, _) = t.split(vt, b, Axis::TopBottom).unwrap();
+        t.split(vt, c, Axis::LeftRight).unwrap();
+        let ws = Rect { x: 0.0, y: 56.0, w: 1974.0, h: 972.0 };
+        let min = |_: &Pane| (8.0 * 15.6, 4.0 * 33.0 + 45.0);
+        assert!(t.resize_split(vt, &[], 5.0, ws, 6.0, &min));
+        assert!(t.resize_split(vt, &[], -5.0, ws, 6.0, &min));
+        let h = |id| t.vtab(vt).unwrap().layout(ws, 6.0).into_iter().find(|(p, _)| *p == id).unwrap().1.h;
+        assert!((h(top) - 177.0).abs() < 0.01 && h(e) > 177.0);
+    }
+
+    #[test]
+    fn any_drag_keeps_the_minimums_where_they_fit_and_never_panics() {
+        // Splits nested both ways, every divider dragged to a pseudo-random
+        // ratio (often past an end), over a range of cell sizes.
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        for _ in 0..200 {
+            let mut t = Tree::new();
+            let (vt, first, _) = t.add_vtab("a");
+            let mut panes = vec![first];
+            for i in 0..5 {
+                let target = panes[(next() * panes.len() as f32) as usize % panes.len()];
+                let axis = if i % 2 == 0 { Axis::LeftRight } else { Axis::TopBottom };
+                panes.push(t.split(vt, target, axis).unwrap().0);
+            }
+            let cell = (6.0 + next() * 14.0, 12.0 + next() * 30.0);
+            let min = move |_: &Pane| (8.0 * cell.0, 4.0 * cell.1 + cell.1 + 6.0);
+            let ws = Rect { x: 0.0, y: 0.0, w: 600.0 + next() * 2000.0, h: 400.0 + next() * 1200.0 };
+            let root_min = t.vtab(vt).unwrap().root.min_size(6.0, &min);
+            for _ in 0..20 {
+                let paths: Vec<_> = t.vtab(vt).unwrap().dividers(ws, 6.0).into_iter().map(|d| d.path).collect();
+                let path = &paths[(next() * paths.len() as f32) as usize % paths.len()];
+                assert!(t.resize_split(vt, path, next() * 3.0 - 1.0, ws, 6.0, &min));
+            }
+            if root_min.0 <= ws.w && root_min.1 <= ws.h {
+                for (_, r) in t.vtab(vt).unwrap().layout(ws, 6.0) {
+                    let (mw, mh) = min(t.vtab(vt).unwrap().panes()[0]);
+                    assert!(r.w >= mw - 0.1 && r.h >= mh - 0.1, "{r:?} below ({mw}, {mh})");
+                }
+            }
+        }
     }
 
     #[test]
