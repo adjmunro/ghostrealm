@@ -1581,6 +1581,17 @@ mod tests {
         // Redoing back to the reloaded text is the file again.
         v.buffer_mut().redo();
         assert!(!v.modified() && !v.disk_conflict());
+        assert!(!v.marked_changed_on_disk(), "no longer marked");
+    }
+
+    #[test]
+    fn undo_keeps_the_mark_while_the_file_changed_under_unsaved_edits() {
+        let (mut v, path) = conflicted("editor-undo-conflict");
+        assert!(v.changed_on_disk(&path), "the mark appears");
+        v.buffer_mut().undo();
+        assert!(v.marked_changed_on_disk() && v.disk_conflict(), "the file still isn't what the buffer read");
+        v.buffer_mut().redo();
+        assert!(v.marked_changed_on_disk());
     }
 
     #[test]

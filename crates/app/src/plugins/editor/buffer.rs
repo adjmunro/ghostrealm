@@ -638,8 +638,9 @@ impl EditorBuffer {
         self.edits = self.edits.wrapping_add(1);
         self.dirty_from = Some(0);
         self.modified = s.version != self.history.saved_version;
-        // The file changed under this text: saving it asks.
-        self.changed_on_disk |= s.stale;
+        // Marked while saving this text would ask: it predates a reload, or
+        // the file changed since the buffer read it.
+        self.changed_on_disk = self.conflicted();
     }
 
     /// Step back to the state before the last undo step.
