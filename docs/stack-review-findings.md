@@ -18,14 +18,6 @@ it; the rest come from reading the code.
   Tracked in TODO.md ("User-visible error surface"): it needs a design, and the
   user wants to be prompted about it.
 
-## Low
-
-7. The git filter runs `git status --untracked-files=all` on the UI thread
-   (`ensure_git_status`, [`fs_tree.rs:438`](../crates/core/src/fs_tree.rs)),
-   the first time a git filter or the git view is shown after a refresh. A
-   large repo, or a large untracked directory (listed file by file), stalls
-   a frame.
-
 ## To confirm
 
 `41d9d6b` changed the first cardinal rule in `docs/GIT.md` from "do not commit

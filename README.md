@@ -77,7 +77,10 @@ Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclud
 (in a git repository), Rename, Save Copy As (editor), and Delete, last under a rule.
 Delete moves to the Trash (macOS only for now) and closes the file's editors; it asks
 first unless git tracks the file and it is unmodified (a folder: all of it, and it
-isn't a repository itself). Names are asked for in the palette's argument prompt.
+isn't a repository itself). Paste, Duplicate, and Delete's git check run in the
+background, one at a time in the order given, so a big folder doesn't freeze the
+window; quitting waits for one still running, with the window hidden. Names are
+asked for in the palette's argument prompt.
 Each item is also a `file.*` command (palette, agent, key bindings) acting on the
 focused file, or on its `path` argument (a relative one is taken from the workspace
 folder). Cut and Copy keep the
@@ -95,7 +98,7 @@ line — over the same command registry the palette and keybindings use:
 ```
 {"op":"help"}                              # all commands + arg schemas
 {"op":"search","query":"split"}            # fuzzy match -> ids
-{"op":"set","id":"split.leftright"}        # run a command
+{"op":"set","id":"split.leftright"}        # run a command (file commands reply when done)
 {"op":"get","what":"tree"}                 # text dump of vtabs/panes/surfaces
 {"op":"get","what":"surface","id":3}       # a surface's grid as text
 {"op":"input","text":"ls\r","id":3}        # type into a surface

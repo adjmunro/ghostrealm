@@ -128,8 +128,10 @@ into the overlay layer; it doesn't need to know.
   button files the same request). `subject` is the file or folder the `file.*`
   commands act on when given no `path` (default: `path`; the browser's is its
   selected entry). `save_copy` backs Save Copy As. `files_changed(moved)` hears
-  that the app created, copied, moved, renamed, or deleted files: a listing
-  re-reads, a view of a moved file follows it (`file_ops::follow`).
+  that the app created, copied, moved, renamed, or deleted files (a copy or move
+  once the file worker, `file_jobs`, finishes it, which may be after the
+  command returned): a listing re-reads, a view of a moved file follows it
+  (`file_ops::follow`).
   `changed_on_disk(path)` is asked, for each open view's `path`, to check
   whether another program wrote the file (the app polls every 2 s while the
   window is focused and on window focus): a view showing it with no unsaved
