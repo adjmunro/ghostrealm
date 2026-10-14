@@ -3,14 +3,15 @@
 //! in, so the press/drag/release flow is testable without a window.
 
 use crate::clicks::{Click, ClickCounter};
-use ghostrealm_core::{Axis, Divider, PaneId, Rect, SplitPath, Tree, Vtab, VtabId};
+use ghostrealm_core::{Divider, Pane, PaneId, Rect, SplitPath, Tree, Vtab, VtabId};
 
-/// Dragging a divider leaves each pane at least this many columns / rows.
+/// Dragging a divider leaves each pane's content (below its tab strip) at
+/// least this many columns / rows.
 const MIN_PANE_COLS: f32 = 8.0;
 const MIN_PANE_ROWS: f32 = 4.0;
 
-/// Where the dividers are laid out, and the cell size that sets how small a
-/// drag may make a pane. All in physical pixels.
+/// Where the dividers are laid out, and the sizes that set how small a drag
+/// may make a pane. All in physical pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     pub workspace: Rect,
@@ -19,6 +20,25 @@ pub struct Frame {
     /// How far either side of the gap a pointer still grabs it.
     pub slop: f32,
     pub cell: (f32, f32),
+    /// A pane's tab strip, and whether a pane with at most one surface shows
+    /// it (`[tabs] autohide_single_tab` off).
+    pub strip_h: f32,
+    pub strip_for_one: bool,
+}
+
+impl Frame {
+    /// The least room pane `p` may be dragged to, (width, height): its tab
+    /// strip, if shown, and a few cells of content.
+    pub fn pane_min(&self, p: &Pane) -> (f32, f32) {
+        let strip = if p.surfaces.len() > 1 || self.strip_for_one { self.strip_h } else { 0.0 };
+        (MIN_PANE_COLS * self.cell.0, MIN_PANE_ROWS * self.cell.1 + strip)
+    }
+
+    /// Resize the split at `path` of `vt` to `ratio`, keeping every pane in it
+    /// at least [`Self::pane_min`].
+    fn resize(&self, tree: &mut Tree, vt: VtabId, path: &[bool], ratio: f32) -> bool {
+        tree.resize_split(vt, path, ratio, self.workspace, self.gap, &|p| self.pane_min(p))
+    }
 }
 
 /// What a press on a divider did.
@@ -75,9 +95,9 @@ impl Dividers {
 
     /// A left press, `click`, on divider `d` of `vt`: grab it to drag, or reset
     /// its split to halves on a double-click.
-    pub fn press(&mut self, tree: &mut Tree, (vt, d): (VtabId, Divider), click: &Click) -> Press {
+    pub fn press(&mut self, tree: &mut Tree, frame: &Frame, (vt, d): (VtabId, Divider), click: &Click) -> Press {
         if self.clicks.count(click) >= 2 {
-            tree.set_ratio(vt, &d.path, 0.5);
+            frame.resize(tree, vt, &d.path, 0.5);
             return Press::Reset;
         }
         let grab = d.grab_offset(click.pos);
@@ -102,8 +122,7 @@ impl Dividers {
             self.drag = None;
             return true;
         };
-        let ratio = dragged_ratio(&divider, drag.grab, p, frame.cell);
-        tree.set_ratio(drag.vt, &divider.path, ratio)
+        frame.resize(tree, drag.vt, &divider.path, divider.ratio_at(p, drag.grab))
     }
 
     /// The left button went up: let go of the divider. Returns whether one was
@@ -151,28 +170,22 @@ fn dragged_divider(tree: &Tree, drag: &Drag, frame: &Frame) -> Option<Divider> {
     v.dividers(frame.workspace, frame.gap).into_iter().find(|d| d.path == drag.path)
 }
 
-/// The least a pane may be dragged to along its split, in physical pixels.
-fn pane_min(axis: Axis, cell_w: f32, cell_h: f32) -> f32 {
-    match axis {
-        Axis::LeftRight => MIN_PANE_COLS * cell_w,
-        Axis::TopBottom => MIN_PANE_ROWS * cell_h,
-    }
-}
-
-/// The ratio a drag with the pointer at `pointer` gives `divider`'s split.
-fn dragged_ratio(divider: &Divider, grab: f32, pointer: (f32, f32), cell: (f32, f32)) -> f32 {
-    divider.ratio_at(pointer, grab, pane_min(divider.axis, cell.0, cell.1))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{dragged_divider, dragged_ratio, pane_ids, pane_min, under, Dividers, Drag, Frame, Press};
+    use super::{dragged_divider, pane_ids, under, Dividers, Drag, Frame, Press};
     use crate::clicks::Click;
     use ghostrealm_core::{Axis, PaneId, Rect, Tree, VtabId};
     use std::time::{Duration, Instant};
 
     /// 806x606: 800 px for two side-by-side panes, the strip at x = 400..406.
-    const FRAME: Frame = Frame { workspace: Rect { x: 0.0, y: 0.0, w: 806.0, h: 606.0 }, gap: 6.0, slop: 3.0, cell: (10.0, 20.0) };
+    const FRAME: Frame = Frame {
+        workspace: Rect { x: 0.0, y: 0.0, w: 806.0, h: 606.0 },
+        gap: 6.0,
+        slop: 3.0,
+        cell: (10.0, 20.0),
+        strip_h: 26.0,
+        strip_for_one: false,
+    };
 
     fn side_by_side() -> (Tree, VtabId, PaneId) {
         let mut t = Tree::new();
@@ -198,7 +211,7 @@ mod tests {
         let at = (403.0, 300.0);
         let hit = under(&t, &FRAME, at).expect("on the divider");
         assert!(d.hover(Some(&hit)));
-        assert_eq!(d.press(&mut t, hit, &click(t0, 0, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 0, at)), Press::Grabbed);
         assert!(d.drag(&mut t, &FRAME, (203.0, 300.0)));
         assert_eq!(width(&t, vt, left), 200.0, "the grabbed spot stays under the pointer");
         let (lit, dragging) = d.highlight(&t, &FRAME).expect("lit while dragged");
@@ -215,7 +228,7 @@ mod tests {
         let mut d = Dividers::default();
         let at = (403.0, 300.0);
         let hit = under(&t, &FRAME, at).unwrap();
-        assert_eq!(d.press(&mut t, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
         assert!(d.drag(&mut t, &FRAME, (303.0, 300.0)));
         // No release; the next press, in a pane, lets go first (the window's
         // `release_lost_press`).
@@ -228,15 +241,15 @@ mod tests {
     #[test]
     fn a_double_click_on_a_divider_resets_its_split_to_halves() {
         let (mut t, vt, left) = side_by_side();
-        t.set_ratio(vt, &[], 0.25);
+        FRAME.resize(&mut t, vt, &[], 0.25);
         let mut d = Dividers::default();
         let t0 = Instant::now();
         let at = (203.0, 300.0);
         let hit = under(&t, &FRAME, at).expect("on the divider");
-        assert_eq!(d.press(&mut t, hit, &click(t0, 0, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 0, at)), Press::Grabbed);
         assert!(d.release());
         let hit = under(&t, &FRAME, at).unwrap();
-        assert_eq!(d.press(&mut t, hit, &click(t0, 150, at)), Press::Reset);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 150, at)), Press::Reset);
         assert_eq!(width(&t, vt, left), 400.0);
         assert!(!d.dragging(), "a reset grabs nothing");
     }
@@ -244,55 +257,68 @@ mod tests {
     #[test]
     fn a_press_elsewhere_between_two_on_a_divider_is_no_double_click() {
         let (mut t, vt, left) = side_by_side();
-        t.set_ratio(vt, &[], 0.25);
+        FRAME.resize(&mut t, vt, &[], 0.25);
         let mut d = Dividers::default();
         let t0 = Instant::now();
         let at = (203.0, 300.0);
         // A pane click beside the divider, then a press on it.
         d.missed();
         let hit = under(&t, &FRAME, at).unwrap();
-        assert_eq!(d.press(&mut t, hit, &click(t0, 100, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 100, at)), Press::Grabbed);
         assert!(d.release());
         // A press on it, a pane click, and another press on it.
         d.missed();
         let hit = under(&t, &FRAME, at).unwrap();
-        assert_eq!(d.press(&mut t, hit, &click(t0, 200, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 200, at)), Press::Grabbed);
         assert_eq!(width(&t, vt, left), 200.0, "the split kept its ratio");
     }
 
     #[test]
-    fn dragging_a_divider_resizes_its_split_down_to_a_few_cells() {
-        const GAP: f32 = 6.0;
-        let ws = Rect { x: 200.0, y: 28.0, w: 806.0, h: 628.0 };
-        let cell = (10.0, 20.0);
+    fn a_drag_leaves_each_pane_a_few_cells_of_content() {
+        // left | (top / bottom), in 806x628 at (200, 28).
+        let frame = Frame { workspace: Rect { x: 200.0, y: 28.0, w: 806.0, h: 628.0 }, ..FRAME };
         let mut t = Tree::new();
         let (vt, left, _) = t.add_vtab("w");
-        let (right, _) = t.split(vt, left, Axis::LeftRight).unwrap();
-        let (bottom, _) = t.split(vt, right, Axis::TopBottom).unwrap();
-        let rect_of = |t: &Tree, id| t.vtab(vt).unwrap().layout(ws, GAP).into_iter().find(|(p, _)| *p == id).unwrap().1;
+        let (top, _) = t.split(vt, left, Axis::LeftRight).unwrap();
+        let (bottom, _) = t.split(vt, top, Axis::TopBottom).unwrap();
+        let rect_of = |t: &Tree, id| t.vtab(vt).unwrap().layout(frame.workspace, frame.gap).into_iter().find(|(p, _)| *p == id).unwrap().1;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let mut d = Dividers::default();
+        let t0 = Instant::now();
 
-        // Press on the vertical divider, 1 px off its centre; the grab holds that spot.
-        let strip = rect_of(&t, left).x + rect_of(&t, left).w;
-        let press = (strip + GAP * 0.5 + 1.0, 300.0);
-        let d = t.vtab(vt).unwrap().divider_at(ws, GAP, 3.0, press).expect("grabbed");
-        let grab = d.grab_offset(press);
+        // Grab the vertical divider 1 px off its centre; the grab holds that spot.
+        let press = (rect_of(&t, left).x + rect_of(&t, left).w + 4.0, 300.0);
+        let hit = under(&t, &frame, press).expect("grabbed");
+        assert_eq!(d.press(&mut t, &frame, hit, &click(t0, 0, press)), Press::Grabbed);
         for (to, left_w) in [(400.0, 196.0), (250.0, 80.0), (9999.0, 800.0 - 80.0)] {
-            let pointer = (to, 300.0);
-            assert!(t.set_ratio(vt, &d.path, dragged_ratio(&d, grab, pointer, cell)));
+            assert!(d.drag(&mut t, &frame, (to, 300.0)));
             let w = rect_of(&t, left).w;
-            assert!((w - left_w).abs() < 0.01, "pointer {to}: {w} != {left_w}");
-            assert!(rect_of(&t, right).w >= 80.0 - 0.01, "the right pane keeps 8 columns");
+            assert!(near(w, left_w), "pointer {to}: {w} != {left_w}");
         }
-        // The stacked split was left alone.
-        assert_eq!(rect_of(&t, right).h, rect_of(&t, bottom).h);
-        // Double-click: back to halves.
-        t.set_ratio(vt, &d.path, 0.5);
-        assert_eq!(rect_of(&t, left).w, rect_of(&t, right).w);
+        assert!(near(rect_of(&t, top).w, 80.0), "the right panes keep 8 columns");
+        assert!(d.release());
+        assert_eq!(rect_of(&t, top).h, rect_of(&t, bottom).h, "the stacked split was left alone");
+
+        // The stacked divider: the top pane keeps 4 rows.
+        let strip_y = |t: &Tree| rect_of(t, top).y + rect_of(t, top).h;
+        let press = (960.0, strip_y(&t) + 3.0);
+        let hit = under(&t, &frame, press).expect("grabbed");
+        assert_eq!(d.press(&mut t, &frame, hit, &click(t0, 1000, press)), Press::Grabbed);
+        assert!(d.drag(&mut t, &frame, (960.0, -1000.0)));
+        assert!(near(rect_of(&t, top).h, 80.0));
+        assert!(d.release());
+        // With a tab strip shown, 4 rows of content below it.
+        t.add_surface(vt, top);
+        let press = (960.0, strip_y(&t) + 3.0);
+        let hit = under(&t, &frame, press).expect("grabbed");
+        assert_eq!(d.press(&mut t, &frame, hit, &click(t0, 2000, press)), Press::Grabbed);
+        assert!(d.drag(&mut t, &frame, (960.0, -1000.0)));
+        assert!(near(rect_of(&t, top).h, 80.0 + 26.0));
     }
 
     #[test]
     fn a_drag_lets_go_when_a_pane_closes_under_it() {
-        let frame = Frame { workspace: Rect { x: 0.0, y: 0.0, w: 806.0, h: 606.0 }, gap: 6.0, slop: 3.0, cell: (10.0, 20.0) };
+        let frame = FRAME;
         let mut t = Tree::new();
         let (vt, left, _) = t.add_vtab("w");
         let (right, _) = t.split(vt, left, Axis::LeftRight).unwrap();
@@ -311,7 +337,7 @@ mod tests {
         let mut d = Dividers::default();
         let at = (403.0, 300.0);
         let hit = under(&t, &FRAME, at).unwrap();
-        assert_eq!(d.press(&mut t, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
+        assert_eq!(d.press(&mut t, &FRAME, hit, &click(Instant::now(), 0, at)), Press::Grabbed);
         t.add_vtab("other");
         assert!(d.drag(&mut t, &FRAME, (203.0, 300.0)));
         assert!(!d.dragging() && d.highlight(&t, &FRAME).is_none());
@@ -328,20 +354,20 @@ mod tests {
         assert!(d.hover(under(&t, &FRAME, at).as_ref()));
         assert_eq!(d.highlight(&t, &FRAME).map(|(h, dragging)| (h.strip.x, dragging)), Some((400.0, false)));
         // The split moves away from the pointer: refreshed, nothing is lit.
-        t.set_ratio(vt, &[], 0.25);
+        FRAME.resize(&mut t, vt, &[], 0.25);
         assert!(d.hover(under(&t, &FRAME, at).as_ref()));
         assert_eq!(d.highlight(&t, &FRAME), None);
         // Split again under the pointer: the new divider is the one lit.
         let right = t.vtab(vt).unwrap().panes()[1].id;
         t.split(vt, right, Axis::TopBottom).unwrap();
-        t.set_ratio(vt, &[], 0.5);
+        FRAME.resize(&mut t, vt, &[], 0.5);
         let at = (600.0, 303.0);
         assert!(d.hover(under(&t, &FRAME, at).as_ref()));
         assert_eq!(d.highlight(&t, &FRAME).map(|(h, _)| (h.path, h.axis)), Some((vec![true], Axis::TopBottom)));
         // A drag let go away from its divider: the hover is the pointer's again.
         let at = (403.0, 100.0);
         let hit = under(&t, &FRAME, at).unwrap();
-        assert!(d.press(&mut t, hit, &click(Instant::now(), 0, at)) == Press::Grabbed);
+        assert!(d.press(&mut t, &FRAME, hit, &click(Instant::now(), 0, at)) == Press::Grabbed);
         assert!(d.drag(&mut t, &FRAME, (-500.0, 100.0)));
         assert!(d.release());
         assert!(d.hover(under(&t, &FRAME, (-500.0, 100.0)).as_ref()));
@@ -350,8 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn panes_keep_a_few_cells() {
-        assert_eq!(pane_min(Axis::LeftRight, 9.0, 18.0), 72.0);
-        assert_eq!(pane_min(Axis::TopBottom, 9.0, 18.0), 72.0);
+    fn a_pane_keeps_a_few_cells_below_its_tab_strip() {
+        let mut t = Tree::new();
+        let (vt, pane, _) = t.add_vtab("w");
+        let min = |t: &Tree, frame: &Frame| frame.pane_min(t.vtab(vt).unwrap().panes()[0]);
+        assert_eq!(min(&t, &FRAME), (80.0, 80.0), "one surface: no strip");
+        assert_eq!(min(&t, &Frame { strip_for_one: true, ..FRAME }), (80.0, 106.0));
+        t.add_surface(vt, pane);
+        assert_eq!(min(&t, &FRAME), (80.0, 106.0));
     }
 }

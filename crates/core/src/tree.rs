@@ -128,15 +128,55 @@ impl Node {
         }
     }
 
-    /// The ratio of the split at `path`.
-    fn ratio_at_mut(&mut self, path: &[bool]) -> Option<&mut f32> {
-        match (self, path.split_first()) {
-            (Node::Split { ratio, .. }, None) => Some(ratio),
-            (Node::Split { first, second, .. }, Some((&side, rest))) => {
-                if side { second } else { first }.ratio_at_mut(rest)
+    /// The least room this subtree needs, (width, height): each pane `min` of
+    /// it, and a split its children side by side (or stacked) with the gap
+    /// between them.
+    pub fn min_size(&self, gap: f32, min: &dyn Fn(&Pane) -> (f32, f32)) -> (f32, f32) {
+        match self {
+            Node::Leaf(p) => min(p),
+            Node::Split { axis, first, second, .. } => {
+                let (a, b) = (first.min_size(gap, min), second.min_size(gap, min));
+                match axis {
+                    Axis::LeftRight => (a.0 + gap + b.0, a.1.max(b.1)),
+                    Axis::TopBottom => (a.0.max(b.0), a.1 + gap + b.1),
+                }
             }
-            (Node::Leaf(_), _) => None,
         }
+    }
+
+    /// The split at `path` and the rect it is laid out in, within `rect`.
+    fn split_at_mut(&mut self, path: &[bool], rect: Rect, gap: f32) -> Option<(&mut Node, Rect)> {
+        let Some((&side, rest)) = path.split_first() else {
+            return matches!(self, Node::Split { .. }).then_some((self, rect));
+        };
+        let Node::Split { axis, ratio, first, second } = self else {
+            return None;
+        };
+        let (a, _, b) = split_rects(*axis, *ratio, rect, gap);
+        if side { second.split_at_mut(rest, b, gap) } else { first.split_at_mut(rest, a, gap) }
+    }
+
+    /// Clamp the ratio of every split in this subtree, laid out in `rect`, so
+    /// each child keeps its [`Self::min_size`] along the split; a split with
+    /// no room for both shares what it has in proportion to them.
+    fn fit(&mut self, rect: Rect, gap: f32, min: &dyn Fn(&Pane) -> (f32, f32)) {
+        let Node::Split { axis, ratio, first, second } = self else {
+            return;
+        };
+        let along = |size: (f32, f32)| match axis {
+            Axis::LeftRight => size.0,
+            Axis::TopBottom => size.1,
+        };
+        let (a, b) = (along(first.min_size(gap, min)), along(second.min_size(gap, min)));
+        let avail = along((rect.w, rect.h)) - gap;
+        *ratio = if avail <= 0.0 || a + b > avail {
+            if a + b > 0.0 { a / (a + b) } else { 0.5 }
+        } else {
+            ratio.clamp(a / avail, 1.0 - b / avail)
+        };
+        let (ra, _, rb) = split_rects(*axis, *ratio, rect, gap);
+        first.fit(ra, gap, min);
+        second.fit(rb, gap, min);
     }
 
     fn collect_panes<'a>(&'a self, out: &mut Vec<&'a Pane>) {
@@ -317,18 +357,15 @@ impl Divider {
     }
 
     /// The ratio that puts the strip where the pointer `p` drags it, holding
-    /// the spot grabbed at `grab` ([`Self::grab_offset`]). Each child keeps at
-    /// least `min` along the direction of the split; when the split has no room
-    /// for two of those it stays halved.
-    pub fn ratio_at(&self, p: (f32, f32), grab: f32, min: f32) -> f32 {
+    /// the spot grabbed at `grab` ([`Self::grab_offset`]). It is not clamped:
+    /// [`Tree::resize_split`] keeps the panes' minimum sizes.
+    pub fn ratio_at(&self, p: (f32, f32), grab: f32) -> f32 {
         let start = self.along((self.span.x, self.span.y));
-        let len = self.along((self.span.w, self.span.h));
-        let avail = len - self.strip_len();
-        if avail < 2.0 * min || avail <= 0.0 {
+        let avail = self.along((self.span.w, self.span.h)) - self.strip_len();
+        if avail <= 0.0 {
             return 0.5;
         }
-        let first = self.along(p) - grab - start;
-        (first / avail).clamp(min / avail, 1.0 - min / avail)
+        (self.along(p) - grab - start) / avail
     }
 }
 
@@ -521,20 +558,31 @@ impl Tree {
         }
     }
 
-    /// Set the first child's share of the split at `path` in
-    /// `vtab`. Other splits keep theirs. Returns false for an unknown vtab or
-    /// path, or a ratio that isn't a number.
-    pub fn set_ratio(&mut self, vtab: VtabId, path: &[bool], ratio: f32) -> bool {
+    /// Set the first child's share of the split at `path` in `vtab`, laid out
+    /// in `rect` with `gap`, as far as the panes' minimum sizes (`min`, see
+    /// [`Node::min_size`]) allow. The splits inside it fit their new room;
+    /// other splits keep theirs. Returns false for an unknown vtab or path, or
+    /// a ratio that isn't a number.
+    pub fn resize_split(
+        &mut self,
+        vtab: VtabId,
+        path: &[bool],
+        ratio: f32,
+        rect: Rect,
+        gap: f32,
+        min: &dyn Fn(&Pane) -> (f32, f32),
+    ) -> bool {
         if !ratio.is_finite() {
             return false;
         }
-        match self.vtab_mut(vtab).and_then(|v| v.root.ratio_at_mut(path)) {
-            Some(r) => {
-                *r = ratio.clamp(0.0, 1.0);
-                true
-            }
-            None => false,
+        let Some((split, rect)) = self.vtab_mut(vtab).and_then(|v| v.root.split_at_mut(path, rect, gap)) else {
+            return false;
+        };
+        if let Node::Split { ratio: r, .. } = split {
+            *r = ratio;
         }
+        split.fit(rect, gap, min);
+        true
     }
 
     /// Add a surface (horizontal tab) to a pane; it becomes active. Returns its id.
@@ -961,45 +1009,38 @@ mod tests {
         assert_eq!(at(406.0, 290.0), Some(vec![]), "beside the nested strip, off it");
     }
 
-    #[test]
-    fn dragging_gives_free_ratios_and_a_pane_keeps_its_minimum() {
-        let (t, vt, ..) = left_and_stack();
-        let d = t.vtab(vt).unwrap().dividers(WS, 4.0).remove(0);
-        // 800 px shared; the pointer sets the first pane's width.
-        assert_eq!(d.ratio_at((200.0, 5.0), 0.0, 50.0), 0.25);
-        assert_eq!(d.ratio_at((600.0, 5.0), 0.0, 50.0), 0.75);
-        assert_eq!(d.ratio_at((0.0, 5.0), 0.0, 50.0), 50.0 / 800.0, "left minimum");
-        assert_eq!(d.ratio_at((-500.0, 5.0), 0.0, 50.0), 50.0 / 800.0);
-        assert_eq!(d.ratio_at((5000.0, 5.0), 0.0, 50.0), 1.0 - 50.0 / 800.0, "right minimum");
-        // The spot grabbed stays under the pointer: grabbed 2 px into the strip.
-        let grab = d.grab_offset((402.0, 5.0));
-        assert_eq!(grab, 2.0);
-        assert_eq!(d.ratio_at((302.0, 5.0), grab, 50.0), 300.0 / 800.0);
-        // Pressing and not moving leaves the ratio where it was.
-        assert_eq!(d.ratio_at((402.0, 5.0), grab, 50.0), 0.5);
+    /// Any pane may shrink to nothing.
+    fn no_min(_: &Pane) -> (f32, f32) {
+        (0.0, 0.0)
     }
 
     #[test]
-    fn a_split_too_small_for_two_minimums_stays_halved() {
+    fn dragging_puts_the_strip_under_the_pointer() {
         let (t, vt, ..) = left_and_stack();
-        let small = Rect { w: 104.0, ..WS };
-        let d = t.vtab(vt).unwrap().dividers(small, 4.0).remove(0);
-        assert_eq!(d.ratio_at((10.0, 5.0), 0.0, 60.0), 0.5);
-        assert_eq!(d.ratio_at((90.0, 5.0), 0.0, 60.0), 0.5);
+        let d = t.vtab(vt).unwrap().dividers(WS, 4.0).remove(0);
+        // 800 px shared; the pointer sets the first pane's width.
+        assert_eq!(d.ratio_at((200.0, 5.0), 0.0), 0.25);
+        assert_eq!(d.ratio_at((600.0, 5.0), 0.0), 0.75);
+        assert_eq!(d.ratio_at((-400.0, 5.0), 0.0), -0.5, "not clamped");
+        // The spot grabbed stays under the pointer: grabbed 2 px into the strip.
+        let grab = d.grab_offset((402.0, 5.0));
+        assert_eq!(grab, 2.0);
+        assert_eq!(d.ratio_at((302.0, 5.0), grab), 300.0 / 800.0);
+        // Pressing and not moving leaves the ratio where it was.
+        assert_eq!(d.ratio_at((402.0, 5.0), grab), 0.5);
     }
 
     #[test]
     fn a_top_bottom_divider_follows_the_vertical_pointer() {
         let (t, vt, ..) = left_and_stack();
         let d = t.vtab(vt).unwrap().dividers(WS, 4.0).remove(1);
-        assert_eq!(d.ratio_at((600.0, 150.0), 0.0, 40.0), 0.25);
-        assert_eq!(d.ratio_at((0.0, 1000.0), 0.0, 40.0), 1.0 - 40.0 / 600.0);
+        assert_eq!(d.ratio_at((600.0, 150.0), 0.0), 0.25);
     }
 
     #[test]
-    fn set_ratio_resizes_only_the_split_that_owns_the_divider() {
+    fn resize_split_resizes_only_the_split_that_owns_the_divider() {
         let (mut t, vt, left, right, bottom) = left_and_stack();
-        assert!(t.set_ratio(vt, &[], 0.25));
+        assert!(t.resize_split(vt, &[], 0.25, WS, 4.0, &no_min));
         assert_eq!(width_of(&t, vt, left), 200.0);
         assert_eq!(width_of(&t, vt, right), 600.0);
         let heights = |t: &Tree| {
@@ -1008,24 +1049,69 @@ mod tests {
             (h(right), h(bottom))
         };
         assert_eq!(heights(&t), (300.0, 300.0), "the nested split kept its half");
-        assert!(t.set_ratio(vt, &[true], 0.75));
+        assert!(t.resize_split(vt, &[true], 0.75, WS, 4.0, &no_min));
         assert_eq!(heights(&t), (450.0, 150.0));
         assert_eq!(width_of(&t, vt, left), 200.0, "and the outer one kept its ratio");
     }
 
     #[test]
-    fn set_ratio_rejects_unknown_targets_and_bad_numbers_and_clamps() {
+    fn resize_split_rejects_unknown_targets_and_bad_numbers_and_clamps() {
         let (mut t, vt, left, ..) = left_and_stack();
-        assert!(!t.set_ratio(VtabId(999), &[], 0.3));
-        assert!(!t.set_ratio(vt, &[false], 0.3), "a leaf is not a split");
-        assert!(!t.set_ratio(vt, &[true, true, true], 0.3));
-        assert!(!t.set_ratio(vt, &[], f32::NAN));
-        assert!(!t.set_ratio(vt, &[], f32::INFINITY));
+        let mut resize = |path: &[bool], r| t.resize_split(vt, path, r, WS, 4.0, &no_min);
+        assert!(!resize(&[false], 0.3), "a leaf is not a split");
+        assert!(!resize(&[true, true, true], 0.3));
+        assert!(!resize(&[], f32::NAN));
+        assert!(!resize(&[], f32::INFINITY));
+        assert!(!t.resize_split(VtabId(999), &[], 0.3, WS, 4.0, &no_min));
         assert_eq!(width_of(&t, vt, left), 400.0, "nothing changed");
-        assert!(t.set_ratio(vt, &[], 2.0));
+        assert!(t.resize_split(vt, &[], 2.0, WS, 4.0, &no_min));
         assert_eq!(width_of(&t, vt, left), 800.0);
-        assert!(t.set_ratio(vt, &[], -1.0));
+        assert!(t.resize_split(vt, &[], -1.0, WS, 4.0, &no_min));
         assert_eq!(width_of(&t, vt, left), 0.0);
+    }
+
+    #[test]
+    fn a_subtree_needs_the_room_of_its_children() {
+        let (t, vt, ..) = left_and_stack();
+        let min = |_: &Pane| (50.0, 40.0);
+        let root = &t.vtab(vt).unwrap().root;
+        assert_eq!(root.min_size(4.0, &min), (104.0, 84.0));
+        let Node::Split { second, .. } = root else { unreachable!() };
+        assert_eq!(second.min_size(4.0, &min), (50.0, 84.0), "stacked: as wide as the wider");
+    }
+
+    #[test]
+    fn a_split_keeps_its_panes_minimums_down_through_nested_splits() {
+        // left | (middle | right): the nested split has the same axis.
+        let mut t = Tree::new();
+        let (vt, left, _) = t.add_vtab("a");
+        let (middle, _) = t.split(vt, left, Axis::LeftRight).unwrap();
+        let (right, _) = t.split(vt, middle, Axis::LeftRight).unwrap();
+        let min = |_: &Pane| (50.0, 40.0);
+        let near = |w: f32, want: f32| (w - want).abs() < 0.01;
+        assert!(t.resize_split(vt, &[], -1.0, WS, 4.0, &min));
+        assert!(near(width_of(&t, vt, left), 50.0));
+        // The right side can't shrink past both its panes.
+        assert!(t.resize_split(vt, &[], 2.0, WS, 4.0, &min));
+        assert!(near(width_of(&t, vt, left), 800.0 - 104.0));
+        assert!(near(width_of(&t, vt, middle), 50.0) && near(width_of(&t, vt, right), 50.0));
+        // A lopsided nested split fits the room the outer one leaves it.
+        assert!(t.resize_split(vt, &[], 0.5, WS, 4.0, &min));
+        assert!(t.resize_split(vt, &[true], 0.95, WS, 4.0, &min));
+        assert!(near(width_of(&t, vt, right), 50.0), "at its minimum");
+        assert!(t.resize_split(vt, &[], 0.75, WS, 4.0, &min));
+        assert!(near(width_of(&t, vt, right), 50.0), "still at its minimum");
+        assert!(near(width_of(&t, vt, middle), 200.0 - 4.0 - 50.0));
+    }
+
+    #[test]
+    fn a_split_too_small_for_its_minimums_shares_by_them() {
+        let (mut t, vt, left, right, _) = left_and_stack();
+        let small = Rect { w: 104.0, ..WS };
+        let min = |p: &Pane| (if p.id == left { 60.0 } else { 120.0 }, 0.0);
+        assert!(t.resize_split(vt, &[], 0.9, small, 4.0, &min));
+        let w = |id| t.vtab(vt).unwrap().layout(small, 4.0).into_iter().find(|(p, _)| *p == id).unwrap().1.w;
+        assert!((w(left) - 100.0 / 3.0).abs() < 0.01 && (w(right) - 200.0 / 3.0).abs() < 0.01);
     }
 
     // Small test-only helper.

@@ -1437,6 +1437,8 @@ impl State {
             gap: DIVIDER,
             slop: DIVIDER_SLOP * self.scale,
             cell: (self.cell_w, self.cell_h),
+            strip_h: self.strip_height(),
+            strip_for_one: self.strip_shown(1),
         }
     }
 
@@ -1480,8 +1482,8 @@ impl State {
         };
         // Not part of a pane's multi-click; dividers count their own.
         self.clicks.reset();
-        let click = self.click();
-        if self.dividers.press(&mut self.app.tree, hit, &click) == Press::Grabbed {
+        let (click, frame) = (self.click(), self.divider_frame());
+        if self.dividers.press(&mut self.app.tree, &frame, hit, &click) == Press::Grabbed {
             self.begin_press();
         }
         self.dirty = true;
