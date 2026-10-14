@@ -421,13 +421,21 @@ fn wait_for_row(term: &mut GhosttyTerminal, want: &str) -> String {
 }
 
 #[test]
-fn reports_the_alternate_screen() {
-    let mut term = cat_v_with("", |_| true);
-    term.write_bytes(b"x\r");
-    wait_for_row(&mut term, "x");
-    assert!(!term.alt_screen(), "the primary screen");
-    // Waits for the switch to show.
-    cat_v_with("\\033[?1049h", |t| t.alt_screen());
+fn snapshots_carry_the_screen_flags() {
+    let mut term = GhosttyTerminal::spawn(20, 10, 8, 16, Some(sh("seq 1 30; exec sleep 3"))).expect("spawn backend");
+    wait_for_row(&mut term, "30");
+    let live = term.snapshot();
+    assert!(live.viewport_active && !live.alt_screen, "the live primary screen");
+    term.scroll(Scroll::Delta(-5));
+    assert!(!term.snapshot().viewport_active, "scrolled back");
+
+    let mut term = cat_v_with("\\033[?1049h", |_| true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !term.snapshot().alt_screen {
+        assert!(Instant::now() < deadline, "the switch never showed");
+        term.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn bracketed_on(t: &GhosttyTerminal) -> bool {

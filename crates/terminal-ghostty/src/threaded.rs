@@ -74,8 +74,6 @@ struct Meta {
     mouse_tracking: bool,
     /// The viewport shows the live screen, not scrollback.
     viewport_active: bool,
-    /// The alternate screen is active.
-    alt_screen: bool,
     /// The PTY's foreground process group, for a forced shutdown.
     foreground: Option<i32>,
 }
@@ -127,7 +125,6 @@ impl ThreadedTerminal {
                 lifecycle: Lifecycle::Running,
                 mouse_tracking: false,
                 viewport_active: true,
-                alt_screen: false,
                 foreground: None,
             }),
             generation: AtomicU64::new(0),
@@ -291,10 +288,6 @@ impl TerminalBackend for ThreadedTerminal {
         self.shared.meta.lock().unwrap().viewport_active
     }
 
-    fn alt_screen(&self) -> bool {
-        self.shared.meta.lock().unwrap().alt_screen
-    }
-
     fn send_mouse(&mut self, report: &MouseReport) {
         self.send(Cmd::Mouse(*report));
     }
@@ -450,7 +443,6 @@ fn worker_loop(
             lifecycle: term.lifecycle(),
             mouse_tracking: term.mouse_tracking(),
             viewport_active: term.viewport_active(),
-            alt_screen: term.alt_screen(),
             foreground: term.foreground_group(),
         };
         exit_poll = exit_poll_after(term, new_meta.lifecycle);

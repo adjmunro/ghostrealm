@@ -334,20 +334,7 @@ impl View for TerminalView {
         }
         let cols = ((rect.w / cw).floor() as u16).max(1);
         let pane_rows = ((rect.h / ch).floor() as u16).max(1);
-        // An ended shell's output with no blank row left for the banner gives
-        // up the pane's last row, judged on the live screen (scrolled back,
-        // the grid is history with no cursor) at the pane's size. Shrinking
-        // drops the top row from a one-row pane or the alternate screen (no
-        // scrollback), so those keep the banner over the last row.
-        let sized = (self.grid.size.cols, self.grid.size.rows) == (cols, pane_rows);
-        if self.exit.is_some()
-            && !self.banner_reserved
-            && pane_rows > 1
-            && sized
-            && banner_row(&self.grid).is_none()
-            && !self.term.alt_screen()
-            && self.term.viewport_active()
-        {
+        if self.exit.is_some() && !self.banner_reserved && wants_banner_row(&self.grid, cols, pane_rows) {
             self.banner_reserved = true;
             // The shrink scrolls the output up under a viewport-relative
             // selection.
@@ -685,6 +672,20 @@ fn report_button(b: MouseButton) -> ReportButton {
     }
 }
 
+/// Whether an ended shell's `grid` should give up the last of a pane's
+/// `cols` x `pane_rows` cells to the exit banner: no blank row is left for it.
+/// Judged on the grid's own flags, not the backend's live state, which can
+/// be newer than the grid: scrolled back, the rows are history with no
+/// cursor. Shrinking drops the top row from a one-row pane or the alternate
+/// screen (no scrollback), so those keep the banner over the last row.
+fn wants_banner_row(grid: &Grid, cols: u16, pane_rows: u16) -> bool {
+    pane_rows > 1
+        && (grid.size.cols, grid.size.rows) == (cols, pane_rows)
+        && grid.viewport_active
+        && !grid.alt_screen
+        && banner_row(grid).is_none()
+}
+
 /// The first blank row from the cursor's down, which the exit banner takes.
 /// With none, the banner goes below the grid, or over its last row where the
 /// grid can't give one up.
@@ -925,6 +926,8 @@ mod tests {
             cursor: Cursor { col: 0, row: 0, visible: false },
             default_fg: [200, 200, 200],
             default_bg: [0, 0, 0],
+            viewport_active: true,
+            alt_screen: false,
         }
     }
 
@@ -951,6 +954,20 @@ mod tests {
         let mut full = grid_of(&["out ", "err "]);
         full.cursor.row = 1;
         assert_eq!(banner_row(&full), None);
+    }
+
+    #[test]
+    fn only_a_full_live_primary_grid_at_the_pane_size_gives_up_a_row() {
+        let mut g = grid_of(&["out ", "err "]);
+        g.cursor.row = 1;
+        assert!(wants_banner_row(&g, 4, 2));
+        assert!(!wants_banner_row(&g, 4, 3), "a grid not yet at the pane's size");
+        assert!(!wants_banner_row(&grid_of(&["out "]), 4, 1), "a one-row pane");
+        let history = Grid { viewport_active: false, ..g.clone() };
+        assert!(!wants_banner_row(&history, 4, 2), "a page of scrollback");
+        let alt = Grid { alt_screen: true, ..g.clone() };
+        assert!(!wants_banner_row(&alt, 4, 2), "the alternate screen");
+        assert!(!wants_banner_row(&grid_of(&["out ", "    "]), 4, 2), "a blank row is left");
     }
 
     #[test]
@@ -1173,6 +1190,29 @@ mod tests {
         h.paint(&mut v, RECT);
         assert!(!v.banner_reserved, "the live screen has a blank row for the banner");
         assert_eq!(v.geom.map(|g| g.1), Some(10));
+    }
+
+    /// Scrolled back then to the bottom, the backend's live state reports the
+    /// live screen before the painted grid stops being history.
+    #[test]
+    fn the_painted_grid_not_the_live_state_decides_the_banner_row() {
+        let mut v = running("printf ready; sleep 3", "ready");
+        let mut h = Harness::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while v.grid.size != (GridSize { cols: 40, rows: 10 }) || v.term.needs_snapshot() {
+            assert!(Instant::now() < deadline, "the grid never settled");
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(v.term.viewport_active());
+        let row = "x".repeat(40);
+        v.grid = Grid { viewport_active: false, ..grid_of(&[row.as_str(); 10]) };
+        v.exit = Some(Lifecycle::Exited(Some(0)));
+        h.paint(&mut v, RECT);
+        assert!(!v.banner_reserved, "a page of history kept the pane's rows");
+        v.grid.viewport_active = true;
+        h.paint(&mut v, RECT);
+        assert!(v.banner_reserved, "the same rows as the live screen give one up");
     }
 
     #[test]

@@ -354,6 +354,8 @@ impl GhosttyTerminal {
         out.size = GridSize { cols, rows };
         out.default_fg = default_fg;
         out.default_bg = default_bg;
+        out.viewport_active = self.term.viewport_active().unwrap_or(true);
+        out.alt_screen = self.term.active_screen().is_ok_and(|s| s == Screen::Alternate);
         out.cursor = match cursor_vp {
             Some(c) => Cursor {
                 col: c.x,
@@ -617,10 +619,6 @@ impl TerminalBackend for GhosttyTerminal {
 
     fn viewport_active(&self) -> bool {
         self.term.viewport_active().unwrap_or(true)
-    }
-
-    fn alt_screen(&self) -> bool {
-        self.term.active_screen().is_ok_and(|s| s == Screen::Alternate)
     }
 
     fn send_mouse(&mut self, report: &MouseReport) {

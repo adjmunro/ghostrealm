@@ -70,6 +70,11 @@ pub struct Grid {
     pub cursor: Cursor,
     pub default_fg: Rgb,
     pub default_bg: Rgb,
+    /// The rows are the live screen, not scrollback (where `cursor` is
+    /// hidden at the origin).
+    pub viewport_active: bool,
+    /// The rows are the alternate screen, which keeps no scrollback.
+    pub alt_screen: bool,
 }
 
 impl Grid {
@@ -87,6 +92,8 @@ impl Grid {
             },
             default_fg,
             default_bg,
+            viewport_active: true,
+            alt_screen: false,
         }
     }
 
@@ -103,6 +110,8 @@ impl Grid {
             },
             default_fg: [0, 0, 0],
             default_bg: [0, 0, 0],
+            viewport_active: true,
+            alt_screen: false,
         }
     }
 
@@ -261,12 +270,6 @@ pub trait TerminalBackend {
     /// meaningful while this holds.
     fn viewport_active(&self) -> bool {
         true
-    }
-
-    /// Whether the program switched to the alternate screen, which keeps no
-    /// scrollback.
-    fn alt_screen(&self) -> bool {
-        false
     }
 
     /// Report a pointer event in whichever protocol the program selected. Does
