@@ -60,6 +60,9 @@ pub struct Dividers {
     /// Presses on dividers, counted apart from other presses: a click in a
     /// pane next to a divider is not half of a double-click on it.
     clicks: ClickCounter,
+    /// The divider the counted presses landed on. Where grab areas meet, a
+    /// press at the same spot can land on another, which starts a new count.
+    clicked: Option<(VtabId, SplitPath)>,
 }
 
 /// A divider being dragged: which split, and where along its strip it was
@@ -96,6 +99,11 @@ impl Dividers {
     /// A left press, `click`, on divider `d` of `vt`: grab it to drag, or reset
     /// its split to halves on a double-click.
     pub fn press(&mut self, tree: &mut Tree, frame: &Frame, (vt, d): (VtabId, Divider), click: &Click) -> Press {
+        let hit = Some((vt, d.path.clone()));
+        if self.clicked != hit {
+            self.clicks.reset();
+            self.clicked = hit;
+        }
         if self.clicks.count(click) >= 2 {
             frame.resize(tree, vt, &d.path, 0.5);
             return Press::Reset;
@@ -252,6 +260,29 @@ mod tests {
         assert_eq!(d.press(&mut t, &FRAME, hit, &click(t0, 150, at)), Press::Reset);
         assert_eq!(width(&t, vt, left), 400.0);
         assert!(!d.dragging(), "a reset grabs nothing");
+    }
+
+    #[test]
+    fn a_double_click_across_two_dividers_resets_neither() {
+        // left | (top / bottom): at the T-junction a press lands on either.
+        let (mut t, vt, left) = side_by_side();
+        let right = t.vtab(vt).unwrap().panes()[1].id;
+        t.split(vt, right, Axis::TopBottom).unwrap();
+        FRAME.resize(&mut t, vt, &[], 0.25);
+        FRAME.resize(&mut t, vt, &[true], 0.25);
+        let mut d = Dividers::default();
+        let t0 = Instant::now();
+        let at = (206.0, 151.0);
+        let root = t.vtab(vt).unwrap().dividers(FRAME.workspace, FRAME.gap).remove(0);
+        let nested = under(&t, &FRAME, at).expect("on the nested divider");
+        assert_eq!(nested.1.path, vec![true]);
+        assert_eq!(d.press(&mut t, &FRAME, (vt, root), &click(t0, 0, at)), Press::Grabbed);
+        assert!(d.release());
+        assert_eq!(d.press(&mut t, &FRAME, nested, &click(t0, 100, at)), Press::Grabbed);
+        assert!(d.release());
+        assert_eq!(width(&t, vt, left), 200.0, "the root split kept its ratio");
+        let top = t.vtab(vt).unwrap().layout(FRAME.workspace, FRAME.gap)[1].1.h;
+        assert_eq!(top, 150.0, "and so did the nested one");
     }
 
     #[test]
