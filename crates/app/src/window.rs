@@ -1484,7 +1484,8 @@ impl State {
             self.app.tree.set_ratio(vt, &d.path, 0.5);
         } else {
             let grab = d.grab_offset(self.cursor);
-            self.divider_drag = Some(DividerDrag { vt, path: d.path, grab });
+            let panes = self.app.tree.vtab(vt).map(pane_ids).unwrap_or_default();
+            self.divider_drag = Some(DividerDrag { vt, path: d.path, grab, panes });
             self.begin_press();
         }
         self.dirty = true;
@@ -1494,35 +1495,33 @@ impl State {
     /// The pointer moved with a divider grabbed: resize its split. Returns
     /// whether to redraw.
     fn drag_divider(&mut self) -> bool {
-        let Some(DividerDrag { vt, path, grab }) = self.divider_drag.clone() else {
+        let Some(drag) = self.divider_drag.as_ref() else {
             return false;
         };
-        let workspace = self.workspace_rect();
-        let divider = self
-            .app
-            .tree
-            .vtab(vt)
-            .and_then(|v| v.dividers(workspace, DIVIDER).into_iter().find(|d| d.path == path));
-        let Some(divider) = divider else {
+        let Some(divider) = dragged_divider(&self.app.tree, drag, self.workspace_rect()) else {
             self.divider_drag = None;
-            return false;
+            self.dirty = true;
+            return true;
         };
+        let (vt, grab) = (drag.vt, drag.grab);
         let ratio = dragged_ratio(&divider, grab, self.cursor, (self.cell_w, self.cell_h));
         self.dirty = true;
-        self.app.tree.set_ratio(vt, &path, ratio)
+        self.app.tree.set_ratio(vt, &divider.path, ratio)
     }
 
     /// The divider to draw highlighted (hovered, or dragged: `true`).
     fn divider_highlight(&self, workspace: Rect) -> Option<(Divider, bool)> {
-        let (vt, path, dragging) = match (&self.divider_drag, &self.divider_hover) {
-            (Some(d), _) => (d.vt, &d.path, true),
-            (None, Some((vt, path))) => (*vt, path, false),
+        let (vt, divider, dragging) = match (&self.divider_drag, &self.divider_hover) {
+            (Some(d), _) => (d.vt, dragged_divider(&self.app.tree, d, workspace)?, true),
+            (None, Some((vt, path))) => {
+                let d = self.app.tree.vtab(*vt)?.dividers(workspace, DIVIDER).into_iter().find(|d| &d.path == path)?;
+                (*vt, d, false)
+            }
             (None, None) => return None,
         };
         if self.app.tree.active_vtab() != Some(vt) {
             return None;
         }
-        let divider = self.app.tree.vtab(vt)?.dividers(workspace, DIVIDER).into_iter().find(|d| &d.path == path)?;
         Some((divider, dragging))
     }
 
@@ -4654,11 +4653,28 @@ fn sidebar_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
 /// The workspace rect (everything the sidebar doesn't occupy) for `side`.
 /// A divider being dragged: which split, and where along its strip it was
 /// grabbed.
-#[derive(Clone)]
 struct DividerDrag {
     vt: VtabId,
     path: SplitPath,
     grab: f32,
+    /// The vtab's panes when it was grabbed. A pane closing reshapes the tree,
+    /// and `path` may then name another split (or another axis).
+    panes: Vec<PaneId>,
+}
+
+/// The vtab's panes in tree order.
+fn pane_ids(v: &ghostrealm_core::Vtab) -> Vec<PaneId> {
+    v.panes().into_iter().map(|p| p.id).collect()
+}
+
+/// The divider `drag` holds, laid out in `workspace`; none once its vtab
+/// closed or its panes changed.
+fn dragged_divider(tree: &ghostrealm_core::Tree, drag: &DividerDrag, workspace: Rect) -> Option<Divider> {
+    let v = tree.vtab(drag.vt)?;
+    if pane_ids(v) != drag.panes {
+        return None;
+    }
+    v.dividers(workspace, DIVIDER).into_iter().find(|d| d.path == drag.path)
 }
 
 /// The cursor over a divider between `axis` children.
@@ -4944,7 +4960,8 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 mod tests {
     use super::{
         build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, dragged_ratio, pane_min,
+        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, dragged_divider, dragged_ratio, pane_min,
+        pane_ids, DividerDrag, DIVIDER,
     };
     use ghostrealm_core::{Axis, Rect, Side, SurfaceId, Tree};
     use winit::window::CursorIcon;
@@ -4979,6 +4996,21 @@ mod tests {
         // Double-click: back to halves.
         t.set_ratio(vt, &d.path, 0.5);
         assert_eq!(rect_of(&t, left).w, rect_of(&t, right).w);
+    }
+
+    #[test]
+    fn a_drag_lets_go_when_a_pane_closes_under_it() {
+        let ws = Rect { x: 0.0, y: 0.0, w: 806.0, h: 606.0 };
+        let mut t = Tree::new();
+        let (vt, left, _) = t.add_vtab("w");
+        let (right, _) = t.split(vt, left, Axis::LeftRight).unwrap();
+        t.split(vt, right, Axis::TopBottom).unwrap();
+        let drag = DividerDrag { vt, path: vec![], grab: 0.0, panes: pane_ids(t.vtab(vt).unwrap()) };
+        assert_eq!(dragged_divider(&t, &drag, ws).unwrap().axis, Axis::LeftRight);
+        t.close_pane(vt, left);
+        let root = t.vtab(vt).unwrap().dividers(ws, DIVIDER).remove(0);
+        assert_eq!((root.path, root.axis), (vec![], Axis::TopBottom), "the path now names the other split");
+        assert_eq!(dragged_divider(&t, &drag, ws), None);
     }
 
     #[test]
