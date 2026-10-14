@@ -38,9 +38,6 @@ Found reviewing `8a77896..d34d7fa` (the web browser `0c67045`/`35e68b9`/`04794e1
 and the file-browser preview `3f58197`/`b6e3944`/`d34d7fa`). Line numbers are
 against `f59386c`.
 
-Right and middle clicks were lost when the browser was rebased (`465b076` →
-`04794e1`): `MouseEvent` carries no button, so only left clicks reach a page.
-
 ### High
 
 #### 21. Chromium runs without its sandbox
