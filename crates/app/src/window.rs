@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ghostrealm_core::config::Catalogue;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Axis, Chrome, Config, PaneId, Rect, Registry, Side,
-    SurfaceId, TabStatus, Value, VtabId,
+    ArgKind, ArgSpec, Args, Axis, Chrome, Config, Divider, PaneId, Rect, Registry, Side,
+    SplitPath, SurfaceId, TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Mods};
 use glyphon::{
@@ -44,6 +44,11 @@ use crate::tap::{HeldKey, TapDetector};
 
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
+/// How far from the divider gap, in logical pixels, a pointer still grabs it.
+const DIVIDER_SLOP: f32 = 3.0;
+/// Dragging a divider leaves each pane at least this many columns / rows.
+const MIN_PANE_COLS: f32 = 8.0;
+const MIN_PANE_ROWS: f32 = 4.0;
 /// How many command-palette matches to rank (the visible window scrolls through
 /// them).
 const PALETTE_SEARCH_CAP: usize = 100;
@@ -379,6 +384,8 @@ impl ApplicationHandler<UserEvent> for App {
                     redraw |= if state.palette_selecting { state.palette_drag() } else { state.palette_hover() };
                 } else if state.menu.is_some() {
                     redraw |= state.menu_hover();
+                } else if state.divider_drag.is_some() {
+                    redraw |= state.drag_divider();
                 } else if state.mouse_down {
                     redraw |= state.update_drag();
                 } else if state.cfg.input.focus_follows_mouse && state.focus_pane_under_cursor() {
@@ -386,6 +393,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Close-button hover highlight tracks the cursor everywhere.
                 redraw |= state.update_button_hover();
+                redraw |= state.update_divider_hover();
                 // Hover reaches the view under the cursor (e.g. the file browser's
                 // highlight follows the mouse).
                 redraw |= state.hover_view();
@@ -411,6 +419,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // armed; fires on release
                 } else if state.cursor.1 < state.title_bar_h() {
                     let _ = state.window.drag_window();
+                } else if state.press_divider() {
+                    // grabbed a split divider
                 } else {
                     state.on_click();
                     state.begin_press();
@@ -515,6 +525,10 @@ struct State {
     /// cursor resets to the default when the mouse leaves that rect).
     cursor_icon: CursorIcon,
     cursor_rect: Option<Rect>,
+    /// The split divider the pointer is over (highlighted, resize cursor).
+    divider_hover: Option<(VtabId, SplitPath)>,
+    /// The divider being dragged with the left button.
+    divider_drag: Option<DividerDrag>,
     /// Views painted last frame (on screen), for [`View::shown`].
     shown: std::collections::HashSet<SurfaceId>,
     /// The view last sent hover, told when the pointer leaves it.
@@ -943,6 +957,8 @@ impl State {
             images,
             cursor_icon: CursorIcon::Default,
             cursor_rect: None,
+            divider_hover: None,
+            divider_drag: None,
             shown: std::collections::HashSet::new(),
             hover: Hover::default(),
             quad_buffer,
@@ -1416,6 +1432,98 @@ impl State {
         self.view_event(sid, |v, cx| {
             v.raw_key(cx, &raw);
         })
+    }
+
+    /// The split divider under the cursor, unless something covers it: an
+    /// overlay, the sidebar, the title bar, or a button.
+    fn divider_under_cursor(&self) -> Option<(VtabId, Divider)> {
+        let (x, y) = self.cursor;
+        let covered = self.palette.is_some()
+            || self.menu.is_some()
+            || self.app.picker_open()
+            || self.app.confirm().is_some()
+            || self.in_sidebar(x)
+            || y < self.title_bar_h()
+            || self.button_at_cursor().is_some();
+        if covered {
+            return None;
+        }
+        let vt = self.app.tree.active_vtab()?;
+        let slop = DIVIDER_SLOP * self.scale;
+        let d = self.app.tree.vtab(vt)?.divider_at(self.workspace_rect(), DIVIDER, slop, (x, y))?;
+        Some((vt, d))
+    }
+
+    /// Track which divider the pointer is over. Returns whether it changed.
+    fn update_divider_hover(&mut self) -> bool {
+        if self.divider_drag.is_some() {
+            return false;
+        }
+        let over = self.divider_under_cursor();
+        let key = over.as_ref().map(|(vt, d)| (*vt, d.path.clone()));
+        if key == self.divider_hover {
+            return false;
+        }
+        self.divider_hover = key;
+        if let Some((_, d)) = over {
+            self.set_cursor_icon(divider_icon(d.axis));
+            self.cursor_rect = Some(d.grab_rect(DIVIDER_SLOP * self.scale));
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// A left press: grab the divider under the cursor to drag it, or reset
+    /// its split to halves on a double-click. Returns whether it took the press.
+    fn press_divider(&mut self) -> bool {
+        let Some((vt, d)) = self.divider_under_cursor() else {
+            return false;
+        };
+        self.release_lost_press();
+        if self.count_click() >= 2 {
+            self.app.tree.set_ratio(vt, &d.path, 0.5);
+        } else {
+            let grab = d.grab_offset(self.cursor);
+            self.divider_drag = Some(DividerDrag { vt, path: d.path, grab });
+            self.begin_press();
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The pointer moved with a divider grabbed: resize its split. Returns
+    /// whether to redraw.
+    fn drag_divider(&mut self) -> bool {
+        let Some(DividerDrag { vt, path, grab }) = self.divider_drag.clone() else {
+            return false;
+        };
+        let workspace = self.workspace_rect();
+        let divider = self
+            .app
+            .tree
+            .vtab(vt)
+            .and_then(|v| v.dividers(workspace, DIVIDER).into_iter().find(|d| d.path == path));
+        let Some(divider) = divider else {
+            self.divider_drag = None;
+            return false;
+        };
+        let ratio = dragged_ratio(&divider, grab, self.cursor, (self.cell_w, self.cell_h));
+        self.dirty = true;
+        self.app.tree.set_ratio(vt, &path, ratio)
+    }
+
+    /// The divider to draw highlighted (hovered, or dragged: `true`).
+    fn divider_highlight(&self, workspace: Rect) -> Option<(Divider, bool)> {
+        let (vt, path, dragging) = match (&self.divider_drag, &self.divider_hover) {
+            (Some(d), _) => (d.vt, &d.path, true),
+            (None, Some((vt, path))) => (*vt, path, false),
+            (None, None) => return None,
+        };
+        if self.app.tree.active_vtab() != Some(vt) {
+            return None;
+        }
+        let divider = self.app.tree.vtab(vt)?.dividers(workspace, DIVIDER).into_iter().find(|d| &d.path == path)?;
+        Some((divider, dragging))
     }
 
     fn set_cursor_icon(&mut self, icon: CursorIcon) {
@@ -2106,6 +2214,9 @@ impl State {
     /// Finish a press: the view that took it gets the release.
     fn end_press(&mut self) {
         self.mouse_down = false;
+        if self.divider_drag.take().is_some() {
+            self.dirty = true;
+        }
         let dragged = std::mem::take(&mut self.dragging);
         if let Some(sid) = self.mouse_capture.take() {
             let pos = self.cursor;
@@ -3987,6 +4098,14 @@ impl State {
                 self.set_cursor_icon(CursorIcon::Default);
             }
         }
+        // A divider under the pointer, or being dragged, lights up and sets
+        // the cursor (a drag keeps it wherever the pointer goes).
+        if let Some((d, dragging)) = self.divider_highlight(workspace).filter(|_| !modal) {
+            let alpha = if dragging { 0.9 } else { 0.6 };
+            frame.bg.push(rect_quad(d.strip, sw, sh, self.chrome.accent, alpha));
+            self.set_cursor_icon(divider_icon(d.axis));
+            self.cursor_rect = (!dragging).then(|| d.grab_rect(DIVIDER_SLOP * self.scale));
+        }
 
         // Palette overlay: dim + panel + selection quads (drawn after terminal
         // text), and its text (drawn last, via a second renderer).
@@ -4533,6 +4652,36 @@ fn sidebar_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
 }
 
 /// The workspace rect (everything the sidebar doesn't occupy) for `side`.
+/// A divider being dragged: which split, and where along its strip it was
+/// grabbed.
+#[derive(Clone)]
+struct DividerDrag {
+    vt: VtabId,
+    path: SplitPath,
+    grab: f32,
+}
+
+/// The cursor over a divider between `axis` children.
+fn divider_icon(axis: Axis) -> CursorIcon {
+    match axis {
+        Axis::LeftRight => CursorIcon::ColResize,
+        Axis::TopBottom => CursorIcon::RowResize,
+    }
+}
+
+/// The least a pane may be dragged to along its split, in physical pixels.
+fn pane_min(axis: Axis, cell_w: f32, cell_h: f32) -> f32 {
+    match axis {
+        Axis::LeftRight => MIN_PANE_COLS * cell_w,
+        Axis::TopBottom => MIN_PANE_ROWS * cell_h,
+    }
+}
+
+/// The ratio a drag with the pointer at `pointer` gives `divider`'s split.
+fn dragged_ratio(divider: &Divider, grab: f32, pointer: (f32, f32), cell: (f32, f32)) -> f32 {
+    divider.ratio_at(pointer, grab, pane_min(divider.axis, cell.0, cell.1))
+}
+
 fn workspace_rect_for(side: Side, width: f32, sw: f32, sh: f32) -> Rect {
     let x = match side {
         Side::Left => width,
@@ -4795,11 +4944,50 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 mod tests {
     use super::{
         build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, wrap_words, Hover, QuadInstance,
+        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, dragged_ratio, pane_min,
     };
-    use ghostrealm_core::{Rect, Side, SurfaceId};
+    use ghostrealm_core::{Axis, Rect, Side, SurfaceId, Tree};
+    use winit::window::CursorIcon;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dragging_a_divider_resizes_its_split_down_to_a_few_cells() {
+        const GAP: f32 = 6.0;
+        let ws = Rect { x: 200.0, y: 28.0, w: 806.0, h: 628.0 };
+        let cell = (10.0, 20.0);
+        let mut t = Tree::new();
+        let (vt, left, _) = t.add_vtab("w");
+        let (right, _) = t.split(vt, left, Axis::LeftRight).unwrap();
+        let (bottom, _) = t.split(vt, right, Axis::TopBottom).unwrap();
+        let rect_of = |t: &Tree, id| t.vtab(vt).unwrap().layout(ws, GAP).into_iter().find(|(p, _)| *p == id).unwrap().1;
+
+        // Press on the vertical divider, 1 px off its centre; the grab holds that spot.
+        let strip = rect_of(&t, left).x + rect_of(&t, left).w;
+        let press = (strip + GAP * 0.5 + 1.0, 300.0);
+        let d = t.vtab(vt).unwrap().divider_at(ws, GAP, 3.0, press).expect("grabbed");
+        let grab = d.grab_offset(press);
+        for (to, left_w) in [(400.0, 196.0), (250.0, 80.0), (9999.0, 800.0 - 80.0)] {
+            let pointer = (to, 300.0);
+            assert!(t.set_ratio(vt, &d.path, dragged_ratio(&d, grab, pointer, cell)));
+            let w = rect_of(&t, left).w;
+            assert!((w - left_w).abs() < 0.01, "pointer {to}: {w} != {left_w}");
+            assert!(rect_of(&t, right).w >= 80.0 - 0.01, "the right pane keeps 8 columns");
+        }
+        // The stacked split was left alone.
+        assert_eq!(rect_of(&t, right).h, rect_of(&t, bottom).h);
+        // Double-click: back to halves.
+        t.set_ratio(vt, &d.path, 0.5);
+        assert_eq!(rect_of(&t, left).w, rect_of(&t, right).w);
+    }
+
+    #[test]
+    fn the_resize_cursor_follows_the_divider_axis_and_panes_keep_a_few_cells() {
+        assert_eq!(divider_icon(Axis::LeftRight), CursorIcon::ColResize);
+        assert_eq!(divider_icon(Axis::TopBottom), CursorIcon::RowResize);
+        assert_eq!(pane_min(Axis::LeftRight, 9.0, 18.0), 72.0);
+        assert_eq!(pane_min(Axis::TopBottom, 9.0, 18.0), 72.0);
+    }
 
     #[test]
     fn the_palette_pointer_maps_to_carets_and_characters() {

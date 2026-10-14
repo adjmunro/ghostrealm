@@ -41,6 +41,11 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+Z / Cmd+Shift+Z | undo / redo (editor) |
 | Cmd+Shift+C | copy the focused file's absolute path |
 
+Drag the divider between split panes to resize them (it lights up and the cursor
+becomes a resize arrow; a pane keeps at least 8 columns or 4 rows). A drag moves
+only the split that owns the divider. Double-click a divider to put its split back
+to halves. Sizes last for the session.
+
 Text fields and the editor share macOS editing keys: Option+←/→ by word,
 Cmd+←/→ to the line's start/end, Cmd+↑/↓ to the start/end, Shift to select with
 any of them; Option/Cmd+Backspace delete a word / to the line's start; Cmd+A/C/X/V.
