@@ -289,10 +289,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = cb.set_text(text);
             }
         }
-        // File operations that failed after their command returned.
+        // File operations that failed after their command returned, or went
+        // ahead only in part.
         for report in state.app.take_file_reports() {
-            if let Err(e) = report.result {
-                eprintln!("ghostrealm: {}: {e}", report.command);
+            match report.result {
+                Err(e) => eprintln!("ghostrealm: {}: {e}", report.command),
+                Ok(m) if report.warning => eprintln!("ghostrealm: {}: {m}", report.command),
+                Ok(_) => {}
             }
         }
         // A termination waiting on the file worker hides the window, as a

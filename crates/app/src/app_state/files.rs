@@ -30,6 +30,9 @@ pub struct FileReport {
     pub command: &'static str,
     /// What the command would have said, or why it failed.
     pub result: Result<String, String>,
+    /// The operation went ahead but not wholly (a move that left part of the
+    /// original behind): `result` says what, for the user to see.
+    pub warning: bool,
 }
 
 /// What Cut or Copy picked, for Paste.
@@ -194,7 +197,14 @@ impl AppState {
         let deadline = Instant::now() + self.file_job_wait;
         while let Some(done) = self.file_jobs.take_until(deadline) {
             if done.id == id {
-                return self.apply_file_job(done);
+                let command = done.job.command();
+                let (result, warning) = self.apply_file_job(done);
+                // The command's reply goes to stderr only when it fails; a
+                // warning is reported as one that finished later is.
+                if let (true, Ok(message)) = (warning, &result) {
+                    self.file_reports.push(FileReport { command, result: Ok(message.clone()), warning });
+                }
+                return result;
             }
             self.report_file_job(done);
         }
@@ -236,19 +246,56 @@ impl AppState {
 
     fn report_file_job(&mut self, done: Done) {
         let command = done.job.command();
-        let result = self.apply_file_job(done).map_err(|e| format!("{e:#}"));
-        self.file_reports.push(FileReport { command, result });
+        let (result, warning) = self.apply_file_job(done);
+        let result = result.map_err(|e| format!("{e:#}"));
+        self.file_reports.push(FileReport { command, result, warning });
     }
 
     /// Bring the views up to date with a finished job. Returns what its
-    /// command says.
-    fn apply_file_job(&mut self, done: Done) -> Result<String> {
+    /// command says, and whether that is a warning.
+    fn apply_file_job(&mut self, done: Done) -> (Result<String>, bool) {
+        if let (FileJob::Paste { src, cut: true, .. }, Ok(Output::Moved(moved))) = (&done.job, &done.result) {
+            let renames = self.move_renames(src, moved);
+            self.changed(&renames);
+            return (Ok(pasted_message(moved)), moved.source_left);
+        }
+        (self.apply_file_job_result(done), false)
+    }
+
+    /// What a move of `src` to `moved.dest` moved, as renames for
+    /// [`Self::changed`]. A move that left part of the original behind
+    /// renames only what is gone from it: a file left there (changed while it
+    /// was copied) keeps its views, which would otherwise show the older copy.
+    fn move_renames(&self, src: &Path, moved: &file_ops::Moved) -> Vec<(PathBuf, PathBuf)> {
+        if moved.dest == src {
+            return Vec::new();
+        }
+        let whole = vec![(src.to_path_buf(), moved.dest.clone())];
+        if !moved.source_left {
+            return whole;
+        }
+        let browser_roots = self
+            .views
+            .values()
+            .filter_map(|v| v.downcast_ref::<FileBrowserView>())
+            .map(|b| b.tree().root().to_path_buf());
+        let mut followed: Vec<PathBuf> = self
+            .views
+            .values()
+            .flat_map(|v| [v.path(), v.subject()])
+            .flatten()
+            .chain(browser_roots)
+            .chain(self.tree.vtabs().iter().filter_map(|v| v.root_dir.clone()))
+            .chain(self.file_clip.as_ref().map(|c| c.path.clone()))
+            .filter(|p| p.starts_with(src) && p.symlink_metadata().is_err())
+            .collect();
+        followed.sort();
+        followed.dedup();
+        followed.into_iter().filter_map(|p| Some((p.clone(), file_ops::follow(&p, &whole)?))).collect()
+    }
+
+    fn apply_file_job_result(&mut self, done: Done) -> Result<String> {
         match (done.job, done.result) {
-            (FileJob::Paste { src, cut: true, .. }, Ok(Output::Moved(moved))) => {
-                let renames = if moved.dest == src { Vec::new() } else { vec![(src, moved.dest.clone())] };
-                self.changed(&renames);
-                Ok(pasted_message(&moved))
-            }
             (FileJob::Paste { src, cut: true, .. }, Err(e)) => {
                 // The cut wasn't spent; unless something else was cut or
                 // copied since, it can be pasted again.
@@ -1137,7 +1184,11 @@ mod tests {
         let reports = pump_until_reported(&mut s);
         assert_eq!(
             reports,
-            [FileReport { command: "file.paste", result: Ok(format!("pasted {}", d.join("to/src").display())) }]
+            [FileReport {
+                command: "file.paste",
+                result: Ok(format!("pasted {}", d.join("to/src").display())),
+                warning: false,
+            }]
         );
         assert!(browser_text(&mut s, browser).contains("src"), "the listing re-read once it finished");
         let copied = walkdir_count(&d.join("to/src"));
@@ -1228,6 +1279,35 @@ mod tests {
         assert!(d.join("to/a.txt").is_file() && d.join("to/b.txt").is_file());
         assert!(s.view(a).is_none());
         assert_eq!(editor_path(&s, b), Some(d.join("to/b.txt")), "the open one follows");
+    }
+
+    #[test]
+    fn a_move_that_left_an_open_file_behind_keeps_its_editor_there_and_warns() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-move-left");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("to/src")).unwrap();
+        for name in ["left.txt", "moved.txt"] {
+            std::fs::write(d.join("src").join(name), "old").unwrap();
+            std::fs::write(d.join("to/src").join(name), "old").unwrap();
+        }
+        let left = open_editor(&mut s, &d.join("src/left.txt"));
+        let moved = open_editor(&mut s, &d.join("src/moved.txt"));
+        // As a move across filesystems leaves it: the copy is in, the copied
+        // file removed, and the one written during the copy left in place.
+        std::fs::remove_file(d.join("src/moved.txt")).unwrap();
+        std::fs::write(d.join("src/left.txt"), "new").unwrap();
+        let done = Done {
+            id: 0,
+            job: FileJob::Paste { src: d.join("src"), dir: d.join("to"), cut: true },
+            result: Ok(Output::Moved(file_ops::Moved { dest: d.join("to/src"), source_left: true })),
+        };
+        s.report_file_job(done);
+        assert_eq!(editor_path(&s, left), Some(d.join("src/left.txt")), "stays on the newer file");
+        assert_eq!(editor_path(&s, moved), Some(d.join("to/src/moved.txt")), "follows the move");
+        let reports = s.take_file_reports();
+        assert!(reports[0].warning, "{reports:?}");
+        assert!(reports[0].result.as_ref().unwrap().contains("wasn't fully removed"));
     }
 
     #[test]
