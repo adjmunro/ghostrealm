@@ -3,13 +3,15 @@
 //! removes), and Delete's git check. A big folder or a slow `git` would
 //! otherwise freeze the window.
 //!
-//! One thread runs the jobs one at a time, in the order they were given, so
-//! an operation always sees the result of the ones before it (a second paste
-//! of the same file picks its free name after the first has taken one). Each
-//! finished job comes back as a [`Done`] for the UI thread to apply; the
-//! worker wakes the UI when one is waiting. Dropping [`FileJobs`] lets the
-//! worker finish what it was given; the process exiting does not, so a quit
-//! waits for [`Pending::wait_idle`].
+//! One thread runs the copies and moves one at a time, in the order they were
+//! given, so an operation always sees the result of the ones before it (a
+//! second paste of the same file picks its free name after the first has
+//! taken one). Delete's checks only read, and run on a second thread, so one
+//! never waits behind a long copy. Each finished job comes back as a [`Done`]
+//! for the UI thread to apply; the workers wake the UI when one is waiting.
+//! Dropping [`FileJobs`] lets the workers finish what they were given; the
+//! process exiting does not, so a quit asks while a copy or move is
+//! [`Pending`].
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -32,6 +34,10 @@ pub enum FileJob {
     /// Find whether git holds a copy of everything at `path` (tracked and
     /// unmodified), which decides whether Delete asks first.
     DeleteCheck { path: PathBuf },
+    /// A copy that runs until `until` exists, for tests that need one in
+    /// flight.
+    #[cfg(test)]
+    Hold { until: PathBuf },
 }
 
 /// What a job produced.
@@ -52,6 +58,8 @@ impl FileJob {
             FileJob::Paste { .. } => "file.paste",
             FileJob::Duplicate { .. } => "file.duplicate",
             FileJob::DeleteCheck { .. } => "file.delete",
+            #[cfg(test)]
+            FileJob::Hold { .. } => "file.paste",
         }
     }
 
@@ -61,6 +69,8 @@ impl FileJob {
             FileJob::Paste { dir, .. } => format!("pasting into {}", dir.display()),
             FileJob::Duplicate { src } => format!("duplicating {}", src.display()),
             FileJob::DeleteCheck { path } => format!("checking {} with git", path.display()),
+            #[cfg(test)]
+            FileJob::Hold { until } => format!("holding until {}", until.display()),
         }
     }
 
@@ -70,6 +80,13 @@ impl FileJob {
             FileJob::Paste { src, dir, cut: false } => Output::Copied(file_ops::copy_into(src, dir)?),
             FileJob::Duplicate { src } => Output::Copied(file_ops::duplicate(src)?),
             FileJob::DeleteCheck { path } => Output::Clean(git::is_tracked_clean(path)),
+            #[cfg(test)]
+            FileJob::Hold { until } => {
+                while !until.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Output::Copied(until.clone())
+            }
         })
     }
 }
@@ -116,72 +133,91 @@ impl Pending {
     }
 }
 
-struct Worker {
-    jobs: Sender<(u64, FileJob)>,
+/// The two lanes and the channel both send their results on.
+struct Lanes {
+    copies: Sender<(u64, FileJob)>,
+    checks: Sender<(u64, FileJob)>,
     done: Receiver<Done>,
 }
 
-/// The file-operation worker: started on the first job.
+/// The file-operation workers: started on the first job.
 #[derive(Default)]
 pub struct FileJobs {
-    worker: Option<Worker>,
+    lanes: Option<Lanes>,
     waker: Option<Waker>,
+    /// Copies and moves not finished yet: what a quit must not cut off.
     pending: Pending,
+    /// Delete's checks not finished yet. Only reads, so a quit drops them.
+    checking: Pending,
     next_id: u64,
 }
 
 impl FileJobs {
-    /// Wake the UI with `waker` when a job finishes. Applies to a worker
+    /// Wake the UI with `waker` when a job finishes. Applies to workers
     /// started after this call.
     pub fn set_waker(&mut self, waker: Option<Waker>) {
         self.waker = waker;
     }
 
-    /// Queue `job` behind the ones given before it. Returns its id.
+    /// Queue `job` behind the ones of its lane given before it: copies and
+    /// moves on one, Delete's checks on another, so a check never waits
+    /// behind a long copy. Returns its id.
     pub fn submit(&mut self, job: FileJob) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.pending.add();
-        let worker = self.worker.get_or_insert_with(|| spawn(self.waker.clone(), self.pending.clone()));
-        // The thread catches every panic, so it runs until this end drops.
-        worker.jobs.send((id, job)).expect("the file-jobs worker is running");
+        let check = matches!(job, FileJob::DeleteCheck { .. });
+        if check { &self.checking } else { &self.pending }.add();
+        let lanes = self.lanes.get_or_insert_with(|| {
+            let (outbox, done) = mpsc::channel();
+            Lanes {
+                copies: spawn("file-jobs", outbox.clone(), self.waker.clone(), self.pending.clone()),
+                checks: spawn("file-checks", outbox, self.waker.clone(), self.checking.clone()),
+                done,
+            }
+        });
+        // The threads catch every panic, so they run until this end drops.
+        if check { &lanes.checks } else { &lanes.copies }.send((id, job)).expect("the file-jobs workers are running");
         id
     }
 
     /// A finished job, if one is waiting.
     pub fn try_take(&mut self) -> Option<Done> {
-        self.worker.as_ref()?.done.try_recv().ok()
+        self.lanes.as_ref()?.done.try_recv().ok()
     }
 
     /// A finished job, waiting for one until `deadline`.
     pub fn take_until(&mut self, deadline: Instant) -> Option<Done> {
-        let worker = self.worker.as_ref()?;
+        let lanes = self.lanes.as_ref()?;
         let wait = deadline.saturating_duration_since(Instant::now());
-        worker.done.recv_timeout(wait).ok()
+        lanes.done.recv_timeout(wait).ok()
     }
 
-    /// Block until every job given has finished, and return them all in order.
+    /// Block until every job given has finished, and return them all, each
+    /// lane's in order.
     pub fn wait_all(&mut self) -> Vec<Done> {
         self.pending.wait_idle();
+        self.checking.wait_idle();
         std::iter::from_fn(|| self.try_take()).collect()
     }
 
-    /// Whether every job given has finished (its result may still be waiting).
+    /// Whether every copy and move given has finished (its result may still
+    /// be waiting). Delete's checks don't count: a quit drops them.
     pub fn idle(&self) -> bool {
         self.pending.idle()
     }
 
-    /// A handle on the count of unfinished jobs.
+    /// A handle on the count of unfinished copies and moves.
     pub fn pending(&self) -> Pending {
         self.pending.clone()
     }
 }
 
-fn spawn(waker: Option<Waker>, pending: Pending) -> Worker {
+/// Start a lane: a thread that runs its jobs in order, sends each result on
+/// `outbox`, and counts it off `pending`.
+fn spawn(name: &str, outbox: Sender<Done>, waker: Option<Waker>, pending: Pending) -> Sender<(u64, FileJob)> {
     let (jobs, inbox) = mpsc::channel::<(u64, FileJob)>();
-    let (outbox, done) = mpsc::channel();
     std::thread::Builder::new()
-        .name("file-jobs".into())
+        .name(name.into())
         .spawn(move || {
             while let Ok((id, job)) = inbox.recv() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
@@ -195,8 +231,8 @@ fn spawn(waker: Option<Waker>, pending: Pending) -> Worker {
                 }
             }
         })
-        .expect("spawn file-jobs worker");
-    Worker { jobs, done }
+        .expect("spawn a file-jobs worker");
+    jobs
 }
 
 #[cfg(test)]
@@ -290,6 +326,24 @@ pub mod tests {
         assert_eq!(count_files(&d.join("src copy")), 100, "nothing cut off half done");
         let done = jobs.wait_all();
         assert!(done[0].result.is_err(), "not into itself");
+    }
+
+    #[test]
+    fn a_delete_check_doesnt_wait_behind_a_copy_or_count_as_pending() {
+        let d = tmpdir("jobs-lanes");
+        let mut jobs = FileJobs::default();
+        jobs.submit(FileJob::DeleteCheck { path: d.clone() });
+        assert!(jobs.idle(), "a check alone holds up nothing");
+        jobs.wait_all();
+        let hold = jobs.submit(FileJob::Hold { until: d.join("go") });
+        let check = jobs.submit(FileJob::DeleteCheck { path: d.clone() });
+        let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("the check finishes first");
+        assert_eq!(done.id, check);
+        assert!(!jobs.idle(), "the copy still runs");
+        std::fs::write(d.join("go"), "").unwrap();
+        let done = jobs.wait_all();
+        assert_eq!(done.iter().map(|d| d.id).collect::<Vec<_>>(), [hold]);
+        assert!(jobs.idle());
     }
 
     #[test]
