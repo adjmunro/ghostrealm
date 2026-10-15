@@ -300,6 +300,12 @@ impl FileJobs {
         !self.checks.is_empty()
     }
 
+    /// Whether a Delete check is still running.
+    #[cfg(test)]
+    pub fn checking_unfinished(&self) -> bool {
+        !self.checking.idle()
+    }
+
     /// A handle on the count of unfinished copies and moves.
     pub fn pending(&self) -> Pending {
         self.pending.clone()

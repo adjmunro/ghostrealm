@@ -260,11 +260,11 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     /// AppKit is terminating the app (its quit went ahead at once, or after
-    /// a held request was answered yes): report what the file worker
-    /// finished, as an in-window quit does before it exits.
+    /// a held request was answered yes): report the copies and moves the
+    /// file worker finished, as an in-window quit does before it exits.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
-            state.app.poll_file_jobs();
+            state.app.poll_file_jobs_on_exit();
             state.print_file_reports();
         }
     }
@@ -1697,12 +1697,12 @@ impl State {
     /// sometimes long enough that macOS marks the app unresponsive. Exiting
     /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
     /// child shells, exactly as closing any terminal does. A copy or move
-    /// still running was asked about before the quit was agreed; what the
-    /// file worker finished is reported first.
+    /// still running was asked about before the quit was agreed; the copies
+    /// and moves the file worker finished are reported first.
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
-            self.app.poll_file_jobs();
+            self.app.poll_file_jobs_on_exit();
             self.print_file_reports();
             std::process::exit(0);
         }

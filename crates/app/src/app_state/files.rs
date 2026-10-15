@@ -221,6 +221,18 @@ impl AppState {
         any
     }
 
+    /// Apply the copies and moves that finished, as the app exits, so their
+    /// reports can be printed. Delete's finished checks are dropped: one
+    /// would trash (or ask) during termination, while a check still running
+    /// is dropped anyway.
+    pub fn poll_file_jobs_on_exit(&mut self) {
+        while let Some(done) = self.file_jobs.try_take() {
+            if !matches!(done.job, FileJob::DeleteCheck { .. }) {
+                self.report_file_job(done);
+            }
+        }
+    }
+
     /// Block until every file job has finished, and apply them. For callers
     /// with no event loop to wake (the agent channel, tests).
     pub fn wait_file_jobs(&mut self) {
@@ -1365,6 +1377,25 @@ mod tests {
             s.poll_file_jobs();
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn exiting_reports_finished_copies_and_drops_finished_delete_checks() {
+        let Some(r) = repo("fm-exit-poll") else { return };
+        let (mut s, calls) = app_in_background();
+        start(&mut s, "file.delete", &[("path", &r.join("tracked.txt"))]).unwrap();
+        start(&mut s, "file.duplicate", &[("path", &r.join("tracked.txt"))]).unwrap();
+        s.file_jobs.pending().wait_idle();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.file_jobs.checking_unfinished() {
+            assert!(Instant::now() < deadline, "the check never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        s.poll_file_jobs_on_exit();
+        assert!(calls.borrow().is_empty() && s.confirm().is_none(), "the clean file isn't trashed on the way out");
+        let reports = s.take_file_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].command, "file.duplicate");
     }
 
     #[test]
