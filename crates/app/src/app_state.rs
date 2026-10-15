@@ -123,6 +123,9 @@ enum Confirmed {
     /// (accept) or load the disk version over its edits (discard). Then carry
     /// on with `rest`, the other views a Save and Close was saving, and `then`.
     DiskConflict { sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume> },
+    /// A copy or move is running: quit once it finishes (accept), or now,
+    /// leaving it half done (discard).
+    BusyQuit,
 }
 
 /// What a save that stopped to ask about a changed file goes on to do.
@@ -164,6 +167,8 @@ pub struct AppState {
     guard_unsaved: bool,
     /// An accepted quit is waiting for the window to exit.
     quitting: bool,
+    /// A quit is waiting for the running copies and moves to finish.
+    quit_after_jobs: bool,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -213,6 +218,7 @@ impl AppState {
             confirm: None,
             guard_unsaved: false,
             quitting: false,
+            quit_after_jobs: false,
             shell_line: None,
             waker: None,
             languages: None,
@@ -669,6 +675,10 @@ impl AppState {
                 // Nothing is closed unless every save worked.
                 self.save_views(&save, Some(Resume::Leave(what)))
             }
+            Some(Confirm { then: Confirmed::BusyQuit, .. }) => {
+                self.quit_after_jobs = true;
+                Ok(Vec::new())
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -726,6 +736,7 @@ impl AppState {
         }
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
+            Some(Confirm { then: Confirmed::BusyQuit, .. }) => self.quitting = true,
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
@@ -760,6 +771,18 @@ impl AppState {
     /// Whether a quit has been agreed and the window should exit.
     pub fn quitting(&self) -> bool {
         self.quitting
+    }
+
+    /// Go on with a quit that waited for the running copies and moves, once
+    /// they have finished: it asks again about anything unsaved since.
+    /// Returns whether it did.
+    pub fn quit_when_idle(&mut self) -> bool {
+        if !self.quit_after_jobs || !self.file_jobs_idle() {
+            return false;
+        }
+        self.quit_after_jobs = false;
+        self.request_quit();
+        true
     }
 
     /// Confirm the picker with its browser's choice, then close it. With no
@@ -1067,6 +1090,18 @@ impl AppState {
     /// Leave `what`: remove it from the tree and drop the views of surfaces
     /// that no longer exist, or flag the quit.
     fn perform(&mut self, what: Leave) {
+        // Exiting mid-copy leaves a half-copied tree under the real name, so
+        // the GUI asks first. Delete's checks don't count: they only read.
+        if what == Leave::Quit && self.guard_unsaved && !self.file_jobs_idle() {
+            self.confirm = Some(Confirm {
+                message: "A file copy or move is still running. Quitting now would leave it half done.".into(),
+                accept: Some("Wait"),
+                discard: Some("Quit Anyway"),
+                then: Confirmed::BusyQuit,
+                late: None,
+            });
+            return;
+        }
         self.prune_orphan_surfaces_after(|s| match what {
             Leave::Quit => {
                 s.quitting = true;

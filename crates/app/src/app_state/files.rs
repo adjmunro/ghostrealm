@@ -1252,6 +1252,70 @@ mod tests {
         assert!(s.confirm().unwrap().takes_keys_at(Instant::now()));
     }
 
+    fn guarded_app() -> AppState {
+        let mut s = AppState::new().with_unsaved_guard().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        s
+    }
+
+    #[test]
+    fn quitting_while_a_copy_runs_asks_then_waits_for_it_or_quits_anyway() {
+        let d = tmpdir("fm-quit-busy");
+        // Wait: the quit goes on once the copy is done.
+        let mut s = guarded_app();
+        s.file_jobs.submit(FileJob::Hold { until: d.join("go") });
+        s.request_quit();
+        let c = s.confirm().expect("a copy runs: ask");
+        assert_eq!((c.accept, c.discard), (Some("Wait"), Some("Quit Anyway")));
+        s.accept_confirm().unwrap();
+        assert!(!s.quitting() && !s.quit_when_idle(), "the copy still runs");
+        std::fs::write(d.join("go"), "").unwrap();
+        s.wait_file_jobs();
+        assert!(s.quit_when_idle());
+        assert!(s.quitting());
+        assert!(!s.quit_when_idle(), "once");
+        // Quit Anyway: at once.
+        let mut s = guarded_app();
+        s.file_jobs.submit(FileJob::Hold { until: d.join("go2") });
+        s.request_quit();
+        s.discard_confirm().unwrap();
+        assert!(s.quitting());
+        std::fs::write(d.join("go2"), "").unwrap();
+        // Cancel: no quit, and none later.
+        let mut s = guarded_app();
+        s.file_jobs.submit(FileJob::Hold { until: d.join("go3") });
+        s.request_quit();
+        s.cancel_confirm();
+        std::fs::write(d.join("go3"), "").unwrap();
+        s.wait_file_jobs();
+        assert!(!s.quit_when_idle() && !s.quitting());
+    }
+
+    #[test]
+    fn a_quit_asks_about_unsaved_changes_then_about_a_running_copy() {
+        let d = tmpdir("fm-quit-unsaved-busy");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let mut s = guarded_app();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        s.file_jobs.submit(FileJob::Hold { until: d.join("go") });
+        s.request_quit();
+        assert_eq!(s.confirm().unwrap().discard, Some("Quit Without Saving"));
+        s.discard_confirm().unwrap();
+        assert_eq!(s.confirm().unwrap().accept, Some("Wait"), "then the copy");
+        assert!(!s.quitting());
+        std::fs::write(d.join("go"), "").unwrap();
+    }
+
+    #[test]
+    fn a_running_delete_check_doesnt_hold_up_a_quit() {
+        let d = tmpdir("fm-quit-check");
+        let mut s = guarded_app();
+        s.file_jobs.submit(FileJob::DeleteCheck { path: d });
+        s.request_quit();
+        assert!(s.confirm().is_none() && s.quitting());
+    }
+
     #[test]
     fn a_delete_check_that_finishes_under_another_question_deletes_nothing() {
         let (mut s, calls) = app_in_background();

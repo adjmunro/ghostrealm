@@ -137,7 +137,8 @@ struct App {
     unsaved: UnsavedFlag,
 }
 
-/// A cached answer to "would quitting ask about unsaved changes?", shared with
+/// A cached answer to "would quitting ask first?" (about unsaved changes, or
+/// a file copy or move still running), shared with
 /// the system's quit request. The exact value is computed once per loop pass
 /// (`about_to_wait`); every event handler first assumes the worst, because an
 /// event (a keystroke) may edit a buffer and a quit request can arrive in the
@@ -169,21 +170,6 @@ impl UnsavedFlag {
         self.reply_due.set(true);
     }
 
-    /// Whether a termination request is waiting for an answer.
-    fn termination_held(&self) -> bool {
-        self.reply_due.get()
-    }
-
-    /// [`Self::settle`], except that with nothing to ask, a held request
-    /// waits (`None`) until the file worker is idle (`jobs_idle`): going
-    /// ahead would cut a running copy off half done.
-    fn settle_after_jobs(&self, unsaved: bool, jobs_idle: bool) -> Option<bool> {
-        if unsaved || jobs_idle {
-            self.settle(unsaved)
-        } else {
-            None
-        }
-    }
 
     /// With the exact value known, the answer to a held termination request:
     /// `Some(true)` to go ahead, `Some(false)` to stay and ask. `None` when
@@ -281,8 +267,12 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        // An agreed quit waiting on the file worker exits once it is idle.
-        state.exit_if_quitting();
+        // A quit that waited for a copy or move goes on once it finished.
+        if state.app.quit_when_idle() {
+            state.exit_if_quitting();
+            state.dirty = true;
+            state.window.request_redraw();
+        }
         // Text a command put aside for the system clipboard.
         if let Some(text) = state.app.take_clipboard_text() {
             if let Some(cb) = state.clipboard.as_mut() {
@@ -298,14 +288,10 @@ impl ApplicationHandler<UserEvent> for App {
                 Ok(_) => {}
             }
         }
-        // A termination waiting on the file worker hides the window, as a
-        // quit does; the worker's wake brings the loop back here. One with
-        // unsaved changes asks first, so the window stays.
-        let (unsaved, jobs_idle) = (state.app.has_unsaved(), state.app.file_jobs_idle());
-        if !unsaved && !jobs_idle && self.unsaved.termination_held() {
-            state.window.set_visible(false);
-        }
-        match self.unsaved.settle_after_jobs(unsaved, jobs_idle) {
+        // A copy or move still running asks too: going ahead would leave it
+        // half done.
+        let ask = state.app.has_unsaved() || !state.app.file_jobs_idle();
+        match self.unsaved.settle(ask) {
             // After this handler returns: terminating inside it would re-enter winit.
             Some(true) => reply_to_terminate_later(true),
             // Asked from outside the window (it may be minimised, or the app
@@ -1710,16 +1696,12 @@ impl State {
     /// (the wgpu/Metal device drop) is synchronous and can stall for seconds,
     /// sometimes long enough that macOS marks the app unresponsive. Exiting
     /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
-    /// child shells, exactly as closing any terminal does. A file operation
-    /// still running (a copy) finishes first, with the window hidden: exiting
-    /// would leave it half done. `about_to_wait` calls back here once the
-    /// worker's wake arrives.
+    /// child shells, exactly as closing any terminal does. A copy or move
+    /// still running was asked about before the quit was agreed.
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
-            if self.app.file_jobs_idle() {
-                std::process::exit(0);
-            }
+            std::process::exit(0);
         }
     }
 
@@ -5069,18 +5051,6 @@ mod tests {
         flag.hold_termination();
         assert_eq!(flag.settle(true), Some(false));
         assert!(flag.get());
-    }
-
-    #[test]
-    fn a_held_termination_with_nothing_to_ask_waits_for_running_file_operations() {
-        let flag = super::UnsavedFlag::default();
-        flag.hold_termination();
-        assert_eq!(flag.settle_after_jobs(false, false), None, "a copy is running");
-        assert!(flag.termination_held());
-        assert_eq!(flag.settle_after_jobs(false, true), Some(true), "done: go ahead");
-        // Unsaved changes ask at once; the quit they lead to waits instead.
-        flag.hold_termination();
-        assert_eq!(flag.settle_after_jobs(true, false), Some(false));
     }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so
