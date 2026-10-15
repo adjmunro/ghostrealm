@@ -13,7 +13,8 @@
 //! process exiting does not, so a quit asks while a copy or move is
 //! [`Pending`].
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -34,10 +35,10 @@ pub enum FileJob {
     /// Find whether git holds a copy of everything at `path` (tracked and
     /// unmodified), which decides whether Delete asks first.
     DeleteCheck { path: PathBuf },
-    /// A copy that runs until `until` exists, for tests that need one in
-    /// flight.
+    /// A copy of `src` into `dir` that runs until `until` exists, for tests
+    /// that need one in flight.
     #[cfg(test)]
-    Hold { until: PathBuf },
+    Hold { src: PathBuf, dir: PathBuf, until: PathBuf },
 }
 
 /// What a job produced.
@@ -70,7 +71,19 @@ impl FileJob {
             FileJob::Duplicate { src } => format!("duplicating {}", src.display()),
             FileJob::DeleteCheck { path } => format!("checking {} with git", path.display()),
             #[cfg(test)]
-            FileJob::Hold { until } => format!("holding until {}", until.display()),
+            FileJob::Hold { until, .. } => format!("holding until {}", until.display()),
+        }
+    }
+
+    /// What a copy or move reads from and writes into: its source and the
+    /// folder it copies into.
+    fn uses(&self) -> Vec<PathBuf> {
+        match self {
+            FileJob::Paste { src, dir, .. } => vec![src.clone(), dir.clone()],
+            FileJob::Duplicate { src } => src.parent().map(Path::to_path_buf).into_iter().chain([src.clone()]).collect(),
+            FileJob::DeleteCheck { .. } => Vec::new(),
+            #[cfg(test)]
+            FileJob::Hold { src, dir, .. } => vec![src.clone(), dir.clone()],
         }
     }
 
@@ -81,7 +94,7 @@ impl FileJob {
             FileJob::Duplicate { src } => Output::Copied(file_ops::duplicate(src)?),
             FileJob::DeleteCheck { path } => Output::Clean(git::is_tracked_clean(path)),
             #[cfg(test)]
-            FileJob::Hold { until } => {
+            FileJob::Hold { until, .. } => {
                 while !until.exists() {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
@@ -98,6 +111,9 @@ pub struct Done {
     pub id: u64,
     pub job: FileJob,
     pub result: Result<Output>,
+    /// For Delete's check: a copy or move used the path (or a folder around
+    /// or inside it) while the check ran, so git's answer may be out of date.
+    pub busy: bool,
 }
 
 /// The number of jobs given to the worker and not finished yet, shared with
@@ -149,7 +165,18 @@ pub struct FileJobs {
     pending: Pending,
     /// Delete's checks not finished yet. Only reads, so a quit drops them.
     checking: Pending,
+    /// Copies and moves given and not taken back yet, with what they use.
+    active: Vec<(u64, Vec<PathBuf>)>,
+    /// Delete's checks not taken back yet: their path, and whether a copy or
+    /// move used it since the check was given.
+    checks: HashMap<u64, (PathBuf, bool)>,
     next_id: u64,
+}
+
+/// Whether `a` and `b` are the same entry or one holds the other (whole
+/// path components: `/a/b` is not inside `/a/bc`).
+fn overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }
 
 impl FileJobs {
@@ -167,6 +194,16 @@ impl FileJobs {
         self.next_id += 1;
         let check = matches!(job, FileJob::DeleteCheck { .. });
         if check { &self.checking } else { &self.pending }.add();
+        if let FileJob::DeleteCheck { path } = &job {
+            let busy = self.active.iter().flat_map(|(_, uses)| uses).any(|u| overlap(u, path));
+            self.checks.insert(id, (path.clone(), busy));
+        } else {
+            let uses = job.uses();
+            for (path, busy) in self.checks.values_mut() {
+                *busy |= uses.iter().any(|u| overlap(u, path));
+            }
+            self.active.push((id, uses));
+        }
         let lanes = self.lanes.get_or_insert_with(|| {
             let (outbox, done) = mpsc::channel();
             Lanes {
@@ -182,14 +219,26 @@ impl FileJobs {
 
     /// A finished job, if one is waiting.
     pub fn try_take(&mut self) -> Option<Done> {
-        self.lanes.as_ref()?.done.try_recv().ok()
+        let done = self.lanes.as_ref()?.done.try_recv().ok()?;
+        Some(self.taken(done))
     }
 
     /// A finished job, waiting for one until `deadline`.
     pub fn take_until(&mut self, deadline: Instant) -> Option<Done> {
         let lanes = self.lanes.as_ref()?;
         let wait = deadline.saturating_duration_since(Instant::now());
-        lanes.done.recv_timeout(wait).ok()
+        let done = lanes.done.recv_timeout(wait).ok()?;
+        Some(self.taken(done))
+    }
+
+    /// Note that `done` was taken back: a copy or move no longer uses its
+    /// paths, and a check learns whether one did meanwhile.
+    fn taken(&mut self, mut done: Done) -> Done {
+        self.active.retain(|(id, _)| *id != done.id);
+        if let Some((_, busy)) = self.checks.remove(&done.id) {
+            done.busy = busy;
+        }
+        done
     }
 
     /// Block until every job given has finished, and return them all, each
@@ -204,6 +253,12 @@ impl FileJobs {
     /// be waiting). Delete's checks don't count: a quit drops them.
     pub fn idle(&self) -> bool {
         self.pending.idle()
+    }
+
+    /// Whether a Delete check hasn't been taken back yet.
+    #[cfg(test)]
+    pub fn checking(&self) -> bool {
+        !self.checks.is_empty()
     }
 
     /// A handle on the count of unfinished copies and moves.
@@ -224,7 +279,7 @@ fn spawn(name: &str, outbox: Sender<Done>, waker: Option<Waker>, pending: Pendin
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("the file operation failed unexpectedly")));
                 // Sent before the count drops, so once idle every result is
                 // waiting. A closed UI end still lets the queued jobs run.
-                let _ = outbox.send(Done { id, job, result });
+                let _ = outbox.send(Done { id, job, result, busy: false });
                 pending.finish();
                 if let Some(wake) = &waker {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
@@ -335,7 +390,7 @@ pub mod tests {
         jobs.submit(FileJob::DeleteCheck { path: d.clone() });
         assert!(jobs.idle(), "a check alone holds up nothing");
         jobs.wait_all();
-        let hold = jobs.submit(FileJob::Hold { until: d.join("go") });
+        let hold = jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
         let check = jobs.submit(FileJob::DeleteCheck { path: d.clone() });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("the check finishes first");
         assert_eq!(done.id, check);
@@ -344,6 +399,29 @@ pub mod tests {
         let done = jobs.wait_all();
         assert_eq!(done.iter().map(|d| d.id).collect::<Vec<_>>(), [hold]);
         assert!(jobs.idle());
+    }
+
+    #[test]
+    fn a_check_learns_whether_a_copy_used_its_path_by_whole_components() {
+        let d = tmpdir("jobs-busy");
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        let mut jobs = FileJobs::default();
+        let hold = |until: &str| FileJob::Hold { src: d.join("a/b"), dir: d.join("to"), until: d.join(until) };
+        jobs.submit(hold("go"));
+        for (path, busy) in [("a", true), ("a/b/c", true), ("a/bc", false), ("to/x", true), ("elsewhere", false)] {
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path) });
+            let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+            assert_eq!(done.busy, busy, "{path}");
+        }
+        // Given after the check started: the check hears of it.
+        jobs.submit(FileJob::Hold { src: d.join("x"), dir: d.join("y"), until: d.join("go") });
+        std::fs::write(d.join("go"), "").unwrap();
+        let done = jobs.wait_all();
+        assert_eq!(done.len(), 2);
+        let check = jobs.submit(FileJob::DeleteCheck { path: d.join("late") });
+        jobs.submit(FileJob::Duplicate { src: d.join("late/f") });
+        let done = jobs.wait_all();
+        assert!(done.iter().find(|x| x.id == check).unwrap().busy);
     }
 
     #[test]

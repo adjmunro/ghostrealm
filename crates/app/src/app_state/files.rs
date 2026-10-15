@@ -301,6 +301,7 @@ impl AppState {
     }
 
     fn apply_file_job_result(&mut self, done: Done) -> Result<String> {
+        let busy = done.busy;
         match (done.job, done.result) {
             (FileJob::Paste { src, cut: true, .. }, Err(e)) => {
                 // The cut wasn't spent; unless something else was cut or
@@ -316,8 +317,10 @@ impl AppState {
                 self.changed(&[]);
                 Ok(format!("duplicated to {}", dest.display()))
             }
+            // A copy or move using the path while git looked may have changed
+            // what git saw (or be reading from it): ask.
             (FileJob::DeleteCheck { path }, Ok(Output::Clean(clean))) => {
-                self.delete_checked(&path, clean).map(|()| String::new())
+                self.delete_checked(&path, clean && !busy).map(|()| String::new())
             }
             (_, Err(e)) => Err(e),
             (job, Ok(output)) => bail!("{} produced {output:?}", job.command()),
@@ -1263,7 +1266,7 @@ mod tests {
         let d = tmpdir("fm-quit-busy");
         // Quit Anyway: at once.
         let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::Hold { until: d.join("go") });
+        s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
         s.request_quit();
         let c = s.confirm().expect("a copy runs: ask");
         assert_eq!((c.accept, c.discard), (Some("Quit Anyway"), None));
@@ -1274,7 +1277,7 @@ mod tests {
         std::fs::write(d.join("go"), "").unwrap();
         // Cancel: the app stays, the copy goes on, and a later quit asks again.
         let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::Hold { until: d.join("go2") });
+        s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go2") });
         s.request_quit();
         assert_eq!(s.enter_confirm().unwrap(), Vec::<PathBuf>::new());
         assert!(s.confirm().is_none() && !s.quitting(), "Enter cancelled");
@@ -1294,13 +1297,49 @@ mod tests {
         let mut s = guarded_app();
         let sid = open_editor(&mut s, &d.join("a.txt"));
         s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
-        s.file_jobs.submit(FileJob::Hold { until: d.join("go") });
+        s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
         s.request_quit();
         assert_eq!(s.confirm().unwrap().discard, Some("Quit Without Saving"));
         s.discard_confirm().unwrap();
         assert_eq!(s.confirm().unwrap().accept, Some("Quit Anyway"), "then the copy");
         assert!(!s.quitting());
         std::fs::write(d.join("go"), "").unwrap();
+    }
+
+    #[test]
+    fn deleting_what_a_running_copy_reads_from_or_writes_into_asks_first() {
+        let Some(r) = repo("fm-delete-busy") else { return };
+        std::fs::create_dir(r.join("to")).unwrap();
+        std::fs::write(r.join("to/kept.txt"), "k\n").unwrap();
+        assert!(git_ok(&r, &["add", "-A"]));
+        assert!(git_ok(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "to"]));
+        for (target, why) in [(r.join("tracked.txt"), "the copy's source"), (r.join("to"), "the folder pasted into")] {
+            let (mut s, calls) = app();
+            let go = tmpdir("fm-delete-busy-go").join("go");
+            s.file_jobs.submit(FileJob::Hold { src: r.join("tracked.txt"), dir: r.join("to"), until: go.clone() });
+            run_until_check(&mut s, &target);
+            assert!(s.confirm().is_some(), "{why}: tracked and clean, but in use, so ask");
+            assert!(calls.borrow().is_empty());
+            std::fs::write(&go, "").unwrap();
+            s.wait_file_jobs();
+        }
+        // Once the copy is done, a clean file goes without asking again.
+        let (mut s, calls) = app();
+        run_until_check(&mut s, &r.join("tracked.txt"));
+        assert!(s.confirm().is_none());
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
+    /// Start a Delete of `path` and apply its check (only: a held copy may
+    /// still run).
+    fn run_until_check(s: &mut AppState, path: &Path) {
+        start(s, "file.delete", &[("path", path)]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.file_jobs.checking() {
+            assert!(Instant::now() < deadline, "the check never finished");
+            s.poll_file_jobs();
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
@@ -1389,6 +1428,7 @@ mod tests {
             id: 0,
             job: FileJob::Paste { src: d.join("src"), dir: d.join("to"), cut: true },
             result: Ok(Output::Moved(file_ops::Moved { dest: d.join("to/src"), source_left: true })),
+            busy: false,
         };
         s.report_file_job(done);
         assert_eq!(editor_path(&s, left), Some(d.join("src/left.txt")), "stays on the newer file");
