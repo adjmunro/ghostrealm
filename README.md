@@ -77,10 +77,14 @@ Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclud
 (in a git repository), Rename, Save Copy As (editor), and Delete, last under a rule.
 Delete moves to the Trash (macOS only for now) and closes the file's editors; it asks
 first unless git tracks the file and it is unmodified (a folder: all of it, and it
-isn't a repository itself). Paste, Duplicate, and Delete's git check run in the
-background, one at a time in the order given, so a big folder doesn't freeze the
-window; quitting waits for one still running, with the window hidden. Names are
-asked for in the palette's argument prompt.
+isn't a repository itself). Paste and Duplicate run in the background, one at a
+time in the order given, so a big folder doesn't freeze the window; Delete's git
+check runs beside them. A question that appears when a background check finishes
+ignores keys for a moment, so an Enter typed elsewhere doesn't answer it.
+Quitting while a copy or move runs asks: Wait (quit when it finishes) or Quit
+Anyway. A move across filesystems that leaves part of the original (a file
+changed while it was copied) keeps that file's editor on it and says so on
+stderr. Names are asked for in the palette's argument prompt.
 Each item is also a `file.*` command (palette, agent, key bindings) acting on the
 focused file, or on its `path` argument (a relative one is taken from the workspace
 folder). Cut and Copy keep the
