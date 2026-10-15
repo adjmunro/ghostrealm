@@ -14,7 +14,7 @@
 //! [`Pending`].
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -183,13 +183,38 @@ fn overlap(a: &Path, b: &Path) -> bool {
 /// above it that exists, with symlinks resolved (`/tmp` is `/private/tmp` on
 /// macOS), then the rest as given, so a symlink entry stays itself. Both
 /// count: deleting a link to a folder still breaks a copy reading through it.
+/// A `.` or `..` in it would never match a whole component: an existing
+/// such path is resolved whole, any other has them dropped first.
 fn spellings(path: &Path) -> [PathBuf; 2] {
-    let resolved = path
-        .ancestors()
-        .skip(1)
-        .find_map(|dir| Some((dir.canonicalize().ok()?, path.strip_prefix(dir).ok()?)))
-        .map_or_else(|| path.to_path_buf(), |(dir, rest)| dir.join(rest));
+    let dotted = path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    let resolved = match dotted.then(|| path.canonicalize().ok()).flatten() {
+        Some(whole) => whole,
+        None => {
+            let plain = if dotted { lexical(path) } else { path.to_path_buf() };
+            plain
+                .ancestors()
+                .skip(1)
+                .find_map(|dir| Some((dir.canonicalize().ok()?, plain.strip_prefix(dir).ok()?)))
+                .map_or_else(|| plain.clone(), |(dir, rest)| dir.join(rest))
+        }
+    };
     [path.to_path_buf(), resolved]
+}
+
+/// `path` with `.` dropped and each `..` taking the component before it, by
+/// spelling alone (for a path that doesn't exist, so the disk can't say).
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl FileJobs {
@@ -460,6 +485,22 @@ pub mod tests {
         assert!(done.busy, "inside the destination folder");
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(!done.busy);
+        std::fs::write(d.join("go"), "").unwrap();
+        jobs.wait_all();
+    }
+
+    #[test]
+    fn a_dotted_path_matches_the_folder_it_names() {
+        let d = tmpdir("jobs-busy-dots");
+        std::fs::create_dir_all(d.join("real/a")).unwrap();
+        std::fs::create_dir_all(d.join("real/b")).unwrap();
+        let mut jobs = FileJobs::default();
+        jobs.submit(FileJob::Hold { src: d.join("real/b"), dir: d.join("to"), until: d.join("go") });
+        for (path, busy) in [("real/a/..", true), ("real/./b", true), ("real/a/../a", false), ("nope/../to/x", true)] {
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path) });
+            let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+            assert_eq!(done.busy, busy, "{path}");
+        }
         std::fs::write(d.join("go"), "").unwrap();
         jobs.wait_all();
     }
