@@ -92,8 +92,11 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
             match (ran, finished) {
                 (Err(e), _) => json!({ "ok": false, "error": e.to_string() }),
                 (Ok(_), Err(e)) => json!({ "ok": false, "error": e }),
-                (Ok(out), Ok(messages)) => {
-                    let message = messages.into_iter().rfind(|m| !m.is_empty()).or(out.message);
+                // A job that reported speaks for the command: what the command
+                // said was that the job is running.
+                (Ok(out), Ok(messages)) if messages.is_empty() => json!({ "ok": true, "message": out.message }),
+                (Ok(_), Ok(messages)) => {
+                    let message = messages.into_iter().rfind(|m| !m.is_empty());
                     json!({ "ok": true, "message": message })
                 }
             }
@@ -280,6 +283,26 @@ mod tests {
         assert!(text.contains("FINISHED"), "the output stays readable:\n{text}");
         let resp = ask(&mut state, r#"{"op":"get","what":"tree"}"#);
         assert!(resp["tree"].as_str().unwrap().contains("surface "), "the surface is still in the tree");
+    }
+
+    #[test]
+    fn a_file_command_finished_in_the_background_replies_with_its_outcome_not_its_progress() {
+        let d = crate::plugin::testing::tmpdir("agent-file-job");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let mut state = AppState::new().with_file_job_wait(std::time::Duration::ZERO);
+        state.new_empty_vtab();
+        let mut registry = build_registry();
+        let path = d.to_str().unwrap();
+        let dup = format!(r#"{{"op":"set","id":"file.duplicate","args":{{"path":"{path}/a.txt"}}}}"#);
+        let resp = handle(&dup, &mut state, &mut registry);
+        assert_eq!(resp["message"], json!(format!("duplicated to {path}/a copy.txt")), "{resp:?}");
+        // Delete's check says nothing once done (here it asks first).
+        let del = format!(r#"{{"op":"set","id":"file.delete","args":{{"path":"{path}/a.txt"}}}}"#);
+        let resp = handle(&del, &mut state, &mut registry);
+        assert_eq!(resp, json!({ "ok": true, "message": null }));
+        if ghostrealm_core::git::repo_root(&d).is_none() {
+            assert!(state.confirm().is_some(), "untracked: asks first");
+        }
     }
 
     #[test]

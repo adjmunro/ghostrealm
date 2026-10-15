@@ -615,7 +615,8 @@ mod tests {
         let out = start(s, id, args)?;
         s.wait_file_jobs();
         match s.take_file_reports().into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>() {
-            Ok(messages) => Ok(messages.into_iter().next_back().map_or(out, CmdOutcome::msg)),
+            Ok(messages) if messages.is_empty() => Ok(out),
+            Ok(messages) => Ok(messages.into_iter().rfind(|m| !m.is_empty()).map_or_else(CmdOutcome::ok, CmdOutcome::msg)),
             Err(e) => Err(CmdError::Failed(e)),
         }
     }
