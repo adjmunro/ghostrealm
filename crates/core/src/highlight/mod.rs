@@ -461,6 +461,10 @@ mod tests {
         assert_eq!(md.comment_on("```", toml), md.comment(), "the closing fence is Markdown");
         let rust = md.line("```rust", 0).1;
         assert_eq!(md.comment_on("let a = 1;", rust), language("rust").unwrap().comment);
+        for info in ["rust,ignore", "{.rust .numberLines}"] {
+            let st = md.line(&format!("```{info}"), 0).1;
+            assert_eq!(md.comment_on("x", st), language("rust").unwrap().comment, "{info}");
+        }
         let quoted = md.line("> ```rust", 0).1;
         assert_eq!(md.comment_on("> let a = 1;", quoted), language("rust").unwrap().comment);
         assert_eq!(md.comment_lead("> let a = 1;", quoted), 1);

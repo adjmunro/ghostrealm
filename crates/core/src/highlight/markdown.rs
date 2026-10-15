@@ -113,16 +113,20 @@ fn fence_of(state: State) -> (char, usize, State) {
     )
 }
 
-/// The language a fence's info string (its first word) names, encoded as
-/// [`LANG_SHIFT`] describes. Only line-local highlighters qualify: the body
-/// lines enter it with state 0.
+/// The language a fence's info string names, encoded as [`LANG_SHIFT`]
+/// describes: its first word (up to a space, `,` or `{`: ```` ```rust,ignore````),
+/// or for an attribute block the first class in it (```` ```{.python}````).
+/// Only line-local highlighters qualify: the body lines enter it with state 0.
 fn fence_lang(info: &[char]) -> State {
-    let word: String = info
-        .iter()
-        .skip_while(|x| x.is_whitespace())
-        .take_while(|x| !x.is_whitespace() && **x != '{')
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let info: String = info.iter().collect::<String>().to_ascii_lowercase();
+    let info = info.trim_start();
+    let word = match info.strip_prefix('{') {
+        Some(attrs) => attrs
+            .split(|x: char| x.is_whitespace() || x == ',' || x == '}')
+            .find_map(|w| w.strip_prefix('.'))
+            .unwrap_or(""),
+        None => info.split(|x: char| x.is_whitespace() || x == ',' || x == '{').next().unwrap_or(""),
+    };
     let word = word.trim_start_matches('.');
     let highlighted = ALL.iter().position(|h| !h.carries_state() && (h.name() == word || h.extensions().contains(&word)));
     let listed = || LANGUAGES.iter().position(|l| l.names.contains(&word)).map(|i| ALL.len() + i);
@@ -675,11 +679,11 @@ mod tests {
         assert_eq!(close, vec![run("```", Marker)]);
         assert_eq!(s, 0);
         // Names and extensions both resolve; unknown or stateful ones stay plain code.
-        for info in ["TOML", " toml {x}", ".toml"] {
+        for info in ["TOML", " toml {x}", ".toml", "toml,ignore", "{.toml}", "{#id .toml .x}", "toml{x}"] {
             let (_, s) = lex_in(&format!("```{info}"), 0);
             assert_eq!(lex_in("a = 1", s).0[0], run("a ", Key), "{info:?}");
         }
-        for info in ["rust", "", "markdown", "md"] {
+        for info in ["rust", "", "markdown", "md", "{toml}", "{}", ",toml"] {
             let (_, s) = lex_in(&format!("```{info}"), 0);
             assert_eq!(lex_in("a = 1", s).0, vec![run("a = 1", Code)], "{info:?}");
         }
