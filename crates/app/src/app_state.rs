@@ -102,9 +102,11 @@ impl Confirm {
     /// Whether Enter cancels instead of accepting (and Cancel is drawn as the
     /// primary button): accepting would write over another program's version
     /// of a file, or cut a running copy off half done, which a stray Enter
-    /// must not do.
+    /// must not do. So would a question a background job opened: it came
+    /// while the user may be typing elsewhere, and its Delete is answered by
+    /// a click.
     pub fn enter_cancels(&self) -> bool {
-        matches!(self.then, Confirmed::DiskConflict { .. } | Confirmed::BusyQuit)
+        self.late.is_some() || matches!(self.then, Confirmed::DiskConflict { .. } | Confirmed::BusyQuit)
     }
 }
 

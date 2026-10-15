@@ -1246,6 +1246,9 @@ mod tests {
         let c = s.confirm().expect("untracked: asks");
         assert!(!c.takes_keys_at(now), "an Enter typed meanwhile doesn't answer it");
         assert!(c.takes_keys_at(now + crate::app_state::LATE_CONFIRM_GRACE));
+        assert!(c.enter_cancels(), "even later, Enter doesn't delete");
+        s.enter_confirm().unwrap();
+        assert!(s.confirm().is_none() && d.join("a.txt").exists(), "cancelled");
         // One the user's own action opens takes keys at once.
         let mut s = AppState::new().with_unsaved_guard().with_shell_line("sleep 1");
         s.new_empty_vtab();
@@ -1253,6 +1256,7 @@ mod tests {
         s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
         run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
         assert!(s.confirm().unwrap().takes_keys_at(Instant::now()));
+        assert!(!s.confirm().unwrap().enter_cancels(), "Enter answers it as before");
     }
 
     fn guarded_app() -> AppState {
