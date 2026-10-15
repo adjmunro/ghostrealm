@@ -367,15 +367,21 @@ impl EditorView {
     }
 
     /// Comment or uncomment the selected lines per the language of the first
-    /// one ([`highlight::Highlighter::comment_on`]). Returns `Err` when that
+    /// one ([`highlight::Highlighter::comment_on`], or the file's
+    /// [`highlight::Language`] without a highlighter). Returns `Err` when that
     /// language has no comment syntax.
     pub fn toggle_comment(&mut self) -> Result<(), &'static str> {
         const NONE: &str = "this language has no comment syntax";
-        let h = self.buf.path.as_deref().and_then(highlight::for_path).ok_or(NONE)?;
-        let row = self.buf.selection().map_or(self.buf.cursor.0, |((r, _), _)| r);
-        self.sync_hl_states();
-        let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
-        let syntax = h.comment_on(&self.buf.lines[row], state);
+        let path = self.buf.path.as_deref().ok_or(NONE)?;
+        let syntax = match highlight::for_path(path) {
+            Some(h) => {
+                let row = self.buf.line_rows().0;
+                self.sync_hl_states();
+                let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
+                h.comment_on(&self.buf.lines[row], state)
+            }
+            None => highlight::language_for_path(path).map(|l| l.comment).unwrap_or_default(),
+        };
         if syntax == highlight::CommentSyntax::default() {
             return Err(NONE);
         }
@@ -1862,6 +1868,25 @@ mod tests {
         v.buf.cursor = (5, 0);
         assert!(v.toggle_comment().is_err(), "a block in an unknown language has no comment syntax");
         assert_eq!(v.buffer().lines[5], "x");
+    }
+
+    #[test]
+    fn a_file_in_a_language_without_a_highlighter_toggles_its_comments() {
+        let dir = tmpdir("editor-comment-table");
+        for (name, text, want) in [("a.rs", "let a = 1;", "// let a = 1;"), ("a.py", "a = 1", "# a = 1")] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("{text}\n")).unwrap();
+            let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+            v.toggle_comment().unwrap();
+            assert_eq!(v.buffer().lines[0], want, "{name}");
+            v.toggle_comment().unwrap();
+            assert_eq!(v.buffer().lines[0], text, "{name}");
+        }
+        let json = dir.join("a.json");
+        std::fs::write(&json, "{}\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(json).unwrap());
+        assert!(v.toggle_comment().is_err(), "JSON has no comments");
+        assert_eq!(v.buffer().lines[0], "{}");
     }
 
     #[test]
