@@ -83,9 +83,22 @@ pub struct Confirm {
     /// ("Quit Without Saving").
     pub discard: Option<&'static str>,
     then: Confirmed,
+    /// When it appeared, for a question a background job opened (Delete's
+    /// git check) rather than the user's own key or click.
+    late: Option<Instant>,
 }
 
+/// How long a question a background job opened ignores keys: an Enter typed
+/// for something else (a command in a terminal) must not answer it.
+pub const LATE_CONFIRM_GRACE: Duration = Duration::from_millis(400);
+
 impl Confirm {
+    /// Whether a key at `now` may answer it: not within
+    /// [`LATE_CONFIRM_GRACE`] of a background job opening it.
+    pub fn takes_keys_at(&self, now: Instant) -> bool {
+        self.late.is_none_or(|at| now >= at + LATE_CONFIRM_GRACE)
+    }
+
     /// Whether Enter cancels instead of accepting (and Cancel is drawn as the
     /// primary button): accepting would write over another program's version
     /// of a file, which a stray Enter must not do.
@@ -700,6 +713,7 @@ impl AppState {
             accept: Some("Overwrite"),
             discard: Some("Reload"),
             then: Confirmed::DiskConflict { sid, rest, then },
+            late: None,
         });
     }
 
@@ -776,6 +790,7 @@ impl AppState {
                     accept: Some("Replace"),
                     discard: None,
                     then: Confirmed::Pick(path),
+                    late: None,
                 });
                 return Ok(None);
             }
@@ -1024,6 +1039,7 @@ impl AppState {
             accept: can_save.then_some(accept),
             discard: Some(discard),
             then: Confirmed::Unsaved { what, save },
+            late: None,
         });
     }
 

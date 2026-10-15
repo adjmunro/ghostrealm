@@ -3344,9 +3344,12 @@ impl State {
         // A confirmation owns the keyboard: Enter presses the primary button
         // (the save button, when it has one; Cancel over a file changed on
         // disk), Escape cancels. A held
-        // key's repeats are ignored, so the Enter that asked can't also answer.
-        if self.app.confirm().is_some() {
-            if event.repeat {
+        // key's repeats are ignored, so the Enter that asked can't also answer
+        // (nor one pressed before a background job asked). For a moment after
+        // a job asks, keys are ignored: an Enter typed for a terminal must not
+        // answer a Delete question that has just appeared.
+        if let Some(confirm) = self.app.confirm() {
+            if event.repeat || !confirm.takes_keys_at(Instant::now()) {
                 return;
             }
             match &event.logical_key {

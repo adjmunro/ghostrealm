@@ -246,7 +246,13 @@ impl AppState {
 
     fn report_file_job(&mut self, done: Done) {
         let command = done.job.command();
+        let asking = self.confirm.is_some();
         let (result, warning) = self.apply_file_job(done);
+        // A question from a job that finished after its command returned
+        // comes while the user may be typing elsewhere.
+        if let (false, Some(c)) = (asking, &mut self.confirm) {
+            c.late = Some(Instant::now());
+        }
         let result = result.map_err(|e| format!("{e:#}"));
         self.file_reports.push(FileReport { command, result, warning });
     }
@@ -468,6 +474,7 @@ impl AppState {
                 accept: Some("Delete"),
                 discard: None,
                 then: Confirmed::Trash(path.to_path_buf()),
+                late: None,
             });
         } else {
             self.trash_now(path)?;
@@ -493,6 +500,7 @@ impl AppState {
             accept: can_save.then_some("Save and Delete"),
             discard: Some("Delete Without Saving"),
             then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save },
+            late: None,
         });
     }
 
@@ -1222,6 +1230,26 @@ mod tests {
         assert_eq!((c.accept, c.discard), (Some("Delete"), None));
         assert!(c.message.contains("new.txt"));
         assert_eq!(calls.borrow().len(), 1, "nothing more trashed");
+    }
+
+    #[test]
+    fn a_question_a_late_job_asks_ignores_keys_for_a_moment() {
+        let (mut s, _) = app_in_background();
+        let d = tmpdir("fm-bg-late-confirm");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        start(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        pump_until_reported(&mut s);
+        let now = Instant::now();
+        let c = s.confirm().expect("untracked: asks");
+        assert!(!c.takes_keys_at(now), "an Enter typed meanwhile doesn't answer it");
+        assert!(c.takes_keys_at(now + crate::app_state::LATE_CONFIRM_GRACE));
+        // One the user's own action opens takes keys at once.
+        let mut s = AppState::new().with_unsaved_guard().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        assert!(s.confirm().unwrap().takes_keys_at(Instant::now()));
     }
 
     #[test]
