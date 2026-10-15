@@ -132,17 +132,18 @@ struct App {
     /// waker send at most one pending `PtyOutput` event no matter how many chunks
     /// arrive, so a flood doesn't drown the event queue.
     wake_pending: Arc<AtomicBool>,
-    /// Whether quitting would ask about unsaved changes. The system's quit
-    /// request reads it: AppKit wants an answer at once.
+    /// Whether quitting would ask first (unsaved changes, a copy or move
+    /// still running). The system's quit request reads it: AppKit wants an
+    /// answer at once.
     unsaved: UnsavedFlag,
 }
 
 /// A cached answer to "would quitting ask first?" (about unsaved changes, or
-/// a file copy or move still running), shared with
-/// the system's quit request. The exact value is computed once per loop pass
-/// (`about_to_wait`); every event handler first assumes the worst, because an
-/// event (a keystroke) may edit a buffer and a quit request can arrive in the
-/// same pass before the exact value is refreshed. A termination request that
+/// a file copy or move still running), shared with the system's quit request.
+/// The exact value is computed once per loop pass (`about_to_wait`); every
+/// event handler first assumes the worst, because an event (a keystroke) may
+/// edit a buffer and a quit request can arrive in the same pass before the
+/// exact value is refreshed. A termination request that
 /// meets a `true` is held, and answered once the exact value is known (a wrong
 /// `true` is answered yes), so a stale flag never cancels a logout.
 #[derive(Clone, Default)]
@@ -169,7 +170,6 @@ impl UnsavedFlag {
     fn hold_termination(&self) {
         self.reply_due.set(true);
     }
-
 
     /// With the exact value known, the answer to a held termination request:
     /// `Some(true)` to go ahead, `Some(false)` to stay and ask. `None` when
