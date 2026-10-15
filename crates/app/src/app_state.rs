@@ -2336,6 +2336,9 @@ mod tests {
         let banner = "exited with code 0 \u{2014} press any key to close";
         assert!(pump_until(&mut s, |s| s.surface_text(sid).is_some_and(|t| t.contains(banner))));
         assert!(!emptied(&s, vt));
+        // The text shows the banner from the terminal's lifecycle; the view
+        // takes the exit (and with it, any key closing) at its next pump.
+        s.pump_all();
         assert!(s.send_key_to_focused(&enter()));
         assert!(emptied(&s, vt));
     }
