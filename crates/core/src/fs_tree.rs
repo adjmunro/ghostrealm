@@ -218,13 +218,16 @@ pub struct FsTree {
     ext: Option<String>,
     /// Git status per absolute path, from the worker, with the generation it
     /// was run for. Built lazily when a git filter or the git view is on. A
-    /// refresh or a new root keeps it until the next result replaces it: its
-    /// paths are absolute, so for the few milliseconds it is out of date it
-    /// is stale, never wrong about another file.
+    /// refresh keeps it until the next result replaces it, so the list doesn't
+    /// blank meanwhile. A new root drops it: it holds only the old root's
+    /// files, so every new one would read as unchanged.
     git_status: Option<(u64, GitMap)>,
     /// Bumped by a refresh or a new root: the status of an older generation is
     /// out of date.
     git_generation: u64,
+    /// The generation the root last changed at: a result from before it is
+    /// for another root, and is dropped.
+    git_root_generation: u64,
     /// The generation last sent to the worker.
     git_requested: Option<u64>,
     /// Started on the first request.
@@ -254,6 +257,7 @@ impl FsTree {
             ext: None,
             git_status: None,
             git_generation: 0,
+            git_root_generation: 0,
             git_requested: None,
             git_worker: None,
             waker: None,
@@ -282,6 +286,8 @@ impl FsTree {
         self.cache.clear();
         self.walk_cache = None;
         self.git_generation += 1;
+        self.git_root_generation = self.git_generation;
+        self.git_status = None;
         self.query.clear();
         self.dirty = true;
     }
@@ -370,7 +376,8 @@ impl FsTree {
         let Some(worker) = &self.git_worker else { return false };
         let mut arrived = false;
         while let Ok((generation, map)) = worker.results.try_recv() {
-            if self.git_status.as_ref().is_none_or(|(g, _)| generation > *g) {
+            let newer = self.git_status.as_ref().is_none_or(|(g, _)| generation > *g);
+            if newer && generation >= self.git_root_generation {
                 self.git_status = Some((generation, map));
                 arrived = true;
             }
@@ -1252,6 +1259,33 @@ mod tests {
         t.poll();
         let cats: Vec<String> = t.rows().iter().map(|r| r.key.clone()).collect();
         assert_eq!(cats, ["Modified", "Unchanged"]);
+    }
+
+    #[test]
+    fn a_new_root_drops_the_old_roots_git_status_and_its_late_result() {
+        let (Some(a), Some(b)) = (repo_with_a_change(), repo_with_a_change()) else { return };
+        let (mut t, woken) = tree_with_waker(&a);
+        t.set_view(FsView::GitStatus);
+        t.rows();
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        t.poll();
+        assert!(t.rows().iter().any(|r| r.key == "Modified"));
+        // A request for A still in flight when the root moves to B.
+        t.refresh();
+        t.rows();
+        t.set_root(&b);
+        let keys = |t: &mut FsTree| t.rows().iter().map(|r| r.key.clone()).collect::<Vec<_>>();
+        assert!(keys(&mut t).is_empty(), "nothing listed as Unchanged while B's status loads");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while t.git_status_loading() {
+            assert!(std::time::Instant::now() < until, "B's status arrives");
+            let _ = woken.recv_timeout(Duration::from_millis(50));
+            t.poll();
+            if t.git_status.is_some() {
+                assert!(t.git_status.as_ref().unwrap().1.keys().all(|p| p.starts_with(&b)), "never A's");
+            }
+        }
+        assert_eq!(keys(&mut t), ["Modified", "Unchanged"]);
     }
 
     #[test]
