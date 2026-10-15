@@ -771,6 +771,18 @@ impl AppState {
         self.quitting
     }
 
+    /// Go on with the quit the running-copy question held, once the copies
+    /// and moves have finished: the question closes, as nothing would be cut
+    /// off any more. Returns whether it did.
+    pub fn continue_busy_quit(&mut self) -> bool {
+        let asking = self.confirm.as_ref().is_some_and(|c| c.then == Confirmed::BusyQuit);
+        if !asking || !self.file_jobs_idle() {
+            return false;
+        }
+        self.confirm = None;
+        self.quitting = true;
+        true
+    }
 
     /// Confirm the picker with its browser's choice, then close it. With no
     /// choice yet (a file picker with nothing selected), it stays open.

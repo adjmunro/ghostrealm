@@ -1295,6 +1295,27 @@ mod tests {
     }
 
     #[test]
+    fn the_quit_goes_on_when_the_copy_it_asked_about_finishes() {
+        let d = tmpdir("fm-quit-busy-done");
+        let mut s = guarded_app();
+        s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
+        s.request_quit();
+        assert!(!s.continue_busy_quit(), "still running");
+        assert!(s.confirm().is_some() && !s.quitting());
+        std::fs::write(d.join("go"), "").unwrap();
+        s.wait_file_jobs();
+        assert!(s.continue_busy_quit());
+        assert!(s.confirm().is_none() && s.quitting());
+        // Another question isn't closed.
+        let mut s = guarded_app();
+        std::fs::write(d.join("x.txt"), "x").unwrap();
+        start(&mut s, "file.delete", &[("path", &d.join("x.txt"))]).unwrap();
+        s.wait_file_jobs();
+        assert!(s.confirm().is_some());
+        assert!(!s.continue_busy_quit() && s.confirm().is_some() && !s.quitting());
+    }
+
+    #[test]
     fn a_quit_asks_about_unsaved_changes_then_about_a_running_copy() {
         let d = tmpdir("fm-quit-unsaved-busy");
         std::fs::write(d.join("a.txt"), "A").unwrap();

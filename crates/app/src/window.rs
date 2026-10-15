@@ -274,6 +274,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         state.print_file_reports();
+        // The copy the quit question was about finished: quit.
+        if state.app.continue_busy_quit() {
+            state.exit_if_quitting();
+        }
         // A copy or move still running asks too: going ahead would leave it
         // half done.
         let ask = state.app.has_unsaved() || !state.app.file_jobs_idle();
