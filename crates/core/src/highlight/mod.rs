@@ -56,6 +56,60 @@ pub struct CommentSyntax {
     pub block: Option<(&'static str, &'static str)>,
 }
 
+/// A language with no highlighter yet, known so a comment toggle works on it
+/// (a whole file, or a Markdown code block). A language that gains a
+/// highlighter declares its syntax there and leaves this table.
+#[derive(Debug)]
+pub struct Language {
+    /// The fence info words and file extensions (lowercase, no dot) naming it.
+    pub names: &'static [&'static str],
+    pub comment: CommentSyntax,
+}
+
+const SLASHES: CommentSyntax = CommentSyntax { line: Some("//"), block: Some(("/*", "*/")) };
+const HASH: CommentSyntax = CommentSyntax { line: Some("#"), block: None };
+const DASHES: CommentSyntax = CommentSyntax { line: Some("--"), block: None };
+const MARKUP: CommentSyntax = CommentSyntax { line: None, block: Some(("<!--", "-->")) };
+
+/// Every [`Language`]. JSON is absent: it has no comments.
+pub static LANGUAGES: &[Language] = &[
+    Language { names: &["rust", "rs"], comment: SLASHES },
+    Language { names: &["c", "h"], comment: SLASHES },
+    Language { names: &["cpp", "c++", "cc", "cxx", "hpp", "hh", "hxx"], comment: SLASHES },
+    Language { names: &["java"], comment: SLASHES },
+    Language { names: &["kotlin", "kt", "kts"], comment: SLASHES },
+    Language { names: &["swift"], comment: SLASHES },
+    Language { names: &["go", "golang"], comment: SLASHES },
+    Language { names: &["zig"], comment: CommentSyntax { line: Some("//"), block: None } },
+    Language { names: &["javascript", "js", "mjs", "cjs", "jsx"], comment: SLASHES },
+    Language { names: &["typescript", "ts", "mts", "cts", "tsx"], comment: SLASHES },
+    Language { names: &["csharp", "cs", "c#"], comment: SLASHES },
+    Language { names: &["scss", "less"], comment: SLASHES },
+    Language { names: &["css"], comment: CommentSyntax { line: None, block: Some(("/*", "*/")) } },
+    Language { names: &["python", "py"], comment: HASH },
+    Language { names: &["sh", "bash", "zsh", "shell", "fish"], comment: HASH },
+    Language { names: &["ruby", "rb"], comment: HASH },
+    Language { names: &["perl", "pl"], comment: HASH },
+    Language { names: &["yaml", "yml"], comment: HASH },
+    Language { names: &["elixir", "ex", "exs"], comment: HASH },
+    Language { names: &["nix"], comment: HASH },
+    Language { names: &["sql"], comment: DASHES },
+    Language { names: &["lua"], comment: DASHES },
+    Language { names: &["haskell", "hs"], comment: DASHES },
+    Language { names: &["html", "htm", "xml", "svg"], comment: MARKUP },
+];
+
+/// The [`Language`] named `word` (case-insensitive).
+pub fn language(word: &str) -> Option<&'static Language> {
+    let word = word.to_ascii_lowercase();
+    LANGUAGES.iter().find(|l| l.names.contains(&word.as_str()))
+}
+
+/// The [`Language`] for `path`'s extension.
+pub fn language_for_path(path: &Path) -> Option<&'static Language> {
+    language(path.extension()?.to_str()?)
+}
+
 /// What a highlighter carries from the end of one line to the start of the
 /// next (e.g. "inside a fenced block"). Opaque to callers; `0` starts a
 /// document.
@@ -398,9 +452,36 @@ mod tests {
         let toml = md.line("```toml", 0).1;
         assert_eq!(md.comment_on("a = 1", toml), for_extension("toml").unwrap().comment());
         assert_eq!(md.comment_on("```", toml), md.comment(), "the closing fence is Markdown");
+        let rust = md.line("```rust", 0).1;
+        assert_eq!(md.comment_on("let a = 1;", rust), language("rust").unwrap().comment);
         let unknown = md.line("```zzz", 0).1;
         assert_eq!(md.comment_on("x", unknown), CommentSyntax::default());
         assert_eq!(md.comment_on("text", 0), md.comment());
+    }
+
+    #[test]
+    fn languages_without_a_highlighter_are_found_by_name_or_extension() {
+        assert_eq!(language("rs").unwrap().comment, SLASHES);
+        assert_eq!(language("Rust").unwrap().comment, SLASHES);
+        assert_eq!(language_for_path(Path::new("a/b.py")).unwrap().comment, HASH);
+        assert_eq!(language("sql").unwrap().comment, DASHES);
+        assert!(language("json").is_none(), "JSON has no comments");
+        assert!(language("toml").is_none() && language_for_path(Path::new("Makefile")).is_none());
+    }
+
+    #[test]
+    fn the_language_table_leaves_highlighted_languages_to_their_highlighters() {
+        for l in LANGUAGES {
+            assert_ne!(l.comment, CommentSyntax::default(), "{:?}", l.names);
+            for n in l.names {
+                assert_eq!(*n, n.to_ascii_lowercase());
+                assert!(
+                    ALL.iter().all(|h| h.name() != *n && !h.extensions().contains(n)),
+                    "{n} has a highlighter: declare its comments there"
+                );
+                assert_eq!(LANGUAGES.iter().filter(|o| o.names.contains(n)).count(), 1, "{n} is listed once");
+            }
+        }
     }
 
     #[test]

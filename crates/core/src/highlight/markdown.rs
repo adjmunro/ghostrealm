@@ -6,7 +6,8 @@
 //!
 //! A fence whose info string names a language with a registered highlighter
 //! that is line-local (`carries_state` false, e.g. `toml`) highlights its body
-//! lines with it; the language rides in the carried state.
+//! lines with it; one naming a [`LANGUAGES`] entry only takes its comment
+//! syntax. The language rides in the carried state.
 //!
 //! A fence opened after a list marker or `>` is recognised; it ends at its
 //! closing fence, or at the first non-blank line that leaves the container
@@ -17,7 +18,7 @@
 //! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
 //! unmarked, so a pathological line costs a bounded number of scans.
 
-use super::{runs, CommentSyntax, Highlighter, Span, State, Token, ALL};
+use super::{runs, CommentSyntax, Highlighter, Span, State, Token, ALL, LANGUAGES};
 
 pub struct Markdown;
 
@@ -49,7 +50,8 @@ impl Highlighter for Markdown {
         }
         match (state >> LANG_SHIFT) as usize {
             0 => CommentSyntax::default(),
-            i => ALL[i - 1].comment(),
+            i if i <= ALL.len() => ALL[i - 1].comment(),
+            i => LANGUAGES[i - 1 - ALL.len()].comment,
         }
     }
 
@@ -72,9 +74,11 @@ const QUOTE: State = 2;
 
 /// Longest fence length the state holds (longer ones are clamped).
 const MAX_FENCE: usize = (1 << 21) - 1;
-/// The state's top byte: 1 + the index into [`ALL`] of the fence's language
-/// highlighter, or 0 for none.
+/// The state's top byte: the fence's language as 1 + the index into [`ALL`]
+/// of its highlighter, or 1 + `ALL.len()` + its index into [`LANGUAGES`], or
+/// 0 for none.
 const LANG_SHIFT: u32 = 24;
+const _: () = assert!(ALL.len() + LANGUAGES.len() < 1 << (State::BITS - LANG_SHIFT));
 
 /// The state while inside a fence: its length, whether it is `~`, its
 /// container, and its language (a fence is at least 3 long, so the state is
@@ -91,8 +95,8 @@ fn fence_of(state: State) -> (char, usize, State) {
     )
 }
 
-/// The highlighter registered for a fence's info string (its first word), as
-/// `1 + index into ALL`, or 0. Only line-local highlighters qualify: the body
+/// The language a fence's info string (its first word) names, encoded as
+/// [`LANG_SHIFT`] describes. Only line-local highlighters qualify: the body
 /// lines enter it with state 0.
 fn fence_lang(info: &[char]) -> State {
     let word: String = info
@@ -102,9 +106,9 @@ fn fence_lang(info: &[char]) -> State {
         .collect::<String>()
         .to_ascii_lowercase();
     let word = word.trim_start_matches('.');
-    ALL.iter()
-        .position(|h| !h.carries_state() && (h.name() == word || h.extensions().contains(&word)))
-        .map_or(0, |i| i as State + 1)
+    let highlighted = ALL.iter().position(|h| !h.carries_state() && (h.name() == word || h.extensions().contains(&word)));
+    let listed = || LANGUAGES.iter().position(|l| l.names.contains(&word)).map(|i| ALL.len() + i);
+    highlighted.or_else(listed).map_or(0, |i| i as State + 1)
 }
 
 /// An opening fence at `p`: the fence char and run length, if the run is 3 or
@@ -174,6 +178,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
                 fill(tok, p, n, Token::Marker);
                 return 0;
             }
+            // A language past `ALL` has no highlighter: its body is plain code.
             let lang = state >> LANG_SHIFT;
             match lang.checked_sub(1).and_then(|i| ALL.get(i as usize)) {
                 Some(h) => {

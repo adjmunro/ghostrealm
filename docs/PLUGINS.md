@@ -202,10 +202,12 @@ reads a file once (the browser's preview) runs `highlight_lines` on its worker.
 A highlighter must bound its work per line: a paint highlights every visible line.
 `Highlighter::comment` declares the language's line and block comment tokens
 (`CommentSyntax`); `comment_on` gives a line's, which differs inside an embedded
-language (a Markdown code block). The editor's `editor.toggle_comment` (bound to
-`cmd+/` in a new config file, never implicitly) reads it.
-To add a language, implement `Highlighter` in a module under `core/src/highlight/`
-and list it in `ALL`.
+language (a Markdown code block). A language with no highlighter yet declares its
+comment tokens in `highlight::LANGUAGES` (found by fence word or extension with
+`language`). The editor's `editor.toggle_comment` (bound to `cmd+/` in a new
+config file, never implicitly) reads them.
+To add a language, implement `Highlighter` in a module under `core/src/highlight/`,
+list it in `ALL`, and drop its `LANGUAGES` entry.
 
 ## Testing
 
