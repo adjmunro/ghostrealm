@@ -82,10 +82,11 @@ time in the order given, so a big folder doesn't freeze the window; Delete's git
 check runs beside them, and asks first about anything a copy or move is using.
 A question that appears when a background check finishes ignores keys for a
 moment, and Enter then cancels it, so an Enter typed elsewhere doesn't delete.
-Quitting while a copy or move runs asks (after any unsaved changes): Quit Anyway,
-or Cancel to let it finish and quit later. A move across filesystems that leaves part of the original (a file
-changed while it was copied) keeps that file's editor on it and says so on
-stderr. Names are asked for in the palette's argument prompt.
+Quitting while a copy or move runs asks (after any unsaved changes): Quit
+Anyway, or Cancel to let it finish and quit later; the quit goes ahead by itself
+if it finishes while asking. A move across filesystems that leaves part of the
+original (a file changed while it was copied) keeps that file's editor on it and
+says so on stderr. Names are asked for in the palette's argument prompt.
 Each item is also a `file.*` command (palette, agent, key bindings) acting on the
 focused file, or on its `path` argument (a relative one is taken from the workspace
 folder). Cut and Copy keep the
