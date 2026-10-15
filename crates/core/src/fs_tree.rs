@@ -1281,8 +1281,8 @@ mod tests {
             assert!(std::time::Instant::now() < until, "B's status arrives");
             let _ = woken.recv_timeout(Duration::from_millis(50));
             t.poll();
-            if t.git_status.is_some() {
-                assert!(t.git_status.as_ref().unwrap().1.keys().all(|p| p.starts_with(&b)), "never A's");
+            if let Some((_, map)) = &t.git_status {
+                assert!(map.keys().all(|p| p.starts_with(&b)), "never A's");
             }
         }
         assert_eq!(keys(&mut t), ["Modified", "Unchanged"]);
