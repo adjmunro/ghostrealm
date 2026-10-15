@@ -123,7 +123,7 @@ fn fence_of(state: State) -> (char, usize, State) {
 /// The language a fence's info string names, encoded as [`LANG_SHIFT`]
 /// describes: its first word (up to a space, `,` or `{`: ```` ```rust,ignore````),
 /// or for an attribute block the first class in it (```` ```{.python}````),
-/// else its first bare word (```` ```{r, echo=FALSE}````).
+/// else the first word, if bare (```` ```{python, echo=FALSE}````).
 /// Only line-local highlighters qualify: the body lines enter it with state 0.
 fn fence_lang(info: &[char]) -> State {
     let info: String = info.iter().collect::<String>().to_ascii_lowercase();
