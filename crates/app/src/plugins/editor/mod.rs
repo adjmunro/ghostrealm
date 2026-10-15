@@ -374,20 +374,30 @@ impl EditorView {
     pub fn toggle_comment(&mut self) -> Result<(), &'static str> {
         const NONE: &str = "this language has no comment syntax";
         let path = self.buf.path.as_deref().ok_or(NONE)?;
+        let mut lead = Vec::new();
         let syntax = match highlight::for_path(path) {
             Some(h) if h.carries_state() => {
                 let (first, last) = self.buf.line_rows();
                 self.sync_hl_states();
                 let mut on = |row: usize| {
                     let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
-                    h.comment_on(&self.buf.lines[row], state)
+                    let line = &self.buf.lines[row];
+                    (h.comment_on(line, state), h.comment_lead(line, state))
                 };
-                let embedded = on(first);
+                let embedded = on(first).0;
                 // A closing fence or host text between two blocks is the host's.
-                if (first + 1..=last).all(|r| on(r) == embedded) {
-                    embedded
-                } else {
+                for r in first..=last {
+                    let (syntax, at) = on(r);
+                    if syntax != embedded {
+                        lead.clear();
+                        break;
+                    }
+                    lead.push(at);
+                }
+                if lead.is_empty() {
                     h.comment()
+                } else {
+                    embedded
                 }
             }
             Some(h) => h.comment(),
@@ -396,7 +406,7 @@ impl EditorView {
         if syntax == highlight::CommentSyntax::default() {
             return Err(NONE);
         }
-        if self.buf.toggle_comment(syntax) {
+        if self.buf.toggle_comment(syntax, &lead) {
             self.note_edits();
         }
         Ok(())
@@ -1895,6 +1905,28 @@ mod tests {
         v.buf.cursor = (0, 0);
         v.toggle_comment().unwrap();
         assert_eq!(v.buffer().lines[0], "<!-- ```rust -->", "the opening fence is Markdown");
+    }
+
+    #[test]
+    fn a_comment_in_a_quoted_code_block_stays_in_the_quote() {
+        let dir = tmpdir("editor-comment-quoted-fence");
+        let path = dir.join("a.md");
+        let text = "> ```rust\n> let a = 1;\n>     b();\n> ```\n- ```toml\n  c = 1\n  ```\n";
+        std::fs::write(&path, text).unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        v.buf.anchor = Some((1, 0));
+        v.buf.cursor = (2, 4);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[1..3], ["> // let a = 1;", "> //     b();"]);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[1..3], ["> let a = 1;", ">     b();"]);
+        // A list item's body comments at its indent.
+        v.buf.anchor = None;
+        v.buf.cursor = (5, 0);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[5], "  # c = 1");
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines.join("\n") + "\n", text);
     }
 
     #[test]

@@ -169,6 +169,20 @@ impl History {
     }
 }
 
+/// Per-row chars a comment toggle leaves before a line's indent, from row
+/// `first` on (see [`EditorBuffer::toggle_comment`]).
+#[derive(Clone, Copy)]
+struct Lead<'a> {
+    first: usize,
+    cols: &'a [usize],
+}
+
+impl Lead<'_> {
+    fn at(&self, row: usize) -> usize {
+        row.checked_sub(self.first).and_then(|i| self.cols.get(i)).copied().unwrap_or(0)
+    }
+}
+
 impl EditorBuffer {
     /// An empty scratch buffer.
     pub fn scratch() -> Self {
@@ -676,17 +690,20 @@ impl EditorBuffer {
     /// or uncomment them when every non-blank one is already commented, using
     /// `syntax`: its line token on each non-blank line at the least indent, else
     /// its block tokens around the first and last non-blank lines (or off each
-    /// line that is a block comment of its own), on [`Self::line_rows`]. One
-    /// undo step. Returns whether the text changed (not when blank or the
-    /// language has no comment syntax).
-    pub fn toggle_comment(&mut self, syntax: CommentSyntax) -> bool {
+    /// line that is a block comment of its own), on [`Self::line_rows`].
+    /// `lead[i]` is the chars of row `first + i` that come before its indent
+    /// (a quoted code block's `>`), 0 past its end. One undo step. Returns
+    /// whether the text changed (not when blank or the language has no comment
+    /// syntax).
+    pub fn toggle_comment(&mut self, syntax: CommentSyntax, lead: &[usize]) -> bool {
         let (first, last) = self.line_rows();
+        let lead = Lead { first, cols: lead };
         let edits = self.edits;
         let opened = self.checkpoint(Step::Other);
         if let Some(token) = syntax.line {
-            self.toggle_line_comment(token, first, last);
+            self.toggle_line_comment(token, first, last, lead);
         } else if let Some((open, close)) = syntax.block {
-            self.toggle_block_comment(open, close, first, last);
+            self.toggle_block_comment(open, close, first, last, lead);
         }
         self.history.run = None;
         if self.edits == edits {
@@ -705,61 +722,64 @@ impl EditorBuffer {
         (first..=last).filter(|r| !self.lines[*r].trim().is_empty()).collect()
     }
 
-    /// Leading whitespace chars of `row`.
-    fn indent_of(&self, row: usize) -> usize {
-        self.lines[row].chars().take_while(|c| c.is_whitespace()).count()
+    /// The column after `row`'s lead and the whitespace following it.
+    fn indent_of(&self, row: usize, lead: Lead) -> usize {
+        let lead = lead.at(row).min(self.lines[row].chars().count());
+        lead + self.lines[row].chars().skip(lead).take_while(|c| c.is_whitespace()).count()
     }
 
-    fn toggle_line_comment(&mut self, token: &str, first: usize, last: usize) {
+    fn toggle_line_comment(&mut self, token: &str, first: usize, last: usize, lead: Lead) {
         let rows = self.text_rows(first, last);
         if rows.is_empty() {
             return;
         }
         let width = token.chars().count();
         let commented = |e: &Self, r: usize| {
-            let at = e.byte_of(r, e.indent_of(r));
+            let at = e.byte_of(r, e.indent_of(r, lead));
             e.lines[r][at..].starts_with(token)
         };
         if rows.iter().all(|r| commented(self, *r)) {
             for r in rows {
-                let col = self.indent_of(r);
+                let col = self.indent_of(r, lead);
                 let after = self.byte_of(r, col) + token.len();
                 let space = usize::from(self.lines[r][after..].starts_with(' '));
                 self.remove_at(r, col, width + space);
             }
         } else {
-            let col = rows.iter().map(|r| self.indent_of(*r)).min().unwrap_or(0);
+            // The least indent past each row's own lead.
+            let depth = rows.iter().map(|r| self.indent_of(*r, lead) - lead.at(*r)).min().unwrap_or(0);
             for r in rows {
+                let col = lead.at(r).min(self.lines[r].chars().count()) + depth;
                 self.insert_at(r, col, &format!("{token} "));
             }
         }
     }
 
-    fn toggle_block_comment(&mut self, open: &str, close: &str, first: usize, last: usize) {
+    fn toggle_block_comment(&mut self, open: &str, close: &str, first: usize, last: usize, lead: Lead) {
         let rows = self.text_rows(first, last);
         let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
             return;
         };
         // Lines commented one by one: unwrapping the first and last as one
         // block would leave their inner tokens behind (`a -->`, `<!-- b`).
-        let each = rows.len() > 1 && rows.iter().all(|&r| self.only_block_on(open, close, r));
+        let each = rows.len() > 1 && rows.iter().all(|&r| self.only_block_on(open, close, r, lead));
         if each {
             for r in rows {
-                self.unwrap_block(open, close, r, r);
+                self.unwrap_block(open, close, r, r, lead);
             }
-        } else if self.block_wrapped(open, close, top, bottom) {
-            self.unwrap_block(open, close, top, bottom);
+        } else if self.block_wrapped(open, close, top, bottom, lead) {
+            self.unwrap_block(open, close, top, bottom, lead);
         } else {
             let end = self.lines[bottom].trim_end().chars().count();
             self.insert_at(bottom, end, &format!(" {close}"));
-            self.insert_at(top, self.indent_of(top), &format!("{open} "));
+            self.insert_at(top, self.indent_of(top, lead), &format!("{open} "));
         }
     }
 
     /// Whether `open` starts row `top` (after its indent) and `close` ends row
     /// `bottom`, as two distinct tokens.
-    fn block_wrapped(&self, open: &str, close: &str, top: usize, bottom: usize) -> bool {
-        let start = self.indent_of(top);
+    fn block_wrapped(&self, open: &str, close: &str, top: usize, bottom: usize, lead: Lead) -> bool {
+        let start = self.indent_of(top, lead);
         let head = &self.lines[top][self.byte_of(top, start)..];
         let tail = self.lines[bottom].trim_end();
         head.starts_with(open)
@@ -768,20 +788,20 @@ impl EditorBuffer {
     }
 
     /// Whether row `r` is one block comment, with no closer inside it.
-    fn only_block_on(&self, open: &str, close: &str, r: usize) -> bool {
-        if !self.block_wrapped(open, close, r, r) {
+    fn only_block_on(&self, open: &str, close: &str, r: usize, lead: Lead) -> bool {
+        if !self.block_wrapped(open, close, r, r, lead) {
             return false;
         }
-        let at = self.byte_of(r, self.indent_of(r));
+        let at = self.byte_of(r, self.indent_of(r, lead));
         let tail = self.lines[r].trim_end();
         !tail[at + open.len()..tail.len() - close.len()].contains(close)
     }
 
     /// Remove the block tokens [`Self::block_wrapped`] found, with the space
     /// inside each.
-    fn unwrap_block(&mut self, open: &str, close: &str, top: usize, bottom: usize) {
+    fn unwrap_block(&mut self, open: &str, close: &str, top: usize, bottom: usize, lead: Lead) {
         let (open_w, close_w) = (open.chars().count(), close.chars().count());
-        let start = self.indent_of(top);
+        let start = self.indent_of(top, lead);
         let end = self.lines[bottom].trim_end().chars().count();
         let at = self.byte_of(top, start);
         let tail = self.lines[bottom].trim_end();
@@ -1340,10 +1360,10 @@ mod tests {
     fn a_line_comment_toggles_on_at_the_least_indent_and_off_again() {
         let mut e = buffer_with("  a = 1\n\n    b = 2\n  c = 3");
         select(&mut e, (0, 3), (3, 2));
-        assert!(e.toggle_comment(HASH));
+        assert!(e.toggle_comment(HASH, &[]));
         assert_eq!(e.lines, vec!["  # a = 1", "", "  #   b = 2", "  # c = 3"], "blank lines are skipped");
         assert_eq!(e.selection(), Some(((0, 5), (3, 4))), "the selection follows the text");
-        assert!(e.toggle_comment(HASH));
+        assert!(e.toggle_comment(HASH, &[]));
         assert_eq!(e.lines, vec!["  a = 1", "", "    b = 2", "  c = 3"]);
         assert_eq!(e.selection(), Some(((0, 3), (3, 2))));
     }
@@ -1352,13 +1372,13 @@ mod tests {
     fn a_mixed_selection_comments_everything_and_uncommenting_needs_all_commented() {
         let mut e = buffer_with("# a\nb");
         select(&mut e, (0, 0), (1, 1));
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.lines, vec!["# # a", "# b"]);
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.lines, vec!["# a", "b"]);
         // No space after the token: only the token goes.
         let mut e = buffer_with("#a");
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.lines, vec!["a"]);
     }
 
@@ -1366,20 +1386,20 @@ mod tests {
     fn without_a_selection_the_cursor_line_toggles_and_a_selection_ending_at_column_zero_stops_short() {
         let mut e = buffer_with("a\nb\nc");
         e.cursor = (1, 1);
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.lines, vec!["a", "# b", "c"]);
         assert_eq!(e.cursor, (1, 3));
         let mut e = buffer_with("a\nb\nc");
         select(&mut e, (0, 0), (2, 0));
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.lines, vec!["# a", "# b", "c"]);
         // A blank cursor line, or a language without comments, changes nothing.
         let mut e = buffer_with("\nx");
-        assert!(!e.toggle_comment(HASH));
-        assert!(!e.toggle_comment(CommentSyntax::default()));
+        assert!(!e.toggle_comment(HASH, &[]));
+        assert!(!e.toggle_comment(CommentSyntax::default(), &[]));
         assert!(!e.modified);
         let undo_before = e.history.undo.len();
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert_eq!(e.history.undo.len(), undo_before, "a no-op leaves no undo step");
     }
 
@@ -1387,25 +1407,25 @@ mod tests {
     fn a_block_comment_wraps_the_first_and_last_lines() {
         let mut e = buffer_with("  one\n  two");
         select(&mut e, (0, 0), (1, 5));
-        assert!(e.toggle_comment(HTML));
+        assert!(e.toggle_comment(HTML, &[]));
         assert_eq!(e.lines, vec!["  <!-- one", "  two -->"]);
-        assert!(e.toggle_comment(HTML));
+        assert!(e.toggle_comment(HTML, &[]));
         assert_eq!(e.lines, vec!["  one", "  two"]);
         let mut e = buffer_with("text");
         e.cursor = (0, 2);
-        e.toggle_comment(HTML);
+        e.toggle_comment(HTML, &[]);
         assert_eq!(e.lines, vec!["<!-- text -->"]);
         assert_eq!(e.cursor, (0, 7));
-        e.toggle_comment(HTML);
+        e.toggle_comment(HTML, &[]);
         assert_eq!(e.lines, vec!["text"]);
         assert_eq!(e.cursor, (0, 2));
         let mut e = buffer_with("<!--x-->");
-        e.toggle_comment(HTML);
+        e.toggle_comment(HTML, &[]);
         assert_eq!(e.lines, vec!["x"]);
         // Lines commented one by one are uncommented one by one.
         let mut e = buffer_with("<!-- a -->\n\n  <!-- b -->");
         select(&mut e, (0, 0), (2, 12));
-        assert!(e.toggle_comment(HTML));
+        assert!(e.toggle_comment(HTML, &[]));
         assert_eq!(e.lines, vec!["a", "", "  b"]);
     }
 
@@ -1413,7 +1433,7 @@ mod tests {
     fn toggling_a_comment_is_one_undo_step() {
         let mut e = buffer_with("a\nb\nc");
         select(&mut e, (0, 0), (2, 1));
-        e.toggle_comment(HASH);
+        e.toggle_comment(HASH, &[]);
         assert!(e.modified);
         e.undo();
         assert_eq!(e.lines, vec!["a", "b", "c"]);

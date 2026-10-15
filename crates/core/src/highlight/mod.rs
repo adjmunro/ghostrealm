@@ -145,6 +145,13 @@ pub trait Highlighter: Sync {
         self.comment()
     }
 
+    /// The chars of `line` (entering with `state`) that belong to the
+    /// container embedding [`Self::comment_on`]'s language, which a comment
+    /// goes after: a quoted code block's `>`. 0 by default.
+    fn comment_lead(&self, _line: &str, _state: State) -> usize {
+        0
+    }
+
     /// Whether `line`, entering with `state_in` and leaving with `state_out`,
     /// belongs to a block drawn as a unit (a fenced code block, including its
     /// fences).
@@ -454,6 +461,14 @@ mod tests {
         assert_eq!(md.comment_on("```", toml), md.comment(), "the closing fence is Markdown");
         let rust = md.line("```rust", 0).1;
         assert_eq!(md.comment_on("let a = 1;", rust), language("rust").unwrap().comment);
+        let quoted = md.line("> ```rust", 0).1;
+        assert_eq!(md.comment_on("> let a = 1;", quoted), language("rust").unwrap().comment);
+        assert_eq!(md.comment_lead("> let a = 1;", quoted), 1);
+        assert_eq!(md.comment_lead(" > >  x", quoted), 4, "nested quotes, before the indent");
+        assert_eq!(md.comment_lead("> ```", quoted), 0, "the closing fence is Markdown's");
+        assert_eq!(md.comment_lead("a = 1", toml), 0);
+        let listed = md.line("- ```toml", 0).1;
+        assert_eq!(md.comment_lead("  a = 1", listed), 0, "a list item's indent is indent");
         let unknown = md.line("```zzz", 0).1;
         assert_eq!(md.comment_on("x", unknown), CommentSyntax::default());
         assert_eq!(md.comment_on("text", 0), md.comment());

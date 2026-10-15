@@ -55,6 +55,24 @@ impl Highlighter for Markdown {
         }
     }
 
+    /// A quoted code block's body comments after its `>` markers, so the line
+    /// stays in the quote.
+    fn comment_lead(&self, line: &str, state: State) -> usize {
+        if state == 0 || fence_of(state).2 != QUOTE || self.line(line, state).1 != state {
+            return 0;
+        }
+        let c: Vec<char> = line.chars().collect();
+        let (mut p, mut lead) = (0, 0);
+        loop {
+            p += run_of(&c, p, ' ');
+            if c.get(p) != Some(&'>') {
+                return lead;
+            }
+            p += 1;
+            lead = p;
+        }
+    }
+
     fn block(&self, line: &str, state_in: State, state_out: State) -> bool {
         state_out != 0 || (state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in))
     }
