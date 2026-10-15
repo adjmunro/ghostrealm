@@ -1911,7 +1911,7 @@ mod tests {
     fn a_comment_in_a_quoted_code_block_stays_in_the_quote() {
         let dir = tmpdir("editor-comment-quoted-fence");
         let path = dir.join("a.md");
-        let text = "> ```rust\n> let a = 1;\n>\n> \n>     b();\n> ```\n- ```toml\n  c = 1\n  ```\n";
+        let text = "> ```rust\n> let a = 1;\n>\n> \n>     b();\n> ```\n- ```python\n  >>> c = 1\n  ```\n";
         std::fs::write(&path, text).unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
         // A bare `>` row is blank: left alone, and no limit on the depth.
@@ -1921,11 +1921,11 @@ mod tests {
         assert_eq!(v.buffer().lines[1..5], ["> // let a = 1;", ">", "> ", "> //     b();"]);
         v.toggle_comment().unwrap();
         assert_eq!(v.buffer().lines[1..5], ["> let a = 1;", ">", "> ", ">     b();"]);
-        // A list item's body comments at its indent.
+        // A list item's body comments at its indent, even before a `>`.
         v.buf.anchor = None;
         v.buf.cursor = (7, 0);
         v.toggle_comment().unwrap();
-        assert_eq!(v.buffer().lines[7], "  # c = 1");
+        assert_eq!(v.buffer().lines[7], "  # >>> c = 1");
         v.toggle_comment().unwrap();
         assert_eq!(v.buffer().lines.join("\n") + "\n", text);
     }

@@ -58,7 +58,7 @@ impl Highlighter for Markdown {
     /// A quoted code block's body (a quote's, or a list item's in a quote)
     /// comments after its `>` markers, so the line stays in the quote.
     fn comment_lead(&self, line: &str, state: State) -> usize {
-        if state == 0 || fence_of(state).2 == TOP || self.line(line, state).1 != state {
+        if state == 0 || !quoted(fence_of(state).2) || self.line(line, state).1 != state {
             return 0;
         }
         let c: Vec<char> = line.chars().collect();
@@ -89,6 +89,13 @@ const MAX_FAILED: u32 = 32;
 const TOP: State = 0;
 const LIST: State = 1;
 const QUOTE: State = 2;
+/// A list item in a quote: ends as a list item does, with a `>` prefix.
+const QUOTED_LIST: State = 3;
+
+/// Whether a fence in `container` has a `>` prefix on its lines.
+fn quoted(container: State) -> bool {
+    matches!(container, QUOTE | QUOTED_LIST)
+}
 
 /// Longest fence length the state holds (longer ones are clamped).
 const MAX_FENCE: usize = (1 << 21) - 1;
@@ -170,7 +177,7 @@ fn leaves(c: &[char], state: State) -> bool {
     let quoted = c.get(indent) == Some(&'>');
     !blank(c)
         && match fence_of(state).2 {
-            LIST => indent == 0 && !quoted,
+            LIST | QUOTED_LIST => indent == 0 && !quoted,
             QUOTE => !quoted,
             _ => false,
         }
@@ -185,7 +192,9 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
         if !leaves(c, state) {
             // Skip the container's prefix (indent, `>`), then look for the closer.
             let mut p = 0;
-            if container != TOP {
+            if container == LIST {
+                p = indent;
+            } else if quoted(container) {
                 loop {
                     p += run_of(c, p, ' ');
                     if c.get(p) != Some(&'>') {
@@ -279,7 +288,11 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
         if let Some((fc, run)) = fence_at(c, at) {
             fill(tok, at, at + run, Token::Marker);
             fill(tok, at + run, n, Token::Key);
-            let container = if item > 0 { LIST } else { QUOTE };
+            let container = match (base == Token::Quote, item > 0) {
+                (true, true) => QUOTED_LIST,
+                (false, true) => LIST,
+                _ => QUOTE,
+            };
             return fence_state(fc, run, container, fence_lang(&c[at + run..]));
         }
     }
@@ -716,6 +729,16 @@ mod tests {
             assert_eq!(out, 0, "{after:?} ends the fence");
             assert!(!Markdown.block(after, s, out), "{after:?} after {open:?} is prose");
         }
+    }
+
+    #[test]
+    fn only_a_quoted_fence_marks_its_bodys_angle_brackets() {
+        let (_, listed) = lex_in("- ```", 0);
+        assert_eq!(lex_in("  >>> x", listed).0, vec![run("  ", Plain), run(">>> x", Code)]);
+        let (_, quoted) = lex_in("> - ```", 0);
+        assert_eq!(lex_in(">   x", quoted).0, vec![run(">", Marker), run("   ", Plain), run("x", Code)]);
+        assert_eq!(lex_in("x", quoted).1, 0, "a quoted list item ends as a list item does");
+        assert_ne!(lex_in("  x", quoted).1, 0);
     }
 
     #[test]

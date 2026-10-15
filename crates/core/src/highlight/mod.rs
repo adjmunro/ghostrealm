@@ -474,6 +474,8 @@ mod tests {
         let quoted_item = md.line("> - ```rust", 0).1;
         assert_eq!(md.comment_on(">   a();", quoted_item), language("rust").unwrap().comment);
         assert_eq!(md.comment_lead(">   a();", quoted_item), 1, "a list item in a quote");
+        let listed_py = md.line("- ```python", 0).1;
+        assert_eq!(md.comment_lead("  >>> x = 1", listed_py), 0, "an unquoted list item's `>` is code");
         let listed = md.line("- ```toml", 0).1;
         assert_eq!(md.comment_lead("  a = 1", listed), 0, "a list item's indent is indent");
         let unknown = md.line("```zzz", 0).1;
