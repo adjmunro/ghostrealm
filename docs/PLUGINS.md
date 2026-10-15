@@ -205,7 +205,8 @@ A highlighter must bound its work per line: a paint highlights every visible lin
 language (a Markdown code block). A language with no highlighter yet declares its
 comment tokens in `highlight::LANGUAGES` (found by fence word or extension with
 `language`). The editor's `editor.toggle_comment` (bound to `cmd+/` in a new
-config file, never implicitly) reads them.
+config file, never implicitly) reads them, taking an embedded language's only
+when every selected line is inside one block of it.
 To add a language, implement `Highlighter` in a module under `core/src/highlight/`,
 list it in `ALL`, and drop its `LANGUAGES` entry.
 

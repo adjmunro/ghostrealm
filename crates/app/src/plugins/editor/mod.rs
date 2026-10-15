@@ -366,20 +366,31 @@ impl EditorView {
         }
     }
 
-    /// Comment or uncomment the selected lines per the language of the first
-    /// one ([`highlight::Highlighter::comment_on`], or the file's
-    /// [`highlight::Language`] without a highlighter). Returns `Err` when that
-    /// language has no comment syntax.
+    /// Comment or uncomment the selected lines per the file's language, or
+    /// per an embedded language when every line takes its syntax
+    /// ([`highlight::Highlighter::comment_on`]: all inside one Markdown code
+    /// block). A file without a highlighter uses its [`highlight::Language`].
+    /// Returns `Err` when the language has no comment syntax.
     pub fn toggle_comment(&mut self) -> Result<(), &'static str> {
         const NONE: &str = "this language has no comment syntax";
         let path = self.buf.path.as_deref().ok_or(NONE)?;
         let syntax = match highlight::for_path(path) {
-            Some(h) => {
-                let row = self.buf.line_rows().0;
+            Some(h) if h.carries_state() => {
+                let (first, last) = self.buf.line_rows();
                 self.sync_hl_states();
-                let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
-                h.comment_on(&self.buf.lines[row], state)
+                let mut on = |row: usize| {
+                    let state = self.hl_states.state_in(h, &self.buf.lines, self.buf.edits, row);
+                    h.comment_on(&self.buf.lines[row], state)
+                };
+                let embedded = on(first);
+                // A closing fence or host text between two blocks is the host's.
+                if (first + 1..=last).all(|r| on(r) == embedded) {
+                    embedded
+                } else {
+                    h.comment()
+                }
             }
+            Some(h) => h.comment(),
             None => highlight::language_for_path(path).map(|l| l.comment).unwrap_or_default(),
         };
         if syntax == highlight::CommentSyntax::default() {
@@ -1868,6 +1879,47 @@ mod tests {
         v.buf.cursor = (5, 0);
         assert!(v.toggle_comment().is_err(), "a block in an unknown language has no comment syntax");
         assert_eq!(v.buffer().lines[5], "x");
+    }
+
+    #[test]
+    fn a_comment_in_a_code_block_without_a_highlighter_uses_the_language_table() {
+        let dir = tmpdir("editor-comment-rust-fence");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "```rust\nlet a = 1;\n\nlet b = 2;\n```\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        v.buf.anchor = Some((1, 0));
+        v.buf.cursor = (3, 3);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[1..4], ["// let a = 1;", "", "// let b = 2;"]);
+        v.buf.anchor = None;
+        v.buf.cursor = (0, 0);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[0], "<!-- ```rust -->", "the opening fence is Markdown");
+    }
+
+    #[test]
+    fn a_selection_leaving_a_code_block_uses_markdowns_comments() {
+        let dir = tmpdir("editor-comment-fence-edge");
+        let path = dir.join("a.md");
+        let text = "```toml\na = 1\n```\ntext\n```toml\nb = 2\n```\n";
+        std::fs::write(&path, text).unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        let lines = |v: &EditorView| v.buffer().lines[..7].to_vec();
+        // Over the closing fence.
+        v.buf.anchor = Some((1, 0));
+        v.buf.cursor = (3, 4);
+        v.toggle_comment().unwrap();
+        assert_eq!(lines(&v)[1..4], ["<!-- a = 1", "```", "text -->"]);
+        v.toggle_comment().unwrap();
+        // Across two blocks of one language, through the text between them.
+        v.buf.anchor = Some((1, 0));
+        v.buf.cursor = (5, 5);
+        v.toggle_comment().unwrap();
+        assert_eq!(lines(&v)[1], "<!-- a = 1");
+        assert_eq!(lines(&v)[5], "b = 2 -->");
+        // One undo step restores it.
+        v.buffer_mut().undo();
+        assert_eq!(lines(&v).join("\n") + "\n", text);
     }
 
     #[test]
