@@ -274,6 +274,17 @@ impl EditorBuffer {
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
+    /// The first and last rows a line-wise command acts on: the selection's
+    /// (one ending at column 0 of a later line leaves that line out), else the
+    /// cursor's.
+    pub fn line_rows(&self) -> (usize, usize) {
+        let (first, last) = match self.selection() {
+            Some(((sr, _), (er, ec))) => (sr, if er > sr && ec == 0 { er - 1 } else { er }),
+            None => (self.cursor.0, self.cursor.0),
+        };
+        (first, last.min(self.lines.len() - 1))
+    }
+
     /// The selected text (rows joined with `\n`), if any.
     pub fn selected_text(&self) -> Option<String> {
         let ((sr, sc), (er, ec)) = self.selection()?;
@@ -665,16 +676,11 @@ impl EditorBuffer {
     /// or uncomment them when every non-blank one is already commented, using
     /// `syntax`: its line token on each non-blank line at the least indent, else
     /// its block tokens around the first and last non-blank lines (or off each
-    /// line that is a block comment of its own). A selection ending at column
-    /// 0 of a later line leaves that line out. One undo step.
-    /// Returns whether the text changed (not when blank or the language has
-    /// no comment syntax).
+    /// line that is a block comment of its own), on [`Self::line_rows`]. One
+    /// undo step. Returns whether the text changed (not when blank or the
+    /// language has no comment syntax).
     pub fn toggle_comment(&mut self, syntax: CommentSyntax) -> bool {
-        let (first, last) = match self.selection() {
-            Some(((sr, _), (er, ec))) => (sr, if er > sr && ec == 0 { er - 1 } else { er }),
-            None => (self.cursor.0, self.cursor.0),
-        };
-        let last = last.min(self.lines.len() - 1);
+        let (first, last) = self.line_rows();
         let edits = self.edits;
         let opened = self.checkpoint(Step::Other);
         if let Some(token) = syntax.line {
