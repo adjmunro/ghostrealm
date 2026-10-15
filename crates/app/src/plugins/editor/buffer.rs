@@ -717,9 +717,9 @@ impl EditorBuffer {
         true
     }
 
-    /// The non-blank rows among `first..=last`.
-    fn text_rows(&self, first: usize, last: usize) -> Vec<usize> {
-        (first..=last).filter(|r| !self.lines[*r].trim().is_empty()).collect()
+    /// The rows among `first..=last` with text past their lead.
+    fn text_rows(&self, first: usize, last: usize, lead: Lead) -> Vec<usize> {
+        (first..=last).filter(|r| self.indent_of(*r, lead) < self.lines[*r].chars().count()).collect()
     }
 
     /// The column after `row`'s lead and the whitespace following it.
@@ -729,7 +729,7 @@ impl EditorBuffer {
     }
 
     fn toggle_line_comment(&mut self, token: &str, first: usize, last: usize, lead: Lead) {
-        let rows = self.text_rows(first, last);
+        let rows = self.text_rows(first, last, lead);
         if rows.is_empty() {
             return;
         }
@@ -756,7 +756,7 @@ impl EditorBuffer {
     }
 
     fn toggle_block_comment(&mut self, open: &str, close: &str, first: usize, last: usize, lead: Lead) {
-        let rows = self.text_rows(first, last);
+        let rows = self.text_rows(first, last, lead);
         let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
             return;
         };
@@ -1427,6 +1427,13 @@ mod tests {
         select(&mut e, (0, 0), (2, 12));
         assert!(e.toggle_comment(HTML, &[]));
         assert_eq!(e.lines, vec!["a", "", "  b"]);
+        // Rows with nothing past their lead are blank.
+        let mut e = buffer_with(">\n> a\n> b\n> ");
+        select(&mut e, (0, 0), (3, 2));
+        assert!(e.toggle_comment(HTML, &[1, 1, 1, 1]));
+        assert_eq!(e.lines, vec![">", "> <!-- a", "> b -->", "> "]);
+        assert!(e.toggle_comment(HTML, &[1, 1, 1, 1]));
+        assert_eq!(e.lines, vec![">", "> a", "> b", "> "]);
     }
 
     #[test]

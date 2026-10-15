@@ -1911,20 +1911,21 @@ mod tests {
     fn a_comment_in_a_quoted_code_block_stays_in_the_quote() {
         let dir = tmpdir("editor-comment-quoted-fence");
         let path = dir.join("a.md");
-        let text = "> ```rust\n> let a = 1;\n>     b();\n> ```\n- ```toml\n  c = 1\n  ```\n";
+        let text = "> ```rust\n> let a = 1;\n>\n> \n>     b();\n> ```\n- ```toml\n  c = 1\n  ```\n";
         std::fs::write(&path, text).unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        // A bare `>` row is blank: left alone, and no limit on the depth.
         v.buf.anchor = Some((1, 0));
-        v.buf.cursor = (2, 4);
+        v.buf.cursor = (4, 4);
         v.toggle_comment().unwrap();
-        assert_eq!(v.buffer().lines[1..3], ["> // let a = 1;", "> //     b();"]);
+        assert_eq!(v.buffer().lines[1..5], ["> // let a = 1;", ">", "> ", "> //     b();"]);
         v.toggle_comment().unwrap();
-        assert_eq!(v.buffer().lines[1..3], ["> let a = 1;", ">     b();"]);
+        assert_eq!(v.buffer().lines[1..5], ["> let a = 1;", ">", "> ", ">     b();"]);
         // A list item's body comments at its indent.
         v.buf.anchor = None;
-        v.buf.cursor = (5, 0);
+        v.buf.cursor = (7, 0);
         v.toggle_comment().unwrap();
-        assert_eq!(v.buffer().lines[5], "  # c = 1");
+        assert_eq!(v.buffer().lines[7], "  # c = 1");
         v.toggle_comment().unwrap();
         assert_eq!(v.buffer().lines.join("\n") + "\n", text);
     }
