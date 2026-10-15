@@ -55,10 +55,10 @@ impl Highlighter for Markdown {
         }
     }
 
-    /// A quoted code block's body comments after its `>` markers, so the line
-    /// stays in the quote.
+    /// A quoted code block's body (a quote's, or a list item's in a quote)
+    /// comments after its `>` markers, so the line stays in the quote.
     fn comment_lead(&self, line: &str, state: State) -> usize {
-        if state == 0 || fence_of(state).2 != QUOTE || self.line(line, state).1 != state {
+        if state == 0 || fence_of(state).2 == TOP || self.line(line, state).1 != state {
             return 0;
         }
         let c: Vec<char> = line.chars().collect();

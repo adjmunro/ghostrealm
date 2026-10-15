@@ -471,6 +471,9 @@ mod tests {
         assert_eq!(md.comment_lead(" > >  x", quoted), 4, "nested quotes, before the indent");
         assert_eq!(md.comment_lead("> ```", quoted), 0, "the closing fence is Markdown's");
         assert_eq!(md.comment_lead("a = 1", toml), 0);
+        let quoted_item = md.line("> - ```rust", 0).1;
+        assert_eq!(md.comment_on(">   a();", quoted_item), language("rust").unwrap().comment);
+        assert_eq!(md.comment_lead(">   a();", quoted_item), 1, "a list item in a quote");
         let listed = md.line("- ```toml", 0).1;
         assert_eq!(md.comment_lead("  a = 1", listed), 0, "a list item's indent is indent");
         let unknown = md.line("```zzz", 0).1;

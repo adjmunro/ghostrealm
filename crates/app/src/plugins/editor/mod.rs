@@ -1931,6 +1931,21 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_in_a_quoted_list_items_code_block_stays_in_the_quote() {
+        let dir = tmpdir("editor-comment-quoted-item");
+        let path = dir.join("a.md");
+        let text = "> - ```rust\n>   a();\n>\n>   b();\n>   ```\n";
+        std::fs::write(&path, text).unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        v.buf.anchor = Some((1, 0));
+        v.buf.cursor = (3, 3);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines[1..4], [">   // a();", ">", ">   // b();"]);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buffer().lines.join("\n") + "\n", text);
+    }
+
+    #[test]
     fn a_selection_leaving_a_code_block_uses_markdowns_comments() {
         let dir = tmpdir("editor-comment-fence-edge");
         let path = dir.join("a.md");
