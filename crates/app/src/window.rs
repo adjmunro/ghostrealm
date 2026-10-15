@@ -259,6 +259,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    /// AppKit is terminating the app (its quit went ahead at once, or after
+    /// a held request was answered yes): report what the file worker
+    /// finished, as an in-window quit does before it exits.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &mut self.state {
+            state.app.poll_file_jobs();
+            state.print_file_reports();
+        }
+    }
+
     /// Pace PTY-driven redraws: at most one per `FRAME_INTERVAL`, and never in a
     /// way that starves queued input (winit delivers input events, waking the
     /// `WaitUntil` sleep, before this schedules the next frame).
