@@ -11,7 +11,8 @@
 //!
 //! A fence opened after a list marker or `>` is recognised; it ends at its
 //! closing fence, or at the first non-blank line that leaves the container
-//! (no indent for a list item, no `>` for a quote). Containers are not
+//! (no indent for a list item, no `>` for a quote, either for a list item in
+//! a quote, its indent counted after the `>`). Containers are not
 //! tracked beyond that, so a fence in a nested list closes at the same rules.
 //!
 //! Inline work per line is bounded: nesting stops at [`MAX_DEPTH`], and after
@@ -171,14 +172,23 @@ fn blank(c: &[char]) -> bool {
 
 /// Whether line `c`, entering inside the fence `state`, leaves the fence's
 /// container (which ends the fence): a non-blank line with no indent for a
-/// list item, with no `>` for a quote.
+/// list item, with no `>` for a quote, and either for a list item in a quote
+/// (its indent counted after the `>` markers, each with one optional space).
 fn leaves(c: &[char], state: State) -> bool {
     let indent = run_of(c, 0, ' ');
     let quoted = c.get(indent) == Some(&'>');
     !blank(c)
         && match fence_of(state).2 {
-            LIST | QUOTED_LIST => indent == 0 && !quoted,
+            LIST => indent == 0,
             QUOTE => !quoted,
+            QUOTED_LIST => {
+                let mut p = 0;
+                while c.get(p + run_of(c, p, ' ')) == Some(&'>') {
+                    p += run_of(c, p, ' ') + 1;
+                    p += usize::from(c.get(p) == Some(&' '));
+                }
+                !quoted || (!blank(&c[p..]) && c[p] != ' ')
+            }
             _ => false,
         }
 }
@@ -720,7 +730,11 @@ mod tests {
     #[test]
     fn a_line_that_leaves_a_fences_container_is_not_part_of_the_block() {
         for (open, body, close, after) in
-            [("- ```toml", "  a = 1", "  ```", "after"), ("> ```", "> x", "> ```", "after")]
+            [
+                ("- ```toml", "  a = 1", "  ```", "after"),
+                ("- ```toml", "  a = 1", "  ```", "> x"),
+                ("> ```", "> x", "> ```", "after"),
+            ]
         {
             let (_, s) = lex_in(open, 0);
             let (_, s) = lex_in(body, s);
@@ -737,8 +751,22 @@ mod tests {
         assert_eq!(lex_in("  >>> x", listed).0, vec![run("  ", Plain), run(">>> x", Code)]);
         let (_, quoted) = lex_in("> - ```", 0);
         assert_eq!(lex_in(">   x", quoted).0, vec![run(">", Marker), run("   ", Plain), run("x", Code)]);
-        assert_eq!(lex_in("x", quoted).1, 0, "a quoted list item ends as a list item does");
-        assert_ne!(lex_in("  x", quoted).1, 0);
+        assert_eq!(lex_in("x", quoted).1, 0, "a line without `>` ends a quoted list item");
+        assert_eq!(lex_in("  x", quoted).1, 0, "fenced code has no lazy continuation");
+        assert_eq!(lex_in("> x", quoted).1, 0, "no indent after the `>`");
+        assert_eq!(lex_in(">x", quoted).1, 0);
+        assert_ne!(lex_in(">   x", quoted).1, 0);
+        assert_ne!(lex_in(">", quoted).1, 0);
+        assert_ne!(lex_in("> ", quoted).1, 0);
+    }
+
+    #[test]
+    fn a_quote_at_column_0_ends_a_list_items_fence() {
+        for after in ["> ```", "> x"] {
+            let (_, s) = lex_in("- ```", 0);
+            let (_, s) = lex_in("  x", s);
+            assert_eq!(lex_in(after, s), lex_in(after, 0), "{after:?} is read as if outside the fence");
+        }
     }
 
     #[test]
