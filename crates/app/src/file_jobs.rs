@@ -179,33 +179,37 @@ fn overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// `path` as given and spelled one way, for [`overlap`]: the nearest folder
-/// above it that exists, with symlinks resolved (`/tmp` is `/private/tmp` on
-/// macOS), then the rest as given, so a symlink entry stays itself. Both
-/// count: deleting a link to a folder still breaks a copy reading through it.
-/// A `.` or `..` in it would never match a whole component: an existing
-/// such path is resolved whole, any other has them dropped first.
+/// `path` as given and spelled one way, for [`overlap`]. Its final
+/// component is kept unresolved, so a symlink entry stays itself (unless it
+/// is `..` or `.`, which name a folder through the rest). The rest is
+/// resolved through its longest existing ancestor, by the kernel (which
+/// follows its symlinks and `..` as the filesystem does: `/tmp` is
+/// `/private/tmp` on macOS), and what follows that, which doesn't exist, by
+/// spelling. Both forms count: deleting a link to a folder still breaks a
+/// copy reading through it. (`Path::components` already drops an interior
+/// `.`; only `..` and a leading `.` are left to resolve.)
 fn spellings(path: &Path) -> [PathBuf; 2] {
-    let dotted = path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir));
-    let resolved = match dotted.then(|| path.canonicalize().ok()).flatten() {
-        Some(whole) => whole,
-        None => {
-            let plain = if dotted { lexical(path) } else { path.to_path_buf() };
-            plain
-                .ancestors()
-                .skip(1)
-                .find_map(|dir| Some((dir.canonicalize().ok()?, plain.strip_prefix(dir).ok()?)))
-                .map_or_else(|| plain.clone(), |(dir, rest)| dir.join(rest))
-        }
+    let (prefix, last) = match path.components().next_back() {
+        Some(Component::Normal(name)) => (path.parent().unwrap_or(Path::new("")), Some(name)),
+        _ => (path, None),
+    };
+    let resolved = prefix
+        .ancestors()
+        .find_map(|dir| Some((dir.canonicalize().ok()?, prefix.strip_prefix(dir).ok()?)))
+        .map_or_else(|| lexical(PathBuf::new(), prefix), |(dir, rest)| lexical(dir, rest));
+    let resolved = match last {
+        Some(name) => resolved.join(name),
+        None => resolved,
     };
     [path.to_path_buf(), resolved]
 }
 
-/// `path` with `.` dropped and each `..` taking the component before it, by
-/// spelling alone (for a path that doesn't exist, so the disk can't say).
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
+/// `rest` applied to `base` by spelling alone: `.` dropped, and each `..`
+/// taking the component before it (for components that don't exist, so the
+/// disk can't say).
+fn lexical(base: PathBuf, rest: &Path) -> PathBuf {
+    let mut out = base;
+    for c in rest.components() {
         match c {
             Component::CurDir => {}
             Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
@@ -503,6 +507,28 @@ pub mod tests {
         let mut jobs = FileJobs::default();
         jobs.submit(FileJob::Hold { src: d.join("real/b"), dir: d.join("to"), until: d.join("go") });
         for (path, busy) in [("real/a/..", true), ("real/./b", true), ("real/a/../a", false), ("nope/../to/x", true)] {
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path) });
+            let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+            assert_eq!(done.busy, busy, "{path}");
+        }
+        std::fs::write(d.join("go"), "").unwrap();
+        jobs.wait_all();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dotted_path_resolves_as_the_kernel_does_and_keeps_a_final_link() {
+        let d = tmpdir("jobs-busy-dots-links");
+        std::fs::create_dir_all(d.join("x")).unwrap();
+        std::fs::create_dir_all(d.join("other/real")).unwrap();
+        std::fs::create_dir_all(d.join("other/to")).unwrap();
+        std::os::unix::fs::symlink(d.join("other/real"), d.join("link")).unwrap();
+        let mut jobs = FileJobs::default();
+        // A copy of the link itself; one into `link/..`'s `to` (the kernel's
+        // `other/to`, not the spelling's `to`).
+        jobs.submit(FileJob::Hold { src: d.join("link"), dir: d.join("elsewhere"), until: d.join("go") });
+        jobs.submit(FileJob::Hold { src: d.join("src"), dir: d.join("other/to"), until: d.join("go") });
+        for (path, busy) in [("x/../link", true), ("link/../to/nonex", true), ("to/nonex", false)] {
             jobs.submit(FileJob::DeleteCheck { path: d.join(path) });
             let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
             assert_eq!(done.busy, busy, "{path}");
