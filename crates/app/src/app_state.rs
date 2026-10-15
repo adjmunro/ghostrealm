@@ -101,9 +101,10 @@ impl Confirm {
 
     /// Whether Enter cancels instead of accepting (and Cancel is drawn as the
     /// primary button): accepting would write over another program's version
-    /// of a file, which a stray Enter must not do.
+    /// of a file, or cut a running copy off half done, which a stray Enter
+    /// must not do.
     pub fn enter_cancels(&self) -> bool {
-        matches!(self.then, Confirmed::DiskConflict { .. })
+        matches!(self.then, Confirmed::DiskConflict { .. } | Confirmed::BusyQuit)
     }
 }
 
@@ -123,8 +124,7 @@ enum Confirmed {
     /// (accept) or load the disk version over its edits (discard). Then carry
     /// on with `rest`, the other views a Save and Close was saving, and `then`.
     DiskConflict { sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume> },
-    /// A copy or move is running: quit once it finishes (accept), or now,
-    /// leaving it half done (discard).
+    /// A copy or move is running: quit now anyway, leaving it half done.
     BusyQuit,
 }
 
@@ -167,8 +167,6 @@ pub struct AppState {
     guard_unsaved: bool,
     /// An accepted quit is waiting for the window to exit.
     quitting: bool,
-    /// A quit is waiting for the running copies and moves to finish.
-    quit_after_jobs: bool,
     /// Optional command line new terminals run (`sh -c <line>`); `None` = the
     /// user's shell.
     shell_line: Option<String>,
@@ -218,7 +216,6 @@ impl AppState {
             confirm: None,
             guard_unsaved: false,
             quitting: false,
-            quit_after_jobs: false,
             shell_line: None,
             waker: None,
             languages: None,
@@ -676,7 +673,7 @@ impl AppState {
                 self.save_views(&save, Some(Resume::Leave(what)))
             }
             Some(Confirm { then: Confirmed::BusyQuit, .. }) => {
-                self.quit_after_jobs = true;
+                self.quitting = true;
                 Ok(Vec::new())
             }
             None => Ok(Vec::new()),
@@ -736,7 +733,6 @@ impl AppState {
         }
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
-            Some(Confirm { then: Confirmed::BusyQuit, .. }) => self.quitting = true,
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
@@ -773,17 +769,6 @@ impl AppState {
         self.quitting
     }
 
-    /// Go on with a quit that waited for the running copies and moves, once
-    /// they have finished: it asks again about anything unsaved since.
-    /// Returns whether it did.
-    pub fn quit_when_idle(&mut self) -> bool {
-        if !self.quit_after_jobs || !self.file_jobs_idle() {
-            return false;
-        }
-        self.quit_after_jobs = false;
-        self.request_quit();
-        true
-    }
 
     /// Confirm the picker with its browser's choice, then close it. With no
     /// choice yet (a file picker with nothing selected), it stays open.
@@ -1091,12 +1076,14 @@ impl AppState {
     /// that no longer exist, or flag the quit.
     fn perform(&mut self, what: Leave) {
         // Exiting mid-copy leaves a half-copied tree under the real name, so
-        // the GUI asks first. Delete's checks don't count: they only read.
+        // the GUI asks first, after the unsaved-changes question. Cancel
+        // leaves the app running and the copy going; quitting again later
+        // asks again. Delete's checks don't count: they only read.
         if what == Leave::Quit && self.guard_unsaved && !self.file_jobs_idle() {
             self.confirm = Some(Confirm {
                 message: "A file copy or move is still running. Quitting now would leave it half done.".into(),
-                accept: Some("Wait"),
-                discard: Some("Quit Anyway"),
+                accept: Some("Quit Anyway"),
+                discard: None,
                 then: Confirmed::BusyQuit,
                 late: None,
             });

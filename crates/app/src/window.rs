@@ -267,27 +267,13 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        // A quit that waited for a copy or move goes on once it finished.
-        if state.app.quit_when_idle() {
-            state.exit_if_quitting();
-            state.dirty = true;
-            state.window.request_redraw();
-        }
         // Text a command put aside for the system clipboard.
         if let Some(text) = state.app.take_clipboard_text() {
             if let Some(cb) = state.clipboard.as_mut() {
                 let _ = cb.set_text(text);
             }
         }
-        // File operations that failed after their command returned, or went
-        // ahead only in part.
-        for report in state.app.take_file_reports() {
-            match report.result {
-                Err(e) => eprintln!("ghostrealm: {}: {e}", report.command),
-                Ok(m) if report.warning => eprintln!("ghostrealm: {}: {m}", report.command),
-                Ok(_) => {}
-            }
-        }
+        state.print_file_reports();
         // A copy or move still running asks too: going ahead would leave it
         // half done.
         let ask = state.app.has_unsaved() || !state.app.file_jobs_idle();
@@ -1697,11 +1683,26 @@ impl State {
     /// sometimes long enough that macOS marks the app unresponsive. Exiting
     /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
     /// child shells, exactly as closing any terminal does. A copy or move
-    /// still running was asked about before the quit was agreed.
+    /// still running was asked about before the quit was agreed; what the
+    /// file worker finished is reported first.
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
+            self.app.poll_file_jobs();
+            self.print_file_reports();
             std::process::exit(0);
+        }
+    }
+
+    /// Print file operations that failed after their command returned, or
+    /// went ahead only in part.
+    fn print_file_reports(&mut self) {
+        for report in self.app.take_file_reports() {
+            match report.result {
+                Err(e) => eprintln!("ghostrealm: {}: {e}", report.command),
+                Ok(m) if report.warning => eprintln!("ghostrealm: {}: {m}", report.command),
+                Ok(_) => {}
+            }
         }
     }
 

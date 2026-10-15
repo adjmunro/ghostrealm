@@ -1259,36 +1259,32 @@ mod tests {
     }
 
     #[test]
-    fn quitting_while_a_copy_runs_asks_then_waits_for_it_or_quits_anyway() {
+    fn quitting_while_a_copy_runs_asks_to_quit_anyway_or_cancel() {
         let d = tmpdir("fm-quit-busy");
-        // Wait: the quit goes on once the copy is done.
+        // Quit Anyway: at once.
         let mut s = guarded_app();
         s.file_jobs.submit(FileJob::Hold { until: d.join("go") });
         s.request_quit();
         let c = s.confirm().expect("a copy runs: ask");
-        assert_eq!((c.accept, c.discard), (Some("Wait"), Some("Quit Anyway")));
+        assert_eq!((c.accept, c.discard), (Some("Quit Anyway"), None));
+        assert!(c.enter_cancels(), "a stray Enter doesn't cut the copy off");
+        assert!(!s.quitting());
         s.accept_confirm().unwrap();
-        assert!(!s.quitting() && !s.quit_when_idle(), "the copy still runs");
-        std::fs::write(d.join("go"), "").unwrap();
-        s.wait_file_jobs();
-        assert!(s.quit_when_idle());
         assert!(s.quitting());
-        assert!(!s.quit_when_idle(), "once");
-        // Quit Anyway: at once.
+        std::fs::write(d.join("go"), "").unwrap();
+        // Cancel: the app stays, the copy goes on, and a later quit asks again.
         let mut s = guarded_app();
         s.file_jobs.submit(FileJob::Hold { until: d.join("go2") });
         s.request_quit();
-        s.discard_confirm().unwrap();
-        assert!(s.quitting());
-        std::fs::write(d.join("go2"), "").unwrap();
-        // Cancel: no quit, and none later.
-        let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::Hold { until: d.join("go3") });
+        assert_eq!(s.enter_confirm().unwrap(), Vec::<PathBuf>::new());
+        assert!(s.confirm().is_none() && !s.quitting(), "Enter cancelled");
         s.request_quit();
+        assert!(s.confirm().is_some(), "asks again");
         s.cancel_confirm();
-        std::fs::write(d.join("go3"), "").unwrap();
+        std::fs::write(d.join("go2"), "").unwrap();
         s.wait_file_jobs();
-        assert!(!s.quit_when_idle() && !s.quitting());
+        s.request_quit();
+        assert!(s.confirm().is_none() && s.quitting(), "nothing running: quits");
     }
 
     #[test]
@@ -1302,7 +1298,7 @@ mod tests {
         s.request_quit();
         assert_eq!(s.confirm().unwrap().discard, Some("Quit Without Saving"));
         s.discard_confirm().unwrap();
-        assert_eq!(s.confirm().unwrap().accept, Some("Wait"), "then the copy");
+        assert_eq!(s.confirm().unwrap().accept, Some("Quit Anyway"), "then the copy");
         assert!(!s.quitting());
         std::fs::write(d.join("go"), "").unwrap();
     }
