@@ -431,7 +431,8 @@
 - Requires: NO BLOCKERS
 - Detail: The registry (`ghostrealm_core::highlight`) has TOML and Markdown. Add
   more as small `Highlighter` modules (JSON, YAML, Rust, shell, ...); each is one
-  line in `highlight::ALL`. Later: consider LSP-backed semantic highlight, but
+  line in `highlight::ALL`, declares its comment tokens (`Highlighter::comment`)
+  and drops its `highlight::LANGUAGES` entry. Later: consider LSP-backed semantic highlight, but
   keep the rule-based path for the common case. Markdown has no setext headings,
   indented code, or YAML front matter (they need line-number or neighbouring-line
   context). The direction for the main languages (tree-sitter, hand-written, or
@@ -842,23 +843,6 @@
 > against e9617b8; notes that were already fixed are not listed. The "Small
 > fixes" entries are actionable now; the "Discussion" entries need a design
 > session before any code.
-
----
-
-[2026-10-13T20:25+1300@e9617b8] PRIORITY: Quality of life (owner review) — editor and file browser polish
-
-- Requires: NO BLOCKERS
-- Detail:
-  - **Cmd+/ comment toggle: remaining.** `editor.toggle_comment` exists and a
-    new config file binds it to `cmd+/` (`Highlighter::comment` holds each
-    language's tokens). Only languages with a highlighter have comment syntax
-    (TOML, Markdown); each new highlighter in "Syntax highlighting — more
-    languages" must declare its own. Inside a Markdown fence the toggle still
-    uses Markdown's tokens, not the fence language's. The owner's own
-    `config.toml` binds `split.leftright` to `cmd+/` (and `split.topbottom` to
-    `cmd+shift+/`), which shadows it: app chords take precedence over the
-    focused view, so the owner moves those.
-- Reason: owner review; small, visible rough edges.
 
 ---
 
