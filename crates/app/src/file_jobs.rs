@@ -169,7 +169,7 @@ pub struct FileJobs {
     active: Vec<(u64, Vec<PathBuf>)>,
     /// Delete's checks not taken back yet: their path, and whether a copy or
     /// move used it since the check was given.
-    checks: HashMap<u64, (PathBuf, bool)>,
+    checks: HashMap<u64, ([PathBuf; 2], bool)>,
     next_id: u64,
 }
 
@@ -177,6 +177,19 @@ pub struct FileJobs {
 /// path components: `/a/b` is not inside `/a/bc`).
 fn overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
+}
+
+/// `path` as given and spelled one way, for [`overlap`]: the nearest folder
+/// above it that exists, with symlinks resolved (`/tmp` is `/private/tmp` on
+/// macOS), then the rest as given, so a symlink entry stays itself. Both
+/// count: deleting a link to a folder still breaks a copy reading through it.
+fn spellings(path: &Path) -> [PathBuf; 2] {
+    let resolved = path
+        .ancestors()
+        .skip(1)
+        .find_map(|dir| Some((dir.canonicalize().ok()?, path.strip_prefix(dir).ok()?)))
+        .map_or_else(|| path.to_path_buf(), |(dir, rest)| dir.join(rest));
+    [path.to_path_buf(), resolved]
 }
 
 impl FileJobs {
@@ -195,12 +208,13 @@ impl FileJobs {
         let check = matches!(job, FileJob::DeleteCheck { .. });
         if check { &self.checking } else { &self.pending }.add();
         if let FileJob::DeleteCheck { path } = &job {
-            let busy = self.active.iter().flat_map(|(_, uses)| uses).any(|u| overlap(u, path));
-            self.checks.insert(id, (path.clone(), busy));
+            let path = spellings(path);
+            let busy = self.active.iter().flat_map(|(_, uses)| uses).any(|u| path.iter().any(|p| overlap(u, p)));
+            self.checks.insert(id, (path, busy));
         } else {
-            let uses = job.uses();
+            let uses: Vec<PathBuf> = job.uses().iter().flat_map(|p| spellings(p)).collect();
             for (path, busy) in self.checks.values_mut() {
-                *busy |= uses.iter().any(|u| overlap(u, path));
+                *busy |= uses.iter().any(|u| path.iter().any(|p| overlap(u, p)));
             }
             self.active.push((id, uses));
         }
@@ -422,6 +436,32 @@ pub mod tests {
         jobs.submit(FileJob::Duplicate { src: d.join("late/f") });
         let done = jobs.wait_all();
         assert!(done.iter().find(|x| x.id == check).unwrap().busy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_check_sees_a_copy_through_a_symlinked_folder() {
+        let d = tmpdir("jobs-busy-link");
+        std::fs::create_dir_all(d.join("real/a")).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        let mut jobs = FileJobs::default();
+        jobs.submit(FileJob::Hold { src: d.join("link/a"), dir: d.join("to"), until: d.join("go") });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("real/a") });
+        let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(done.busy, "the same folder, spelled through the link");
+        // The link the copy reads through, though only a link.
+        jobs.submit(FileJob::DeleteCheck { path: d.join("link") });
+        let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(done.busy, "it holds the copy's source as spelled");
+        // Inside the destination, spelled through the link, before it exists.
+        jobs.submit(FileJob::DeleteCheck { path: d.join("link/../to/new") });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("elsewhere") });
+        let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(done.busy, "inside the destination folder");
+        let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(!done.busy);
+        std::fs::write(d.join("go"), "").unwrap();
+        jobs.wait_all();
     }
 
     #[test]
