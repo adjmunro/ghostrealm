@@ -98,26 +98,6 @@ pub enum GitFilter {
     Untracked,
 }
 
-impl GitFilter {
-    /// Cycle All → Modified → Untracked → All.
-    pub fn next(self) -> Self {
-        match self {
-            GitFilter::All => GitFilter::Modified,
-            GitFilter::Modified => GitFilter::Untracked,
-            GitFilter::Untracked => GitFilter::All,
-        }
-    }
-
-    /// A short label for a header control.
-    pub fn label(self) -> &'static str {
-        match self {
-            GitFilter::All => "git: all",
-            GitFilter::Modified => "git: modified",
-            GitFilter::Untracked => "git: untracked",
-        }
-    }
-}
-
 /// How `rows()` presents the subtree: the real ancestor hierarchy, or a flat set of
 /// synthetic collapsible categories grouping files by one facet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,31 +114,6 @@ pub enum FsView {
     Modified,
     /// Group files by size bucket.
     Size,
-}
-
-impl FsView {
-    pub fn next(self) -> Self {
-        match self {
-            FsView::Tree => FsView::Extension,
-            FsView::Extension => FsView::Kind,
-            FsView::Kind => FsView::GitStatus,
-            FsView::GitStatus => FsView::Modified,
-            FsView::Modified => FsView::Size,
-            FsView::Size => FsView::Tree,
-        }
-    }
-
-    /// Short header label.
-    pub fn label(self) -> &'static str {
-        match self {
-            FsView::Tree => "tree",
-            FsView::Extension => "type",
-            FsView::Kind => "kind",
-            FsView::GitStatus => "git",
-            FsView::Modified => "modified",
-            FsView::Size => "size",
-        }
-    }
 }
 
 /// A row in the flattened visible tree, ready to render.
@@ -411,12 +366,6 @@ impl FsTree {
         }
     }
 
-    /// Advance to the next view mode (tree → type → kind → git → modified → size → …).
-    pub fn cycle_view(&mut self) {
-        self.view = self.view.next();
-        self.dirty = true;
-    }
-
     /// Expand/collapse a synthetic category in a grouped view.
     pub fn toggle_category(&mut self, key: &str) {
         if !self.expanded_cats.remove(key) {
@@ -427,12 +376,6 @@ impl FsTree {
 
     pub fn git_filter(&self) -> GitFilter {
         self.git_filter
-    }
-
-    /// Advance the git-status filter (All → Modified → Untracked → All).
-    pub fn cycle_git_filter(&mut self) {
-        self.git_filter = self.git_filter.next();
-        self.dirty = true;
     }
 
     /// Set the git-status filter.
@@ -477,20 +420,26 @@ impl FsTree {
                 // Grouped views ignore the query; the view IS the navigation.
                 self.ensure_walk();
                 self.grouped_rows(self.view)
-            } else if self.query.trim().is_empty() || self.input_is_path() {
-                // A path-like input drives the completion dropdown, not a filter, so
-                // the tree keeps showing the current root while the user types.
-                self.browse_rows()
-            } else {
+            } else if self.is_filtering() {
                 self.ensure_walk();
                 self.filter_rows()
+            } else {
+                self.browse_rows()
             };
             self.dirty = false;
         }
         &self.rows_cache
     }
 
-    /// Whether the git/recent/type filters are all off.
+    /// Whether [`rows`](Self::rows) is a flat list of filter matches: the tree
+    /// view with a query that is neither blank nor a path. A path-like input
+    /// drives the completion dropdown instead, so the tree keeps showing the
+    /// current root while the user types.
+    pub fn is_filtering(&self) -> bool {
+        self.view == FsView::Tree && !self.query.trim().is_empty() && !self.input_is_path()
+    }
+
+    /// Whether any of the git/recent/type filters is on.
     pub fn filters_active(&self) -> bool {
         self.git_filter != GitFilter::All || self.recent.is_some() || self.ext.is_some()
     }
@@ -1229,7 +1178,7 @@ mod tests {
     fn git_status_arrives_from_the_worker_and_the_filter_applies_then() {
         let Some(d) = repo_with_a_change() else { return };
         let (mut t, woken) = tree_with_waker(&d);
-        t.cycle_git_filter();
+        t.set_git_filter(GitFilter::Modified);
         assert_eq!(t.git_filter(), GitFilter::Modified);
         assert!(file_names(&mut t).is_empty(), "no git state yet: no file passes");
         assert!(t.git_status_loading());
@@ -1244,7 +1193,7 @@ mod tests {
     fn a_refresh_keeps_the_last_git_status_until_the_new_one_arrives() {
         let Some(d) = repo_with_a_change() else { return };
         let (mut t, woken) = tree_with_waker(&d);
-        t.cycle_git_filter();
+        t.set_git_filter(GitFilter::Modified);
         t.rows();
         woken.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(file_names(&mut t), ["changed.txt"]);
@@ -1300,7 +1249,7 @@ mod tests {
     fn git_status_requests_coalesce_and_stale_results_are_superseded() {
         let Some(d) = repo_with_a_change() else { return };
         let (mut t, _woken) = tree_with_waker(&d);
-        t.cycle_git_filter();
+        t.set_git_filter(GitFilter::Modified);
         for _ in 0..5 {
             t.rows();
             t.refresh();
@@ -1552,10 +1501,18 @@ mod tests {
     }
 
     #[test]
-    fn the_time_grouped_view_is_labelled_modified() {
-        assert_eq!(FsView::Modified.label(), "modified");
-        assert_eq!(FsView::GitStatus.next(), FsView::Modified);
-        assert_eq!(FsView::Modified.next(), FsView::Size);
+    fn a_blank_or_path_query_is_not_a_filter() {
+        let d = tmpdir();
+        fs::write(d.join("a.txt"), "").unwrap();
+        let mut t = FsTree::new(&d);
+        for (q, filtering) in [("", false), ("  ", false), ("a", true), (" a ", true), ("./a", false)] {
+            t.set_query(q);
+            assert_eq!(t.is_filtering(), filtering, "{q:?}");
+        }
+        t.set_query("a");
+        t.set_view(FsView::Extension);
+        assert!(!t.is_filtering(), "a grouped view ignores the query");
+        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
