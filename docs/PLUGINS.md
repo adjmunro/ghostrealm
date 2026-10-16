@@ -178,7 +178,18 @@ into the overlay layer; it doesn't need to know.
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
   explicit save found the file changed on disk: the app asks before writing),
-  `FileMenu` (open the file menu on a target).
+  `FileMenu` (open the file menu on a target), `Menu` (open the view's own
+  menu).
+- View menu: `Request::Menu { items, at }` opens a menu of the view's own at
+  `at` (physical px; clamped on-screen), drawn and run by the app like the
+  file menu (hover highlight, fires on mouse-up). Choosing an item calls
+  `View::button(id)` with the item's `id`, so an item and a ribbon icon that
+  do the same thing share an id. `MenuItem::new(id, label)`, then
+  `.check(on)` (a toggle: a check mark when on), `.with_hint(text)` (dim,
+  right-aligned: a shortcut or value), `.enable(false)` (dim, not choosable);
+  `MenuItem::RULE` separates sections. Build the items when the menu opens,
+  so checks show the current state. Not shown while the picker is open. The
+  editor ribbon's `⋯` lists every ribbon option this way.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules
