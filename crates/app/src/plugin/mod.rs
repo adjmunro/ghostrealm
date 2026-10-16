@@ -170,8 +170,8 @@ pub trait View: Any {
         self.doc(self.active_doc()).and_then(|d| d.title())
     }
 
-    /// Unsaved changes (the tab title shows italic): in any document, for a
-    /// view hosting several.
+    /// Unsaved changes (the tab's close slot shows a dot): in any document,
+    /// for a view hosting several.
     fn modified(&self) -> bool {
         self.docs().into_iter().any(|id| self.doc(id).is_some_and(|d| d.modified()))
     }

@@ -4253,17 +4253,13 @@ impl State {
                         self.strip_buffers
                             .push(Buffer::new(&mut self.text.font_system, metrics));
                     }
-                    // Italic when the tab's view has unsaved changes.
                     let unsaved = self.app.view(*sid).is_some_and(|v| v.modified());
                     // Amber when the file changed on disk under unsaved edits.
                     let changed = self.app.view(*sid).is_some_and(|v| v.marked_changed_on_disk());
                     let title_color = if changed { theme::WARN } else { [220, 220, 230] };
-                    let mut title_attrs = Attrs::new()
+                    let title_attrs = Attrs::new()
                         .family(Family::SansSerif)
                         .color(Color::rgb(title_color[0], title_color[1], title_color[2]));
-                    if unsaved {
-                        title_attrs = title_attrs.style(Style::Italic);
-                    }
                     let buf = &mut self.strip_buffers[strip_idx];
                     buf.set_metrics(metrics);
                     // Leave room on the right for the close button.
@@ -4296,28 +4292,24 @@ impl State {
                             w: close_w,
                             h: *strip_h,
                         };
-                        let hovered = rect_contains(hit, self.cursor.0, self.cursor.1);
-                        if hovered {
-                            frame.bg.push(rect_quad(
-                                hover_box(hit, close_w),
-                                sw,
-                                sh,
-                                theme::HOVER_BG,
-                                theme::HOVER_ALPHA,
-                            ));
+                        let tab = Rect { x: tab_x, y: pr.rect.y, w: tab_w, h: *strip_h };
+                        let hover = |r: Rect| rect_contains(r, self.cursor.0, self.cursor.1);
+                        let slot = close_slot(hit, unsaved, hover(tab), hover(hit), self.cell_h, (sw, sh));
+                        frame.bg.extend(slot.quads);
+                        if let Some(color) = slot.cross {
+                            close_placements.push(Placement {
+                                idx: 0,
+                                left: close_x + (close_w - self.cell_w) * 0.5,
+                                top: text_top,
+                                bounds: TextBounds {
+                                    left: close_x as i32,
+                                    top: pr.rect.y as i32,
+                                    right: (close_x + close_w) as i32,
+                                    bottom: (pr.rect.y + *strip_h) as i32,
+                                },
+                                color,
+                            });
                         }
-                        close_placements.push(Placement {
-                            idx: 0,
-                            left: close_x + (close_w - self.cell_w) * 0.5,
-                            top: text_top,
-                            bounds: TextBounds {
-                                left: close_x as i32,
-                                top: pr.rect.y as i32,
-                                right: (close_x + close_w) as i32,
-                                bottom: (pr.rect.y + *strip_h) as i32,
-                            },
-                            color: if hovered { theme::GLYPH_HOVER } else { theme::GLYPH },
-                        });
                         self.buttons.push((hit, ButtonAction::CloseSurface(vt, pr.id, *sid)));
                     }
                 }
@@ -5316,12 +5308,50 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// What a pane tab's close slot draws.
+struct CloseSlot {
+    quads: Vec<QuadInstance>,
+    /// The '×' glyph's colour, when it shows.
+    cross: Option<[u8; 3]>,
+}
+
+/// A pane tab's close slot `hit`: a dot while its surface has unsaved
+/// changes, until the pointer is over the tab (`tab_hovered`) and the slot
+/// offers to close it with '×'.
+fn close_slot(
+    hit: Rect,
+    unsaved: bool,
+    tab_hovered: bool,
+    hovered: bool,
+    cell_h: f32,
+    screen: (f32, f32),
+) -> CloseSlot {
+    let (sw, sh) = screen;
+    if unsaved && !tab_hovered {
+        let d = (cell_h * 0.45).round();
+        let dot = Rect {
+            x: hit.x + ((hit.w - d) * 0.5).round(),
+            y: hit.y + ((hit.h - d) * 0.5).round(),
+            w: d,
+            h: d,
+        };
+        let quads = vec![round_quad(dot, sw, sh, d * 0.5, theme::TEXT, 1.0, None)];
+        return CloseSlot { quads, cross: None };
+    }
+    let quads = match hovered {
+        true => vec![rect_quad(hover_box(hit, hit.h.min(hit.w)), sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA)],
+        false => Vec::new(),
+    };
+    CloseSlot { quads, cross: Some(if hovered { theme::GLYPH_HOVER } else { theme::GLYPH }) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon,
+        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, close_slot,
     };
+    use crate::plugin::theme;
     use ghostrealm_core::{Axis, Rect, Side, SurfaceId};
     use winit::window::CursorIcon;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
@@ -5496,6 +5526,24 @@ mod tests {
             let h = narrow.rows[0].hint;
             assert!(h.is_none_or(|h| h.w < 90.0), "the hint is cut or dropped: {h:?}");
         }
+    }
+
+    #[test]
+    fn an_unsaved_pane_tab_shows_a_dot_in_its_close_slot_until_hovered() {
+        let hit = Rect { x: 100.0, y: 0.0, w: 16.0, h: 28.0 };
+        let screen = (800.0, 600.0);
+        let saved = close_slot(hit, false, false, false, 16.0, screen);
+        assert!(saved.quads.is_empty() && saved.cross == Some(theme::GLYPH));
+
+        let unsaved = close_slot(hit, true, false, false, 16.0, screen);
+        assert_eq!(unsaved.cross, None, "no cross");
+        let [dot] = unsaved.quads.as_slice() else { panic!("one dot") };
+        assert_eq!((dot.px, dot.radius), ([7.0, 7.0], 3.5), "a disc");
+
+        let over_tab = close_slot(hit, true, true, false, 16.0, screen);
+        assert!(over_tab.quads.is_empty() && over_tab.cross == Some(theme::GLYPH));
+        let over_slot = close_slot(hit, true, true, true, 16.0, screen);
+        assert_eq!((over_slot.quads.len(), over_slot.cross), (1, Some(theme::GLYPH_HOVER)));
     }
 
     #[test]
