@@ -128,9 +128,6 @@ enum Confirmed {
     /// Move this path to the Trash, after saving `save` (accept) or without
     /// saving (discard) the open documents of it.
     UnsavedTrash { path: std::path::PathBuf, save: Vec<DocRef> },
-    /// Replace `doc` with a document of `path` (`None`: an empty buffer),
-    /// after saving `save` (accept) or without saving (discard).
-    UnsavedOpen { doc: DocRef, path: Option<std::path::PathBuf>, save: Vec<DocRef> },
     /// `doc`'s file changed on disk since it was loaded: write over it
     /// (accept) or load the disk version over its edits (discard). Then carry
     /// on with `rest`, the other documents a Save and Close was saving, and
@@ -147,10 +144,6 @@ enum Resume {
     Leave(Leave),
     /// Move this path to the Trash, once the saving is done.
     Trash(std::path::PathBuf),
-    /// Replace this document with one of this file (`None`: an empty
-    /// buffer), once the saving is done: only while its Files surface still
-    /// shows it, saved.
-    Open(DocRef, Option<std::path::PathBuf>),
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -228,14 +221,6 @@ pub struct AppState {
     /// a file opens in the latest when none is focused.
     files_seen: HashMap<SurfaceId, u64>,
     focus_stamp: u64,
-    /// What to do once the open Save As picker has saved (replacing a
-    /// scratch buffer asked to save it first).
-    after_save_as: Option<Resume>,
-    /// Files written on a document's behalf, until the window takes them.
-    saved_out: Vec<std::path::PathBuf>,
-    /// The config, for what the app does on a document's behalf (an
-    /// autosave before replacing it).
-    cfg: Config,
 }
 
 impl AppState {
@@ -267,15 +252,7 @@ impl AppState {
             files_session: files_plugin::Session::default(),
             files_seen: HashMap::new(),
             focus_stamp: 0,
-            after_save_as: None,
-            saved_out: Vec::new(),
-            cfg: Config::default(),
         }
-    }
-
-    /// Use `cfg` for what the app does on a document's behalf.
-    pub fn set_config(&mut self, cfg: Config) {
-        self.cfg = cfg;
     }
 
     /// Set the inbox timing config (auto-read dwell + unfocus grace).
@@ -575,7 +552,6 @@ impl AppState {
         };
         let browser = FileBrowserView::picker(root, purpose.mode()).with_waker(self.waker.clone());
         self.picker = Some((browser, purpose));
-        self.after_save_as = None;
     }
 
     /// Where the picker starts: the active workspace's dir, else the app
@@ -662,14 +638,11 @@ impl AppState {
             browser.set_name(name.to_string_lossy());
         }
         self.picker = Some((browser, purpose));
-        // A follow-up belongs to the dialog it was set for, after it opens.
-        self.after_save_as = None;
     }
 
     /// Close the floating picker.
     pub fn close_picker(&mut self) {
         self.picker = None;
-        self.after_save_as = None;
         self.confirm = None;
     }
 
@@ -706,17 +679,6 @@ impl AppState {
             }
             Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
                 self.save_views(&save, Some(Resume::Trash(path)))
-            }
-            // A buffer with no file is saved where the picker says first.
-            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. })
-                if save.is_empty() && self.doc(doc).is_some_and(|v| v.path().is_none()) =>
-            {
-                self.open_save_dialog(doc, Pick::SaveAs(doc));
-                self.after_save_as = Some(Resume::Open(doc, path));
-                Ok(Vec::new())
-            }
-            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. }) => {
-                self.save_views(&save, Some(Resume::Open(doc, path)))
             }
             Some(Confirm { then: Confirmed::DiskConflict { doc, rest, then }, .. }) => {
                 let view = self
@@ -773,7 +735,6 @@ impl AppState {
         match then {
             Resume::Leave(what) => self.perform(what),
             Resume::Trash(path) => self.trash_now(&path)?,
-            Resume::Open(doc, path) => self.replace_with(doc, path.as_deref(), false)?,
         }
         Ok(())
     }
@@ -809,9 +770,6 @@ impl AppState {
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
-            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, .. }, .. }) => {
-                self.replace_with(doc, path.as_deref(), true)?
-            }
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
             Some(Confirm { then: Confirmed::DiskConflict { doc, .. }, .. }) => {
@@ -900,8 +858,6 @@ impl AppState {
         let Some((_, purpose)) = self.picker.take() else {
             return Ok(None);
         };
-        // Whatever happens, the follow-up is this dialog's only.
-        let then = self.after_save_as.take();
         match purpose {
             Pick::ActiveRoot => self.set_active_root_dir(path),
             Pick::NewWorkspace => {
@@ -914,9 +870,6 @@ impl AppState {
                     .save_as(path.clone())?;
                 if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
                     self.tree.set_surface_title(doc.0, t, false);
-                }
-                if let Some(then) = then {
-                    self.resume(then)?;
                 }
                 return Ok(Some(path));
             }
@@ -965,8 +918,8 @@ impl AppState {
         if let Some(vt) = existing {
             self.focus_vtab(vt);
             match self.files_target() {
-                Some(sid) if self.files_shows(sid, &path) => self.show_surface(sid),
-                target => self.place_doc(target, doc, Some(path)),
+                Some(sid) if self.files_has(sid, &path) => self.show_file_in(sid, &path),
+                target => self.place_doc(target, doc, Some(&path)),
             }
             return Ok(());
         }
@@ -1072,11 +1025,24 @@ impl AppState {
     /// Close surface `sid` wherever it is, whole: every document in it,
     /// asking first about any with unsaved changes.
     pub fn close_surface_id(&mut self, sid: SurfaceId) {
-        let found = self.tree.vtabs().iter().find_map(|v| {
-            v.panes().iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
-        });
-        if let Some((vt, pane)) = found {
+        if let Some((vt, pane)) = self.pane_of(sid) {
             self.leave(Leave::Surface(vt, pane, sid));
+        }
+    }
+
+    /// The workspace and pane holding surface `sid`.
+    fn pane_of(&self, sid: SurfaceId) -> Option<(VtabId, PaneId)> {
+        self.tree.vtabs().iter().find_map(|v| {
+            v.panes().iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
+        })
+    }
+
+    /// Close document `doc` of surface `sid` (a file tab's close button),
+    /// asking first about its unsaved changes; the surface too when the view
+    /// says so (see [`View::close_doc`]).
+    pub fn close_doc_of(&mut self, sid: SurfaceId, doc: DocId) {
+        if let Some((vt, pane)) = self.pane_of(sid) {
+            self.leave(Leave::Doc(vt, pane, sid, doc));
         }
     }
 

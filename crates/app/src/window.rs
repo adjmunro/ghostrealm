@@ -281,10 +281,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         state.print_file_reports();
-        // Files the app wrote for a document (a command's open autosaved it).
-        for written in state.app.take_saved() {
-            state.saved(written);
-        }
         // The copy the quit question was about finished: quit.
         if state.app.continue_busy_quit() {
             state.exit_if_quitting();
@@ -1150,7 +1146,6 @@ impl State {
                 catalogue.clone(),
             )));
         app.set_inbox_config(cfg.inbox);
-        app.set_config(cfg.clone());
         app.set_default_dir(cfg.default_dir());
         app.set_close_on_exit(cfg.terminal.close_on_exit);
         // A CLI command spawns a terminal running it; a bare launch opens the empty
@@ -1291,7 +1286,6 @@ impl State {
         }
         self.chrome = cfg.resolved_chrome();
         self.app.set_inbox_config(cfg.inbox);
-        self.app.set_config(cfg.clone());
         self.app.set_default_dir(cfg.default_dir());
         self.app.set_close_on_exit(cfg.terminal.close_on_exit);
         self.cfg = cfg;
@@ -1490,9 +1484,6 @@ impl State {
     fn open_requested_file(&mut self, sid: SurfaceId, path: std::path::PathBuf) {
         if let Err(e) = self.app.open_file_from(sid, &path) {
             eprintln!("ghostrealm: open {}: {e:#}", path.display());
-        }
-        for written in self.app.take_saved() {
-            self.saved(written);
         }
     }
 
@@ -1843,6 +1834,7 @@ impl State {
                     }
                     self.app.close_surface_id(sid);
                 }
+                Request::CloseDoc(doc) => self.app.close_doc_of(sid, doc),
                 Request::FileMenu { target, at, align } => self.open_file_menu(target, at, align),
                 Request::Menu { items, at, align } => self.open_view_menu(sid, items, at, align),
             }

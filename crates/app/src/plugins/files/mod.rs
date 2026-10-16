@@ -1,6 +1,6 @@
 //! The Files surface: a file sidebar (a [`FileBrowserView`]) beside the
-//! document it opened, with a slim row above them holding the sidebar
-//! button. Every file the app opens lands in one (see
+//! documents it opened, with a slim row above them holding the sidebar
+//! button and a tab per document. Every file the app opens lands in one (see
 //! `AppState::open_file`). The documents are views of their own: an
 //! [`EditorView`](crate::plugins::editor::EditorView) for text, a
 //! [`MediaView`] for images and audio, each under a [`header::DocHeader`].
@@ -9,6 +9,7 @@
 
 pub mod header;
 pub(crate) mod media;
+mod tabs;
 mod view;
 
 use std::cell::Cell;
@@ -84,21 +85,37 @@ impl Plugin for FilesPlugin {
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
-        r.register(
-            CommandMeta::new(
-                "files.focus_sidebar",
-                "Focus File Sidebar",
-                "Move the keyboard to the focused Files surface's sidebar, showing it if hidden",
-            ),
-            Box::new(|s: &mut AppState, _| {
-                let files = s
-                    .focused_surface()
-                    .and_then(|sid| s.view_mut(sid))
-                    .and_then(|v| v.downcast_mut::<FilesView>())
-                    .ok_or_else(|| CmdError::Failed("no Files surface is focused".into()))?;
-                files.focus_sidebar();
-                Ok(CmdOutcome::ok())
-            }),
+        let mut on_focused = |id: &'static str, title: &'static str, description: &'static str, f: fn(&mut FilesView)| {
+            r.register(
+                CommandMeta::new(id, title, description),
+                Box::new(move |s: &mut AppState, _| {
+                    let files = s
+                        .focused_surface()
+                        .and_then(|sid| s.view_mut(sid))
+                        .and_then(|v| v.downcast_mut::<FilesView>())
+                        .ok_or_else(|| CmdError::Failed("no Files surface is focused".into()))?;
+                    f(files);
+                    Ok(CmdOutcome::ok())
+                }),
+            );
+        };
+        on_focused(
+            "files.focus_sidebar",
+            "Focus File Sidebar",
+            "Move the keyboard to the focused Files surface's sidebar, showing it if hidden",
+            FilesView::focus_sidebar,
+        );
+        on_focused(
+            "files.next_tab",
+            "Next File Tab",
+            "Show the focused Files surface's next file tab (from the last, the first)",
+            |f| f.cycle_tab(1),
+        );
+        on_focused(
+            "files.prev_tab",
+            "Previous File Tab",
+            "Show the focused Files surface's previous file tab (from the first, the last)",
+            |f| f.cycle_tab(-1),
         );
     }
 }

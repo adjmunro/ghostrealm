@@ -1043,6 +1043,23 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_file_of_a_tab_not_shown_closes_just_that_tab() {
+        let (mut s, calls) = app();
+        let d = tmpdir("fm-delete-tab");
+        for n in ["a.txt", "b.txt"] {
+            std::fs::write(d.join(n), n).unwrap();
+        }
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        s.open_file(&d.join("b.txt")).unwrap();
+        let shown = s.active_doc(sid).unwrap();
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        s.accept_confirm().unwrap();
+        assert_eq!(*calls.borrow(), [format!("trash {}", d.join("a.txt").display())]);
+        assert_eq!(s.view(sid).unwrap().docs(), [shown.1], "b.txt's tab stays, shown");
+        assert_eq!(s.active_doc(sid), Some(shown));
+    }
+
+    #[test]
     fn deleting_a_tracked_unmodified_file_needs_no_confirmation() {
         let Some(r) = repo("fm-delete-git") else { return };
         let (mut s, calls) = app();

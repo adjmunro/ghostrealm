@@ -309,8 +309,8 @@ mod tests {
     fn get_surface_shows_the_opened_file_else_the_sidebars_listing() {
         let d = crate::plugin::testing::tmpdir("agent-files");
         std::fs::write(d.join("notes.md"), "# Notes\nhello agent\n").unwrap();
-        // The default config autosaves on losing focus; the agent still
-        // never saves for the user.
+        // The default config autosaves on losing focus; the agent channel
+        // focuses nothing, so it never saves for the user.
         let mut state = AppState::new();
         let mut registry = build_registry();
         let path = d.to_str().unwrap();
@@ -328,14 +328,18 @@ mod tests {
         assert_eq!(state.focused_surface().map(|s| s.0), Some(id), "into the Files surface there");
         let resp = ask(&mut state, &get);
         assert_eq!(resp["text"], json!("# Notes\nhello agent"), "the file, as an editor reads it");
-        // Edited, then another file opened with nobody to ask: a new surface,
-        // and the edit stays.
+        // Edited, then another file opened: a tab beside it, shown, and the
+        // edit stays unsaved.
         let resp = ask(&mut state, &format!(r#"{{"op":"input","id":{id},"text":"x"}}"#));
         assert_eq!(resp["ok"], json!(true), "{resp:?}");
         std::fs::write(d.join("b.txt"), "b").unwrap();
         let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/b.txt"}}}}"#));
         assert_eq!(resp["ok"], json!(true), "{resp:?}");
-        assert_ne!(state.focused_surface().map(|s| s.0), Some(id));
+        assert_eq!(state.focused_surface().map(|s| s.0), Some(id));
+        let resp = ask(&mut state, &get);
+        assert_eq!(resp["text"], json!("b"));
+        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/notes.md"}}}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
         let resp = ask(&mut state, &get);
         assert_eq!(resp["text"], json!("x# Notes\nhello agent"));
         assert_eq!(std::fs::read_to_string(d.join("notes.md")).unwrap(), "# Notes\nhello agent\n", "unsaved");

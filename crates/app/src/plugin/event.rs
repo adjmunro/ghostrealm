@@ -98,6 +98,12 @@ pub enum Request {
     /// about any with unsaved changes (as the tab's close button does). A
     /// terminal whose shell exited asks this on the next key.
     Close,
+    /// Close document `DocId` of the view (one of its [`View::docs`]), asking
+    /// first about its unsaved changes, as Close (Cmd+W) does for the active
+    /// one: a file tab's close button.
+    ///
+    /// [`View::docs`]: super::View::docs
+    CloseDoc(super::DocId),
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,

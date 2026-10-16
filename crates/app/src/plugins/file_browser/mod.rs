@@ -203,9 +203,7 @@ pub struct FileBrowserView {
     suggest_hits: Vec<(Rect, usize, PathBuf, bool)>,
     /// Scroll the chosen entry into view at the next paint.
     reveal_chosen: bool,
-    /// A key opened a file since [`Self::take_opened_by_key`] last asked.
-    opened_by_key: bool,
-    /// Files opened, counted so a key can tell that it opened one.
+    /// Files opened, counted so a host can tell that an event opened one.
     opens: u64,
     /// The `⋯` button as last painted, which its menu opens under.
     more_hit: Option<Rect>,
@@ -229,7 +227,6 @@ impl FileBrowserView {
             row_h: 1.0,
             suggest_hits: Vec::new(),
             reveal_chosen: false,
-            opened_by_key: false,
             opens: 0,
             more_hit: None,
             field: FieldMouse::default(),
@@ -388,12 +385,6 @@ impl FileBrowserView {
     /// that an event opened one.
     pub fn opens(&self) -> u64 {
         self.opens
-    }
-
-    /// Whether a key opened a file since the last ask (the Files surface then
-    /// moves the keyboard to the document).
-    pub fn take_opened_by_key(&mut self) -> bool {
-        std::mem::take(&mut self.opened_by_key)
     }
 
     /// Open (sidebar: selecting it) or pick (file picker) `path`; saving
@@ -907,7 +898,6 @@ impl View for FileBrowserView {
             && self.input.cursor() == self.input.text().chars().count();
         let pick_dir = self.mode == Mode::PickDir;
         let browsing = !path_mode && self.input.is_empty();
-        let opens = self.opens;
         match k.key {
             Key::Escape if plain => {
                 self.tree.set_query("");
@@ -979,7 +969,6 @@ impl View for FileBrowserView {
                 }
             },
         }
-        self.opened_by_key = self.opens != opens;
         self.sync_input();
         cx.redraw();
         true

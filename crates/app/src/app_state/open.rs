@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ghostrealm_core::{SurfaceId, VtabId};
 
-use super::{AppState, Confirm, Confirmed, DocRef};
+use super::AppState;
 use crate::plugin::{OpenCx, View};
 use crate::plugins::editor;
 use crate::plugins::files::{self, FilesView};
@@ -14,12 +14,12 @@ use crate::plugins::files::{self, FilesView};
 impl AppState {
     /// Open `path` from outside any Files surface (the palette, a link,
     /// `file.open`, the agent): in a Files surface of the active workspace
-    /// showing it already (only brought into view), else the focused one,
-    /// else the one focused last, else a new one as a tab in the focused
-    /// pane. It replaces the document shown (see [`Self::place_doc`]).
+    /// with a tab of it already (that tab shown), else the focused one, else
+    /// the one focused last, else a new one as a tab in the focused pane. It
+    /// gets a tab of its own there (see [`FilesView::show_doc`]).
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
         if let Some(sid) = self.files_showing(path) {
-            self.show_surface(sid);
+            self.show_file_in(sid, path);
             return Ok(());
         }
         self.open_file_in(self.files_target(), path)
@@ -32,8 +32,8 @@ impl AppState {
         if !self.is_files(from) {
             return self.open_file(path);
         }
-        if self.files_shows(from, path) {
-            self.show_surface(from);
+        if self.files_has(from, path) {
+            self.show_file_in(from, path);
             return Ok(());
         }
         self.open_file_in(Some(from), path)
@@ -42,28 +42,17 @@ impl AppState {
     fn open_file_in(&mut self, target: Option<SurfaceId>, path: &Path) -> Result<()> {
         // Made first: a file that won't open changes nothing.
         let doc = self.view_for_path(None, path)?;
-        self.place_doc(target, doc, Some(path.to_path_buf()));
+        self.place_doc(target, doc, Some(path));
         Ok(())
     }
 
     /// Open an empty text document in a Files surface, as [`Self::open_file`]
     /// places a file.
     pub fn open_scratch(&mut self) -> Result<()> {
-        let doc = self.scratch_view()?;
+        let plugin = self.plugins.iter().find(|p| p.id() == editor::ID).context("no editor plugin")?;
+        let doc = plugin.open(&self.open_cx(None))?;
         self.place_doc(self.files_target(), doc, None);
         Ok(())
-    }
-
-    fn scratch_view(&self) -> Result<Box<dyn View>> {
-        let plugin = self.plugins.iter().find(|p| p.id() == editor::ID).context("no editor plugin")?;
-        plugin.open(&self.open_cx(None))
-    }
-
-    /// The files the app wrote on a document's behalf since last asked (an
-    /// autosave before replacing it), for the window to treat as saves (the
-    /// config hot-reloads).
-    pub fn take_saved(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.saved_out)
     }
 
     /// What a plugin opens a view with, starting in `cwd`.
@@ -91,19 +80,29 @@ impl AppState {
         self.views.get(&sid).is_some_and(|v| v.downcast_ref::<FilesView>().is_some())
     }
 
-    /// A Files surface of the active workspace showing `path`, the focused
-    /// one first.
+    /// A Files surface of the active workspace with a tab of `path`, the
+    /// focused one first.
     fn files_showing(&self, path: &Path) -> Option<SurfaceId> {
         let focused = self.focused_surface();
         let mut all = self.active().map(|vt| self.surfaces_of(vt)).unwrap_or_default();
         all.sort_by_key(|sid| Some(*sid) != focused);
-        all.into_iter().find(|sid| self.is_files(*sid) && self.files_shows(*sid, path))
+        all.into_iter().find(|sid| self.files_has(*sid, path))
     }
 
-    /// Whether Files surface `sid` shows `path`.
-    pub(super) fn files_shows(&self, sid: SurfaceId, path: &Path) -> bool {
-        let shown = self.active_doc(sid).and_then(|d| self.doc(d)).and_then(|v| v.path());
-        shown.is_some_and(|p| crate::languages::same_file(&p, path))
+    /// Whether Files surface `sid` has a tab of `path`.
+    pub(super) fn files_has(&self, sid: SurfaceId, path: &Path) -> bool {
+        self.views.get(&sid).and_then(|v| v.downcast_ref::<FilesView>()).is_some_and(|f| f.has_path(path))
+    }
+
+    /// Bring Files surface `sid` into view, showing its tab of `path`.
+    pub(super) fn show_file_in(&mut self, sid: SurfaceId, path: &Path) {
+        self.show_surface(sid);
+        let Some(files) = self.views.get_mut(&sid).and_then(|v| v.downcast_mut::<FilesView>()) else { return };
+        files.show_path(path);
+        if let Some(t) = files.title() {
+            self.tree.set_surface_title(sid, t, false);
+        }
+        self.note_focus(sid);
     }
 
     /// Every surface of workspace `vt`, in tree order.
@@ -122,82 +121,13 @@ impl AppState {
     }
 
     /// Show `doc` (of `path`, `None` for a scratch buffer) in Files surface
-    /// `target`, else in a new one. A document there with unsaved changes:
-    /// - with nobody to ask (the headless agent channel), `doc` opens in a
-    ///   new Files surface instead. That channel runs on the default config,
-    ///   so autosaving there would write files against the user's settings.
-    /// - else, being replaced is losing focus: it autosaves when it
-    ///   autosaves on losing focus (`[editor] autosave_on_unfocus`, or its
-    ///   header toggle), and otherwise the user is asked first, and it is
-    ///   replaced once answered.
-    pub(super) fn place_doc(&mut self, target: Option<SurfaceId>, doc: Box<dyn View>, path: Option<PathBuf>) {
+    /// `target`, else in a new one.
+    pub(super) fn place_doc(&mut self, target: Option<SurfaceId>, doc: Box<dyn View>, path: Option<&Path>) {
         let Some(sid) = target else {
-            self.new_files_surface(doc, path.as_deref());
+            self.new_files_surface(doc, path);
             return;
         };
-        let modified = |s: &Self| s.active_doc(sid).filter(|d| s.doc(*d).is_some_and(|v| v.modified()));
-        if modified(self).is_some() && !self.guard_unsaved {
-            self.new_files_surface(doc, path.as_deref());
-            return;
-        }
-        if let Some((_, id)) = modified(self) {
-            let cfg = &self.cfg;
-            let written = self.views.get_mut(&sid).and_then(|v| v.document_mut(id)).and_then(|v| v.autosave(cfg));
-            self.saved_out.extend(written);
-        }
-        match modified(self) {
-            None => {
-                self.show_surface(sid);
-                self.replace_doc(sid, doc);
-            }
-            Some(old) => {
-                self.show_surface(sid);
-                self.ask_replace(old, path);
-            }
-        }
-    }
-
-    /// Ask whether to save `old`'s unsaved changes before `path` (`None`: an
-    /// empty buffer) replaces it. A buffer with no file offers Save As.
-    fn ask_replace(&mut self, old: DocRef, path: Option<PathBuf>) {
-        let (message, save, can_save) = self.unsaved_question(&[old]);
-        let (message, accept) = match can_save {
-            true => (message, "Save and Open"),
-            false => {
-                let name = self.doc(old).and_then(|v| v.title()).unwrap_or_default();
-                (format!("\u{201c}{name}\u{201d} has unsaved changes."), "Save As\u{2026}")
-            }
-        };
-        self.confirm = Some(Confirm {
-            message,
-            accept: Some(accept),
-            discard: Some("Open Without Saving"),
-            then: Confirmed::UnsavedOpen { doc: old, path, save },
-            late: None,
-        });
-    }
-
-    /// Replace document `old` with a new one of `path` (`None`: an empty
-    /// buffer), once its changes were saved or (`discarded`) given up. Only
-    /// while its Files surface still shows it and, unless discarded, it has
-    /// no unsaved changes: an answer can come after either changed, and must
-    /// not drop edits made since.
-    pub(super) fn replace_with(&mut self, old: DocRef, path: Option<&Path>, discarded: bool) -> Result<()> {
-        let (sid, _) = old;
-        let shown = self.active_doc(sid) == Some(old);
-        let unsaved = self.doc(old).is_some_and(|v| v.modified());
-        if !self.is_files(sid) || !shown || (unsaved && !discarded) {
-            return Ok(());
-        }
-        let doc = match path {
-            Some(p) => self.view_for_path(None, p)?,
-            None => self.scratch_view()?,
-        };
-        self.replace_doc(sid, doc);
-        Ok(())
-    }
-
-    fn replace_doc(&mut self, sid: SurfaceId, doc: Box<dyn View>) {
+        self.show_surface(sid);
         let Some(files) = self.views.get_mut(&sid).and_then(|v| v.downcast_mut::<FilesView>()) else { return };
         files.show_doc(doc);
         if let Some(t) = files.title() {
@@ -287,25 +217,26 @@ mod tests {
             std::fs::write(d.join(n), n).unwrap();
         }
         let mut s = AppState::new().with_unsaved_guard();
-        s.set_config(no_autosave());
         s.set_default_dir(Some(d.clone()));
         s.new_empty_vtab();
         (s, d)
-    }
-
-    /// A config whose editors never save by themselves.
-    fn no_autosave() -> ghostrealm_core::Config {
-        let mut cfg = ghostrealm_core::Config::default();
-        (cfg.editor.autosave_on_unfocus, cfg.editor.autosave_after) = (false, 0);
-        cfg
     }
 
     fn shown(s: &AppState, sid: SurfaceId) -> Option<PathBuf> {
         s.active_doc(sid).and_then(|d| s.doc(d)).and_then(|v| v.path())
     }
 
+    /// The files of surface `sid`'s tabs, in order.
+    fn tabs(s: &AppState, sid: SurfaceId) -> Vec<PathBuf> {
+        s.view(sid).unwrap().docs().into_iter().filter_map(|d| s.doc((sid, d)).and_then(|v| v.path())).collect()
+    }
+
     fn surfaces(s: &AppState) -> usize {
         s.tree.surface_count()
+    }
+
+    fn edit(s: &mut AppState, sid: SurfaceId) {
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"new "));
     }
 
     #[test]
@@ -316,9 +247,10 @@ mod tests {
         let first = s.focused_surface().unwrap();
         assert!(s.is_files(first));
         assert_eq!((surfaces(&s), shown(&s, first)), (1, Some(d.join("a.txt"))));
-        // Focused: it replaces the document there.
+        // Focused: a tab there.
         s.open_file(&d.join("b.txt")).unwrap();
         assert_eq!((surfaces(&s), shown(&s, first)), (1, Some(d.join("b.txt"))));
+        assert_eq!(tabs(&s, first), [d.join("a.txt"), d.join("b.txt")]);
 
         // A second Files surface, focused last; then a terminal takes focus.
         s.open_file_in_new_surface(&d.join("c.txt")).unwrap();
@@ -326,9 +258,10 @@ mod tests {
         s.add_empty_surface_in_focused();
         assert!(s.focused_surface().is_some_and(|sid| !s.is_files(sid)));
         s.note_focus(first);
-        s.open_file(&d.join("a.txt")).unwrap();
+        std::fs::write(d.join("e.txt"), "e").unwrap();
+        s.open_file(&d.join("e.txt")).unwrap();
         assert_eq!(s.focused_surface(), Some(first), "the one focused last, brought into view");
-        assert_eq!(shown(&s, first), Some(d.join("a.txt")));
+        assert_eq!(shown(&s, first), Some(d.join("e.txt")));
         assert_eq!(shown(&s, second), Some(d.join("c.txt")));
 
         // Another workspace with no Files surface gets its own.
@@ -339,133 +272,36 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_file_shown_already_keeps_its_document() {
+    fn opening_a_file_a_tab_shows_shows_that_tab() {
         let (mut s, d) = app("open-same");
         s.open_file(&d.join("a.txt")).unwrap();
         let sid = s.focused_surface().unwrap();
-        let doc = s.active_doc(sid).unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"x"));
+        let a = s.active_doc(sid).unwrap();
+        edit(&mut s, sid);
+        s.open_file(&d.join("b.txt")).unwrap();
         s.open_file(&d.join("a.txt")).unwrap();
         assert!(s.confirm().is_none(), "nothing replaced, nothing asked");
-        assert_eq!(s.active_doc(sid), Some(doc));
+        assert_eq!(s.active_doc(sid), Some(a));
+        assert_eq!(tabs(&s, sid), [d.join("a.txt"), d.join("b.txt")]);
+        assert_eq!(s.tree.vtabs()[0].panes()[0].surfaces[0].title, "a.txt", "the pane's tab follows");
     }
 
     #[test]
-    fn replacing_a_modified_document_asks_and_each_button_decides() {
-        let (mut s, d) = app("open-replace");
+    fn a_modified_document_keeps_its_tab_when_another_file_opens() {
+        let (mut s, d) = app("open-beside");
         s.open_file(&d.join("a.txt")).unwrap();
         let sid = s.focused_surface().unwrap();
-        let old = s.active_doc(sid).unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"new "));
-
-        // Cancel: the edited document stays.
-        s.open_file(&d.join("b.txt")).unwrap();
-        let c = s.confirm().expect("asks about the unsaved changes");
-        assert_eq!((c.accept, c.discard), (Some("Save and Open"), Some("Open Without Saving")));
-        assert!(c.message.contains("a.txt"), "{}", c.message);
-        s.cancel_confirm();
-        assert_eq!(s.active_doc(sid), Some(old));
-
-        // Save and open: written, then replaced, under a new id.
-        s.open_file(&d.join("b.txt")).unwrap();
-        assert_eq!(s.accept_confirm().unwrap(), vec![d.join("a.txt")]);
-        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "new a.txt\n");
-        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
-        assert_ne!(s.active_doc(sid), Some(old));
-        let title = s.tree.vtabs()[0].panes()[0].surfaces[0].title.clone();
-        assert_eq!(title, "b.txt", "the tab follows");
-
-        // Open without saving: replaced, the file untouched.
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"lost "));
-        s.open_file(&d.join("c.txt")).unwrap();
-        s.discard_confirm().unwrap();
-        assert_eq!(shown(&s, sid), Some(d.join("c.txt")));
-        assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "b.txt");
-
-        // An empty buffer is saved where the picker says, then replaced.
-        build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
-        assert!(s.confirm().is_none(), "c.txt was unmodified");
-        let scratch = s.active_doc(sid).unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"scratch"));
-        s.open_file(&d.join("a.txt")).unwrap();
-        assert_eq!(s.confirm().map(|c| c.accept), Some(Some("Save As\u{2026}")));
-        assert_eq!(s.accept_confirm().unwrap(), Vec::<PathBuf>::new());
-        assert_eq!(s.picker_purpose(), Some(super::super::Pick::SaveAs(scratch)));
-        s.confirm_picker_with(d.join("kept.txt")).unwrap();
-        assert_eq!(std::fs::read_to_string(d.join("kept.txt")).unwrap(), "scratch\n");
-        assert_eq!(shown(&s, sid), Some(d.join("a.txt")), "then the file opened");
-        // A Save As cancelled opens nothing.
-        build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"more"));
-        s.open_file(&d.join("b.txt")).unwrap();
-        s.accept_confirm().unwrap();
-        s.close_picker();
-        assert_eq!(shown(&s, sid), None, "still the buffer");
-    }
-
-    #[test]
-    fn save_and_open_over_a_file_changed_on_disk_asks_and_then_opens() {
-        let (mut s, d) = app("open-conflict");
-        s.open_file(&d.join("a.txt")).unwrap();
-        let sid = s.focused_surface().unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"mine "));
-        std::fs::write(d.join("a.txt"), "theirs").unwrap();
-        s.open_file(&d.join("b.txt")).unwrap();
-        s.accept_confirm().unwrap();
-        let c = s.confirm().expect("the changed file asks before it is written");
-        assert_eq!(c.accept, Some("Overwrite"));
-        assert_eq!(shown(&s, sid), Some(d.join("a.txt")), "nothing replaced yet");
-        assert_eq!(s.accept_confirm().unwrap(), vec![d.join("a.txt")]);
-        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "mine a.txt\n");
-        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
-    }
-
-    #[test]
-    fn a_file_deleted_before_the_answer_opens_as_a_new_one() {
-        let (mut s, d) = app("open-gone");
-        s.open_file(&d.join("a.txt")).unwrap();
-        let sid = s.focused_surface().unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"x"));
-        s.open_file(&d.join("b.txt")).unwrap();
-        std::fs::remove_file(d.join("b.txt")).unwrap();
-        s.discard_confirm().unwrap();
-        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
-        assert_eq!(s.editor(sid).map(|e| e.buffer().lines.clone()), Some(vec![String::new()]));
-    }
-
-    #[test]
-    fn an_autosaving_document_saves_instead_of_asking() {
-        let (mut s, d) = app("open-autosave");
-        s.set_config(ghostrealm_core::Config::default());
-        s.open_file(&d.join("a.txt")).unwrap();
-        let sid = s.focused_surface().unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"auto "));
+        let a = s.active_doc(sid).unwrap();
+        edit(&mut s, sid);
         s.open_file(&d.join("b.txt")).unwrap();
         assert!(s.confirm().is_none());
-        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "auto a.txt\n");
-        assert_eq!(s.take_saved(), [d.join("a.txt")], "the window hears of the write");
         assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
-    }
-
-    #[test]
-    fn a_failed_save_as_leaves_no_open_for_a_later_one() {
-        let (mut s, d) = app("open-save-as-fails");
+        assert!(s.doc(a).is_some_and(|v| v.modified()), "kept, unsaved");
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a.txt");
+        // So does a new buffer.
         build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
-        let sid = s.focused_surface().unwrap();
-        let scratch = s.active_doc(sid).unwrap();
-        assert!(s.views.get_mut(&sid).unwrap().write_input(b"keep me"));
-        s.open_file(&d.join("a.txt")).unwrap();
-        s.accept_confirm().unwrap();
-        // A folder can't be written as a file: the Save As fails.
-        std::fs::create_dir(d.join("dir")).unwrap();
-        assert!(s.confirm_picker_with(d.join("dir")).is_err());
-        // Another document's Save As later opens nothing here.
-        s.open_file_in_new_surface(&d.join("b.txt")).unwrap();
-        let other = s.focused_surface().unwrap();
-        s.open_save_as(other);
-        s.confirm_picker_with(d.join("b2.txt")).unwrap();
-        assert_eq!(s.active_doc(sid), Some(scratch), "the buffer stays");
-        assert!(s.doc(scratch).unwrap().modified());
+        assert_eq!(s.view(sid).unwrap().docs().len(), 3);
+        assert_eq!(shown(&s, sid), None, "the buffer shows");
     }
 
     #[test]
@@ -479,11 +315,14 @@ mod tests {
         s.open_file_from(second, &d.join("a.txt")).unwrap();
         assert_eq!((s.focused_surface(), shown(&s, second)), (Some(second), Some(d.join("a.txt"))));
         assert_eq!(shown(&s, first), Some(d.join("a.txt")));
-        // From elsewhere, the surface showing it comes into view.
+        // From elsewhere, the focused surface first: it has a tab of b.txt.
         s.open_file(&d.join("b.txt")).unwrap();
-        assert_eq!(s.focused_surface(), Some(second), "b.txt shows nowhere: the focused one");
-        s.open_file(&d.join("a.txt")).unwrap();
-        assert_eq!(s.focused_surface(), Some(first));
+        assert_eq!((s.focused_surface(), shown(&s, second)), (Some(second), Some(d.join("b.txt"))));
+        // Only `first` has c.txt: it comes into view.
+        s.open_file_from(first, &d.join("c.txt")).unwrap();
+        s.show_surface(second);
+        s.open_file(&d.join("c.txt")).unwrap();
+        assert_eq!((s.focused_surface(), shown(&s, first)), (Some(first), Some(d.join("c.txt"))));
     }
 
     #[test]
@@ -491,10 +330,11 @@ mod tests {
         let (mut s, d) = app("open-stale-close");
         s.open_file(&d.join("a.txt")).unwrap();
         let sid = s.focused_surface().unwrap();
-        let old = s.active_doc(sid).unwrap();
+        let a = s.active_doc(sid).unwrap();
         s.open_file(&d.join("b.txt")).unwrap();
-        assert!(!s.close_doc(old), "the surface stays");
-        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+        assert!(!s.close_doc(a), "the surface stays");
+        assert!(!s.close_doc(a), "a second time, nothing");
+        assert_eq!(tabs(&s, sid), [d.join("b.txt")]);
         assert!(!s.close_doc((sid, DocId::SELF)));
     }
 
@@ -507,7 +347,7 @@ mod tests {
         let second = s.focused_surface().unwrap();
         s.open_file(&d.join("a.txt")).unwrap();
         assert_eq!(s.focused_surface(), Some(first));
-        assert_eq!(shown(&s, second), Some(d.join("b.txt")), "the focused one kept its file");
+        assert_eq!(tabs(&s, second), [d.join("b.txt")], "the focused one got no tab");
     }
 
     #[test]
@@ -543,6 +383,91 @@ mod tests {
     }
 
     #[test]
+    fn close_closes_tabs_one_at_a_time_asking_about_each_unsaved_one() {
+        let (mut s, d) = app("open-close-tabs");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            s.open_file(&d.join(n)).unwrap();
+        }
+        let sid = s.focused_surface().unwrap();
+        let docs = s.view(sid).unwrap().docs();
+        assert!(s.doc_mut((sid, docs[0])).unwrap().write_input(b"a "));
+        assert!(s.doc_mut((sid, docs[2])).unwrap().write_input(b"c "));
+
+        s.close_focused_surface();
+        let c = s.confirm().expect("c.txt is unsaved");
+        assert!(c.message.contains("c.txt") && !c.message.contains("a.txt"), "{}", c.message);
+        s.discard_confirm().unwrap();
+        assert_eq!(tabs(&s, sid), [d.join("a.txt"), d.join("b.txt")]);
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")), "its left neighbour");
+        assert_eq!(s.tree.vtabs()[0].panes()[0].surfaces[0].title, "b.txt");
+
+        s.close_focused_surface();
+        assert!(s.confirm().is_none(), "b.txt has no changes");
+        s.close_focused_surface();
+        assert!(s.confirm().is_some_and(|c| c.message.contains("a.txt")));
+        assert_eq!(s.accept_confirm().unwrap(), vec![d.join("a.txt")], "Save and Close");
+        assert!(s.active_doc(sid).is_none() && s.view(sid).is_some(), "the sidebar stays");
+        s.close_focused_surface();
+        assert!(s.view(sid).is_none());
+    }
+
+    #[test]
+    fn a_tabs_close_button_closes_it_asking_first() {
+        let (mut s, d) = app("open-close-button");
+        s.open_file(&d.join("a.txt")).unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let docs = s.view(sid).unwrap().docs();
+        assert!(s.doc_mut((sid, docs[0])).unwrap().write_input(b"a "));
+        s.close_doc_of(sid, docs[0]);
+        assert!(s.confirm().is_some_and(|c| c.message.contains("a.txt")), "the tab not shown asks too");
+        s.cancel_confirm();
+        assert_eq!(s.view(sid).unwrap().docs(), docs);
+        s.close_doc_of(sid, docs[0]);
+        s.discard_confirm().unwrap();
+        assert_eq!(tabs(&s, sid), [d.join("b.txt")]);
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a.txt");
+    }
+
+    #[test]
+    fn quit_asks_about_every_unsaved_tab_and_save_acts_on_the_shown_one() {
+        let (mut s, d) = app("open-quit-tabs");
+        s.open_file(&d.join("a.txt")).unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let docs = s.view(sid).unwrap().docs();
+        assert!(s.doc_mut((sid, docs[0])).unwrap().write_input(b"a "));
+        assert!(s.doc_mut((sid, docs[1])).unwrap().write_input(b"b "));
+        // Cmd+S and Save As are the shown b.txt's.
+        assert!(s.send_key_to_focused(&cmd(Key::Char('s'))));
+        assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "b b.txt\n");
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a.txt");
+        s.open_save_as(sid);
+        assert_eq!(s.picker_purpose(), Some(super::super::Pick::SaveAs((sid, docs[1]))));
+        s.close_picker();
+
+        assert!(s.doc_mut((sid, docs[1])).unwrap().write_input(b"b "));
+        s.request_quit();
+        let c = s.confirm().expect("asks");
+        assert!(c.message.starts_with("2 buffers have unsaved changes"), "{}", c.message);
+        assert_eq!(s.accept_confirm().unwrap(), vec![d.join("a.txt"), d.join("b.txt")]);
+        assert!(s.quitting());
+    }
+
+    #[test]
+    fn checking_files_on_disk_reaches_tabs_not_shown() {
+        let (mut s, d) = app("open-check-tabs");
+        s.open_file(&d.join("a.txt")).unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let a = s.view(sid).unwrap().docs()[0];
+        std::fs::write(d.join("a.txt"), "theirs").unwrap();
+        assert!(s.check_open_files());
+        let editor = s.doc((sid, a)).and_then(|v| v.downcast_ref::<editor::EditorView>()).unwrap();
+        assert_eq!(editor.buffer().lines, ["theirs"]);
+    }
+
+    #[test]
     fn a_key_in_the_sidebar_opens_the_file_there() {
         let (mut s, d) = app("open-key");
         build_registry().execute("file_browser.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
@@ -553,8 +478,27 @@ mod tests {
         assert_eq!(shown(&s, sid), Some(d.join("a.txt")));
         let files = s.view(sid).and_then(|v| v.downcast_ref::<FilesView>()).unwrap();
         assert!(!files.sidebar_has_keys(), "the keyboard moved to the document");
+        assert!(!files.is_preview(files.active_doc()), "a key opens a kept tab");
         build_registry().execute("files.focus_sidebar", &ghostrealm_core::Args::new(), &mut s).unwrap();
         let files = s.view(sid).and_then(|v| v.downcast_ref::<FilesView>()).unwrap();
         assert!(files.sidebar_has_keys());
+        // Right on it again: its tab shows, with the keyboard.
+        s.send_key_to_focused(&crate::plugin::testing::press(Key::Right));
+        let files = s.view(sid).and_then(|v| v.downcast_ref::<FilesView>()).unwrap();
+        assert!(!files.sidebar_has_keys());
+        assert_eq!(tabs(&s, sid), [d.join("a.txt")]);
+    }
+
+    #[test]
+    fn next_and_previous_tab_commands_cycle_the_focused_surfaces_tabs() {
+        let (mut s, d) = app("open-cycle");
+        s.open_file(&d.join("a.txt")).unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let mut r = build_registry();
+        r.execute("files.next_tab", &ghostrealm_core::Args::new(), &mut s).unwrap();
+        assert_eq!(shown(&s, sid), Some(d.join("a.txt")));
+        r.execute("files.prev_tab", &ghostrealm_core::Args::new(), &mut s).unwrap();
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
     }
 }
