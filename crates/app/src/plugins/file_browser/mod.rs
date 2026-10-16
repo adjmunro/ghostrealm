@@ -137,8 +137,10 @@ pub enum Mode {
     /// The file browser pane: opening a file requests it.
     Browse,
     /// Choosing a directory: only directories are listed, and files never open.
-    /// Enter picks what the confirm button shows ([`FileBrowserView::choice`]);
-    /// Right/Tab enter the highlighted directory, Left/Backspace go up.
+    /// Enter picks what the confirm button shows ([`FileBrowserView::choice`]).
+    /// The keys act on the keyboard's highlight, never the hover: Right/Tab
+    /// enter it; Left/Backspace collapse it when expanded, else move to its
+    /// parent row when nested, else go up.
     PickDir,
     /// Choosing a file: a click selects it; a double-click or Enter picks it.
     PickFile,
@@ -172,10 +174,12 @@ pub struct FileBrowserView {
     sel: Option<usize>,
     /// The highlighted completion (path mode).
     completion: Option<usize>,
-    /// The keyboard, not the mouse, last moved `sel` or `completion`: only
-    /// then is the highlight a directory picker's answer, since the pointer
-    /// crosses rows on its way to the confirm button.
-    keyed: bool,
+    /// The row and the completion the keyboard last highlighted. Hover moves
+    /// `sel` and `completion` but not these: the pointer crosses rows on its way
+    /// to the confirm button, so only these are a directory picker's answer
+    /// and what its keys act on. Dropped once no longer listed.
+    keyed_row: Option<PathBuf>,
+    keyed_completion: Option<PathBuf>,
     /// The clicked (selected) entry; cleared once it is no longer listed.
     chosen: Option<PathBuf>,
     /// The filter / path input, mirroring the tree's query (the tree clears it
@@ -214,7 +218,8 @@ impl FileBrowserView {
             scroll: 0.0,
             sel: None,
             completion: None,
-            keyed: false,
+            keyed_row: None,
+            keyed_completion: None,
             chosen: None,
             input: LineEdit::default(),
             name: LineEdit::default(),
@@ -317,34 +322,48 @@ impl FileBrowserView {
     }
 
     /// What a directory picker confirms, the same for Enter and the confirm
-    /// button. A typed path: the keyboard-highlighted completion, else the
-    /// directory it names, else its first completion. Otherwise the
-    /// keyboard-highlighted directory, else the selected one, else the shown
-    /// one, or while filtering the first match (none: nothing).
+    /// button, canonical so one directory is always the same path. A typed
+    /// path: the keyboard-highlighted completion, else the directory it names,
+    /// else its first completion. Otherwise the keyboard-highlighted
+    /// directory, else the selected one, else the shown one, or while
+    /// filtering the first match (none: nothing).
     fn dir_choice(&self) -> Option<PathBuf> {
         let query = self.tree.query();
-        if !query.is_empty() && self.tree.input_is_path() {
-            let suggestions = || self.tree.suggestions(query).into_iter();
-            let dir = self
-                .completion
-                .filter(|_| self.keyed)
-                .and_then(|i| suggestions().nth(i))
+        let dir = if !query.is_empty() && self.tree.input_is_path() {
+            let suggestions = self.tree.suggestions(query);
+            self.keyed_completion
+                .clone()
+                .filter(|p| suggestions.contains(p))
                 .or_else(|| Some(self.tree.resolve_path(query)).filter(|p| p.is_dir()))
-                .or_else(|| suggestions().next())
-                .filter(|p| p.is_dir())?;
-            return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
+                .or_else(|| suggestions.into_iter().next())
+                .filter(|p| p.is_dir())?
+        } else {
+            let listed_dir = |p: &PathBuf| self.rows.iter().any(|r| r.is_dir && !r.is_category && &r.path == p);
+            match self.keyed_row.clone().filter(listed_dir).or_else(|| self.chosen.clone().filter(|p| p.is_dir())) {
+                Some(dir) => dir,
+                None if query.is_empty() => self.tree.root().to_path_buf(),
+                None => self.rows.iter().find(|r| r.is_dir && !r.is_category)?.path.clone(),
+            }
+        };
+        Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    }
+
+    /// The keyboard-highlighted row as listed now.
+    fn keyed_file_row(&mut self) -> Option<FileRow> {
+        let path = self.keyed_row.clone()?;
+        self.tree.rows().iter().find(|r| !r.is_category && r.path == path).cloned()
+    }
+
+    /// The listing changed under the highlight: keep the keyboard's row
+    /// highlighted where it moved to, or drop it when it is gone.
+    fn relist(&mut self) {
+        self.completion = None;
+        self.keyed_completion = None;
+        let at = self.keyed_row.clone().and_then(|p| self.tree.rows().iter().position(|r| r.path == p));
+        self.sel = at;
+        if at.is_none() {
+            self.keyed_row = None;
         }
-        let keyed = self.sel.filter(|_| self.keyed).and_then(|i| self.rows.get(i));
-        if let Some(r) = keyed.filter(|r| r.is_dir && !r.is_category) {
-            return Some(r.path.clone());
-        }
-        if let Some(dir) = self.chosen.clone().filter(|p| p.is_dir()) {
-            return Some(dir);
-        }
-        if query.is_empty() {
-            return Some(self.tree.root().to_path_buf());
-        }
-        self.rows.iter().find(|r| r.is_dir && !r.is_category).map(|r| r.path.clone())
     }
 
     /// Open (browse) or pick (file picker) `path`; saving picks the choice.
@@ -417,43 +436,36 @@ impl FileBrowserView {
         }
     }
 
-    /// [`Mode::PickDir`]'s Enter: pick [`Self::dir_choice`]. A keyboard-
-    /// highlighted category toggles instead; a typed path naming no directory
-    /// is gone to, as browsing does.
+    /// [`Mode::PickDir`]'s Enter: pick [`Self::dir_choice`]. A typed path
+    /// naming no directory (nor completing to one) is gone to, as browsing does.
+    /// (A directory picker lists no categories: it shows only the tree view.)
     fn pick_dir(&mut self, cx: &mut EventCx, path_mode: bool) {
-        if !path_mode && self.keyed {
-            if let Some(r) = self.selected_row().filter(|r| r.is_category) {
-                self.tree.toggle_category(&r.key);
-                return;
-            }
-        }
         // The rows as listed now: a key since the last paint may have changed them.
         self.rows = self.tree.rows().iter().map(RowRef::from).collect();
         match self.choice() {
             Some(dir) => cx.request(Request::Pick(dir)),
             None if path_mode => {
-                self.accept_completion();
                 self.tree.navigate_input();
-                self.completion = None;
+                self.clear_highlight();
             }
             None => {}
         }
     }
 
-    /// Make the highlighted directory the shown one.
+    /// Make the keyboard-highlighted directory the shown one.
     fn enter_highlighted_dir(&mut self) {
-        if let Some(r) = self.selected_row().filter(|r| r.is_dir && !r.is_category) {
+        if let Some(r) = self.keyed_file_row().filter(|r| r.is_dir) {
             self.tree.set_root(r.path);
-            self.sel = None;
+            self.clear_highlight();
             self.chosen = None;
         }
     }
 
-    /// Collapse the highlighted directory when it is expanded, move the
-    /// highlight to its parent row when it is nested, else show the parent
+    /// Collapse the keyboard-highlighted directory when it is expanded, move
+    /// the highlight to its parent row when it is nested, else show the parent
     /// with the directory just left highlighted.
     fn leave_dir(&mut self) {
-        let row = self.selected_row().filter(|r| !r.is_category);
+        let row = self.keyed_file_row();
         if let Some(r) = row.as_ref().filter(|r| r.is_dir && r.expanded) {
             self.tree.toggle_dir(&r.path);
             return;
@@ -471,14 +483,15 @@ impl FileBrowserView {
             }
         };
         self.sel = self.tree.rows().iter().position(|r| !r.is_category && r.path == target);
-        self.keyed = true;
+        self.keyed_row = self.sel.map(|_| target);
         self.ensure_sel_visible();
     }
 
     fn clear_highlight(&mut self) {
         self.sel = None;
         self.completion = None;
-        self.keyed = false;
+        self.keyed_row = None;
+        self.keyed_completion = None;
     }
 
     /// Scroll so the highlighted row is visible (last paint's list geometry).
@@ -656,11 +669,14 @@ impl View for FileBrowserView {
         } else {
             Vec::new()
         };
-        // The field shows the highlighted completion, else what was typed.
-        let preview = self
-            .completion
+        // The field shows the highlighted completion, else what was typed. A
+        // directory picker shows only the keyboard's, its answer, not the hover.
+        let shown = match self.mode {
+            Mode::PickDir => self.keyed_completion.as_ref().filter(|p| suggestions.contains(p)),
+            _ => self.completion.and_then(|i| suggestions.get(i)),
+        };
+        let preview = shown
             .filter(|_| is_path)
-            .and_then(|i| suggestions.get(i))
             .map(|p| {
                 let mut s = p.to_string_lossy().into_owned();
                 if p.is_dir() {
@@ -814,19 +830,21 @@ impl View for FileBrowserView {
             Key::Left | Key::Backspace if pick_dir && plain && browsing => self.leave_dir(),
             Key::Down | Key::Up | Key::Tab if !m.super_ => {
                 let delta = if k.key == Key::Up { -1 } else { 1 };
-                self.keyed = true;
                 if path_mode {
-                    let n = self.tree.completions().len();
-                    move_highlight(&mut self.completion, n, delta);
+                    let suggestions = self.tree.suggestions(self.tree.query());
+                    move_highlight(&mut self.completion, suggestions.len(), delta);
+                    self.keyed_completion = self.completion.and_then(|i| suggestions.get(i).cloned());
                 } else if k.key != Key::Tab {
                     let n = self.tree.rows().len();
                     move_highlight(&mut self.sel, n, delta);
+                    self.keyed_row = self.selected_row().filter(|r| !r.is_category).map(|r| r.path);
                     self.ensure_sel_visible();
                 }
             }
             Key::Right if plain && path_mode && at_end => {
                 self.accept_completion();
                 self.completion = None;
+                self.keyed_completion = None;
             }
             Key::Right if plain && self.input.is_empty() => {
                 if let Some(r) = self.selected_row() {
@@ -901,6 +919,7 @@ impl View for FileBrowserView {
                 {
                     if is_dir {
                         self.tree.set_root(path);
+                        self.clear_highlight();
                     } else {
                         self.open_file(cx, path);
                     }
@@ -909,7 +928,8 @@ impl View for FileBrowserView {
                 }
                 let Some((idx, row)) = self.row_at(x, y) else { return };
                 self.sel = Some(idx);
-                self.keyed = false;
+                // A click answers instead of the keyboard's highlight.
+                self.keyed_row = None;
                 if row.is_category {
                     self.tree.toggle_category(&row.key);
                 } else if row.is_dir {
@@ -944,7 +964,6 @@ impl View for FileBrowserView {
                 {
                     if self.completion != Some(idx) {
                         self.completion = Some(idx);
-                        self.keyed = false;
                         cx.redraw();
                     }
                     return;
@@ -952,7 +971,6 @@ impl View for FileBrowserView {
                 if let Some((idx, _)) = self.row_at(x, y) {
                     if self.sel != Some(idx) {
                         self.sel = Some(idx);
-                        self.keyed = false;
                         cx.redraw();
                     }
                 }
@@ -969,7 +987,6 @@ impl View for FileBrowserView {
             Some((_, row)) if row.is_category => return,
             Some((idx, row)) => {
                 self.sel = Some(idx);
-                self.keyed = false;
                 self.chosen = Some(row.path.clone());
                 let kind = if row.is_dir { TargetKind::Dir } else { TargetKind::File };
                 FileTarget { path: row.path, kind, origin: Origin::Browser }
@@ -998,7 +1015,11 @@ impl View for FileBrowserView {
         if let Some(chosen) = self.chosen.as_deref().and_then(follow) {
             self.chosen = Some(chosen);
         }
+        if let Some(keyed) = self.keyed_row.as_deref().and_then(follow) {
+            self.keyed_row = Some(keyed);
+        }
         self.tree.refresh();
+        self.relist();
     }
 
     fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
@@ -1018,9 +1039,13 @@ impl View for FileBrowserView {
         if self.preview.button(cx, id) {
             return;
         }
+        if id == BTN_PREVIEW {
+            self.preview_on = Some(!self.preview_shown);
+            cx.redraw();
+            return;
+        }
         let t = &mut self.tree;
         match id {
-            BTN_PREVIEW => self.preview_on = Some(!self.preview_shown),
             BTN_PARENT => {
                 t.go_to_parent();
             }
@@ -1036,6 +1061,7 @@ impl View for FileBrowserView {
             BTN_VIEW => t.cycle_view(),
             _ => return,
         }
+        self.relist();
         cx.redraw();
     }
 
@@ -1224,10 +1250,10 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.clone())], "nothing highlighted: the shown one");
+        assert_eq!(out.requests, vec![Request::Pick(canon(d.clone()))], "nothing highlighted: the shown one");
         h.key(&mut v, press(Key::Down));
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.join("adir"))]);
+        assert_eq!(out.requests, vec![Request::Pick(canon(d.join("adir")))]);
         assert_eq!(v.tree().root(), d, "Enter doesn't enter it");
     }
 
@@ -1248,7 +1274,7 @@ mod tests {
         h.key(&mut v, press(Key::Backspace));
         assert_eq!(v.tree().root(), d.join("a"));
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.join("a/b"))], "the directory left stays highlighted");
+        assert_eq!(out.requests, vec![Request::Pick(canon(d.join("a/b")))], "the directory left stays highlighted");
         h.key(&mut v, press(Key::Left));
         assert_eq!(v.tree().root(), d);
         // With a filter typed, Left and Backspace edit it instead.
@@ -1322,7 +1348,7 @@ mod tests {
         h.paint(&mut v, RECT);
         type_in(&mut h, &mut v, "cd");
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.join("cdir"))]);
+        assert_eq!(out.requests, vec![Request::Pick(canon(d.join("cdir")))]);
         type_in(&mut h, &mut v, "zzz");
         assert_eq!(v.choice(), None);
         let (_, out) = h.key(&mut v, press(Key::Enter));
@@ -1342,16 +1368,78 @@ mod tests {
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
         assert_eq!(v.sel, Some(0));
-        assert_eq!(v.choice(), Some(d.clone()), "the button shows the listed directory");
+        assert_eq!(v.choice(), Some(canon(d.clone())), "the button shows the listed directory");
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.clone())], "and Enter agrees");
+        assert_eq!(out.requests, vec![Request::Pick(canon(d.clone()))], "and Enter agrees");
         h.key(&mut v, press(Key::Down));
         h.key(&mut v, press(Key::Up));
-        assert_eq!(v.choice(), Some(d.join("adir")), "a keyboard highlight is the answer");
+        assert_eq!(v.choice(), Some(canon(d.join("adir"))), "a keyboard highlight is the answer");
     }
 
     #[test]
-    fn directory_picker_left_collapses_then_climbs_to_the_parent_row() {
+    fn directory_picker_keys_follow_the_keyboard_highlight_through_hover() {
+        let d = tmpdir("fb-pickdir-hover");
+        std::fs::create_dir_all(d.join("a/inner")).unwrap();
+        std::fs::create_dir(d.join("b")).unwrap();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.key(&mut v, press(Key::Down));
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(1) });
+        assert_eq!(v.sel, Some(1), "the hover moves the highlight");
+        assert_eq!(v.choice(), Some(canon(d.join("a"))), "but not the answer");
+        h.key(&mut v, press(Key::Right));
+        assert_eq!(v.tree().root(), d.join("a"), "→ enters the keyboard's row, not the hovered one");
+        // A modified Tab moves nothing, so it highlights nothing.
+        let mut shift_tab = press(Key::Tab);
+        shift_tab.mods.shift = true;
+        h.paint(&mut v, RECT);
+        h.key(&mut v, shift_tab);
+        assert_eq!(v.choice(), Some(canon(d.join("a"))), "the shown directory");
+    }
+
+    #[test]
+    fn directory_picker_drops_a_keyboard_highlight_the_listing_lost() {
+        let d = tmpdir("fb-pickdir-relist");
+        std::fs::create_dir_all(d.join("a/inner")).unwrap();
+        std::fs::create_dir(d.join(".hidden")).unwrap();
+        let mut v = FileBrowserView::picker(d.join("a"), Mode::PickDir);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.choice(), Some(canon(d.join("a/inner"))));
+        h.button(&mut v, BTN_PARENT);
+        h.paint(&mut v, RECT);
+        assert_eq!((v.sel, v.choice()), (None, Some(canon(d.clone()))), "not row 0 of the parent");
+        // A listing that still holds it keeps it highlighted where it moved.
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.choice(), Some(canon(d.join("a"))));
+        let shown = v.tree().show_hidden();
+        h.button(&mut v, BTN_HIDDEN);
+        h.paint(&mut v, RECT);
+        let at = v.tree_mut().rows().iter().position(|r| r.path == d.join("a"));
+        assert_eq!(v.sel, at, "hidden shown: {}", !shown);
+        assert_eq!(v.choice(), Some(canon(d.join("a"))));
+    }
+
+    #[test]
+    fn directory_picker_field_shows_only_a_keyboard_completion() {
+        let (d, _) = fixture();
+        std::fs::create_dir(d.join("adir").join("deep")).unwrap();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut h = Harness::new();
+        type_in(&mut h, &mut v, "adir/");
+        let (r, ..) = v.suggest_hits[0];
+        h.mouse(&mut v, MouseEvent::Move { pos: (r.x + 5.0, r.y + r.h * 0.5) });
+        h.paint(&mut v, RECT);
+        assert!(v.field.geom().is_some(), "a hovered completion leaves the typed text");
+        h.key(&mut v, press(Key::Down));
+        h.paint(&mut v, RECT);
+        assert!(v.field.geom().is_none(), "a keyboard one shows in the field");
+    }
+
+    #[test]
+    fn directory_picker_left_climbs_to_the_parent_row_then_collapses_it() {
         let d = tmpdir("fb-pickdir-left");
         std::fs::create_dir_all(d.join("a/b")).unwrap();
         let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
@@ -1366,20 +1454,6 @@ mod tests {
         h.key(&mut v, press(Key::Left));
         assert!(!v.tree().is_expanded(&d.join("a")), "then collapses it");
         assert_eq!(v.tree().root(), d);
-    }
-
-    #[test]
-    fn directory_picker_enter_picks_a_typed_directory() {
-        let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
-        let mut h = Harness::new();
-        h.paint(&mut v, RECT);
-        for c in "./adir".chars() {
-            h.key(&mut v, press(Key::Char(c)));
-        }
-        let (_, out) = h.key(&mut v, press(Key::Enter));
-        let adir = std::fs::canonicalize(d.join("adir")).unwrap();
-        assert_eq!(out.requests, vec![Request::Pick(adir)]);
     }
 
     #[test]
@@ -1401,16 +1475,16 @@ mod tests {
         let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        assert_eq!(v.choice(), Some(d.clone()), "with nothing selected, the shown directory");
+        assert_eq!(v.choice(), Some(canon(d.clone())), "with nothing selected, the shown directory");
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
-        assert_eq!(v.choice(), Some(d.join("adir")), "a click selects without entering");
+        assert_eq!(v.choice(), Some(canon(d.join("adir"))), "a click selects without entering");
         assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
         // Hover and arrows leave the selection alone.
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
         h.key(&mut v, press(Key::Down));
         h.paint(&mut v, RECT);
-        assert_eq!(v.choice(), Some(d.join("adir")));
+        assert_eq!(v.choice(), Some(canon(d.join("adir"))));
     }
 
     #[test]
