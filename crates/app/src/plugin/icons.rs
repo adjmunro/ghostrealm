@@ -164,6 +164,7 @@ impl FileKind {
 pub enum Icon {
     ChevronRight,
     ChevronDown,
+    ChevronUp,
     /// Show / hide a sidebar (a bulleted list).
     SidebarToggle,
     /// `⋯`: more options.
@@ -181,9 +182,10 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, for tests and galleries.
-    pub const ALL: [Icon; 10] = [
+    pub const ALL: [Icon; 11] = [
         Icon::ChevronRight,
         Icon::ChevronDown,
+        Icon::ChevronUp,
         Icon::SidebarToggle,
         Icon::More,
         Icon::ViewPreview,
@@ -201,6 +203,7 @@ impl Icon {
         match self {
             Icon::ChevronRight => p.polyline(&[(6.0, 4.0), (10.0, 8.0), (6.0, 12.0)], c),
             Icon::ChevronDown => p.polyline(&[(4.0, 6.0), (8.0, 10.0), (12.0, 6.0)], c),
+            Icon::ChevronUp => p.polyline(&[(4.0, 10.0), (8.0, 6.0), (12.0, 10.0)], c),
             Icon::SidebarToggle => {
                 let w = p.stroke_units();
                 for y in [4.0, 8.0, 12.0] {

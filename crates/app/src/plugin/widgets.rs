@@ -126,11 +126,17 @@ impl FieldMouse {
 /// Returns where the text was drawn, for [`FieldMouse`], which shows the text
 /// cursor (a field that is inert shows none).
 pub fn text_field(cx: &mut PaintCx, r: Rect, edit: &LineEdit, placeholder: &str, focused: bool) -> FieldGeom {
+    cx.fill(r, cx.chrome.background);
+    cx.border(r, theme::INPUT_BORDER);
+    field_text(cx, r, edit, placeholder, focused)
+}
+
+/// [`text_field`]'s contents with no background or border, for a field that
+/// draws its own box (a rounded one with icons beside the text).
+pub fn field_text(cx: &mut PaintCx, r: Rect, edit: &LineEdit, placeholder: &str, focused: bool) -> FieldGeom {
     let scale = cx.ui.scale;
     let pad = 8.0 * scale;
     let cw = cx.ui.cell_w;
-    cx.fill(r, cx.chrome.background);
-    cx.border(r, theme::INPUT_BORDER);
     let inner_w = (r.w - pad).max(1.0);
     let cols = ((inner_w / cw) as usize).max(1);
     let left = r.x + pad * 0.5;
