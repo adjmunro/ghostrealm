@@ -147,9 +147,10 @@ enum Resume {
     Leave(Leave),
     /// Move this path to the Trash, once the saving is done.
     Trash(std::path::PathBuf),
-    /// Show this file (`None`: an empty buffer) in this Files surface, once
-    /// the saving is done.
-    Open(SurfaceId, Option<std::path::PathBuf>),
+    /// Replace this document with one of this file (`None`: an empty
+    /// buffer), once the saving is done: only while its Files surface still
+    /// shows it, saved.
+    Open(DocRef, Option<std::path::PathBuf>),
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -230,6 +231,8 @@ pub struct AppState {
     /// What to do once the open Save As picker has saved (replacing a
     /// scratch buffer asked to save it first).
     after_save_as: Option<Resume>,
+    /// Files written on a document's behalf, until the window takes them.
+    saved_out: Vec<std::path::PathBuf>,
     /// The config, for what the app does on a document's behalf (an
     /// autosave before replacing it).
     cfg: Config,
@@ -265,6 +268,7 @@ impl AppState {
             files_seen: HashMap::new(),
             focus_stamp: 0,
             after_save_as: None,
+            saved_out: Vec::new(),
             cfg: Config::default(),
         }
     }
@@ -571,6 +575,7 @@ impl AppState {
         };
         let browser = FileBrowserView::picker(root, purpose.mode()).with_waker(self.waker.clone());
         self.picker = Some((browser, purpose));
+        self.after_save_as = None;
     }
 
     /// Where the picker starts: the active workspace's dir, else the app
@@ -613,7 +618,9 @@ impl AppState {
     fn close_doc(&mut self, (sid, doc): DocRef) -> bool {
         let Some(view) = self.views.get_mut(&sid) else { return true };
         if view.doc(doc).is_none() {
-            return true;
+            // Only a view that is its own document closes with it; an id
+            // a host no longer has closes nothing.
+            return doc == DocId::SELF && view.docs() == [DocId::SELF];
         }
         let close = view.close_doc(doc);
         if !close {
@@ -655,6 +662,8 @@ impl AppState {
             browser.set_name(name.to_string_lossy());
         }
         self.picker = Some((browser, purpose));
+        // A follow-up belongs to the dialog it was set for, after it opens.
+        self.after_save_as = None;
     }
 
     /// Close the floating picker.
@@ -703,11 +712,11 @@ impl AppState {
                 if save.is_empty() && self.doc(doc).is_some_and(|v| v.path().is_none()) =>
             {
                 self.open_save_dialog(doc, Pick::SaveAs(doc));
-                self.after_save_as = Some(Resume::Open(doc.0, path));
+                self.after_save_as = Some(Resume::Open(doc, path));
                 Ok(Vec::new())
             }
             Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. }) => {
-                self.save_views(&save, Some(Resume::Open(doc.0, path)))
+                self.save_views(&save, Some(Resume::Open(doc, path)))
             }
             Some(Confirm { then: Confirmed::DiskConflict { doc, rest, then }, .. }) => {
                 let view = self
@@ -764,7 +773,7 @@ impl AppState {
         match then {
             Resume::Leave(what) => self.perform(what),
             Resume::Trash(path) => self.trash_now(&path)?,
-            Resume::Open(sid, path) => self.replace_with(sid, path.as_deref())?,
+            Resume::Open(doc, path) => self.replace_with(doc, path.as_deref(), false)?,
         }
         Ok(())
     }
@@ -801,7 +810,7 @@ impl AppState {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
             Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, .. }, .. }) => {
-                self.replace_with(doc.0, path.as_deref())?
+                self.replace_with(doc, path.as_deref(), true)?
             }
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
@@ -891,6 +900,8 @@ impl AppState {
         let Some((_, purpose)) = self.picker.take() else {
             return Ok(None);
         };
+        // Whatever happens, the follow-up is this dialog's only.
+        let then = self.after_save_as.take();
         match purpose {
             Pick::ActiveRoot => self.set_active_root_dir(path),
             Pick::NewWorkspace => {
@@ -904,7 +915,7 @@ impl AppState {
                 if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
                     self.tree.set_surface_title(doc.0, t, false);
                 }
-                if let Some(then) = self.after_save_as.take() {
+                if let Some(then) = then {
                     self.resume(then)?;
                 }
                 return Ok(Some(path));
@@ -1335,7 +1346,7 @@ impl AppState {
                 Request::Busy => self.mark_busy(sid),
                 Request::Close => self.close_surface_id(sid),
                 Request::OpenFile(path) => {
-                    let _ = self.open_file(&path);
+                    let _ = self.open_file_from(sid, &path);
                 }
                 _ => {}
             }

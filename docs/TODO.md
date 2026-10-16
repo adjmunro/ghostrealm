@@ -1337,6 +1337,7 @@
   of them also show as header icons.
 - Reason: GitHub issue #1; keeps the header usable when narrow.
 
+---
 
 [2026-10-16T21:23+1300@ad13ff26] Comment mode
 

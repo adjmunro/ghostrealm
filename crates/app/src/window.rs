@@ -281,6 +281,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         state.print_file_reports();
+        // Files the app wrote for a document (a command's open autosaved it).
+        for written in state.app.take_saved() {
+            state.saved(written);
+        }
         // The copy the quit question was about finished: quit.
         if state.app.continue_busy_quit() {
             state.exit_if_quitting();
@@ -1482,10 +1486,13 @@ impl State {
         Duration::from_millis(self.cfg.input.double_click_ms as u64)
     }
 
-    /// Open a file a view asked for, in a Files surface.
-    fn open_requested_file(&mut self, path: std::path::PathBuf) {
-        if let Err(e) = self.app.open_file(&path) {
+    /// Open a file view `sid` asked for, in a Files surface.
+    fn open_requested_file(&mut self, sid: SurfaceId, path: std::path::PathBuf) {
+        if let Err(e) = self.app.open_file_from(sid, &path) {
             eprintln!("ghostrealm: open {}: {e:#}", path.display());
+        }
+        for written in self.app.take_saved() {
+            self.saved(written);
         }
     }
 
@@ -1823,7 +1830,7 @@ impl State {
         }
         for req in out.requests {
             match req {
-                Request::OpenFile(path) => self.open_requested_file(path),
+                Request::OpenFile(path) => self.open_requested_file(sid, path),
                 Request::Saved(path) => self.saved(path),
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}

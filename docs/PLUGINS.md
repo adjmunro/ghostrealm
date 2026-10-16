@@ -13,13 +13,18 @@ browser, image viewer, ...) should be too. The API lives in
   - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
   - `opens_path` / `open_path`: claim a file. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
-    The view it returns is a document: the app shows it in a Files surface
-    (`AppState::open_file`: one of the workspace showing the file already,
-    else the focused one, else the one focused last, else a new one),
-    replacing the document there. A replaced document with unsaved changes
-    autosaves if it autosaves, else the app asks first (Save As for one with
-    no file); with nobody to ask (the agent channel) the file opens in a new
-    Files surface instead. `files` claims images and audio (`MediaView`).
+    The view it returns is a document: the app shows it in a Files surface,
+    replacing the document there. A Files surface's own sidebar opens in
+    that surface (`AppState::open_file_from`); any other open
+    (`AppState::open_file`) brings into view a Files surface of the
+    workspace showing the file already, else uses the focused one, else the
+    one focused last, else a new one. Being replaced counts as losing focus:
+    a document with unsaved changes autosaves if it autosaves on losing
+    focus (`[editor] autosave_on_unfocus` or its header toggle), else the app
+    asks first (Save As for one with no file). The headless agent channel
+    runs on the default config and has nobody to ask, so there the file
+    always opens in a new Files surface and nothing is saved for the user.
+    `files` claims images and audio (`MediaView`).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
     A plugin whose views are only documents (`editor`) or parts of another
     surface (`file_browser`) isn't.

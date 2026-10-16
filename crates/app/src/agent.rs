@@ -309,10 +309,9 @@ mod tests {
     fn get_surface_shows_the_opened_file_else_the_sidebars_listing() {
         let d = crate::plugin::testing::tmpdir("agent-files");
         std::fs::write(d.join("notes.md"), "# Notes\nhello agent\n").unwrap();
+        // The default config autosaves on losing focus; the agent still
+        // never saves for the user.
         let mut state = AppState::new();
-        let mut cfg = ghostrealm_core::Config::default();
-        (cfg.editor.autosave_on_unfocus, cfg.editor.autosave_after) = (false, 0);
-        state.set_config(cfg);
         let mut registry = build_registry();
         let path = d.to_str().unwrap();
         let mut ask = |state: &mut AppState, req: &str| handle(req, state, &mut registry);
@@ -339,6 +338,7 @@ mod tests {
         assert_ne!(state.focused_surface().map(|s| s.0), Some(id));
         let resp = ask(&mut state, &get);
         assert_eq!(resp["text"], json!("x# Notes\nhello agent"));
+        assert_eq!(std::fs::read_to_string(d.join("notes.md")).unwrap(), "# Notes\nhello agent\n", "unsaved");
     }
 
     #[test]

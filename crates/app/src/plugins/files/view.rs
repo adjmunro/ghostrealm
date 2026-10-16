@@ -60,7 +60,6 @@ struct Layout {
     /// The resize handle on the sidebar's right edge.
     edge: Option<Rect>,
     doc: Option<Rect>,
-    toggle: Option<Rect>,
 }
 
 /// The Files surface: the file sidebar beside one document. With no
@@ -256,6 +255,16 @@ impl FilesView {
         }
     }
 
+    /// Drop a drag of the sidebar's edge (and its surface-wide cursor).
+    /// Returns whether one was running.
+    fn end_edge_drag(&mut self) -> bool {
+        let dragging = matches!(self.press, Some(Press::Edge(_)));
+        if dragging {
+            self.press = None;
+        }
+        dragging
+    }
+
     /// The narrowest and widest the sidebar may be in a surface `w` wide
     /// (logical px).
     fn width_range(w: f32) -> (f32, f32) {
@@ -308,7 +317,6 @@ impl FilesView {
             (true, false, false) => theme::GLYPH,
         };
         Icon::SidebarToggle.paint(cx, icon, color);
-        self.layout.toggle = Some(b);
     }
 
     /// The top row's height.
@@ -477,7 +485,13 @@ impl View for FilesView {
                     self.on_part(cx, part, |v, cx| v.mouse(cx, event));
                 }
             }
-            MouseEvent::Leave { pos } => self.hover_to(cx, None, pos),
+            MouseEvent::Leave { pos } => {
+                self.hover_to(cx, None, pos);
+                // A release the view never heard can't leave a drag running.
+                if self.end_edge_drag() {
+                    cx.redraw();
+                }
+            }
         }
     }
 
@@ -515,8 +529,18 @@ impl View for FilesView {
     }
 
     fn focus_changed(&mut self, cx: &mut EventCx, focused: bool) {
+        // A part whose loss of the keys is still queued hears it first, so a
+        // document that lost them still autosaves.
+        if let Some((_, lost)) = self.unfocused.take() {
+            if !focused && lost != self.part_with_keys() {
+                self.part_focus(cx, lost, false);
+            }
+        }
         self.focused = focused;
-        self.unfocused = None;
+        if !focused {
+            self.clicked = None;
+            self.end_edge_drag();
+        }
         let part = self.part_with_keys();
         self.part_focus(cx, part, focused);
     }
@@ -637,7 +661,7 @@ mod tests {
         let texts = h.texts();
         assert!(texts.iter().any(|t| t == "a.md") && texts.iter().any(|t| t == "b.txt"), "{texts:?}");
         assert_eq!(v.title().as_deref(), Some("Files"));
-        assert!(v.docs().is_empty(), "no document: closing closes the surface");
+        assert!(v.docs().is_empty(), "no document: Close closes the surface");
         let ids: Vec<u32> = h.frame.view_buttons.iter().map(|b| b.2).collect();
         assert!(!ids.contains(&BTN_SIDEBAR), "the sidebar button is inert: {ids:?}");
         assert!(ids.iter().any(|id| *id > SIDEBAR_IDS), "{ids:?}");
@@ -793,6 +817,7 @@ mod tests {
         h.cfg.file_browser.sidebar = SidebarPin::Hidden;
         h.paint(&mut v, RECT);
         h.mouse(&mut v, down(sidebar_row(0)));
+        assert!(v.clicked.is_some(), "the click opened a.md");
         v.show_doc(editor(&d.join("a.md")));
         assert!(!v.sidebar_has_keys(), "the sidebar won't show beside it");
         h.key(&mut v, press(Key::Char('x')));
@@ -841,6 +866,37 @@ mod tests {
         assert_eq!(out.requests, [Request::Saved(path.clone())], "the document autosaved on losing the keys");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit x\n");
         assert_eq!(v.deadline(&h.cfg), None);
+    }
+
+    #[test]
+    fn losing_focus_first_tells_a_part_whose_loss_was_queued() {
+        let path = tmpdir("files-unfocus-lost").join("f.txt");
+        std::fs::write(&path, "x\n").unwrap();
+        let (_, mut v) = fixture(&Session::default());
+        let h = Harness::new();
+        h.focus(&mut v, true);
+        v.show_doc(editor(&path));
+        assert!(v.write_input(b"edit "));
+        v.focus_sidebar();
+        let out = h.focus(&mut v, false);
+        assert_eq!(out.requests, [Request::Saved(path.clone())], "the document autosaved");
+        assert_eq!(v.deadline(&h.cfg), None, "nothing left queued");
+    }
+
+    #[test]
+    fn a_lost_release_doesnt_strand_an_edge_drag() {
+        let (d, mut v) = fixture(&Session::default());
+        v.show_doc(editor(&d.join("a.md")));
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let edge = v.layout.edge.unwrap();
+        h.mouse(&mut v, down((edge.x + 1.0, 200.0)));
+        h.mouse(&mut v, MouseEvent::Leave { pos: (-5.0, 200.0) });
+        h.cursor = (RECT.w * 0.75, 200.0);
+        assert_eq!(h.paint(&mut v, RECT).cursor, None, "no surface-wide resize cursor");
+        h.mouse(&mut v, down((edge.x + 1.0, 200.0)));
+        h.focus(&mut v, false);
+        assert!(v.press.is_none());
     }
 
     #[test]

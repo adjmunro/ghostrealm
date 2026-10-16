@@ -268,8 +268,8 @@ impl FileBrowserView {
     /// the root.
     pub fn reveal(&mut self, path: &Path) {
         self.tree.set_query("");
-        // Back to the folder the browser opened on (a Files surface's: the
-        // workspace's) when it holds the path, before re-rooting elsewhere.
+        // Back to the folder the browser opened on when it holds the path,
+        // before re-rooting elsewhere.
         if !path.starts_with(self.tree.root()) && path.starts_with(&self.start) {
             self.tree.set_root(&self.start);
         }

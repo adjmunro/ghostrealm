@@ -154,7 +154,7 @@
 
 - Category: Architecture / files and editing
 - Detail: Shape S1 from GitHub issue #1: one Files surface (plugin `files`) owns a file sidebar (`FileBrowserView`, `Mode::Sidebar`), its own top row (sidebar button; file tabs next), and its documents as child views (`EditorView`, `MediaView`) under a document header. A pane holding only it autohides its tab strip.
-- Detail: Every file open goes to the focused Files surface, else the workspace's last focused one, else a new one. The editor and file browser are no longer surfaces of their own; their command ids and config sections stay.
+- Detail: A file opened from a Files surface's own sidebar opens in that surface. Any other open (the palette, a link, `file.open`, the agent) brings into view a Files surface of the workspace showing the file already, else goes to the focused Files surface, else the workspace's last focused one, else a new one. The editor and file browser are no longer surfaces of their own; their command ids and config sections stay.
 - Detail: The file browser shows no preview beside its list: images and audio are documents (`MediaView`), and text opens in the editor.
 - Detail: Closing a Files surface's last document leaves the surface showing its sidebar; closing that closes the surface.
 - Reason: owner decision on issue #1 (clone the Claude Code app's file panel); alternatives were per-pane file tabs with a window-level sidebar (S2) and a per-workspace explorer (S3).

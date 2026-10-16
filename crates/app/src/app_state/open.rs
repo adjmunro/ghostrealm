@@ -12,16 +12,34 @@ use crate::plugins::editor;
 use crate::plugins::files::{self, FilesView};
 
 impl AppState {
-    /// Open `path` in a Files surface: one of the active workspace showing
-    /// it already (only brought into view), else the focused one, else the
-    /// one focused last, else a new one as a tab in the focused pane. It
-    /// replaces the document shown (see [`Self::place_doc`]).
+    /// Open `path` from outside any Files surface (the palette, a link,
+    /// `file.open`, the agent): in a Files surface of the active workspace
+    /// showing it already (only brought into view), else the focused one,
+    /// else the one focused last, else a new one as a tab in the focused
+    /// pane. It replaces the document shown (see [`Self::place_doc`]).
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
         if let Some(sid) = self.files_showing(path) {
             self.show_surface(sid);
             return Ok(());
         }
-        let target = self.files_target();
+        self.open_file_in(self.files_target(), path)
+    }
+
+    /// Open `path` as surface `from` asked (a view's `Request::OpenFile`).
+    /// A Files surface's own sidebar opens in that surface, whichever other
+    /// shows the file; any other view opens as [`Self::open_file`] does.
+    pub fn open_file_from(&mut self, from: SurfaceId, path: &Path) -> Result<()> {
+        if !self.is_files(from) {
+            return self.open_file(path);
+        }
+        if self.files_shows(from, path) {
+            self.show_surface(from);
+            return Ok(());
+        }
+        self.open_file_in(Some(from), path)
+    }
+
+    fn open_file_in(&mut self, target: Option<SurfaceId>, path: &Path) -> Result<()> {
         // Made first: a file that won't open changes nothing.
         let doc = self.view_for_path(None, path)?;
         self.place_doc(target, doc, Some(path.to_path_buf()));
@@ -39,6 +57,13 @@ impl AppState {
     fn scratch_view(&self) -> Result<Box<dyn View>> {
         let plugin = self.plugins.iter().find(|p| p.id() == editor::ID).context("no editor plugin")?;
         plugin.open(&self.open_cx(None))
+    }
+
+    /// The files the app wrote on a document's behalf since last asked (an
+    /// autosave before replacing it), for the window to treat as saves (the
+    /// config hot-reloads).
+    pub fn take_saved(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.saved_out)
     }
 
     /// What a plugin opens a view with, starting in `cwd`.
@@ -97,33 +122,38 @@ impl AppState {
     }
 
     /// Show `doc` (of `path`, `None` for a scratch buffer) in Files surface
-    /// `target`, else in a new one. A document there with unsaved changes
-    /// autosaves when it autosaves; otherwise the user is asked first (and
-    /// it is replaced once answered), and with nobody to ask (the agent
-    /// channel) `doc` opens in a new Files surface instead, so no edit is
-    /// lost.
+    /// `target`, else in a new one. A document there with unsaved changes:
+    /// - with nobody to ask (the headless agent channel), `doc` opens in a
+    ///   new Files surface instead. That channel runs on the default config,
+    ///   so autosaving there would write files against the user's settings.
+    /// - else, being replaced is losing focus: it autosaves when it
+    ///   autosaves on losing focus (`[editor] autosave_on_unfocus`, or its
+    ///   header toggle), and otherwise the user is asked first, and it is
+    ///   replaced once answered.
     pub(super) fn place_doc(&mut self, target: Option<SurfaceId>, doc: Box<dyn View>, path: Option<PathBuf>) {
         let Some(sid) = target else {
             self.new_files_surface(doc, path.as_deref());
             return;
         };
         let modified = |s: &Self| s.active_doc(sid).filter(|d| s.doc(*d).is_some_and(|v| v.modified()));
+        if modified(self).is_some() && !self.guard_unsaved {
+            self.new_files_surface(doc, path.as_deref());
+            return;
+        }
         if let Some((_, id)) = modified(self) {
             let cfg = &self.cfg;
-            if let Some(v) = self.views.get_mut(&sid).and_then(|v| v.document_mut(id)) {
-                v.autosave(cfg);
-            }
+            let written = self.views.get_mut(&sid).and_then(|v| v.document_mut(id)).and_then(|v| v.autosave(cfg));
+            self.saved_out.extend(written);
         }
         match modified(self) {
             None => {
                 self.show_surface(sid);
                 self.replace_doc(sid, doc);
             }
-            Some(old) if self.guard_unsaved => {
+            Some(old) => {
                 self.show_surface(sid);
                 self.ask_replace(old, path);
             }
-            Some(_) => self.new_files_surface(doc, path.as_deref()),
         }
     }
 
@@ -147,11 +177,16 @@ impl AppState {
         });
     }
 
-    /// Replace the document Files surface `sid` shows with a new one of
-    /// `path` (`None`: an empty buffer), once its old one was saved or given
-    /// up. Nothing happens when the surface has gone.
-    pub(super) fn replace_with(&mut self, sid: SurfaceId, path: Option<&Path>) -> Result<()> {
-        if !self.is_files(sid) {
+    /// Replace document `old` with a new one of `path` (`None`: an empty
+    /// buffer), once its changes were saved or (`discarded`) given up. Only
+    /// while its Files surface still shows it and, unless discarded, it has
+    /// no unsaved changes: an answer can come after either changed, and must
+    /// not drop edits made since.
+    pub(super) fn replace_with(&mut self, old: DocRef, path: Option<&Path>, discarded: bool) -> Result<()> {
+        let (sid, _) = old;
+        let shown = self.active_doc(sid) == Some(old);
+        let unsaved = self.doc(old).is_some_and(|v| v.modified());
+        if !self.is_files(sid) || !shown || (unsaved && !discarded) {
             return Ok(());
         }
         let doc = match path {
@@ -408,7 +443,59 @@ mod tests {
         s.open_file(&d.join("b.txt")).unwrap();
         assert!(s.confirm().is_none());
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "auto a.txt\n");
+        assert_eq!(s.take_saved(), [d.join("a.txt")], "the window hears of the write");
         assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+    }
+
+    #[test]
+    fn a_failed_save_as_leaves_no_open_for_a_later_one() {
+        let (mut s, d) = app("open-save-as-fails");
+        build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let scratch = s.active_doc(sid).unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"keep me"));
+        s.open_file(&d.join("a.txt")).unwrap();
+        s.accept_confirm().unwrap();
+        // A folder can't be written as a file: the Save As fails.
+        std::fs::create_dir(d.join("dir")).unwrap();
+        assert!(s.confirm_picker_with(d.join("dir")).is_err());
+        // Another document's Save As later opens nothing here.
+        s.open_file_in_new_surface(&d.join("b.txt")).unwrap();
+        let other = s.focused_surface().unwrap();
+        s.open_save_as(other);
+        s.confirm_picker_with(d.join("b2.txt")).unwrap();
+        assert_eq!(s.active_doc(sid), Some(scratch), "the buffer stays");
+        assert!(s.doc(scratch).unwrap().modified());
+    }
+
+    #[test]
+    fn an_open_from_a_sidebar_stays_in_its_surface() {
+        let (mut s, d) = app("open-own-sidebar");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let first = s.focused_surface().unwrap();
+        s.open_file_in_new_surface(&d.join("b.txt")).unwrap();
+        let second = s.focused_surface().unwrap();
+        // From `second`'s own sidebar, a.txt opens there, though `first` shows it.
+        s.open_file_from(second, &d.join("a.txt")).unwrap();
+        assert_eq!((s.focused_surface(), shown(&s, second)), (Some(second), Some(d.join("a.txt"))));
+        assert_eq!(shown(&s, first), Some(d.join("a.txt")));
+        // From elsewhere, the surface showing it comes into view.
+        s.open_file(&d.join("b.txt")).unwrap();
+        assert_eq!(s.focused_surface(), Some(second), "b.txt shows nowhere: the focused one");
+        s.open_file(&d.join("a.txt")).unwrap();
+        assert_eq!(s.focused_surface(), Some(first));
+    }
+
+    #[test]
+    fn closing_a_document_its_host_no_longer_has_closes_nothing() {
+        let (mut s, d) = app("open-stale-close");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let old = s.active_doc(sid).unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        assert!(!s.close_doc(old), "the surface stays");
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+        assert!(!s.close_doc((sid, DocId::SELF)));
     }
 
     #[test]
