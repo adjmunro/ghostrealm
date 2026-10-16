@@ -25,6 +25,20 @@ const MIN_SHAPES_PER_FRAME: usize = 8;
 /// Focused-pane / panel border thickness, in physical pixels.
 pub const BORDER: f32 = 2.0;
 
+/// One quad the GPU draws: a plain fill, a rounded rect with an optional
+/// border, or a segment, by its shape fields:
+///
+/// - `radius` and `border_w` both 0: a plain fill of the rect.
+/// - `radius` > 0 or `border_w` > 0: a rect with rounded corners and a border
+///   `border_w` wide inside it, in `border_color`.
+/// - `radius` < 0: a segment `-radius` px either side of the line between two
+///   endpoints, held in `border_color` as `[ax, ay, bx, by]` (px from the
+///   rect's top-left); `border_w` 0 gives round ends, > 0 flat ends exactly
+///   at the endpoints (an oriented box). The rect must contain the shape.
+///
+/// Shaped quads are antialiased, and draw one pixel past their rect for it.
+/// They also draw only inside `clip`; a plain fill ignores it (clip its rect
+/// instead, as [`PaintCx::with_clip`] does).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct QuadInstance {
@@ -32,7 +46,32 @@ pub struct QuadInstance {
     pub pos: [f32; 2],
     /// Width/height in NDC (height negative to grow downward).
     pub size: [f32; 2],
+    /// Fill: linear RGB, straight alpha.
     pub color: [f32; 4],
+    /// Width/height in physical px, so the shader measures shapes in pixels
+    /// without knowing the surface size.
+    pub px: [f32; 2],
+    /// Corner radius in physical px, or minus a segment's half-width.
+    pub radius: f32,
+    /// Border width in physical px, or a segment's end style.
+    pub border_w: f32,
+    /// Border colour (linear RGB, straight alpha; equal to `color` when there
+    /// is no border, so the antialiased edge blends into the fill alone), or a
+    /// segment's endpoints.
+    pub border_color: [f32; 4],
+    /// `[x0, y0, x1, y1]` in physical px: a shaped quad's pixels outside it
+    /// aren't drawn. [`NO_CLIP`] by default.
+    pub clip: [f32; 4],
+}
+
+/// A [`QuadInstance::clip`] that clips nothing.
+pub const NO_CLIP: [f32; 4] = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+
+/// The overlap of `a` and `b`, if they overlap.
+pub fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+    (x1 > x0 && y1 > y0).then_some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
 }
 
 /// A solid quad covering `r` (physical px) on a `sw`x`sh` surface.
@@ -41,16 +80,74 @@ pub fn rect_quad(r: Rect, sw: f32, sh: f32, color: [u8; 3], alpha: f32) -> QuadI
     let ndc_y = 1.0 - r.y / sh * 2.0;
     let ndc_w = r.w / sw * 2.0;
     let ndc_h = -(r.h / sh * 2.0);
+    let color = linear(color, alpha);
     QuadInstance {
         pos: [ndc_x, ndc_y],
         size: [ndc_w, ndc_h],
-        color: [
-            srgb_to_linear(color[0]) as f32,
-            srgb_to_linear(color[1]) as f32,
-            srgb_to_linear(color[2]) as f32,
-            alpha,
-        ],
+        color,
+        px: [r.w, r.h],
+        radius: 0.0,
+        border_w: 0.0,
+        border_color: color,
+        clip: NO_CLIP,
     }
+}
+
+/// A quad covering `r` with corners rounded to `radius` (clamped to half the
+/// shorter side) and an optional `(width, colour, alpha)` border inside it,
+/// antialiased. A zero alpha fill with a border draws an outline. With no
+/// radius and no border it is a plain fill, with hard pixel edges.
+pub fn round_quad(
+    r: Rect,
+    sw: f32,
+    sh: f32,
+    radius: f32,
+    color: [u8; 3],
+    alpha: f32,
+    border: Option<(f32, [u8; 3], f32)>,
+) -> QuadInstance {
+    let mut q = rect_quad(r, sw, sh, color, alpha);
+    q.radius = radius.max(0.0);
+    if let Some((w, c, a)) = border.filter(|(w, _, _)| *w > 0.0) {
+        q.border_w = w;
+        q.border_color = linear(c, a);
+    }
+    q
+}
+
+/// A segment from `a` to `b` (physical px), `width` wide, with round ends or
+/// `flat` ends exactly at `a` and `b`. Antialiased, and centred on the line
+/// between them.
+#[allow(clippy::too_many_arguments)]
+pub fn line_quad(
+    a: (f32, f32),
+    b: (f32, f32),
+    width: f32,
+    flat: bool,
+    sw: f32,
+    sh: f32,
+    color: [u8; 3],
+    alpha: f32,
+) -> QuadInstance {
+    // A zero half-width would read as a plain fill.
+    let hw = (width / 2.0).max(1e-3);
+    let x = a.0.min(b.0) - hw;
+    let y = a.1.min(b.1) - hw;
+    let r = Rect { x, y, w: (a.0 - b.0).abs() + 2.0 * hw, h: (a.1 - b.1).abs() + 2.0 * hw };
+    let mut q = rect_quad(r, sw, sh, color, alpha);
+    q.radius = -hw;
+    q.border_w = if flat { 1.0 } else { 0.0 };
+    q.border_color = [a.0 - x, a.1 - y, b.0 - x, b.1 - y];
+    q
+}
+
+fn linear(c: [u8; 3], alpha: f32) -> [f32; 4] {
+    [
+        srgb_to_linear(c[0]) as f32,
+        srgb_to_linear(c[1]) as f32,
+        srgb_to_linear(c[2]) as f32,
+        alpha,
+    ]
 }
 
 /// Four thin quads forming a border just inside `r`.
@@ -559,6 +656,8 @@ pub struct PaintCx<'a> {
     pub(crate) frame: &'a mut Frame,
     pub(crate) layer: Layer,
     pub(crate) owner: SurfaceId,
+    /// Quads draw only inside this, if set ([`with_clip`](Self::with_clip)).
+    clip: Option<Rect>,
 }
 
 impl<'a> PaintCx<'a> {
@@ -585,6 +684,7 @@ impl<'a> PaintCx<'a> {
             frame,
             layer,
             owner,
+            clip: None,
         }
     }
 
@@ -601,26 +701,121 @@ impl<'a> PaintCx<'a> {
     /// Fill `r` under the text, translucent.
     pub fn fill_alpha(&mut self, r: Rect, color: [u8; 3], alpha: f32) {
         let q = self.frame.quad(r, color, alpha);
-        match self.layer {
-            Layer::Base => self.frame.bg.push(q),
-            Layer::Overlay => self.frame.top.push(q),
+        self.push_quad(q, false);
+    }
+
+    /// Paint `f` with its quads (fills, borders, rounded rects, strokes) and
+    /// button hit rects clipped to `clip`, within any clip already set. Text
+    /// and images keep the clip each call passes. A rounded rect keeps its shape inside the clip;
+    /// shrinking its rect instead would move its corners.
+    pub fn with_clip(&mut self, clip: Rect, f: impl FnOnce(&mut Self)) {
+        let inner = match self.clip {
+            Some(c) => intersect(c, clip).unwrap_or(Rect { x: clip.x, y: clip.y, w: 0.0, h: 0.0 }),
+            None => clip,
+        };
+        let outer = self.clip.replace(inner);
+        f(self);
+        self.clip = outer;
+    }
+
+    /// `r` within the clip, or `None` if nothing of it shows.
+    fn clipped(&self, r: Rect) -> Option<Rect> {
+        match self.clip {
+            Some(c) => intersect(r, c),
+            None => Some(r),
         }
+    }
+
+    /// Push a quad to this layer (or over the text), clipped: a plain fill's
+    /// rect is cut here (the shader doesn't clip one), a shaped quad carries
+    /// the clip to the shader. A quad with nothing inside the clip is dropped.
+    fn push_quad(&mut self, mut q: QuadInstance, top: bool) {
+        if let Some(c) = self.clip {
+            let (sw, sh) = self.frame.screen;
+            let r = Rect {
+                x: (q.pos[0] + 1.0) / 2.0 * sw,
+                y: (1.0 - q.pos[1]) / 2.0 * sh,
+                w: q.px[0].abs(),
+                h: q.px[1].abs(),
+            };
+            if q.radius == 0.0 && q.border_w == 0.0 {
+                let Some(cut) = intersect(r, c) else { return };
+                if cut != r {
+                    let placed = rect_quad(cut, sw, sh, [0; 3], 0.0);
+                    (q.pos, q.size, q.px) = (placed.pos, placed.size, placed.px);
+                }
+            } else {
+                // The pixel of antialiasing past the rect can reach into the clip.
+                let bounds = Rect { x: r.x - 1.0, y: r.y - 1.0, w: r.w + 2.0, h: r.h + 2.0 };
+                if intersect(bounds, c).is_none() {
+                    return;
+                }
+                q.clip = [c.x, c.y, c.x + c.w, c.y + c.h];
+            }
+        }
+        match (top, self.layer) {
+            (false, Layer::Base) => self.frame.bg.push(q),
+            _ => self.frame.top.push(q),
+        }
+    }
+
+    /// Fill `r` under the text with corners rounded to `radius` and an optional
+    /// `(width, colour, alpha)` border inside it (pills, boxes, outlines; a
+    /// circle is a square with `radius` half its side). An `alpha` of 0 with a
+    /// border draws just the outline. Snap `r` to whole pixels: shaped quads
+    /// sharing a fractional edge leave a seam.
+    pub fn round_rect(
+        &mut self,
+        r: Rect,
+        radius: f32,
+        fill: [u8; 3],
+        alpha: f32,
+        border: Option<(f32, [u8; 3], f32)>,
+    ) {
+        let (sw, sh) = self.frame.screen;
+        let q = round_quad(r, sw, sh, radius, fill, alpha, border);
+        self.push_quad(q, false);
+    }
+
+    /// A `width`-wide stroke from `a` to `b` with round ends, under the text,
+    /// centred on the line between them: a 1 px line along a whole-pixel
+    /// coordinate covers two pixels at half strength, so put it on a pixel's
+    /// centre (`n + 0.5`), or draw a straight one as a snapped
+    /// [`fill`](Self::fill). Joints of a polyline overlap, so draw one opaque:
+    /// a translucent one is more opaque where its segments meet.
+    pub fn line(&mut self, a: (f32, f32), b: (f32, f32), width: f32, color: [u8; 3], alpha: f32) {
+        self.push_line(a, b, width, false, color, alpha);
+    }
+
+    /// Like [`line`](Self::line) with flat ends exactly at `a` and `b`: a
+    /// rotated rect `width` wide, centred on the line between them.
+    pub fn bar(&mut self, a: (f32, f32), b: (f32, f32), width: f32, color: [u8; 3], alpha: f32) {
+        self.push_line(a, b, width, true, color, alpha);
+    }
+
+    fn push_line(&mut self, a: (f32, f32), b: (f32, f32), width: f32, flat: bool, color: [u8; 3], alpha: f32) {
+        let (sw, sh) = self.frame.screen;
+        let q = line_quad(a, b, width, flat, sw, sh, color, alpha);
+        self.push_quad(q, false);
     }
 
     /// Fill `r` over the text (cursors, carets).
     pub fn fill_top(&mut self, r: Rect, color: [u8; 3], alpha: f32) {
         let q = self.frame.quad(r, color, alpha);
-        self.frame.top.push(q);
+        self.push_quad(q, true);
     }
 
     /// A `BORDER`-thick outline just inside `r`, under the text.
     pub fn border(&mut self, r: Rect, color: [u8; 3]) {
-        let (sw, sh) = self.frame.screen;
-        let out = match self.layer {
-            Layer::Base => &mut self.frame.bg,
-            Layer::Overlay => &mut self.frame.top,
-        };
-        push_border(out, r, sw, sh, color);
+        let t = BORDER;
+        for edge in [
+            Rect { x: r.x, y: r.y, w: r.w, h: t },
+            Rect { x: r.x, y: r.y + r.h - t, w: r.w, h: t },
+            Rect { x: r.x, y: r.y, w: t, h: r.h },
+            Rect { x: r.x + r.w - t, y: r.y, w: t, h: r.h },
+        ] {
+            self.fill_alpha(edge, color, 1.0);
+        }
     }
 
     /// Whether the mouse is over `r`.
@@ -636,7 +831,10 @@ impl<'a> PaintCx<'a> {
     /// Register a clickable button; [`View::button`](super::View::button) gets
     /// `id` when it's clicked. Returns whether it is hovered (the caller styles
     /// it; [`highlight`](Self::highlight) is the standard hover look).
+    /// Under [`with_clip`](Self::with_clip) only the part inside the clip
+    /// takes clicks.
     pub fn button(&mut self, r: Rect, id: u32) -> bool {
+        let Some(r) = self.clipped(r) else { return false };
         self.frame.view_buttons.push((r, self.owner, id));
         self.hovered(r)
     }
@@ -885,9 +1083,12 @@ impl<'a> PaintCx<'a> {
         if self.modal {
             return;
         }
+        // Popups escape the view's clip, as they do its rect.
         let layer = std::mem::replace(&mut self.layer, Layer::Overlay);
+        let clip = self.clip.take();
         f(self);
         self.layer = layer;
+        self.clip = clip;
     }
 
     /// Ask for another (paced) frame after this one, e.g. to continue an eased
@@ -931,6 +1132,81 @@ mod tests {
         }
         assert!(h.text.finish_paint(), "some rows were deferred");
         assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
+
+    /// `with_clip` cuts plain fills (and plain `round_rect`s) on the CPU,
+    /// hands shaped quads the clip, drops what has nothing inside it, clips
+    /// buttons, nests by intersection, and ends with its closure; popups
+    /// painted `above` escape it, and it applies again after them.
+    #[test]
+    fn with_clip_clips_fills_shaped_quads_and_buttons() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let px = |q: &QuadInstance| {
+            let r = Rect {
+                x: (q.pos[0] + 1.0) / 2.0 * 800.0,
+                y: (1.0 - q.pos[1]) / 2.0 * 600.0,
+                w: q.px[0],
+                h: q.px[1],
+            };
+            [r.x, r.y, r.w, r.h].map(|v| (v * 1000.0).round() / 1000.0)
+        };
+        let clip = Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 };
+        let c = [100.0, 100.0, 150.0, 150.0];
+        let white = [255; 3];
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            cx.with_clip(clip, |cx| {
+                cx.fill(Rect { x: 80.0, y: 120.0, w: 40.0, h: 10.0 }, white); // bg 0
+                cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white); // dropped
+                cx.round_rect(Rect { x: 140.0, y: 140.0, w: 30.0, h: 30.0 }, 4.0, white, 1.0, None); // bg 1
+                cx.round_rect(Rect { x: 90.0, y: 90.0, w: 20.0, h: 20.0 }, 0.0, white, 1.0, None); // bg 2: plain
+                cx.line((300.0, 300.0), (320.0, 320.0), 1.0, white, 1.0); // dropped
+                cx.bar((90.0, 125.0), (120.0, 125.0), 2.0, white, 1.0); // bg 3
+                // Just outside the clip, but its antialiased pixel reaches in.
+                cx.round_rect(Rect { x: 150.5, y: 120.0, w: 10.0, h: 10.0 }, 2.0, white, 1.0, None); // bg 4
+                cx.round_rect(Rect { x: 152.0, y: 120.0, w: 10.0, h: 10.0 }, 2.0, white, 1.0, None); // dropped
+                cx.border(Rect { x: 90.0, y: 140.0, w: 30.0, h: 30.0 }, white); // bg 5, 6
+                cx.fill_top(Rect { x: 140.0, y: 90.0, w: 20.0, h: 20.0 }, white, 1.0); // top 0
+                cx.with_clip(Rect { x: 120.0, y: 0.0, w: 100.0, h: 600.0 }, |cx| {
+                    cx.round_rect(Rect { x: 110.0, y: 110.0, w: 20.0, h: 20.0 }, 4.0, white, 1.0, None);
+                });
+                cx.above(|cx| cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white)); // top 1
+                cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white); // dropped: the clip is back
+                cx.button(Rect { x: 90.0, y: 140.0, w: 30.0, h: 30.0 }, 1);
+                cx.button(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, 2);
+            });
+            cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white);
+            cx.button(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, 3);
+        }
+        let (bg, top) = (&h.frame.bg, &h.frame.top);
+        assert_eq!(px(&bg[0]), [100.0, 120.0, 20.0, 10.0], "a fill is cut to the clip");
+        assert_eq!((bg[1].clip, bg[1].px), (c, [30.0, 30.0]), "a shaped quad keeps its rect and carries the clip");
+        assert_eq!(px(&bg[2]), [100.0, 100.0, 10.0, 10.0], "a plain round_rect is cut like a fill");
+        assert_eq!(bg[2].clip, NO_CLIP, "a plain fill carries no clip");
+        assert!(bg[3].radius < 0.0 && bg[3].clip == c, "a bar carries the clip");
+        assert_eq!(px(&bg[4])[0], 150.5, "kept: its antialiased pixel reaches into the clip");
+        // The border's left edge (x 90..92) and bottom edge (y 168..170) lie
+        // outside the clip.
+        assert_eq!(px(&bg[5]), [100.0, 140.0, 20.0, 2.0], "the border's top edge, cut");
+        assert_eq!(px(&bg[6]), [118.0, 140.0, 2.0, 10.0], "the border's right edge, cut");
+        assert_eq!(bg[7].clip, [120.0, 100.0, 150.0, 150.0], "nested clips intersect");
+        assert_eq!(px(&bg[8]), [0.0, 0.0, 10.0, 10.0], "the clip ends with its closure");
+        assert_eq!(bg.len(), 9);
+        assert_eq!(px(&top[0]), [140.0, 100.0, 10.0, 10.0], "fill_top is cut");
+        assert_eq!(px(&top[1]), [0.0, 0.0, 10.0, 10.0], "a popup escapes the clip");
+        assert_eq!(top.len(), 2);
+        let buttons: Vec<(Rect, u32)> = h.frame.view_buttons.iter().map(|(r, _, id)| (*r, *id)).collect();
+        assert_eq!(
+            buttons,
+            vec![
+                (Rect { x: 100.0, y: 140.0, w: 20.0, h: 10.0 }, 1),
+                (Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, 3),
+            ],
+            "a button is cut to the clip, or dropped outside it"
+        );
     }
 
     #[test]

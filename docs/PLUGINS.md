@@ -33,6 +33,24 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 
 - Quads: `fill`, `fill_alpha` (under text), `fill_top` (over text: cursors,
   carets), `border`, `highlight` (the standard hover/selection look).
+  `round_rect(r, radius, fill, alpha, border)` draws an antialiased rounded
+  rect with an optional `(width, colour, alpha)` border inside it (pills,
+  code boxes, focus rings); `alpha` 0 with a border draws only the outline,
+  and a square with `radius` half its side is a circle. Snap pill and row
+  rects to whole pixels: shaped quads sharing a fractional edge leave a seam.
+  `line(a, b, width, colour, alpha)` (round ends) and `bar` (flat ends, a
+  rotated rect) draw antialiased strokes, one quad each, centred on the line
+  from `a` to `b`: a 1 px line along a whole-pixel coordinate blurs over two
+  pixels, so put it on a pixel centre (`n + 0.5`), and draw straight
+  guides as snapped `fill`s. A translucent polyline is more opaque where
+  its segments overlap, as are overlapping translucent fills: draw
+  translucent guides so they don't overlap.
+- Clipping: `with_clip(rect, |cx| ...)` clips every quad painted inside it
+  (fills, borders, rounded rects, strokes) and every `button` hit
+  rect, nesting by intersection. Clip a scrolled list's rows to the list so
+  they don't overdraw a header or take its clicks; a rounded rect keeps its
+  shape inside the clip, so never shrink its rect to clip it. Text and
+  `image` keep the `clip` each call takes; popups painted `above` escape it.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool; `Font` picks family + italic/bold.
 - Rows: `row` (cached by content, always shaped) and `budgeted_row` (cached by

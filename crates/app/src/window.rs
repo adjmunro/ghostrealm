@@ -4892,7 +4892,10 @@ fn build_quad_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wg
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<QuadInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+                attributes: &wgpu::vertex_attr_array![
+                    0 => Float32x2, 1 => Float32x2, 2 => Float32x4,
+                    3 => Float32x2, 4 => Float32, 5 => Float32, 6 => Float32x4, 7 => Float32x4,
+                ],
             })],
             compilation_options: Default::default(),
         },
@@ -4982,15 +4985,33 @@ impl Hover {
     }
 }
 
+// A quad is a plain fill unless it has a corner radius, border, or segment
+// (see `QuadInstance`); those take a signed distance to their shape in pixels,
+// antialiased over one pixel, and clipped to the quad's clip rect. Shaped
+// quads grow by `PAD` px per side so the outer half of that pixel, past the
+// shape's own rect, is shaded too.
 const QUAD_WGSL: &str = r#"
+const PAD: f32 = 1.0;
 struct Inst {
     @location(0) pos: vec2<f32>,
     @location(1) size: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) px: vec2<f32>,
+    @location(4) radius: f32,
+    @location(5) border_w: f32,
+    @location(6) border_color: vec4<f32>,
+    @location(7) clip: vec4<f32>,
 };
 struct VOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    // The border colour, or a segment's endpoints relative to the centre.
+    @location(1) @interpolate(flat) extra: vec4<f32>,
+    // Pixels from the rect's centre.
+    @location(2) local: vec2<f32>,
+    @location(3) @interpolate(flat) half: vec2<f32>,
+    @location(4) @interpolate(flat) shape: vec2<f32>,
+    @location(5) @interpolate(flat) clip: vec4<f32>,
 };
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VOut {
@@ -4998,15 +5019,73 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VOut {
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0));
     let c = corners[vi];
-    let p = inst.pos + c * inst.size;
+    let px = abs(inst.px);
+    let shaped = inst.radius != 0.0 || inst.border_w != 0.0;
+    let pad = select(0.0, PAD, shaped);
+    let ndc_per_px = inst.size / max(px, vec2<f32>(1e-4));
+    let p = inst.pos + c * inst.size + (c * 2.0 - 1.0) * pad * ndc_per_px;
     var o: VOut;
-    o.clip = vec4<f32>(p, 0.0, 1.0);
+    o.position = vec4<f32>(p, 0.0, 1.0);
     o.color = inst.color;
+    o.clip = inst.clip;
+    o.local = (c - vec2<f32>(0.5)) * (px + 2.0 * pad);
+    o.half = px * 0.5;
+    o.shape = vec2<f32>(inst.radius, inst.border_w);
+    if (inst.radius < 0.0) {
+        let h = vec4<f32>(o.half, o.half);
+        o.extra = inst.border_color - h;
+    } else {
+        o.extra = inst.border_color;
+    }
     return o;
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    return in.color;
+    if (in.shape.x == 0.0 && in.shape.y == 0.0) {
+        return in.color;
+    }
+    // A shaped quad draws only inside its clip (a plain fill's rect is
+    // clipped before it gets here).
+    let f = in.position.xy;
+    if (f.x < in.clip.x || f.y < in.clip.y || f.x >= in.clip.z || f.y >= in.clip.w) {
+        discard;
+    }
+    if (in.shape.x < 0.0) {
+        // A segment from `a` to `b`, `hw` either side: round ends, or flat
+        // ends exactly at `a` and `b` (an oriented box).
+        let hw = -in.shape.x;
+        let a = in.extra.xy;
+        let b = in.extra.zw;
+        let ba = b - a;
+        let len = length(ba);
+        var d: f32;
+        if (in.shape.y > 0.0) {
+            let u = select(vec2<f32>(1.0, 0.0), ba / len, len > 0.0);
+            let v = vec2<f32>(-u.y, u.x);
+            let m = in.local - (a + b) * 0.5;
+            let q = vec2<f32>(abs(dot(m, u)) - len * 0.5, abs(dot(m, v)) - hw);
+            d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+        } else {
+            let pa = in.local - a;
+            let t = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+            d = length(pa - ba * t) - hw;
+        }
+        return vec4<f32>(in.color.rgb, in.color.a * clamp(0.5 - d, 0.0, 1.0));
+    }
+    let r = min(in.shape.x, min(in.half.x, in.half.y));
+    let q = abs(in.local) - in.half + vec2<f32>(r);
+    let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let cover = clamp(0.5 - d, 0.0, 1.0);
+    // How much of the pixel lies inside the border, in the fill.
+    let inner = clamp(0.5 - (d + in.shape.y), 0.0, 1.0);
+    // Mix border and fill premultiplied, so a translucent fill beside an
+    // opaque border doesn't tint the border's edge.
+    let a = mix(in.extra.a, in.color.a, inner);
+    if (a <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let rgb = mix(in.extra.rgb * in.extra.a, in.color.rgb * in.color.a, inner) / a;
+    return vec4<f32>(rgb, a * cover);
 }
 "#;
 
@@ -5239,6 +5318,236 @@ mod tests {
         pollster::block_on(offscreen_red());
     }
 
+    /// The summed coverage of a white-on-black render, in pixels.
+    fn ink(data: &[u8]) -> f32 {
+        data.chunks(4).map(|p| p[0] as f32 / 255.0).sum()
+    }
+
+    const D: f32 = 64.0;
+
+    fn render(quads: &[QuadInstance], clear: f64) -> Vec<u8> {
+        let c = wgpu::Color { r: clear, g: clear, b: clear, a: 1.0 };
+        pollster::block_on(render_quads(quads, D as u32, c))
+    }
+
+    /// A stroke covers its exact area (length x width plus its round ends) at
+    /// icon stroke widths, at any angle and sub-pixel position.
+    #[test]
+    fn strokes_cover_their_exact_area() {
+        use crate::plugin::paint::line_quad;
+        for w in [1.0, 2.0, 3.0] {
+            for (a, b) in [((10.3, 12.1), (40.7, 35.6)), ((8.6, 30.25), (50.2, 30.25)), ((20.5, 50.0), (31.0, 9.7))] {
+                let q = line_quad(a, b, w, false, D, D, [255, 255, 255], 1.0);
+                let len = (b.0 - a.0).hypot(b.1 - a.1);
+                let exact = len * w + std::f32::consts::PI * (w / 2.0).powi(2);
+                let got = ink(&render(&[q], 0.0));
+                assert!((got - exact).abs() / exact < 0.04, "width {w} {a:?}-{b:?}: {got} vs {exact}");
+            }
+        }
+    }
+
+    /// A flat-ended bar is a rotated rect: a diamond covers its area.
+    #[test]
+    fn bars_cover_a_rotated_rect() {
+        use crate::plugin::paint::line_quad;
+        let (x, y, h) = (32.3, 31.8, 14.0);
+        let q = line_quad((x - h / 2.0, y - h / 2.0), (x + h / 2.0, y + h / 2.0), h * std::f32::consts::SQRT_2, true, D, D, [255; 3], 1.0);
+        let data = render(&[q], 0.0);
+        let exact = 2.0 * h * h;
+        assert!((ink(&data) - exact).abs() / exact < 0.02, "{} vs {exact}", ink(&data));
+        assert_eq!(pixel(&data, 64, 32, 31)[0], 255, "solid in the middle");
+        assert_eq!(pixel(&data, 64, 20, 20)[0], 0, "clear past the slanted side");
+    }
+
+    /// A long thin bar at 30 degrees covers its area, ends flat at its
+    /// endpoints, and is solid along its axis.
+    #[test]
+    fn an_angled_bar_covers_its_rotated_rect() {
+        use crate::plugin::paint::line_quad;
+        let (len, w) = (30.0_f32, 4.0_f32);
+        let (c, s) = (30f32.to_radians().cos(), 30f32.to_radians().sin());
+        let mid = (32.2, 31.7);
+        let a = (mid.0 - c * len / 2.0, mid.1 - s * len / 2.0);
+        let b = (mid.0 + c * len / 2.0, mid.1 + s * len / 2.0);
+        let data = render(&[line_quad(a, b, w, true, D, D, [255; 3], 1.0)], 0.0);
+        let exact = len * w;
+        assert!((ink(&data) - exact).abs() / exact < 0.02, "{} vs {exact}", ink(&data));
+        assert_eq!(pixel(&data, 64, 32, 31)[0], 255, "solid at mid-length");
+        // 1.5 px past `b` along the axis: a round end would cover it.
+        let past = (b.0 + c * 1.5, b.1 + s * 1.5);
+        assert_eq!(pixel(&data, 64, past.0 as u32, past.1 as u32)[0], 0, "flat end");
+    }
+
+    /// A plain fill at fractional coordinates covers exactly the pixels whose
+    /// centres it contains, at full strength: no antialiasing.
+    #[test]
+    fn a_fractional_flat_rect_has_hard_edges() {
+        let r = Rect { x: 8.3, y: 10.7, w: 12.3, h: 9.6 };
+        let data = render(&[crate::plugin::paint::rect_quad(r, D, D, [255; 3], 1.0)], 0.0);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let inside = cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h;
+                assert_eq!(pixel(&data, 64, x, y)[0], if inside { 255 } else { 0 }, "({x}, {y})");
+            }
+        }
+    }
+
+    /// A rounded rect half outside its clip keeps its corners inside it and
+    /// draws nothing outside it.
+    #[test]
+    fn a_clipped_rounded_rect_keeps_its_shape_inside_the_clip() {
+        use crate::plugin::paint::round_quad;
+        let r = Rect { x: 10.0, y: 10.0, w: 40.0, h: 30.0 };
+        let whole = round_quad(r, D, D, 8.0, [255; 3], 1.0, Some((2.0, [255, 0, 0], 1.0)));
+        let mut clipped = whole;
+        clipped.clip = [0.0, 0.0, 30.0, 25.0];
+        let (full, cut) = (render(&[whole], 0.0), render(&[clipped], 0.0));
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let want = if x < 30 && y < 25 { pixel(&full, 64, x, y) } else { [0, 0, 0, 255] };
+                assert_eq!(pixel(&cut, 64, x, y), want, "({x}, {y})");
+            }
+        }
+        assert_eq!(pixel(&cut, 64, 10, 10), [0, 0, 0, 255], "the corner inside the clip stays round");
+    }
+
+    /// At a fractional clip edge, a plain fill cut on the CPU and a shaped
+    /// quad clipped in the shader cover the same pixels: those whose centres
+    /// lie inside the clip.
+    #[test]
+    fn cpu_and_shader_clips_agree_at_a_fractional_edge() {
+        use crate::plugin::paint::{intersect, rect_quad, round_quad};
+        let r = Rect { x: 8.0, y: 8.0, w: 40.0, h: 40.0 };
+        let clip = Rect { x: 12.6, y: 5.0, w: 7.8, h: 30.3 };
+        let cut = rect_quad(intersect(r, clip).unwrap(), D, D, [255; 3], 1.0);
+        // Square corners and a border in the fill's colour: shaped, but solid.
+        let mut shaped = round_quad(r, D, D, 0.0, [255; 3], 1.0, Some((1.0, [255; 3], 1.0)));
+        shaped.clip = [clip.x, clip.y, clip.x + clip.w, clip.y + clip.h];
+        let (a, b) = (render(&[cut], 0.0), render(&[shaped], 0.0));
+        assert_eq!(a, b);
+        // The clip spans x 12.6..20.4: centres 13.5 to 19.5 are inside.
+        let row: Vec<u8> = (11..22).map(|x| pixel(&a, 64, x, 20)[0]).collect();
+        assert_eq!(row, [0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0]);
+    }
+
+    /// A translucent segment is one quad, so it never draws past its own
+    /// alpha anywhere along its length. (Segments of a polyline overlap at
+    /// their joints; icons draw opaque.)
+    #[test]
+    fn a_translucent_segment_never_exceeds_its_alpha() {
+        use crate::plugin::paint::line_quad;
+        let q = line_quad((8.4, 10.2), (55.1, 47.9), 2.0, false, D, D, [255; 3], 0.5);
+        let data = render(&[q], 0.0);
+        let max = data.chunks(4).map(|p| p[0]).max().unwrap();
+        assert!((127..=129).contains(&max), "peak {max}");
+    }
+
+    /// A small disc keeps its area: its antialiased rim isn't cut off at the
+    /// quad's edge.
+    #[test]
+    fn discs_keep_their_area() {
+        use crate::plugin::paint::round_quad;
+        for d in [2.0, 3.0, 5.5] {
+            let r = Rect { x: 20.3, y: 20.6, w: d, h: d };
+            let q = round_quad(r, D, D, d / 2.0, [255; 3], 1.0, None);
+            let exact = std::f32::consts::PI * (d / 2.0).powi(2);
+            let got = ink(&render(&[q], 0.0));
+            // The one-pixel ramp runs a little over on a curve this tight.
+            assert!((got - exact).abs() / exact < 0.1, "disc {d}: {got} vs {exact}");
+        }
+    }
+
+    /// A shaped quad's edge at a fractional position shades the pixel it
+    /// half-covers, even where that pixel's centre is outside the rect.
+    #[test]
+    fn a_fractional_shaped_edge_is_antialiased() {
+        let r = Rect { x: 8.7, y: 8.0, w: 20.0, h: 32.0 };
+        let q = crate::plugin::paint::round_quad(r, D, D, 2.0, [255; 3], 1.0, None);
+        let data = render(&[q], 0.0);
+        let edge = pixel(&data, 64, 8, 20)[0];
+        assert!((60..=95).contains(&edge), "pixel 8 is 30% covered, got {edge}");
+        assert_eq!(pixel(&data, 64, 7, 20)[0], 0);
+        assert_eq!(pixel(&data, 64, 9, 20)[0], 255);
+    }
+
+    /// Border and translucent fill mix premultiplied: the fill's colour adds
+    /// no more than its own alpha's worth anywhere, the border's edge included.
+    #[test]
+    fn a_translucent_fill_does_not_tint_its_border_edge() {
+        let r = Rect { x: 8.0, y: 8.0, w: 48.0, h: 48.0 };
+        let q = crate::plugin::paint::round_quad(r, D, D, 6.0, [255, 0, 0], 0.2, Some((2.5, [0, 0, 255], 1.0)));
+        let data = render(&[q], 0.0);
+        let red = data.chunks(4).map(|p| p[0]).max().unwrap();
+        assert!(red <= 52, "red reaches {red}, past the fill's 0.2 alpha");
+        assert!(pixel(&data, 64, 10, 32)[0] > 0 && pixel(&data, 64, 10, 32)[2] > 0, "the inner edge mixes both");
+    }
+
+    /// An outline (zero alpha fill) and a ring leave their interiors as they were.
+    #[test]
+    fn outlines_and_rings_leave_their_interior_untouched() {
+        use crate::plugin::paint::round_quad;
+        let outline = round_quad(Rect { x: 8.0, y: 8.0, w: 48.0, h: 30.0 }, D, D, 5.0, [255; 3], 0.0, Some((2.0, [255; 3], 1.0)));
+        let ring = round_quad(Rect { x: 20.5, y: 40.5, w: 20.0, h: 20.0 }, D, D, 10.0, [255; 3], 0.0, Some((1.5, [255; 3], 1.0)));
+        let data = render(&[outline, ring], 0.25);
+        let bg = pixel(&data, 64, 1, 1);
+        assert_eq!(pixel(&data, 64, 32, 22), bg, "outline interior");
+        assert_eq!(pixel(&data, 64, 30, 50), bg, "ring interior");
+        assert!(pixel(&data, 64, 32, 9)[0] > bg[0], "the outline draws");
+        assert!(pixel(&data, 64, 30, 41)[0] > bg[0], "the ring draws");
+    }
+
+    /// The RGBA8 pixel at `(x, y)` of a `dim`-wide render.
+    fn pixel(data: &[u8], dim: u32, x: u32, y: u32) -> [u8; 4] {
+        let o = ((y * dim + x) * 4) as usize;
+        [data[o], data[o + 1], data[o + 2], data[o + 3]]
+    }
+
+    /// A flat quad keeps hard, pixel-aligned edges: no antialiasing leaks
+    /// outside it or softens its border pixels.
+    #[test]
+    fn flat_quads_fill_exactly_their_pixels() {
+        // 64 px rows meet the copy's 256-byte row alignment.
+        const DIM: u32 = 64;
+        let r = Rect { x: 8.0, y: 8.0, w: 16.0, h: 16.0 };
+        let q = crate::plugin::paint::rect_quad(r, DIM as f32, DIM as f32, [0, 255, 0], 1.0);
+        let data = pollster::block_on(render_quads(&[q], DIM, wgpu::Color::BLACK));
+        for y in 0..DIM {
+            for x in 0..DIM {
+                let inside = (8..24).contains(&x) && (8..24).contains(&y);
+                let want = if inside { [0, 255, 0, 255] } else { [0, 0, 0, 255] };
+                assert_eq!(pixel(&data, DIM, x, y), want, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    /// A rounded, bordered quad: clear past the rounded corner, the border
+    /// colour along its edge, the fill in the middle, and an antialiased
+    /// (partly covered) pixel on the curve.
+    #[test]
+    fn rounded_bordered_quads_draw_corner_border_and_fill() {
+        const DIM: u32 = 64;
+        let r = Rect { x: 8.0, y: 8.0, w: 48.0, h: 32.0 };
+        let q = crate::plugin::paint::round_quad(
+            r, DIM as f32, DIM as f32, 10.0, [255, 0, 0], 1.0, Some((3.0, [0, 0, 255], 1.0)),
+        );
+        let data = pollster::block_on(render_quads(&[q], DIM, wgpu::Color::BLACK));
+        let px = |x, y| pixel(&data, DIM, x, y);
+        assert_eq!(px(8, 8), [0, 0, 0, 255], "the corner pixel is clear");
+        assert_eq!(px(55, 39), [0, 0, 0, 255], "the opposite corner is clear");
+        assert_eq!(px(5, 20), [0, 0, 0, 255], "outside the rect is clear");
+        for (x, y) in [(32, 9), (32, 38), (9, 24), (54, 24)] {
+            let p = px(x, y);
+            assert!(p[2] > 240 && p[0] < 15, "border at ({x}, {y}), got {p:?}");
+        }
+        let c = px(32, 24);
+        assert!(c[0] > 240 && c[2] < 15, "fill in the middle, got {c:?}");
+        // The top-left corner's arc is centred on (18, 18) with radius 10; pixel
+        // (12, 9)'s centre lies 0.12 px outside it, so it is part covered.
+        let edge = px(12, 9);
+        assert!(edge[2] > 10 && edge[2] < 245, "antialiased curve, got {edge:?}");
+    }
+
     /// Paint one 192x24 monospace row of `text` in `style` and rasterise it: the
     /// frame's under-text quads on the GPU, then the shaped glyphs composited on
     /// the CPU. RGBA8 pixels.
@@ -5273,7 +5582,7 @@ mod tests {
                 QuadInstance {
                     pos: [px(q.pos[0], sw), -px(-q.pos[1], sh)],
                     size: [q.size[0] * sw / DIM as f32, q.size[1] * sh / DIM as f32],
-                    color: q.color,
+                    ..*q
                 }
             })
             .collect();
@@ -5446,11 +5755,8 @@ mod tests {
 
     async fn offscreen_red() {
         let dim = 64u32;
-        let inst = QuadInstance {
-            pos: [-1.0, 1.0],
-            size: [2.0, -2.0],
-            color: [1.0, 0.0, 0.0, 1.0],
-        };
+        let full = Rect { x: 0.0, y: 0.0, w: dim as f32, h: dim as f32 };
+        let inst = crate::plugin::paint::rect_quad(full, dim as f32, dim as f32, [255, 0, 0], 1.0);
         let data = render_quads(&[inst], dim, wgpu::Color::BLACK).await;
         let bytes_per_row = dim * 4;
         let off = ((dim / 2) * bytes_per_row + (dim / 2) * 4) as usize;
