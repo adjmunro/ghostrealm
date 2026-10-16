@@ -154,12 +154,12 @@ impl DocId {
 /// the view, about its file: `path`, `modified`, `disk_conflict`, `save_as`,
 /// `save_copy`, `reload`, `changed_on_disk`, `autosave`. Everything else
 /// (input, paint, pump, timers, `files_changed`) goes to the view, which
-/// passes it on to its documents. A [`Request`] names no document, so the
-/// app applies one to the active document. Where one answer stands for the
-/// whole view, the defaults take the active document's (the tab title, the
-/// agent channel), except the tab's unsaved and changed-on-disk markers,
-/// which show when any document has them: the tab's close button asks about
-/// every one. A view implementing [`doc`](Self::doc) implements
+/// passes it on to its documents. A [`Request`] names no document (except
+/// [`Request::CloseDoc`]), so the app applies one to the active document.
+/// Where one answer stands for the whole view, the defaults take the active
+/// document's (the tab title, the agent channel), except the tab's unsaved
+/// and changed-on-disk markers, which show when any document has them: the
+/// tab's close button asks about every one. A view implementing [`doc`](Self::doc) implements
 /// [`doc_mut`](Self::doc_mut) too.
 pub trait View: Any {
     /// The id of the plugin that opened this view.

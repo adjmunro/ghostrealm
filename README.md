@@ -32,7 +32,7 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Shift, Shift (double-tap) | command palette (type to filter, ↑/↓, Enter, Esc) |
 | Ctrl, Ctrl (double-tap) | run a command in a new workspace |
 | Cmd+N | new workspace (pick its directory first) |
-| Cmd+T / Cmd+W | new / close tab in the focused pane |
+| Cmd+T / Cmd+W | new / close tab in the focused pane (in a Files surface, Cmd+W closes the shown file tab first) |
 | Cmd+D / Cmd+Shift+D | split left-right / top-bottom |
 | Cmd+] / Cmd+[ | focus next / previous pane |
 | Cmd+, | open the config file |
@@ -52,6 +52,12 @@ any of them; Option/Cmd+Backspace delete a word / to the line's start; Cmd+A/C/X
 Linux and Windows use Ctrl for words and the clipboard, and Home/End for lines. In
 the terminal, the same word/line motions and deletes send readline keys.
 
+A Files surface shows a tab per open file. A single click in its sidebar opens the
+file in the preview tab (name in italics), which the next single click reuses; a
+double click, an edit, or opening the file any other way keeps it. A tab with unsaved
+changes shows a dot where its × is (pane tabs too), × again under the pointer. Its
+×, a middle click, or Cmd+W closes one file tab; right-click it for the file menu.
+
 Quitting, or closing a tab, pane, or workspace, with unsaved editor changes asks
 first: Save and Quit / Cancel / Quit Without Saving (Save and Close / Close Without
 Saving for closes). Enter saves, Esc cancels. A buffer with no file can't be saved
@@ -69,15 +75,15 @@ overwrites such a file: it skips it and the buffer stays modified. Undoing back 
 a reload, or a file that became unreadable as text, counts the same way. Saving a file that
 was deleted on disk recreates it without asking.
 
-Right-click a file or folder in a Files surface's sidebar (or empty space in it), or
-click a document's file name in its header (or "File actions…" in its `⋯` menu), for
-the file menu: New File / New Folder (on a folder or empty space), Reveal in Finder,
+Right-click a file or folder in a Files surface's sidebar (or empty space in it) or
+a file tab, or click a document's file name in its header (or "File actions…" in
+its `⋯` menu), for the file menu: New File / New Folder (on a folder or empty space), Reveal in Finder,
 Show in File Browser (document), Open in
 Default App, Open in Terminal (folders), Cut / Copy / Paste / Duplicate, Copy Path /
 Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclude
 (in a git repository), Rename, Save Copy As (document), and Delete, last under a rule.
-Delete moves to the Trash (macOS only for now) and closes the file's documents (their
-Files surfaces stay, showing the sidebar); it asks
+Delete moves to the Trash (macOS only for now) and closes the file's tabs (a Files
+surface left with none shows its sidebar); it asks
 first unless git tracks the file and it is unmodified (a folder: all of it, and it
 isn't a repository itself). Paste and Duplicate run in the background, one at a
 time in the order given, so a big folder doesn't freeze the window; Delete's git

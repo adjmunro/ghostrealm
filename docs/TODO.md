@@ -907,8 +907,9 @@
 [2026-10-14@7364079] File and folder context menu — remaining
 
 - Requires: NO BLOCKERS (each item below is independent)
-- Detail: The menu exists (right-click in a Files surface's sidebar, a
-  document's file name in its header and its `⋯`; README, PLUGINS.md). Not built:
+- Detail: The menu exists (right-click in a Files surface's sidebar or on a
+  file tab, a document's file name in its header and its `⋯`; README,
+  PLUGINS.md). Not built:
   - **Undo / Redo** of file operations (Zed's Edit section). Needs an operation
     log with an inverse for create, duplicate, paste, rename, move, and Trash
     (move back from the Trash). Left out rather than half-done.
@@ -918,8 +919,6 @@
     (`NSFileManager trashItemAtURL`); elsewhere it reports "not supported" and
     never deletes permanently. The `trash` crate or the freedesktop spec would
     cover Linux.
-  - **File tabs**: the Files surface's file tabs (next increment) need the
-    menu on a right-click too.
   - **Cmd+Backspace** on the file browser's selection to delete (from the old
     "Delete files" entry).
   - New File / New Folder create the entry and do not open it.
@@ -936,10 +935,9 @@
 - Requires: the implementation plan (written separately)
 - Decided (2026-10-16@ad13ff26, GitHub issue #1): clone the Claude Code app's
   file browser and editor (DECISION.md). The Files surface exists with its
-  pinnable sidebar, document header, and one document. Remaining: file tabs
-  (single-click opens an ephemeral preview tab, double-click a real one) in
-  the surface's top row, the "? to search in files" box, and the other things
-  the issue says the owner likes.
+  pinnable sidebar, document header, and file tabs (with the preview tab).
+  Remaining: the "? to search in files" box, dragging file tabs to reorder
+  them, and the other things the issue says the owner likes.
 - Detail: Related, for the plan to cover:
   - **Markdown**: shown formatted, with the markup symbols still visible and
     editable. This is the "mixed" mode in "Markdown rich text — follow-ups"; the mixed mode is done.

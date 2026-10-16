@@ -11,6 +11,8 @@ Mutual project lexicon so we both know what we're talking about. Aim to be consi
 - Command palette: the popup window that allows the user to search and run command actions from the registry.
 - Command registry: the place where all "actions" an "actor" (user->UI button, user->palette, agent->MCP) can take live for lookup and execution.
 - Document: one file a surface shows (`DocId`). Most views are their own single document; a view can host several (one per file tab). Saving, closing (Cmd+W), and the unsaved-changes questions act per document.
-- Files surface: the surface (plugin `files`) every opened file shows in: a file sidebar, the document it opened, and a slim top row with the sidebar button (file tabs go there next).
+- Files surface: the surface (plugin `files`) every opened file shows in: a file sidebar, its documents, and a slim top row with the sidebar button and a file tab per document.
+- File tab: a document's pill in a Files surface's top row (file icon, name, close slot). Not a pane tab (htab): those hold surfaces. An unsaved one shows a dot in its close slot, × while hovered; pane tabs show the same dot.
+- Preview tab: the one file tab a single click in the sidebar opens, its name in italics; the next single click replaces its document. Editing it, a double click on it or its file, or opening its file from elsewhere keeps it as an ordinary file tab.
 - File sidebar: the file browser inside a Files surface. Pinned, it shows beside the document; hidden, the document takes the width. With no document it shows alone.
 - Document header: the details above a Files surface's document (name, kind and size, when modified), with the document's controls and `⋯` at the right.

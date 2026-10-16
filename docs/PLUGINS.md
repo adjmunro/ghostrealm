@@ -13,17 +13,19 @@ browser, image viewer, ...) should be too. The API lives in
   - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
   - `opens_path` / `open_path`: claim a file. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
-    The view it returns is a document: the app shows it in a Files surface,
-    replacing the document there. A Files surface's own sidebar opens in
-    that surface (`AppState::open_file_from`); any other open
+    The view it returns is a document: the app shows it in a tab of a Files
+    surface (`FilesView::show_doc`), or shows the tab of a file one has
+    already (`show_path`). A Files surface's own sidebar opens in that
+    surface (`AppState::open_file_from`); any other open
     (`AppState::open_file`) brings into view a Files surface of the
-    workspace showing the file already, else uses the focused one, else the
-    one focused last, else a new one. Being replaced counts as losing focus:
-    a document with unsaved changes autosaves if it autosaves on losing
-    focus (`[editor] autosave_on_unfocus` or its header toggle), else the app
-    asks first (Save As for one with no file). The headless agent channel
-    runs on the default config and has nobody to ask, so there the file
-    always opens in a new Files surface and nothing is saved for the user.
+    workspace with a tab of the file, else uses the focused one, else the
+    one focused last, else a new one. A single click in the sidebar opens
+    the file in the preview tab (title in italics), replacing the document
+    there under a new id; nothing is asked, as an edit keeps a preview tab
+    (so does a double click on it or its file, or an open from elsewhere).
+    Every other open gets a tab of its own, right of the shown one, so no
+    open replaces a document with unsaved changes. A document that loses
+    the shown tab loses focus (it autosaves if it autosaves then).
     `files` claims images and audio (`MediaView`).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
     A plugin whose views are only documents (`editor`) or parts of another
@@ -43,7 +45,7 @@ browser, image viewer, ...) should be too. The API lives in
   shown, `doc(id)` / `doc_mut(id)` return a hosted one (`None`: the view
   itself is that document; implement both or neither), and
   `dyn View::document(id)` resolves either case. An id is never reused
-  within a view and is not a position: a replaced document (a preview tab
+  within a view and is not a position: a replaced document (the preview tab
   showing another file) gets a new id, so a question holding one (Save As, a
   save conflict, Close) can't reach a different file. The app asks
   documents, not the view, about files: `path`, `modified`,
@@ -51,18 +53,23 @@ browser, image viewer, ...) should be too. The API lives in
   `autosave`. A `Request` names no document: the app applies it to the
   active document (`SaveAs`, `SaveConflict`), except `Close`, which closes
   the whole surface and asks about every unsaved document in it, as the
-  tab's close button and closing a pane, workspace, or the app do. Close
-  (Cmd+W) asks about the active document's unsaved changes, then calls
-  `close_doc(id)`, whose answer says whether the surface closes: the view
+  pane tab's close button and closing a pane, workspace, or the app do,
+  and `CloseDoc(id)`, which closes that one document as Close (Cmd+W)
+  does the active one: asks about its unsaved changes, then calls
+  `close_doc(id)`, whose answer says whether the surface closes. The view
   decides (a view that is its own document closes at once). The Files
-  surface (`plugins::files::FilesView`) is the host: it shows one
-  document, which another open replaces under a new id, and it keeps its
-  sidebar when its last document closes (showing only its sidebar, it has
-  none, and Close closes it). Everything
-  else (input, paint, pump, timers, `files_changed`) reaches the view, which
-  passes it on. `title`, `path`, `write_input`, and `text` default to the
-  active document's; `modified` and `marked_changed_on_disk` (the tab's
-  italic and amber) to whether any document is.
+  surface (`plugins::files::FilesView`) is the host: a tab per document
+  (`plugins::files::tabs`), the shown one filled; a file tab's close slot,
+  a middle click on it, and Cmd+W close one tab, and closing the shown
+  tab shows its right neighbour, else its left. It keeps its sidebar when
+  its last document closes (showing only its sidebar, it has none, and
+  Close closes it). `files.next_tab` / `files.prev_tab` step through the
+  focused surface's tabs. Everything else (input, paint, pump, timers,
+  `files_changed`) reaches the view, which passes it on (paint, keys, and
+  focus to the shown document only; pump, timers, and `files_changed` to
+  every one). `title`, `path`, `write_input`, and `text` default to the
+  active document's; `modified` and `marked_changed_on_disk` (the pane
+  tab's dot and amber title) to whether any document is.
 
 The app owns the window, GPU, fonts, layout, focus, tab strips, sidebar, and
 overlays. A view owns everything inside its content rect.
@@ -203,7 +210,8 @@ into the overlay layer; it doesn't need to know.
   (agent channel).
 - File menu: `context_menu(pos)` is a right-click inside the view; a view with a
   file or folder to act on files `Request::FileMenu { target, at, align }`
-  (the file browser on its rows and empty space, a document on its header;
+  (the file browser on its rows and empty space, a document on its header,
+  the Files surface on a file tab;
   its file name button and its `⋯` menu's "File actions…" file the same
   request, the latter right-aligned at `⋯`). `subject` is the file or folder the `file.*`
   commands act on when given no `path` (default: `path`; the browser's is its
@@ -232,7 +240,7 @@ into the overlay layer; it doesn't need to know.
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
   explicit save found the file changed on disk: the app asks before writing),
   `FileMenu` (open the file menu on a target), `Menu` (open the view's own
-  menu).
+  menu), `Close` / `CloseDoc` (see Documents above).
 - View menu: `Request::Menu { items, at, align }` opens a menu of the view's
   own with its top edge at `at` (physical px) and its left or right edge
   there per `align` (`MenuAlign::Right` for a button at the view's right end,
