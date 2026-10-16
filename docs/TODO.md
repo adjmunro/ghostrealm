@@ -937,7 +937,9 @@
   file browser and editor (DECISION.md). The Files surface exists with its
   pinnable sidebar, document header, and file tabs (with the preview tab).
   Remaining: the "? to search in files" box, dragging file tabs to reorder
-  them, and the other things the issue says the owner likes.
+  them, the panel controls at the tab row's right end (search, `⋯`,
+  maximise, close; issue screenshot img25), and the other things the issue
+  says the owner likes.
 - Detail: Related, for the plan to cover:
   - **Markdown**: shown formatted, with the markup symbols still visible and
     editable. This is the "mixed" mode in "Markdown rich text — follow-ups"; the mixed mode is done.

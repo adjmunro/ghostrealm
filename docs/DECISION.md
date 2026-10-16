@@ -154,7 +154,7 @@
 
 - Category: Architecture / files and editing
 - Detail: Shape S1 from GitHub issue #1: one Files surface (plugin `files`) owns a file sidebar (`FileBrowserView`, `Mode::Sidebar`), its own top row (sidebar button, file tabs), and its documents as child views (`EditorView`, `MediaView`) under a document header. A pane holding only it autohides its tab strip.
-- Detail: A file opened from a Files surface's own sidebar opens in that surface. Any other open (the palette, a link, `file.open`, the agent) brings into view a Files surface of the workspace showing the file already, else goes to the focused Files surface, else the workspace's last focused one, else a new one. The editor and file browser are no longer surfaces of their own; their command ids and config sections stay.
+- Detail: A file opened from a Files surface's own sidebar opens in that surface. Any other open (the palette, a link, `file.open`, the agent) brings into view a Files surface of the workspace with a tab of the file (that tab shown), else goes to the focused Files surface, else the workspace's last focused one, else a new one. The editor and file browser are no longer surfaces of their own; their command ids and config sections stay.
 - Detail: The file browser shows no preview beside its list: images and audio are documents (`MediaView`), and text opens in the editor.
 - Detail: Closing a Files surface's last document leaves the surface showing its sidebar; closing that closes the surface.
 - Reason: owner decision on issue #1 (clone the Claude Code app's file panel); alternatives were per-pane file tabs with a window-level sidebar (S2) and a per-workspace explorer (S3).
@@ -165,6 +165,6 @@
 
 - Category: UX / files and tabs
 - Detail: A Files surface shows a file tab per document. A single click in its sidebar opens the file in the preview tab (italic), whose document the next single click replaces; editing it, a double click on it or its file, or an open from anywhere else keeps it. Every other open gets a tab of its own, so an open never replaces a document with unsaved changes and never asks.
-- Detail: Italic means "preview tab". An unsaved document shows a dot in its tab's close slot, × while the tab is hovered; pane tabs (htabs) do the same. Changed on disk under unsaved edits stays an amber title.
-- Detail: Closing the shown file tab shows its right neighbour, else its left (as VS Code and the Claude Code app do).
+- Detail: Italic means "preview tab". An unsaved document shows a dot in its tab's close slot, × while the tab is hovered; pane tabs (htabs) do the same, and the document header shows the dot after the name. Changed on disk under unsaved edits stays an amber title.
+- Detail: Closing the shown file tab shows its right neighbour, else its left.
 - Reason: owner decisions on issue #1 (clone the Claude Code app's file panel; unsaved indicator, answered 2026-10-16).
