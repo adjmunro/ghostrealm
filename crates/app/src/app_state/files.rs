@@ -13,8 +13,7 @@ use super::{AppState, Confirm, Confirmed, DocRef, Pick};
 use crate::file_jobs::{self, Done, FileJob, Output};
 use crate::file_menu::{self, FileAction, FileTarget, MenuEntry, MenuEnv};
 use crate::file_ops;
-use crate::plugins::editor;
-use crate::plugins::file_browser::{self, FileBrowserView};
+use crate::plugins::files::{self, FilesView};
 use crate::plugins::terminal;
 
 /// How long a file command waits for its job on the worker before returning.
@@ -106,8 +105,8 @@ impl AppState {
         let shown = self
             .focused_surface()
             .and_then(|sid| self.views.get(&sid))
-            .and_then(|v| v.downcast_ref::<FileBrowserView>())
-            .map(|b| b.tree().root().to_path_buf());
+            .and_then(|v| v.downcast_ref::<FilesView>())
+            .map(|f| f.sidebar().tree().root().to_path_buf());
         self.focused_subject()
             .and_then(folder_of)
             .or(shown)
@@ -298,8 +297,8 @@ impl AppState {
         let browser_roots = self
             .views
             .values()
-            .filter_map(|v| v.downcast_ref::<FileBrowserView>())
-            .map(|b| b.tree().root().to_path_buf());
+            .filter_map(|v| v.downcast_ref::<FilesView>())
+            .map(|f| f.sidebar().tree().root().to_path_buf());
         let doc_paths = self.all_docs().into_iter().filter_map(|d| self.doc(d)?.path());
         let mut followed: Vec<PathBuf> = self
             .views
@@ -389,54 +388,44 @@ impl AppState {
         self.open_plugin_in_focused_at(terminal::ID, Some(dir.to_path_buf()))
     }
 
-    /// Show `path` in a file browser of the active workspace (focusing it), or
-    /// in a new one.
+    /// Show `path` selected in the sidebar of a Files surface (the one a file
+    /// would open in, else a new one), with the keyboard there.
     pub fn show_in_browser(&mut self, path: &Path) -> Result<()> {
-        let vt = self.active().context("no workspace")?;
-        let found = self.tree.vtab(vt).and_then(|v| {
-            v.panes().into_iter().find_map(|p| {
-                let i = p.surfaces.iter().position(|s| self.views.get(&s.id).is_some_and(|v| v.plugin() == file_browser::ID))?;
-                Some((p.id, i, p.surfaces[i].id))
-            })
-        });
-        let sid = match found {
-            Some((pane, index, sid)) => {
-                if let Some(v) = self.tree.vtab_mut(vt) {
-                    v.focused_pane = pane;
-                    if let Some(p) = v.pane_mut(pane) {
-                        p.active = index;
-                    }
-                }
+        let sid = match self.files_target() {
+            Some(sid) => {
+                self.show_surface(sid);
                 sid
             }
             None => {
-                self.open_plugin_in_focused(file_browser::ID)?;
-                self.focused_surface().context("the file browser didn't open")?
+                self.open_plugin_in_focused(files::ID)?;
+                let sid = self.focused_surface().context("the Files surface didn't open")?;
+                self.note_focus(sid);
+                sid
             }
         };
-        let browser = self
+        let view = self
             .views
             .get_mut(&sid)
-            .and_then(|v| v.downcast_mut::<FileBrowserView>())
-            .context("the file browser didn't open")?;
-        browser.reveal(path);
+            .and_then(|v| v.downcast_mut::<FilesView>())
+            .context("the Files surface didn't open")?;
+        view.focus_sidebar();
+        view.sidebar_mut().reveal(path);
         Ok(())
     }
 
-    /// The editor document showing `path`, the focused surface's if one of
-    /// its documents does.
-    fn editor_of(&self, path: &Path) -> Option<DocRef> {
-        let shows =
-            |d: &DocRef| self.doc(*d).is_some_and(|v| v.plugin() == editor::ID && v.path().as_deref() == Some(path));
+    /// The document showing `path`, the focused surface's if one of its
+    /// documents does.
+    fn doc_of(&self, path: &Path) -> Option<DocRef> {
+        let shows = |d: &DocRef| self.doc(*d).is_some_and(|v| v.path().as_deref() == Some(path));
         let focused = self.focused_surface();
         let mut docs = self.all_docs();
         docs.sort_by_key(|(sid, _)| Some(*sid) != focused);
         docs.into_iter().find(shows)
     }
 
-    /// Ask where to save a copy of the editor showing `path`.
+    /// Ask where to save a copy of the document showing `path`.
     pub fn save_copy_of(&mut self, path: &Path) -> Result<()> {
-        let doc = self.editor_of(path).with_context(|| format!("{} isn't open in an editor", path.display()))?;
+        let doc = self.doc_of(path).with_context(|| format!("{} isn't open", path.display()))?;
         self.open_save_dialog(doc, Pick::SaveCopy(doc));
         Ok(())
     }
@@ -601,7 +590,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
     path_command(FileAction::AddToExclude, "Add a file or folder to its repository's .git/info/exclude", |s, p| {
         s.ignore_path(p, true).map(|changed| if changed { "added".into() } else { "already excluded".into() })
     });
-    path_command(FileAction::SaveCopyAs, "Save a copy of an open editor's file to a file chosen in a picker", |s, p| {
+    path_command(FileAction::SaveCopyAs, "Save a copy of an open document's file to a file chosen in a picker", |s, p| {
         s.save_copy_of(p).map(|()| String::new())
     });
     path_command(
@@ -665,7 +654,6 @@ mod tests {
     use crate::file_menu::{Kind, Origin};
     use crate::plugin::testing::{tmpdir, DocsView};
     use crate::plugin::{DocId, View};
-    use crate::plugins::editor::EditorView;
 
     type Calls = Rc<RefCell<Vec<String>>>;
 
@@ -703,12 +691,12 @@ mod tests {
     }
 
     fn open_editor(s: &mut AppState, path: &Path) -> SurfaceId {
-        s.open_path_with_in_focused(editor::ID, path).unwrap();
+        s.open_file_in_new_surface(path).unwrap();
         s.focused_surface().unwrap()
     }
 
     fn editor_path(s: &AppState, sid: SurfaceId) -> Option<PathBuf> {
-        s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).and_then(|e| e.buffer().path.clone())
+        s.editor(sid).and_then(|e| e.buffer().path.clone())
     }
 
     fn git_ok(dir: &Path, args: &[&str]) -> bool {
@@ -779,7 +767,7 @@ mod tests {
         assert!(run(&mut s, "file.new_file", &[("dir", &d), ("name", Path::new("a.txt"))]).is_err(), "exists");
         assert!(run(&mut s, "file.new_file", &[("dir", &d), ("name", Path::new("x/y"))]).is_err(), "nested name");
         // A menu target maps to the command's arguments: a file's folder, a folder itself.
-        let file = FileTarget { path: d.join("a.txt"), kind: Kind::File, origin: Origin::Editor };
+        let file = FileTarget { path: d.join("a.txt"), kind: Kind::File, origin: Origin::Document };
         assert_eq!(FileAction::Paste.args(&file).get_str("dir").unwrap(), d.to_str().unwrap());
         assert_eq!(FileAction::Delete.args(&file).get_str("path").unwrap(), d.join("a.txt").to_str().unwrap());
     }
@@ -845,7 +833,7 @@ mod tests {
         assert!(run(&mut s, "file.rename", &[("path", &d.join("b.txt")), ("name", Path::new("renamed"))]).is_err());
         assert_eq!(editor_path(&s, a), Some(d.join("b.txt")));
         // The renamed editor saves to the new place.
-        let v = s.view_mut(a).and_then(|v| v.downcast_mut::<EditorView>()).unwrap();
+        let v = s.editor_mut(a).unwrap();
         v.buffer_mut().insert_str("x");
         assert!(v.buffer_mut().save().unwrap());
         assert!(std::fs::read_to_string(d.join("b.txt")).unwrap().starts_with('x'));
@@ -876,7 +864,7 @@ mod tests {
         run(&mut s, "file.paste", &[("dir", &d.join("to"))]).unwrap();
         assert_eq!(root(&s, vt), Some(d.join("to/outer/renamed")));
         assert_eq!(root(&s, other), Some(d.join("to/outer")));
-        let view = s.view(browser).and_then(|v| v.downcast_ref::<FileBrowserView>()).unwrap();
+        let view = s.view(browser).and_then(|v| v.downcast_ref::<FilesView>()).unwrap().sidebar();
         assert!(view.tree().root().starts_with(d.join("to/outer")), "the browser's root follows too");
         // A new terminal starts in the moved folder.
         assert_eq!(s.resolve_cwd(vt), Some(d.join("to/outer/renamed")));
@@ -977,27 +965,29 @@ mod tests {
     }
 
     #[test]
-    fn show_in_file_browser_opens_one_on_the_file_then_reuses_it() {
+    fn show_in_file_browser_reveals_the_file_in_a_files_sidebar() {
         let (mut s, _) = app();
         let d = tmpdir("fm-show");
         std::fs::create_dir_all(d.join("deep/er")).unwrap();
         std::fs::write(d.join("deep/er/f.txt"), "").unwrap();
+        std::fs::write(d.join("g.txt"), "").unwrap();
         s.set_active_root_dir(&d);
-        let editor = open_editor(&mut s, &d.join("deep/er/f.txt"));
-        run(&mut s, "file.show_in_browser", &[("path", &d.join("deep/er/f.txt"))]).unwrap();
-        let browser = s.focused_surface().unwrap();
-        assert_ne!(browser, editor);
-        let view = s.view(browser).and_then(|v| v.downcast_ref::<FileBrowserView>()).unwrap();
-        assert_eq!(view.subject(), Some(d.join("deep/er/f.txt")), "selected");
-        assert!(view.tree().is_expanded(&d.join("deep")) && view.tree().is_expanded(&d.join("deep/er")));
-        // Focus elsewhere, ask again: the same browser comes back, no new tab.
-        let vt = s.active().unwrap();
-        let pane = s.tree.vtab(vt).unwrap().focused_pane;
-        s.tree.vtab_mut(vt).unwrap().pane_mut(pane).unwrap().active = 0;
+        let files = open_editor(&mut s, &d.join("g.txt"));
         let before = s.tree.surface_count();
         run(&mut s, "file.show_in_browser", &[("path", &d.join("deep/er/f.txt"))]).unwrap();
-        assert_eq!(s.tree.surface_count(), before);
-        assert_eq!(s.focused_surface(), Some(browser));
+        assert_eq!((s.focused_surface(), s.tree.surface_count()), (Some(files), before), "the Files surface there");
+        let view = s.view(files).and_then(|v| v.downcast_ref::<FilesView>()).unwrap();
+        assert!(view.sidebar_has_keys());
+        let sidebar = view.sidebar();
+        assert_eq!(sidebar.subject(), Some(d.join("deep/er/f.txt")), "selected");
+        assert!(sidebar.tree().is_expanded(&d.join("deep")) && sidebar.tree().is_expanded(&d.join("deep/er")));
+        // A workspace with no Files surface gets one.
+        s.new_empty_vtab();
+        run(&mut s, "file.show_in_browser", &[("path", &d.join("g.txt"))]).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert_ne!(sid, files);
+        let view = s.view(sid).and_then(|v| v.downcast_ref::<FilesView>()).unwrap();
+        assert_eq!(view.sidebar().subject(), Some(d.join("g.txt")));
     }
 
     #[test]
@@ -1006,9 +996,9 @@ mod tests {
         let d = tmpdir("fm-copy-as");
         std::fs::write(d.join("a.txt"), "A\n").unwrap();
         let sid = open_editor(&mut s, &d.join("a.txt"));
-        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("edit ");
+        s.editor_mut(sid).unwrap().buffer_mut().insert_str("edit ");
         run(&mut s, "file.save_copy_as", &[("path", &d.join("a.txt"))]).unwrap();
-        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy((sid, crate::plugin::DocId::SELF))));
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy((sid, crate::plugin::DocId(1)))));
         s.confirm_picker_with(d.join("sub/copy.txt")).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("sub/copy.txt")).unwrap(), "edit A\n", "the unsaved text");
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "A\n", "the original is untouched");
@@ -1018,7 +1008,7 @@ mod tests {
         run(&mut s, "file.save_copy_as", &[("path", &d.join("a.txt"))]).unwrap();
         assert_eq!(s.confirm_picker_with(d.join("a.txt")).unwrap(), None);
         assert!(s.confirm().is_some());
-        // Only an open editor can be copied.
+        // Only an open document can be copied.
         assert!(run(&mut s, "file.save_copy_as", &[("path", &d.join("nope.txt"))]).is_err());
     }
 
@@ -1094,7 +1084,7 @@ mod tests {
         let mut docs = Vec::new();
         for f in &files {
             std::fs::write(f, "x").unwrap();
-            docs.push(s.view_for_path(Some(editor::ID), f).unwrap());
+            docs.push(s.view_for_path(Some(crate::plugins::editor::ID), f).unwrap());
         }
         s.open_view_in_focused(Box::new(DocsView::new(docs)));
         let sid = s.focused_surface().unwrap();
@@ -1127,7 +1117,7 @@ mod tests {
         assert!(!s.check_open_files());
         std::fs::write(d.join("a.txt"), "Bee\n").unwrap();
         assert!(s.check_open_files());
-        let lines = &s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines;
+        let lines = &s.editor(sid).unwrap().buffer().lines;
         assert_eq!(lines, &["Bee"]);
         assert!(!s.check_open_files(), "once");
     }
@@ -1143,7 +1133,7 @@ mod tests {
         let d = tmpdir("fm-delete-unsaved");
         std::fs::write(d.join("a.txt"), "A\n").unwrap();
         let sid = open_editor(&mut s, &d.join("a.txt"));
-        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        s.editor_mut(sid).unwrap().buffer_mut().insert_str("x");
         run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
         let c = s.confirm().unwrap();
         assert_eq!((c.accept, c.discard), (Some("Save and Delete"), Some("Delete Without Saving")));
@@ -1230,7 +1220,7 @@ mod tests {
         crate::file_jobs::tests::big_tree(&d.join("src"), 200);
         std::fs::create_dir(d.join("to")).unwrap();
         s.set_active_root_dir(d.join("to"));
-        s.open_plugin_in_focused(file_browser::ID).unwrap();
+        s.open_plugin_in_focused(files::ID).unwrap();
         let browser = s.focused_surface().unwrap();
         assert!(!browser_text(&mut s, browser).contains("src"));
         run(&mut s, "file.copy", &[("path", &d.join("src"))]).unwrap();
@@ -1298,7 +1288,7 @@ mod tests {
         let mut s = AppState::new().with_unsaved_guard().with_shell_line("sleep 1");
         s.new_empty_vtab();
         let sid = open_editor(&mut s, &d.join("a.txt"));
-        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        s.editor_mut(sid).unwrap().buffer_mut().insert_str("x");
         run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
         assert!(s.confirm().unwrap().takes_keys_at(Instant::now()));
         assert!(!s.confirm().unwrap().enter_cancels(), "Enter answers it as before");
@@ -1366,7 +1356,7 @@ mod tests {
         std::fs::write(d.join("a.txt"), "A").unwrap();
         let mut s = guarded_app();
         let sid = open_editor(&mut s, &d.join("a.txt"));
-        s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("x");
+        s.editor_mut(sid).unwrap().buffer_mut().insert_str("x");
         s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
         s.request_quit();
         assert_eq!(s.confirm().unwrap().discard, Some("Quit Without Saving"));

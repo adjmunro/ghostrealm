@@ -14,6 +14,7 @@ use crate::plugin::Plugin;
 pub fn builtin() -> Vec<Box<dyn Plugin>> {
     vec![
         Box::new(terminal::TerminalPlugin),
+        Box::new(files::FilesPlugin),
         Box::new(file_browser::FileBrowserPlugin),
         Box::new(editor::EditorPlugin),
         Box::new(web::WebPlugin::new()),

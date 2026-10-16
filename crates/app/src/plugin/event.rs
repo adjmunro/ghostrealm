@@ -65,8 +65,9 @@ pub struct RawKey<'a> {
 /// Something a view asks the app to do once the current call returns.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
-    /// Open this file beside/in the view's pane, per `[file_browser] open_in`,
-    /// with whichever plugin claims the path.
+    /// Open this file in a Files surface (the focused one, else the
+    /// workspace's last focused one, else a new one), with whichever plugin
+    /// claims the path.
     OpenFile(PathBuf),
     /// The view wrote this file (the app hot-reloads it if it is the config).
     Saved(PathBuf),

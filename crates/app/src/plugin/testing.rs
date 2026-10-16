@@ -19,8 +19,6 @@ pub struct Harness {
     pub text: TextKit,
     pub frame: Frame,
     pub cursor: (f32, f32),
-    /// Paint as if the pane shows a tab strip above the view.
-    pub tab_strip: bool,
     /// Paint as if a modal overlay covers the panes.
     pub modal: bool,
 }
@@ -53,7 +51,6 @@ impl Harness {
             text: TextKit::new(fs, 256),
             frame: Frame::new((800.0, 600.0)),
             cursor: (-1.0, -1.0),
-            tab_strip: false,
             modal: false,
         }
     }
@@ -75,11 +72,19 @@ impl Harness {
             SurfaceId(1),
         );
         cx.focused = true;
-        cx.tab_strip = self.tab_strip;
         cx.modal = self.modal;
         view.paint(&mut cx, rect);
         self.text.finish_paint();
         &self.frame
+    }
+
+    /// The text of every text item the last paint drew, in order.
+    pub fn texts(&self) -> Vec<String> {
+        let items = self.frame.text.iter().chain(&self.frame.overlay_text);
+        items
+            .filter_map(|t| self.text.buffer(t.src))
+            .map(|b| b.layout_runs().map(|r| r.text).collect::<Vec<_>>().join("\n"))
+            .collect()
     }
 
     fn event(&self, mods: Mods, f: impl FnOnce(&mut EventCx)) -> Outcome {

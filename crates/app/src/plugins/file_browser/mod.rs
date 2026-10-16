@@ -1,26 +1,24 @@
-//! The file browser plugin: a navigable, filterable tree over
-//! [`FsTree`](ghostrealm_core::fs_tree::FsTree). The same view backs the
-//! floating picker, which chooses a directory, a file, or where to save (see
-//! [`Mode`]).
+//! The file browser: a navigable, filterable tree over
+//! [`FsTree`](ghostrealm_core::fs_tree::FsTree). It is a Files surface's
+//! sidebar, and it backs the floating picker, which chooses a directory, a
+//! file, or where to save (see [`Mode`]). The plugin opens no view of its
+//! own: it keeps the `file_browser.*` commands and the `[file_browser]`
+//! config section, and opens a Files surface.
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
 //! completes it; Up/Down move the single highlight, which the mouse also takes
 //! over on hover. A click also *selects* the row: a separate, sticky highlight
 //! that hover and arrows leave alone. In the picker, the selected entry is the
 //! one confirming chooses.
-//!
-//! A wide enough browser shows a [`preview`] of the highlighted (else selected)
-//! entry beside the list; the `⋯` menu's Preview overrides the width rule.
 
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::Result;
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::fs_tree::{FileRow, FsTree, FsView, GitFilter};
-use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Config, Rect, Registry};
+use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::AppState;
@@ -31,8 +29,7 @@ use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
     MenuItem, Request, UiMetrics, View, Waker,
 };
-use crate::plugins::files::media as preview;
-use preview::PreviewPane;
+use crate::plugins::files;
 
 pub const ID: &str = "file_browser";
 
@@ -51,38 +48,10 @@ const BTN_HIDDEN: u32 = 1;
 const BTN_IGNORED: u32 = 2;
 const BTN_GIT_MODIFIED: u32 = 3;
 const BTN_GIT_UNTRACKED: u32 = 4;
-const BTN_PREVIEW: u32 = 5;
 const BTN_MORE: u32 = 6;
 const BTN_CLEAR: u32 = 7;
-/// `BTN_GROUP + i` shows [`VIEWS`]`[i]`. Past [`preview`]'s ids.
+/// `BTN_GROUP + i` shows [`VIEWS`]`[i]`. Past every other id.
 const BTN_GROUP: u32 = 20;
-
-// The browser's and the preview's ids share `View::button`: none may repeat
-// or fall in the `BTN_GROUP` range.
-const _: () = {
-    let ids = [
-        BTN_PARENT,
-        BTN_HIDDEN,
-        BTN_IGNORED,
-        BTN_GIT_MODIFIED,
-        BTN_GIT_UNTRACKED,
-        BTN_PREVIEW,
-        BTN_MORE,
-        BTN_CLEAR,
-        preview::BTN_PLAY,
-        preview::BTN_AUTOPLAY,
-    ];
-    let mut i = 0;
-    while i < ids.len() {
-        assert!(ids[i] < BTN_GROUP || ids[i] >= BTN_GROUP + VIEWS.len() as u32);
-        let mut j = i + 1;
-        while j < ids.len() {
-            assert!(ids[i] != ids[j]);
-            j += 1;
-        }
-        i += 1;
-    }
-};
 
 /// The listings the `⋯` menu offers, with their labels.
 const VIEWS: [(FsView, &str); 6] = [
@@ -93,9 +62,6 @@ const VIEWS: [(FsView, &str); 6] = [
     (FsView::Modified, "Group by date modified"),
     (FsView::Size, "Group by size"),
 ];
-
-/// The preview's share of the browser's width.
-const PREVIEW_SHARE: f32 = 0.45;
 
 pub struct FileBrowserPlugin;
 
@@ -108,13 +74,15 @@ impl Plugin for FileBrowserPlugin {
         "File browser"
     }
 
+    /// The browser lives in a Files surface's sidebar, so it isn't a surface
+    /// of its own.
+    fn pickable(&self) -> bool {
+        false
+    }
+
+    /// A Files surface showing only its sidebar.
     fn open(&self, cx: &OpenCx) -> Result<Box<dyn View>> {
-        let root = cx
-            .cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        Ok(Box::new(FileBrowserView::new(root).with_waker(cx.waker.clone())))
+        files::FilesPlugin.open(cx)
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
@@ -122,10 +90,10 @@ impl Plugin for FileBrowserPlugin {
             CommandMeta::new(
                 "file_browser.new",
                 "New File Browser",
-                "Open a file browser in the focused pane",
+                "Open a Files surface showing only its file sidebar in the focused pane",
             ),
             Box::new(|s: &mut AppState, _| {
-                s.open_plugin_in_focused(ID)
+                s.open_plugin_in_focused(files::ID)
                     .map_err(|e| CmdError::Failed(format!("{e:#}")))?;
                 Ok(CmdOutcome::ok())
             }),
@@ -133,37 +101,28 @@ impl Plugin for FileBrowserPlugin {
     }
 
     fn config_sections(&self) -> Vec<SectionSpec> {
-        const OPEN_IN: &[(&str, &str)] = &[
-            (
-                "split",
-                "A horizontal split beside the file browser (a tab when the pane is too narrow).",
-            ),
-            ("tab", "A tab in the file browser's own pane."),
+        const SIDEBAR: &[(&str, &str)] = &[
+            ("pinned", "Beside the document."),
+            ("hidden", "Hidden until the sidebar button shows it."),
         ];
         vec![SectionSpec::options(
             "file_browser",
-            "The file browser.",
+            "The Files surface's file sidebar, and its images and audio.",
             vec![
                 OptionSpec::new(
-                    "open_in",
-                    Kind::Enum(OPEN_IN),
-                    Some("\"split\""),
-                    "Where opening a file puts it.",
-                ),
-                OptionSpec::new(
-                    "preview_min_width",
-                    Kind::Int { min: 0, max: 10_000 },
-                    Some("900"),
-                    "Show the preview (details, text, images, audio) beside the list once the \
-                     browser is at least this many logical px wide. Preview in the browser's `⋯` menu \
-                     overrides it per pane.",
+                    "sidebar",
+                    Kind::Enum(SIDEBAR),
+                    Some("\"pinned\""),
+                    "Whether a new Files surface shows its file sidebar beside a document. Once the \
+                     sidebar button is clicked, new Files surfaces start as it was left, until the app \
+                     quits. A Files surface showing no document always shows the sidebar.",
                 ),
                 OptionSpec::new(
                     "preview_autoplay",
                     Kind::Bool,
                     Some("true"),
-                    "Play audio once the preview has shown it for a moment (toggle per pane with \
-                     the preview's `autoplay` button).",
+                    "Play a track once it has been shown for a moment (toggle per document with \
+                     its `autoplay` button).",
                 ),
             ],
         )]
@@ -173,8 +132,9 @@ impl Plugin for FileBrowserPlugin {
 /// What the browser is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// The file browser pane: opening a file requests it.
-    Browse,
+    /// A Files surface's sidebar: opening a file requests it (a click, Enter,
+    /// or Right on a file).
+    Sidebar,
     /// Choosing a directory: only directories are listed, and files never open.
     /// Enter picks what the confirm button shows ([`FileBrowserView::choice`]).
     /// The keys act on the keyboard's highlight, never the hover: Right/Tab
@@ -241,14 +201,12 @@ pub struct FileBrowserView {
     row_h: f32,
     /// Path-mode completions as drawn: (rect, index, path, is_dir).
     suggest_hits: Vec<(Rect, usize, PathBuf, bool)>,
-    preview: PreviewPane,
-    /// This view's preview override; `None` shows it when the browser is at least
-    /// `[file_browser] preview_min_width` wide.
-    preview_on: Option<bool>,
-    /// The last paint showed the preview.
-    preview_shown: bool,
     /// Scroll the chosen entry into view at the next paint.
     reveal_chosen: bool,
+    /// A key opened a file since [`Self::take_opened_by_key`] last asked.
+    opened_by_key: bool,
+    /// Files opened, counted so a key can tell that it opened one.
+    opens: u64,
     /// The `⋯` button as last painted, which its menu opens under.
     more_hit: Option<Rect>,
 }
@@ -258,7 +216,7 @@ impl FileBrowserView {
         FileBrowserView {
             start: root.clone(),
             tree: FsTree::new(root),
-            mode: Mode::Browse,
+            mode: Mode::Sidebar,
             scroll: 0.0,
             sel: None,
             completion: None,
@@ -270,10 +228,9 @@ impl FileBrowserView {
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
             suggest_hits: Vec::new(),
-            preview: PreviewPane::default(),
-            preview_on: None,
-            preview_shown: false,
             reveal_chosen: false,
+            opened_by_key: false,
+            opens: 0,
             more_hit: None,
             field: FieldMouse::default(),
             name_field: FieldMouse::default(),
@@ -345,7 +302,7 @@ impl FileBrowserView {
     /// directory holding it ([`Mode::Save`]).
     pub fn choice(&mut self) -> Option<PathBuf> {
         match self.mode {
-            Mode::Browse => None,
+            Mode::Sidebar => None,
             Mode::PickDir => self.dir_choice(),
             Mode::PickFile => self.chosen.clone().filter(|p| !p.is_dir()),
             Mode::Save => {
@@ -416,10 +373,32 @@ impl FileBrowserView {
         self.sel = path.and_then(|p| self.tree.rows().iter().position(|r| !r.is_category && r.path == p));
     }
 
-    /// Open (browse) or pick (file picker) `path`; saving picks the choice.
+    /// The selected entry.
+    pub fn chosen(&self) -> Option<&Path> {
+        self.chosen.as_deref()
+    }
+
+    /// How many files the sidebar has opened: a host compares counts to tell
+    /// that an event opened one.
+    pub fn opens(&self) -> u64 {
+        self.opens
+    }
+
+    /// Whether a key opened a file since the last ask (the Files surface then
+    /// moves the keyboard to the document).
+    pub fn take_opened_by_key(&mut self) -> bool {
+        std::mem::take(&mut self.opened_by_key)
+    }
+
+    /// Open (sidebar: selecting it) or pick (file picker) `path`; saving
+    /// picks the choice.
     fn open_file(&mut self, cx: &mut EventCx, path: PathBuf) {
         match self.mode {
-            Mode::Browse => cx.request(Request::OpenFile(path)),
+            Mode::Sidebar => {
+                self.chosen = Some(path.clone());
+                self.opens += 1;
+                cx.request(Request::OpenFile(path));
+            }
             Mode::PickFile => cx.request(Request::Pick(path)),
             Mode::Save => {
                 if let Some(target) = self.choice() {
@@ -476,18 +455,6 @@ impl FileBrowserView {
         let geom = widgets::field_text(cx, text, &self.name, "file name", cx.focused);
         self.name_field.painted(cx, geom);
         h
-    }
-
-    /// Preview `subject` in `rect`; with no rect, the preview is hidden and
-    /// lets go of what it showed (stopping its audio).
-    fn paint_preview(&mut self, cx: &mut PaintCx, rect: Option<Rect>, subject: Option<&Path>) {
-        match rect {
-            Some(r) => {
-                self.preview.show(subject);
-                self.preview.paint(cx, r);
-            }
-            None => self.preview.show(None),
-        }
     }
 
     /// [`Mode::PickDir`]'s Enter: pick [`Self::dir_choice`]. A typed path
@@ -721,7 +688,7 @@ impl FileBrowserView {
     /// says.
     fn hint(&self) -> String {
         match self.mode {
-            Mode::Browse if self.tree.root() == self.start => "Filter files".to_string(),
+            Mode::Sidebar if self.tree.root() == self.start => "Filter files".to_string(),
             _ => tilde(self.tree.root()),
         }
     }
@@ -776,8 +743,6 @@ impl FileBrowserView {
             let item = MenuItem::new(BTN_GROUP + i as u32, label).check(t.view() == view);
             items.push(if view == FsView::GitStatus { loading(item) } else { item });
         }
-        items.push(MenuItem::RULE);
-        items.push(MenuItem::new(BTN_PREVIEW, "Preview").check(self.preview_shown));
         items
     }
 }
@@ -819,7 +784,6 @@ impl View for FileBrowserView {
 
     fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
         cx.fill(rect, cx.chrome.background);
-        let scale = cx.ui.scale;
 
         self.sync_input();
         let query = self.tree.query().to_string();
@@ -841,8 +805,6 @@ impl View for FileBrowserView {
                 }
                 LineEdit::new(s)
             });
-        let min_w = cx.cfg.file_browser.preview_min_width as f32 * scale;
-        self.preview_shown = self.mode != Mode::PickDir && self.preview_on.unwrap_or(rect.w >= min_w);
         let editable = preview.is_none() && self.mode != Mode::Save;
         let value = preview.unwrap_or_else(|| self.input.clone());
         let header_h = self.paint_header(cx, rect, &value, editable);
@@ -858,14 +820,7 @@ impl View for FileBrowserView {
             w: rect.w,
             h: (rect.h - header_h - footer_h).max(0.0),
         };
-        // The list on the left, the preview (when shown) on the right.
-        let (list, preview_rect) = if self.preview_shown {
-            let pw = (body.w * PREVIEW_SHARE).round();
-            let pane = Rect { x: body.x + body.w - pw, w: pw, ..body };
-            (Rect { w: body.w - pw, ..body }, Some(pane))
-        } else {
-            (body, None)
-        };
+        let list = body;
         let g = RowGeom::new(cx.ui, list);
         let row_h = g.row_h;
         self.list = list;
@@ -894,8 +849,6 @@ impl View for FileBrowserView {
                     self.suggest_hits.push((row_rect, i, p.clone(), is_dir));
                 }
             });
-            let subject = self.completion.and_then(|i| suggestions.get(i));
-            self.paint_preview(cx, preview_rect, subject.map(PathBuf::as_path));
             return;
         }
 
@@ -919,7 +872,6 @@ impl View for FileBrowserView {
         let first = ((self.scroll / row_h).floor() as usize).min(count);
         let last = (((self.scroll + list.h) / row_h).ceil() as usize).clamp(first, count);
         let visible: Vec<FileRow> = rows[first..last].to_vec();
-        let highlighted = self.sel.and_then(|i| rows.get(i)).filter(|r| !r.is_category).map(|r| r.path.clone());
         // Clipped, so a row scrolled half out draws neither over the header
         // nor under the footer.
         cx.with_clip(list, |cx| self.paint_rows(cx, list, &visible, first, filtering));
@@ -927,15 +879,14 @@ impl View for FileBrowserView {
         if let Some(note) = note {
             cx.label(&note, Font::SANS, g.text_x(0), g.text_y(cx.ui, list.y), list, theme::DIM);
         }
-        let subject = highlighted.or_else(|| self.chosen.clone());
-        self.paint_preview(cx, preview_rect, subject.as_deref());
     }
 
     /// Up/Down (Tab: completions) move the highlight, Enter opens or enters it,
     /// Escape clears the input, and other keys edit the input (see
     /// [`crate::plugin::text_edit`]). Plain ←/→ expand/collapse the highlighted
-    /// row while the input is empty, and → at the end of a path accepts the
-    /// highlighted completion. A directory picker differs (see [`Mode::PickDir`]):
+    /// row while the input is empty (→ on a sidebar's file opens it), and →
+    /// at the end of a path accepts the highlighted completion. A directory
+    /// picker differs (see [`Mode::PickDir`]):
     /// a directory is the answer there, so Enter picks it and the arrows and Tab
     /// move between directories.
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
@@ -950,6 +901,7 @@ impl View for FileBrowserView {
             && self.input.cursor() == self.input.text().chars().count();
         let pick_dir = self.mode == Mode::PickDir;
         let browsing = !path_mode && self.input.is_empty();
+        let opens = self.opens;
         match k.key {
             Key::Escape if plain => {
                 self.tree.set_query("");
@@ -980,6 +932,8 @@ impl View for FileBrowserView {
                         self.tree.toggle_category(&r.key);
                     } else if r.is_dir && !r.is_category && !r.expanded {
                         self.tree.toggle_dir(&r.path);
+                    } else if !r.is_dir && !r.is_category && self.mode == Mode::Sidebar {
+                        self.open_file(cx, r.path);
                     }
                 }
             }
@@ -1019,6 +973,7 @@ impl View for FileBrowserView {
                 }
             },
         }
+        self.opened_by_key = self.opens != opens;
         self.sync_input();
         cx.redraw();
         true
@@ -1035,10 +990,6 @@ impl View for FileBrowserView {
         }
         match *event {
             MouseEvent::Down { pos: (x, y), clicks, .. } => {
-                if self.preview_shown && self.preview.contains((x, y)) {
-                    self.preview.mouse_down(cx, (x, y));
-                    return;
-                }
                 if let Some((_, _, path, is_dir)) = self
                     .suggest_hits
                     .iter()
@@ -1078,7 +1029,7 @@ impl View for FileBrowserView {
                     if self.mode == Mode::Save {
                         self.name.set_text(file_name(&row.path));
                     }
-                    if self.mode == Mode::Browse || again {
+                    if self.mode == Mode::Sidebar || again {
                         self.open_file(cx, row.path);
                     }
                 }
@@ -1123,7 +1074,7 @@ impl View for FileBrowserView {
     }
 
     fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
-        if self.mode != Mode::Browse || !rect_contains(self.list, pos.0, pos.1) {
+        if self.mode != Mode::Sidebar || !rect_contains(self.list, pos.0, pos.1) {
             return;
         }
         let target = match self.row_at(pos.0, pos.1) {
@@ -1146,7 +1097,7 @@ impl View for FileBrowserView {
 
     /// The selected entry.
     fn subject(&self) -> Option<PathBuf> {
-        self.chosen.clone().filter(|_| self.mode == Mode::Browse)
+        self.chosen.clone().filter(|_| self.mode == Mode::Sidebar)
     }
 
     /// Re-read the listings; follow a moved selection or root.
@@ -1161,11 +1112,7 @@ impl View for FileBrowserView {
         self.tree.refresh();
     }
 
-    fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
-        if self.preview_shown && self.preview.contains(pos) {
-            self.preview.scroll(cx, dy);
-            return;
-        }
+    fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), _dx: f32, dy: f32) {
         // Pixel-precise; the upper bound is clamped to the content at paint.
         let next = (self.scroll - dy).max(0.0);
         if next != self.scroll {
@@ -1177,9 +1124,6 @@ impl View for FileBrowserView {
     }
 
     fn button(&mut self, cx: &mut EventCx, id: u32) {
-        if self.preview.button(cx, id) {
-            return;
-        }
         match id {
             BTN_MORE => {
                 if let Some(mb) = self.more_hit {
@@ -1201,7 +1145,6 @@ impl View for FileBrowserView {
         let t = &mut self.tree;
         let git = |t: &FsTree, f: GitFilter| if t.git_filter() == f { GitFilter::All } else { f };
         match id {
-            BTN_PREVIEW => self.preview_on = Some(!self.preview_shown),
             BTN_PARENT => {
                 t.go_to_parent();
             }
@@ -1226,18 +1169,6 @@ impl View for FileBrowserView {
 
     fn refresh(&mut self) -> bool {
         self.tree.poll()
-    }
-
-    fn deadline(&self, _cfg: &Config) -> Option<Instant> {
-        self.preview.deadline()
-    }
-
-    fn tick(&mut self, cx: &mut EventCx, now: Instant) {
-        self.preview.tick(cx, now);
-    }
-
-    fn shown(&mut self, visible: bool) {
-        self.preview.set_visible(visible);
     }
 
     fn text(&mut self) -> Option<String> {
@@ -1415,6 +1346,7 @@ fn move_highlight(sel: &mut Option<usize>, count: usize, delta: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use crate::plugin::MouseButton;
     use crate::plugin::testing::{press, tmpdir, Harness, UI};
 
@@ -2169,160 +2101,6 @@ mod tests {
         assert!(after.contains("changed.txt") && !after.contains("clean.txt"), "{after}");
     }
 
-    /// Wider than the default `preview_min_width` (900).
-    const WIDE: Rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 300.0 };
-
-    /// Tick `v` until its preview shows `path` (the loader runs on a thread).
-    fn await_preview(h: &Harness, v: &mut FileBrowserView, path: &Path) {
-        let until = Instant::now() + std::time::Duration::from_secs(5);
-        while v.preview.shown().map(|p| p.path.as_path()) != Some(path) {
-            assert!(Instant::now() < until, "preview of {path:?} never loaded");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            if v.deadline(&h.cfg).is_some_and(|d| Instant::now() >= d) {
-                h.tick(v, Instant::now());
-            }
-        }
-    }
-
-    #[test]
-    fn preview_shows_when_wide_and_the_toggle_overrides() {
-        let (_d, mut v) = fixture();
-        let mut h = Harness::new();
-        h.paint(&mut v, RECT);
-        assert!(!v.preview_shown, "narrower than preview_min_width");
-        h.button(&mut v, BTN_PREVIEW);
-        h.paint(&mut v, RECT);
-        assert!(v.preview_shown, "the toggle forces it on");
-
-        let (_d, mut v) = fixture();
-        h.paint(&mut v, WIDE);
-        assert!(v.preview_shown, "wide enough");
-        h.button(&mut v, BTN_PREVIEW);
-        h.paint(&mut v, WIDE);
-        assert!(!v.preview_shown, "the toggle forces it off");
-        assert!(v.row_at(900.0, row_centre(0).1).is_some(), "the list takes the full width again");
-    }
-
-    #[test]
-    fn preview_follows_the_highlight_and_owns_its_scroll() {
-        let (d, mut v) = fixture();
-        let lines: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        std::fs::write(d.join("b.txt"), lines).unwrap();
-        let mut h = Harness::new();
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(1) });
-        h.paint(&mut v, WIDE);
-        await_preview(&h, &mut v, &d.join("b.txt"));
-        assert!(matches!(v.preview.shown().unwrap().content, preview::Content::Text { .. }));
-
-        // Over the preview (the right of the browser), the wheel scrolls it, not the list.
-        h.paint(&mut v, WIDE);
-        let out = h.scroll(&mut v, (900.0, 200.0), -40.0);
-        assert!(out.frame);
-        assert_eq!(v.scroll, 0.0, "the list didn't move");
-        // Moving onto the preview keeps the highlight (and so the preview).
-        h.mouse(&mut v, MouseEvent::Move { pos: (900.0, row_centre(0).1) });
-        assert_eq!(v.sel, Some(1));
-    }
-
-    #[test]
-    fn preview_paints_highlighted_text_rows() {
-        let (d, mut v) = fixture();
-        std::fs::write(d.join("b.md"), "# Title\n\n**bold** and `code`\n").unwrap();
-        let mut h = Harness::new();
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(1) });
-        h.paint(&mut v, WIDE);
-        await_preview(&h, &mut v, &d.join("b.md"));
-        let plain = h.paint(&mut v, WIDE).text.len();
-        let preview::Content::Text { spans, .. } = &v.preview.shown().unwrap().content else { panic!("text") };
-        assert_eq!(spans.len(), 3);
-        assert!(plain >= 3, "the lines are drawn, got {plain} text items");
-    }
-
-    #[test]
-    fn preview_draws_an_image() {
-        let (d, mut v) = fixture();
-        std::fs::write(d.join("c.png"), crate::media::testing::png(4, 2, [0, 0, 255, 255])).unwrap();
-        let mut h = Harness::new();
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
-        h.paint(&mut v, WIDE);
-        await_preview(&h, &mut v, &d.join("c.png"));
-        let frame = h.paint(&mut v, WIDE);
-        assert_eq!(frame.images.len(), 1);
-        let r = frame.images[0].rect;
-        assert!(r.x >= WIDE.w * (1.0 - PREVIEW_SHARE), "inside the preview, got {r:?}");
-        assert_eq!((r.w, r.h), (4.0, 2.0), "never upscaled past a pixel per logical px");
-    }
-
-    #[test]
-    fn audio_preview_offers_play_without_autoplaying_when_off() {
-        let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
-        let mut h = Harness::new();
-        h.cfg.file_browser.preview_autoplay = false;
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
-        h.paint(&mut v, WIDE);
-        await_preview(&h, &mut v, &d.join("c.wav"));
-        let frame = h.paint(&mut v, WIDE);
-        let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
-        assert!(ids.contains(&preview::BTN_PLAY) && ids.contains(&preview::BTN_AUTOPLAY));
-        assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled: no autoplay");
-    }
-
-    /// A browser with the audio file `c.wav` previewed and autoplay pending.
-    fn previewing_audio_with_autoplay() -> (Harness, FileBrowserView, PathBuf) {
-        let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
-        let mut h = Harness::new();
-        h.cfg.file_browser.preview_autoplay = true;
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
-        h.paint(&mut v, WIDE);
-        await_preview(&h, &mut v, &d.join("c.wav"));
-        (h, v, d.join("c.wav"))
-    }
-
-    #[test]
-    fn hiding_the_view_cancels_a_pending_autoplay_and_showing_it_does_not_restore_it() {
-        let (h, mut v, _) = previewing_audio_with_autoplay();
-        assert!(v.deadline(&h.cfg).is_some(), "autoplay is pending");
-        v.shown(false);
-        assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled while hidden");
-        v.shown(true);
-        assert_eq!(v.deadline(&h.cfg), None, "not re-armed on return");
-    }
-
-    #[test]
-    fn audio_that_finishes_loading_in_a_hidden_view_does_not_autoplay() {
-        let (d, mut v) = fixture();
-        std::fs::write(d.join("c.wav"), crate::media::testing::wav(8000, 800)).unwrap();
-        let mut h = Harness::new();
-        h.cfg.file_browser.preview_autoplay = true;
-        h.paint(&mut v, WIDE);
-        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(2) });
-        h.paint(&mut v, WIDE);
-        v.shown(false);
-        await_preview(&h, &mut v, &d.join("c.wav"));
-        assert_eq!(v.deadline(&h.cfg), None, "no autoplay armed while hidden");
-    }
-
-    #[test]
-    fn hiding_the_view_pauses_a_playing_track_and_showing_it_leaves_it_paused() {
-        let (h, mut v, wav) = previewing_audio_with_autoplay();
-        let player = crate::media::audio::AudioPlayer::new();
-        player.play(&wav);
-        v.preview.install_player(player);
-        assert!(v.preview.audio_status().is_some_and(|s| s.playing));
-        v.shown(false);
-        assert!(v.preview.audio_status().is_some_and(|s| !s.playing), "paused on hide");
-        v.shown(true);
-        assert!(v.preview.audio_status().is_some_and(|s| !s.playing), "not resumed on show");
-        assert_eq!(v.deadline(&h.cfg), None);
-    }
-
     #[test]
     fn scroll_is_pixel_precise_and_paced() {
         let d = tmpdir("fb-scroll");
@@ -2497,7 +2275,6 @@ mod tests {
         assert_eq!(checked(&items, BTN_GIT_MODIFIED), Some(false));
         assert_eq!(checked(&items, BTN_GROUP), Some(true), "the tree");
         assert_eq!(checked(&items, BTN_GROUP + 1), Some(false));
-        assert_eq!(checked(&items, BTN_PREVIEW), Some(false), "too narrow for the preview");
 
         // Choosing an item calls `button` with its id.
         h.button(&mut v, BTN_HIDDEN);

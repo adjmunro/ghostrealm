@@ -93,6 +93,9 @@ pub struct OpenCx {
     pub waker: Option<Waker>,
     /// Starts the language service for a file, if it has one.
     pub languages: Option<Arc<crate::languages::Languages>>,
+    /// What this run's Files surfaces share (the sidebar's last pin and
+    /// width).
+    pub files: crate::plugins::files::Session,
 }
 
 /// A kind of content a surface can hold. Registered once; opens [`View`]s.

@@ -78,9 +78,6 @@ const TITLE_BAR_H: f32 = 28.0;
 const TRAFFIC_LIGHT_W: f32 = 76.0;
 /// Empty-workspace screen: dim hint colour.
 const EMPTY_HINT: [u8; 3] = [110, 110, 125];
-/// Below this focused-pane width (logical px), the file browser opens files as tabs even
-/// when `[file_browser] open_in = "split"` (a split would be too cramped).
-const FILE_BROWSER_SPLIT_MIN_W: f32 = 560.0;
 
 /// Glyphs pre-rasterised into the atlas after a metrics change so the first
 /// scroll into fresh content doesn't stall rasterising them: printable ASCII
@@ -1427,8 +1424,8 @@ impl State {
     }
 
     /// Whether a pane shows a tab strip: multiple surfaces, or autohide disabled.
-    /// (A single-tab editor's filename goes in its own ribbon, not a tab, so it
-    /// doesn't carry a close button.)
+    /// (A pane holding one Files surface shows its file in the surface's own
+    /// row and header instead.)
     fn strip_shown(&self, n: usize) -> bool {
         n > 1 || !self.cfg.tabs.autohide_single_tab
     }
@@ -1483,32 +1480,9 @@ impl State {
         Duration::from_millis(self.cfg.input.double_click_ms as u64)
     }
 
-    /// The focused pane's width in physical pixels (for the split-vs-tab decision).
-    fn focused_pane_width(&self) -> f32 {
-        let ws = self.workspace_rect();
-        self.app
-            .tree
-            .active_vtab()
-            .and_then(|vt| self.app.tree.vtab(vt))
-            .and_then(|v| {
-                let fp = v.focused_pane;
-                v.layout(ws, DIVIDER).into_iter().find(|(id, _)| *id == fp).map(|(_, r)| r.w)
-            })
-            .unwrap_or(ws.w)
-    }
-
-    /// Open a file a view asked for: a horizontal split beside it when
-    /// `[file_browser] open_in = "split"` and the pane is wide enough, else a tab.
+    /// Open a file a view asked for, in a Files surface.
     fn open_requested_file(&mut self, path: std::path::PathBuf) {
-        use ghostrealm_core::config::OpenIn;
-        let split = self.cfg.file_browser.open_in == OpenIn::Split
-            && self.focused_pane_width() >= FILE_BROWSER_SPLIT_MIN_W * self.scale;
-        let opened = if split {
-            self.app.open_path_split(&path, Axis::LeftRight)
-        } else {
-            self.app.open_path_in_focused(&path)
-        };
-        if let Err(e) = opened {
+        if let Err(e) = self.app.open_file(&path) {
             eprintln!("ghostrealm: open {}: {e:#}", path.display());
         }
     }
@@ -2824,7 +2798,7 @@ impl State {
         let title_text = match purpose {
             Pick::NewWorkspace => "New workspace directory",
             Pick::ActiveRoot => "Set workspace directory",
-            Pick::OpenWith(_) => "Open file",
+            Pick::Open => "Open file",
             Pick::SaveAs(_) => "Save as",
             Pick::SaveCopy(_) => "Save copy as",
         };
@@ -2862,7 +2836,7 @@ impl State {
         // With nothing chosen yet, the confirm button shows but is inert.
         let choice = view.choice();
         let verb = match purpose {
-            Pick::OpenWith(_) => "Open",
+            Pick::Open => "Open",
             Pick::SaveAs(_) | Pick::SaveCopy(_) if choice.as_ref().is_some_and(|p| p.exists()) => "Replace",
             Pick::SaveAs(_) | Pick::SaveCopy(_) => "Save",
             Pick::NewWorkspace | Pick::ActiveRoot => "Use",
@@ -4164,6 +4138,7 @@ impl State {
             }
             if let Some(next) = focused {
                 self.view_event(next, |v, cx| v.focus_changed(cx, true));
+                self.app.note_focus(next);
             }
             self.last_focused_surface = focused;
         }
@@ -4375,7 +4350,6 @@ impl State {
                     sid,
                 );
                 cx.focused = pr.focused;
-                cx.tab_strip = *strip_h > 0.0;
                 cx.modal = modal;
                 view.paint(&mut cx, *term);
                 painted.push(sid);

@@ -16,7 +16,7 @@ pub const LABEL_HOVER: [u8; 3] = [210, 210, 220];
 pub const DIM: [u8; 3] = [120, 120, 135];
 /// Headings and titles.
 pub const TITLE: [u8; 3] = [170, 170, 185];
-/// Body text on chrome surfaces (tab titles, ribbons).
+/// Body text on chrome surfaces (tab titles, document headers).
 pub const TEXT: [u8; 3] = [220, 220, 230];
 /// Metadata beside body text (sizes, counts, paths).
 pub const TEXT_DIM: [u8; 3] = [140, 140, 155];

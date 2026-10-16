@@ -1,4 +1,4 @@
-//! The ribbon's file statistic, cycled by clicking: lines, words, bytes, and —
+//! The document header's file statistic, cycled by clicking: lines, words, bytes, and —
 //! for a file git tracks — lines added and deleted since `HEAD` (unsaved edits
 //! included).
 
@@ -11,7 +11,7 @@ use ghostrealm_core::{git, line_diff};
 use super::buffer::{split_lines, EditorBuffer};
 use crate::plugin::{theme, Waker};
 
-/// Which statistic the ribbon shows.
+/// Which statistic the header shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stat {
     Lines,

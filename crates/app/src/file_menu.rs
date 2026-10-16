@@ -11,8 +11,8 @@ use ghostrealm_core::{Args, Value};
 pub enum Origin {
     /// A row (or empty space) in a file browser.
     Browser,
-    /// An editor's file name.
-    Editor,
+    /// A document's header (its file name, `⋯`, or a right-click on it).
+    Document,
 }
 
 /// What the menu was opened on.
@@ -170,14 +170,14 @@ pub enum MenuEntry {
 /// The menu for `target`: sections separated by rules, Delete last.
 pub fn entries(target: &FileTarget, env: MenuEnv) -> Vec<MenuEntry> {
     use FileAction::*;
-    let (kind, editor) = (target.kind, target.origin == Origin::Editor);
+    let (kind, doc) = (target.kind, target.origin == Origin::Document);
     let entry = kind != Kind::Empty;
     let dir = kind != Kind::File;
     let mut sections: Vec<Vec<FileAction>> = vec![
         [NewFile, NewFolder].into_iter().filter(|_| dir).collect(),
         [
             env.reveal.then_some(Reveal),
-            editor.then_some(ShowInBrowser),
+            doc.then_some(ShowInBrowser),
             Some(OpenDefault),
             dir.then_some(OpenInTerminal),
         ]
@@ -195,7 +195,7 @@ pub fn entries(target: &FileTarget, env: MenuEnv) -> Vec<MenuEntry> {
         .collect(),
         [CopyPath, CopyRelativePath].into_iter().filter(|_| entry).collect(),
         [AddToGitignore, AddToExclude].into_iter().filter(|_| entry && env.in_git).collect(),
-        [entry.then_some(Rename), editor.then_some(SaveCopyAs)].into_iter().flatten().collect(),
+        [entry.then_some(Rename), doc.then_some(SaveCopyAs)].into_iter().flatten().collect(),
         [Delete].into_iter().filter(|_| entry).collect(),
     ];
     sections.retain(|s| !s.is_empty());
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn the_editors_file_name_gets_show_in_browser_and_save_copy_as() {
-        let items = shape(target(Kind::File, Origin::Editor), ENV);
+        let items = shape(target(Kind::File, Origin::Document), ENV);
         assert!(items.contains(&Some(ShowInBrowser)));
         assert!(items.contains(&Some(SaveCopyAs)));
         assert!(!items.contains(&Some(NewFile)));

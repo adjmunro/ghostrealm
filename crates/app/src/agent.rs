@@ -306,6 +306,26 @@ mod tests {
     }
 
     #[test]
+    fn get_surface_shows_an_opened_file_under_its_sidebars_listing() {
+        let d = crate::plugin::testing::tmpdir("agent-files");
+        std::fs::write(d.join("notes.md"), "# Notes\nhello agent\n").unwrap();
+        let mut state = AppState::new();
+        let mut registry = build_registry();
+        let path = d.to_str().unwrap();
+        let mut ask = |state: &mut AppState, req: &str| handle(req, state, &mut registry);
+        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"workspace.new","args":{{"dir":"{path}"}}}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
+        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/notes.md"}}}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
+        let id = state.focused_surface().unwrap().0;
+        let resp = ask(&mut state, &format!(r#"{{"op":"get","what":"surface","id":{id}}}"#));
+        let text = resp["text"].as_str().unwrap_or_else(|| panic!("{resp:?}"));
+        assert!(text.starts_with(&format!("{path}\n")), "the sidebar's folder first:\n{text}");
+        assert!(text.contains("  notes.md\n"), "then its listing:\n{text}");
+        assert!(text.ends_with(&format!("--- {path}/notes.md\n# Notes\nhello agent")), "then the file:\n{text}");
+    }
+
+    #[test]
     fn set_validates_missing_args() {
         let resps = drive(&[
             r#"{"op":"set","id":"workspace.new"}"#,

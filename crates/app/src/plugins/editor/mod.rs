@@ -21,7 +21,7 @@ use ghostrealm_core::{
 use ghostrealm_lsp::Client;
 use ghostrealm_terminal::{Key, KeyPress};
 
-use crate::app_state::{AppState, Pick};
+use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::syntax;
 use crate::plugin::icons::Icon;
@@ -30,6 +30,7 @@ use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MenuAlign, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
     Request, RowStyles, View, Waker,
 };
+use crate::plugins::files::header::{text_kind, DocHeader, HeaderText};
 
 pub use buffer::EditorBuffer;
 use stats::{Stat, Stats};
@@ -51,7 +52,7 @@ const EDITOR_CURSOR_LINE_ALPHA: f32 = 0.05;
 /// Spaces a Tab inserts.
 const TAB_WIDTH: usize = 4;
 
-/// The ribbon's buttons and `⋯` menu items (see [`View::button`]). The
+/// The header's buttons and `⋯` menu items (see [`View::button`]). The
 /// statistic items take a range from `BTN_SHOW_STAT` up, so every other id
 /// stays below it.
 const BTN_WRAP: u32 = 0;
@@ -72,7 +73,7 @@ const _: () = assert!(
         && BTN_SHOW_STAT > BTN_FILE_MENU,
     "the statistic items' ids must not collide with another button's"
 );
-/// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
+/// The idle-autosave delay (seconds) when autosave is switched on in the header
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
 
@@ -87,6 +88,12 @@ impl Plugin for EditorPlugin {
         "New File"
     }
 
+    /// An editor is a Files surface's document, not a surface of its own.
+    fn pickable(&self) -> bool {
+        false
+    }
+
+    /// An empty buffer, as a document (see `AppState::open_doc`).
     fn open(&self, cx: &OpenCx) -> Result<Box<dyn View>> {
         Ok(Box::new(EditorView::with_waker(EditorBuffer::scratch(), cx.waker.clone())))
     }
@@ -110,9 +117,9 @@ impl Plugin for EditorPlugin {
     fn register_commands(&self, r: &mut Registry<AppState>) {
         let failed = |e: anyhow::Error| CmdError::Failed(format!("{e:#}"));
         r.register(
-            CommandMeta::new("editor.new", "New Editor", "Open an empty text editor in the focused pane"),
+            CommandMeta::new("editor.new", "New Editor", "Open an empty text document in a Files surface"),
             Box::new(move |s: &mut AppState, _| {
-                s.open_plugin_in_focused(ID).map_err(failed)?;
+                s.open_scratch().map_err(failed)?;
                 Ok(CmdOutcome::ok())
             }),
         );
@@ -120,16 +127,16 @@ impl Plugin for EditorPlugin {
             CommandMeta::new(
                 "editor.open",
                 "Open File in Editor",
-                "Open a file in a text editor in the focused pane",
+                "Open a file in a Files surface: the focused one, else the workspace's last focused one, else a new one",
             )
             .arg(ArgSpec::optional("path", ArgKind::Str, "the file to open (chosen in a picker unless given)")),
             Box::new(move |s: &mut AppState, a| {
                 if a.get("path").is_none() {
-                    s.open_picker(Pick::OpenWith(ID));
+                    s.open_picker(crate::app_state::Pick::Open);
                     return Ok(CmdOutcome::ok());
                 }
                 let path = PathBuf::from(a.get_str("path")?);
-                s.open_path_with_in_focused(ID, &path).map_err(failed)?;
+                s.open_file(&path).map_err(failed)?;
                 Ok(CmdOutcome::ok())
             }),
         );
@@ -182,7 +189,7 @@ impl Plugin for EditorPlugin {
                     "soft_wrap",
                     Kind::Bool,
                     Some("true"),
-                    "Wrap long lines at the pane edge (toggle per pane with the ribbon button). \
+                    "Wrap long lines at the pane edge (toggle per document with the header's button). \
                      Off clips them.",
                 ),
                 OptionSpec::new(
@@ -205,7 +212,7 @@ impl Plugin for EditorPlugin {
 /// Where the last paint put the text, for mapping the mouse to (line, col).
 #[derive(Clone, Copy)]
 struct Layout {
-    /// The text area including the gutter (below any ribbon).
+    /// The text area including the gutter (below any header).
     body: Rect,
     /// Left edge of the text (right of the gutter).
     text_x: f32,
@@ -217,12 +224,12 @@ pub struct EditorView {
     buf: EditorBuffer,
     /// This view's soft-wrap override; `None` follows `[editor] soft_wrap`.
     soft_wrap: Option<bool>,
-    /// This view's autosave override (the ribbon toggle); `None` follows
+    /// This view's autosave override (the header toggle); `None` follows
     /// `[editor] autosave_after` / `autosave_on_unfocus`.
     autosave: Option<bool>,
     /// When the buffer was last written (any save).
     last_saved: Option<Instant>,
-    /// The ribbon's statistic (click to cycle).
+    /// The header's statistic (click to cycle).
     stats: Stats,
     /// Sub-line wheel remainder (px) carried between events so slow scrolls
     /// accumulate instead of rounding away.
@@ -232,11 +239,16 @@ pub struct EditorView {
     seen_edits: u64,
     last_edit_at: Option<Instant>,
     layout: Layout,
-    /// The ribbon's file name and the ribbon itself, as last painted (none
-    /// under a tab strip or without a file): they open the file menu.
+    /// Draw the document header above the text: the view is a Files
+    /// surface's document.
+    header_on: bool,
+    header: DocHeader,
+    /// The header's file name and the header itself, as last painted (none
+    /// without a header, the name none without a file): they open the file
+    /// menu.
     name_hit: Option<Rect>,
-    ribbon: Option<Rect>,
-    /// The ribbon's `⋯` button, as last painted: its menu opens below it.
+    header_rect: Option<Rect>,
+    /// The header's `⋯` button, as last painted: its menu opens below it.
     more_hit: Option<Rect>,
     /// The file's language service, if it has one.
     lang: Option<Lang>,
@@ -252,7 +264,7 @@ impl EditorView {
     }
 
     /// Like [`Self::new`], waking the UI with `waker` when background work
-    /// (the ribbon's statistic) finishes.
+    /// (the header's statistic) finishes.
     pub fn with_waker(buf: EditorBuffer, waker: Option<Waker>) -> Self {
         let mut stats = Stats::new(waker);
         stats.fetch_head(buf.path.clone());
@@ -273,8 +285,10 @@ impl EditorView {
                 wrap_cols: usize::MAX,
             },
             lang: None,
+            header_on: false,
+            header: DocHeader::default(),
             name_hit: None,
-            ribbon: None,
+            header_rect: None,
             more_hit: None,
         }
     }
@@ -295,6 +309,12 @@ impl EditorView {
 
     pub fn buffer_mut(&mut self) -> &mut EditorBuffer {
         &mut self.buf
+    }
+
+    /// Draw the document header above the text (its host, a Files surface,
+    /// sets it).
+    pub fn set_header(&mut self, on: bool) {
+        self.header_on = on;
     }
 
     /// The file's language service, if it has one.
@@ -444,7 +464,7 @@ impl EditorView {
     fn open_file_menu(&self, cx: &mut EventCx, at: (f32, f32), align: MenuAlign) {
         if let Some(path) = self.buf.path.clone() {
             cx.request(Request::FileMenu {
-                target: FileTarget { path, kind: TargetKind::File, origin: Origin::Editor },
+                target: FileTarget { path, kind: TargetKind::File, origin: Origin::Document },
                 at,
                 align,
             });
@@ -457,8 +477,8 @@ impl EditorView {
         self.more_hit.map(|mb| (mb.x + mb.w, mb.y + mb.h))
     }
 
-    /// The ribbon's `⋯` menu: every ribbon option, checked as it stands.
-    fn ribbon_menu(&self, cfg: &Config) -> Vec<MenuItem> {
+    /// The header's `⋯` menu: every header option, checked as it stands.
+    fn header_menu(&self, cfg: &Config) -> Vec<MenuItem> {
         let has_file = self.buf.path.is_some();
         let mut items = vec![
             MenuItem::new(BTN_WRAP, "Soft wrap").check(self.wrap_on(cfg)),
@@ -559,77 +579,82 @@ impl EditorView {
         (col_off < len).then_some((ln, start + col_off))
     }
 
-    /// The filename ribbon a single-tab editor shows in place of a tab: the name
-    /// (italic when unsaved), a statistic (click to cycle), the autosave and
-    /// soft-wrap toggles, and `⋯` (a menu of every option).
-    fn paint_ribbon(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
+    /// The document header: the file's details, with the controls at the
+    /// right of the name's line: a statistic (click to cycle), the autosave
+    /// and soft-wrap toggles, and `⋯` (a menu of every option).
+    fn paint_header(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
-        let pad = 8.0 * cx.ui.scale;
-        cx.fill(r, cx.chrome.sidebar);
-        let top = r.y + (r.h - ch) * 0.5;
+        let row = DocHeader::control_row(cx.ui, r);
+        let side = row.h;
+        let top = row.y + (row.h - ch) * 0.5;
+        // Laid out right to left first: the header's text stops at them.
+        let mb = Rect { x: row.x + row.w - side, y: row.y, w: side, h: side };
+        let wb = Rect { x: mb.x - side, ..mb };
+        let ab = Rect { x: wb.x - side, ..wb };
+        self.stats.poll();
+        let spans = self.stats.spans(&self.buf);
+        let stat = cx.shape_spans(&spans, Font::SANS, r.w);
+        let gap = 6.0 * cx.ui.scale;
+        let stat_left = ab.x - gap - stat.width;
+        let sb = Rect { x: stat_left - gap, y: row.y, w: stat.width + gap * 2.0, h: row.h };
+
+        let e = &self.buf;
+        let title = e.title();
+        let kind = text_kind(e.path.as_deref());
+        let text = HeaderText {
+            name: &title,
+            path: e.path.as_deref(),
+            kind: &kind,
+            modified: e.modified,
+            changed_on_disk: e.changed_on_disk,
+            extra: None,
+        };
+        let name = self.header.paint(cx, r, sb.x, &text, Some(BTN_NAME));
+        self.name_hit = e.path.is_some().then_some(name);
+        self.header_rect = Some(r);
+
+        let radius = theme::box_radius(cx.ui);
+        let hover = |cx: &mut PaintCx, b: Rect| {
+            cx.round_rect(hover_box(b, side), radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
+        };
         // `⋯`, pinned to the right end.
-        let mb = Rect { x: r.x + r.w - ch - pad, y: r.y, w: ch, h: r.h };
         let more_hover = cx.button(mb, BTN_MORE);
         if more_hover {
-            cx.highlight(hover_box(mb, ch));
+            hover(cx, mb);
         }
         cx.tooltip(mb, "More options");
-        let side = ch * 0.75;
-        let icon = Rect { x: mb.x + (mb.w - side) * 0.5, y: mb.y + (mb.h - side) * 0.5, w: side, h: side };
+        let icon_side = (ch * 0.8).round();
+        let icon = Rect {
+            x: mb.x + ((mb.w - icon_side) * 0.5).round(),
+            y: mb.y + ((mb.h - icon_side) * 0.5).round(),
+            w: icon_side,
+            h: icon_side,
+        };
         Icon::More.paint(cx, icon, if more_hover { theme::GLYPH_HOVER } else { theme::GLYPH });
         self.more_hit = Some(mb);
         // Soft-wrap toggle left of it.
-        let wb = Rect { x: mb.x - ch, ..mb };
         if cx.button(wb, BTN_WRAP) {
-            cx.highlight(hover_box(wb, ch));
+            hover(cx, wb);
         }
         cx.tooltip(wb, "Soft wrap");
         let wb_color = if wrap { cx.chrome.accent } else { theme::GLYPH };
         cx.label("\u{21a9}", Font::MONO, wb.x + (wb.w - cw) * 0.5, top, wb, wb_color);
         // Autosave toggle (a floppy disk: green on, grey off) left of it; a
         // buffer with no file never autosaves, so there it is off and inert.
-        let ab = Rect { x: wb.x - ch, ..wb };
         let has_file = self.buf.path.is_some();
         if has_file && cx.button(ab, BTN_AUTOSAVE) {
-            cx.highlight(hover_box(ab, ch));
+            hover(cx, ab);
         }
         cx.tooltip(ab, self.autosave_tip(cx.cfg));
         let disk = if has_file && self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
         paint_floppy(cx, ab, FLOPPY * ch, disk);
         // The statistic (click to cycle), right-aligned against the disk's
         // whole button (not just the glyph), so their hit areas never overlap.
-        self.stats.poll();
-        let spans = self.stats.spans(&self.buf);
-        let stat = cx.shape_spans(&spans, Font::SANS, r.w);
-        let gap = 6.0 * cx.ui.scale;
-        let stat_left = ab.x - gap - stat.width;
-        let sb = Rect { x: stat_left - gap, y: r.y, w: stat.width + gap * 2.0, h: r.h };
         if cx.button(sb, BTN_STAT) {
-            cx.highlight(sb);
+            cx.round_rect(sb, radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
         }
         cx.tooltip(sb, self.stats.tip());
         cx.place(stat, stat_left, top, sb, theme::TEXT_DIM);
-        // Filename, left-aligned, clipped before the statistic.
-        let e = &self.buf;
-        let name_clip = Rect { x: r.x, y: r.y, w: (sb.x - r.x).max(0.0), h: r.h };
-        let font = Font::SANS.italic(e.modified);
-        let name = cx.shape(&e.title(), font, name_clip.w);
-        let name_w = name.width;
-        let name_color = if e.changed_on_disk { theme::WARN } else { theme::TEXT };
-        cx.place(name, r.x + pad, top, name_clip, name_color);
-        // With a file, the name opens its menu.
-        self.ribbon = Some(r);
-        self.name_hit = e.path.is_some().then(|| {
-            let hit = Rect { x: r.x, y: r.y, w: (name_w + pad * 2.0).min(name_clip.w), h: r.h };
-            if cx.button(hit, BTN_NAME) {
-                cx.highlight(hit);
-            }
-            cx.tooltip(
-                hit,
-                if e.changed_on_disk { "Changed on disk since you opened it\nFile actions" } else { "File actions" },
-            );
-            hit
-        });
     }
 }
 
@@ -637,7 +662,7 @@ impl EditorView {
 const FLOPPY: f32 = 0.6;
 
 /// A floppy-disk icon `side` px square, centred in `r`: a body in `color` with
-/// the shutter and label cut out in the ribbon colour.
+/// the shutter and label cut out in the header colour.
 fn paint_floppy(cx: &mut PaintCx, r: Rect, side: f32, color: [u8; 3]) {
     let x = r.x + (r.w - side) * 0.5;
     let y = r.y + (r.h - side) * 0.5;
@@ -686,13 +711,12 @@ impl View for EditorView {
         }
         let (cw, ch, scale) = (cx.ui.cell_w, cx.ui.cell_h, cx.ui.scale);
         let wrap = self.wrap_on(cx.cfg);
-        // Without a tab strip, the filename gets a ribbon of its own.
         let mut body = rect;
-        (self.ribbon, self.name_hit, self.more_hit) = (None, None, None);
-        if !cx.tab_strip {
-            let ribbon_h = ch + 6.0 * scale;
-            self.paint_ribbon(cx, Rect { h: ribbon_h, ..rect }, wrap);
-            body = Rect { y: rect.y + ribbon_h, h: (rect.h - ribbon_h).max(1.0), ..rect };
+        (self.header_rect, self.name_hit, self.more_hit) = (None, None, None);
+        if self.header_on {
+            let header_h = DocHeader::height(cx.ui).min(rect.h);
+            self.paint_header(cx, Rect { h: header_h, ..rect }, wrap);
+            body = Rect { y: rect.y + header_h, h: (rect.h - header_h).max(1.0), ..rect };
         }
 
         let rows_vis = (body.h / ch).floor().max(1.0) as usize;
@@ -982,7 +1006,7 @@ impl View for EditorView {
     }
 
     fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
-        if self.ribbon.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
+        if self.header_rect.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
             self.open_file_menu(cx, pos, MenuAlign::Left);
         }
     }
@@ -1003,7 +1027,7 @@ impl View for EditorView {
             }
             BTN_MORE => {
                 if let Some(at) = self.more_anchor() {
-                    let items = self.ribbon_menu(cx.cfg);
+                    let items = self.header_menu(cx.cfg);
                     cx.request(Request::Menu { items, at, align: MenuAlign::Right });
                 }
                 return;
@@ -1182,16 +1206,21 @@ mod tests {
         EditorView::new(b)
     }
 
-    /// Where column `col` of visual row `row` sits, painted with a tab strip (no
-    /// ribbon) and the default gutter (2 digits + 2 pad = 4 cells).
+    /// Where column `col` of visual row `row` sits, painted with no header
+    /// and the default gutter (2 digits + 2 pad = 4 cells).
     fn at(row: usize, col: usize) -> (f32, f32) {
         let text_x = 4.0 * UI.cell_w;
         (text_x + col as f32 * UI.cell_w, row as f32 * UI.cell_h + 1.0)
     }
 
-    fn paint_in_strip(h: &mut Harness, v: &mut EditorView) {
-        h.tab_strip = true;
+    fn paint_plain(h: &mut Harness, v: &mut EditorView) {
         h.paint(v, RECT);
+    }
+
+    /// `v` with the document header, as a Files surface shows it.
+    fn hosted(mut v: EditorView) -> EditorView {
+        v.set_header(true);
+        v
     }
 
     /// A language server that flags every "bad" and documents every word.
@@ -1263,10 +1292,10 @@ mod tests {
     fn diagnostics_are_underlined_and_follow_edits() {
         let mut h = Harness::new();
         let mut v = attached("ok bad\n");
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         let plain = h.frame.top.len();
         settle(&mut v);
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         assert_eq!(h.frame.top.len(), plain + 1, "one underline");
 
         v.buffer_mut().cursor = (1, 0);
@@ -1279,7 +1308,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             v.refresh();
-            paint_in_strip(&mut h, &mut v);
+            paint_plain(&mut h, &mut v);
             if h.frame.top.len() == plain + 2 {
                 break;
             }
@@ -1293,7 +1322,7 @@ mod tests {
         let mut h = Harness::new();
         let mut v = attached("ok bad\n");
         settle(&mut v);
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
 
         let p = at(0, 4);
         h.cursor = p;
@@ -1304,7 +1333,7 @@ mod tests {
         assert_eq!(popup_text(&v), Some(vec!["flagged".to_string()]));
         settle(&mut v);
         assert_eq!(popup_text(&v), Some(vec!["flagged".to_string(), "docs for bad".to_string()]));
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         assert!(!h.frame.overlay_text.is_empty(), "the popup paints above the panes");
 
         // Moving within the word keeps it; moving off closes it.
@@ -1319,17 +1348,17 @@ mod tests {
         let mut h = Harness::new();
         let mut v = attached("word\n");
         h.cursor = at(0, 1);
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         settle(&mut v);
         h.mouse(&mut v, MouseEvent::Move { pos: at(0, 1) });
         let due = v.deadline(&h.cfg).unwrap();
         h.tick(&mut v, due);
         settle(&mut v);
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         assert!(popup_text(&v).is_some(), "a plain repaint keeps it");
         assert!(!h.frame.overlay_text.is_empty());
         h.modal = true;
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         assert_eq!(popup_text(&v), None);
         assert!(h.frame.overlay_text.is_empty(), "nothing paints over the modal");
         assert_eq!(v.deadline(&h.cfg), None, "and it doesn't come back under it");
@@ -1339,7 +1368,7 @@ mod tests {
     fn typing_closes_the_popup() {
         let mut h = Harness::new();
         let mut v = attached("word\n");
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         settle(&mut v);
         h.mouse(&mut v, MouseEvent::Move { pos: at(0, 1) });
         let due = v.deadline(&h.cfg).unwrap();
@@ -1351,18 +1380,22 @@ mod tests {
     }
 
     #[test]
-    fn a_single_tab_editor_draws_its_ribbon_with_the_wrap_toggle() {
-        let mut v = view_with("hello");
+    fn a_hosted_editor_draws_its_header_with_the_wrap_toggle_above_the_text() {
+        let mut v = hosted(view_with("hello"));
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
         assert!(frame.view_buttons.iter().any(|(_, _, id)| *id == BTN_WRAP));
-        paint_in_strip(&mut h, &mut v);
-        assert!(h.frame.view_buttons.is_empty(), "under a tab strip, no ribbon");
+        assert!(h.texts().iter().any(|t| t == "Text"), "the kind: {:?}", h.texts());
+        let header_h = crate::plugins::files::header::DocHeader::height(UI);
+        assert_eq!(v.layout.body.y, header_h, "the text starts below the header");
+        v.set_header(false);
+        paint_plain(&mut h, &mut v);
+        assert!(h.frame.view_buttons.is_empty(), "no header, no buttons");
     }
 
     #[test]
     fn the_statistic_ends_where_the_disk_button_begins_and_cycles_on_click() {
-        let mut v = view_with("one two");
+        let mut v = hosted(view_with("one two"));
         v.buf.path = Some(tmpdir("editor-stat").join("f.txt"));
         let mut h = Harness::new();
         let buttons = h.paint(&mut v, RECT).view_buttons.clone();
@@ -1375,18 +1408,18 @@ mod tests {
     }
 
     #[test]
-    fn the_ribbons_file_name_opens_the_file_menu_and_so_does_a_right_click_on_the_ribbon() {
+    fn the_headers_file_name_opens_the_file_menu_and_so_does_a_right_click_on_the_header() {
         let path = tmpdir("editor-menu").join("f.txt");
         std::fs::write(&path, "x
 ").unwrap();
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        let mut v = hosted(EditorView::new(EditorBuffer::open(path.clone()).unwrap()));
         let mut h = Harness::new();
         let name = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_NAME).expect("a name button").0;
-        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Editor };
+        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Document };
         let out = h.button(&mut v, BTN_NAME);
         let at = (name.x, name.y + name.h);
         assert_eq!(out.requests, [Request::FileMenu { target: target.clone(), at, align: MenuAlign::Left }]);
-        // Right-click anywhere on the ribbon; not on the text.
+        // Right-click anywhere on the header; not on the text.
         let at = (RECT.w - 2.0, 3.0);
         let out = h.context_menu(&mut v, at);
         assert_eq!(out.requests, [Request::FileMenu { target, at, align: MenuAlign::Left }]);
@@ -1402,10 +1435,10 @@ mod tests {
     }
 
     #[test]
-    fn the_ribbons_more_button_lists_every_option_checked_as_it_stands() {
+    fn the_headers_more_button_lists_every_option_checked_as_it_stands() {
         let path = tmpdir("editor-more").join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
-        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        let mut v = hosted(EditorView::new(EditorBuffer::open(path.clone()).unwrap()));
         let mut h = Harness::new();
         h.cfg.editor.soft_wrap = false;
         (h.cfg.editor.autosave_after, h.cfg.editor.autosave_on_unfocus) = (0, false);
@@ -1414,7 +1447,7 @@ mod tests {
         let others = buttons.iter().filter(|b| b.2 != BTN_MORE);
         assert!(others.clone().count() >= 3);
         for b in others {
-            assert!(b.0.x + b.0.w <= more.x + 0.5, "⋯ is right of every other ribbon button: {b:?}");
+            assert!(b.0.x + b.0.w <= more.x + 0.5, "⋯ is right of every other header button: {b:?}");
         }
         // Below the button, right edges flush, so the menu stays over the
         // editor.
@@ -1435,11 +1468,11 @@ mod tests {
         assert!(items.iter().all(|i| i.id != BTN_SHOW_STAT + 3), "untracked: no changes item");
         assert!(items.iter().any(|i| i.id == BTN_FILE_MENU && i.enabled), "file actions");
         // "File actions…" opens the file menu where the `⋯` menu was.
-        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Editor };
+        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Document };
         let out = h.button(&mut v, BTN_FILE_MENU);
         assert_eq!(out.requests, [Request::FileMenu { target, at: anchor, align: MenuAlign::Right }]);
 
-        // Choosing an item is the same click as its ribbon icon.
+        // Choosing an item is the same click as its header icon.
         for id in [BTN_WRAP, BTN_AUTOSAVE, BTN_SHOW_STAT + 2] {
             assert!(h.button(&mut v, id).redraw);
         }
@@ -1453,7 +1486,7 @@ mod tests {
 
     #[test]
     fn a_scratch_buffers_more_menu_offers_autosave_disabled() {
-        let mut v = view_with("x");
+        let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let out = h.button(&mut v, BTN_MORE);
@@ -1466,8 +1499,8 @@ mod tests {
     }
 
     #[test]
-    fn a_scratch_buffer_or_a_tab_strip_has_no_file_menu() {
-        let mut v = view_with("x");
+    fn a_scratch_buffer_or_an_editor_without_a_header_has_no_file_menu() {
+        let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
         assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_NAME), "no file, no menu");
@@ -1476,8 +1509,8 @@ mod tests {
         std::fs::write(&path, "x
 ").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
-        paint_in_strip(&mut h, &mut v);
-        assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty(), "the tab strip has no ribbon");
+        paint_plain(&mut h, &mut v);
+        assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty(), "no header there");
     }
 
     #[test]
@@ -1560,7 +1593,7 @@ mod tests {
 
     #[test]
     fn a_scratch_buffer_shows_autosave_off_and_inert() {
-        let mut v = view_with("x");
+        let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
         assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_AUTOSAVE), "no toggle to click");
@@ -1569,7 +1602,7 @@ mod tests {
 
     #[test]
     fn hovering_the_wrap_toggle_offers_a_tooltip() {
-        let mut v = view_with("x");
+        let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
         let wrap = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_WRAP).unwrap().0;
         assert!(h.frame.tooltip.is_none(), "not hovered");
@@ -1582,7 +1615,7 @@ mod tests {
     fn click_places_the_cursor_and_drag_selects() {
         let mut v = view_with("hello world\nsecond");
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         h.mouse(&mut v, MouseEvent::Down { pos: at(1, 3), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.buffer().cursor, (1, 3));
         h.mouse(&mut v, MouseEvent::Drag { pos: at(0, 5), button: MouseButton::Left });
@@ -1598,7 +1631,7 @@ mod tests {
     fn double_click_selects_the_word_and_keeps_it_on_release() {
         let mut v = view_with("hello world");
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 7), clicks: 2, button: MouseButton::Left });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 7), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("world"));
@@ -1608,7 +1641,7 @@ mod tests {
     fn double_click_on_the_right_half_of_a_cell_selects_that_cells_word() {
         let mut v = view_with("hello world again");
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         let (x, y) = at(0, 10); // the `d` ending "world"
         let pos = (x + UI.cell_w * 0.75, y);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2, button: MouseButton::Left });
@@ -1620,7 +1653,7 @@ mod tests {
     fn triple_click_selects_the_line() {
         let mut v = view_with("one two\nthree");
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 5), clicks: 3, button: MouseButton::Left });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 5), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().selected_text().as_deref(), Some("one two"));
@@ -1632,7 +1665,7 @@ mod tests {
         v.soft_wrap = Some(false);
         v.buf.hscroll = 50;
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         h.mouse(&mut v, MouseEvent::Down { pos: at(0, 3), clicks: 1, button: MouseButton::Left });
         h.mouse(&mut v, MouseEvent::Up { pos: at(0, 3), dragged: false, button: MouseButton::Left });
         assert_eq!(v.buffer().cursor, (0, 2));
@@ -1644,7 +1677,7 @@ mod tests {
     fn typing_after_a_mouse_selection_is_its_own_undo_step() {
         let mut v = view_with("");
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         for c in "abc".chars() {
             h.key(&mut v, press(Key::Char(c)));
         }
@@ -1663,7 +1696,7 @@ mod tests {
         let long = "word ".repeat(20);
         let mut v = view_with(&long);
         let mut h = Harness::new();
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         h.mouse(&mut v, MouseEvent::Down { pos: at(1, 2), clicks: 1, button: MouseButton::Left });
         let (line, col) = v.buffer().cursor;
         assert_eq!(line, 0, "the second visual row is still line 0");
@@ -1938,16 +1971,16 @@ mod tests {
         let mut h = Harness::new();
         let text = "hello world\n- item one\n> quote";
         let mut md = markdown_view("editor-md-plain", text);
-        paint_in_strip(&mut h, &mut md);
+        paint_plain(&mut h, &mut md);
         let md_quads = bg_rects(&h).len();
         let row0 = text_item(&h, 0);
         let mut txt = view_with(text);
-        paint_in_strip(&mut h, &mut txt);
+        paint_plain(&mut h, &mut txt);
         assert_eq!(bg_rects(&h).len(), md_quads, "no decoration quads for plain rows");
         // The first row has one span in the plain colour: the key a plain row always had.
         let key = h.text.row_cache.row_key(std::iter::once(("hello world", EDITOR_FG)));
         assert_eq!(row0, TextSrc::Row(key));
-        paint_in_strip(&mut h, &mut txt);
+        paint_plain(&mut h, &mut txt);
         assert_eq!(text_item(&h, 0), TextSrc::Row(key), "same as with no highlighter");
     }
 
@@ -1955,11 +1988,11 @@ mod tests {
     fn markdown_styles_draw_underline_and_code_box_quads_and_keep_the_markers() {
         let mut h = Harness::new();
         let mut plain = markdown_view("editor-md-plain2", "see the docs now");
-        paint_in_strip(&mut h, &mut plain);
+        paint_plain(&mut h, &mut plain);
         let base = bg_rects(&h);
 
         let mut v = markdown_view("editor-md-link", "see [the docs](u) now");
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         let got = bg_rects(&h);
         // "the docs" starts at column 5 and is 8 cells wide; the underline is a thin quad at the row bottom.
         let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w);
@@ -1971,7 +2004,7 @@ mod tests {
         assert_eq!(v.buffer().lines[0], "see [the docs](u) now");
 
         let mut v = markdown_view("editor-md-code", "a `code` b");
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         let boxes: Vec<_> = bg_rects(&h).into_iter().filter(|r| !base.contains(r) && r.3 > 3.0).collect();
         assert_eq!(boxes.len(), 1, "{boxes:?}");
         assert_eq!((boxes[0].0, boxes[0].2), (text_x + 3.0 * cw, 4.0 * cw), "the code text, not the backticks");
@@ -1981,7 +2014,7 @@ mod tests {
     fn fenced_blocks_get_a_full_width_background_and_their_language_colours() {
         let mut h = Harness::new();
         let mut v = markdown_view("editor-md-fence", "text\n```toml\nname = 1\n```\nafter");
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         let text_x = 4.0 * UI.cell_w;
         let block: Vec<_> = bg_rects(&h)
             .into_iter()
@@ -2159,24 +2192,24 @@ mod tests {
                 state = md.line(l, state).1;
             }
         };
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         check(&mut v);
         // Delete the opening fence's first backtick: the block is no longer a fence.
         v.buf.cursor = (1, 0);
         h.key(&mut v, press(Key::Delete));
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         check(&mut v);
         // Type it back, then undo.
         h.key(&mut v, press(Key::Char('`')));
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         check(&mut v);
         h.key(&mut v, cmd(Key::Char('z')));
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         check(&mut v);
         // A new line above shifts the fence down.
         v.buf.cursor = (0, 1);
         h.key(&mut v, press(Key::Enter));
-        paint_in_strip(&mut h, &mut v);
+        paint_plain(&mut h, &mut v);
         check(&mut v);
     }
 

@@ -23,12 +23,14 @@ use ghostrealm_terminal::{KeyPress, Lifecycle};
 use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
 use crate::languages::same_file;
-use crate::plugin::{DocId, EventCx, OpenCx, Plugin, Request, UiMetrics, View};
+use crate::plugin::{DocId, EventCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor;
+use crate::plugins::files::{self as files_plugin, FilesView};
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 
 mod files;
+mod open;
 pub use files::{FileClip, FileReport};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
@@ -55,8 +57,8 @@ pub enum Pick {
     ActiveRoot,
     /// Create a new workspace rooted at a directory.
     NewWorkspace,
-    /// Open a file in the focused pane with this plugin.
-    OpenWith(&'static str),
+    /// Open a file ([`AppState::open_file`]).
+    Open,
     /// Save this document to a file ([`View::save_as`]).
     SaveAs(DocRef),
     /// Save a copy of this document to a file ([`View::save_copy`]).
@@ -68,7 +70,7 @@ impl Pick {
     fn mode(self) -> Mode {
         match self {
             Pick::ActiveRoot | Pick::NewWorkspace => Mode::PickDir,
-            Pick::OpenWith(_) => Mode::PickFile,
+            Pick::Open => Mode::PickFile,
             Pick::SaveAs(_) | Pick::SaveCopy(_) => Mode::Save,
         }
     }
@@ -126,6 +128,9 @@ enum Confirmed {
     /// Move this path to the Trash, after saving `save` (accept) or without
     /// saving (discard) the open documents of it.
     UnsavedTrash { path: std::path::PathBuf, save: Vec<DocRef> },
+    /// Replace `doc` with a document of `path` (`None`: an empty buffer),
+    /// after saving `save` (accept) or without saving (discard).
+    UnsavedOpen { doc: DocRef, path: Option<std::path::PathBuf>, save: Vec<DocRef> },
     /// `doc`'s file changed on disk since it was loaded: write over it
     /// (accept) or load the disk version over its edits (discard). Then carry
     /// on with `rest`, the other documents a Save and Close was saving, and
@@ -142,6 +147,9 @@ enum Resume {
     Leave(Leave),
     /// Move this path to the Trash, once the saving is done.
     Trash(std::path::PathBuf),
+    /// Show this file (`None`: an empty buffer) in this Files surface, once
+    /// the saving is done.
+    Open(SurfaceId, Option<std::path::PathBuf>),
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -213,6 +221,12 @@ pub struct AppState {
     /// Outcomes of file jobs that finished after their command returned,
     /// until the window (or the agent channel) takes them.
     file_reports: Vec<FileReport>,
+    /// What the Files surfaces share (the sidebar's last pin and width).
+    files_session: files_plugin::Session,
+    /// When each Files surface last took the keyboard (a count, not a time):
+    /// a file opens in the latest when none is focused.
+    files_seen: HashMap<SurfaceId, u64>,
+    focus_stamp: u64,
 }
 
 impl AppState {
@@ -241,6 +255,9 @@ impl AppState {
             file_jobs: FileJobs::default(),
             file_job_wait: files::INLINE_WAIT,
             file_reports: Vec::new(),
+            files_session: files_plugin::Session::default(),
+            files_seen: HashMap::new(),
+            focus_stamp: 0,
         }
     }
 
@@ -398,12 +415,7 @@ impl AppState {
 
     /// [`Self::materialize_plugin`], starting in `cwd`.
     fn materialize_plugin_at(&mut self, sid: SurfaceId, id: &str, cwd: Option<std::path::PathBuf>) -> Result<()> {
-        let cx = OpenCx {
-            cwd,
-            command: self.shell_line.clone(),
-            waker: self.waker.clone(),
-            languages: self.languages.clone(),
-        };
+        let cx = self.open_cx(cwd);
         let plugin = self
             .plugins
             .iter()
@@ -501,23 +513,8 @@ impl AppState {
         }
     }
 
-    /// Open `path` in a new tab in the focused pane, with the first plugin that
-    /// claims it (the editor claims anything).
-    pub fn open_path_in_focused(&mut self, path: &Path) -> Result<()> {
-        let view = self.view_for_path(None, path)?;
-        self.open_view_in_focused(view);
-        Ok(())
-    }
-
-    /// Open `path` in a new tab in the focused pane with plugin `id`.
-    pub fn open_path_with_in_focused(&mut self, id: &str, path: &Path) -> Result<()> {
-        let view = self.view_for_path(Some(id), path)?;
-        self.open_view_in_focused(view);
-        Ok(())
-    }
-
     /// A view of `path` from plugin `id`, or else from the first plugin that
-    /// claims the path.
+    /// claims the path: the document a Files surface shows.
     fn view_for_path(&self, id: Option<&str>, path: &Path) -> Result<Box<dyn View>> {
         let plugin = self
             .plugins
@@ -527,24 +524,8 @@ impl AppState {
                 None => p.opens_path(path),
             })
             .ok_or_else(|| anyhow::anyhow!("no plugin opens {}", path.display()))?;
-        let cx = OpenCx {
-            cwd: self.active().and_then(|vt| self.resolve_cwd(vt)),
-            command: None,
-            waker: self.waker.clone(),
-            languages: self.languages.clone(),
-        };
+        let cx = self.open_cx(self.active().and_then(|vt| self.resolve_cwd(vt)));
         plugin.open_path(path, &cx)
-    }
-
-    /// Open `path` in a new split beside the focused pane (e.g. beside the file
-    /// browser), falling back to a tab if the split can't be made.
-    pub fn open_path_split(&mut self, path: &Path, axis: Axis) -> Result<()> {
-        let view = self.view_for_path(None, path)?;
-        if let Some((vt, pane)) = self.focused_pane() {
-            self.tree.split_empty(vt, pane, axis);
-        }
-        self.open_view_in_focused(view);
-        Ok(())
     }
 
     /// Whether the floating picker is open.
@@ -705,6 +686,9 @@ impl AppState {
             Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
                 self.save_views(&save, Some(Resume::Trash(path)))
             }
+            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. }) => {
+                self.save_views(&save, Some(Resume::Open(doc.0, path)))
+            }
             Some(Confirm { then: Confirmed::DiskConflict { doc, rest, then }, .. }) => {
                 let view = self
                     .doc_mut(doc)
@@ -752,6 +736,7 @@ impl AppState {
         match then {
             Some(Resume::Leave(what)) => self.perform(what),
             Some(Resume::Trash(path)) => self.trash_now(&path)?,
+            Some(Resume::Open(sid, path)) => self.replace_with(sid, path.as_deref())?,
             None => {}
         }
         Ok(written)
@@ -788,6 +773,9 @@ impl AppState {
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
+            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, .. }, .. }) => {
+                self.replace_with(doc.0, path.as_deref())?
+            }
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
             Some(Confirm { then: Confirmed::DiskConflict { doc, .. }, .. }) => {
@@ -881,7 +869,7 @@ impl AppState {
             Pick::NewWorkspace => {
                 self.new_workspace_in(path);
             }
-            Pick::OpenWith(id) => self.open_path_with_in_focused(id, &path)?,
+            Pick::Open => self.open_file(&path)?,
             Pick::SaveAs(doc) => {
                 self.doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?
@@ -921,13 +909,9 @@ impl AppState {
         vt
     }
 
-    /// An editor on the settings file, with its language service.
-    fn settings_view(&self, path: &Path) -> Result<Box<dyn View>> {
-        self.view_for_path(Some(editor::ID), path)
-    }
-
-    /// Open the settings file in a dedicated "settings" workspace: focus the
-    /// existing one (opening the editor there if it was closed), or create it.
+    /// Open the settings file in a dedicated "settings" workspace, in a Files
+    /// surface there: focus the existing workspace (opening the file there if
+    /// it was closed), or create it.
     pub fn open_settings(&mut self, path: std::path::PathBuf) -> Result<()> {
         let existing = self
             .tree
@@ -935,31 +919,24 @@ impl AppState {
             .iter()
             .find(|v| v.name == SETTINGS_VTAB_NAME)
             .map(|v| v.id);
-        match existing {
-            Some(vt) => {
-                let has_editor = self
-                    .tree
-                    .vtab(vt)
-                    .map(|v| {
-                        v.panes()
-                            .into_iter()
-                            .flat_map(|p| p.surfaces.iter())
-                            .any(|s| self.view(s.id).is_some_and(|v| v.plugin() == editor::ID))
-                    })
-                    .unwrap_or(false);
-                // Make the editor first: a file that won't open leaves the
-                // focus where it was.
-                let view = if has_editor { None } else { Some(self.settings_view(&path)?) };
-                self.focus_vtab(vt);
-                if let Some(view) = view {
-                    self.open_view_in_focused(view);
-                }
+        // Made first: a file that won't open leaves the focus alone.
+        let doc = self.view_for_path(Some(editor::ID), &path)?;
+        if let Some(vt) = existing {
+            self.focus_vtab(vt);
+            match self.files_target() {
+                Some(sid) if self.files_shows(sid, &path) => self.show_surface(sid),
+                target => self.place_doc(target, doc, Some(path)),
             }
-            None => {
-                let view = self.settings_view(&path)?;
-                let vt = self.new_view_vtab(SETTINGS_VTAB_NAME, view);
-                self.focus_vtab(vt);
-            }
+            return Ok(());
+        }
+        let cx = self.open_cx(None);
+        let root = path.parent().map(Path::to_path_buf).unwrap_or_else(|| files_plugin::start_dir(&cx));
+        let mut files = FilesView::new(root, &cx);
+        files.show_doc(doc);
+        let vt = self.new_view_vtab(SETTINGS_VTAB_NAME, Box::new(files));
+        self.focus_vtab(vt);
+        if let Some(sid) = self.focused_surface() {
+            self.note_focus(sid);
         }
         Ok(())
     }
@@ -1327,6 +1304,9 @@ impl AppState {
             match req {
                 Request::Busy => self.mark_busy(sid),
                 Request::Close => self.close_surface_id(sid),
+                Request::OpenFile(path) => {
+                    let _ = self.open_file(&path);
+                }
                 _ => {}
             }
         }
@@ -1660,12 +1640,12 @@ pub fn build_registry() -> Registry<AppState> {
         CommandMeta::new(
             "file.open",
             "Open File",
-            "Open a file in the focused pane with the plugin that handles it",
+            "Open a file in a Files surface: the focused one, else the workspace's last focused one, else a new one",
         )
         .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open")),
         Box::new(|s: &mut AppState, a| {
             let path = std::path::PathBuf::from(a.get_str("path")?);
-            s.open_path_in_focused(&path).map_err(failed)?;
+            s.open_file(&path).map_err(failed)?;
             Ok(CmdOutcome::ok())
         }),
     );
@@ -1740,15 +1720,15 @@ mod tests {
         let mut s = AppState::new().with_languages(Arc::new(languages));
         s.open_settings(path).unwrap();
         let sid = s.focused_surface().expect("the settings editor is focused");
-        let editor = s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
+        let editor = s.editor(sid).unwrap();
         assert!(editor.lang().is_some());
 
         // Another file gets none.
         let other = dir.join("notes.toml");
         std::fs::write(&other, "").unwrap();
-        s.open_path_with_in_focused(editor::ID, &other).unwrap();
+        s.open_file_in_new_surface(&other).unwrap();
         let sid = s.focused_surface().unwrap();
-        let editor = s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
+        let editor = s.editor(sid).unwrap();
         assert!(editor.lang().is_none());
     }
 
@@ -1849,7 +1829,7 @@ mod tests {
     fn picker_options_are_ordered_with_the_web_browser_last() {
         let s = AppState::new();
         let titles: Vec<_> = s.plugins().iter().filter(|p| p.pickable()).map(|p| p.title()).collect();
-        assert_eq!(titles, ["Terminal", "File browser", "New File", "Web browser"]);
+        assert_eq!(titles, ["Terminal", "Files", "Web browser"]);
     }
 
     #[test]
@@ -2016,17 +1996,15 @@ mod tests {
     }
 
     #[test]
-    fn open_editor_creates_a_focused_editor_surface() {
+    fn editor_new_opens_an_empty_document_in_a_focused_files_surface() {
         let mut s = AppState::new().with_shell_line("sleep 2");
         s.new_vtab().unwrap();
-        s.open_plugin_in_focused(editor::ID).unwrap();
+        build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
 
         let surf = s.focused_surface().unwrap();
-        let view = s.view_mut(surf).expect("the opened editor becomes focused");
-        assert_eq!(view.plugin(), editor::ID);
-        let ed = view.downcast_mut::<EditorView>().expect("an EditorView");
-        ed.buffer_mut().insert_char('x');
-        assert_eq!(s.surface_text(surf).as_deref(), Some("x"));
+        assert_eq!(s.view(surf).map(|v| v.plugin()), Some(files_plugin::ID));
+        s.editor_mut(surf).expect("an empty editor document").buffer_mut().insert_char('x');
+        assert!(s.surface_text(surf).unwrap().ends_with("\nx"), "the document's text follows the listing");
         assert!(
             s.surface_lifecycle(surf).is_none(),
             "an editor surface has no terminal"
@@ -2045,10 +2023,17 @@ mod tests {
         args.insert("path", ghostrealm_core::Value::Str(file.display().to_string()));
         r.execute("file.open", &args, &mut s).expect("file.open runs");
         let sid = s.focused_surface().unwrap();
-        assert_eq!(s.view(sid).map(|v| v.plugin()), Some(editor::ID));
-        assert_eq!(s.surface_text(sid).as_deref(), Some("hello"));
+        assert_eq!(s.view(sid).map(|v| v.plugin()), Some(files_plugin::ID));
+        assert_eq!(s.editor(sid).map(|e| e.buffer().lines.clone()), Some(vec!["hello".to_string()]));
         let title = s.tree.vtabs()[0].panes()[0].surfaces.last().unwrap().title.clone();
-        assert_eq!(title, "notes.txt", "the view titles its tab");
+        assert_eq!(title, "notes.txt", "the document titles its tab");
+        // An image opens as media, in the same surface.
+        let png = dir.join("pic.png");
+        std::fs::write(&png, crate::media::testing::png(2, 2, [0; 4])).unwrap();
+        s.open_file(&png).unwrap();
+        assert_eq!(s.focused_surface(), Some(sid));
+        let doc = s.active_doc(sid).and_then(|d| s.doc(d)).unwrap();
+        assert!(doc.downcast_ref::<files_plugin::MediaView>().is_some());
     }
 
     #[test]
@@ -2116,7 +2101,7 @@ mod tests {
         r.execute("file_browser.new", &ghostrealm_core::Args::new(), &mut s)
             .expect("file_browser.new runs");
         let sid = s.focused_surface().expect("the empty pane got a surface");
-        assert_eq!(s.view(sid).map(|v| v.plugin()), Some("file_browser"));
+        assert_eq!(s.view(sid).map(|v| v.plugin()), Some(files_plugin::ID));
         assert!(!s.surface_is_empty(sid));
         let text = s.surface_text(sid).expect("a view reports its text");
         assert!(text.contains("hello.txt"), "rooted at the workspace dir: {text}");
@@ -2154,14 +2139,14 @@ mod tests {
         s.new_empty_vtab();
 
         r.execute("editor.open", &Args::new(), &mut s).unwrap();
-        assert_eq!(s.picker_purpose(), Some(Pick::OpenWith(editor::ID)));
+        assert_eq!(s.picker_purpose(), Some(Pick::Open));
         s.confirm_picker().unwrap();
         assert!(s.picker_open(), "nothing chosen: the picker stays open");
 
         s.confirm_picker_with(file.clone()).unwrap();
         assert!(!s.picker_open());
         let sid = s.focused_surface().unwrap();
-        let ed = s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap();
+        let ed = s.editor(sid).unwrap();
         assert_eq!(ed.buffer().path.as_deref(), Some(file.as_path()));
     }
 
@@ -2171,7 +2156,7 @@ mod tests {
         let file = crate::plugin::testing::tmpdir("app-open-binary").join("latin1.txt");
         std::fs::write(&file, b"caf\xe9").unwrap();
         s.new_empty_vtab();
-        let err = s.open_path_in_focused(&file).unwrap_err();
+        let err = s.open_file(&file).unwrap_err();
         assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
         assert_eq!(s.focused_surface(), None, "no tab bound to it");
     }
@@ -2199,7 +2184,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let mut s = AppState::new();
         s.new_empty_vtab();
-        s.open_path_with_in_focused(editor::ID, &link).unwrap();
+        s.open_file_in_new_surface(&link).unwrap();
         let sid = s.focused_surface().unwrap();
         s.views.get_mut(&sid).unwrap().write_input(b"x");
         let mut cfg = Config::default();
@@ -2216,11 +2201,11 @@ mod tests {
         let file = dir.join("old.txt");
         std::fs::write(&file, "x").unwrap();
         s.new_empty_vtab();
-        s.open_path_with_in_focused(editor::ID, &file).unwrap();
+        s.open_file_in_new_surface(&file).unwrap();
         let sid = s.focused_surface().unwrap();
 
         r.execute("editor.save_as", &Args::new(), &mut s).unwrap();
-        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, DocId::SELF))));
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, DocId(1)))));
         let target = dir.join("old.txt");
         assert_eq!(s.picker_mut().unwrap().choice(), Some(target), "beside it, same name");
 
@@ -2243,9 +2228,9 @@ mod tests {
         let toml = dir.join("a.toml");
         std::fs::write(&toml, "a = 1\nb = 2\n").unwrap();
         s.new_empty_vtab();
-        s.open_path_with_in_focused(editor::ID, &toml).unwrap();
+        s.open_file_in_new_surface(&toml).unwrap();
         let sid = s.focused_surface().unwrap();
-        let lines = |s: &AppState| s.view(sid).unwrap().downcast_ref::<EditorView>().unwrap().buffer().lines.clone();
+        let lines = |s: &AppState| s.editor(sid).unwrap().buffer().lines.clone();
 
         r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap();
         assert_eq!(lines(&s), ["# a = 1", "b = 2"]);
@@ -2255,7 +2240,7 @@ mod tests {
         // A file whose language has no comment syntax reports it and stays as it was.
         let txt = dir.join("a.txt");
         std::fs::write(&txt, "x").unwrap();
-        s.open_path_with_in_focused(editor::ID, &txt).unwrap();
+        s.open_file_in_new_surface(&txt).unwrap();
         assert!(r.execute("editor.toggle_comment", &Args::new(), &mut s).is_err());
     }
 
@@ -2267,7 +2252,7 @@ mod tests {
         std::fs::write(&mine, "mine").unwrap();
         std::fs::write(&theirs, "theirs").unwrap();
         s.new_empty_vtab();
-        s.open_path_with_in_focused(editor::ID, &mine).unwrap();
+        s.open_file_in_new_surface(&mine).unwrap();
         let sid = s.focused_surface().unwrap();
 
         s.open_save_as(sid);
@@ -2549,7 +2534,7 @@ mod tests {
         s.new_empty_vtab();
         let file = dir.join(name);
         std::fs::write(&file, "old\n").unwrap();
-        s.open_path_with_in_focused(editor::ID, &file).unwrap();
+        s.open_file_in_new_surface(&file).unwrap();
         let sid = s.focused_surface().unwrap();
         assert!(s.views.get_mut(&sid).unwrap().write_input(b"new"));
         assert!(s.view(sid).unwrap().modified());
@@ -2565,7 +2550,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("close-clean");
         let mut s = AppState::new().with_unsaved_guard();
         s.new_empty_vtab();
-        s.open_path_with_in_focused(editor::ID, &dir.join("new.txt")).unwrap();
+        s.open_file_in_new_surface(&dir.join("new.txt")).unwrap();
         assert!(!s.view(s.focused_surface().unwrap()).unwrap().modified());
         assert!(!s.has_unsaved());
         s.close_focused_surface();
@@ -2613,7 +2598,7 @@ mod tests {
     }
 
     fn lines(s: &AppState, sid: SurfaceId) -> Vec<String> {
-        s.view(sid).and_then(|v| v.downcast_ref::<EditorView>()).unwrap().buffer().lines.clone()
+        s.editor(sid).unwrap().buffer().lines.clone()
     }
 
     #[test]

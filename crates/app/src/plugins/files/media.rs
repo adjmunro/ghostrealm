@@ -1,41 +1,40 @@
-//! The file browser's preview of the highlighted entry: its details, plus a
-//! scrollable head of a text file, an image, or an audio player. Reading and
-//! decoding run on a worker; the view polls for the result on a timer, keeping
-//! the previous preview up until the new one is ready.
+//! [`MediaView`]: a Files surface document showing an image or playing a
+//! track, under its [`DocHeader`]. Decoding runs on a worker; the view polls
+//! for the result on a timer.
 
-use std::fs::File;
-use std::io::Read;
+use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use ghostrealm_core::highlight::{self, Span};
 use ghostrealm_core::{Config, Rect};
 use glyphon::Family;
 
+use super::header::{DocHeader, HeaderText};
+use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::media::audio::{self, AudioPlayer};
 use crate::media;
-use crate::plugin::{rect_contains, theme, EventCx, Font, Image, PaintCx};
-use crate::syntax;
+use crate::plugin::icons::Icon;
+use crate::plugin::{
+    hover_box, rect_contains, theme, EventCx, Image, MenuAlign, MenuItem, MouseEvent, PaintCx, Request, View,
+};
 
-/// Preview button ids, apart from the browser's (see `View::button`).
-pub const BTN_PLAY: u32 = 10;
-pub const BTN_AUTOPLAY: u32 = 11;
-/// The preview's image within its view (see `PaintCx::image`).
+/// Button and menu item ids (see `View::button`).
+pub const BTN_PLAY: u32 = 0;
+pub const BTN_AUTOPLAY: u32 = 1;
+const BTN_NAME: u32 = 2;
+const BTN_MORE: u32 = 3;
+const BTN_FILE_MENU: u32 = 4;
+/// The image within the view (see `PaintCx::image`).
 const IMAGE_ID: u32 = 0;
 
-/// How much of a text file to read, and how many lines (and chars per line) to
-/// keep of it.
-const TEXT_MAX_BYTES: u64 = 64 * 1024;
-const TEXT_MAX_LINES: usize = 1000;
-const TEXT_MAX_COLS: usize = 400;
 /// Images larger than this on either side are downscaled when decoded.
 const IMAGE_MAX_SIDE: u32 = 2048;
 /// How often to check for a pending load's result.
 const POLL_EVERY: Duration = Duration::from_millis(15);
-/// How long audio must stay previewed before autoplay starts it (so sweeping
-/// the highlight across tracks stays quiet).
+/// How long a track must stay shown before autoplay starts it (so a quick
+/// look stays quiet).
 const AUTOPLAY_AFTER: Duration = Duration::from_millis(400);
 /// How often the playback position redraws.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -43,94 +42,69 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 const IMAGE_EXTS: &[&str] = &["bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
 const AUDIO_EXTS: &[&str] = &["flac", "m4a", "mp3", "oga", "ogg", "wav"];
 
-/// What the preview shows below an entry's details.
+/// Whether `path` names an image or a track (by extension), which a
+/// [`MediaView`] shows rather than the editor.
+pub fn is_media(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    IMAGE_EXTS.contains(&ext.as_str()) || AUDIO_EXTS.contains(&ext.as_str())
+}
+
+/// What a loaded file shows.
 #[derive(Clone)]
 pub enum Content {
-    Dir { entries: usize },
-    /// `spans` is each line's syntax highlight, empty for a file with no
-    /// highlighter.
-    Text { lines: Vec<String>, spans: Vec<Vec<Span>>, truncated: bool },
     /// `width` x `height` is the file's size; `image` may be downscaled.
     Image { image: Arc<Image>, width: u32, height: u32 },
     Audio { duration: Option<Duration> },
-    /// Binary, or a kind with no preview.
+    /// A pipe, socket, or device: described, never read.
     Nothing,
     Error(String),
 }
 
-/// An entry's loaded preview.
+/// A file's loaded media.
 #[derive(Clone)]
-pub struct Preview {
+pub struct Loaded {
     pub path: PathBuf,
     pub kind: String,
-    /// Files only.
-    pub size: Option<u64>,
-    pub modified: Option<SystemTime>,
     pub content: Content,
 }
 
-/// Read and decode `path`'s preview. Runs on the loader thread.
-pub fn load(path: &Path) -> Preview {
-    let meta = std::fs::metadata(path);
-    let modified = meta.as_ref().ok().and_then(|m| m.modified().ok());
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+/// Read and decode `path`. Runs on the loader thread.
+pub fn load(path: &Path) -> Loaded {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let upper = ext.to_uppercase();
-    let preview = |kind: String, size: Option<u64>, content: Content| Preview {
-        path: path.to_path_buf(),
-        kind,
-        size,
-        modified,
-        content,
-    };
-    let meta = match meta {
+    let loaded = |kind: String, content: Content| Loaded { path: path.to_path_buf(), kind, content };
+    let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(e) => return preview("Missing".into(), None, Content::Error(e.to_string())),
+        Err(e) => return loaded("Missing".into(), Content::Error(e.to_string())),
     };
-    if meta.is_dir() {
-        let content = match std::fs::read_dir(path) {
-            Ok(rd) => Content::Dir { entries: rd.count() },
-            Err(e) => Content::Error(e.to_string()),
-        };
-        return preview("Folder".into(), None, content);
-    }
     if !meta.is_file() {
         // Opening a pipe or device can block forever (and reading eats a
         // pipe's data): describe it without touching its content.
-        return preview(special_kind(&meta).into(), None, Content::Nothing);
-    }
-    let size = Some(meta.len());
-    if IMAGE_EXTS.contains(&ext.as_str()) {
-        let content = match decode_image(path) {
-            Ok(c) => c,
-            Err(e) => Content::Error(e),
-        };
-        return preview(format!("{upper} image"), size, content);
+        return loaded(special_kind(&meta).into(), Content::Nothing);
     }
     if AUDIO_EXTS.contains(&ext.as_str()) {
         let content = match audio::duration(path) {
             Ok(duration) => Content::Audio { duration },
             Err(e) => Content::Error(e),
         };
-        return preview(format!("{upper} audio"), size, content);
+        return loaded(format!("{upper} audio"), content);
     }
-    match read_text(path) {
-        Ok(Some(content)) if ext.is_empty() => preview("Text".into(), size, content),
-        Ok(Some(content)) => preview(format!("{upper} text"), size, content),
-        Ok(None) if ext.is_empty() => preview("File".into(), size, Content::Nothing),
-        Ok(None) => preview(format!("{upper} file"), size, Content::Nothing),
-        Err(e) => preview("File".into(), size, Content::Error(e)),
-    }
+    let content = match decode_image(path) {
+        Ok(c) => c,
+        Err(e) => Content::Error(e),
+    };
+    loaded(format!("{upper} image"), content)
 }
 
-/// What a non-regular, non-directory entry is.
+/// What a non-regular entry is.
 fn special_kind(meta: &std::fs::Metadata) -> &'static str {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
         let t = meta.file_type();
+        if t.is_dir() {
+            return "Folder";
+        }
         if t.is_fifo() {
             return "Pipe";
         }
@@ -153,42 +127,11 @@ fn decode_image(path: &Path) -> Result<Content, String> {
     Ok(Content::Image { image, width: d.source_width, height: d.source_height })
 }
 
-/// The head of a text file, or `None` if it looks binary (a NUL byte, or
-/// invalid UTF-8).
-fn read_text(path: &Path) -> Result<Option<Content>, String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(TEXT_MAX_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|e| e.to_string())?;
-    let mut truncated = bytes.len() as u64 > TEXT_MAX_BYTES;
-    bytes.truncate(TEXT_MAX_BYTES as usize);
-    if bytes.contains(&0) {
-        return Ok(None);
-    }
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        // Cut mid-character at the read limit: keep what's whole.
-        Err(e) if e.error_len().is_none() => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
-        Err(_) => return Ok(None),
-    };
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if lines.len() == TEXT_MAX_LINES {
-            truncated = true;
-            break;
-        }
-        let line = line.replace('\t', "    ");
-        lines.push(line.chars().take(TEXT_MAX_COLS).collect());
-    }
-    let spans = highlight::for_path(path).map(|h| highlight::highlight_lines(h, &lines)).unwrap_or_default();
-    Ok(Some(Content::Text { lines, spans, truncated }))
-}
-
-/// A worker that loads the latest requested preview, skipping requests that
+/// A worker that loads the latest requested file, skipping requests that
 /// were superseded while it was busy.
 struct Loader {
     tx: Sender<PathBuf>,
-    done: Arc<Mutex<Option<Preview>>>,
+    done: Arc<Mutex<Option<Loaded>>>,
     thread: std::thread::JoinHandle<()>,
 }
 
@@ -198,35 +141,33 @@ impl Loader {
     }
 
     /// A loader that runs `load`. A panic in it (a decoder bug on a malformed
-    /// file) becomes that entry's error rather than ending the worker.
-    fn with(load: fn(&Path) -> Preview) -> Self {
+    /// file) becomes that file's error rather than ending the worker.
+    fn with(load: fn(&Path) -> Loaded) -> Self {
         let (tx, rx) = mpsc::channel::<PathBuf>();
         let done = Arc::new(Mutex::new(None));
         let out = done.clone();
         let thread = std::thread::Builder::new()
-            .name("preview-loader".into())
+            .name("media-loader".into())
             .spawn(move || {
                 while let Ok(mut path) = rx.recv() {
                     while let Ok(newer) = rx.try_recv() {
                         path = newer;
                     }
-                    let p = std::panic::catch_unwind(|| load(&path)).unwrap_or_else(|_| Preview {
+                    let p = std::panic::catch_unwind(|| load(&path)).unwrap_or_else(|_| Loaded {
                         path: path.clone(),
                         kind: "File".into(),
-                        size: None,
-                        modified: None,
-                        content: Content::Error("can't preview this file".into()),
+                        content: Content::Error("can't show this file".into()),
                     });
                     if let Ok(mut slot) = out.lock() {
                         *slot = Some(p);
                     }
                 }
             })
-            .expect("spawn preview loader");
+            .expect("spawn media loader");
         Loader { tx, done, thread }
     }
 
-    fn take(&self) -> Option<Preview> {
+    fn take(&self) -> Option<Loaded> {
         self.done.lock().ok()?.take()
     }
 
@@ -235,95 +176,63 @@ impl Loader {
     }
 }
 
-/// The preview pane's state, owned by a file browser view.
-pub struct PreviewPane {
-    /// Started on the first preview.
+/// An image or a track, as a document.
+pub struct MediaView {
+    path: PathBuf,
+    header: DocHeader,
+    /// Started on the first load.
     loader: Option<Loader>,
-    /// The entry to show (the last one asked for).
-    wanted: Option<PathBuf>,
-    /// What is drawn: `wanted`'s preview once loaded, the previous one until then.
-    shown: Option<Preview>,
-    /// When to next check for `wanted`'s preview (while loading).
+    /// What is drawn: the file once loaded (the previous load until a reload
+    /// is ready).
+    shown: Option<Loaded>,
+    /// When to next check for the load's result (while loading).
     poll_at: Option<Instant>,
-    /// When autoplay starts the shown audio.
+    /// When autoplay starts the track.
     autoplay_at: Option<Instant>,
     /// The view is off screen: nothing plays and nothing autoplays.
     hidden: bool,
     /// When to redraw the playback position.
     progress_at: Option<Instant>,
-    /// This pane's autoplay override; `None` follows `[file_browser] preview_autoplay`.
+    /// This view's autoplay override; `None` follows `[file_browser] preview_autoplay`.
     autoplay: Option<bool>,
     /// Started on the first play.
     audio: Option<AudioPlayer>,
-    /// Text scroll (physical px).
-    scroll: f32,
     // Geometry from the last paint, for input.
-    rect: Rect,
+    header_rect: Option<Rect>,
+    name_hit: Option<Rect>,
+    more_hit: Option<Rect>,
     /// The seek bar's hit rect and its track's x span.
     seek: Option<(Rect, f32, f32)>,
 }
 
-impl Default for PreviewPane {
-    fn default() -> Self {
-        PreviewPane {
+impl MediaView {
+    /// A view of `path`, loading it.
+    pub fn open(path: PathBuf) -> Self {
+        let mut v = MediaView {
+            path,
+            header: DocHeader::default(),
             loader: None,
-            wanted: None,
             shown: None,
             poll_at: None,
             autoplay_at: None,
-            hidden: false,
+            hidden: true,
             progress_at: None,
             autoplay: None,
             audio: None,
-            scroll: 0.0,
-            rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            header_rect: None,
+            name_hit: None,
+            more_hit: None,
             seek: None,
-        }
-    }
-}
-
-impl PreviewPane {
-    /// Show `path` (`None`: nothing). Loads it unless it is already wanted;
-    /// moving off a playing track pauses it.
-    pub fn show(&mut self, path: Option<&Path>) {
-        if self.wanted.as_deref() == path {
-            return;
-        }
-        self.wanted = path.map(Path::to_path_buf);
-        self.scroll = 0.0;
-        self.autoplay_at = None;
-        if let Some(a) = &self.audio {
-            let st = a.status();
-            if st.playing && st.path.as_deref() != path {
-                a.pause();
-            }
-        }
-        match path {
-            Some(p) => {
-                let loader = self.loader.get_or_insert_with(Loader::new);
-                let _ = loader.tx.send(p.to_path_buf());
-                self.poll_at = Some(Instant::now() + POLL_EVERY);
-            }
-            None => {
-                self.shown = None;
-                self.poll_at = None;
-            }
-        }
+        };
+        v.load();
+        v
     }
 
-    /// The view came on screen or left it. Leaving pauses a playing track and
-    /// cancels a pending autoplay; coming back resumes nothing, so a track
-    /// never starts without the user seeing the view.
-    pub fn set_visible(&mut self, visible: bool) {
-        self.hidden = !visible;
-        if visible {
-            return;
-        }
-        self.autoplay_at = None;
-        self.progress_at = None;
-        if let Some(a) = self.audio.as_ref().filter(|a| a.status().playing) {
-            a.pause();
-        }
+    /// (Re)load the file on the worker.
+    fn load(&mut self) {
+        let loader = self.loader.get_or_insert_with(Loader::new);
+        let _ = loader.tx.send(self.path.clone());
+        self.poll_at = Some(Instant::now() + POLL_EVERY);
     }
 
     /// Use `player` for playback.
@@ -338,13 +247,13 @@ impl PreviewPane {
         self.audio.as_ref().map(AudioPlayer::status)
     }
 
-    /// The preview drawn now.
+    /// The file as loaded.
     #[cfg(test)]
-    pub fn shown(&self) -> Option<&Preview> {
+    pub fn loaded(&self) -> Option<&Loaded> {
         self.shown.as_ref()
     }
 
-    /// Whether the wanted preview is still loading.
+    /// Whether the load is still running.
     pub fn loading(&self) -> bool {
         self.poll_at.is_some()
     }
@@ -353,50 +262,7 @@ impl PreviewPane {
         self.autoplay.unwrap_or(cfg.file_browser.preview_autoplay)
     }
 
-    pub fn deadline(&self) -> Option<Instant> {
-        [self.poll_at, self.autoplay_at, self.progress_at].into_iter().flatten().min()
-    }
-
-    pub fn tick(&mut self, cx: &mut EventCx, now: Instant) {
-        if self.poll_at.is_some_and(|t| now >= t) {
-            self.poll_at = Some(now + POLL_EVERY);
-            let ready = self.loader.as_ref().and_then(Loader::take);
-            if let Some(p) = ready.filter(|p| Some(&p.path) == self.wanted.as_ref()) {
-                if matches!(p.content, Content::Audio { .. }) && self.autoplay_on(cx.cfg) && !self.hidden {
-                    self.autoplay_at = Some(now + AUTOPLAY_AFTER);
-                }
-                self.shown = Some(p);
-                self.poll_at = None;
-                cx.redraw();
-            } else if self.loader.as_ref().is_some_and(|l| !l.alive()) {
-                // Nothing more will arrive: stop polling, and start a fresh
-                // loader for the next entry.
-                self.loader = None;
-                self.poll_at = None;
-                self.shown = self.wanted.clone().map(|path| Preview {
-                    path,
-                    kind: "File".into(),
-                    size: None,
-                    modified: None,
-                    content: Content::Error("the preview stopped".into()),
-                });
-                cx.redraw();
-            }
-        }
-        if self.autoplay_at.is_some_and(|t| now >= t) {
-            self.autoplay_at = None;
-            if let Some(p) = self.audio_path() {
-                self.audio.get_or_insert_with(AudioPlayer::new).play(&p);
-                cx.redraw();
-            }
-        }
-        if self.progress_at.is_some_and(|t| now >= t) {
-            self.progress_at = None;
-            cx.redraw();
-        }
-    }
-
-    /// The shown entry, if it is audio.
+    /// The file, if it is a track.
     fn audio_path(&self) -> Option<PathBuf> {
         self.shown
             .as_ref()
@@ -404,162 +270,79 @@ impl PreviewPane {
             .map(|p| p.path.clone())
     }
 
-    /// Whether `pos` is over the pane (as last painted).
-    pub fn contains(&self, pos: (f32, f32)) -> bool {
-        rect_contains(self.rect, pos.0, pos.1)
+    /// What the file is, from its extension until it has loaded.
+    fn kind(&self) -> String {
+        if let Some(p) = &self.shown {
+            return p.kind.clone();
+        }
+        let ext = self.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let what = if AUDIO_EXTS.contains(&ext.as_str()) { "audio" } else { "image" };
+        format!("{} {what}", ext.to_uppercase())
     }
 
-    pub fn scroll(&mut self, cx: &mut EventCx, dy: f32) {
-        let next = (self.scroll - dy).max(0.0);
-        if next != self.scroll {
-            self.scroll = next;
-            cx.request_frame();
+    /// The facts after the kind and size: an image's size, a track's length.
+    fn extra(&self) -> Option<String> {
+        match &self.shown.as_ref()?.content {
+            Content::Image { width, height, .. } => Some(format!("{width} \u{00d7} {height}")),
+            Content::Audio { duration: Some(d) } => Some(clock(*d)),
+            _ => None,
         }
     }
 
-    /// A press in the pane: seeks when it lands on the seek bar.
-    pub fn mouse_down(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
-        let Some((hit, x0, x1)) = self.seek else { return };
-        if !rect_contains(hit, pos.0, pos.1) {
-            return;
+    fn name(&self) -> String {
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// The `⋯` menu: autoplay for a track, and the file menu.
+    fn more_menu(&self, cfg: &Config) -> Vec<MenuItem> {
+        let mut items = Vec::new();
+        if self.audio_path().is_some() {
+            items.push(MenuItem::new(BTN_AUTOPLAY, "Autoplay").check(self.autoplay_on(cfg)));
+            items.push(MenuItem::RULE);
         }
-        let Some(Content::Audio { duration: Some(total) }) = self.shown.as_ref().map(|p| &p.content) else {
-            return;
+        items.push(MenuItem::new(BTN_FILE_MENU, "File actions\u{2026}"));
+        items
+    }
+
+    fn open_file_menu(&self, cx: &mut EventCx, at: (f32, f32), align: MenuAlign) {
+        let target = FileTarget { path: self.path.clone(), kind: TargetKind::File, origin: Origin::Document };
+        cx.request(Request::FileMenu { target, at, align });
+    }
+
+    /// The header with `⋯` at its right end. Returns the header's height.
+    fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect) -> f32 {
+        let h = DocHeader::height(cx.ui);
+        let r = Rect { h, ..rect };
+        let row = DocHeader::control_row(cx.ui, r);
+        let side = row.h;
+        let mb = Rect { x: row.x + row.w - side, y: row.y, w: side, h: side };
+        // The header's background goes first: `⋯` draws over it.
+        let (kind, extra, name) = (self.kind(), self.extra(), self.name());
+        let text = HeaderText {
+            name: &name,
+            path: Some(&self.path),
+            kind: &kind,
+            modified: false,
+            changed_on_disk: false,
+            extra,
         };
-        let frac = ((pos.0 - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
-        let at = total.mul_f32(frac);
-        if let (Some(a), Some(path)) = (&self.audio, self.audio_path()) {
-            if a.status().path.as_ref() == Some(&path) {
-                a.seek(at);
-                cx.redraw();
-            }
+        self.name_hit = Some(self.header.paint(cx, r, mb.x, &text, Some(BTN_NAME)));
+        let hover = cx.button(mb, BTN_MORE);
+        if hover {
+            cx.round_rect(hover_box(mb, side), theme::box_radius(cx.ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
         }
-    }
-
-    /// Returns whether `id` was one of the pane's buttons.
-    pub fn button(&mut self, cx: &mut EventCx, id: u32) -> bool {
-        match id {
-            BTN_PLAY => {
-                let Some(path) = self.audio_path() else { return true };
-                self.autoplay_at = None;
-                let player = self.audio.get_or_insert_with(AudioPlayer::new);
-                let st = player.status();
-                if st.path.as_ref() != Some(&path) || !st.loaded {
-                    player.play(&path);
-                } else if st.playing {
-                    player.pause();
-                } else {
-                    player.resume();
-                }
-            }
-            BTN_AUTOPLAY => self.autoplay = Some(!self.autoplay_on(cx.cfg)),
-            _ => return false,
-        }
-        cx.redraw();
-        true
-    }
-
-    pub fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
-        self.rect = rect;
-        self.seek = None;
-        let scale = cx.ui.scale;
-        let ch = cx.ui.cell_h;
-        let pad = 12.0 * scale;
-        cx.fill(rect, cx.chrome.sidebar);
-        cx.fill(Rect { x: rect.x, y: rect.y, w: scale.max(1.0), h: rect.h }, theme::INPUT_BORDER);
-        let inner = Rect {
-            x: rect.x + pad,
-            y: rect.y + pad,
-            w: (rect.w - pad * 2.0).max(1.0),
-            h: (rect.h - pad * 2.0).max(1.0),
+        cx.tooltip(mb, "More options");
+        let icon_side = (cx.ui.cell_h * 0.8).round();
+        let icon = Rect {
+            x: mb.x + ((mb.w - icon_side) * 0.5).round(),
+            y: mb.y + ((mb.h - icon_side) * 0.5).round(),
+            w: icon_side,
+            h: icon_side,
         };
-        let Some(p) = self.shown.clone() else {
-            let msg = if self.loading() { "Loading\u{2026}" } else { "Nothing selected" };
-            cx.label(msg, Family::SansSerif, inner.x, inner.y, inner, theme::DIM);
-            return;
-        };
-
-        // Details: name, then kind/size/dimensions, then age.
-        let mut y = inner.y;
-        let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        cx.label(&name, Font::SANS.bold(true), inner.x, y, inner, theme::TEXT);
-        y += ch * 1.4;
-        let mut facts = vec![p.kind.clone()];
-        if let Some(size) = p.size {
-            facts.push(human_size(size));
-        }
-        match &p.content {
-            Content::Dir { entries } => facts.push(match entries {
-                1 => "1 item".to_string(),
-                n => format!("{n} items"),
-            }),
-            Content::Image { width, height, .. } => facts.push(format!("{width} \u{00d7} {height}")),
-            Content::Audio { duration: Some(d) } => facts.push(clock(*d)),
-            _ => {}
-        }
-        cx.label(&facts.join("  \u{00b7}  "), Family::SansSerif, inner.x, y, inner, theme::TEXT_DIM);
-        y += ch * 1.2;
-        if let Some(m) = p.modified {
-            cx.label(&format!("Modified {}", ago(m)), Family::SansSerif, inner.x, y, inner, theme::TEXT_DIM);
-            y += ch * 1.2;
-        }
-        y += pad * 0.5;
-        let body = Rect { x: inner.x, y, w: inner.w, h: (inner.y + inner.h - y).max(0.0) };
-        if body.h < ch {
-            return;
-        }
-
-        match &p.content {
-            Content::Text { lines, spans, truncated } => self.paint_text(cx, body, lines, spans, *truncated),
-            Content::Image { image, .. } => {
-                // One image pixel per logical pixel at most: small images stay crisp.
-                let r = image.fit(body, scale);
-                cx.image(IMAGE_ID, image.id(), image.clone(), r, body);
-            }
-            Content::Audio { duration } => self.paint_audio(cx, body, &p.path, *duration),
-            Content::Nothing => {
-                cx.label("No preview", Family::SansSerif, body.x, body.y, body, theme::DIM);
-            }
-            Content::Error(e) => {
-                cx.label(e, Family::SansSerif, body.x, body.y, body, theme::DIM);
-            }
-            Content::Dir { .. } => {}
-        }
-    }
-
-    fn paint_text(&mut self, cx: &mut PaintCx, body: Rect, lines: &[String], spans: &[Vec<Span>], truncated: bool) {
-        let ch = cx.ui.cell_h;
-        let count = lines.len() + usize::from(truncated);
-        if count == 0 {
-            cx.label("Empty file", Family::SansSerif, body.x, body.y, body, theme::DIM);
-            return;
-        }
-        let max_scroll = (count as f32 * ch - body.h).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let first = (self.scroll / ch).floor() as usize;
-        let mut i = first;
-        while i < count {
-            let top = body.y + i as f32 * ch - self.scroll;
-            if top > body.y + body.h {
-                break;
-            }
-            let (text, color) = match lines.get(i) {
-                Some(l) => (l.as_str(), theme::TEXT),
-                None => ("\u{2026}", theme::DIM),
-            };
-            match spans.get(i) {
-                Some(hl) => {
-                    let row = syntax::row_spans(text, hl, 0, usize::MAX, color);
-                    let key = cx.row_key(row.iter().map(|(t, c)| (t.as_str(), *c)));
-                    cx.budgeted_row(key, || row, body.x, top, body.w, body, color);
-                }
-                None => {
-                    let key = cx.row_key(std::iter::once((text, color)));
-                    cx.budgeted_row(key, || vec![(text.to_string(), color)], body.x, top, body.w, body, color);
-                }
-            }
-            i += 1;
-        }
+        Icon::More.paint(cx, icon, if hover { theme::GLYPH_HOVER } else { theme::GLYPH });
+        self.more_hit = Some(mb);
+        self.header_rect = Some(r);
+        h
     }
 
     fn paint_audio(&mut self, cx: &mut PaintCx, body: Rect, path: &Path, duration: Option<Duration>) {
@@ -620,22 +403,208 @@ impl PreviewPane {
     }
 }
 
-/// A byte count the way Finder shows it (powers of 1000).
-pub fn human_size(n: u64) -> String {
-    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    if n < 1000 {
-        return format!("{n} B");
+impl View for MediaView {
+    fn plugin(&self) -> &'static str {
+        super::ID
     }
-    let mut v = n as f64 / 1000.0;
-    let mut unit = 0;
-    while v >= 1000.0 && unit < UNITS.len() - 1 {
-        v /= 1000.0;
-        unit += 1;
+
+    fn title(&self) -> Option<String> {
+        Some(self.name())
     }
-    if v < 10.0 {
-        format!("{v:.1} {}", UNITS[unit])
-    } else {
-        format!("{v:.0} {}", UNITS[unit])
+
+    fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
+        self.seek = None;
+        cx.fill(rect, cx.chrome.background);
+        let header_h = self.paint_header(cx, rect);
+        let pad = (12.0 * cx.ui.scale).round();
+        let body = Rect {
+            x: rect.x + pad,
+            y: rect.y + header_h + pad,
+            w: (rect.w - pad * 2.0).max(1.0),
+            h: (rect.h - header_h - pad * 2.0).max(0.0),
+        };
+        let Some(p) = self.shown.clone() else {
+            cx.label("Loading\u{2026}", Family::SansSerif, body.x, body.y, body, theme::DIM);
+            return;
+        };
+        match &p.content {
+            Content::Image { image, .. } => {
+                // One image pixel per logical pixel at most: small images stay crisp.
+                let r = image.fit(body, cx.ui.scale);
+                cx.image(IMAGE_ID, image.id(), image.clone(), r, body);
+            }
+            Content::Audio { duration } => self.paint_audio(cx, body, &p.path, *duration),
+            Content::Nothing => {
+                cx.label("Nothing to show", Family::SansSerif, body.x, body.y, body, theme::DIM);
+            }
+            Content::Error(e) => {
+                cx.label(e, Family::SansSerif, body.x, body.y, body, theme::DIM);
+            }
+        }
+    }
+
+    fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        let MouseEvent::Down { pos, button: crate::plugin::MouseButton::Left, .. } = *event else { return };
+        let Some((hit, x0, x1)) = self.seek else { return };
+        if !rect_contains(hit, pos.0, pos.1) {
+            return;
+        }
+        let Some(Content::Audio { duration: Some(total) }) = self.shown.as_ref().map(|p| &p.content) else {
+            return;
+        };
+        let frac = ((pos.0 - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+        let at = total.mul_f32(frac);
+        if let (Some(a), Some(path)) = (&self.audio, self.audio_path()) {
+            if a.status().path.as_ref() == Some(&path) {
+                a.seek(at);
+                cx.redraw();
+            }
+        }
+    }
+
+    fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
+        if self.header_rect.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
+            self.open_file_menu(cx, pos, MenuAlign::Left);
+        }
+    }
+
+    fn button(&mut self, cx: &mut EventCx, id: u32) {
+        match id {
+            BTN_PLAY => {
+                let Some(path) = self.audio_path() else { return };
+                self.autoplay_at = None;
+                let player = self.audio.get_or_insert_with(AudioPlayer::new);
+                let st = player.status();
+                if st.path.as_ref() != Some(&path) || !st.loaded {
+                    player.play(&path);
+                } else if st.playing {
+                    player.pause();
+                } else {
+                    player.resume();
+                }
+            }
+            BTN_AUTOPLAY => self.autoplay = Some(!self.autoplay_on(cx.cfg)),
+            BTN_NAME => {
+                if let Some(hit) = self.name_hit {
+                    self.open_file_menu(cx, (hit.x, hit.y + hit.h), MenuAlign::Left);
+                }
+                return;
+            }
+            BTN_MORE => {
+                if let Some(mb) = self.more_hit {
+                    let items = self.more_menu(cx.cfg);
+                    cx.request(Request::Menu { items, at: (mb.x + mb.w, mb.y + mb.h), align: MenuAlign::Right });
+                }
+                return;
+            }
+            BTN_FILE_MENU => {
+                if let Some(mb) = self.more_hit {
+                    self.open_file_menu(cx, (mb.x + mb.w, mb.y + mb.h), MenuAlign::Right);
+                }
+                return;
+            }
+            _ => return,
+        }
+        cx.redraw();
+    }
+
+    /// Leaving the screen pauses a playing track and cancels a pending
+    /// autoplay; coming back resumes nothing, so a track never starts without
+    /// the user seeing it.
+    fn shown(&mut self, visible: bool) {
+        self.hidden = !visible;
+        if visible {
+            return;
+        }
+        self.autoplay_at = None;
+        self.progress_at = None;
+        if let Some(a) = self.audio.as_ref().filter(|a| a.status().playing) {
+            a.pause();
+        }
+    }
+
+    fn deadline(&self, _cfg: &Config) -> Option<Instant> {
+        [self.poll_at, self.autoplay_at, self.progress_at].into_iter().flatten().min()
+    }
+
+    fn tick(&mut self, cx: &mut EventCx, now: Instant) {
+        if self.poll_at.is_some_and(|t| now >= t) {
+            self.poll_at = Some(now + POLL_EVERY);
+            let ready = self.loader.as_ref().and_then(Loader::take);
+            if let Some(p) = ready.filter(|p| p.path == self.path) {
+                let first = self.shown.is_none();
+                if first && matches!(p.content, Content::Audio { .. }) && self.autoplay_on(cx.cfg) && !self.hidden {
+                    self.autoplay_at = Some(now + AUTOPLAY_AFTER);
+                }
+                self.shown = Some(p);
+                self.poll_at = None;
+                cx.redraw();
+            } else if self.loader.as_ref().is_some_and(|l| !l.alive()) {
+                // Nothing more will arrive: stop polling, and start a fresh
+                // loader for the next load.
+                self.loader = None;
+                self.poll_at = None;
+                self.shown = Some(Loaded {
+                    path: self.path.clone(),
+                    kind: "File".into(),
+                    content: Content::Error("loading stopped".into()),
+                });
+                cx.redraw();
+            }
+        }
+        if self.autoplay_at.is_some_and(|t| now >= t) {
+            self.autoplay_at = None;
+            if let Some(p) = self.audio_path() {
+                self.audio.get_or_insert_with(AudioPlayer::new).play(&p);
+                cx.redraw();
+            }
+        }
+        if self.progress_at.is_some_and(|t| now >= t) {
+            self.progress_at = None;
+            cx.redraw();
+        }
+    }
+
+    fn path(&self) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+
+    /// Copies the file as it is on disk: the view never changes it.
+    fn save_copy(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::copy(&self.path, &path)?;
+        Ok(())
+    }
+
+    fn files_changed(&mut self, moved: &[(PathBuf, PathBuf)]) {
+        if let Some(to) = crate::file_ops::follow(&self.path, moved) {
+            self.path = to;
+            self.load();
+        }
+    }
+
+    fn changed_on_disk(&mut self, path: &Path) -> bool {
+        if !crate::languages::same_file(&self.path, path) {
+            return false;
+        }
+        self.load();
+        true
+    }
+
+    fn text(&mut self) -> Option<String> {
+        let mut facts = vec![self.kind()];
+        facts.extend(self.extra());
+        Some(format!("{}\n{}", self.path.display(), facts.join(" \u{00b7} ")))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -649,79 +618,17 @@ pub fn clock(d: Duration) -> String {
     }
 }
 
-/// How long ago `t` was, in its largest whole unit ("3 days ago").
-pub fn ago(t: SystemTime) -> String {
-    let Ok(d) = SystemTime::now().duration_since(t) else {
-        return "just now".to_string();
-    };
-    let s = d.as_secs();
-    let (n, unit) = match s {
-        0..60 => return "just now".to_string(),
-        60..3600 => (s / 60, "minute"),
-        3600..86_400 => (s / 3600, "hour"),
-        86_400..2_592_000 => (s / 86_400, "day"),
-        2_592_000..31_536_000 => (s / 2_592_000, "month"),
-        _ => (s / 31_536_000, "year"),
-    };
-    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::testing::wav;
-    use crate::plugin::testing::tmpdir;
+    use crate::plugin::testing::{tmpdir, Harness};
 
-    #[test]
-    fn text_keeps_a_bounded_head_and_spots_binary() {
-        let d = tmpdir("preview-text");
-        std::fs::write(d.join("a.rs"), "fn main() {\n\tx\n}\n").unwrap();
-        let p = load(&d.join("a.rs"));
-        assert_eq!(p.kind, "RS text");
-        let Content::Text { lines, truncated, .. } = p.content else { panic!("text") };
-        assert_eq!(lines, vec!["fn main() {", "    x", "}"]);
-        assert!(!truncated);
-
-        std::fs::write(d.join("long.txt"), "x\n".repeat(TEXT_MAX_LINES + 5)).unwrap();
-        let Content::Text { lines, truncated, .. } = load(&d.join("long.txt")).content else { panic!("text") };
-        assert_eq!(lines.len(), TEXT_MAX_LINES);
-        assert!(truncated);
-
-        std::fs::write(d.join("blob.bin"), [0x7f, b'E', b'L', b'F', 0, 1]).unwrap();
-        let p = load(&d.join("blob.bin"));
-        assert!(matches!(p.content, Content::Nothing));
-        assert_eq!(p.kind, "BIN file");
-        assert_eq!(p.size, Some(6));
-    }
-
-    #[test]
-    fn text_with_a_highlighter_carries_a_span_list_per_line() {
-        use ghostrealm_core::highlight::Token;
-        let d = tmpdir("preview-highlight");
-        std::fs::write(d.join("n.md"), "# Title\n```\n# code\n```\n").unwrap();
-        let Content::Text { lines, spans, .. } = load(&d.join("n.md")).content else { panic!("text") };
-        assert_eq!(spans.len(), lines.len());
-        assert_eq!(spans[0][0].token, Token::Marker, "heading");
-        assert_eq!(spans[2][0].token, Token::Code, "inside the fence");
-
-        std::fs::write(d.join("a.rs"), "fn main() {}\n").unwrap();
-        let Content::Text { spans, .. } = load(&d.join("a.rs")).content else { panic!("text") };
-        assert!(spans.is_empty(), "no highlighter for .rs");
-    }
-
-    #[test]
-    fn folders_count_their_entries() {
-        let d = tmpdir("preview-dir");
-        std::fs::write(d.join("a"), "").unwrap();
-        std::fs::write(d.join("b"), "").unwrap();
-        let p = load(&d);
-        assert_eq!(p.kind, "Folder");
-        assert!(matches!(p.content, Content::Dir { entries: 2 }));
-    }
+    const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 };
 
     #[test]
     fn images_decode_and_shrink_to_the_cap() {
-        let d = tmpdir("preview-img");
+        let d = tmpdir("media-img");
         std::fs::write(d.join("wide.png"), media::testing::png(IMAGE_MAX_SIDE * 2, 10, [255, 0, 0, 255])).unwrap();
         let p = load(&d.join("wide.png"));
         assert_eq!(p.kind, "PNG image");
@@ -733,11 +640,18 @@ mod tests {
         assert!(matches!(load(&d.join("bad.png")).content, Content::Error(_)));
     }
 
+    #[test]
+    fn only_images_and_tracks_are_media() {
+        assert!(is_media(Path::new("a/b.PNG")));
+        assert!(is_media(Path::new("song.mp3")));
+        assert!(!is_media(Path::new("notes.md")));
+        assert!(!is_media(Path::new("Makefile")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn pipes_and_devices_are_described_without_being_read() {
-        let d = tmpdir("preview-fifo");
-        // Named like audio, so the extension doesn't pick the plain-file path.
+        let d = tmpdir("media-fifo");
         let fifo = d.join("pipe.mp3");
         assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
         let (tx, rx) = mpsc::channel();
@@ -751,99 +665,152 @@ mod tests {
 
         let p = load(Path::new("/dev/null"));
         assert_eq!(p.kind, "Device");
-        assert!(matches!(p.content, Content::Nothing));
     }
 
     #[test]
     fn an_image_with_no_pixels_is_an_error_not_a_panic() {
-        let d = tmpdir("preview-empty-img");
+        let d = tmpdir("media-empty-img");
         // A fuzzed 17x0 GIF that used to panic building mips.
         std::fs::write(d.join("empty.gif"), include_bytes!("../../media/testdata/zero-height.gif")).unwrap();
         let p = load(&d.join("empty.gif"));
         assert!(matches!(p.content, Content::Error(_)), "{:?}", p.kind);
     }
 
-    fn tick(pane: &mut PreviewPane, now: Instant) {
-        let cfg = Config::default();
-        let mut cx = EventCx::new(&cfg, crate::plugin::testing::UI, Default::default(), None);
-        pane.tick(&mut cx, now);
-    }
-
-    /// Tick `pane` until it stops polling (or a second passes).
-    fn settle(pane: &mut PreviewPane) {
-        let until = Instant::now() + Duration::from_secs(1);
-        while pane.loading() && Instant::now() < until {
-            std::thread::sleep(POLL_EVERY);
-            tick(pane, Instant::now());
-        }
-    }
-
-    #[test]
-    fn a_panicking_load_shows_an_error_and_the_loader_carries_on() {
-        fn explode(path: &Path) -> Preview {
-            if path.ends_with("bad") {
-                panic!("decoder bug");
-            }
-            load(path)
-        }
-        let d = tmpdir("preview-panic");
-        std::fs::write(d.join("good.txt"), "hi").unwrap();
-        let mut pane = PreviewPane { loader: Some(Loader::with(explode)), ..Default::default() };
-        pane.show(Some(&d.join("bad")));
-        settle(&mut pane);
-        assert!(!pane.loading());
-        assert!(matches!(pane.shown().unwrap().content, Content::Error(_)));
-        pane.show(Some(&d.join("good.txt")));
-        settle(&mut pane);
-        assert!(matches!(pane.shown().unwrap().content, Content::Text { .. }));
-    }
-
-    #[test]
-    fn a_dead_loader_stops_the_polling() {
-        let d = tmpdir("preview-dead");
-        std::fs::write(d.join("a.txt"), "a").unwrap();
-        let mut pane = PreviewPane::default();
-        pane.show(Some(&d.join("a.txt")));
-        settle(&mut pane);
-        // A loader whose worker has gone, with a request it will never answer.
-        let (tx, rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || drop(rx));
-        thread_wait(&thread);
-        pane.loader = Some(Loader { tx, done: Arc::default(), thread });
-        pane.show(Some(&d.join("gone")));
-        settle(&mut pane);
-        assert!(!pane.loading(), "stops polling");
-        assert!(pane.deadline().is_none(), "no timer left");
-        assert!(matches!(pane.shown().unwrap().content, Content::Error(_)));
-        assert!(pane.loader.is_none(), "the next entry starts a new loader");
-    }
-
-    fn thread_wait(t: &std::thread::JoinHandle<()>) {
-        while !t.is_finished() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
     #[test]
     fn audio_reports_its_length() {
-        let d = tmpdir("preview-wav");
+        let d = tmpdir("media-wav");
         std::fs::write(d.join("tone.wav"), wav(8000, 8000 * 2)).unwrap();
         let p = load(&d.join("tone.wav"));
         assert_eq!(p.kind, "WAV audio");
         let Content::Audio { duration } = p.content else { panic!("audio") };
         assert_eq!(duration, Some(Duration::from_secs(2)));
+        assert_eq!(clock(Duration::from_secs(65)), "1:05");
+        assert_eq!(clock(Duration::from_secs(3_725)), "1:02:05");
+    }
+
+    /// Tick `v` until it stops loading (or five seconds pass).
+    fn settle(h: &Harness, v: &mut MediaView) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while v.loading() {
+            assert!(Instant::now() < until, "{:?} never loaded", v.path);
+            std::thread::sleep(POLL_EVERY);
+            h.tick(v, Instant::now());
+        }
     }
 
     #[test]
-    fn formats_sizes_clocks_and_ages() {
-        assert_eq!(human_size(999), "999 B");
-        assert_eq!(human_size(1_234), "1.2 KB");
-        assert_eq!(human_size(45_600_000), "46 MB");
-        assert_eq!(clock(Duration::from_secs(65)), "1:05");
-        assert_eq!(clock(Duration::from_secs(3_725)), "1:02:05");
-        let now = SystemTime::now();
-        assert_eq!(ago(now), "just now");
-        assert_eq!(ago(now - Duration::from_secs(3 * 86_400 + 5)), "3 days ago");
-        assert_eq!(ago(now - Duration::from_secs(3_700)), "1 hour ago");
+    fn a_panicking_load_shows_an_error_and_the_loader_carries_on() {
+        fn explode(path: &Path) -> Loaded {
+            if path.ends_with("bad.png") {
+                panic!("decoder bug");
+            }
+            load(path)
+        }
+        let d = tmpdir("media-panic");
+        std::fs::write(d.join("good.png"), media::testing::png(2, 2, [0; 4])).unwrap();
+        let h = Harness::new();
+        let mut v = MediaView::open(d.join("bad.png"));
+        v.loader = Some(Loader::with(explode));
+        v.load();
+        settle(&h, &mut v);
+        assert!(matches!(v.loaded().unwrap().content, Content::Error(_)));
+        v.files_changed(&[(d.join("bad.png"), d.join("good.png"))]);
+        settle(&h, &mut v);
+        assert!(matches!(v.loaded().unwrap().content, Content::Image { .. }));
+    }
+
+    #[test]
+    fn a_dead_loader_stops_the_polling() {
+        let d = tmpdir("media-dead");
+        let h = Harness::new();
+        let mut v = MediaView::open(d.join("gone.png"));
+        settle(&h, &mut v);
+        // A loader whose worker has gone, with a request it will never answer.
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || drop(rx));
+        while !thread.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        v.loader = Some(Loader { tx, done: Arc::default(), thread });
+        v.load();
+        settle(&h, &mut v);
+        assert_eq!(v.deadline(&h.cfg), None, "no timer left");
+        assert!(matches!(v.loaded().unwrap().content, Content::Error(_)));
+        assert!(v.loader.is_none(), "the next load starts a new loader");
+    }
+
+    #[test]
+    fn an_image_draws_under_its_header() {
+        let d = tmpdir("media-draw");
+        std::fs::write(d.join("c.png"), media::testing::png(4, 2, [0, 0, 255, 255])).unwrap();
+        let mut h = Harness::new();
+        let mut v = MediaView::open(d.join("c.png"));
+        settle(&h, &mut v);
+        let frame = h.paint(&mut v, RECT);
+        assert_eq!(frame.images.len(), 1);
+        let r = frame.images[0].rect;
+        assert!(r.y >= DocHeader::height(crate::plugin::testing::UI), "below the header, got {r:?}");
+        assert_eq!((r.w, r.h), (4.0, 2.0), "never upscaled past a pixel per logical px");
+        assert!(h.texts().iter().any(|t| t == "PNG image  \u{00b7}  4 \u{00d7} 2" || t.starts_with("PNG image")));
+        assert!(h.frame.view_buttons.iter().any(|b| b.2 == BTN_MORE));
+    }
+
+    /// A shown view of the track `c.wav`, loaded, with autoplay per `on`.
+    fn track(on: bool) -> (Harness, MediaView, PathBuf) {
+        let d = tmpdir("media-track");
+        std::fs::write(d.join("c.wav"), wav(8000, 800)).unwrap();
+        let mut h = Harness::new();
+        h.cfg.file_browser.preview_autoplay = on;
+        let mut v = MediaView::open(d.join("c.wav"));
+        v.shown(true);
+        settle(&h, &mut v);
+        (h, v, d.join("c.wav"))
+    }
+
+    #[test]
+    fn a_track_offers_play_without_autoplaying_when_off() {
+        let (mut h, mut v, _) = track(false);
+        let frame = h.paint(&mut v, RECT);
+        let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
+        assert!(ids.contains(&BTN_PLAY) && ids.contains(&BTN_AUTOPLAY));
+        assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled: no autoplay");
+        let out = h.button(&mut v, BTN_MORE);
+        let Some(Request::Menu { items, .. }) = out.requests.first() else { panic!("a menu") };
+        assert_eq!(items.iter().find(|i| i.id == BTN_AUTOPLAY).and_then(|i| i.checked), Some(false));
+    }
+
+    #[test]
+    fn hiding_the_view_cancels_a_pending_autoplay_and_showing_it_does_not_restore_it() {
+        let (h, mut v, _) = track(true);
+        assert!(v.deadline(&h.cfg).is_some(), "autoplay is pending");
+        v.shown(false);
+        assert_eq!(v.deadline(&h.cfg), None, "nothing scheduled while hidden");
+        v.shown(true);
+        assert_eq!(v.deadline(&h.cfg), None, "not re-armed on return");
+    }
+
+    #[test]
+    fn a_track_that_finishes_loading_while_hidden_does_not_autoplay() {
+        let d = tmpdir("media-hidden");
+        std::fs::write(d.join("c.wav"), wav(8000, 800)).unwrap();
+        let mut h = Harness::new();
+        h.cfg.file_browser.preview_autoplay = true;
+        let mut v = MediaView::open(d.join("c.wav"));
+        settle(&h, &mut v);
+        assert_eq!(v.deadline(&h.cfg), None, "no autoplay armed while hidden");
+    }
+
+    #[test]
+    fn hiding_the_view_pauses_a_playing_track_and_showing_it_leaves_it_paused() {
+        let (h, mut v, wav) = track(true);
+        let player = AudioPlayer::new();
+        player.play(&wav);
+        v.install_player(player);
+        assert!(v.audio_status().is_some_and(|s| s.playing));
+        v.shown(false);
+        assert!(v.audio_status().is_some_and(|s| !s.playing), "paused on hide");
+        v.shown(true);
+        assert!(v.audio_status().is_some_and(|s| !s.playing), "not resumed on show");
+        assert_eq!(v.deadline(&h.cfg), None);
     }
 }

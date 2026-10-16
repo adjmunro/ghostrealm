@@ -126,36 +126,30 @@ impl Default for Inbox {
     }
 }
 
-/// How the file browser opens a file when you click/Enter it.
+/// Whether a new Files surface shows its file sidebar beside a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum OpenIn {
-    /// Add a tab in the file browser's own pane.
-    Tab,
-    /// Open beside the file browser in a new horizontal split (when the pane is wide
-    /// enough; otherwise falls back to a tab).
+pub enum SidebarPin {
     #[default]
-    Split,
+    Pinned,
+    Hidden,
 }
 
 /// `[file_browser]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileBrowser {
-    /// Where opening a file puts it.
-    pub open_in: OpenIn,
-    /// Show the preview beside the list once the browser is at least this wide
-    /// (logical px). Preview in the browser's `⋯` menu overrides it per pane.
-    pub preview_min_width: u32,
-    /// Start playing audio once the preview has shown it for a moment.
+    /// Whether a new Files surface shows the sidebar beside its document,
+    /// until the sidebar is toggled this session.
+    pub sidebar: SidebarPin,
+    /// Start playing audio once its document has shown it for a moment.
     pub preview_autoplay: bool,
 }
 
 impl Default for FileBrowser {
     fn default() -> Self {
         FileBrowser {
-            open_in: OpenIn::Split,
-            preview_min_width: 900,
+            sidebar: SidebarPin::Pinned,
             preview_autoplay: true,
         }
     }
@@ -244,7 +238,7 @@ pub struct Editor {
     pub line_numbers: LineNumbers,
     /// Highlight the line the cursor is on.
     pub cursor_line: bool,
-    /// Default soft-wrap state for editor panes (toggle per-pane with the ribbon
+    /// Default soft-wrap state for editor panes (toggle per document with the header's
     /// button). When off, long lines are clipped at the pane edge.
     pub soft_wrap: bool,
     /// Save a modified file when its editor loses focus (tab/workspace/app switch).

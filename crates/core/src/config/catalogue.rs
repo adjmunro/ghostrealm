@@ -236,7 +236,7 @@ pub fn core_sections(commands: &[KeyDoc]) -> Vec<SectionSpec> {
              With it, unset colours use those defaults.",
             vec![
                 OptionSpec::new("background", Rgb, Some("[20, 20, 24]"), "Behind panes and split dividers."),
-                OptionSpec::new("sidebar", Rgb, Some("[24, 24, 30]"), "Sidebar and ribbon background."),
+                OptionSpec::new("sidebar", Rgb, Some("[24, 24, 30]"), "Sidebar and document header background."),
                 OptionSpec::new(
                     "accent",
                     Rgb,

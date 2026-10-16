@@ -645,9 +645,6 @@ pub struct PaintCx<'a> {
     pub cursor: (f32, f32),
     /// The view's pane has keyboard focus.
     pub focused: bool,
-    /// The pane shows a tab strip above the view (a single-tab pane may hide it;
-    /// a view that wants a header of its own then draws one).
-    pub tab_strip: bool,
     /// A modal overlay (palette, menu, picker, confirmation) covers the panes:
     /// [`above`](Self::above) paints nothing, and a view should close its
     /// popups.
@@ -680,7 +677,6 @@ impl<'a> PaintCx<'a> {
             ui,
             cursor,
             focused: false,
-            tab_strip: false,
             modal: false,
             text,
             frame,
