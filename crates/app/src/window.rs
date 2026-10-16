@@ -413,6 +413,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Close-button hover highlight tracks the cursor everywhere.
                 redraw |= state.update_button_hover();
+                redraw |= state.update_htab_hover();
                 redraw |= state.update_divider_hover();
                 // Hover reaches the view under the cursor (e.g. the file browser's
                 // highlight follows the mouse).
@@ -611,6 +612,9 @@ struct State {
     /// Index into `buttons` of the close button under the cursor, if any — used
     /// to redraw only when the hovered button changes.
     button_hover: Option<usize>,
+    /// The pane tab under the cursor (pane, index): an unsaved one's close
+    /// slot shows '×' instead of its dot while hovered.
+    htab_hover: Option<(PaneId, usize)>,
     /// A close button pressed but not yet released. It fires on release only if
     /// the cursor is still over the same button, so a press can be cancelled by
     /// moving away before releasing.
@@ -1215,6 +1219,7 @@ impl State {
             sidebar_rows: Vec::new(),
             buttons: Vec::new(),
             button_hover: None,
+            htab_hover: None,
             armed_button: None,
             close_buffer,
             toggle_buffer,
@@ -2017,14 +2022,12 @@ impl State {
             }
             return;
         }
-        let Some(PaneHit { vt, pid, rect, n, active_sid }) = self.pane_under_cursor() else {
+        let Some(PaneHit { vt, pid, active_sid, .. }) = self.pane_under_cursor() else {
             return;
         };
 
         // A click in a visible tab strip switches the pane's active surface.
-        if self.in_strip(rect, n, y) {
-            let tab_w = rect.w / n.max(1) as f32;
-            let idx = (((x - rect.x) / tab_w).floor() as usize).min(n - 1);
+        if let Some((_, idx)) = self.htab_under_cursor() {
             if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
                 pane.active = idx;
             }
@@ -2068,6 +2071,25 @@ impl State {
             n: pane.surfaces.len(),
             active_sid: pane.active_surface().map(|s| s.id),
         })
+    }
+
+    /// The pane tab under the cursor: its pane and index.
+    fn htab_under_cursor(&self) -> Option<(PaneId, usize)> {
+        let PaneHit { pid, rect, n, .. } = self.pane_under_cursor()?;
+        if !self.in_strip(rect, n, self.cursor.1) {
+            return None;
+        }
+        let tab_w = rect.w / n.max(1) as f32;
+        Some((pid, (((self.cursor.0 - rect.x) / tab_w).floor() as usize).min(n - 1)))
+    }
+
+    /// Note the pane tab under the cursor; returns whether it changed (its
+    /// close slot then repaints).
+    fn update_htab_hover(&mut self) -> bool {
+        let now = self.htab_under_cursor();
+        let changed = now != self.htab_hover;
+        self.htab_hover = now;
+        changed
     }
 
     /// Whether `y` is in the tab strip of a pane at `rect` holding `n`
