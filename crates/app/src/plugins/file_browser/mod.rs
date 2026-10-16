@@ -339,13 +339,14 @@ impl FileBrowserView {
                 .and_then(|i| suggestions.get(i).cloned())
                 .or_else(|| Some(self.tree.resolve_path(&query)).filter(|p| p.is_dir()))
                 .or_else(|| suggestions.into_iter().next())
-                .filter(|p| p.is_dir())
-                .map(|p| lexical(&p));
+                .map(|p| lexical(&p))
+                .filter(|p| p.is_dir());
         }
         if let Some(r) = self.selected_row().filter(|r| r.is_dir && !r.is_category) {
             return Some(r.path);
         }
-        if let Some(dir) = self.chosen.clone().filter(|p| p.is_dir()) {
+        let chosen = self.chosen.clone();
+        if let Some(dir) = chosen.filter(|c| self.tree.rows().iter().any(|r| r.is_dir && !r.is_category && &r.path == c)) {
             return Some(dir);
         }
         if query.is_empty() {
@@ -355,7 +356,7 @@ impl FileBrowserView {
     }
 
     /// [`Mode::PickDir`]'s highlighted row, to find again once the listing
-    /// changes (other modes keep the index, as they always have).
+    /// changes; other modes keep the highlight's index.
     fn sel_path(&mut self) -> Option<PathBuf> {
         if self.mode != Mode::PickDir {
             return None;
@@ -471,6 +472,7 @@ impl FileBrowserView {
     /// highlight to its parent row when it is nested, else show the parent
     /// with the directory just left highlighted.
     fn leave_dir(&mut self) {
+        self.hover = None;
         let row = self.selected_row().filter(|r| !r.is_category);
         if let Some(r) = row.as_ref().filter(|r| r.is_dir && r.expanded) {
             self.tree.toggle_dir(&r.path);
@@ -938,6 +940,7 @@ impl View for FileBrowserView {
                     if clicks >= 2 && self.last_click.as_ref() == Some(&row.path) {
                         self.tree.set_root(row.path.clone());
                         self.chosen = None;
+                        self.clear_highlight();
                     } else {
                         self.tree.toggle_dir(&row.path);
                         self.chosen = Some(row.path.clone());
@@ -1031,9 +1034,7 @@ impl View for FileBrowserView {
         if let Some(chosen) = self.chosen.as_deref().and_then(follow) {
             self.chosen = Some(chosen);
         }
-        let sel = self.sel_path().map(|p| follow(&p).unwrap_or(p));
         self.tree.refresh();
-        self.reselect(sel);
     }
 
     fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
@@ -1045,6 +1046,8 @@ impl View for FileBrowserView {
         let next = (self.scroll - dy).max(0.0);
         if next != self.scroll {
             self.scroll = next;
+            // The rows moved under the pointer; the next move finds its row.
+            self.hover = None;
             cx.request_frame();
         }
     }
@@ -1340,7 +1343,7 @@ mod tests {
             type_in(&mut h, &mut v, "~");
             assert_eq!(enter(&mut h, &mut v), vec![Request::Pick(PathBuf::from(home))]);
         }
-        // Tab still cycles completions; Enter then takes the highlighted one.
+        // Tab cycles the completions; Enter takes the highlighted one.
         type_in(&mut h, &mut v, "adir/");
         h.key(&mut v, press(Key::Tab));
         h.key(&mut v, press(Key::Tab));
@@ -1388,6 +1391,20 @@ mod tests {
             .filter(|y| *y > header_h - 1.0)
             .map(|y| ((y - header_h) / row_h).round() as usize)
             .collect()
+    }
+
+    #[test]
+    fn directory_picker_double_click_answers_the_entered_directory() {
+        let (d, _) = fixture();
+        std::fs::create_dir(d.join("adir").join("deep")).unwrap();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 2, button: MouseButton::Left });
+        h.paint(&mut v, RECT);
+        assert_eq!(v.tree().root(), d.join("adir"));
+        assert_eq!((v.sel, v.choice()), (None, Some(d.join("adir"))), "not its first child");
     }
 
     #[test]
