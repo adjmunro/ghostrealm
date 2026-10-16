@@ -435,6 +435,14 @@ impl FsTree {
         self.dirty = true;
     }
 
+    /// Set the git-status filter.
+    pub fn set_git_filter(&mut self, filter: GitFilter) {
+        if self.git_filter != filter {
+            self.git_filter = filter;
+            self.dirty = true;
+        }
+    }
+
     /// Whether the "recently modified" filter is on.
     pub fn recent_on(&self) -> bool {
         self.recent.is_some()
