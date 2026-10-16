@@ -51,14 +51,27 @@ const EDITOR_CURSOR_LINE_ALPHA: f32 = 0.05;
 /// Spaces a Tab inserts.
 const TAB_WIDTH: usize = 4;
 
-/// The ribbon's toggles (see [`View::button`]).
+/// The ribbon's buttons and `⋯` menu items (see [`View::button`]). The
+/// statistic items take a range from `BTN_SHOW_STAT` up, so every other id
+/// stays below it.
 const BTN_WRAP: u32 = 0;
 const BTN_AUTOSAVE: u32 = 1;
 const BTN_STAT: u32 = 2;
 const BTN_NAME: u32 = 3;
 const BTN_MORE: u32 = 4;
+/// The `⋯` menu's "File actions…": the file menu, where the `⋯` menu was.
+const BTN_FILE_MENU: u32 = 5;
 /// Menu items showing statistic `Stat::ALL[i]` are `BTN_SHOW_STAT + i`.
 const BTN_SHOW_STAT: u32 = 16;
+const _: () = assert!(
+    BTN_SHOW_STAT > BTN_WRAP
+        && BTN_SHOW_STAT > BTN_AUTOSAVE
+        && BTN_SHOW_STAT > BTN_STAT
+        && BTN_SHOW_STAT > BTN_NAME
+        && BTN_SHOW_STAT > BTN_MORE
+        && BTN_SHOW_STAT > BTN_FILE_MENU,
+    "the statistic items' ids must not collide with another button's"
+);
 /// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -428,14 +441,20 @@ impl EditorView {
     }
 
     /// Ask the app for the file menu of this editor's file at `at`.
-    fn open_file_menu(&self, cx: &mut EventCx, at: (f32, f32)) {
+    fn open_file_menu(&self, cx: &mut EventCx, at: (f32, f32), align: MenuAlign) {
         if let Some(path) = self.buf.path.clone() {
             cx.request(Request::FileMenu {
                 target: FileTarget { path, kind: TargetKind::File, origin: Origin::Editor },
                 at,
-                align: MenuAlign::Left,
+                align,
             });
         }
+    }
+
+    /// Where the `⋯` menu opens: right-aligned below the button, so it stays
+    /// over the editor.
+    fn more_anchor(&self) -> Option<(f32, f32)> {
+        self.more_hit.map(|mb| (mb.x + mb.w, mb.y + mb.h))
     }
 
     /// The ribbon's `⋯` menu: every ribbon option, checked as it stands.
@@ -455,7 +474,7 @@ impl EditorView {
         }
         if has_file {
             items.push(MenuItem::RULE);
-            items.push(MenuItem::new(BTN_NAME, "File actions…"));
+            items.push(MenuItem::new(BTN_FILE_MENU, "File actions…"));
         }
         items
     }
@@ -964,7 +983,7 @@ impl View for EditorView {
 
     fn context_menu(&mut self, cx: &mut EventCx, pos: (f32, f32)) {
         if self.ribbon.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
-            self.open_file_menu(cx, pos);
+            self.open_file_menu(cx, pos, MenuAlign::Left);
         }
     }
 
@@ -972,14 +991,20 @@ impl View for EditorView {
         match id {
             BTN_NAME => {
                 if let Some(hit) = self.name_hit {
-                    self.open_file_menu(cx, (hit.x, hit.y + hit.h));
+                    self.open_file_menu(cx, (hit.x, hit.y + hit.h), MenuAlign::Left);
+                }
+                return;
+            }
+            BTN_FILE_MENU => {
+                if let Some(at) = self.more_anchor() {
+                    self.open_file_menu(cx, at, MenuAlign::Right);
                 }
                 return;
             }
             BTN_MORE => {
-                if let Some(mb) = self.more_hit {
+                if let Some(at) = self.more_anchor() {
                     let items = self.ribbon_menu(cx.cfg);
-                    cx.request(Request::Menu { items, at: (mb.x, mb.y + mb.h), align: MenuAlign::Left });
+                    cx.request(Request::Menu { items, at, align: MenuAlign::Right });
                 }
                 return;
             }
@@ -1380,15 +1405,23 @@ mod tests {
     fn the_ribbons_more_button_lists_every_option_checked_as_it_stands() {
         let path = tmpdir("editor-more").join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
-        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let mut h = Harness::new();
         h.cfg.editor.soft_wrap = false;
         (h.cfg.editor.autosave_after, h.cfg.editor.autosave_on_unfocus) = (0, false);
-        let more = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_MORE).expect("a ⋯ button").0;
-        assert!(more.x + more.w <= RECT.w, "at the right end");
+        let buttons = h.paint(&mut v, RECT).view_buttons.clone();
+        let more = buttons.iter().find(|b| b.2 == BTN_MORE).expect("a ⋯ button").0;
+        let others = buttons.iter().filter(|b| b.2 != BTN_MORE);
+        assert!(others.clone().count() >= 3);
+        for b in others {
+            assert!(b.0.x + b.0.w <= more.x + 0.5, "⋯ is right of every other ribbon button: {b:?}");
+        }
+        // Below the button, right edges flush, so the menu stays over the
+        // editor.
+        let anchor = (more.x + more.w, more.y + more.h);
         let menu = |h: &Harness, v: &mut EditorView| match h.button(v, BTN_MORE).requests.as_slice() {
-            [Request::Menu { items, at, .. }] => {
-                assert_eq!(*at, (more.x, more.y + more.h), "opens below the button");
+            [Request::Menu { items, at, align }] => {
+                assert_eq!((*at, *align), (anchor, MenuAlign::Right));
                 items.clone()
             }
             other => panic!("expected one menu request, got {other:?}"),
@@ -1400,7 +1433,11 @@ mod tests {
         assert_eq!(checked(&items, BTN_SHOW_STAT), Some(true), "line count shows");
         assert_eq!(checked(&items, BTN_SHOW_STAT + 1), Some(false));
         assert!(items.iter().all(|i| i.id != BTN_SHOW_STAT + 3), "untracked: no changes item");
-        assert!(items.iter().any(|i| i.id == BTN_NAME && i.enabled), "file actions");
+        assert!(items.iter().any(|i| i.id == BTN_FILE_MENU && i.enabled), "file actions");
+        // "File actions…" opens the file menu where the `⋯` menu was.
+        let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Editor };
+        let out = h.button(&mut v, BTN_FILE_MENU);
+        assert_eq!(out.requests, [Request::FileMenu { target, at: anchor, align: MenuAlign::Right }]);
 
         // Choosing an item is the same click as its ribbon icon.
         for id in [BTN_WRAP, BTN_AUTOSAVE, BTN_SHOW_STAT + 2] {
@@ -1425,7 +1462,7 @@ mod tests {
         };
         let autosave = items.iter().find(|i| i.id == BTN_AUTOSAVE).unwrap();
         assert_eq!((autosave.checked, autosave.enabled), (Some(false), false));
-        assert!(items.iter().all(|i| i.id != BTN_NAME), "no file, no file actions");
+        assert!(items.iter().all(|i| i.id != BTN_FILE_MENU), "no file, no file actions");
     }
 
     #[test]
