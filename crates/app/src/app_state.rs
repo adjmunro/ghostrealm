@@ -788,7 +788,7 @@ impl AppState {
     /// choice yet (a file picker with nothing selected), it stays open.
     /// Returns the file written, if any.
     pub fn confirm_picker(&mut self) -> Result<Option<std::path::PathBuf>> {
-        match self.picker.as_ref().and_then(|(b, _)| b.choice()) {
+        match self.picker.as_mut().and_then(|(b, _)| b.choice()) {
             Some(path) => self.confirm_picker_with(path),
             None => Ok(None),
         }
@@ -2073,8 +2073,6 @@ mod tests {
         s.picker_mut().unwrap().tree_mut().set_root(&sub);
         s.confirm_picker().unwrap();
         assert!(!s.picker_open());
-        // A directory picker answers with the canonical path.
-        let sub = std::fs::canonicalize(&sub).unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(sub.as_path()));
     }
 
@@ -2245,7 +2243,6 @@ mod tests {
         s.confirm_picker().unwrap();
         assert_eq!(count(&s), 1);
         let vt = s.active().unwrap();
-        let proj = std::fs::canonicalize(&proj).unwrap();
         assert_eq!(s.tree.vtab(vt).unwrap().root_dir.as_deref(), Some(proj.as_path()));
 
         // The picker starts at the default directory, not the active workspace's.
