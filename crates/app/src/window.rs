@@ -33,11 +33,11 @@ use winit::window::{CursorIcon, Window, WindowId};
 use crate::config_watch::{self, ConfigWatch};
 use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::file_menu::{FileAction, FileTarget, MenuEntry};
-use crate::plugin::paint::{push_border, rect_quad, srgb_to_linear, QuadInstance};
+use crate::plugin::paint::{line_quad, push_border, rect_quad, round_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseButton, MouseEvent, Outcome, PaintCx, RawKey,
-    Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
+    MenuItem, Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
@@ -738,6 +738,8 @@ enum MenuAction {
     Close,
     /// An item of the file menu.
     File(FileAction),
+    /// An item of a view's own menu: the view hears it as `View::button(id)`.
+    View(u32),
     /// A horizontal rule between sections; not clickable.
     Rule,
 }
@@ -749,6 +751,42 @@ enum MenuTarget {
     Vtab(ghostrealm_core::VtabId),
     /// A file, folder, or empty space in a file browser, or an editor's file.
     File(FileTarget),
+    /// The view on this surface, which filed `Request::Menu`.
+    View(SurfaceId),
+}
+
+/// A context-menu row.
+#[derive(Clone)]
+struct MenuRow {
+    label: String,
+    action: MenuAction,
+    /// `Some` for a toggle: whether a check mark shows.
+    checked: Option<bool>,
+    /// Dim text at the right end.
+    hint: Option<String>,
+    /// A disabled row shows dim and takes no hover or clicks.
+    enabled: bool,
+}
+
+impl MenuRow {
+    fn new(label: impl Into<String>, action: MenuAction) -> Self {
+        let enabled = !matches!(action, MenuAction::Rule);
+        MenuRow { label: label.into(), action, checked: None, hint: None, enabled }
+    }
+
+    /// A view's item; one with an empty label is a rule.
+    fn of_view(item: MenuItem) -> Self {
+        if item.is_rule() {
+            return MenuRow::new("", MenuAction::Rule);
+        }
+        MenuRow {
+            label: item.label,
+            action: MenuAction::View(item.id),
+            checked: item.checked,
+            hint: item.hint,
+            enabled: item.enabled,
+        }
+    }
 }
 
 /// A right-click context menu.
@@ -756,7 +794,7 @@ struct Menu {
     target: MenuTarget,
     /// Where the menu was opened (physical px); the panel is clamped on-screen.
     anchor: (f32, f32),
-    items: Vec<(String, MenuAction)>,
+    items: Vec<MenuRow>,
     /// Item under the cursor, for highlight.
     hover: Option<usize>,
     /// Item the left button went down on; it runs on release over the same item.
@@ -765,6 +803,41 @@ struct Menu {
     rows: Vec<Rect>,
     /// The panel rect (physical px), for click-outside dismissal.
     panel: Rect,
+}
+
+impl Menu {
+    fn new(target: MenuTarget, anchor: (f32, f32), items: Vec<MenuRow>) -> Self {
+        Menu {
+            target,
+            anchor,
+            items,
+            hover: None,
+            armed: None,
+            rows: Vec::new(),
+            panel: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+        }
+    }
+}
+
+/// Surface `sid`'s view: the picker's for [`PICKER_SID`].
+fn view_of(app: &mut AppState, sid: SurfaceId) -> Option<&mut dyn View> {
+    if sid == PICKER_SID {
+        app.picker_mut().map(|v| v as &mut dyn View)
+    } else {
+        app.view_mut(sid).map(|v| v as &mut dyn View)
+    }
+}
+
+/// Run a view-menu `action` chosen on `target`: the owning view hears it as a
+/// click on its button with the item's id. Returns the surface whose view ran
+/// it (its requests are in `cx`); `None` for another kind of item or a view
+/// that has gone.
+fn choose_view_item(app: &mut AppState, cx: &mut EventCx, action: MenuAction, target: &MenuTarget) -> Option<SurfaceId> {
+    let (MenuAction::View(id), MenuTarget::View(sid)) = (action, target) else {
+        return None;
+    };
+    view_of(app, *sid)?.button(cx, id);
+    Some(*sid)
 }
 
 /// A pane resolved for rendering: its rect, focus, and its surfaces
@@ -1582,16 +1655,8 @@ impl State {
     /// a redraw (`false` when there is no such view).
     fn view_event(&mut self, sid: SurfaceId, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
         let ui = self.ui();
-        let view: &mut dyn View = if sid == PICKER_SID {
-            match self.app.picker_mut() {
-                Some(v) => v,
-                None => return false,
-            }
-        } else {
-            match self.app.view_mut(sid) {
-                Some(v) => v,
-                None => return false,
-            }
+        let Some(view) = view_of(&mut self.app, sid) else {
+            return false;
         };
         let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
         f(view, &mut cx);
@@ -1625,6 +1690,7 @@ impl State {
                     self.app.close_surface_id(sid);
                 }
                 Request::FileMenu { target, at } => self.open_file_menu(target, at),
+                Request::Menu { items, at } => self.open_view_menu(sid, items, at),
             }
         }
     }
@@ -1912,31 +1978,16 @@ impl State {
             return;
         };
         let status = self.app.tree.vtab(target).map(|v| v.status);
-        let mut items: Vec<(String, MenuAction)> = Vec::new();
+        let mut items = Vec::new();
         match status {
-            Some(TabStatus::Unread { .. }) => {
-                items.push(("Mark read".into(), MenuAction::MarkRead))
-            }
-            Some(TabStatus::NeedsInput) => items.push(("Dismiss".into(), MenuAction::Dismiss)),
-            _ => items.push(("Mark unread".into(), MenuAction::MarkUnread)),
+            Some(TabStatus::Unread { .. }) => items.push(MenuRow::new("Mark read", MenuAction::MarkRead)),
+            Some(TabStatus::NeedsInput) => items.push(MenuRow::new("Dismiss", MenuAction::Dismiss)),
+            _ => items.push(MenuRow::new("Mark unread", MenuAction::MarkUnread)),
         }
-        items.push(("Rename…".into(), MenuAction::Rename));
-        items.push(("Set directory…".into(), MenuAction::SetDir));
-        items.push(("Close workspace".into(), MenuAction::Close));
-        self.menu = Some(Menu {
-            target: MenuTarget::Vtab(target),
-            anchor: (x, y),
-            items,
-            hover: None,
-            armed: None,
-            rows: Vec::new(),
-            panel: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 0.0,
-                h: 0.0,
-            },
-        });
+        items.push(MenuRow::new("Rename…", MenuAction::Rename));
+        items.push(MenuRow::new("Set directory…", MenuAction::SetDir));
+        items.push(MenuRow::new("Close workspace", MenuAction::Close));
+        self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), items));
         self.dirty = true;
     }
 
@@ -1968,7 +2019,7 @@ impl State {
         if !over {
             return true; // released off the item: cancelled, the menu stays
         }
-        let (action, target) = (menu.items[armed].1, menu.target.clone());
+        let (action, target) = (menu.items[armed].action, menu.target.clone());
         self.menu = None;
         self.apply_menu_action(action, target);
         self.dirty = true;
@@ -1997,6 +2048,15 @@ impl State {
                 self.run_file_action(action, &target);
                 return;
             }
+            (MenuAction::View(_), target @ MenuTarget::View(_)) => {
+                let ui = self.ui();
+                let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
+                if let Some(sid) = choose_view_item(&mut self.app, &mut cx, action, &target) {
+                    let out = cx.finish();
+                    self.apply_outcome(sid, out);
+                }
+                return;
+            }
             (_, MenuTarget::Vtab(target)) => target,
             _ => return,
         };
@@ -2020,7 +2080,7 @@ impl State {
                 self.app.open_picker(Pick::ActiveRoot);
                 self.dirty = true;
             }
-            MenuAction::File(_) | MenuAction::Rule => {}
+            MenuAction::File(_) | MenuAction::View(_) | MenuAction::Rule => {}
         }
     }
 
@@ -2034,20 +2094,24 @@ impl State {
             .file_menu(&target)
             .into_iter()
             .map(|e| match e {
-                MenuEntry::Item(a) => (a.label().to_string(), MenuAction::File(a)),
-                MenuEntry::Rule => (String::new(), MenuAction::Rule),
+                MenuEntry::Item(a) => MenuRow::new(a.label(), MenuAction::File(a)),
+                MenuEntry::Rule => MenuRow::new("", MenuAction::Rule),
             })
             .collect();
         self.palette = None;
-        self.menu = Some(Menu {
-            target: MenuTarget::File(target),
-            anchor: at,
-            items,
-            hover: None,
-            armed: None,
-            rows: Vec::new(),
-            panel: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
-        });
+        self.menu = Some(Menu::new(MenuTarget::File(target), at, items));
+        self.dirty = true;
+    }
+
+    /// Open surface `sid`'s own menu of `items` at `at`. Not over the picker,
+    /// which draws above menus.
+    fn open_view_menu(&mut self, sid: SurfaceId, items: Vec<MenuItem>, at: (f32, f32)) {
+        if self.app.picker_open() || items.is_empty() {
+            return;
+        }
+        let items = items.into_iter().map(MenuRow::of_view).collect();
+        self.palette = None;
+        self.menu = Some(Menu::new(MenuTarget::View(sid), at, items));
         self.dirty = true;
     }
 
@@ -3105,55 +3169,81 @@ impl State {
         placements
     }
 
-    /// Build the context-menu overlay (panel + hover quads); shape item labels into
-    /// `menu_buffers`; record row/panel rects for hit-testing. Returns placements.
+    /// Build the context-menu overlay (panel, hover pill, check marks); shape
+    /// item labels and hints into `menu_buffers`; record row/panel rects for
+    /// hit-testing. Returns placements.
     fn build_menu(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
         let (items, anchor, hover) = match &self.menu {
             Some(m) => (m.items.clone(), m.anchor, m.hover),
             None => return Vec::new(),
         };
         let metrics = self.metrics();
+        let ui = self.ui();
         let pad = 8.0 * self.scale;
         let row_h = self.cell_h + 6.0 * self.scale;
-        let maxlen = items
-            .iter()
-            .map(|(l, _)| l.chars().count())
-            .max()
-            .unwrap_or(6) as f32;
-        let panel_w = (maxlen * self.cell_w + pad * 3.0).min(sw * 0.6);
-        // A rule takes less height than an item.
-        let rule_h = 9.0 * self.scale;
-        let height_of = |a: &MenuAction| if matches!(a, MenuAction::Rule) { rule_h } else { row_h };
-        let panel_h = items.iter().map(|(_, a)| height_of(a)).sum::<f32>() + pad;
-        let px = anchor.0.min((sw - panel_w).max(0.0)).max(0.0);
-        let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
-
-        quads.push(rect_quad(
-            Rect {
-                x: px,
-                y: py,
-                w: panel_w,
-                h: panel_h,
-            },
-            sw,
-            sh,
-            [34, 34, 42],
-            0.98,
-        ));
-
-        while self.menu_buffers.len() < items.len() {
+        let gap = self.cell_w;
+        let n = items.len();
+        while self.menu_buffers.len() < n * 2 {
             let b = Buffer::new(&mut self.text.font_system, metrics);
             self.menu_buffers.push(b);
         }
+        let shape = |buf: &mut Buffer, text: &str, width: f32, color: [u8; 3], fs: &mut FontSystem| -> f32 {
+            buf.set_metrics(metrics);
+            buf.set_size(Some(width.max(1.0)), Some(self.cell_h));
+            buf.set_rich_text(
+                std::iter::once((text, attrs_for(color))),
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(fs, false);
+            buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+        };
+        // Hints are shaped first: they are right-aligned, so their widths set
+        // the panel's.
+        let mut hint_w = vec![0.0f32; n];
+        for (i, item) in items.iter().enumerate() {
+            if let Some(hint) = &item.hint {
+                let buf = &mut self.menu_buffers[n + i];
+                hint_w[i] = shape(buf, hint, sw, theme::TEXT_DIM, &mut self.text.font_system);
+            }
+        }
+        let check_w = if items.iter().any(|i| i.checked.is_some()) { self.cell_h * 0.8 } else { 0.0 };
+        let right_w = items
+            .iter()
+            .zip(&hint_w)
+            .map(|(item, hw)| {
+                let check = if item.checked.is_some() { check_w } else { 0.0 };
+                let hint = if item.hint.is_some() { hw + if check > 0.0 { gap } else { 0.0 } } else { 0.0 };
+                check + hint
+            })
+            .fold(0.0, f32::max);
+        let right_w = if right_w > 0.0 { right_w + gap * 2.0 } else { 0.0 };
+        let maxlen = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(6) as f32;
+        let panel_w = (maxlen * self.cell_w + pad * 3.0 + right_w).min(sw * 0.6);
+        // A rule takes less height than an item.
+        let rule_h = 9.0 * self.scale;
+        let height_of = |a: &MenuAction| if matches!(a, MenuAction::Rule) { rule_h } else { row_h };
+        let panel_h = items.iter().map(|i| height_of(&i.action)).sum::<f32>() + pad;
+        let px = anchor.0.min((sw - panel_w).max(0.0)).max(0.0);
+        let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
 
-        let mut rows = Vec::with_capacity(items.len());
-        let mut placements = Vec::with_capacity(items.len());
+        // The hover pill sits `inset` inside the panel; the panel's corners
+        // are the pill's grown by it, so the two curves run parallel.
+        let inset = pad * 0.5;
+        let pill_r = theme::pill_radius(ui);
+        let panel = Rect { x: px, y: py, w: panel_w, h: panel_h };
+        let border = (theme::hairline(ui), theme::INPUT_BORDER, 1.0);
+        quads.push(round_quad(panel, sw, sh, pill_r + inset, [34, 34, 42], 0.98, Some(border)));
+
+        let mut rows = Vec::with_capacity(n);
+        let mut placements = Vec::with_capacity(n * 2);
         let mut ry = py + pad * 0.5;
-        for (i, (label, action)) in items.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             let row_y = ry;
-            ry += height_of(action);
-            if matches!(action, MenuAction::Rule) {
-                let line_h = self.scale.max(1.0);
+            ry += height_of(&item.action);
+            if matches!(item.action, MenuAction::Rule) {
+                let line_h = theme::hairline(ui);
                 quads.push(rect_quad(
                     Rect { x: px + pad, y: row_y + (rule_h - line_h) * 0.5, w: panel_w - pad * 2.0, h: line_h },
                     sw,
@@ -3166,48 +3256,52 @@ impl State {
                 continue;
             }
             let ry = row_y;
-            let rrect = Rect {
-                x: px,
-                y: ry,
-                w: panel_w,
-                h: row_h,
-            };
+            let rrect = Rect { x: px, y: ry, w: panel_w, h: row_h };
             if hover == Some(i) {
-                quads.push(rect_quad(rrect, sw, sh, self.chrome.accent, 0.5));
+                let pill = Rect { x: px + inset, w: panel_w - inset * 2.0, ..rrect };
+                quads.push(round_quad(pill, sw, sh, pill_r, self.chrome.accent, 0.5, None));
             }
-            let buf = &mut self.menu_buffers[i];
-            buf.set_metrics(metrics);
-            buf.set_size(Some((panel_w - pad * 2.0).max(1.0)), Some(self.cell_h));
-            buf.set_rich_text(
-                std::iter::once((label.as_str(), attrs_for([230, 230, 240]))),
-                &Attrs::new().family(Family::SansSerif),
-                Shaping::Advanced,
-                None,
-            );
-            buf.shape_until_scroll(&mut self.text.font_system, false);
-            placements.push(Placement {
-                idx: i,
-                left: px + pad,
-                top: ry + (row_h - self.cell_h) * 0.5,
-                bounds: TextBounds {
-                    left: px as i32,
-                    top: ry as i32,
-                    right: (px + panel_w) as i32,
-                    bottom: (ry + row_h) as i32,
-                },
-                color: [230, 230, 240],
-            });
-            rows.push(rrect);
+            let bounds = TextBounds {
+                left: px as i32,
+                top: ry as i32,
+                right: (px + panel_w) as i32,
+                bottom: (ry + row_h) as i32,
+            };
+            let top = ry + (row_h - self.cell_h) * 0.5;
+            // Right to left: the hint against the right edge, the check mark
+            // left of it.
+            let mut right = px + panel_w - pad;
+            if item.hint.is_some() {
+                let color = theme::TEXT_DIM;
+                placements.push(Placement { idx: n + i, left: right - hint_w[i], top, bounds, color });
+                right -= hint_w[i] + gap;
+            }
+            if item.checked == Some(true) {
+                let s = check_w;
+                let (x, y) = (right - s, ry + (row_h - s) * 0.5);
+                let w = (1.5 * self.scale).max(1.0);
+                // On the accent hover pill, an accent check would fade out.
+                let color = match (item.enabled, hover == Some(i)) {
+                    (false, _) => theme::DIM,
+                    (true, true) => [230, 230, 240],
+                    (true, false) => self.chrome.accent,
+                };
+                let pts = [(0.15, 0.55), (0.4, 0.8), (0.85, 0.25)].map(|(u, v)| (x + u * s, y + v * s));
+                for seg in pts.windows(2) {
+                    quads.push(line_quad(seg[0], seg[1], w, false, sw, sh, color, 1.0));
+                }
+            }
+            // The label is cut short of the check mark and hint.
+            let label_w = if item.checked.is_some() { right - check_w - gap } else { right } - px - pad;
+            let color = if item.enabled { [230, 230, 240] } else { theme::DIM };
+            shape(&mut self.menu_buffers[i], &item.label, label_w, color, &mut self.text.font_system);
+            placements.push(Placement { idx: i, left: px + pad, top, bounds, color });
+            rows.push(if item.enabled { rrect } else { Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
         }
 
         if let Some(m) = self.menu.as_mut() {
             m.rows = rows;
-            m.panel = Rect {
-                x: px,
-                y: py,
-                w: panel_w,
-                h: panel_h,
-            };
+            m.panel = panel;
         }
         placements
     }
@@ -5099,6 +5193,51 @@ mod tests {
     use winit::window::CursorIcon;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    /// A view that records the buttons it hears.
+    struct Buttons(Vec<u32>);
+
+    impl crate::plugin::View for Buttons {
+        fn plugin(&self) -> &'static str {
+            "buttons"
+        }
+        fn paint(&mut self, _cx: &mut crate::plugin::PaintCx, _rect: Rect) {}
+        fn button(&mut self, cx: &mut crate::plugin::EventCx, id: u32) {
+            self.0.push(id);
+            cx.redraw();
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn choosing_a_view_menu_item_calls_the_views_button_with_its_id() {
+        use super::{choose_view_item, MenuAction, MenuTarget};
+        use crate::app_state::AppState;
+        use crate::plugin::{testing::UI, EventCx};
+
+        let mut app = AppState::new();
+        app.new_view_vtab("v", Box::new(Buttons(Vec::new())));
+        let sid = app.focused_surface().expect("the view's surface");
+        let cfg = ghostrealm_core::Config::default();
+        let mut cx = EventCx::new(&cfg, UI, Default::default(), None);
+
+        let ran = choose_view_item(&mut app, &mut cx, MenuAction::View(7), &MenuTarget::View(sid));
+        assert_eq!(ran, Some(sid));
+        assert!(cx.finish().redraw, "the view's outcome comes back to apply");
+        let heard = |app: &AppState| app.view(sid).unwrap().downcast_ref::<Buttons>().unwrap().0.clone();
+        assert_eq!(heard(&app), [7]);
+
+        let mut cx = EventCx::new(&cfg, UI, Default::default(), None);
+        let other = MenuTarget::View(SurfaceId(sid.0 + 100));
+        assert_eq!(choose_view_item(&mut app, &mut cx, MenuAction::View(8), &other), None, "no such view");
+        assert_eq!(choose_view_item(&mut app, &mut cx, MenuAction::Close, &MenuTarget::View(sid)), None);
+        assert_eq!(heard(&app), [7], "only a view item on a view runs");
+    }
 
     #[test]
     fn the_resize_cursor_follows_the_divider_axis() {

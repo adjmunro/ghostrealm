@@ -47,7 +47,7 @@ use ghostrealm_terminal::{KeyPress, Pumped};
 
 use crate::app_state::AppState;
 
-pub use event::{EventCx, MouseButton, MouseEvent, Outcome, RawKey, Request};
+pub use event::{EventCx, MenuItem, MouseButton, MouseEvent, Outcome, RawKey, Request};
 pub use paint::{
     Font, Frame, Image, ImageItem, ImageSource, Layer, PaintCx, RowStyles, Shaped, TextItem, TextKit,
     TextSrc,
@@ -180,7 +180,8 @@ pub trait View: Any {
     /// means the content should move down (reveal what is above).
     fn scroll(&mut self, _cx: &mut EventCx, _pos: (f32, f32), _dx: f32, _dy: f32) {}
 
-    /// A button registered by the last [`paint`](Self::paint) was clicked.
+    /// A button registered by the last [`paint`](Self::paint) was clicked, or
+    /// an item of the view's [`Request::Menu`] was chosen.
     fn button(&mut self, _cx: &mut EventCx, _id: u32) {}
 
     /// Keyboard focus moved onto (`true`) or away from (`false`) this view.

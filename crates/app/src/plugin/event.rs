@@ -86,12 +86,65 @@ pub enum Request {
         target: crate::file_menu::FileTarget,
         at: (f32, f32),
     },
+    /// Open the view's own menu at `at` (physical px). Choosing an item calls
+    /// [`View::button`] with its `id`.
+    ///
+    /// [`View::button`]: super::View::button
+    Menu { items: Vec<MenuItem>, at: (f32, f32) },
     /// Close the view's surface, as the Close command would. A terminal whose
     /// shell exited asks this on the next key.
     Close,
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,
+}
+
+/// An item of a view's menu ([`Request::Menu`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuItem {
+    /// The item's text; empty for a [rule](Self::RULE).
+    pub label: String,
+    /// `Some` for a toggle: whether a check mark shows.
+    pub checked: Option<bool>,
+    /// Dim text at the right end (a shortcut, a value).
+    pub hint: Option<String>,
+    /// A disabled item shows dim and can't be chosen.
+    pub enabled: bool,
+    /// What [`View::button`](super::View::button) hears when it is chosen.
+    pub id: u32,
+}
+
+impl MenuItem {
+    /// A horizontal rule between sections; not clickable.
+    pub const RULE: MenuItem = MenuItem {
+        label: String::new(),
+        checked: None,
+        hint: None,
+        enabled: false,
+        id: u32::MAX,
+    };
+
+    /// An enabled plain item.
+    pub fn new(id: u32, label: impl Into<String>) -> Self {
+        MenuItem { label: label.into(), checked: None, hint: None, enabled: true, id }
+    }
+
+    /// A toggle, checked when `on`.
+    pub fn check(self, on: bool) -> Self {
+        MenuItem { checked: Some(on), ..self }
+    }
+
+    pub fn with_hint(self, hint: impl Into<String>) -> Self {
+        MenuItem { hint: Some(hint.into()), ..self }
+    }
+
+    pub fn enable(self, on: bool) -> Self {
+        MenuItem { enabled: on, ..self }
+    }
+
+    pub fn is_rule(&self) -> bool {
+        self.label.is_empty()
+    }
 }
 
 /// What an input handler produced, for the app to apply.
