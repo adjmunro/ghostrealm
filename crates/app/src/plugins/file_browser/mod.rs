@@ -58,6 +58,33 @@ const BTN_CLEAR: u32 = 7;
 /// `BTN_GROUP + i` shows [`VIEWS`]`[i]`. Past [`preview`]'s ids.
 const BTN_GROUP: u32 = 20;
 
+// The browser's and the preview's ids share `View::button`: none may repeat
+// or fall in the `BTN_GROUP` range.
+const _: () = {
+    let ids = [
+        BTN_PARENT,
+        BTN_HIDDEN,
+        BTN_IGNORED,
+        BTN_GIT_MODIFIED,
+        BTN_GIT_UNTRACKED,
+        BTN_PREVIEW,
+        BTN_MORE,
+        BTN_CLEAR,
+        preview::BTN_PLAY,
+        preview::BTN_AUTOPLAY,
+    ];
+    let mut i = 0;
+    while i < ids.len() {
+        assert!(ids[i] < BTN_GROUP || ids[i] >= BTN_GROUP + VIEWS.len() as u32);
+        let mut j = i + 1;
+        while j < ids.len() {
+            assert!(ids[i] != ids[j]);
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 /// The listings the `⋯` menu offers, with their labels.
 const VIEWS: [(FsView, &str); 6] = [
     (FsView::Tree, "Tree"),
@@ -180,6 +207,9 @@ impl From<&FileRow> for RowRef {
 
 pub struct FileBrowserView {
     tree: FsTree,
+    /// The directory the browser opened on; elsewhere, the filter hint shows
+    /// the one listed.
+    start: PathBuf,
     mode: Mode,
     /// Vertical scroll of the row list (physical px).
     scroll: f32,
@@ -210,7 +240,10 @@ pub struct FileBrowserView {
     // Geometry from the last paint, for mapping input to rows.
     list: Rect,
     row_h: f32,
+    /// The rows drawn, from row index `rows_first`: only those can be under
+    /// the pointer.
     rows: Vec<RowRef>,
+    rows_first: usize,
     /// Path-mode completions as drawn: (rect, index, path, is_dir).
     suggest_hits: Vec<(Rect, usize, PathBuf, bool)>,
     preview: PreviewPane,
@@ -228,6 +261,7 @@ pub struct FileBrowserView {
 impl FileBrowserView {
     pub fn new(root: PathBuf) -> Self {
         FileBrowserView {
+            start: root.clone(),
             tree: FsTree::new(root),
             mode: Mode::Browse,
             scroll: 0.0,
@@ -241,6 +275,7 @@ impl FileBrowserView {
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
             rows: Vec::new(),
+            rows_first: 0,
             suggest_hits: Vec::new(),
             preview: PreviewPane::default(),
             preview_on: None,
@@ -628,9 +663,8 @@ impl FileBrowserView {
                 FileKind::of(&r.path).paint(cx, icon);
             }
             let spans = if filtering { Self::result_spans(r) } else { Self::tree_spans(r) };
-            let x = g.text_x(r.depth);
-            let shaped = cx.shape_spans(&spans, Font::SANS, (list.x + list.w - x).max(1.0));
-            cx.place(shaped, x, g.text_y(cx.ui, ry), text_clip, NAME_FG);
+            // Cached by content: a row redrawn unchanged isn't reshaped.
+            cx.row_font(&spans, Font::SANS, g.text_x(r.depth), g.text_y(cx.ui, ry), list.w, text_clip, NAME_FG);
         }
     }
 
@@ -645,9 +679,17 @@ impl FileBrowserView {
         let y = rect.y + ((header_h - side) * 0.5).round();
 
         let up = Rect { x: (rect.x + pad * 0.5).round(), y, w: side, h: side };
-        icon_button(cx, up, BTN_PARENT, Icon::ChevronUp, "Parent folder");
+        // Built only while hovered: the tooltip shows only then.
+        let tip = match cx.hovered(up) {
+            true => format!("Parent folder\n{}", tilde(self.tree.root())),
+            false => String::new(),
+        };
+        icon_button(cx, up, BTN_PARENT, Icon::ChevronUp, &tip, theme::GLYPH);
         let more = Rect { x: (rect.x + rect.w - pad * 0.5 - side).round(), ..up };
-        icon_button(cx, more, BTN_MORE, Icon::More, "More options");
+        // Tinted while an option hides or adds entries, so a filter that
+        // empties the list doesn't go unnoticed.
+        let tint = if self.options_changed() { cx.chrome.accent } else { theme::GLYPH };
+        icon_button(cx, more, BTN_MORE, Icon::More, "More options", tint);
         self.more_hit = Some(more);
 
         // Saving types into the name field, so this one takes no keys there.
@@ -666,17 +708,12 @@ impl FileBrowserView {
         let mut text_right = field.x + field.w - pad * 0.5;
         if typed_into && !value.is_empty() {
             let clear = Rect { x: field.x + field.w - side, w: side, ..field };
-            icon_button(cx, clear, BTN_CLEAR, Icon::Close, "Clear");
+            icon_button(cx, clear, BTN_CLEAR, Icon::Close, "Clear", theme::GLYPH);
             text_right = clear.x;
         }
         let text_x = icon.x + icon.w + pad * 0.5;
         let text = Rect { x: text_x, w: (text_right - text_x).max(1.0), ..field };
-        // A browser filters; a picker also goes where a typed path leads, so
-        // it shows where it is.
-        let hint = match self.mode {
-            Mode::Browse => "Filter files".to_string(),
-            _ => self.tree.root().display().to_string(),
-        };
+        let hint = self.hint();
         let geom = widgets::field_text(cx, text, value, &hint, cx.focused && typed_into);
         if editable {
             self.field.painted(cx, geom);
@@ -684,6 +721,36 @@ impl FileBrowserView {
             self.field.clear();
         }
         header_h
+    }
+
+    /// The filter box's hint: where the list is once that isn't where the
+    /// browser opened. A picker, which goes where a typed path leads, always
+    /// says.
+    fn hint(&self) -> String {
+        match self.mode {
+            Mode::Browse if self.tree.root() == self.start => "Filter files".to_string(),
+            _ => tilde(self.tree.root()),
+        }
+    }
+
+    /// Why the listing is empty, if it is for a reason other than an empty
+    /// folder: the git status it waits for, or a filter nothing passes.
+    fn empty_note(&mut self) -> Option<String> {
+        let filtered = self.tree.is_filtering() || self.tree.filters_active();
+        if !self.tree.rows().is_empty() {
+            return None;
+        }
+        if self.tree.git_status_loading() {
+            return Some("Loading git status\u{2026}".to_string());
+        }
+        let what = if self.mode == Mode::PickDir { "folders" } else { "files" };
+        filtered.then(|| format!("No matching {what}"))
+    }
+
+    /// Whether a listing option is off its default.
+    fn options_changed(&self) -> bool {
+        let t = &self.tree;
+        t.show_hidden() || t.show_gitignored() || t.git_filter() != GitFilter::All || t.view() != FsView::Tree
     }
 
     /// The `⋯` menu: what the listing shows, checked as it stands. A
@@ -731,9 +798,9 @@ fn field_box(cx: &mut PaintCx, r: Rect, focused: bool) {
     cx.round_rect(r, theme::box_radius(cx.ui), cx.chrome.background, 1.0, Some(border));
 }
 
-/// An icon button filling `r`: a rounded hover highlight, the icon brighter
-/// under the pointer, and a tooltip naming it.
-fn icon_button(cx: &mut PaintCx, r: Rect, id: u32, icon: Icon, tip: &str) {
+/// An icon button filling `r`: a rounded hover highlight, the icon in `color`
+/// and brighter under the pointer, and a tooltip naming it.
+fn icon_button(cx: &mut PaintCx, r: Rect, id: u32, icon: Icon, tip: &str, color: [u8; 3]) {
     let hover = cx.button(r, id);
     if hover {
         let inset = (2.0 * cx.ui.scale).round();
@@ -743,7 +810,7 @@ fn icon_button(cx: &mut PaintCx, r: Rect, id: u32, icon: Icon, tip: &str) {
     cx.tooltip(r, tip);
     let side = (cx.ui.cell_h * 0.8).round();
     let at = Rect { x: r.x + ((r.w - side) * 0.5).round(), y: r.y + ((r.h - side) * 0.5).round(), w: side, h: side };
-    icon.paint(cx, at, if hover { theme::GLYPH_HOVER } else { theme::GLYPH });
+    icon.paint(cx, at, if hover { theme::GLYPH_HOVER } else { color });
 }
 
 impl View for FileBrowserView {
@@ -827,7 +894,8 @@ impl View for FileBrowserView {
                     }
                     let kind = if is_dir { FileKind::Folder { open: false } } else { FileKind::of(p) };
                     kind.paint(cx, g.icon(0, ry));
-                    cx.label(&label, Font::SANS, g.text_x(0), g.text_y(cx.ui, ry), list, NAME_FG);
+                    let spans = [(label, NAME_FG)];
+                    cx.row_font(&spans, Font::SANS, g.text_x(0), g.text_y(cx.ui, ry), list.w, list, NAME_FG);
                     let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
                     self.suggest_hits.push((row_rect, i, p.clone(), is_dir));
                 }
@@ -837,34 +905,37 @@ impl View for FileBrowserView {
             return;
         }
 
-        // Browse/filter mode: the scrollable tree (or results) list.
-        let rows: Vec<FileRow> = self.tree.rows().to_vec();
-        if let Some(c) = &self.chosen {
-            if !rows.iter().any(|r| !r.is_category && &r.path == c) {
-                self.chosen = None;
-            }
+        // Browse/filter mode: the scrollable tree (or results) list. Only the
+        // rows in view are copied out of the tree.
+        let filtering = self.tree.is_filtering();
+        let note = self.empty_note();
+        let rows = self.tree.rows();
+        let count = rows.len();
+        let listed = |p: &PathBuf| rows.iter().any(|r| !r.is_category && &r.path == p);
+        if self.chosen.as_ref().is_some_and(|c| !listed(c)) {
+            self.chosen = None;
         }
         if std::mem::take(&mut self.reveal_chosen) {
             if let Some(i) = rows.iter().position(|r| !r.is_category && Some(&r.path) == self.chosen.as_ref()) {
                 self.scroll = (i as f32 * row_h - (list.h - row_h) * 0.5).max(0.0);
             }
         }
-        let max_scroll = (rows.len() as f32 * row_h - list.h).max(0.0);
+        let max_scroll = (count as f32 * row_h - list.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        self.rows = rows.iter().map(RowRef::from).collect();
-        // Grouped views ignore the query: their rows are a tree.
-        let filtering = !query.is_empty() && self.tree.view() == FsView::Tree;
-        let first = ((self.scroll / row_h).floor() as usize).min(rows.len());
-        let last = (((self.scroll + list.h) / row_h).ceil() as usize).clamp(first, rows.len());
+        let first = ((self.scroll / row_h).floor() as usize).min(count);
+        let last = (((self.scroll + list.h) / row_h).ceil() as usize).clamp(first, count);
+        let visible: Vec<FileRow> = rows[first..last].to_vec();
+        let highlighted = self.sel.and_then(|i| rows.get(i)).filter(|r| !r.is_category).map(|r| r.path.clone());
+        self.rows = visible.iter().map(RowRef::from).collect();
+        self.rows_first = first;
         // Clipped, so a row scrolled half out draws neither over the header
         // nor under the footer.
-        cx.with_clip(list, |cx| self.paint_rows(cx, list, &rows[first..last], first, filtering));
-        let subject = self
-            .sel
-            .and_then(|i| rows.get(i))
-            .filter(|r| !r.is_category)
-            .map(|r| r.path.clone())
-            .or_else(|| self.chosen.clone());
+        cx.with_clip(list, |cx| self.paint_rows(cx, list, &visible, first, filtering));
+        // Say why the list is empty, else it reads as broken.
+        if let Some(note) = note {
+            cx.label(&note, Font::SANS, g.text_x(0), g.text_y(cx.ui, list.y), list, theme::DIM);
+        }
+        let subject = highlighted.or_else(|| self.chosen.clone());
         self.paint_preview(cx, preview_rect, subject.as_deref());
     }
 
@@ -1209,7 +1280,7 @@ impl FileBrowserView {
             return None;
         }
         let idx = ((y - self.list.y + self.scroll) / self.row_h).floor().max(0.0) as usize;
-        self.rows.get(idx).map(|r| (idx, r.clone()))
+        self.rows.get(idx.checked_sub(self.rows_first)?).map(|r| (idx, r.clone()))
     }
 }
 
@@ -1302,6 +1373,16 @@ fn match_spans(name: &str, matches: &[usize]) -> Vec<(String, [u8; 3])> {
         spans.push((cur, if cur_hit { MATCH_FG } else { UNMATCHED_FG }));
     }
     spans
+}
+
+/// `path` for display, with the home directory as `~`.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// `path` with its `.` and `..` components resolved by name alone, following no
@@ -1604,7 +1685,7 @@ mod tests {
         h.key(&mut v, press(Key::Down));
         h.key(&mut v, press(Key::Down));
         h.button(&mut v, BTN_HIDDEN);
-        assert_eq!(v.sel, Some(1), "a header toggle");
+        assert_eq!(v.sel, Some(1), "a listing option");
         h.button(&mut v, BTN_GROUP + 1);
         assert_eq!(v.sel, Some(1), "grouped, with category rows");
         h.button(&mut v, BTN_GROUP + 2);
@@ -2088,6 +2169,7 @@ mod tests {
         let before = v.text().unwrap();
         assert!(!before.contains("changed.txt"), "no status yet, so nothing passes:\n{before}");
         assert!(v.tree().git_status_loading());
+        assert_eq!(v.empty_note().as_deref(), Some("Loading git status\u{2026}"), "the empty list says why");
         woken.recv_timeout(std::time::Duration::from_secs(10)).expect("the worker wakes the UI");
         assert!(v.refresh(), "the arrived status repaints");
         let after = v.text().unwrap();
@@ -2460,5 +2542,55 @@ mod tests {
         // The focused box is outlined in the focus colour.
         let ring = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, theme::FIELD_FOCUS_BORDER, 1.0).color;
         assert!(h.paint(&mut v, RECT).bg.iter().any(|q| q.border_w > 0.0 && q.border_color == ring));
+    }
+
+    #[test]
+    fn an_empty_listing_says_why() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        assert_eq!(v.empty_note(), None);
+        type_in(&mut h, &mut v, "zzz");
+        assert_eq!(v.empty_note().as_deref(), Some("No matching files"));
+        type_in(&mut h, &mut v, "   ");
+        assert_eq!(v.empty_note(), None, "a blank query filters nothing");
+        std::fs::create_dir(d.join("adir/empty")).unwrap();
+        v.tree_mut().set_root(d.join("adir/empty"));
+        assert_eq!(v.empty_note(), None, "an empty folder is just empty");
+    }
+
+    #[test]
+    fn the_more_button_is_tinted_while_an_option_is_off_its_default() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        let accent = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, h.chrome.accent, 1.0).color;
+        let tinted = |h: &mut Harness, v: &mut FileBrowserView| h.paint(v, RECT).bg.iter().any(|q| q.color == accent);
+        assert!(!tinted(&mut h, &mut v));
+        for id in [BTN_HIDDEN, BTN_IGNORED, BTN_GIT_MODIFIED, BTN_GROUP + 1] {
+            h.button(&mut v, id);
+            assert!(tinted(&mut h, &mut v), "after {id}");
+            h.button(&mut v, if id == BTN_GROUP + 1 { BTN_GROUP } else { id });
+            assert!(!tinted(&mut h, &mut v), "back to the default after {id}");
+        }
+    }
+
+    #[test]
+    fn the_browser_shows_where_it_is_once_it_leaves_where_it_opened() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::new(d.join("adir"));
+        let mut h = Harness::new();
+        assert_eq!(v.hint(), "Filter files");
+        h.button(&mut v, BTN_PARENT);
+        let parent = d.as_path();
+        assert_eq!(v.hint(), tilde(parent));
+        // The up button's tooltip names the folder shown.
+        h.paint(&mut v, RECT);
+        let up = h.frame.view_buttons.iter().find(|b| b.2 == BTN_PARENT).unwrap().0;
+        h.cursor = (up.x + 2.0, up.y + 2.0);
+        let tip = h.paint(&mut v, RECT).tooltip.clone().expect("a tooltip").1;
+        assert!(tip.ends_with(&tilde(parent)), "{tip}");
+        assert_eq!(tilde(&PathBuf::from("/nowhere/x")), "/nowhere/x");
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(tilde(&PathBuf::from(&home).join("a")), "~/a");
+        }
     }
 }
