@@ -103,6 +103,10 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).
+  A view hosting other views paints each inside `with_id_base(base, ...)`
+  and passes its events through `EventCx::with_id_base(base, ...)`: their
+  button, image, and menu item ids are shifted by `base`, so the host tells
+  them apart in `button(id)` by range.
 - Images: `image(id, version, source, rect, clip)` draws BGRA pixels
   (sRGB-encoded, alpha premultiplied in linear light) from an `ImageSource` stretched over `rect`, over the layer's fills and under its
   text. The app keeps a texture per `(view, id)` and re-uploads only when

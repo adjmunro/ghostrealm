@@ -658,6 +658,8 @@ pub struct PaintCx<'a> {
     pub(crate) owner: SurfaceId,
     /// Quads draw only inside this, if set ([`with_clip`](Self::with_clip)).
     clip: Option<Rect>,
+    /// Added to button and image ids ([`with_id_base`](Self::with_id_base)).
+    id_base: u32,
 }
 
 impl<'a> PaintCx<'a> {
@@ -685,6 +687,7 @@ impl<'a> PaintCx<'a> {
             layer,
             owner,
             clip: None,
+            id_base: 0,
         }
     }
 
@@ -716,6 +719,18 @@ impl<'a> PaintCx<'a> {
         let outer = self.clip.replace(inner);
         f(self);
         self.clip = outer;
+    }
+
+    /// Paint `f` with `base` added to the ids of the buttons and images it
+    /// registers, on top of any base already set: a view hosting other views
+    /// gives each its own id range, so their ids can't collide, and tells
+    /// them apart in [`View::button`](super::View::button) by range.
+    pub fn with_id_base<T>(&mut self, base: u32, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.id_base;
+        self.id_base = outer + base;
+        let out = f(self);
+        self.id_base = outer;
+        out
     }
 
     /// `r` within the clip, or `None` if nothing of it shows.
@@ -835,7 +850,7 @@ impl<'a> PaintCx<'a> {
     /// takes clicks.
     pub fn button(&mut self, r: Rect, id: u32) -> bool {
         let Some(r) = self.clipped(r) else { return false };
-        self.frame.view_buttons.push((r, self.owner, id));
+        self.frame.view_buttons.push((r, self.owner, self.id_base + id));
         self.hovered(r)
     }
 
@@ -861,7 +876,7 @@ impl<'a> PaintCx<'a> {
     ) {
         let item = ImageItem {
             owner: self.owner,
-            id,
+            id: self.id_base + id,
             version,
             source,
             rect,
@@ -1167,6 +1182,45 @@ mod tests {
         }
         assert!(h.text.finish_paint(), "some rows were deferred");
         assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
+
+    /// A hosted view's buttons and images carry its host's id base, nested
+    /// bases add, and the base ends with the closure; menus it requests are
+    /// renumbered the same way.
+    #[test]
+    fn with_id_base_offsets_buttons_images_and_menu_items() {
+        use crate::plugin::{EventCx, MenuAlign, MenuItem, Request};
+        let mut h = Harness::new();
+        let r = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            cx.button(r, 1);
+            cx.with_id_base(100, |cx| {
+                cx.button(r, 1);
+                cx.with_id_base(1000, |cx| cx.button(r, 2));
+                cx.image(3, 0, Image::from_rgba(1, 1, vec![0; 4]), r, r);
+            });
+            cx.button(r, 4);
+        }
+        let ids: Vec<u32> = h.frame.view_buttons.iter().map(|b| b.2).collect();
+        assert_eq!(ids, [1, 101, 1102, 4]);
+        assert_eq!(h.frame.images[0].id, 103);
+
+        let mut cx = EventCx::new(&h.cfg, UI, Default::default(), None);
+        let menu = |ids: &[u32]| Request::Menu {
+            items: ids.iter().map(|&i| if i == u32::MAX { MenuItem::RULE } else { MenuItem::new(i, "x") }).collect(),
+            at: (0.0, 0.0),
+            align: MenuAlign::Left,
+        };
+        cx.request(menu(&[1]));
+        let used = cx.with_id_base(100, |cx| {
+            cx.request(menu(&[1, u32::MAX, 2]));
+            true
+        });
+        assert!(used, "the closure's result passes through");
+        assert_eq!(cx.finish().requests, [menu(&[1]), menu(&[101, u32::MAX, 102])], "a rule keeps its id");
     }
 
     /// `with_clip` cuts plain fills (and plain `round_rect`s) on the CPU,

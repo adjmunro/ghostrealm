@@ -227,6 +227,24 @@ impl<'a> EventCx<'a> {
         }
     }
 
+    /// Run `f` with `base` added to the item ids of the menus it requests
+    /// ([`Request::Menu`]), as [`PaintCx::with_id_base`] does for buttons: a
+    /// host passes its hosted view's events through this with the same base.
+    ///
+    /// [`PaintCx::with_id_base`]: super::PaintCx::with_id_base
+    pub fn with_id_base<T>(&mut self, base: u32, f: impl FnOnce(&mut Self) -> T) -> T {
+        let from = self.out.requests.len();
+        let out = f(self);
+        for r in &mut self.out.requests[from..] {
+            if let Request::Menu { items, .. } = r {
+                for item in items.iter_mut().filter(|i| !i.is_rule()) {
+                    item.id += base;
+                }
+            }
+        }
+        out
+    }
+
     /// The requests and repaint flags gathered during the call.
     pub fn finish(self) -> Outcome {
         self.out
