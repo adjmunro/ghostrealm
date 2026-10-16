@@ -29,24 +29,22 @@ use glyphon::Family;
 
 use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
+use crate::plugin::icons::{FileKind, Icon};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin, Request,
-    View, Waker,
+    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
+    Request, UiMetrics, View, Waker,
 };
 use preview::PreviewPane;
 
 pub const ID: &str = "file_browser";
 
-/// Row colours: a file, a hidden (dot) file, a file's extension, and the
-/// fuzzy-match highlight. Directories use the theme accent.
-const FILE_FG: [u8; 3] = [230, 230, 235];
-const HIDDEN_FG: [u8; 3] = [130, 130, 140];
-const EXT_FG: [u8; 3] = [212, 170, 90];
-const MATCH_FG: [u8; 3] = [245, 225, 90];
-/// Opacity of the accent fill behind the selected (clicked) row.
-const SELECTED_ALPHA: f32 = 0.3;
-/// How much of the highlight a directory picker's hover draws: weaker than
+/// Row text: a name, and in filter results the matched characters and the
+/// rest of the name (dimmer, so the matches stand out).
+const NAME_FG: [u8; 3] = theme::TEXT;
+const MATCH_FG: [u8; 3] = [255, 255, 255];
+const UNMATCHED_FG: [u8; 3] = [175, 175, 188];
+/// How much of the hover pill a directory picker's hover draws: weaker than
 /// the keyboard's, which is the answer.
 const HOVER_SHARE: f32 = 0.5;
 
@@ -527,49 +525,94 @@ impl FileBrowserView {
         self.tree.set_query(comps[idx].clone());
     }
 
-    /// Browse-mode spans for a row name: kind colour (directory accent, hidden
-    /// dim, file normal) with a file's extension in gold.
-    fn name_spans(name: &str, is_dir: bool, accent: [u8; 3]) -> Vec<(String, [u8; 3])> {
-        let hidden = name.starts_with('.');
-        let base = if is_dir {
-            accent
-        } else if hidden {
-            HIDDEN_FG
-        } else {
-            FILE_FG
-        };
-        if is_dir || hidden {
-            return vec![(name.to_string(), base)];
+    /// Tree-row spans: a grouped view's dim disambiguating prefix, then the
+    /// name.
+    fn tree_spans(r: &FileRow) -> Vec<(String, [u8; 3])> {
+        let mut spans = Vec::with_capacity(2);
+        if !r.prefix.is_empty() {
+            spans.push((format!("{}/", r.prefix), theme::DIM));
         }
-        match name.rfind('.').filter(|&i| i > 0) {
-            Some(i) => vec![(name[..i].to_string(), base), (name[i..].to_string(), EXT_FG)],
-            None => vec![(name.to_string(), base)],
+        spans.push((r.name.clone(), NAME_FG));
+        spans
+    }
+
+    /// Filter-result spans: the entry's own name with its matches lit, then
+    /// the folder holding it (relative to the root), dim.
+    fn result_spans(r: &FileRow) -> Vec<(String, [u8; 3])> {
+        // A result's name is its path from the root, which the matches index.
+        let leaf = file_name(&r.path);
+        let offset = r.name.chars().count().saturating_sub(leaf.chars().count());
+        let matches: Vec<usize> = r.match_indices.iter().filter_map(|i| i.checked_sub(offset)).collect();
+        let mut spans = match_spans(&leaf, &matches);
+        let dir: String = r.name.chars().take(offset).collect();
+        let dir = dir.trim_end_matches(['/', '\\']);
+        if !dir.is_empty() {
+            spans.push((format!(" {dir}"), theme::DIM));
+        }
+        spans
+    }
+
+    /// The pill behind row `i` (or completion `i`): the selected entry's is
+    /// strongest, then the keyboard's highlight, then a directory picker's
+    /// hover. One per row, so they never stack.
+    fn pill(&self, i: usize, path: Option<&Path>, highlight: Option<usize>) -> Option<([u8; 3], f32)> {
+        if path.is_some() && self.chosen.as_deref() == path {
+            Some((theme::ROW_SELECTED_BG, theme::ROW_SELECTED_ALPHA))
+        } else if highlight == Some(i) {
+            Some((theme::HOVER_BG, theme::HOVER_ALPHA))
+        } else if self.hover == Some(i) {
+            Some((theme::HOVER_BG, theme::HOVER_ALPHA * HOVER_SHARE))
+        } else {
+            None
         }
     }
 
-    /// Filter-mode spans: matched characters (char indices) highlighted, the rest
-    /// in the kind colour.
-    fn match_spans(name: &str, is_dir: bool, matches: &[usize], accent: [u8; 3]) -> Vec<(String, [u8; 3])> {
-        let base = if is_dir { accent } else { FILE_FG };
-        if matches.is_empty() {
-            return vec![(name.to_string(), base)];
-        }
-        let hit: HashSet<usize> = matches.iter().copied().collect();
-        let mut spans: Vec<(String, [u8; 3])> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_hit = false;
-        for (i, ch) in name.chars().enumerate() {
-            let h = hit.contains(&i);
-            if !cur.is_empty() && h != cur_hit {
-                spans.push((std::mem::take(&mut cur), if cur_hit { MATCH_FG } else { base }));
+    /// Paint the visible `rows` (from index `first`) into `list`: indent
+    /// guides, pills, icons, and names. Call it clipped to `list`.
+    fn paint_rows(&self, cx: &mut PaintCx, list: Rect, rows: &[FileRow], first: usize, filtering: bool) {
+        let g = RowGeom::new(cx.ui, list);
+        let top = |i: usize| list.y + (first + i) as f32 * g.row_h - self.scroll;
+        // Each guide is one fill per run of rows below an expanded folder, so
+        // no two overlap (translucent fills look denser where they do).
+        let line = theme::hairline(cx.ui);
+        let mut open: Vec<f32> = Vec::new();
+        let guide = |cx: &mut PaintCx, depth: usize, y0: f32, y1: f32| {
+            let x = (g.slot_x(depth) + (g.slot - line) * 0.5).round();
+            let (y0, y1) = (y0.round(), y1.round());
+            cx.fill_alpha(Rect { x, y: y0, w: line, h: y1 - y0 }, theme::GUIDE, theme::GUIDE_ALPHA);
+        };
+        for (i, r) in rows.iter().enumerate() {
+            while open.len() > r.depth {
+                let y0 = open.pop().unwrap_or_default();
+                guide(cx, open.len(), y0, top(i));
             }
-            cur_hit = h;
-            cur.push(ch);
+            open.resize(r.depth, top(i));
         }
-        if !cur.is_empty() {
-            spans.push((cur, if cur_hit { MATCH_FG } else { base }));
+        while let Some(y0) = open.pop() {
+            guide(cx, open.len(), y0, top(rows.len()));
         }
-        spans
+
+        let text_clip = Rect { w: (list.w - g.pad).max(1.0), ..list };
+        for (i, r) in rows.iter().enumerate() {
+            let ry = top(i);
+            let path = (!r.is_category).then_some(r.path.as_path());
+            if let Some((color, alpha)) = self.pill(first + i, path, self.sel) {
+                cx.round_rect(g.pill(ry), theme::pill_radius(cx.ui), color, alpha, None);
+            }
+            let icon = g.icon(r.depth, ry);
+            if r.is_dir && !filtering {
+                let chevron = if r.expanded { Icon::ChevronDown } else { Icon::ChevronRight };
+                chevron.paint(cx, g.chevron(icon), theme::GLYPH);
+            } else if r.is_dir {
+                FileKind::Folder { open: false }.paint(cx, icon);
+            } else {
+                FileKind::of(&r.path).paint(cx, icon);
+            }
+            let spans = if filtering { Self::result_spans(r) } else { Self::tree_spans(r) };
+            let x = g.text_x(r.depth);
+            let shaped = cx.shape_spans(&spans, Font::SANS, (list.x + list.w - x).max(1.0));
+            cx.place(shaped, x, g.text_y(cx.ui, ry), text_clip, NAME_FG);
+        }
     }
 
     /// The header: parent button, input field, and the filter/view toggles.
@@ -663,9 +706,6 @@ impl View for FileBrowserView {
     fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
         cx.fill(rect, cx.chrome.background);
         let scale = cx.ui.scale;
-        let ch = cx.ui.cell_h;
-        let pad = 8.0 * scale;
-        let accent = cx.chrome.accent;
 
         self.sync_input();
         let query = self.tree.query().to_string();
@@ -712,7 +752,8 @@ impl View for FileBrowserView {
         } else {
             (body, None)
         };
-        let row_h = ch + 4.0 * scale;
+        let g = RowGeom::new(cx.ui, list);
+        let row_h = g.row_h;
         self.list = list;
         self.row_h = row_h;
         self.rows.clear();
@@ -720,27 +761,25 @@ impl View for FileBrowserView {
 
         if is_path {
             // Path mode: the body is the completion list.
-            for (i, p) in suggestions.iter().enumerate() {
-                let ry = list.y + i as f32 * row_h;
-                if ry + row_h > list.y + list.h {
-                    break;
+            cx.with_clip(list, |cx| {
+                for (i, p) in suggestions.iter().enumerate() {
+                    let ry = list.y + i as f32 * row_h;
+                    if ry + row_h > list.y + list.h {
+                        break;
+                    }
+                    let is_dir = p.is_dir();
+                    let name = file_name(p);
+                    let label = if is_dir { format!("{name}/") } else { name };
+                    if let Some((color, alpha)) = self.pill(i, None, self.completion) {
+                        cx.round_rect(g.pill(ry), theme::pill_radius(cx.ui), color, alpha, None);
+                    }
+                    let kind = if is_dir { FileKind::Folder { open: false } } else { FileKind::of(p) };
+                    kind.paint(cx, g.icon(0, ry));
+                    cx.label(&label, Font::SANS, g.text_x(0), g.text_y(cx.ui, ry), list, NAME_FG);
+                    let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
+                    self.suggest_hits.push((row_rect, i, p.clone(), is_dir));
                 }
-                let is_dir = p.is_dir();
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let label = if is_dir { format!("{name}/") } else { name };
-                let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-                if Some(i) == self.completion {
-                    cx.highlight(row_rect);
-                } else if Some(i) == self.hover {
-                    cx.fill_alpha(row_rect, theme::HOVER_BG, theme::HOVER_ALPHA * HOVER_SHARE);
-                }
-                let color = if is_dir { accent } else { FILE_FG };
-                cx.label(&label, Family::Monospace, list.x + pad, ry + (row_h - ch) * 0.5, list, color);
-                self.suggest_hits.push((row_rect, i, p.clone(), is_dir));
-            }
+            });
             let subject = self.completion.and_then(|i| suggestions.get(i));
             self.paint_preview(cx, preview_rect, subject.map(PathBuf::as_path));
             return;
@@ -760,44 +799,14 @@ impl View for FileBrowserView {
         }
         let max_scroll = (rows.len() as f32 * row_h - list.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let filtering = !query.is_empty();
-        let indent_w = cx.ui.cell_w * 2.0;
-        for (i, r) in rows.iter().enumerate() {
-            self.rows.push(RowRef::from(r));
-            let ry = list.y + i as f32 * row_h - self.scroll;
-            if ry + row_h < list.y || ry > list.y + list.h {
-                continue;
-            }
-            let row_rect = Rect { x: list.x, y: ry, w: list.w, h: row_h };
-            if !r.is_category && self.chosen.as_ref() == Some(&r.path) {
-                cx.fill_alpha(row_rect, accent, SELECTED_ALPHA);
-            }
-            if Some(i) == self.sel {
-                cx.highlight(row_rect);
-            } else if Some(i) == self.hover {
-                cx.fill_alpha(row_rect, theme::HOVER_BG, theme::HOVER_ALPHA * HOVER_SHARE);
-            }
-            let marker = match (r.is_dir, r.expanded) {
-                (true, true) => "\u{25be} ",
-                (true, false) => "\u{25b8} ",
-                _ => "  ",
-            };
-            // Marker in the kind colour; an optional dim disambiguating prefix;
-            // then the name by kind/extension (browse) or with matches lit (filter).
-            let mut spans: Vec<(String, [u8; 3])> =
-                vec![(marker.to_string(), if r.is_dir { accent } else { FILE_FG })];
-            if !r.prefix.is_empty() {
-                spans.push((format!("{}/", r.prefix), theme::DIM));
-            }
-            if filtering {
-                spans.extend(Self::match_spans(&r.name, r.is_dir, &r.match_indices, accent));
-            } else {
-                spans.extend(Self::name_spans(&r.name, r.is_dir, accent));
-            }
-            let left = list.x + pad + r.depth as f32 * indent_w;
-            let width = (list.x + list.w - left - pad).max(1.0);
-            cx.row(&spans, left, ry + (row_h - ch) * 0.5, width, list, FILE_FG);
-        }
+        self.rows = rows.iter().map(RowRef::from).collect();
+        // Grouped views ignore the query: their rows are a tree.
+        let filtering = !query.is_empty() && self.tree.view() == FsView::Tree;
+        let first = ((self.scroll / row_h).floor() as usize).min(rows.len());
+        let last = (((self.scroll + list.h) / row_h).ceil() as usize).clamp(first, rows.len());
+        // Clipped, so a row scrolled half out draws neither over the header
+        // nor under the footer.
+        cx.with_clip(list, |cx| self.paint_rows(cx, list, &rows[first..last], first, filtering));
         let subject = self
             .sel
             .and_then(|i| rows.get(i))
@@ -1131,6 +1140,92 @@ impl FileBrowserView {
     }
 }
 
+/// A list row's height: roomier than a line of text, like a sidebar's.
+fn row_height(ui: UiMetrics) -> f32 {
+    (ui.cell_h + 10.0 * ui.scale).round()
+}
+
+/// Where a list row's parts go, in physical px.
+struct RowGeom {
+    list: Rect,
+    row_h: f32,
+    pad: f32,
+    /// An icon or chevron's square, which is also one indent level.
+    slot: f32,
+    /// Between the icon and the name.
+    gap: f32,
+}
+
+impl RowGeom {
+    fn new(ui: UiMetrics, list: Rect) -> Self {
+        RowGeom {
+            list,
+            row_h: row_height(ui),
+            pad: (8.0 * ui.scale).round(),
+            slot: ui.cell_h.round(),
+            gap: (6.0 * ui.scale).round(),
+        }
+    }
+
+    /// The left of a row's icon at `depth`: each level indents one icon, so
+    /// the guide under a folder's chevron runs just left of its children's.
+    fn slot_x(&self, depth: usize) -> f32 {
+        self.list.x + self.pad + depth as f32 * self.slot
+    }
+
+    /// The pill behind the row whose top is `ry`, inset from the list's
+    /// sides and snapped to whole pixels.
+    fn pill(&self, ry: f32) -> Rect {
+        let inset = (self.pad * 0.5).round();
+        Rect { x: self.list.x + inset, y: ry.round() + 1.0, w: self.list.w - inset * 2.0, h: self.row_h - 2.0 }
+    }
+
+    fn icon(&self, depth: usize, ry: f32) -> Rect {
+        let y = (ry + (self.row_h - self.slot) * 0.5).round();
+        Rect { x: self.slot_x(depth).round(), y, w: self.slot, h: self.slot }
+    }
+
+    /// A chevron in an icon's square: smaller than a file icon, as it is
+    /// only a control.
+    fn chevron(&self, icon: Rect) -> Rect {
+        let side = (self.slot * 0.8).round();
+        let d = ((self.slot - side) * 0.5).round();
+        Rect { x: icon.x + d, y: icon.y + d, w: side, h: side }
+    }
+
+    fn text_x(&self, depth: usize) -> f32 {
+        self.slot_x(depth) + self.slot + self.gap
+    }
+
+    fn text_y(&self, ui: UiMetrics, ry: f32) -> f32 {
+        ry + (self.row_h - ui.cell_h) * 0.5
+    }
+}
+
+/// `name` with the characters at `matches` (char indices) lit and the rest
+/// dimmer; with no matches, plain.
+fn match_spans(name: &str, matches: &[usize]) -> Vec<(String, [u8; 3])> {
+    if matches.is_empty() {
+        return vec![(name.to_string(), NAME_FG)];
+    }
+    let hit: HashSet<usize> = matches.iter().copied().collect();
+    let mut spans: Vec<(String, [u8; 3])> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_hit = false;
+    for (i, ch) in name.chars().enumerate() {
+        let h = hit.contains(&i);
+        if !cur.is_empty() && h != cur_hit {
+            spans.push((std::mem::take(&mut cur), if cur_hit { MATCH_FG } else { UNMATCHED_FG }));
+        }
+        cur_hit = h;
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        spans.push((cur, if cur_hit { MATCH_FG } else { UNMATCHED_FG }));
+    }
+    spans
+}
+
 /// `path` with its `.` and `..` components resolved by name alone, following no
 /// symlink.
 fn lexical(path: &Path) -> PathBuf {
@@ -1175,7 +1270,7 @@ mod tests {
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
     fn row_centre(i: usize) -> (f32, f32) {
         let header_h = UI.cell_h + 10.0;
-        let row_h = UI.cell_h + 4.0;
+        let row_h = row_height(UI);
         (50.0, header_h + i as f32 * row_h + row_h * 0.5)
     }
 
@@ -1379,18 +1474,23 @@ mod tests {
         assert!(v.tree().query().ends_with("/deep/"), "the first, got {}", v.tree().query());
     }
 
-    /// The list rows a frame fills with the hover colour at `alpha`.
-    fn rows_lit(frame: &crate::plugin::paint::Frame, alpha: f32) -> Vec<usize> {
-        let (header_h, row_h) = (UI.cell_h + 10.0, UI.cell_h + 4.0);
-        let white = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, theme::HOVER_BG, alpha).color;
+    /// The list rows a frame draws a pill behind in `color` at `alpha`.
+    fn rows_lit_in(frame: &crate::plugin::paint::Frame, color: [u8; 3], alpha: f32) -> Vec<usize> {
+        let (header_h, row_h) = (UI.cell_h + 10.0, row_height(UI));
+        let want = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, color, alpha).color;
         frame
             .bg
             .iter()
-            .filter(|q| q.color == white)
+            .filter(|q| q.color == want && q.radius > 0.0)
             .map(|q| (1.0 - q.pos[1]) * 0.5 * frame.screen.1)
             .filter(|y| *y > header_h - 1.0)
-            .map(|y| ((y - header_h) / row_h).round() as usize)
+            .map(|y| ((y - header_h) / row_h).floor() as usize)
             .collect()
+    }
+
+    /// The list rows a frame draws a hover-coloured pill behind at `alpha`.
+    fn rows_lit(frame: &crate::plugin::paint::Frame, alpha: f32) -> Vec<usize> {
+        rows_lit_in(frame, theme::HOVER_BG, alpha)
     }
 
     #[test]
@@ -2087,5 +2187,142 @@ mod tests {
         assert_eq!(v.scroll, 30.0);
         h.scroll(&mut v, (10.0, 100.0), 1000.0);
         assert_eq!(v.scroll, 0.0, "can't scroll above the top");
+    }
+
+    /// The plain (unrounded) fills a frame draws in `color` at `alpha`, as
+    /// rects in physical px.
+    fn fills(frame: &crate::plugin::paint::Frame, color: [u8; 3], alpha: f32) -> Vec<Rect> {
+        let want = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, color, alpha).color;
+        frame
+            .bg
+            .iter()
+            .filter(|q| q.color == want && q.radius == 0.0 && q.border_w == 0.0)
+            .map(|q| Rect {
+                x: (q.pos[0] + 1.0) * 0.5 * frame.screen.0,
+                y: (1.0 - q.pos[1]) * 0.5 * frame.screen.1,
+                w: q.px[0],
+                h: q.px[1],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_rows_draw_one_guide_per_level_without_overlap() {
+        let d = tmpdir("fb-guides");
+        std::fs::create_dir_all(d.join("a/b/c")).unwrap();
+        std::fs::write(d.join("a/b/c/f.txt"), "").unwrap();
+        let mut v = FileBrowserView::new(d.clone());
+        v.reveal(&d.join("a/b/c/f.txt"));
+        let mut h = Harness::new();
+        let frame = h.paint(&mut v, RECT);
+        // Rows a, b, c, f.txt at depths 0..=3: level 0's guide runs beside
+        // the three rows under a, level 1's the two under b, level 2's one.
+        let mut guides = fills(frame, theme::GUIDE, theme::GUIDE_ALPHA);
+        guides.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let row_h = row_height(UI);
+        // Within float error of the NDC round trip.
+        let whole = |v: f32| (v - v.round()).abs() < 1e-3;
+        let heights: Vec<f32> = guides.iter().map(|g| g.h.round()).collect();
+        assert_eq!(heights, vec![3.0 * row_h, 2.0 * row_h, row_h], "{guides:?}");
+        assert!(guides.windows(2).all(|w| w[0].x + w[0].w <= w[1].x + 1e-3), "no overlap: {guides:?}");
+        assert!(guides.iter().all(|g| whole(g.x) && whole(g.y) && g.w == theme::hairline(UI)), "{guides:?}");
+        // Collapsing a hides its subtree and its guides.
+        v.tree_mut().toggle_dir(&d.join("a"));
+        assert!(fills(h.paint(&mut v, RECT), theme::GUIDE, theme::GUIDE_ALPHA).is_empty());
+    }
+
+    #[test]
+    fn the_selected_rows_pill_is_stronger_than_the_hovered_ones() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
+        let frame = h.paint(&mut v, RECT);
+        assert_eq!(rows_lit_in(frame, theme::ROW_SELECTED_BG, theme::ROW_SELECTED_ALPHA), vec![1]);
+        assert_eq!(rows_lit(frame, theme::HOVER_ALPHA), vec![0]);
+        const { assert!(theme::ROW_SELECTED_ALPHA > theme::HOVER_ALPHA) };
+        // The selected row under the pointer shows one pill, the selected one.
+        h.mouse(&mut v, MouseEvent::Move { pos: row_centre(1) });
+        let frame = h.paint(&mut v, RECT);
+        assert_eq!(rows_lit_in(frame, theme::ROW_SELECTED_BG, theme::ROW_SELECTED_ALPHA), vec![1]);
+        assert!(rows_lit(frame, theme::HOVER_ALPHA).is_empty());
+    }
+
+    #[test]
+    fn rows_scrolled_above_the_list_are_clipped_to_it() {
+        let d = tmpdir("fb-clip");
+        for i in 0..30 {
+            std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let mut v = FileBrowserView::new(d);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let half = (row_height(UI) * 0.5).round();
+        h.scroll(&mut v, (10.0, 100.0), -half);
+        let list = v.list;
+        // Hover the half-hidden first row, so it draws a pill.
+        h.mouse(&mut v, MouseEvent::Move { pos: (50.0, list.y + 1.0) });
+        assert_eq!(v.sel, Some(0));
+        let frame = h.paint(&mut v, RECT);
+        let pill = frame
+            .bg
+            .iter()
+            .find(|q| q.radius > 0.0 && q.color[3] == theme::HOVER_ALPHA)
+            .expect("the hovered row's pill");
+        assert!((1.0 - pill.pos[1]) * 0.5 * frame.screen.1 < list.y, "the pill starts above the list");
+        assert_eq!(pill.clip[1], list.y, "and is cut at its top");
+        // Icons and the row's name are cut there too.
+        let g = RowGeom::new(UI, list);
+        let name = frame.text.iter().find(|t| t.left == g.text_x(0) && t.top < list.y).expect("row 0's name");
+        assert!(name.bounds.top >= list.y as i32, "{:?}", name.bounds);
+        let kind = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, FileKind::Text.color(), 1.0).color;
+        for q in frame.bg.iter().filter(|q| q.color == kind) {
+            let top = (1.0 - q.pos[1]) * 0.5 * frame.screen.1;
+            assert!(top >= list.y || q.clip[1] >= list.y, "an icon quad drawn over the header");
+        }
+    }
+
+    #[test]
+    fn filter_results_are_flat_with_the_folder_dimmed_after_the_name() {
+        let d = tmpdir("fb-results");
+        std::fs::create_dir(d.join("docs")).unwrap();
+        std::fs::write(d.join("docs/GOAL.md"), "").unwrap();
+        std::fs::write(d.join("AGENTS.md"), "").unwrap();
+        let mut v = FileBrowserView::new(d.clone());
+        let mut h = Harness::new();
+        type_in(&mut h, &mut v, "goal");
+        let rows = v.tree_mut().rows().to_vec();
+        let goal = rows.iter().find(|r| r.path == d.join("docs/GOAL.md")).expect("a result");
+        assert_eq!(goal.depth, 0, "flat");
+        let spans = FileBrowserView::result_spans(goal);
+        let text: String = spans.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "GOAL.md docs");
+        assert_eq!(spans.last().unwrap(), &(" docs".to_string(), theme::DIM));
+        let lit: String = spans.iter().filter(|(_, c)| *c == MATCH_FG).map(|(t, _)| t.as_str()).collect();
+        assert_eq!(lit, "GOAL", "the matched letters, within the name");
+        // At the root, no folder follows.
+        type_in(&mut h, &mut v, "agents");
+        let agents = v.tree_mut().rows()[0].clone();
+        let spans = FileBrowserView::result_spans(&agents);
+        assert!(spans.iter().all(|(_, c)| *c != theme::DIM), "{spans:?}");
+    }
+
+    #[test]
+    fn the_filter_is_smart_case() {
+        let d = tmpdir("fb-smart-case");
+        std::fs::write(d.join("Goal.md"), "").unwrap();
+        std::fs::write(d.join("gold.txt"), "").unwrap();
+        let mut v = FileBrowserView::new(d.clone());
+        let mut h = Harness::new();
+        let names = |v: &mut FileBrowserView| {
+            let mut n: Vec<String> = v.tree_mut().rows().iter().map(|r| file_name(&r.path)).collect();
+            n.sort();
+            n
+        };
+        type_in(&mut h, &mut v, "go");
+        assert_eq!(names(&mut v), ["Goal.md", "gold.txt"], "lower case matches either case");
+        type_in(&mut h, &mut v, "Go");
+        assert_eq!(names(&mut v), ["Goal.md"], "a capital matches case");
     }
 }
