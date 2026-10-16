@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry};
 
-use super::{AppState, Confirm, Confirmed, SurfaceId};
+use super::{AppState, Confirm, Confirmed, DocRef, Pick};
 use crate::file_jobs::{self, Done, FileJob, Output};
 use crate::file_menu::{self, FileAction, FileTarget, MenuEntry, MenuEnv};
 use crate::file_ops;
@@ -136,13 +136,16 @@ impl AppState {
         }
     }
 
-    /// Have every view with a file check it against the disk
-    /// ([`View::changed_on_disk`]). Returns whether any view changed.
+    /// Have every document with a file check it against the disk
+    /// ([`View::changed_on_disk`]). Returns whether any document changed.
     pub fn check_open_files(&mut self) -> bool {
         let mut any = false;
         for view in self.views.values_mut() {
-            if let Some(path) = view.path() {
-                any |= view.changed_on_disk(&path);
+            for doc in view.docs() {
+                let Some(doc) = view.document_mut(doc) else { continue };
+                if let Some(path) = doc.path() {
+                    any |= doc.changed_on_disk(&path);
+                }
             }
         }
         any
@@ -297,11 +300,12 @@ impl AppState {
             .values()
             .filter_map(|v| v.downcast_ref::<FileBrowserView>())
             .map(|b| b.tree().root().to_path_buf());
+        let doc_paths = self.all_docs().into_iter().filter_map(|d| self.doc(d)?.path());
         let mut followed: Vec<PathBuf> = self
             .views
             .values()
-            .flat_map(|v| [v.path(), v.subject()])
-            .flatten()
+            .filter_map(|v| v.subject())
+            .chain(doc_paths)
             .chain(browser_roots)
             .chain(self.tree.vtabs().iter().filter_map(|v| v.root_dir.clone()))
             .chain(self.file_clip.as_ref().map(|c| c.path.clone()))
@@ -419,36 +423,29 @@ impl AppState {
         Ok(())
     }
 
-    /// The editor surface showing `path`, the focused one if several do.
-    fn editor_of(&self, path: &Path) -> Option<SurfaceId> {
-        let shows = |sid: &SurfaceId| {
-            self.views.get(sid).is_some_and(|v| v.plugin() == editor::ID && v.path().as_deref() == Some(path))
-        };
-        self.focused_surface().filter(shows).or_else(|| {
-            self.tree
-                .vtabs()
-                .iter()
-                .flat_map(|v| v.panes())
-                .flat_map(|p| p.surfaces.iter().map(|s| s.id))
-                .find(shows)
-        })
+    /// The editor document showing `path`, the focused surface's if one of
+    /// its documents does.
+    fn editor_of(&self, path: &Path) -> Option<DocRef> {
+        let shows =
+            |d: &DocRef| self.doc(*d).is_some_and(|v| v.plugin() == editor::ID && v.path().as_deref() == Some(path));
+        let focused = self.focused_surface();
+        let mut docs = self.all_docs();
+        docs.sort_by_key(|(sid, _)| Some(*sid) != focused);
+        docs.into_iter().find(shows)
     }
 
     /// Ask where to save a copy of the editor showing `path`.
     pub fn save_copy_of(&mut self, path: &Path) -> Result<()> {
-        let sid = self.editor_of(path).with_context(|| format!("{} isn't open in an editor", path.display()))?;
-        self.open_save_copy(sid);
+        let doc = self.editor_of(path).with_context(|| format!("{} isn't open in an editor", path.display()))?;
+        self.open_save_dialog(doc, Pick::SaveCopy(doc));
         Ok(())
     }
 
-    /// The surfaces whose views show `path` or something inside it.
-    fn surfaces_under(&self, path: &Path) -> Vec<SurfaceId> {
-        self.tree
-            .vtabs()
-            .iter()
-            .flat_map(|v| v.panes())
-            .flat_map(|p| p.surfaces.iter().map(|s| s.id))
-            .filter(|sid| self.views.get(sid).and_then(|v| v.path()).is_some_and(|p| p.starts_with(path)))
+    /// The documents that show `path` or something inside it.
+    fn docs_under(&self, path: &Path) -> Vec<DocRef> {
+        self.all_docs()
+            .into_iter()
+            .filter(|d| self.doc(*d).and_then(|v| v.path()).is_some_and(|p| p.starts_with(path)))
             .collect()
     }
 
@@ -497,17 +494,17 @@ impl AppState {
         Ok(())
     }
 
-    /// The surfaces showing `path` or something in it with unsaved changes
+    /// The documents showing `path` or something in it with unsaved changes
     /// (none when closing doesn't ask about them).
-    fn unsaved_under(&self, path: &Path) -> Vec<SurfaceId> {
+    fn unsaved_under(&self, path: &Path) -> Vec<DocRef> {
         if !self.guard_unsaved {
             return Vec::new();
         }
-        self.surfaces_under(path).into_iter().filter(|s| self.views.get(s).is_some_and(|v| v.modified())).collect()
+        self.docs_under(path).into_iter().filter(|d| self.doc(*d).is_some_and(|v| v.modified())).collect()
     }
 
-    /// Ask whether to save `unsaved` (views of `path`) before trashing it.
-    fn ask_unsaved_trash(&mut self, path: &Path, unsaved: &[SurfaceId]) {
+    /// Ask whether to save `unsaved` (documents of `path`) before trashing it.
+    fn ask_unsaved_trash(&mut self, path: &Path, unsaved: &[DocRef]) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let (message, save, can_save) = self.unsaved_question(unsaved);
         self.confirm = Some(Confirm {
@@ -519,11 +516,16 @@ impl AppState {
         });
     }
 
-    /// Move `path` to the Trash and close the views of it.
+    /// Move `path` to the Trash and close the documents of it; a surface left
+    /// with no document closes.
     pub(super) fn trash_now(&mut self, path: &Path) -> Result<()> {
-        let open = self.surfaces_under(path);
+        let open = self.docs_under(path);
         self.system.trash(path).with_context(|| format!("can't move {} to the Trash", path.display()))?;
-        for sid in open {
+        for (sid, doc) in open {
+            let Some(view) = self.views.get_mut(&sid) else { continue };
+            if !view.close_doc(doc) {
+                continue;
+            }
             let place = self.tree.vtabs().iter().find_map(|v| {
                 v.panes().into_iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
             });
@@ -659,10 +661,11 @@ mod tests {
 
     use super::*;
     use crate::app_state::{build_registry, Pick};
+    use ghostrealm_core::SurfaceId;
     use crate::file_ops::tests::FakeSystem;
     use crate::file_menu::{Kind, Origin};
-    use crate::plugin::testing::tmpdir;
-    use crate::plugin::View;
+    use crate::plugin::testing::{tmpdir, DocsView};
+    use crate::plugin::{DocId, View};
     use crate::plugins::editor::EditorView;
 
     type Calls = Rc<RefCell<Vec<String>>>;
@@ -1006,7 +1009,7 @@ mod tests {
         let sid = open_editor(&mut s, &d.join("a.txt"));
         s.view_mut(sid).and_then(|v| v.downcast_mut::<EditorView>()).unwrap().buffer_mut().insert_str("edit ");
         run(&mut s, "file.save_copy_as", &[("path", &d.join("a.txt"))]).unwrap();
-        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy(sid)));
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy((sid, crate::plugin::DocId::SELF))));
         s.confirm_picker_with(d.join("sub/copy.txt")).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("sub/copy.txt")).unwrap(), "edit A\n", "the unsaved text");
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "A\n", "the original is untouched");
@@ -1082,6 +1085,35 @@ mod tests {
         assert!(!d.join("dir").exists());
         let open: Vec<_> = s.views().filter_map(|(_, v)| v.path()).collect();
         assert_eq!(open, [d.join("keep.txt")]);
+    }
+
+    #[test]
+    fn renaming_copying_and_deleting_act_on_the_document_of_that_file() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-docs");
+        let files = ["a.txt", "b.txt"].map(|n| d.join(n));
+        let mut docs = Vec::new();
+        for f in &files {
+            std::fs::write(f, "x").unwrap();
+            docs.push(s.view_for_path(Some(editor::ID), f).unwrap());
+        }
+        s.open_view_in_focused(Box::new(DocsView::new(docs)));
+        let sid = s.focused_surface().unwrap();
+        let path_of = |s: &AppState, id| s.doc((sid, DocId(id))).and_then(|v| v.path());
+
+        run(&mut s, "file.rename", &[("name", Path::new("c.txt")), ("path", &files[0])]).unwrap();
+        assert_eq!((path_of(&s, 1), path_of(&s, 2)), (Some(d.join("c.txt")), Some(files[1].clone())));
+
+        run(&mut s, "file.save_copy_as", &[("path", &d.join("c.txt"))]).unwrap();
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveCopy((sid, DocId(1)))), "not the shown one");
+        s.close_picker();
+
+        run(&mut s, "file.delete", &[("path", &files[1])]).unwrap();
+        s.accept_confirm().unwrap();
+        assert_eq!(s.view(sid).unwrap().docs(), [DocId(1)], "only b.txt's document closed");
+        run(&mut s, "file.delete", &[("path", &d.join("c.txt"))]).unwrap();
+        s.accept_confirm().unwrap();
+        assert!(s.view(sid).is_none(), "the surface closed with its last document");
     }
 
     #[test]

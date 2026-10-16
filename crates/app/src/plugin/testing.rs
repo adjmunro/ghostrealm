@@ -5,7 +5,7 @@ use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
 use ghostrealm_terminal::{Key, KeyPress, Mods};
 use glyphon::FontSystem;
 
-use super::{EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, TextKit, UiMetrics, View};
+use super::{DocId, EventCx, Frame, Layer, MouseEvent, Outcome, PaintCx, TextKit, UiMetrics, View};
 
 pub const UI: UiMetrics = UiMetrics {
     cell_w: 8.0,
@@ -126,6 +126,78 @@ impl Harness {
 
     pub fn tick(&self, view: &mut dyn View, now: std::time::Instant) -> Outcome {
         self.event(Mods::default(), |cx| view.tick(cx, now))
+    }
+}
+
+/// A view hosting several documents, each a view of its own: the shape of a
+/// Files surface, for tests of the app's per-document handling. Ids start at
+/// 1, so none is [`DocId::SELF`]; keys and paint go to the active document.
+pub struct DocsView {
+    pub docs: Vec<(DocId, Box<dyn View>)>,
+    pub active: usize,
+}
+
+impl DocsView {
+    /// Hosting `docs`, showing the last.
+    pub fn new(docs: Vec<Box<dyn View>>) -> Self {
+        let active = docs.len().saturating_sub(1);
+        let docs = docs.into_iter().zip(1..).map(|(v, i)| (DocId(i), v)).collect();
+        DocsView { docs, active }
+    }
+}
+
+impl View for DocsView {
+    fn plugin(&self) -> &'static str {
+        "docs"
+    }
+
+    fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
+        if let Some((_, d)) = self.docs.get_mut(self.active) {
+            d.paint(cx, rect);
+        }
+    }
+
+    fn key(&mut self, cx: &mut EventCx, key: &KeyPress) -> bool {
+        self.docs.get_mut(self.active).is_some_and(|(_, d)| d.key(cx, key))
+    }
+
+    fn files_changed(&mut self, moved: &[(std::path::PathBuf, std::path::PathBuf)]) {
+        for (_, d) in &mut self.docs {
+            d.files_changed(moved);
+        }
+    }
+
+    fn docs(&self) -> Vec<DocId> {
+        self.docs.iter().map(|(id, _)| *id).collect()
+    }
+
+    fn active_doc(&self) -> DocId {
+        self.docs.get(self.active).map_or(DocId::SELF, |(id, _)| *id)
+    }
+
+    fn doc(&self, id: DocId) -> Option<&dyn View> {
+        self.docs.iter().find(|(d, _)| *d == id).map(|(_, v)| &**v)
+    }
+
+    fn doc_mut(&mut self, id: DocId) -> Option<&mut dyn View> {
+        match self.docs.iter_mut().find(|(d, _)| *d == id) {
+            Some((_, v)) => Some(&mut **v),
+            None => None,
+        }
+    }
+
+    fn close_doc(&mut self, id: DocId) -> bool {
+        self.docs.retain(|(d, _)| *d != id);
+        self.active = self.active.min(self.docs.len().saturating_sub(1));
+        self.docs.is_empty()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

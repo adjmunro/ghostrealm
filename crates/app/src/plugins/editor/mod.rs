@@ -140,9 +140,9 @@ impl Plugin for EditorPlugin {
                 "Comment or uncomment the selected lines of the focused editor, per the file's language",
             ),
             Box::new(move |s: &mut AppState, _| {
-                let editor = s
-                    .focused_surface()
-                    .and_then(|sid| s.view_mut(sid))
+                let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
+                let editor = doc
+                    .and_then(|d| s.doc_mut(d))
                     .and_then(|v| v.downcast_mut::<EditorView>())
                     .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
                 editor.toggle_comment().map_err(|e| CmdError::Failed(e.into()))?;
@@ -158,7 +158,7 @@ impl Plugin for EditorPlugin {
             Box::new(move |s: &mut AppState, _| {
                 let sid = s
                     .focused_surface()
-                    .filter(|sid| s.view(*sid).is_some_and(|v| v.plugin() == ID))
+                    .filter(|sid| s.active_doc(*sid).and_then(|d| s.doc(d)).is_some_and(|v| v.plugin() == ID))
                     .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
                 s.open_save_as(sid);
                 Ok(CmdOutcome::ok())

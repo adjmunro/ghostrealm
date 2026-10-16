@@ -23,7 +23,7 @@ use ghostrealm_terminal::{KeyPress, Lifecycle};
 use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
 use crate::languages::same_file;
-use crate::plugin::{EventCx, OpenCx, Plugin, Request, UiMetrics, View};
+use crate::plugin::{DocId, EventCx, OpenCx, Plugin, Request, UiMetrics, View};
 use crate::plugins::editor;
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
@@ -44,6 +44,10 @@ pub const PICKER_SID: SurfaceId = SurfaceId(u64::MAX);
 /// (or produced output) before the next pump. Bridges that race for silent jobs.
 const OPTIMISTIC_BUSY_GRACE: Duration = Duration::from_millis(600);
 
+/// One document of one surface ([`View::docs`]): what saving, the
+/// unsaved-changes questions, and the disk checks act on.
+pub type DocRef = (SurfaceId, DocId);
+
 /// What confirming the floating picker does with its choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
@@ -53,10 +57,10 @@ pub enum Pick {
     NewWorkspace,
     /// Open a file in the focused pane with this plugin.
     OpenWith(&'static str),
-    /// Save this surface's view to a file ([`View::save_as`]).
-    SaveAs(SurfaceId),
-    /// Save a copy of this surface's view to a file ([`View::save_copy`]).
-    SaveCopy(SurfaceId),
+    /// Save this document to a file ([`View::save_as`]).
+    SaveAs(DocRef),
+    /// Save a copy of this document to a file ([`View::save_copy`]).
+    SaveCopy(DocRef),
 }
 
 impl Pick {
@@ -116,16 +120,17 @@ enum Confirmed {
     /// Finish the picker with this path.
     Pick(std::path::PathBuf),
     /// Leave, after saving `save` (accept) or without saving (discard).
-    Unsaved { what: Leave, save: Vec<SurfaceId> },
+    Unsaved { what: Leave, save: Vec<DocRef> },
     /// Move this path to the Trash.
     Trash(std::path::PathBuf),
     /// Move this path to the Trash, after saving `save` (accept) or without
-    /// saving (discard) the open views of it.
-    UnsavedTrash { path: std::path::PathBuf, save: Vec<SurfaceId> },
-    /// `sid`'s file changed on disk since it was loaded: write over it
+    /// saving (discard) the open documents of it.
+    UnsavedTrash { path: std::path::PathBuf, save: Vec<DocRef> },
+    /// `doc`'s file changed on disk since it was loaded: write over it
     /// (accept) or load the disk version over its edits (discard). Then carry
-    /// on with `rest`, the other views a Save and Close was saving, and `then`.
-    DiskConflict { sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume> },
+    /// on with `rest`, the other documents a Save and Close was saving, and
+    /// `then`.
+    DiskConflict { doc: DocRef, rest: Vec<DocRef>, then: Option<Resume> },
     /// A copy or move is running: quit now anyway, leaving it half done.
     BusyQuit,
 }
@@ -588,20 +593,44 @@ impl AppState {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
-    /// Ask where to save surface `sid`'s view: the picker, beside the view's
-    /// file and named after it when it has one.
+    /// Document `doc` of surface `sid`'s view.
+    pub fn doc(&self, (sid, doc): DocRef) -> Option<&dyn View> {
+        self.views.get(&sid)?.document(doc)
+    }
+
+    /// [`Self::doc`], mutably.
+    pub fn doc_mut(&mut self, (sid, doc): DocRef) -> Option<&mut dyn View> {
+        self.views.get_mut(&sid)?.document_mut(doc)
+    }
+
+    /// The document surface `sid` shows now, if it shows one.
+    pub fn active_doc(&self, sid: SurfaceId) -> Option<DocRef> {
+        let view = self.views.get(&sid)?;
+        let doc = view.active_doc();
+        view.docs().contains(&doc).then_some((sid, doc))
+    }
+
+    /// Every document of surface `sid`, in its tab order.
+    fn docs_of(&self, sid: SurfaceId) -> Vec<DocRef> {
+        self.views.get(&sid).map(|v| v.docs().into_iter().map(|d| (sid, d)).collect()).unwrap_or_default()
+    }
+
+    /// Every open document, in tree order.
+    fn all_docs(&self) -> Vec<DocRef> {
+        self.surfaces_in(Leave::Quit).into_iter().flat_map(|sid| self.docs_of(sid)).collect()
+    }
+
+    /// Ask where to save the document surface `sid` shows: the picker,
+    /// beside its file and named after it when it has one.
     pub fn open_save_as(&mut self, sid: SurfaceId) {
-        self.open_save_dialog(sid, Pick::SaveAs(sid));
+        if let Some(doc) = self.active_doc(sid) {
+            self.open_save_dialog(doc, Pick::SaveAs(doc));
+        }
     }
 
-    /// Ask where to save a copy of surface `sid`'s view ([`Self::open_save_as`]
-    /// without re-pointing the view).
-    pub fn open_save_copy(&mut self, sid: SurfaceId) {
-        self.open_save_dialog(sid, Pick::SaveCopy(sid));
-    }
-
-    fn open_save_dialog(&mut self, sid: SurfaceId, purpose: Pick) {
-        let file = self.view(sid).and_then(|v| v.path());
+    /// Ask where to save `doc` ([`Pick::SaveAs`]) or a copy of it.
+    fn open_save_dialog(&mut self, doc: DocRef, purpose: Pick) {
+        let file = self.doc(doc).and_then(|v| v.path());
         let root = file
             .as_deref()
             .and_then(Path::parent)
@@ -654,10 +683,9 @@ impl AppState {
             Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
                 self.save_views(&save, Some(Resume::Trash(path)))
             }
-            Some(Confirm { then: Confirmed::DiskConflict { sid, rest, then }, .. }) => {
+            Some(Confirm { then: Confirmed::DiskConflict { doc, rest, then }, .. }) => {
                 let view = self
-                    .views
-                    .get_mut(&sid)
+                    .doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
                 let mut written = Vec::new();
                 if let Some(path) = view.path() {
@@ -682,19 +710,18 @@ impl AppState {
         }
     }
 
-    /// Save each of `surfaces` to its own file, then do `then`. A view whose
+    /// Save each of `docs` to its own file, then do `then`. A document whose
     /// file changed on disk stops the saving to ask ([`Self::ask_disk_conflict`]),
     /// which carries on with the rest once answered. Returns the files written.
-    fn save_views(&mut self, surfaces: &[SurfaceId], then: Option<Resume>) -> Result<Vec<std::path::PathBuf>> {
+    fn save_views(&mut self, docs: &[DocRef], then: Option<Resume>) -> Result<Vec<std::path::PathBuf>> {
         let mut written = Vec::new();
-        for (i, sid) in surfaces.iter().enumerate() {
+        for (i, doc) in docs.iter().enumerate() {
             let view = self
-                .views
-                .get_mut(sid)
+                .doc_mut(*doc)
                 .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
             let Some(path) = view.path() else { continue };
             if view.disk_conflict() {
-                self.ask_disk_conflict_then(*sid, surfaces[i + 1..].to_vec(), then);
+                self.ask_disk_conflict_then(*doc, docs[i + 1..].to_vec(), then);
                 return Ok(written);
             }
             view.save_as(path.clone())?;
@@ -708,20 +735,23 @@ impl AppState {
         Ok(written)
     }
 
-    /// Ask whether to write over `sid`'s file, which changed on disk since the
-    /// view loaded or wrote it (Overwrite), load the disk version instead
-    /// (Reload, losing the view's edits), or leave things as they are.
+    /// Ask whether to write over the file of the document `sid` shows, which
+    /// changed on disk since the document loaded or wrote it (Overwrite), load
+    /// the disk version instead (Reload, losing its edits), or leave things as
+    /// they are.
     pub fn ask_disk_conflict(&mut self, sid: SurfaceId) {
-        self.ask_disk_conflict_then(sid, Vec::new(), None);
+        if let Some(doc) = self.active_doc(sid) {
+            self.ask_disk_conflict_then(doc, Vec::new(), None);
+        }
     }
 
-    fn ask_disk_conflict_then(&mut self, sid: SurfaceId, rest: Vec<SurfaceId>, then: Option<Resume>) {
-        let name = self.views.get(&sid).and_then(|v| v.title()).unwrap_or_default();
+    fn ask_disk_conflict_then(&mut self, doc: DocRef, rest: Vec<DocRef>, then: Option<Resume>) {
+        let name = self.doc(doc).and_then(|v| v.title()).unwrap_or_default();
         self.confirm = Some(Confirm {
             message: format!("\u{201c}{name}\u{201d} changed on disk since you opened it."),
             accept: Some("Overwrite"),
             discard: Some("Reload"),
-            then: Confirmed::DiskConflict { sid, rest, then },
+            then: Confirmed::DiskConflict { doc, rest, then },
             late: None,
         });
     }
@@ -738,9 +768,8 @@ impl AppState {
             Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
-            Some(Confirm { then: Confirmed::DiskConflict { sid, .. }, .. }) => {
-                self.views
-                    .get_mut(&sid)
+            Some(Confirm { then: Confirmed::DiskConflict { doc, .. }, .. }) => {
+                self.doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to reload has closed"))?
                     .reload()?;
             }
@@ -801,10 +830,10 @@ impl AppState {
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
-        if let Some((_, Pick::SaveAs(sid) | Pick::SaveCopy(sid))) = &self.picker {
-            let own = self.view(*sid).and_then(|v| v.path());
+        if let Some((_, Pick::SaveAs(doc) | Pick::SaveCopy(doc))) = &self.picker {
+            let own = self.doc(*doc).and_then(|v| v.path());
             let copy = matches!(self.picker, Some((_, Pick::SaveCopy(_))));
-            let stale = !copy && self.view(*sid).is_some_and(|v| v.disk_conflict());
+            let stale = !copy && self.doc(*doc).is_some_and(|v| v.disk_conflict());
             if path.is_file() && (copy || stale || own.as_deref() != Some(path.as_path())) {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.confirm = Some(Confirm {
@@ -831,21 +860,18 @@ impl AppState {
                 self.new_workspace_in(path);
             }
             Pick::OpenWith(id) => self.open_path_with_in_focused(id, &path)?,
-            Pick::SaveAs(sid) => {
-                let view = self
-                    .views
-                    .get_mut(&sid)
-                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
-                view.save_as(path.clone())?;
-                if let Some(t) = view.title() {
-                    self.tree.set_surface_title(sid, t, false);
+            Pick::SaveAs(doc) => {
+                self.doc_mut(doc)
+                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?
+                    .save_as(path.clone())?;
+                if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
+                    self.tree.set_surface_title(doc.0, t, false);
                 }
                 return Ok(Some(path));
             }
-            Pick::SaveCopy(sid) => {
+            Pick::SaveCopy(doc) => {
                 let view = self
-                    .views
-                    .get_mut(&sid)
+                    .doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
                 view.save_copy(path.clone())?;
                 self.changed(&[]);
@@ -916,8 +942,8 @@ impl AppState {
         Ok(())
     }
 
-    /// Persist every view's unsaved state that has a home (autosave on app
-    /// blur/quit). Returns whether the config file was among what was saved (so
+    /// Persist every document's unsaved state that has a home (autosave on
+    /// app blur/quit). Returns whether the config file was among what was saved (so
     /// the caller can hot-reload it).
     pub fn autosave_all(&mut self, cfg: &Config) -> bool {
         self.autosave_all_with_config(cfg, ghostrealm_core::config::config_path().as_deref())
@@ -927,8 +953,10 @@ impl AppState {
     fn autosave_all_with_config(&mut self, cfg: &Config, config_path: Option<&Path>) -> bool {
         let mut saved_config = false;
         for view in self.views.values_mut() {
-            if let Some(path) = view.autosave(cfg) {
-                saved_config |= config_path.is_some_and(|c| same_file(c, &path));
+            for doc in view.docs() {
+                if let Some(path) = view.document_mut(doc).and_then(|d| d.autosave(cfg)) {
+                    saved_config |= config_path.is_some_and(|c| same_file(c, &path));
+                }
             }
         }
         saved_config
@@ -1040,17 +1068,17 @@ impl AppState {
             .collect()
     }
 
-    /// The surfaces `what` removes whose views have unsaved changes.
-    fn unsaved_in(&self, what: Leave) -> Vec<SurfaceId> {
-        let mut ids = self.surfaces_in(what);
-        ids.retain(|id| self.views.get(id).is_some_and(|v| v.modified()));
-        ids
+    /// The documents `what` removes that have unsaved changes.
+    fn unsaved_in(&self, what: Leave) -> Vec<DocRef> {
+        let mut docs: Vec<_> = self.surfaces_in(what).into_iter().flat_map(|sid| self.docs_of(sid)).collect();
+        docs.retain(|d| self.doc(*d).is_some_and(|v| v.modified()));
+        docs
     }
 
-    /// Open the save / cancel / discard question for leaving `what`. A view
-    /// with no file has nowhere to save silently, so with one among them there
-    /// is no save button.
-    fn ask_unsaved(&mut self, what: Leave, unsaved: Vec<SurfaceId>) {
+    /// Open the save / cancel / discard question for leaving `what`. A
+    /// document with no file has nowhere to save silently, so with one among
+    /// them there is no save button.
+    fn ask_unsaved(&mut self, what: Leave, unsaved: Vec<DocRef>) {
         let (message, save, can_save) = self.unsaved_question(&unsaved);
         let (accept, discard) = match what {
             Leave::Quit => ("Save and Quit", "Quit Without Saving"),
@@ -1065,16 +1093,16 @@ impl AppState {
         });
     }
 
-    /// The unsaved-changes message for `unsaved`, the surfaces that can be
+    /// The unsaved-changes message for `unsaved`, the documents that can be
     /// saved to their file, and whether all of them can.
-    fn unsaved_question(&self, unsaved: &[SurfaceId]) -> (String, Vec<SurfaceId>, bool) {
+    fn unsaved_question(&self, unsaved: &[DocRef]) -> (String, Vec<DocRef>, bool) {
         let (save, scratch): (Vec<_>, Vec<_>) = unsaved
             .iter()
             .copied()
-            .partition(|id| self.views.get(id).and_then(|v| v.path()).is_some());
+            .partition(|d| self.doc(*d).and_then(|v| v.path()).is_some());
         let subject = match unsaved {
             [one] => {
-                let name = self.views.get(one).and_then(|v| v.title()).unwrap_or_default();
+                let name = self.doc(*one).and_then(|v| v.title()).unwrap_or_default();
                 format!("\u{201c}{name}\u{201d} has")
             }
             many => format!("{} buffers have", many.len()),
@@ -1661,7 +1689,9 @@ pub fn build_registry() -> Registry<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::testing::{cmd, DocsView};
     use crate::plugins::editor::EditorView;
+    use ghostrealm_terminal::Key;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2154,7 +2184,7 @@ mod tests {
         let sid = s.focused_surface().unwrap();
 
         r.execute("editor.save_as", &Args::new(), &mut s).unwrap();
-        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(sid)));
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, DocId::SELF))));
         let target = dir.join("old.txt");
         assert_eq!(s.picker_mut().unwrap().choice(), Some(target), "beside it, same name");
 
@@ -2810,5 +2840,99 @@ mod tests {
         // Losing the window to another app still autosaves.
         assert!(!s.autosave_all(&cfg));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
+    }
+
+    /// A guarded state whose focused pane holds one surface with two
+    /// documents, editors of `a.txt` and `b.txt` in `dir` (each "old\n"),
+    /// showing `b.txt`.
+    fn two_docs(dir: &Path) -> (AppState, SurfaceId, [std::path::PathBuf; 2]) {
+        let mut s = AppState::new().with_unsaved_guard();
+        s.new_empty_vtab();
+        let files = ["a.txt", "b.txt"].map(|n| dir.join(n));
+        let mut docs = Vec::new();
+        for f in &files {
+            std::fs::write(f, "old\n").unwrap();
+            docs.push(s.view_for_path(Some(editor::ID), f).unwrap());
+        }
+        s.open_view_in_focused(Box::new(DocsView::new(docs)));
+        let sid = s.focused_surface().unwrap();
+        (s, sid, files)
+    }
+
+    const A: DocId = DocId(1);
+    const B: DocId = DocId(2);
+
+    fn edit_doc(s: &mut AppState, doc: DocRef) {
+        assert!(s.doc_mut(doc).unwrap().write_input(b"new"));
+    }
+
+    fn show_doc(s: &mut AppState, sid: SurfaceId, index: usize) {
+        s.view_mut(sid).and_then(|v| v.downcast_mut::<DocsView>()).unwrap().active = index;
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn quitting_asks_about_every_unsaved_document_and_saves_each() {
+        let dir = crate::plugin::testing::tmpdir("docs-quit");
+        let (mut s, sid, files) = two_docs(&dir);
+        assert!(!s.has_unsaved());
+        // A document that isn't shown counts.
+        edit_doc(&mut s, (sid, A));
+        assert!(s.has_unsaved());
+        s.request_quit();
+        assert!(s.confirm().unwrap().message.contains("a.txt"), "{}", s.confirm().unwrap().message);
+        s.cancel_confirm();
+
+        edit_doc(&mut s, (sid, B));
+        s.request_quit();
+        let c = s.confirm().expect("asks");
+        assert!(c.message.starts_with("2 buffers have unsaved changes"), "{}", c.message);
+        assert_eq!(c.accept, Some("Save and Quit"));
+        assert_eq!(s.accept_confirm().unwrap(), files.to_vec());
+        assert!(s.quitting());
+        for f in &files {
+            assert_eq!(read(f), "newold\n");
+        }
+    }
+
+    #[test]
+    fn checking_open_files_checks_every_document() {
+        let dir = crate::plugin::testing::tmpdir("docs-check");
+        let (mut s, sid, files) = two_docs(&dir);
+        assert!(!s.check_open_files());
+        std::fs::write(&files[0], "theirs a\n").unwrap();
+        std::fs::write(&files[1], "theirs b\n").unwrap();
+        assert!(s.check_open_files());
+        for (doc, want) in [(A, "theirs a"), (B, "theirs b")] {
+            let editor = s.doc((sid, doc)).and_then(|v| v.downcast_ref::<EditorView>()).unwrap();
+            assert_eq!(editor.buffer().lines, [want]);
+        }
+        assert!(!s.check_open_files(), "once");
+    }
+
+    #[test]
+    fn save_save_as_and_a_save_conflict_act_on_the_shown_document() {
+        let dir = crate::plugin::testing::tmpdir("docs-save");
+        let (mut s, sid, files) = two_docs(&dir);
+        edit_doc(&mut s, (sid, A));
+        edit_doc(&mut s, (sid, B));
+        assert!(s.send_key_to_focused(&cmd(Key::Char('s'))));
+        assert_eq!((read(&files[0]), read(&files[1])), ("old\n".into(), "newold\n".into()));
+
+        s.open_save_as(sid);
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, B))));
+        s.confirm_picker_with(dir.join("c.txt")).unwrap();
+        assert_eq!(s.doc((sid, B)).unwrap().path(), Some(dir.join("c.txt")));
+        assert_eq!(s.doc((sid, A)).unwrap().path(), Some(files[0].clone()));
+
+        show_doc(&mut s, sid, 0);
+        std::fs::write(&files[0], "theirs\n").unwrap();
+        s.ask_disk_conflict(sid);
+        assert!(s.confirm().unwrap().message.contains("a.txt"), "{}", s.confirm().unwrap().message);
+        assert_eq!(s.accept_confirm().unwrap(), vec![files[0].clone()], "Overwrite");
+        assert_eq!(read(&files[0]), "newold\n");
     }
 }
