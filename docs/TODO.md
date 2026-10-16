@@ -326,12 +326,11 @@
 [2026-09-18@6577576]
 
 - Requires: NO BLOCKERS
-- Detail: Soft-wrap follow-ups. Editor soft-wrap + per-pane ribbon toggle are DONE
-  (d04ef0d): greedy word-wrap, gutter/cursor/selection/click all wrap-aware,
-  `[editor] soft_wrap` default on. REMAINING: (1) the toggle only shows on
-  single-tab editors (in the ribbon); add it for multi-tab editors and, if wanted,
-  terminals (terminals already wrap to their column count, so a terminal toggle
-  would need a ghostty reflow/no-wrap mode — likely skip). (2) Wrapped editors
+- Detail: Soft-wrap follow-ups. Editor soft-wrap + its toggle in the document
+  header are DONE: greedy word-wrap, gutter/cursor/selection/click all wrap-aware,
+  `[editor] soft_wrap` default on. REMAINING: (1) a terminal toggle, if wanted
+  (terminals already wrap to their column count, so a terminal toggle would
+  need a ghostty reflow/no-wrap mode — likely skip). (2) Wrapped editors
   re-shape visible rows via the row cache but char-substring keys mean many small
   entries; fine for now, revisit if a huge wrapped file feels slow.
 - Reason: complete the toggle's reach; keep perf healthy.
@@ -472,7 +471,7 @@
     - Headings differ only in weight; they should differ in size. Needs a font
       size per span, so variable row heights: an architectural change to the
       row cache, `PaintCx` rows, and every view's row-to-y mapping.
-    - Three view modes per file, switched by a ribbon button: Preview
+    - Three view modes per file, switched by a header button: Preview
       (rendered, read-only), Source (plain, editable), Integrated (source chars
       with the formatting, editable; Markdown's mixed mode). Extend to other
       languages: TOML `[table]`s as large headers (they render bold today
@@ -542,7 +541,7 @@
   palette (fold the one-shot "Run Anything" terminal into it somehow), and
   double-Shift opens a floating fuzzy FILE search over the current workspace/root
   directory group — reuse the FsTree fuzzy filter and the floating picker overlay,
-  Enter opens the file (respecting `[file_browser] open_in`). Make the triggers
+  Enter opens the file (in a Files surface, as every open does). Make the triggers
   configurable (the existing `[input] double_tap_window_ms` + remappable actions).
   Later: if the root is a code repo, index code SYMBOLS (via the LSP) and search
   those instead of/along files.
@@ -571,7 +570,7 @@
 - Detail: Not a minimap: a list of the file's section headers that jumps to one.
   Headers per language: TOML `[table]` / `[[array]]`, Markdown `#` headings, code
   symbols once an LSP is wired. Clicking a header scrolls so it sits mid-screen.
-  Undecided: where the list lives (side panel, ribbon dropdown, palette-like
+  Undecided: where the list lives (side panel, header dropdown, palette-like
   popup), nesting, whether it tracks the cursor's current section.
   GitHub issue #1 proposes the Claude Code app's sticky table of contents:
   collapsed in a corner, expands on hover, click to jump, unaffected by scroll.
@@ -582,7 +581,7 @@
 [2026-10-13@13e2bda] Editor — inline git change highlights
 
 - Requires: line-level diff hunks (`core::line_diff` only counts today)
-- Detail: While the ribbon statistic shows changes (or via a toggle), tint line
+- Detail: While the header's statistic shows changes (or via a toggle), tint line
   backgrounds like the cursor-line highlight (both can apply): green for added
   lines, red for changed, with the changed characters in a more vibrant shade
   (an intra-line diff). Deleted lines have no row in the buffer; options: (a) a
@@ -908,8 +907,8 @@
 [2026-10-14@7364079] File and folder context menu — remaining
 
 - Requires: NO BLOCKERS (each item below is independent)
-- Detail: The menu exists (right-click in the file browser, the editor's file
-  name in its ribbon; README, PLUGINS.md). Not built:
+- Detail: The menu exists (right-click in a Files surface's sidebar, a
+  document's file name in its header and its `⋯`; README, PLUGINS.md). Not built:
   - **Undo / Redo** of file operations (Zed's Edit section). Needs an operation
     log with an inverse for create, duplicate, paste, rename, move, and Trash
     (move back from the Trash). Left out rather than half-done.
@@ -919,8 +918,8 @@
     (`NSFileManager trashItemAtURL`); elsewhere it reports "not supported" and
     never deletes permanently. The `trash` crate or the freedesktop spec would
     cover Linux.
-  - **Editor tabs**: the menu opens from the single-tab ribbon's file name; with a
-    tab strip the file name is a tab, which has no file menu yet.
+  - **File tabs**: the Files surface's file tabs (next increment) need the
+    menu on a right-click too.
   - **Cmd+Backspace** on the file browser's selection to delete (from the old
     "Delete files" entry).
   - New File / New Folder create the entry and do not open it.
@@ -1330,15 +1329,14 @@
 
 ---
 
-[2026-10-16T21:23+1300@ad13ff26] Ribbon overflow menu
+[2026-10-16T21:23+1300@ad13ff26] Header icons by config
 
 - Requires: NO BLOCKERS
-- Detail: A three-dots button in the ribbon lists every ribbon option
-  (soft-wrap, autosave, ...); a config option chooses which of them also show
-  as ribbon icons.
-- Reason: GitHub issue #1; keeps the ribbon usable when narrow.
+- Detail: The document header's `⋯` lists every option (soft wrap, autosave,
+  the statistic). Remaining: a config option (`[editor] ribbon`) choosing which
+  of them also show as header icons.
+- Reason: GitHub issue #1; keeps the header usable when narrow.
 
----
 
 [2026-10-16T21:23+1300@ad13ff26] Comment mode
 

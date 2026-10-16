@@ -69,13 +69,15 @@ overwrites such a file: it skips it and the buffer stays modified. Undoing back 
 a reload, or a file that became unreadable as text, counts the same way. Saving a file that
 was deleted on disk recreates it without asking.
 
-Right-click a file or folder in the file browser (or empty space in it), or click
-an editor's file name in its ribbon, for the file menu: New File / New Folder (on a
-folder or empty space), Reveal in Finder, Show in File Browser (editor), Open in
+Right-click a file or folder in a Files surface's sidebar (or empty space in it), or
+click a document's file name in its header (or "File actions…" in its `⋯` menu), for
+the file menu: New File / New Folder (on a folder or empty space), Reveal in Finder,
+Show in File Browser (document), Open in
 Default App, Open in Terminal (folders), Cut / Copy / Paste / Duplicate, Copy Path /
 Copy Relative Path (to the workspace root), Add to .gitignore / .git/info/exclude
-(in a git repository), Rename, Save Copy As (editor), and Delete, last under a rule.
-Delete moves to the Trash (macOS only for now) and closes the file's editors; it asks
+(in a git repository), Rename, Save Copy As (document), and Delete, last under a rule.
+Delete moves to the Trash (macOS only for now) and closes the file's documents (their
+Files surfaces stay, showing the sidebar); it asks
 first unless git tracks the file and it is unmodified (a folder: all of it, and it
 isn't a repository itself). Paste and Duplicate run in the background, one at a
 time in the order given, so a big folder doesn't freeze the window; Delete's git

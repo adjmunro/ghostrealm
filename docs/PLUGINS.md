@@ -14,9 +14,12 @@ browser, image viewer, ...) should be too. The API lives in
   - `opens_path` / `open_path`: claim a file. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
     The view it returns is a document: the app shows it in a Files surface
-    (`AppState::open_file`: the focused one, else the workspace's last
-    focused one, else a new one), replacing the document there after the
-    unsaved-changes question. `files` claims images and audio (`MediaView`).
+    (`AppState::open_file`: one of the workspace showing the file already,
+    else the focused one, else the one focused last, else a new one),
+    replacing the document there. A replaced document with unsaved changes
+    autosaves if it autosaves, else the app asks first (Save As for one with
+    no file); with nobody to ask (the agent channel) the file opens in a new
+    Files surface instead. `files` claims images and audio (`MediaView`).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
     A plugin whose views are only documents (`editor`) or parts of another
     surface (`file_browser`) isn't.
@@ -45,11 +48,12 @@ browser, image viewer, ...) should be too. The API lives in
   the whole surface and asks about every unsaved document in it, as the
   tab's close button and closing a pane, workspace, or the app do. Close
   (Cmd+W) asks about the active document's unsaved changes, then calls
-  `close_doc(id)`; the surface closes once `docs()` is empty (at once
-  for a view that is its own document). The Files surface
-  (`plugins::files::FilesView`) is the host: it shows one document, which
-  another open replaces under a new id; showing only its sidebar, it has
-  none. Everything
+  `close_doc(id)`, whose answer says whether the surface closes: the view
+  decides (a view that is its own document closes at once). The Files
+  surface (`plugins::files::FilesView`) is the host: it shows one
+  document, which another open replaces under a new id, and it keeps its
+  sidebar when its last document closes (showing only its sidebar, it has
+  none, and Close closes it). Everything
   else (input, paint, pump, timers, `files_changed`) reaches the view, which
   passes it on. `title`, `path`, `write_input`, and `text` default to the
   active document's; `modified` and `marked_changed_on_disk` (the tab's
@@ -139,7 +143,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   picker, or confirmation covers the panes) it paints nothing; close popups
   then, so they don't reappear when the modal goes.
 - Document header: `plugins::files::header::DocHeader` draws a document's
-  details (name, kind and size, modified) in its rect; the document lays
+  details (name, kind and size, modified) in its rect, from what
+  `refresh(path)` last read (call it when the document shows, saves,
+  reloads, or follows its file; never from `paint`); the document lays
   out its controls right to left in `DocHeader::control_row`, then paints
   the header up to them. An `EditorView` draws one when its host sets
   `set_header(true)` (the Files surface does); `MediaView` always does.
