@@ -12,8 +12,6 @@
 //! A wide enough browser shows a [`preview`] of the highlighted (else selected)
 //! entry beside the list; the `⋯` menu's Preview overrides the width rule.
 
-pub(crate) mod preview;
-
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -33,6 +31,7 @@ use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
     MenuItem, Request, UiMetrics, View, Waker,
 };
+use crate::plugins::files::media as preview;
 use preview::PreviewPane;
 
 pub const ID: &str = "file_browser";

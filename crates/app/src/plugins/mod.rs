@@ -3,6 +3,7 @@
 
 pub mod editor;
 pub mod file_browser;
+pub mod files;
 pub mod terminal;
 pub mod web;
 
