@@ -27,6 +27,7 @@
 //!   by moving off).
 
 pub mod event;
+pub mod icons;
 pub mod paint;
 #[cfg(test)]
 pub mod testing;

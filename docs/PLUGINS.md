@@ -53,6 +53,13 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   they don't overdraw a header or take its clicks; a rounded rect keeps its
   shape inside the clip, so never shrink its rect to clip it. Text and
   `image` keep the `clip` each call takes; popups painted `above` escape it.
+- Icons: `plugin::icons`, drawn from quads (no image assets or font glyphs).
+  `FileKind::of(path)` names a file's kind from its name alone and never
+  returns `Folder`; check `is_dir` first and use `FileKind::Folder { open }`
+  for a directory (`.git` itself maps to `Git`). `kind.paint(cx, rect)` draws
+  it in its colour; `Icon::paint(cx, rect, colour)` draws a UI icon
+  (chevrons, sidebar toggle, `⋯`, view modes, copy, search, close). An icon
+  fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool; `Font` picks family + italic/bold.
 - Rows: `row` (cached by content, always shaped) and `budgeted_row` (cached by
