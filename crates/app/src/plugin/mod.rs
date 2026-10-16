@@ -127,22 +127,72 @@ pub trait Plugin {
     }
 }
 
+/// One document of a view: a file it shows. Ids are the view's own and stay
+/// fixed while that document is open; a view that is a single document is
+/// [`DocId::SELF`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocId(pub u32);
+
+impl DocId {
+    /// The document of a view that is its own (only) document.
+    pub const SELF: DocId = DocId(0);
+}
+
 /// One surface's content: a live instance of a [`Plugin`]'s kind.
 ///
 /// Every method runs on the UI thread. Only [`paint`](Self::paint) is required;
 /// the rest default to "not interested".
+///
+/// A view may host several documents (files), each itself a `View`
+/// ([`docs`](Self::docs), [`doc`](Self::doc)). The app asks a document, not
+/// the view, about its file: `path`, `modified`, `disk_conflict`, `save_as`,
+/// `save_copy`, `reload`, `changed_on_disk`, `autosave`. Everything else
+/// (input, paint, pump, timers, `files_changed`) goes to the view, which
+/// passes it on to its documents. Where one answer stands for the whole view
+/// (the tab title, the agent channel), the defaults take the active
+/// document's.
 pub trait View: Any {
     /// The id of the plugin that opened this view.
     fn plugin(&self) -> &'static str;
 
     /// The tab title. `None` keeps whatever the tab shows now.
     fn title(&self) -> Option<String> {
-        None
+        self.doc(self.active_doc()).and_then(|d| d.title())
     }
 
     /// Unsaved changes (the tab title shows italic).
     fn modified(&self) -> bool {
-        false
+        self.doc(self.active_doc()).is_some_and(|d| d.modified())
+    }
+
+    /// The documents the view hosts, in tab order. Empty when it shows no
+    /// file (closing it then closes the surface).
+    fn docs(&self) -> Vec<DocId> {
+        vec![DocId::SELF]
+    }
+
+    /// The document the view shows now: what Save, Save As, and Close act on.
+    fn active_doc(&self) -> DocId {
+        DocId::SELF
+    }
+
+    /// Document `id` as a view of its own. `None` when the view itself is
+    /// that document (the default), or hosts no such document; the app tells
+    /// the two apart with [`docs`](Self::docs) (see `dyn View::document`).
+    fn doc(&self, _id: DocId) -> Option<&dyn View> {
+        None
+    }
+
+    /// [`doc`](Self::doc), mutably.
+    fn doc_mut(&mut self, _id: DocId) -> Option<&mut dyn View> {
+        None
+    }
+
+    /// Close document `id`. Its unsaved changes were saved or given up
+    /// already (the app asks first). Returns whether the view has no document
+    /// left, which closes its surface.
+    fn close_doc(&mut self, _id: DocId) -> bool {
+        true
     }
 
     /// Paint the view into `rect` (its whole content area, below the pane's tab
@@ -231,7 +281,7 @@ pub trait View: Any {
 
     /// The file the view shows, if any (Save As starts beside it).
     fn path(&self) -> Option<PathBuf> {
-        None
+        self.doc(self.active_doc()).and_then(|d| d.path())
     }
 
     /// The file or folder the view is about, for the file commands that act on
@@ -267,7 +317,7 @@ pub trait View: Any {
     /// The view is marked as differing from its file on disk (the tab title
     /// shows amber).
     fn marked_changed_on_disk(&self) -> bool {
-        false
+        self.doc(self.active_doc()).is_some_and(|d| d.marked_changed_on_disk())
     }
 
     /// Whether writing the view's file now would overwrite a version it has
@@ -284,13 +334,15 @@ pub trait View: Any {
     }
 
     /// Raw input from the agent channel. Returns whether the view accepts it.
-    fn write_input(&mut self, _bytes: &[u8]) -> bool {
-        false
+    fn write_input(&mut self, bytes: &[u8]) -> bool {
+        let active = self.active_doc();
+        self.doc_mut(active).is_some_and(|d| d.write_input(bytes))
     }
 
     /// A plain-text rendering of the view's content, for the agent channel.
     fn text(&mut self) -> Option<String> {
-        None
+        let active = self.active_doc();
+        self.doc_mut(active).and_then(|d| d.text())
     }
 
     fn as_any(&self) -> &dyn Any;
@@ -306,6 +358,26 @@ impl dyn View {
     /// The concrete view, if it is a `T`.
     pub fn downcast_mut<T: View>(&mut self) -> Option<&mut T> {
         self.as_any_mut().downcast_mut()
+    }
+
+    /// Document `id`: a hosted document, or the view itself when it is its
+    /// own. `None` when the view has no such document.
+    pub fn document(&self, id: DocId) -> Option<&dyn View> {
+        if !self.docs().contains(&id) {
+            return None;
+        }
+        Some(self.doc(id).unwrap_or(self))
+    }
+
+    /// [`document`](Self::document), mutably.
+    pub fn document_mut(&mut self, id: DocId) -> Option<&mut dyn View> {
+        if !self.docs().contains(&id) {
+            return None;
+        }
+        if self.doc(id).is_some() {
+            return self.doc_mut(id);
+        }
+        Some(self)
     }
 }
 
