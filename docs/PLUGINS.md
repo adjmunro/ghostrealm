@@ -44,9 +44,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   pixels, so put it on a pixel centre (`n + 0.5`), and draw straight
   guides as snapped `fill`s. A translucent polyline is more opaque where
   its segments overlap, as are overlapping translucent fills: draw
-  translucent guides so they don't overlap.
+  translucent guides so they don't overlap. Size pills, boxes, and borders
+  with `theme::pill_radius`, `box_radius`, `hairline`, and `focus_ring_w`,
+  which scale with `cx.ui`.
 - Clipping: `with_clip(rect, |cx| ...)` clips every quad painted inside it
-  (fills, borders, rounded rects, strokes) and every `button` hit
+  (fills, borders, rounded rects, strokes, icons) and every `button` hit
   rect, nesting by intersection. Clip a scrolled list's rows to the list so
   they don't overdraw a header or take its clicks; a rounded rect keeps its
   shape inside the clip, so never shrink its rect to clip it. Text and

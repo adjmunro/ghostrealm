@@ -1,6 +1,10 @@
 //! Shared UI colour tokens, so views and the app's chrome read as one UI. The
 //! configurable colours (background, sidebar, accent) come from
 //! [`PaintCx::chrome`](super::PaintCx::chrome); these are the fixed ones.
+//! Sizes are functions of the [`UiMetrics`] (physical px), so they scale with
+//! the font and the display.
+
+use super::UiMetrics;
 
 /// Hover / keyboard-selection highlight: this colour at [`HOVER_ALPHA`].
 pub const HOVER_BG: [u8; 3] = [255, 255, 255];
@@ -35,3 +39,48 @@ pub const INPUT_TEXT: [u8; 3] = [225, 225, 235];
 /// at [`CODE_BG_ALPHA`] over the editor background.
 pub const CODE_BG: [u8; 3] = [255, 255, 255];
 pub const CODE_BG_ALPHA: f32 = 0.07;
+/// The active tab's pill: this colour at [`TAB_ACTIVE_ALPHA`], stronger than
+/// hover so the open tab reads apart from the one under the cursor.
+pub const TAB_ACTIVE_BG: [u8; 3] = [255, 255, 255];
+pub const TAB_ACTIVE_ALPHA: f32 = 0.28;
+/// A selected list row's pill: this colour at [`ROW_SELECTED_ALPHA`], stronger
+/// than hover for the same reason.
+pub const ROW_SELECTED_BG: [u8; 3] = [255, 255, 255];
+pub const ROW_SELECTED_ALPHA: f32 = 0.24;
+/// Indent guides in a tree: this colour at [`GUIDE_ALPHA`], so they read on
+/// any background. Translucent, so where two guides overlap they look
+/// denser: draw them without overlap.
+pub const GUIDE: [u8; 3] = [255, 255, 255];
+pub const GUIDE_ALPHA: f32 = 0.10;
+/// A code box (inline code, a fenced block): fill at [`CODE_BOX_ALPHA`] over
+/// the background, outlined in [`CODE_BOX_BORDER`] at
+/// [`CODE_BOX_BORDER_ALPHA`].
+pub const CODE_BOX_BG: [u8; 3] = [255, 255, 255];
+pub const CODE_BOX_ALPHA: f32 = 0.05;
+pub const CODE_BOX_BORDER: [u8; 3] = [255, 255, 255];
+pub const CODE_BOX_BORDER_ALPHA: f32 = 0.14;
+/// A text field's border while it has keyboard focus.
+pub const FIELD_FOCUS_BORDER: [u8; 3] = [110, 140, 210];
+
+/// Corner radius of a pill: a tab, a list row's hover or selection.
+pub fn pill_radius(ui: UiMetrics) -> f32 {
+    (ui.cell_h * 0.3).round()
+}
+
+/// Corner radius of a box: a code box, a text field.
+pub fn box_radius(ui: UiMetrics) -> f32 {
+    (ui.cell_h * 0.2).round()
+}
+
+/// One logical pixel, at least one physical: box borders, indent guides.
+/// Draw a straight guide as a [`fill`](super::PaintCx::fill) on whole pixels
+/// (a stroke is centred on its coordinate, so it blurs across two), and
+/// without overlapping another: translucent fills look denser where they do.
+pub fn hairline(ui: UiMetrics) -> f32 {
+    ui.scale.round().max(1.0)
+}
+
+/// A focused text field's border width.
+pub fn focus_ring_w(ui: UiMetrics) -> f32 {
+    (2.0 * ui.scale).round().max(1.0)
+}
