@@ -344,6 +344,14 @@ impl FsTree {
         false
     }
 
+    /// Whether a git filter or the git view is on and no git status for the
+    /// current root has arrived yet. Unlike
+    /// [`git_status_loading`](Self::git_status_loading), a refresh doesn't
+    /// count: the rows keep the last status until the new one replaces it.
+    pub fn git_status_awaited(&self) -> bool {
+        self.uses_git() && self.git_status.is_none()
+    }
+
     /// Whether a git filter or the git view is on and its git status is not
     /// in yet for the current listing.
     pub fn git_status_loading(&self) -> bool {

@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use glyphon::cosmic_text::Align;
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
 
 /// How one span of a row is drawn beyond its colour. Rows carry styles only
@@ -153,8 +154,8 @@ impl RowCache {
         self.row_key_in(cells, styles, Family::Monospace)
     }
 
-    /// [`row_key_styled`](Self::row_key_styled) for a row shaped in `family`.
-    /// Monospace hashes as `row_key_styled` does, so its rows keep their keys.
+    /// [`row_key_styled`](Self::row_key_styled) for a row shaped in `family`;
+    /// for monospace the two keys are equal.
     pub fn row_key_in<'a>(
         &self,
         cells: impl Iterator<Item = (&'a str, [u8; 3])>,
@@ -234,11 +235,18 @@ impl RowCache {
         // non-ASCII (emoji, combining marks, wide/CJK, RTL) falls back to
         // Advanced for correctness. The choice is a deterministic function of
         // the row's content, so it never needs to enter the cache key.
-        let shaping = if spans.iter().all(|(t, _)| t.is_ascii()) {
+        // Basic also skips kerning, which only a proportional face has.
+        let mono = family == Family::Monospace;
+        let shaping = if mono && spans.iter().all(|(t, _)| t.is_ascii()) {
             Shaping::Basic
         } else {
             Shaping::Advanced
         };
+        // With no alignment an RTL line is right-aligned to the buffer's
+        // width, which the key leaves out; aligned left, the layout doesn't
+        // depend on it. Monospace grid rows place each cell where the grid
+        // says, so they keep the default.
+        let align = if mono { None } else { Some(Align::Left) };
         let buf = &mut slot.buf;
         buf.set_metrics(metrics);
         buf.set_wrap(Wrap::None);
@@ -256,7 +264,7 @@ impl RowCache {
             }),
             &Attrs::new().family(family),
             shaping,
-            None,
+            align,
         );
         buf.shape_until_scroll(font_system, false);
         self.map.insert(key, idx);
@@ -466,7 +474,7 @@ mod tests {
         let mut cache = RowCache::new(256);
         let cells = || std::iter::once(("abc", GREY));
         let mono = cache.row_key_styled(cells(), &[]);
-        assert_eq!(mono, cache.row_key_in(cells(), &[], Family::Monospace), "monospace keys as before");
+        assert_eq!(mono, cache.row_key_in(cells(), &[], Family::Monospace), "monospace keys equal the plain key");
         let sans = cache.row_key_in(cells(), &[], Family::SansSerif);
         assert_ne!(mono, sans);
         assert_ne!(sans, cache.row_key_in(cells(), &[], Family::Serif));
@@ -475,5 +483,19 @@ mod tests {
         cache.ensure_in(sans, &mut fs, m, 400.0, 18.0, &span("abc", GREY), &[], Family::SansSerif);
         cache.end_frame();
         assert_eq!(cache.stats(), (0, 2), "each family shapes its own row");
+    }
+
+    #[test]
+    fn a_proportional_rtl_row_starts_at_the_left_whatever_the_width() {
+        let mut fs = FontSystem::new();
+        let m = Metrics::new(15.0, 18.0);
+        let mut cache = RowCache::new(256);
+        let name = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}.txt";
+        let key = cache.row_key_in(std::iter::once((name, GREY)), &[], Family::SansSerif);
+        cache.begin_frame(0);
+        cache.ensure_in(key, &mut fs, m, 1000.0, 18.0, &span(name, GREY), &[], Family::SansSerif);
+        let buf = cache.buffer(key).unwrap();
+        let left = buf.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x)).fold(f32::MAX, f32::min);
+        assert!(left < 1.0, "glyphs start at {left}, not against the right of a 1000 px box");
     }
 }

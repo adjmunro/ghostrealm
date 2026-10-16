@@ -240,10 +240,6 @@ pub struct FileBrowserView {
     // Geometry from the last paint, for mapping input to rows.
     list: Rect,
     row_h: f32,
-    /// The rows drawn, from row index `rows_first`: only those can be under
-    /// the pointer.
-    rows: Vec<RowRef>,
-    rows_first: usize,
     /// Path-mode completions as drawn: (rect, index, path, is_dir).
     suggest_hits: Vec<(Rect, usize, PathBuf, bool)>,
     preview: PreviewPane,
@@ -274,8 +270,6 @@ impl FileBrowserView {
             last_click: None,
             list: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             row_h: 1.0,
-            rows: Vec::new(),
-            rows_first: 0,
             suggest_hits: Vec::new(),
             preview: PreviewPane::default(),
             preview_on: None,
@@ -681,7 +675,7 @@ impl FileBrowserView {
         let up = Rect { x: (rect.x + pad * 0.5).round(), y, w: side, h: side };
         // Built only while hovered: the tooltip shows only then.
         let tip = match cx.hovered(up) {
-            true => format!("Parent folder\n{}", tilde(self.tree.root())),
+            true => format!("Up from {}", tilde(self.tree.root())),
             false => String::new(),
         };
         icon_button(cx, up, BTN_PARENT, Icon::ChevronUp, &tip, theme::GLYPH);
@@ -740,7 +734,9 @@ impl FileBrowserView {
         if !self.tree.rows().is_empty() {
             return None;
         }
-        if self.tree.git_status_loading() {
+        // Only before the first status: a refresh keeps the last one, so
+        // saying "loading" then would flicker.
+        if self.tree.git_status_awaited() {
             return Some("Loading git status\u{2026}".to_string());
         }
         let what = if self.mode == Mode::PickDir { "folders" } else { "files" };
@@ -875,7 +871,6 @@ impl View for FileBrowserView {
         let row_h = g.row_h;
         self.list = list;
         self.row_h = row_h;
-        self.rows.clear();
         self.suggest_hits.clear();
 
         if is_path {
@@ -926,8 +921,6 @@ impl View for FileBrowserView {
         let last = (((self.scroll + list.h) / row_h).ceil() as usize).clamp(first, count);
         let visible: Vec<FileRow> = rows[first..last].to_vec();
         let highlighted = self.sel.and_then(|i| rows.get(i)).filter(|r| !r.is_category).map(|r| r.path.clone());
-        self.rows = visible.iter().map(RowRef::from).collect();
-        self.rows_first = first;
         // Clipped, so a row scrolled half out draws neither over the header
         // nor under the footer.
         cx.with_clip(list, |cx| self.paint_rows(cx, list, &visible, first, filtering));
@@ -1275,12 +1268,12 @@ impl View for FileBrowserView {
 
 impl FileBrowserView {
     /// The browse/filter row under a point, from the last paint.
-    fn row_at(&self, x: f32, y: f32) -> Option<(usize, RowRef)> {
+    fn row_at(&mut self, x: f32, y: f32) -> Option<(usize, RowRef)> {
         if !rect_contains(self.list, x, y) {
             return None;
         }
         let idx = ((y - self.list.y + self.scroll) / self.row_h).floor().max(0.0) as usize;
-        self.rows.get(idx.checked_sub(self.rows_first)?).map(|r| (idx, r.clone()))
+        self.tree.rows().get(idx).map(|r| (idx, RowRef::from(r)))
     }
 }
 
@@ -1377,7 +1370,8 @@ fn match_spans(name: &str, matches: &[usize]) -> Vec<(String, [u8; 3])> {
 
 /// `path` for display, with the home directory as `~`.
 fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // An unset, empty, or root `HOME` would turn every path into `~/…`.
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.parent().is_some());
     match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
@@ -2548,14 +2542,33 @@ mod tests {
     fn an_empty_listing_says_why() {
         let (d, mut v) = fixture();
         let mut h = Harness::new();
-        assert_eq!(v.empty_note(), None);
+        assert_eq!(v.empty_note(), None, "rows are listed");
         type_in(&mut h, &mut v, "zzz");
         assert_eq!(v.empty_note().as_deref(), Some("No matching files"));
-        type_in(&mut h, &mut v, "   ");
-        assert_eq!(v.empty_note(), None, "a blank query filters nothing");
         std::fs::create_dir(d.join("adir/empty")).unwrap();
         v.tree_mut().set_root(d.join("adir/empty"));
+        assert!(v.tree_mut().rows().is_empty());
         assert_eq!(v.empty_note(), None, "an empty folder is just empty");
+        type_in(&mut h, &mut v, "   ");
+        assert!(v.tree_mut().rows().is_empty());
+        assert_eq!(v.empty_note(), None, "a blank query filters nothing");
+        // A git filter that passes nothing, once its status is in.
+        h.key(&mut v, press(Key::Escape));
+        v.tree_mut().set_git_filter(GitFilter::Modified);
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        while v.tree().git_status_awaited() {
+            assert!(Instant::now() < until, "the git status never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            v.tree_mut().rows();
+        }
+        assert_eq!(v.empty_note().as_deref(), Some("No matching files"));
+        // A refresh keeps the status shown, so nothing says "loading".
+        v.tree_mut().refresh();
+        assert_eq!(v.empty_note().as_deref(), Some("No matching files"));
+
+        let mut pick = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        type_in(&mut h, &mut pick, "zzz");
+        assert_eq!(pick.empty_note().as_deref(), Some("No matching folders"));
     }
 
     #[test]
@@ -2587,7 +2600,7 @@ mod tests {
         let up = h.frame.view_buttons.iter().find(|b| b.2 == BTN_PARENT).unwrap().0;
         h.cursor = (up.x + 2.0, up.y + 2.0);
         let tip = h.paint(&mut v, RECT).tooltip.clone().expect("a tooltip").1;
-        assert!(tip.ends_with(&tilde(parent)), "{tip}");
+        assert_eq!(tip, format!("Up from {}", tilde(parent)));
         assert_eq!(tilde(&PathBuf::from("/nowhere/x")), "/nowhere/x");
         if let Some(home) = std::env::var_os("HOME") {
             assert_eq!(tilde(&PathBuf::from(&home).join("a")), "~/a");
