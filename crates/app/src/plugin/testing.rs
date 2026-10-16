@@ -87,6 +87,15 @@ impl Harness {
             .collect()
     }
 
+    /// Where the leftmost glyph of the drawn text `text` starts within its
+    /// shaped line: 0 for a line laid out from the left, as right-to-left
+    /// text must be to show where it is placed.
+    pub fn text_left(&self, text: &str) -> Option<f32> {
+        let mut items = self.frame.text.iter().chain(&self.frame.overlay_text).filter_map(|t| self.text.buffer(t.src));
+        let buf = items.find(|b| b.layout_runs().any(|r| r.text == text))?;
+        Some(buf.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x)).fold(f32::MAX, f32::min))
+    }
+
     fn event(&self, mods: Mods, f: impl FnOnce(&mut EventCx)) -> Outcome {
         let mut cx = EventCx::new(&self.cfg, UI, mods, None);
         f(&mut cx);

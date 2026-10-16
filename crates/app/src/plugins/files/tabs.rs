@@ -7,7 +7,7 @@ use ghostrealm_core::Rect;
 
 use crate::plugin::icons::{FileKind, Icon};
 use crate::plugin::paint::intersect;
-use crate::plugin::{theme, DocId, Font, PaintCx};
+use crate::plugin::{theme, DocId, Font, PaintCx, Shaped};
 
 /// The tabs' button ids, past the surface's own and below the sidebar's
 /// (see [`button_id`]).
@@ -26,6 +26,11 @@ const TAB_SPACE: f32 = 6.0;
 pub(super) struct TabInfo {
     pub id: DocId,
     pub title: String,
+    /// Dim text after the title telling it apart from another tab's of the
+    /// same name (the file's folder).
+    pub suffix: Option<String>,
+    /// The tooltip: the file's full path.
+    pub path: Option<String>,
     pub kind: FileKind,
     /// The preview tab: the next single click in the sidebar replaces it.
     pub preview: bool,
@@ -34,15 +39,51 @@ pub(super) struct TabInfo {
     pub changed: bool,
 }
 
-/// The button id of document `id`'s tab, or of its close slot.
-pub(super) fn button_id(id: DocId, close: bool) -> u32 {
-    TAB_IDS + id.0 * 2 + close as u32
+/// The button id of document `id`'s close slot.
+pub(super) fn button_id(id: DocId) -> u32 {
+    TAB_IDS + id.0
 }
 
-/// The tab, and whether its close slot, a button id names: ids from
-/// [`TAB_IDS`] below `end`.
-pub(super) fn from_button(id: u32, end: u32) -> Option<(DocId, bool)> {
-    (TAB_IDS..end).contains(&id).then(|| (DocId((id - TAB_IDS) / 2), (id - TAB_IDS) % 2 == 1))
+/// The document whose close slot a button id names: ids from [`TAB_IDS`]
+/// below `end`.
+pub(super) fn from_button(id: u32, end: u32) -> Option<DocId> {
+    (TAB_IDS..end).contains(&id).then(|| DocId(id - TAB_IDS))
+}
+
+/// Disambiguating suffixes for `titles`: for each title another one shares,
+/// the last component of its `dirs` entry (its file's folder).
+pub(super) fn suffixes(titles: &[String], dirs: &[Option<String>]) -> Vec<Option<String>> {
+    titles
+        .iter()
+        .zip(dirs)
+        .map(|(t, dir)| {
+            let shared = titles.iter().filter(|o| *o == t).count() > 1;
+            dir.clone().filter(|_| shared)
+        })
+        .collect()
+}
+
+/// `spans` shaped in `font` to fit `avail` (physical px): whole if they fit,
+/// else the first span cut short with an ellipsis and the rest dropped.
+fn shape_fitting(cx: &mut PaintCx, spans: &[(String, [u8; 3])], font: Font, avail: f32) -> Shaped {
+    let whole = cx.shape_spans(spans, font, avail.max(1.0) * 4.0);
+    if whole.width <= avail || spans.is_empty() {
+        return whole;
+    }
+    let (name, color) = &spans[0];
+    let chars: Vec<char> = name.chars().collect();
+    let cut = |n: usize| vec![(chars[..n].iter().collect::<String>() + "\u{2026}", *color)];
+    // The most chars that fit with the ellipsis.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if cx.shape_spans(&cut(mid), font, avail.max(1.0) * 4.0).width <= avail {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cx.shape_spans(&cut(lo), font, avail.max(1.0) * 4.0)
 }
 
 /// Widths for tabs wanting `natural` (each at most its own) whose sum fits
@@ -76,6 +117,17 @@ fn square_in(r: Rect, side: f32) -> Rect {
     Rect { x: r.x + ((r.w - side) * 0.5).round(), y: r.y + ((r.h - side) * 0.5).round(), w: side, h: side }
 }
 
+/// The active tab and the layout it was scrolled into view in.
+#[derive(Clone, Copy, PartialEq)]
+struct Reveal {
+    id: DocId,
+    area_w: f32,
+    tabs: usize,
+    /// The active tab's offset from the first and its width.
+    at: f32,
+    w: f32,
+}
+
 /// The tab row's state between paints.
 #[derive(Default)]
 pub(super) struct TabRow {
@@ -83,9 +135,9 @@ pub(super) struct TabRow {
     scroll: f32,
     /// The most it may scroll, as last painted.
     max_scroll: f32,
-    /// The active tab and the row's width when the row last scrolled it
-    /// into view: either changing scrolls it into view again.
-    revealed: Option<(DocId, f32)>,
+    /// What the row last scrolled the active tab into view for: any of it
+    /// changing scrolls it into view again.
+    revealed: Option<Reveal>,
     /// The tabs' area as last painted.
     area: Option<Rect>,
     /// Each tab's pill as last painted (unclipped), in tab order.
@@ -137,11 +189,22 @@ impl TabRow {
         let icon = (ui.cell_h * 0.9).round();
         let close = ui.cell_h.round();
         let inset = (3.0 * s).round();
-        let names: Vec<_> =
-            tabs.iter().map(|t| cx.shape(&t.title, Font::SANS.italic(t.preview), TAB_MAX_W * s)).collect();
-        let natural: Vec<f32> = names
+        let spans: Vec<Vec<(String, [u8; 3])>> = tabs
             .iter()
-            .map(|n| (pad * 2.0 + icon + space + n.width + space + close).min(TAB_MAX_W * s).ceil())
+            .map(|t| {
+                let color = if t.changed { theme::WARN } else { theme::TEXT };
+                let mut spans = vec![(t.title.clone(), color)];
+                spans.extend(t.suffix.as_ref().map(|d| (format!(" \u{00b7} {d}"), theme::TEXT_DIM)));
+                spans
+            })
+            .collect();
+        let natural: Vec<f32> = tabs
+            .iter()
+            .zip(&spans)
+            .map(|(t, sp)| {
+                let name = cx.shape_spans(sp, Font::SANS.italic(t.preview), TAB_MAX_W * s).width;
+                (pad * 2.0 + icon + space + name + space + close).min(TAB_MAX_W * s).ceil()
+            })
             .collect();
         let gaps = gap * tabs.len().saturating_sub(1) as f32;
         let widths = fit(&natural, (TAB_MIN_W * s).round(), (area.w - gaps).max(0.0));
@@ -155,15 +218,16 @@ impl TabRow {
             x += w + gap;
         }
         let index = active.and_then(|a| tabs.iter().position(|t| t.id == a));
-        if let (Some(a), Some(i)) = (active, index) {
-            if self.revealed != Some((a, area.w)) {
+        if let (Some(id), Some(i)) = (active, index) {
+            let now = Reveal { id, area_w: area.w, tabs: tabs.len(), at: offsets[i], w: widths[i] };
+            if self.revealed != Some(now) {
                 let (lo, hi) = (offsets[i], offsets[i] + widths[i]);
                 if lo < self.scroll {
                     self.scroll = lo;
                 } else if hi > self.scroll + area.w {
                     self.scroll = hi - area.w;
                 }
-                self.revealed = Some((a, area.w));
+                self.revealed = Some(now);
             }
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll).round();
@@ -172,7 +236,7 @@ impl TabRow {
 
         let radius = theme::pill_radius(ui);
         cx.with_clip(area, |cx| {
-            for ((tab, name), (off, w)) in tabs.iter().zip(names).zip(offsets.iter().zip(&widths)) {
+            for ((tab, spans), (off, w)) in tabs.iter().zip(&spans).zip(offsets.iter().zip(&widths)) {
                 let pill = Rect { x: area.x + off - self.scroll, y: area.y + inset, w: *w, h: area.h - inset * 2.0 };
                 self.pills.push((tab.id, pill));
                 if pill.x + pill.w <= area.x || pill.x >= area.x + area.w {
@@ -180,8 +244,11 @@ impl TabRow {
                 }
                 let slot = square_in(Rect { x: pill.x + pill.w - pad * 0.5 - close, w: close, ..pill }, close);
                 // Registered before anything else here: the slot wins its clicks.
-                let slot_hover = cx.button(slot, button_id(tab.id, true));
+                let slot_hover = cx.button(slot, button_id(tab.id));
                 let hover = cx.hovered(pill) && cx.hovered(area);
+                if let Some(path) = &tab.path {
+                    cx.tooltip(pill, path.clone());
+                }
                 if Some(tab.id) == active {
                     cx.round_rect(pill, radius, theme::TAB_ACTIVE_BG, theme::TAB_ACTIVE_ALPHA, None);
                 } else if hover {
@@ -193,8 +260,8 @@ impl TabRow {
                 let name_clip = Rect { x: name_x, y: pill.y, w: (slot.x - space * 0.5 - name_x).max(0.0), h: pill.h };
                 if let Some(clip) = intersect(name_clip, area) {
                     let top = pill.y + ((pill.h - ui.cell_h) * 0.5).round();
-                    let color = if tab.changed { theme::WARN } else { theme::TEXT };
-                    cx.place(name, name_x, top, clip, color);
+                    let name = shape_fitting(cx, spans, Font::SANS.italic(tab.preview), name_clip.w);
+                    cx.place(name, name_x, top, clip, theme::TEXT);
                 }
                 // Unsaved: a dot, until the pointer is over the tab and the
                 // slot offers to close it.
@@ -233,11 +300,17 @@ mod tests {
     }
 
     #[test]
-    fn button_ids_name_the_tab_and_its_close_slot() {
+    fn button_ids_name_the_tab() {
         let end = 1 << 24;
-        assert_eq!(from_button(button_id(DocId(7), false), end), Some((DocId(7), false)));
-        assert_eq!(from_button(button_id(DocId(7), true), end), Some((DocId(7), true)));
+        assert_eq!(from_button(button_id(DocId(7)), end), Some(DocId(7)));
         assert_eq!(from_button(TAB_IDS - 1, end), None);
         assert_eq!(from_button(end, end), None);
+    }
+
+    #[test]
+    fn only_shared_titles_get_their_folder() {
+        let titles = ["mod.rs", "a.md", "mod.rs"].map(String::from);
+        let dirs = [Some("files"), Some("docs"), Some("editor")].map(|d| d.map(String::from));
+        assert_eq!(suffixes(&titles, &dirs), [Some("files".into()), None, Some("editor".into())]);
     }
 }

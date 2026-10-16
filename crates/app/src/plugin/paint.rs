@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
+use glyphon::cosmic_text::Align;
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, TextBounds, Weight};
 use winit::window::CursorIcon;
 
@@ -605,7 +606,9 @@ impl TextKit {
             }),
             &font.attrs(),
             Shaping::Advanced,
-            None,
+            // With no alignment an RTL line is right-aligned to the buffer's
+            // width, past where callers place and clip it.
+            Some(Align::Left),
         );
         buf.shape_until_scroll(&mut self.font_system, false);
         let w = buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);

@@ -113,9 +113,10 @@ pub struct FilesView {
     /// Whether the config pins the sidebar, as of the last paint (for a pin
     /// that follows it, between paints).
     cfg_pinned: bool,
-    /// What lost the keys where no event context was at hand, and when:
-    /// it and what has them now hear so on the next tick.
-    unfocused: Option<(Instant, Keys)>,
+    /// What lost the keys where no event context was at hand, in order,
+    /// and when the first did: each that hasn't them back, and what has them
+    /// now, hear so on the next tick.
+    unfocused: Option<(Instant, Vec<Keys>)>,
     press: Option<Press>,
     /// The part under the pointer, to tell when it leaves.
     hover: Option<Part>,
@@ -191,7 +192,7 @@ impl FilesView {
             self.docs[at].view.shown(true);
         }
         self.active = at;
-        self.opened(before, clicked.is_some(), path);
+        self.opened(before, clicked.is_some());
         id
     }
 
@@ -207,7 +208,7 @@ impl FilesView {
         }
         let before = self.keys();
         self.set_active(i);
-        self.opened(before, clicked.is_some(), Some(path.to_path_buf()));
+        self.opened(before, clicked.is_some());
         true
     }
 
@@ -230,16 +231,14 @@ impl FilesView {
     /// After an open showed a document: the keyboard goes to it unless a
     /// sidebar click (`by_click`) opened it beside the sidebar, and the
     /// sidebar selects its file.
-    fn opened(&mut self, before: Keys, by_click: bool, path: Option<PathBuf>) {
+    fn opened(&mut self, before: Keys, by_click: bool) {
         if !(by_click && self.pinned.unwrap_or(self.cfg_pinned)) {
             self.focus = Part::Doc;
         }
         if self.keys() != before {
             self.queue_unfocus(before);
         }
-        if let Some(p) = path.filter(|p| self.sidebar.chosen() != Some(p.as_path())) {
-            self.sidebar.reveal(&p);
-        }
+        self.reveal_active();
     }
 
     /// Show tab `i`, telling the documents that went off and on screen.
@@ -255,6 +254,16 @@ impl FilesView {
             self.docs[i].view.shown(true);
         }
         self.active = i;
+        self.reveal_active();
+    }
+
+    /// Select the shown document's file in the sidebar (leaving the keys
+    /// where they are).
+    fn reveal_active(&mut self) {
+        let path = self.docs.get(self.active).and_then(|t| t.view.path());
+        if let Some(p) = path.filter(|p| self.sidebar.chosen() != Some(p.as_path())) {
+            self.sidebar.reveal(&p);
+        }
     }
 
     /// Keep every preview tab whose document has been edited.
@@ -284,9 +293,28 @@ impl FilesView {
     /// Tell what lost the keys (`lost`) on the next tick, and what has them
     /// now that it gained them: done where no event context is at hand.
     /// Only while the surface has the keyboard.
+    /// Every loss until then is kept: two tab switches before a tick still
+    /// tell the document the keys first left.
     fn queue_unfocus(&mut self, lost: Keys) {
         if self.focused {
-            self.unfocused = Some((Instant::now(), lost));
+            let (_, all) = self.unfocused.get_or_insert_with(|| (Instant::now(), Vec::new()));
+            if !all.contains(&lost) {
+                all.push(lost);
+            }
+        }
+    }
+
+    /// Tell what lost the keys while queued (and hasn't them back) that it
+    /// lost them; with `gained`, what has them now that it gained them.
+    fn tell_queued(&mut self, cx: &mut EventCx, gained: bool) {
+        let Some((_, lost)) = self.unfocused.take() else { return };
+        let now = self.keys();
+        let moved = lost.iter().any(|k| *k != now);
+        for k in lost.into_iter().filter(|k| *k != now) {
+            self.tell(cx, k, false);
+        }
+        if gained && moved {
+            self.tell(cx, now, true);
         }
     }
 
@@ -483,14 +511,26 @@ impl FilesView {
 
         let x = b.x + b.w + inset * 2.0;
         let area = Rect { x, y: row.y, w: (row.x + row.w - inset - x).max(0.0), h: row.h - line };
+        let paths: Vec<Option<PathBuf>> = self.docs.iter().map(|t| t.view.path()).collect();
+        let titles: Vec<String> = self.docs.iter().map(|t| t.view.title().unwrap_or_default()).collect();
+        let dirs: Vec<Option<String>> = paths
+            .iter()
+            .map(|p| {
+                let dir = p.as_deref()?.parent()?.file_name()?;
+                Some(dir.to_string_lossy().into_owned())
+            })
+            .collect();
+        let suffixes = tabs::suffixes(&titles, &dirs);
         let infos: Vec<TabInfo> = self
             .docs
             .iter()
-            .map(|t| {
-                let path = t.view.path();
+            .zip(paths.into_iter().zip(titles).zip(suffixes))
+            .map(|(t, ((path, title), suffix))| {
                 TabInfo {
                     id: t.id,
-                    title: t.view.title().unwrap_or_default(),
+                    title,
+                    suffix,
+                    path: path.as_ref().map(|p| p.display().to_string()),
                     kind: path.as_deref().map_or(FileKind::Text, FileKind::of),
                     preview: t.ephemeral,
                     modified: t.view.modified(),
@@ -551,6 +591,7 @@ impl View for FilesView {
             if let Some(t) = self.docs.get_mut(self.active).filter(|_| self.visible) {
                 t.view.shown(true);
             }
+            self.reveal_active();
         }
         if self.docs.is_empty() {
             self.focus = Part::Sidebar;
@@ -753,22 +794,22 @@ impl View for FilesView {
             id if id >= SIDEBAR_IDS => {
                 self.on_part(cx, Part::Sidebar, |v, cx| v.button(cx, id - SIDEBAR_IDS));
             }
-            id => match tabs::from_button(id, SIDEBAR_IDS) {
-                // The app asks about unsaved changes, then closes it.
-                Some((doc, true)) => cx.request(Request::CloseDoc(doc)),
-                Some((doc, false)) => self.activate(cx, doc),
-                None => {}
-            },
+            // A close slot: the app asks about unsaved changes, then closes it.
+            id => {
+                if let Some(doc) = tabs::from_button(id, SIDEBAR_IDS) {
+                    cx.request(Request::CloseDoc(doc));
+                }
+            }
         }
     }
 
     fn focus_changed(&mut self, cx: &mut EventCx, focused: bool) {
         // What lost the keys while still queued hears it first, so a
         // document that lost them still autosaves.
-        if let Some((_, lost)) = self.unfocused.take() {
-            if !focused && lost != self.keys() {
-                self.tell(cx, lost, false);
-            }
+        if focused {
+            self.unfocused = None;
+        } else {
+            self.tell_queued(cx, false);
         }
         self.focused = focused;
         if !focused {
@@ -812,17 +853,15 @@ impl View for FilesView {
 
     fn deadline(&self, cfg: &Config) -> Option<Instant> {
         let docs = self.docs.iter().filter_map(|t| t.view.deadline(cfg));
-        let unfocused = self.unfocused.map(|(at, _)| at);
+        let unfocused = self.unfocused.as_ref().map(|(at, _)| *at);
         self.sidebar.deadline(cfg).into_iter().chain(docs).chain(unfocused).min()
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
-        if let Some((_, lost)) = self.unfocused.take() {
-            let gained = self.keys();
-            if self.focused && lost != gained {
-                self.tell(cx, lost, false);
-                self.tell(cx, gained, true);
-            }
+        if self.focused {
+            self.tell_queued(cx, true);
+        } else {
+            self.unfocused = None;
         }
         cx.with_id_base(SIDEBAR_IDS, |cx| self.sidebar.tick(cx, now));
         for t in &mut self.docs {
@@ -1371,10 +1410,10 @@ mod tests {
         assert!(h.mouse(&mut v, middle).requests.is_empty());
         let out = h.mouse(&mut v, up(at_b, MouseButton::Middle));
         assert_eq!(out.requests, [Request::CloseDoc(b)], "the app asks about unsaved changes, then closes it");
-        let out = h.button(&mut v, tabs::button_id(a, true));
+        let out = h.button(&mut v, tabs::button_id(a));
         assert_eq!(out.requests, [Request::CloseDoc(a)]);
         let ids: Vec<u32> = h.frame.view_buttons.iter().map(|b| b.2).collect();
-        assert!(ids.contains(&tabs::button_id(a, true)) && ids.contains(&tabs::button_id(b, true)), "{ids:?}");
+        assert!(ids.contains(&tabs::button_id(a)) && ids.contains(&tabs::button_id(b)), "{ids:?}");
     }
 
     #[test]
@@ -1413,7 +1452,11 @@ mod tests {
         let mut h = Harness::new();
         // The dot: a disc, 0.45 of a row high.
         let dot = (UI.cell_h * 0.45).round();
-        let dots = |h: &Harness| h.frame.bg.iter().filter(|q| q.px == [dot, dot] && q.radius == dot * 0.5).count();
+        // In the tab row: the document's header shows one too.
+        let in_row = |q: &&crate::plugin::paint::QuadInstance| (1.0 - q.pos[1]) / 2.0 * 600.0 < 28.0;
+        let dots = |h: &Harness| {
+            h.frame.bg.iter().filter(in_row).filter(|q| q.px == [dot, dot] && q.radius == dot * 0.5).count()
+        };
         h.paint(&mut v, RECT);
         assert_eq!(dots(&h), 0);
         assert!(v.write_input(b"x"), "edits the shown 2.txt");
@@ -1464,5 +1507,105 @@ mod tests {
         h.paint(&mut v, RECT);
         let shown = v.tabs.pill(v.active_doc()).unwrap();
         assert!(shown.x >= area.x && shown.x + shown.w <= area.x + area.w);
+    }
+
+    #[test]
+    fn closing_a_tab_while_scrolled_brings_the_shown_one_back_into_view() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        let names: Vec<String> = (0..12).map(|i| format!("a-rather-long-file-name-{i:02}.txt")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ids = tabs_of(&d, &mut v, &refs);
+        h.paint(&mut v, RECT);
+        let area = v.tabs.area().unwrap();
+        h.scroll(&mut v, (area.x + 10.0, area.y + 5.0), 10_000.0);
+        h.paint(&mut v, RECT);
+        assert!(v.tabs.pill(v.active_doc()).unwrap().x > area.x + area.w, "scrolled away from it");
+        v.close_doc(ids[0]);
+        h.paint(&mut v, RECT);
+        let shown = v.tabs.pill(v.active_doc()).unwrap();
+        assert!(shown.x >= area.x && shown.x + shown.w <= area.x + area.w, "{shown:?} in {area:?}");
+    }
+
+    #[test]
+    fn two_tab_switches_before_a_tick_tell_the_document_the_keys_first_left() {
+        let (d, mut v) = fixture(&Session::default());
+        let h = Harness::new();
+        h.focus(&mut v, true);
+        let ids = tabs_of(&d, &mut v, &["1.txt", "2.txt", "3.txt"]);
+        assert!(v.write_input(b"edit "), "edits the shown 3.txt");
+        v.cycle_tab(1);
+        v.cycle_tab(1);
+        assert_eq!(v.active_doc(), ids[1]);
+        let due = v.deadline(&h.cfg).expect("a tick to tell 3.txt");
+        let out = h.tick(&mut v, due);
+        assert_eq!(out.requests, [Request::Saved(d.join("3.txt"))], "3.txt autosaved on losing the keys");
+    }
+
+    #[test]
+    fn switching_tabs_selects_the_file_in_the_sidebar() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        let ids = tabs_of(&d, &mut v, &["1.txt", "2.txt"]);
+        assert_eq!(v.sidebar().chosen(), Some(d.join("2.txt").as_path()));
+        v.cycle_tab(1);
+        assert_eq!(v.sidebar().chosen(), Some(d.join("1.txt").as_path()));
+        h.paint(&mut v, RECT);
+        let at = tab_centre(&v, ids[1]);
+        h.mouse(&mut v, down(at));
+        h.mouse(&mut v, up(at, MouseButton::Left));
+        assert_eq!(v.sidebar().chosen(), Some(d.join("2.txt").as_path()));
+        v.close_doc(ids[1]);
+        assert_eq!(v.sidebar().chosen(), Some(d.join("1.txt").as_path()), "and closing one");
+    }
+
+    #[test]
+    fn a_preview_tab_edited_behind_the_views_back_is_kept() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, down(sidebar_row(0)));
+        let a = v.show_doc(editor(&d.join("a.md")));
+        assert!(v.doc_mut(a).unwrap().write_input(b"x"));
+        h.mouse(&mut v, down(sidebar_row(1)));
+        let b = v.show_doc(editor(&d.join("b.txt")));
+        assert_eq!(v.docs(), [a, b], "the edited a.md wasn't replaced");
+        assert!(!v.is_preview(a) && v.is_preview(b));
+    }
+
+    #[test]
+    fn tabs_of_files_with_one_name_show_their_folder_and_long_names_end_in_an_ellipsis() {
+        let (d, mut v) = fixture(&Session::default());
+        for dir in ["x", "y"] {
+            std::fs::create_dir(d.join(dir)).unwrap();
+            std::fs::write(d.join(dir).join("mod.rs"), "").unwrap();
+            v.show_doc(editor(&d.join(dir).join("mod.rs")));
+        }
+        let long = format!("{}.txt", "long".repeat(30));
+        std::fs::write(d.join(&long), "").unwrap();
+        let id = v.show_doc(editor(&d.join(&long)));
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let texts = h.texts();
+        for want in ["mod.rs \u{00b7} x", "mod.rs \u{00b7} y"] {
+            assert!(texts.iter().any(|t| t == want), "{want:?} in {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t.starts_with("longlong") && t.ends_with('\u{2026}')), "{texts:?}");
+        // Its full path shows as a tooltip.
+        h.cursor = tab_centre(&v, id);
+        h.paint(&mut v, RECT);
+        let tip = h.frame.tooltip.as_ref().map(|t| t.1.clone());
+        assert_eq!(tip, Some(d.join(&long).display().to_string()));
+    }
+
+    #[test]
+    fn a_right_to_left_tab_name_starts_at_the_left() {
+        let (d, mut v) = fixture(&Session::default());
+        let name = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}.txt";
+        tabs_of(&d, &mut v, &[name]);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let left = h.text_left(name).expect("the name was drawn");
+        assert!(left < 1.0, "glyphs start at {left}, not against the right of the box");
     }
 }
