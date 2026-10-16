@@ -24,14 +24,15 @@ use ghostrealm_terminal::{Key, KeyPress};
 use crate::app_state::{AppState, Pick};
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::syntax;
+use crate::plugin::icons::Icon;
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, MouseEvent, OpenCx, PaintCx, Plugin, Request,
-    RowStyles, View, Waker,
+    hover_box, rect_contains, theme, EventCx, Font, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
+    Request, RowStyles, View, Waker,
 };
 
 pub use buffer::EditorBuffer;
-use stats::Stats;
+use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
 use wrap::wrap_line;
 
@@ -55,6 +56,9 @@ const BTN_WRAP: u32 = 0;
 const BTN_AUTOSAVE: u32 = 1;
 const BTN_STAT: u32 = 2;
 const BTN_NAME: u32 = 3;
+const BTN_MORE: u32 = 4;
+/// Menu items showing statistic `Stat::ALL[i]` are `BTN_SHOW_STAT + i`.
+const BTN_SHOW_STAT: u32 = 16;
 /// The idle-autosave delay (seconds) when autosave is switched on in the ribbon
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -219,6 +223,8 @@ pub struct EditorView {
     /// under a tab strip or without a file): they open the file menu.
     name_hit: Option<Rect>,
     ribbon: Option<Rect>,
+    /// The ribbon's `⋯` button, as last painted: its menu opens below it.
+    more_hit: Option<Rect>,
     /// The file's language service, if it has one.
     lang: Option<Lang>,
     /// Where each line's syntax-highlight state starts.
@@ -256,6 +262,7 @@ impl EditorView {
             lang: None,
             name_hit: None,
             ribbon: None,
+            more_hit: None,
         }
     }
 
@@ -430,6 +437,28 @@ impl EditorView {
         }
     }
 
+    /// The ribbon's `⋯` menu: every ribbon option, checked as it stands.
+    fn ribbon_menu(&self, cfg: &Config) -> Vec<MenuItem> {
+        let has_file = self.buf.path.is_some();
+        let mut items = vec![
+            MenuItem::new(BTN_WRAP, "Soft wrap").check(self.wrap_on(cfg)),
+            MenuItem::new(BTN_AUTOSAVE, "Autosave")
+                .check(has_file && self.autosave_on(cfg))
+                .enable(has_file),
+            MenuItem::RULE,
+        ];
+        for (i, stat) in Stat::ALL.into_iter().enumerate() {
+            if self.stats.offers(stat) {
+                items.push(MenuItem::new(BTN_SHOW_STAT + i as u32, stat.name()).check(self.stats.shown() == stat));
+            }
+        }
+        if has_file {
+            items.push(MenuItem::RULE);
+            items.push(MenuItem::new(BTN_NAME, "File actions…"));
+        }
+        items
+    }
+
     /// Close the hover popup. Returns whether one was showing.
     fn dismiss_popup(&mut self) -> bool {
         self.lang.as_mut().is_some_and(Lang::dismiss)
@@ -511,15 +540,26 @@ impl EditorView {
     }
 
     /// The filename ribbon a single-tab editor shows in place of a tab: the name
-    /// (italic when unsaved), a statistic (click to cycle), and the autosave and
-    /// soft-wrap toggles.
+    /// (italic when unsaved), a statistic (click to cycle), the autosave and
+    /// soft-wrap toggles, and `⋯` (a menu of every option).
     fn paint_ribbon(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         let pad = 8.0 * cx.ui.scale;
         cx.fill(r, cx.chrome.sidebar);
         let top = r.y + (r.h - ch) * 0.5;
-        // Soft-wrap toggle, pinned to the right end.
-        let wb = Rect { x: r.x + r.w - ch - pad, y: r.y, w: ch, h: r.h };
+        // `⋯`, pinned to the right end.
+        let mb = Rect { x: r.x + r.w - ch - pad, y: r.y, w: ch, h: r.h };
+        let more_hover = cx.button(mb, BTN_MORE);
+        if more_hover {
+            cx.highlight(hover_box(mb, ch));
+        }
+        cx.tooltip(mb, "More options");
+        let side = ch * 0.75;
+        let icon = Rect { x: mb.x + (mb.w - side) * 0.5, y: mb.y + (mb.h - side) * 0.5, w: side, h: side };
+        Icon::More.paint(cx, icon, if more_hover { theme::GLYPH_HOVER } else { theme::GLYPH });
+        self.more_hit = Some(mb);
+        // Soft-wrap toggle left of it.
+        let wb = Rect { x: mb.x - ch, ..mb };
         if cx.button(wb, BTN_WRAP) {
             cx.highlight(hover_box(wb, ch));
         }
@@ -628,7 +668,7 @@ impl View for EditorView {
         let wrap = self.wrap_on(cx.cfg);
         // Without a tab strip, the filename gets a ribbon of its own.
         let mut body = rect;
-        (self.ribbon, self.name_hit) = (None, None);
+        (self.ribbon, self.name_hit, self.more_hit) = (None, None, None);
         if !cx.tab_strip {
             let ribbon_h = ch + 6.0 * scale;
             self.paint_ribbon(cx, Rect { h: ribbon_h, ..rect }, wrap);
@@ -935,8 +975,18 @@ impl View for EditorView {
                 }
                 return;
             }
+            BTN_MORE => {
+                if let Some(mb) = self.more_hit {
+                    let items = self.ribbon_menu(cx.cfg);
+                    cx.request(Request::Menu { items, at: (mb.x, mb.y + mb.h) });
+                }
+                return;
+            }
             BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
             BTN_STAT => self.stats.cycle(),
+            id if (BTN_SHOW_STAT..BTN_SHOW_STAT + Stat::ALL.len() as u32).contains(&id) => {
+                self.stats.show(Stat::ALL[(id - BTN_SHOW_STAT) as usize]);
+            }
             BTN_AUTOSAVE => {
                 let on = !self.autosave_on(cx.cfg);
                 self.autosave = Some(on);
@@ -1322,6 +1372,58 @@ mod tests {
         h.cursor = (-1.0, -1.0);
         h.paint(&mut v, RECT);
         assert!(hovered > quads(&h), "hover adds a highlight quad");
+    }
+
+    #[test]
+    fn the_ribbons_more_button_lists_every_option_checked_as_it_stands() {
+        let path = tmpdir("editor-more").join("f.txt");
+        std::fs::write(&path, "x\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
+        let mut h = Harness::new();
+        h.cfg.editor.soft_wrap = false;
+        (h.cfg.editor.autosave_after, h.cfg.editor.autosave_on_unfocus) = (0, false);
+        let more = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_MORE).expect("a ⋯ button").0;
+        assert!(more.x + more.w <= RECT.w, "at the right end");
+        let menu = |h: &Harness, v: &mut EditorView| match h.button(v, BTN_MORE).requests.as_slice() {
+            [Request::Menu { items, at }] => {
+                assert_eq!(*at, (more.x, more.y + more.h), "opens below the button");
+                items.clone()
+            }
+            other => panic!("expected one menu request, got {other:?}"),
+        };
+        let checked = |items: &[MenuItem], id| items.iter().find(|i| i.id == id).and_then(|i| i.checked);
+        let items = menu(&h, &mut v);
+        assert_eq!(checked(&items, BTN_WRAP), Some(false));
+        assert_eq!(checked(&items, BTN_AUTOSAVE), Some(false));
+        assert_eq!(checked(&items, BTN_SHOW_STAT), Some(true), "line count shows");
+        assert_eq!(checked(&items, BTN_SHOW_STAT + 1), Some(false));
+        assert!(items.iter().all(|i| i.id != BTN_SHOW_STAT + 3), "untracked: no changes item");
+        assert!(items.iter().any(|i| i.id == BTN_NAME && i.enabled), "file actions");
+
+        // Choosing an item is the same click as its ribbon icon.
+        for id in [BTN_WRAP, BTN_AUTOSAVE, BTN_SHOW_STAT + 2] {
+            assert!(h.button(&mut v, id).redraw);
+        }
+        let items = menu(&h, &mut v);
+        assert_eq!(checked(&items, BTN_WRAP), Some(true));
+        assert_eq!(checked(&items, BTN_AUTOSAVE), Some(true));
+        assert_eq!(checked(&items, BTN_SHOW_STAT), Some(false));
+        assert_eq!(checked(&items, BTN_SHOW_STAT + 2), Some(true), "byte count shows");
+        assert_eq!(v.stats.shown(), stats::Stat::Bytes);
+    }
+
+    #[test]
+    fn a_scratch_buffers_more_menu_offers_autosave_disabled() {
+        let mut v = view_with("x");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let out = h.button(&mut v, BTN_MORE);
+        let [Request::Menu { items, .. }] = out.requests.as_slice() else {
+            panic!("expected a menu");
+        };
+        let autosave = items.iter().find(|i| i.id == BTN_AUTOSAVE).unwrap();
+        assert_eq!((autosave.checked, autosave.enabled), (Some(false), false));
+        assert!(items.iter().all(|i| i.id != BTN_NAME), "no file, no file actions");
     }
 
     #[test]

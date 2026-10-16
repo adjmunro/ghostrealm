@@ -21,6 +21,18 @@ pub enum Stat {
 }
 
 impl Stat {
+    pub const ALL: [Stat; 4] = [Stat::Lines, Stat::Words, Stat::Bytes, Stat::Changes];
+
+    /// The statistic's name in a menu.
+    pub fn name(self) -> &'static str {
+        match self {
+            Stat::Lines => "Line count",
+            Stat::Words => "Word count",
+            Stat::Bytes => "Byte count",
+            Stat::Changes => "Changes since last commit",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Stat::Lines => "lines",
@@ -60,9 +72,21 @@ impl Stats {
         }
     }
 
-    #[cfg(test)]
     pub fn shown(&self) -> Stat {
         self.shown
+    }
+
+    /// Whether `stat` can show: changes only for a tracked file.
+    pub fn offers(&self, stat: Stat) -> bool {
+        stat != Stat::Changes || self.head.is_some()
+    }
+
+    /// Show `stat`, if offered.
+    pub fn show(&mut self, stat: Stat) {
+        self.poll();
+        if self.offers(stat) {
+            self.shown = stat;
+        }
     }
 
     /// Fetch `path`'s committed text in the background (on open and after each
