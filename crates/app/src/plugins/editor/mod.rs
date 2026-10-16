@@ -93,7 +93,7 @@ impl Plugin for EditorPlugin {
         false
     }
 
-    /// An empty buffer, as a document (see `AppState::open_doc`).
+    /// An empty buffer, as a document (see `AppState::open_scratch`).
     fn open(&self, cx: &OpenCx) -> Result<Box<dyn View>> {
         Ok(Box::new(EditorView::with_waker(EditorBuffer::scratch(), cx.waker.clone())))
     }
@@ -315,6 +315,7 @@ impl EditorView {
     /// sets it).
     pub fn set_header(&mut self, on: bool) {
         self.header_on = on;
+        self.header.refresh(self.buf.path.as_deref());
     }
 
     /// The file's language service, if it has one.
@@ -370,6 +371,7 @@ impl EditorView {
     fn saved(&mut self) {
         self.last_edit_at = None;
         self.last_saved = Some(Instant::now());
+        self.header.refresh(self.buf.path.as_deref());
         self.stats.fetch_head(self.buf.path.clone());
     }
 
@@ -1111,6 +1113,7 @@ impl View for EditorView {
             return;
         };
         self.buf.path = Some(to.clone());
+        self.header.refresh(Some(&to));
         self.lang = None;
         self.stats.fetch_head(Some(to));
     }
@@ -1122,6 +1125,7 @@ impl View for EditorView {
         if !ours || !self.buf.disk_changed() {
             return false;
         }
+        self.header.refresh(self.buf.path.as_deref());
         if self.buf.modified {
             // Repaints the mark only the first time.
             !std::mem::replace(&mut self.buf.changed_on_disk, true)
@@ -1149,6 +1153,7 @@ impl View for EditorView {
 
     fn reload(&mut self) -> Result<()> {
         self.buf.reload()?;
+        self.header.refresh(self.buf.path.as_deref());
         self.note_edits();
         Ok(())
     }

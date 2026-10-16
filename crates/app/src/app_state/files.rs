@@ -1017,8 +1017,16 @@ mod tests {
         let (mut s, calls) = app();
         let d = tmpdir("fm-delete");
         std::fs::write(d.join("a.txt"), "A").unwrap();
-        open_editor(&mut s, &d.join("a.txt"));
-        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        // Delete from the sidebar's file menu on the shown file's row.
+        let mut h = crate::plugin::testing::Harness::new();
+        let rect = ghostrealm_core::Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        h.paint(s.view_mut(sid).unwrap(), rect);
+        let row = (60.0, 28.0 + 38.0 + 13.0);
+        let menu = h.context_menu(s.view_mut(sid).unwrap(), row).requests;
+        let [crate::plugin::Request::FileMenu { target, .. }] = menu.as_slice() else { panic!("{menu:?}") };
+        assert_eq!(target.path, d.join("a.txt"));
+        run(&mut s, "file.delete", &[("path", &target.path)]).unwrap();
         let c = s.confirm().expect("not in git: ask first");
         assert_eq!(c.accept, Some("Delete"));
         assert!(c.message.contains("a.txt"));
@@ -1029,7 +1037,8 @@ mod tests {
         s.accept_confirm().unwrap();
         assert_eq!(*calls.borrow(), [format!("trash {}", d.join("a.txt").display())]);
         assert!(!d.join("a.txt").exists());
-        assert_eq!(s.views().count(), 0, "the editor closed like Cmd+W");
+        assert!(s.active_doc(sid).is_none(), "the document closed like Cmd+W");
+        assert!(s.surface_text(sid).unwrap().starts_with(&format!("{}\n", d.display())), "its sidebar stays");
         assert!(s.confirm().is_none());
     }
 
@@ -1041,7 +1050,7 @@ mod tests {
         run(&mut s, "file.delete", &[("path", &r.join("tracked.txt"))]).unwrap();
         assert!(s.confirm().is_none());
         assert_eq!(*calls.borrow(), [format!("trash {}", r.join("tracked.txt").display())]);
-        assert_eq!(s.views().count(), 0);
+        assert!(s.all_docs().is_empty());
     }
 
     #[test]
@@ -1104,7 +1113,7 @@ mod tests {
         assert_eq!(title, "c.txt", "the tab names the document now shown");
         run(&mut s, "file.delete", &[("path", &d.join("c.txt"))]).unwrap();
         s.accept_confirm().unwrap();
-        assert!(s.view(sid).is_none(), "the surface closed with its last document");
+        assert!(s.view(sid).is_none(), "a view hosting no other kind of part closes with its last document");
     }
 
     #[test]
@@ -1143,7 +1152,7 @@ mod tests {
         run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
         s.discard_confirm().unwrap();
         assert_eq!(*calls.borrow(), [format!("trash {}", d.join("a.txt").display())]);
-        assert!(s.view(sid).is_none(), "closed without saving");
+        assert!(s.active_doc(sid).is_none(), "closed without saving");
     }
 
     #[test]

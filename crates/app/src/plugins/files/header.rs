@@ -5,15 +5,11 @@
 //! text up to where they start.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use ghostrealm_core::Rect;
 
 use crate::plugin::{theme, Font, PaintCx, UiMetrics};
-
-/// How long a file's size and modification time are trusted before the
-/// header reads them again (a paint at most this often stats the file).
-const RESTAT_AFTER: Duration = Duration::from_secs(1);
 
 /// What a header says about its document.
 pub struct HeaderText<'a> {
@@ -38,12 +34,12 @@ struct Stat {
     modified: Option<SystemTime>,
 }
 
-/// A document's header. It keeps the file's size and modification time
-/// between paints, read again when the path changes or once they are
-/// [`RESTAT_AFTER`] old.
+/// A document's header. It shows the file's size and modification time as
+/// last read ([`DocHeader::refresh`]): its document reads them again when
+/// it shows, saves, reloads, or follows its file, never while painting.
 #[derive(Default)]
 pub struct DocHeader {
-    stat: Option<(PathBuf, Instant, Stat)>,
+    stat: Option<(PathBuf, Stat)>,
 }
 
 impl DocHeader {
@@ -67,23 +63,25 @@ impl DocHeader {
         Rect { x: header.x + side * 0.5, y, w: (header.w - side).max(1.0), h }
     }
 
-    /// The facts of `path` (`None` for a scratch document), read again when
-    /// stale.
-    fn stat(&mut self, path: Option<&Path>) -> Stat {
-        let Some(path) = path else {
-            self.stat = None;
-            return Stat::default();
-        };
-        let fresh = |(p, at, _): &(PathBuf, Instant, Stat)| p == path && at.elapsed() < RESTAT_AFTER;
-        if !self.stat.as_ref().is_some_and(fresh) {
+    /// Read `path`'s size and modification time again (`None`: a scratch
+    /// document, which has neither).
+    pub fn refresh(&mut self, path: Option<&Path>) {
+        self.stat = path.map(|path| {
             let meta = std::fs::metadata(path).ok();
             let stat = Stat {
                 size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
                 modified: meta.and_then(|m| m.modified().ok()),
             };
-            self.stat = Some((path.to_path_buf(), Instant::now(), stat));
+            (path.to_path_buf(), stat)
+        });
+    }
+
+    /// The facts last read of `path`; none when they were read of another.
+    fn stat(&self, path: Option<&Path>) -> Option<Stat> {
+        match (&self.stat, path) {
+            (Some((p, stat)), Some(path)) if p == path => Some(*stat),
+            _ => None,
         }
-        self.stat.as_ref().map(|s| s.2).unwrap_or_default()
     }
 
     /// Paint the header into `r`: its background, then `text` clipped left of
@@ -125,16 +123,17 @@ impl DocHeader {
 
         let stat = self.stat(text.path);
         let mut facts = vec![text.kind.to_string()];
-        facts.extend(stat.size.map(human_size));
+        facts.extend(stat.and_then(|s| s.size).map(human_size));
         facts.extend(text.extra.clone());
         // Only the name's line holds controls: the rest runs the full width.
         let full = Rect { x: r.x, y: r.y, w: (r.w - side).max(0.0), h: r.h };
         cx.label(&facts.join("  \u{00b7}  "), Font::SANS, x, y, full, theme::TEXT_DIM);
         y += ch * 1.2;
-        let when = match (text.path, stat.modified) {
+        let when = match (text.path, stat) {
             (None, _) => "Not saved".to_string(),
-            (Some(_), Some(m)) => format!("Modified {}", ago(m)),
-            (Some(_), None) => "Not on disk".to_string(),
+            (Some(_), Some(Stat { modified: Some(m), .. })) => format!("Modified {}", ago(m)),
+            (Some(_), Some(_)) => "Not on disk".to_string(),
+            (Some(_), None) => String::new(),
         };
         cx.label(&when, Font::SANS, x, y, full, theme::TEXT_DIM);
         name_rect
@@ -188,6 +187,7 @@ pub fn ago(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::plugin::testing::{tmpdir, Harness, UI};
     use crate::plugin::View;
 
@@ -236,6 +236,7 @@ mod tests {
         let d = tmpdir("doc-header");
         std::fs::write(d.join("a.md"), "x".repeat(4100)).unwrap();
         let mut v = Only(DocHeader::default(), d.join("a.md"));
+        v.0.refresh(Some(&v.1));
         let mut h = Harness::new();
         let r = Rect { x: 0.0, y: 0.0, w: 400.0, h: DocHeader::height(UI) };
         let frame = h.paint(&mut v, r);

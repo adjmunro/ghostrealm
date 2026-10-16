@@ -201,9 +201,10 @@ pub trait View: Any {
     }
 
     /// Close document `id`. Its unsaved changes were saved or given up
-    /// already (the app asks first). Returns whether the view has no document
-    /// left; the app closes the surface when [`docs`](Self::docs) is empty.
-    /// Not called for a view that is its own document: its surface closes.
+    /// already (the app asks first). Returns whether the surface should
+    /// close: the view decides (one that is useful with no document, like
+    /// the Files surface with its sidebar, stays). Not called for a view that
+    /// is its own document: its surface closes.
     fn close_doc(&mut self, _id: DocId) -> bool {
         true
     }

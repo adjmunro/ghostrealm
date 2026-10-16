@@ -230,6 +230,7 @@ impl MediaView {
 
     /// (Re)load the file on the worker.
     fn load(&mut self) {
+        self.header.refresh(Some(&self.path));
         let loader = self.loader.get_or_insert_with(Loader::new);
         let _ = loader.tx.send(self.path.clone());
         self.poll_at = Some(Instant::now() + POLL_EVERY);

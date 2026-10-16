@@ -264,9 +264,15 @@ impl FileBrowserView {
     }
 
     /// Show `path` selected: expand the folders down to it when it is under
-    /// the root, else make its folder the root.
+    /// the root (or the folder the browser opened on), else make its folder
+    /// the root.
     pub fn reveal(&mut self, path: &Path) {
         self.tree.set_query("");
+        // Back to the folder the browser opened on (a Files surface's: the
+        // workspace's) when it holds the path, before re-rooting elsewhere.
+        if !path.starts_with(self.tree.root()) && path.starts_with(&self.start) {
+            self.tree.set_root(&self.start);
+        }
         let root = self.tree.root().to_path_buf();
         if path.starts_with(&root) {
             for dir in path.ancestors().skip(1).take_while(|d| d.starts_with(&root) && *d != root) {
@@ -2045,6 +2051,9 @@ mod tests {
         assert_eq!(v.subject(), Some(other.join("g.txt")));
         Harness::new().paint(&mut v, RECT);
         assert!(v.text().unwrap().contains("g.txt"));
+        // Back inside the folder it opened on, the browser goes back there.
+        v.reveal(&d.join("a/b/f.txt"));
+        assert_eq!(v.tree().root(), d);
     }
 
     #[test]

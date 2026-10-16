@@ -82,10 +82,17 @@ pub struct FilesView {
     focused: bool,
     /// The surface is on screen.
     visible: bool,
-    /// A click in the sidebar opened a file: its document shows with the
-    /// keyboard left in the sidebar, so browsing by clicks goes on. Any other
-    /// open moves the keyboard to the document.
-    click_opened: bool,
+    /// The file a click in the sidebar last opened: its document shows with
+    /// the keyboard left in the sidebar, so browsing by clicks goes on, while
+    /// the sidebar shows beside it. Any other open moves the keyboard to the
+    /// document.
+    clicked: Option<PathBuf>,
+    /// Whether the config pins the sidebar, as of the last paint (for a pin
+    /// that follows it, between paints).
+    cfg_pinned: bool,
+    /// Focus changes of the parts not yet told (made where no event context
+    /// was at hand), with when they were made: delivered on the next tick.
+    unfocused: Option<(Instant, Part)>,
     press: Option<Press>,
     /// The part under the pointer, to tell when it leaves.
     hover: Option<Part>,
@@ -109,7 +116,9 @@ impl FilesView {
             focus: Part::Sidebar,
             focused: false,
             visible: false,
-            click_opened: false,
+            clicked: None,
+            cfg_pinned: true,
+            unfocused: None,
             press: None,
             hover: None,
             layout: Layout::default(),
@@ -118,7 +127,7 @@ impl FilesView {
 
     /// Show `view` as the document, replacing the one shown (whose unsaved
     /// changes the app asked about first). It gets a new id. The keyboard
-    /// moves to it unless a click in the sidebar opened it.
+    /// moves to it unless a click in the shown sidebar opened it.
     pub fn show_doc(&mut self, mut view: Box<dyn View>) -> DocId {
         if let Some(editor) = view.downcast_mut::<EditorView>() {
             editor.set_header(true);
@@ -129,14 +138,31 @@ impl FilesView {
         let path = view.path();
         let id = DocId(self.next_id);
         self.next_id += 1;
+        let before = self.part_with_keys();
         self.doc = Some(Doc { id, view });
-        if !std::mem::take(&mut self.click_opened) {
+        let clicked = self.clicked.take();
+        let keep = path.is_some() && clicked == path && self.pinned.unwrap_or(self.cfg_pinned);
+        if !keep {
             self.focus = Part::Doc;
+        }
+        // The replaced document went with its focus; a sidebar that lost
+        // the keys hears so on the next tick.
+        if before == Part::Sidebar && self.part_with_keys() == Part::Doc {
+            self.queue_unfocus(Part::Sidebar);
         }
         if let Some(p) = path.filter(|p| self.sidebar.chosen() != Some(p.as_path())) {
             self.sidebar.reveal(&p);
         }
         id
+    }
+
+    /// Tell `part` on the next tick that it lost the keys, and the part
+    /// that has them now that it gained them: done where no event context
+    /// is at hand. Only while the surface has the keyboard.
+    fn queue_unfocus(&mut self, part: Part) {
+        if self.focused {
+            self.unfocused = Some((Instant::now(), part));
+        }
     }
 
     /// The document shown, if any.
@@ -162,9 +188,14 @@ impl FilesView {
         self.part_with_keys() == Part::Sidebar
     }
 
-    /// Move the keyboard to the sidebar, showing it.
+    /// Move the keyboard to the sidebar, showing it (and recording the
+    /// pin, as the sidebar button does).
     pub fn focus_sidebar(&mut self) {
         self.pinned = Some(true);
+        self.session.set_pinned(true);
+        if self.part_with_keys() == Part::Doc {
+            self.queue_unfocus(Part::Doc);
+        }
         self.focus = Part::Sidebar;
     }
 
@@ -249,15 +280,20 @@ impl FilesView {
         let inset = (3.0 * ui.scale).round();
         let side = row.h - inset * 2.0;
         let b = Rect { x: row.x + inset * 2.0, y: row.y + inset, w: side, h: side };
-        let pinned = self.pinned(cx.cfg);
-        let hover = cx.button(b, BTN_SIDEBAR);
+        // With no document the sidebar shows whatever the pin: the button
+        // has nothing to do then.
+        let live = self.doc.is_some();
+        let pinned = live && self.pinned(cx.cfg);
+        let hover = live && cx.button(b, BTN_SIDEBAR);
         if pinned {
             cx.round_rect(b, theme::box_radius(ui), cx.chrome.accent, theme::TAB_ACTIVE_ALPHA, None);
         }
         if hover {
             cx.round_rect(b, theme::box_radius(ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
         }
-        cx.tooltip(b, if pinned { "Hide the sidebar" } else { "Show the sidebar" });
+        if live {
+            cx.tooltip(b, if pinned { "Hide the sidebar" } else { "Show the sidebar" });
+        }
         let icon_side = (ui.cell_h * 0.8).round();
         let icon = Rect {
             x: b.x + ((b.w - icon_side) * 0.5).round(),
@@ -265,10 +301,11 @@ impl FilesView {
             w: icon_side,
             h: icon_side,
         };
-        let color = match (hover, pinned) {
-            (true, _) => theme::GLYPH_HOVER,
-            (false, true) => cx.chrome.accent,
-            (false, false) => theme::GLYPH,
+        let color = match (live, hover, pinned) {
+            (false, ..) => theme::DIM,
+            (true, true, _) => theme::GLYPH_HOVER,
+            (true, false, true) => cx.chrome.accent,
+            (true, false, false) => theme::GLYPH,
         };
         Icon::SidebarToggle.paint(cx, icon, color);
         self.layout.toggle = Some(b);
@@ -312,12 +349,13 @@ impl View for FilesView {
         }
     }
 
+    /// The surface stays, showing its sidebar alone.
     fn close_doc(&mut self, id: DocId) -> bool {
         if self.doc.as_ref().is_some_and(|d| d.id == id) {
             self.doc = None;
             self.focus = Part::Sidebar;
         }
-        self.doc.is_none()
+        false
     }
 
     fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
@@ -327,7 +365,13 @@ impl View for FilesView {
         self.paint_top_row(cx, Rect { h: row_h, ..rect });
         let body = Rect { y: rect.y + row_h, h: (rect.h - row_h).max(0.0), ..rect };
         let scale = cx.ui.scale;
+        self.cfg_pinned = cx.cfg.file_browser.sidebar == SidebarPin::Pinned;
         let show_sidebar = self.doc.is_none() || self.pinned(cx.cfg);
+        // A hidden sidebar can't keep the keys.
+        if !show_sidebar && self.focus == Part::Sidebar {
+            self.focus = Part::Doc;
+            self.queue_unfocus(Part::Sidebar);
+        }
         let (side, doc) = match (&self.doc, show_sidebar) {
             (None, _) => (Some(body), None),
             (Some(_), false) => (None, Some(body)),
@@ -339,7 +383,6 @@ impl View for FilesView {
                 cx.fill(Rect { x: body.x + w, y: body.y, w: line, h: body.h }, theme::INPUT_BORDER);
                 let grab = (EDGE_GRAB * scale).round();
                 let edge = Rect { x: body.x + w - grab, y: body.y, w: grab * 2.0 + line, h: body.h };
-                cx.cursor(edge, CursorIcon::ColResize);
                 self.layout.edge = Some(edge);
                 let doc = Rect { x: body.x + w + line, w: (body.w - w - line).max(0.0), ..body };
                 (Some(side), Some(doc))
@@ -357,11 +400,17 @@ impl View for FilesView {
         }
         cx.focused = focused;
         (self.layout.sidebar, self.layout.doc) = (side, doc);
+        // After the parts, so the edge's cursor wins over a field's I-beam;
+        // while dragging it, over the whole surface.
+        let dragging = matches!(self.press, Some(Press::Edge(_)));
+        if let Some(edge) = self.layout.edge {
+            cx.cursor(if dragging { rect } else { edge }, CursorIcon::ColResize);
+        }
     }
 
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let part = self.part_with_keys();
-        self.click_opened = false;
+        self.clicked = None;
         let used = self.on_part(cx, part, |v, cx| v.key(cx, k)).unwrap_or(false);
         if part == Part::Sidebar && self.sidebar.take_opened_by_key() {
             // The open reaches the app as a request, so the document shows
@@ -378,7 +427,7 @@ impl View for FilesView {
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
         match *event {
             MouseEvent::Down { pos, .. } => {
-                self.click_opened = false;
+                self.clicked = None;
                 let on_edge = self.layout.edge.is_some_and(|e| rect_contains(e, pos.0, pos.1));
                 if let (true, Some(side)) = (on_edge, self.layout.sidebar) {
                     if !event.is_other_button() {
@@ -393,7 +442,9 @@ impl View for FilesView {
                 }
                 let opens = self.sidebar.opens();
                 self.on_part(cx, part, |v, cx| v.mouse(cx, event));
-                self.click_opened = self.sidebar.opens() != opens;
+                if self.sidebar.opens() != opens {
+                    self.clicked = self.sidebar.chosen().map(PathBuf::from);
+                }
             }
             MouseEvent::Drag { pos, .. } | MouseEvent::Up { pos, .. } => {
                 let up = matches!(event, MouseEvent::Up { .. });
@@ -465,6 +516,7 @@ impl View for FilesView {
 
     fn focus_changed(&mut self, cx: &mut EventCx, focused: bool) {
         self.focused = focused;
+        self.unfocused = None;
         let part = self.part_with_keys();
         self.part_focus(cx, part, focused);
     }
@@ -495,10 +547,18 @@ impl View for FilesView {
 
     fn deadline(&self, cfg: &Config) -> Option<Instant> {
         let doc = self.doc.as_ref().and_then(|d| d.view.deadline(cfg));
-        self.sidebar.deadline(cfg).into_iter().chain(doc).min()
+        let unfocused = self.unfocused.map(|(at, _)| at);
+        self.sidebar.deadline(cfg).into_iter().chain(doc).chain(unfocused).min()
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
+        if let Some((_, lost)) = self.unfocused.take() {
+            let gained = self.part_with_keys();
+            if self.focused && lost != gained {
+                self.part_focus(cx, lost, false);
+                self.part_focus(cx, gained, true);
+            }
+        }
         cx.with_id_base(SIDEBAR_IDS, |cx| self.sidebar.tick(cx, now));
         if let Some(d) = &mut self.doc {
             cx.with_id_base(DOC_IDS, |cx| d.view.tick(cx, now));
@@ -521,15 +581,12 @@ impl View for FilesView {
         }
     }
 
-    /// The sidebar's listing, then the document's file and text.
+    /// The document's text, else the sidebar's listing.
     fn text(&mut self) -> Option<String> {
-        let mut out = self.sidebar.text().unwrap_or_default();
-        if let Some(d) = &mut self.doc {
-            let name = d.view.path().map_or_else(|| d.view.title().unwrap_or_default(), |p| p.display().to_string());
-            out.push_str(&format!("--- {name}\n"));
-            out.push_str(&d.view.text().unwrap_or_default());
+        match &mut self.doc {
+            Some(d) => d.view.text(),
+            None => self.sidebar.text(),
         }
-        Some(out)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -582,7 +639,8 @@ mod tests {
         assert_eq!(v.title().as_deref(), Some("Files"));
         assert!(v.docs().is_empty(), "no document: closing closes the surface");
         let ids: Vec<u32> = h.frame.view_buttons.iter().map(|b| b.2).collect();
-        assert!(ids.contains(&BTN_SIDEBAR) && ids.iter().any(|id| *id > SIDEBAR_IDS), "{ids:?}");
+        assert!(!ids.contains(&BTN_SIDEBAR), "the sidebar button is inert: {ids:?}");
+        assert!(ids.iter().any(|id| *id > SIDEBAR_IDS), "{ids:?}");
     }
 
     #[test]
@@ -605,7 +663,9 @@ mod tests {
         let next = v.show_doc(editor(&d.join("b.txt")));
         assert_ne!(next, id);
         assert!(v.doc(id).is_none() && v.doc(next).is_some());
-        assert!(v.close_doc(next), "none left");
+        assert!(!v.close_doc(next), "the surface stays");
+        assert!(v.docs().is_empty() && v.sidebar_has_keys());
+        assert_eq!(v.title().as_deref(), Some("Files"));
     }
 
     #[test]
@@ -720,6 +780,86 @@ mod tests {
         assert!(!v.sidebar_has_keys());
     }
 
+    /// The centre of sidebar row `i` (below its filter), in a surface at the
+    /// top left.
+    fn sidebar_row(i: usize) -> (f32, f32) {
+        (60.0, 28.0 + 38.0 + 26.0 * i as f32 + 13.0)
+    }
+
+    #[test]
+    fn a_click_open_with_the_sidebar_hidden_puts_the_keys_on_the_document() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        h.cfg.file_browser.sidebar = SidebarPin::Hidden;
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, down(sidebar_row(0)));
+        v.show_doc(editor(&d.join("a.md")));
+        assert!(!v.sidebar_has_keys(), "the sidebar won't show beside it");
+        h.key(&mut v, press(Key::Char('x')));
+        let active = v.active_doc();
+        assert!(v.doc_mut(active).and_then(|d| d.text()).unwrap().starts_with("x# Title"));
+
+        // A sidebar hidden while it has the keys hands them on at the next paint.
+        let (d, mut v) = fixture(&Session::default());
+        h.cfg.file_browser.sidebar = SidebarPin::Pinned;
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, down(sidebar_row(0)));
+        v.show_doc(editor(&d.join("a.md")));
+        assert!(v.sidebar_has_keys());
+        v.pinned = Some(false);
+        h.paint(&mut v, RECT);
+        assert!(!v.sidebar_has_keys());
+    }
+
+    #[test]
+    fn a_click_on_the_file_shown_already_doesnt_keep_the_keys_for_a_later_open() {
+        let (d, mut v) = fixture(&Session::default());
+        v.show_doc(editor(&d.join("a.md")));
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        // a.md is shown, so the app shows nothing new for this click.
+        let out = h.mouse(&mut v, down(sidebar_row(0)));
+        assert_eq!(out.requests, [Request::OpenFile(d.join("a.md"))]);
+        assert!(v.sidebar_has_keys());
+        // A palette open later takes the keys to its document.
+        v.show_doc(editor(&d.join("b.txt")));
+        assert!(!v.sidebar_has_keys());
+    }
+
+    #[test]
+    fn moving_the_keys_between_parts_tells_them_on_the_next_tick() {
+        let path = tmpdir("files-unfocus").join("f.txt");
+        std::fs::write(&path, "x\n").unwrap();
+        let (_, mut v) = fixture(&Session::default());
+        let h = Harness::new();
+        h.focus(&mut v, true);
+        v.show_doc(editor(&path));
+        assert!(v.write_input(b"edit "));
+        v.focus_sidebar();
+        let due = v.deadline(&h.cfg).expect("a tick to tell the document");
+        let out = h.tick(&mut v, due);
+        assert_eq!(out.requests, [Request::Saved(path.clone())], "the document autosaved on losing the keys");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit x\n");
+        assert_eq!(v.deadline(&h.cfg), None);
+    }
+
+    #[test]
+    fn the_edge_keeps_its_cursor_over_the_filter_and_while_dragged() {
+        let (d, mut v) = fixture(&Session::default());
+        v.show_doc(editor(&d.join("a.md")));
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let edge = v.layout.edge.unwrap();
+        // On the edge at the filter's height: the resize cursor, not the I-beam.
+        h.cursor = (edge.x + edge.w * 0.5, 28.0 + 19.0);
+        let cursor = h.paint(&mut v, RECT).cursor.map(|c| c.1);
+        assert_eq!(cursor, Some(CursorIcon::ColResize));
+        h.mouse(&mut v, down(h.cursor));
+        h.cursor = (RECT.w * 0.75, 200.0);
+        let cursor = h.paint(&mut v, RECT).cursor.map(|c| c.1);
+        assert_eq!(cursor, Some(CursorIcon::ColResize), "while dragging, wherever the pointer is");
+    }
+
     #[test]
     fn escape_clears_the_sidebars_filter() {
         let (_d, mut v) = fixture(&Session::default());
@@ -757,12 +897,10 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_text_lists_the_sidebar_then_the_document() {
+    fn the_agent_text_is_the_documents_else_the_sidebars_listing() {
         let (d, mut v) = fixture(&Session::default());
+        assert_eq!(v.text().unwrap(), format!("{}\n  a.md\n  b.txt\n", d.display()));
         v.show_doc(editor(&d.join("b.txt")));
-        let text = v.text().unwrap();
-        assert!(text.starts_with(&format!("{}\n", d.display())), "{text}");
-        assert!(text.contains("a.md"));
-        assert!(text.ends_with(&format!("--- {}\nbee", d.join("b.txt").display())), "{text}");
+        assert_eq!(v.text().as_deref(), Some("bee"));
     }
 }

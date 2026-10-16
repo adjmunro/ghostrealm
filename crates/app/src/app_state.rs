@@ -227,6 +227,12 @@ pub struct AppState {
     /// a file opens in the latest when none is focused.
     files_seen: HashMap<SurfaceId, u64>,
     focus_stamp: u64,
+    /// What to do once the open Save As picker has saved (replacing a
+    /// scratch buffer asked to save it first).
+    after_save_as: Option<Resume>,
+    /// The config, for what the app does on a document's behalf (an
+    /// autosave before replacing it).
+    cfg: Config,
 }
 
 impl AppState {
@@ -258,7 +264,14 @@ impl AppState {
             files_session: files_plugin::Session::default(),
             files_seen: HashMap::new(),
             focus_stamp: 0,
+            after_save_as: None,
+            cfg: Config::default(),
         }
+    }
+
+    /// Use `cfg` for what the app does on a document's behalf.
+    pub fn set_config(&mut self, cfg: Config) {
+        self.cfg = cfg;
     }
 
     /// Set the inbox timing config (auto-read dwell + unfocus grace).
@@ -593,24 +606,22 @@ impl AppState {
         view.docs().contains(&doc).then_some((sid, doc))
     }
 
-    /// Close document `doc` of its view. Returns whether the surface is left
-    /// with no document (so it should close): a view that is its own
-    /// document, or one whose `docs()` is now empty. Otherwise the tab title
-    /// follows the document now shown.
+    /// Close document `doc` of its view. Returns whether the surface should
+    /// close: a view that is its own document does, else the view decides
+    /// ([`View::close_doc`]). Otherwise the tab title follows what the view
+    /// shows now.
     fn close_doc(&mut self, (sid, doc): DocRef) -> bool {
         let Some(view) = self.views.get_mut(&sid) else { return true };
         if view.doc(doc).is_none() {
             return true;
         }
-        let none_left = view.close_doc(doc);
-        let empty = view.docs().is_empty();
-        debug_assert_eq!(none_left, empty, "close_doc's answer disagrees with docs()");
-        if !empty {
+        let close = view.close_doc(doc);
+        if !close {
             if let Some(t) = view.title() {
                 self.tree.set_surface_title(sid, t, false);
             }
         }
-        empty
+        close
     }
 
     /// Every document of surface `sid`, in its tab order.
@@ -649,6 +660,7 @@ impl AppState {
     /// Close the floating picker.
     pub fn close_picker(&mut self) {
         self.picker = None;
+        self.after_save_as = None;
         self.confirm = None;
     }
 
@@ -685,6 +697,14 @@ impl AppState {
             }
             Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
                 self.save_views(&save, Some(Resume::Trash(path)))
+            }
+            // A buffer with no file is saved where the picker says first.
+            Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. })
+                if save.is_empty() && self.doc(doc).is_some_and(|v| v.path().is_none()) =>
+            {
+                self.open_save_dialog(doc, Pick::SaveAs(doc));
+                self.after_save_as = Some(Resume::Open(doc.0, path));
+                Ok(Vec::new())
             }
             Some(Confirm { then: Confirmed::UnsavedOpen { doc, path, save }, .. }) => {
                 self.save_views(&save, Some(Resume::Open(doc.0, path)))
@@ -733,13 +753,20 @@ impl AppState {
             view.save_as(path.clone())?;
             written.push(path);
         }
-        match then {
-            Some(Resume::Leave(what)) => self.perform(what),
-            Some(Resume::Trash(path)) => self.trash_now(&path)?,
-            Some(Resume::Open(sid, path)) => self.replace_with(sid, path.as_deref())?,
-            None => {}
+        if let Some(then) = then {
+            self.resume(then)?;
         }
         Ok(written)
+    }
+
+    /// Go on with what a save held up.
+    fn resume(&mut self, then: Resume) -> Result<()> {
+        match then {
+            Resume::Leave(what) => self.perform(what),
+            Resume::Trash(path) => self.trash_now(&path)?,
+            Resume::Open(sid, path) => self.replace_with(sid, path.as_deref())?,
+        }
+        Ok(())
     }
 
     /// Ask whether to write over the file of the document `sid` shows, which
@@ -876,6 +903,9 @@ impl AppState {
                     .save_as(path.clone())?;
                 if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
                     self.tree.set_surface_title(doc.0, t, false);
+                }
+                if let Some(then) = self.after_save_as.take() {
+                    self.resume(then)?;
                 }
                 return Ok(Some(path));
             }
@@ -2004,7 +2034,7 @@ mod tests {
         let surf = s.focused_surface().unwrap();
         assert_eq!(s.view(surf).map(|v| v.plugin()), Some(files_plugin::ID));
         s.editor_mut(surf).expect("an empty editor document").buffer_mut().insert_char('x');
-        assert!(s.surface_text(surf).unwrap().ends_with("\nx"), "the document's text follows the listing");
+        assert_eq!(s.surface_text(surf).as_deref(), Some("x"), "the document's text");
         assert!(
             s.surface_lifecycle(surf).is_none(),
             "an editor surface has no terminal"
@@ -2555,7 +2585,9 @@ mod tests {
         assert!(!s.has_unsaved());
         s.close_focused_surface();
         assert!(s.confirm().is_none());
-        assert_eq!(surface_count(&s), 0);
+        assert_eq!(surface_count(&s), 1, "the document closed; its Files surface stays");
+        s.close_focused_surface();
+        assert_eq!(surface_count(&s), 0, "then the surface");
         s.request_quit();
         assert!(s.confirm().is_none() && s.quitting());
     }
@@ -2579,7 +2611,7 @@ mod tests {
         // Close without saving: the tab goes, the file is untouched.
         s.close_focused_surface();
         s.discard_confirm().unwrap();
-        assert!(s.confirm().is_none() && s.view(sid).is_none());
+        assert!(s.confirm().is_none() && s.active_doc(sid).is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
 
         // Save and close: the file is written, then the tab goes.
@@ -2587,7 +2619,7 @@ mod tests {
         s.close_focused_surface();
         assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
-        assert!(s.view(sid).is_none());
+        assert!(s.active_doc(sid).is_none());
     }
 
     /// `edited`, then another program rewrites the file.
@@ -2609,7 +2641,7 @@ mod tests {
         s.close_focused_surface();
         assert!(!s.confirm().unwrap().enter_cancels());
         assert_eq!(s.enter_confirm().unwrap(), vec![file.clone()]);
-        assert!(s.view(sid).is_none());
+        assert!(s.active_doc(sid).is_none());
 
         // A changed file: the Enter that saves reaches the changed-file
         // question, and a second Enter cancels it.
@@ -2675,7 +2707,7 @@ mod tests {
         assert!(s.view(sid).is_some());
         assert_eq!(s.accept_confirm().unwrap(), vec![file.clone()]);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "newold\n");
-        assert!(s.view(sid).is_none(), "closed after the write");
+        assert!(s.active_doc(sid).is_none(), "closed after the write");
 
         // Reload: the disk version is shown and the close stops.
         let (mut s, sid, file) = conflicted(&dir, "b.txt");
@@ -2813,10 +2845,11 @@ mod tests {
     }
 
     #[test]
-    fn a_modified_scratch_buffer_can_only_be_cancelled_or_discarded() {
+    fn closing_a_modified_scratch_buffer_can_only_be_cancelled_or_discarded() {
         let mut s = AppState::new().with_unsaved_guard();
         s.new_empty_vtab();
-        s.open_plugin_in_focused(editor::ID).unwrap();
+        let new = |s: &mut AppState| build_registry().execute("editor.new", &ghostrealm_core::Args::new(), s).unwrap();
+        new(&mut s);
         let sid = s.focused_surface().unwrap();
         s.views.get_mut(&sid).unwrap().write_input(b"x");
         s.close_focused_surface();
@@ -2824,14 +2857,14 @@ mod tests {
         assert_eq!((c.accept, c.discard), (None, Some("Close Without Saving")));
         assert!(c.message.contains("no file"), "{}", c.message);
         assert_eq!(s.accept_confirm().unwrap(), Vec::<std::path::PathBuf>::new());
-        assert!(s.confirm().is_some() && s.view(sid).is_some(), "Enter does nothing");
+        assert!(s.confirm().is_some() && s.editor(sid).is_some(), "Enter does nothing");
         s.discard_confirm().unwrap();
-        assert!(s.view(sid).is_none());
+        assert!(s.editor(sid).is_none() && s.view(sid).is_some(), "the buffer went; its sidebar stays");
 
         // An untouched scratch buffer closes at once.
-        s.open_plugin_in_focused(editor::ID).unwrap();
+        new(&mut s);
         s.close_focused_surface();
-        assert!(s.confirm().is_none());
+        assert!(s.confirm().is_none() && s.editor(sid).is_none());
     }
 
     #[test]
@@ -2841,7 +2874,7 @@ mod tests {
         s.guard_unsaved = false;
         assert!(!s.has_unsaved(), "nothing to ask about");
         s.close_focused_surface();
-        assert!(s.confirm().is_none() && s.view(sid).is_none());
+        assert!(s.confirm().is_none() && s.active_doc(sid).is_none());
     }
 
     #[test]

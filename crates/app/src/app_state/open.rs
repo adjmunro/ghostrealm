@@ -12,17 +12,16 @@ use crate::plugins::editor;
 use crate::plugins::files::{self, FilesView};
 
 impl AppState {
-    /// Open `path` in a Files surface: the focused one, else the one of the
-    /// active workspace focused last, else a new one as a tab in the focused
-    /// pane. It replaces the document shown, asking first about that one's
-    /// unsaved changes. A file the surface shows already is only brought
-    /// into view.
+    /// Open `path` in a Files surface: one of the active workspace showing
+    /// it already (only brought into view), else the focused one, else the
+    /// one focused last, else a new one as a tab in the focused pane. It
+    /// replaces the document shown (see [`Self::place_doc`]).
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
-        let target = self.files_target();
-        if let Some(sid) = target.filter(|sid| self.files_shows(*sid, path)) {
+        if let Some(sid) = self.files_showing(path) {
             self.show_surface(sid);
             return Ok(());
         }
+        let target = self.files_target();
         // Made first: a file that won't open changes nothing.
         let doc = self.view_for_path(None, path)?;
         self.place_doc(target, doc, Some(path.to_path_buf()));
@@ -67,6 +66,15 @@ impl AppState {
         self.views.get(&sid).is_some_and(|v| v.downcast_ref::<FilesView>().is_some())
     }
 
+    /// A Files surface of the active workspace showing `path`, the focused
+    /// one first.
+    fn files_showing(&self, path: &Path) -> Option<SurfaceId> {
+        let focused = self.focused_surface();
+        let mut all = self.active().map(|vt| self.surfaces_of(vt)).unwrap_or_default();
+        all.sort_by_key(|sid| Some(*sid) != focused);
+        all.into_iter().find(|sid| self.is_files(*sid) && self.files_shows(*sid, path))
+    }
+
     /// Whether Files surface `sid` shows `path`.
     pub(super) fn files_shows(&self, sid: SurfaceId, path: &Path) -> bool {
         let shown = self.active_doc(sid).and_then(|d| self.doc(d)).and_then(|v| v.path());
@@ -89,28 +97,50 @@ impl AppState {
     }
 
     /// Show `doc` (of `path`, `None` for a scratch buffer) in Files surface
-    /// `target`, else in a new one. Replacing a document with unsaved
-    /// changes asks first and replaces once answered.
+    /// `target`, else in a new one. A document there with unsaved changes
+    /// autosaves when it autosaves; otherwise the user is asked first (and
+    /// it is replaced once answered), and with nobody to ask (the agent
+    /// channel) `doc` opens in a new Files surface instead, so no edit is
+    /// lost.
     pub(super) fn place_doc(&mut self, target: Option<SurfaceId>, doc: Box<dyn View>, path: Option<PathBuf>) {
         let Some(sid) = target else {
             self.new_files_surface(doc, path.as_deref());
             return;
         };
-        self.show_surface(sid);
-        let shown = self.active_doc(sid).filter(|d| self.doc(*d).is_some_and(|v| v.modified()));
-        match shown {
-            Some(old) if self.guard_unsaved => self.ask_replace(old, path),
-            _ => self.replace_doc(sid, doc),
+        let modified = |s: &Self| s.active_doc(sid).filter(|d| s.doc(*d).is_some_and(|v| v.modified()));
+        if let Some((_, id)) = modified(self) {
+            let cfg = &self.cfg;
+            if let Some(v) = self.views.get_mut(&sid).and_then(|v| v.document_mut(id)) {
+                v.autosave(cfg);
+            }
+        }
+        match modified(self) {
+            None => {
+                self.show_surface(sid);
+                self.replace_doc(sid, doc);
+            }
+            Some(old) if self.guard_unsaved => {
+                self.show_surface(sid);
+                self.ask_replace(old, path);
+            }
+            Some(_) => self.new_files_surface(doc, path.as_deref()),
         }
     }
 
     /// Ask whether to save `old`'s unsaved changes before `path` (`None`: an
-    /// empty buffer) replaces it.
+    /// empty buffer) replaces it. A buffer with no file offers Save As.
     fn ask_replace(&mut self, old: DocRef, path: Option<PathBuf>) {
         let (message, save, can_save) = self.unsaved_question(&[old]);
+        let (message, accept) = match can_save {
+            true => (message, "Save and Open"),
+            false => {
+                let name = self.doc(old).and_then(|v| v.title()).unwrap_or_default();
+                (format!("\u{201c}{name}\u{201d} has unsaved changes."), "Save As\u{2026}")
+            }
+        };
         self.confirm = Some(Confirm {
             message,
-            accept: can_save.then_some("Save and Open"),
+            accept: Some(accept),
             discard: Some("Open Without Saving"),
             then: Confirmed::UnsavedOpen { doc: old, path, save },
             late: None,
@@ -222,9 +252,17 @@ mod tests {
             std::fs::write(d.join(n), n).unwrap();
         }
         let mut s = AppState::new().with_unsaved_guard();
+        s.set_config(no_autosave());
         s.set_default_dir(Some(d.clone()));
         s.new_empty_vtab();
         (s, d)
+    }
+
+    /// A config whose editors never save by themselves.
+    fn no_autosave() -> ghostrealm_core::Config {
+        let mut cfg = ghostrealm_core::Config::default();
+        (cfg.editor.autosave_on_unfocus, cfg.editor.autosave_after) = (false, 0);
+        cfg
     }
 
     fn shown(s: &AppState, sid: SurfaceId) -> Option<PathBuf> {
@@ -309,12 +347,80 @@ mod tests {
         assert_eq!(shown(&s, sid), Some(d.join("c.txt")));
         assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "b.txt");
 
-        // An empty buffer can't be saved: only discard or cancel.
+        // An empty buffer is saved where the picker says, then replaced.
         build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
         assert!(s.confirm().is_none(), "c.txt was unmodified");
+        let scratch = s.active_doc(sid).unwrap();
         assert!(s.views.get_mut(&sid).unwrap().write_input(b"scratch"));
         s.open_file(&d.join("a.txt")).unwrap();
-        assert_eq!(s.confirm().map(|c| c.accept), Some(None));
+        assert_eq!(s.confirm().map(|c| c.accept), Some(Some("Save As\u{2026}")));
+        assert_eq!(s.accept_confirm().unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(s.picker_purpose(), Some(super::super::Pick::SaveAs(scratch)));
+        s.confirm_picker_with(d.join("kept.txt")).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("kept.txt")).unwrap(), "scratch\n");
+        assert_eq!(shown(&s, sid), Some(d.join("a.txt")), "then the file opened");
+        // A Save As cancelled opens nothing.
+        build_registry().execute("editor.new", &ghostrealm_core::Args::new(), &mut s).unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"more"));
+        s.open_file(&d.join("b.txt")).unwrap();
+        s.accept_confirm().unwrap();
+        s.close_picker();
+        assert_eq!(shown(&s, sid), None, "still the buffer");
+    }
+
+    #[test]
+    fn save_and_open_over_a_file_changed_on_disk_asks_and_then_opens() {
+        let (mut s, d) = app("open-conflict");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"mine "));
+        std::fs::write(d.join("a.txt"), "theirs").unwrap();
+        s.open_file(&d.join("b.txt")).unwrap();
+        s.accept_confirm().unwrap();
+        let c = s.confirm().expect("the changed file asks before it is written");
+        assert_eq!(c.accept, Some("Overwrite"));
+        assert_eq!(shown(&s, sid), Some(d.join("a.txt")), "nothing replaced yet");
+        assert_eq!(s.accept_confirm().unwrap(), vec![d.join("a.txt")]);
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "mine a.txt\n");
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+    }
+
+    #[test]
+    fn a_file_deleted_before_the_answer_opens_as_a_new_one() {
+        let (mut s, d) = app("open-gone");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"x"));
+        s.open_file(&d.join("b.txt")).unwrap();
+        std::fs::remove_file(d.join("b.txt")).unwrap();
+        s.discard_confirm().unwrap();
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+        assert_eq!(s.editor(sid).map(|e| e.buffer().lines.clone()), Some(vec![String::new()]));
+    }
+
+    #[test]
+    fn an_autosaving_document_saves_instead_of_asking() {
+        let (mut s, d) = app("open-autosave");
+        s.set_config(ghostrealm_core::Config::default());
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        assert!(s.views.get_mut(&sid).unwrap().write_input(b"auto "));
+        s.open_file(&d.join("b.txt")).unwrap();
+        assert!(s.confirm().is_none());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "auto a.txt\n");
+        assert_eq!(shown(&s, sid), Some(d.join("b.txt")));
+    }
+
+    #[test]
+    fn a_file_shown_anywhere_in_the_workspace_comes_into_view() {
+        let (mut s, d) = app("open-anywhere");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let first = s.focused_surface().unwrap();
+        s.open_file_in_new_surface(&d.join("b.txt")).unwrap();
+        let second = s.focused_surface().unwrap();
+        s.open_file(&d.join("a.txt")).unwrap();
+        assert_eq!(s.focused_surface(), Some(first));
+        assert_eq!(shown(&s, second), Some(d.join("b.txt")), "the focused one kept its file");
     }
 
     #[test]
@@ -337,12 +443,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.join("renamed.txt")).unwrap(), "1 a.txt\n");
         assert_eq!(s.tree.vtabs()[0].panes()[0].surfaces[0].title, "renamed.txt");
 
-        // Close (Cmd+W) asks about the unsaved document, then closes it and
-        // the surface it was the last of.
+        // Close (Cmd+W) asks about the unsaved document, then closes it,
+        // leaving the sidebar; closing again closes the surface.
         assert!(s.views.get_mut(&sid).unwrap().write_input(b"2 "));
         s.close_focused_surface();
         assert!(s.confirm().is_some_and(|c| c.message.contains("renamed.txt")));
         s.discard_confirm().unwrap();
+        assert!(s.active_doc(sid).is_none() && s.view(sid).is_some());
+        assert_eq!(s.tree.vtabs()[0].panes()[0].surfaces[0].title, "Files");
+        s.close_focused_surface();
         assert!(s.view(sid).is_none());
     }
 

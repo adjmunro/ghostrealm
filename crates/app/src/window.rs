@@ -1146,6 +1146,7 @@ impl State {
                 catalogue.clone(),
             )));
         app.set_inbox_config(cfg.inbox);
+        app.set_config(cfg.clone());
         app.set_default_dir(cfg.default_dir());
         app.set_close_on_exit(cfg.terminal.close_on_exit);
         // A CLI command spawns a terminal running it; a bare launch opens the empty
@@ -1286,6 +1287,7 @@ impl State {
         }
         self.chrome = cfg.resolved_chrome();
         self.app.set_inbox_config(cfg.inbox);
+        self.app.set_config(cfg.clone());
         self.app.set_default_dir(cfg.default_dir());
         self.app.set_close_on_exit(cfg.terminal.close_on_exit);
         self.cfg = cfg;

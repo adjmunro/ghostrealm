@@ -306,23 +306,39 @@ mod tests {
     }
 
     #[test]
-    fn get_surface_shows_an_opened_file_under_its_sidebars_listing() {
+    fn get_surface_shows_the_opened_file_else_the_sidebars_listing() {
         let d = crate::plugin::testing::tmpdir("agent-files");
         std::fs::write(d.join("notes.md"), "# Notes\nhello agent\n").unwrap();
         let mut state = AppState::new();
+        let mut cfg = ghostrealm_core::Config::default();
+        (cfg.editor.autosave_on_unfocus, cfg.editor.autosave_after) = (false, 0);
+        state.set_config(cfg);
         let mut registry = build_registry();
         let path = d.to_str().unwrap();
         let mut ask = |state: &mut AppState, req: &str| handle(req, state, &mut registry);
         let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"workspace.new","args":{{"dir":"{path}"}}}}"#));
         assert_eq!(resp["ok"], json!(true), "{resp:?}");
-        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/notes.md"}}}}"#));
+        let resp = ask(&mut state, r#"{"op":"set","id":"file_browser.new"}"#);
         assert_eq!(resp["ok"], json!(true), "{resp:?}");
         let id = state.focused_surface().unwrap().0;
-        let resp = ask(&mut state, &format!(r#"{{"op":"get","what":"surface","id":{id}}}"#));
-        let text = resp["text"].as_str().unwrap_or_else(|| panic!("{resp:?}"));
-        assert!(text.starts_with(&format!("{path}\n")), "the sidebar's folder first:\n{text}");
-        assert!(text.contains("  notes.md\n"), "then its listing:\n{text}");
-        assert!(text.ends_with(&format!("--- {path}/notes.md\n# Notes\nhello agent")), "then the file:\n{text}");
+        let get = format!(r#"{{"op":"get","what":"surface","id":{id}}}"#);
+        let resp = ask(&mut state, &get);
+        assert_eq!(resp["text"], json!(format!("{path}\n  notes.md\n")), "the listing with no document");
+        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/notes.md"}}}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
+        assert_eq!(state.focused_surface().map(|s| s.0), Some(id), "into the Files surface there");
+        let resp = ask(&mut state, &get);
+        assert_eq!(resp["text"], json!("# Notes\nhello agent"), "the file, as an editor reads it");
+        // Edited, then another file opened with nobody to ask: a new surface,
+        // and the edit stays.
+        let resp = ask(&mut state, &format!(r#"{{"op":"input","id":{id},"text":"x"}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
+        std::fs::write(d.join("b.txt"), "b").unwrap();
+        let resp = ask(&mut state, &format!(r#"{{"op":"set","id":"file.open","args":{{"path":"{path}/b.txt"}}}}"#));
+        assert_eq!(resp["ok"], json!(true), "{resp:?}");
+        assert_ne!(state.focused_surface().map(|s| s.0), Some(id));
+        let resp = ask(&mut state, &get);
+        assert_eq!(resp["text"], json!("x# Notes\nhello agent"));
     }
 
     #[test]
