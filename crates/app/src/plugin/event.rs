@@ -81,22 +81,35 @@ pub enum Request {
     /// needs an answer first: ask whether to overwrite it or reload (the view
     /// stays as it is until then).
     SaveConflict,
-    /// Open the file and folder context menu on `target` at `at` (physical px).
+    /// Open the file and folder context menu on `target` at `at` (physical
+    /// px), aligned to it per `align`.
     FileMenu {
         target: crate::file_menu::FileTarget,
         at: (f32, f32),
+        align: MenuAlign,
     },
-    /// Open the view's own menu at `at` (physical px). Choosing an item calls
-    /// [`View::button`] with its `id`.
+    /// Open the view's own menu at `at` (physical px), aligned to it per
+    /// `align`. Choosing an item calls [`View::button`] with its `id`.
     ///
     /// [`View::button`]: super::View::button
-    Menu { items: Vec<MenuItem>, at: (f32, f32) },
+    Menu { items: Vec<MenuItem>, at: (f32, f32), align: MenuAlign },
     /// Close the view's surface, as the Close command would. A terminal whose
     /// shell exited asks this on the next key.
     Close,
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,
+}
+
+/// How a menu sits against the point it opens at: its top edge is at the
+/// point, and its left (`Left`) or right (`Right`) edge too. A menu opened
+/// from a button at a view's right end aligns `Right` so it stays over the
+/// view. Either way the app keeps it on screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MenuAlign {
+    #[default]
+    Left,
+    Right,
 }
 
 /// An item of a view's menu ([`Request::Menu`]).

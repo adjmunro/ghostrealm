@@ -31,8 +31,8 @@ use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, MouseEvent, OpenCx, PaintCx, Plugin, Request, View,
-    Waker,
+    rect_contains, theme, widgets, widgets::FieldMouse, EventCx, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin, Request,
+    View, Waker,
 };
 use preview::PreviewPane;
 
@@ -1016,7 +1016,7 @@ impl View for FileBrowserView {
                 origin: Origin::Browser,
             },
         };
-        cx.request(Request::FileMenu { target, at: pos });
+        cx.request(Request::FileMenu { target, at: pos, align: MenuAlign::Left });
         cx.redraw();
     }
 
@@ -1807,18 +1807,18 @@ mod tests {
         let at = row_centre(0);
         assert_eq!(
             menu(&h, &mut v, at),
-            [Request::FileMenu { target: target(d.join("adir"), TargetKind::Dir, ()), at }]
+            [Request::FileMenu { target: target(d.join("adir"), TargetKind::Dir, ()), at, align: MenuAlign::Left }]
         );
         assert_eq!(v.subject(), Some(d.join("adir")), "the row is selected");
         let at = row_centre(1);
         assert_eq!(
             menu(&h, &mut v, at),
-            [Request::FileMenu { target: target(d.join("b.txt"), TargetKind::File, ()), at }]
+            [Request::FileMenu { target: target(d.join("b.txt"), TargetKind::File, ()), at, align: MenuAlign::Left }]
         );
         let at = (50.0, 250.0);
         assert_eq!(
             menu(&h, &mut v, at),
-            [Request::FileMenu { target: target(d.clone(), TargetKind::Empty, ()), at }],
+            [Request::FileMenu { target: target(d.clone(), TargetKind::Empty, ()), at, align: MenuAlign::Left }],
             "below the rows: the folder shown"
         );
         // Outside the list (the header), and in a picker, there is no menu.

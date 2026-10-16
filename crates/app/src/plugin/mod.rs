@@ -47,7 +47,7 @@ use ghostrealm_terminal::{KeyPress, Pumped};
 
 use crate::app_state::AppState;
 
-pub use event::{EventCx, MenuItem, MouseButton, MouseEvent, Outcome, RawKey, Request};
+pub use event::{EventCx, MenuAlign, MenuItem, MouseButton, MouseEvent, Outcome, RawKey, Request};
 pub use paint::{
     Font, Frame, Image, ImageItem, ImageSource, Layer, PaintCx, RowStyles, Shaped, TextItem, TextKit,
     TextSrc,

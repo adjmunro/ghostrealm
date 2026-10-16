@@ -37,7 +37,7 @@ use crate::plugin::paint::{line_quad, push_border, rect_quad, round_quad, srgb_t
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseButton, MouseEvent, Outcome, PaintCx, RawKey,
-    MenuItem, Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
+    MenuAlign, MenuItem, Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
@@ -579,6 +579,9 @@ struct State {
     /// Separate text renderer for the palette so its text draws above the panel
     /// (terminal text and palette text can't share one pass with a quad between).
     palette_renderer: TextRenderer,
+    /// Draws the context menu's text, after its quads: a menu can stack over
+    /// another overlay (the picker), whose text draws in the palette pass.
+    menu_renderer: TextRenderer,
     palette_buffers: Vec<Buffer>,
     palette: Option<Palette>,
     /// Last-rendered palette panel rect (physical px), for click-outside dismissal.
@@ -728,7 +731,7 @@ struct Palette {
 }
 
 /// An action a sidebar context-menu item performs on its target vtab.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum MenuAction {
     MarkRead,
     MarkUnread,
@@ -789,27 +792,40 @@ impl MenuRow {
     }
 }
 
-/// A right-click context menu.
+/// A context menu: the workspace or file menu, or a view's own.
 struct Menu {
     target: MenuTarget,
     /// Where the menu was opened (physical px); the panel is clamped on-screen.
     anchor: (f32, f32),
+    align: MenuAlign,
     items: Vec<MenuRow>,
     /// Item under the cursor, for highlight.
     hover: Option<usize>,
     /// Item the left button went down on; it runs on release over the same item.
     armed: Option<usize>,
-    /// Per-item rects (physical px), filled at render for hit-testing.
+    /// Per-item hit rects (physical px) from the last layout; empty for a
+    /// rule or a disabled item.
     rows: Vec<Rect>,
     /// The panel rect (physical px), for click-outside dismissal.
     panel: Rect,
 }
 
+/// What a left release on an open menu did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuRelease {
+    /// No item was armed: the release isn't the menu's.
+    Unarmed,
+    /// Released off the armed item: nothing runs, the menu stays.
+    Cancelled,
+    Chosen(MenuAction),
+}
+
 impl Menu {
-    fn new(target: MenuTarget, anchor: (f32, f32), items: Vec<MenuRow>) -> Self {
+    fn new(target: MenuTarget, anchor: (f32, f32), align: MenuAlign, items: Vec<MenuRow>) -> Self {
         Menu {
             target,
             anchor,
+            align,
             items,
             hover: None,
             armed: None,
@@ -817,27 +833,164 @@ impl Menu {
             panel: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
         }
     }
-}
 
-/// Surface `sid`'s view: the picker's for [`PICKER_SID`].
-fn view_of(app: &mut AppState, sid: SurfaceId) -> Option<&mut dyn View> {
-    if sid == PICKER_SID {
-        app.picker_mut().map(|v| v as &mut dyn View)
-    } else {
-        app.view_mut(sid).map(|v| v as &mut dyn View)
+    /// Take the hit rects of `layout`, as drawn.
+    fn place(&mut self, layout: &MenuLayout) {
+        self.rows = layout.rows.iter().map(|r| r.hit).collect();
+        self.panel = layout.panel;
+    }
+
+    fn item_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.rows.iter().position(|r| rect_contains(*r, x, y))
+    }
+
+    /// Hover at `(x, y)`; returns whether the highlighted item changed.
+    fn hover_at(&mut self, x: f32, y: f32) -> bool {
+        let idx = self.item_at(x, y);
+        std::mem::replace(&mut self.hover, idx) != idx
+    }
+
+    /// A left press at `(x, y)` arms the item under it. Returns `false` when
+    /// the press is outside the panel (the menu closes).
+    fn press(&mut self, x: f32, y: f32) -> bool {
+        self.armed = self.item_at(x, y);
+        self.armed.is_some() || rect_contains(self.panel, x, y)
+    }
+
+    /// The left button went up at `(x, y)`.
+    fn release(&mut self, x: f32, y: f32) -> MenuRelease {
+        match self.armed.take() {
+            None => MenuRelease::Unarmed,
+            Some(i) if self.item_at(x, y) == Some(i) => MenuRelease::Chosen(self.items[i].action),
+            Some(_) => MenuRelease::Cancelled,
+        }
     }
 }
 
-/// Run a view-menu `action` chosen on `target`: the owning view hears it as a
-/// click on its button with the item's id. Returns the surface whose view ran
-/// it (its requests are in `cx`); `None` for another kind of item or a view
-/// that has gone.
-fn choose_view_item(app: &mut AppState, cx: &mut EventCx, action: MenuAction, target: &MenuTarget) -> Option<SurfaceId> {
-    let (MenuAction::View(id), MenuTarget::View(sid)) = (action, target) else {
-        return None;
+/// Where a menu's parts go (physical px).
+struct MenuLayout {
+    panel: Rect,
+    rows: Vec<RowLayout>,
+}
+
+/// One row of a [`MenuLayout`].
+struct RowLayout {
+    /// The row's band across the panel.
+    rect: Rect,
+    /// Takes hover and clicks: `rect` for an enabled item, else empty.
+    hit: Rect,
+    /// Where the label shows (it is clipped to this).
+    label: Rect,
+    /// Where the hint shows, if it has one and there is room for it.
+    hint: Option<Rect>,
+    /// The check mark's square, when the item is checked and there is room.
+    check: Option<Rect>,
+}
+
+/// Fewest label columns a narrow menu keeps before giving up hint space.
+const MENU_LABEL_MIN_COLS: f32 = 6.0;
+
+/// Lay out a menu of `items` opened at `anchor` on a `screen`-sized window.
+/// `hint_w[i]` is item `i`'s hint width as shaped. Labels are sized by
+/// character count; the check-mark and hint columns sit at the right end,
+/// the hint against the edge and the check mark left of it. On a narrow
+/// window the hint is cut, then dropped, before the label shrinks below
+/// [`MENU_LABEL_MIN_COLS`].
+fn menu_layout(
+    items: &[MenuRow],
+    hint_w: &[f32],
+    anchor: (f32, f32),
+    align: MenuAlign,
+    screen: (f32, f32),
+    ui: UiMetrics,
+) -> MenuLayout {
+    let (sw, sh) = screen;
+    let pad = 8.0 * ui.scale;
+    let gap = ui.cell_w;
+    let row_h = ui.cell_h + 6.0 * ui.scale;
+    // A rule takes less height than an item.
+    let rule_h = 9.0 * ui.scale;
+    let check_w = ui.cell_h * 0.8;
+    let label_w = |i: &MenuRow| i.label.chars().count() as f32 * ui.cell_w;
+    let right_w = items
+        .iter()
+        .zip(hint_w)
+        .map(|(item, &hw)| match (item.checked.is_some(), item.hint.is_some()) {
+            (true, true) => check_w + gap + hw,
+            (true, false) => check_w,
+            (false, true) => hw,
+            (false, false) => 0.0,
+        })
+        .fold(0.0, f32::max);
+    let right_w = if right_w > 0.0 { right_w + gap * 2.0 } else { 0.0 };
+    let maxlen = items.iter().map(label_w).reduce(f32::max).unwrap_or(6.0 * ui.cell_w);
+    let panel_w = (maxlen + pad * 3.0 + right_w).min(sw * 0.6);
+    let height_of = |i: &MenuRow| if matches!(i.action, MenuAction::Rule) { rule_h } else { row_h };
+    let panel_h = items.iter().map(height_of).sum::<f32>() + pad;
+    let x = match align {
+        MenuAlign::Left => anchor.0,
+        MenuAlign::Right => anchor.0 - panel_w,
     };
-    view_of(app, *sid)?.button(cx, id);
-    Some(*sid)
+    let px = x.min((sw - panel_w).max(0.0)).max(0.0);
+    let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
+    let panel = Rect { x: px, y: py, w: panel_w, h: panel_h };
+
+    let empty = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    let (left, right_edge) = (px + pad, (px + panel_w - pad).max(px + pad));
+    let mut rows = Vec::with_capacity(items.len());
+    let mut y = py + pad * 0.5;
+    for (item, &hw) in items.iter().zip(hint_w) {
+        let rect = Rect { x: px, y, w: panel_w, h: height_of(item) };
+        y += rect.h;
+        let band = |x0: f32, x1: f32| Rect { x: x0, y: rect.y, w: (x1 - x0).max(0.0), h: rect.h };
+        // What the right end may take, keeping the label its minimum.
+        let keep = label_w(item).min(MENU_LABEL_MIN_COLS * ui.cell_w);
+        let mut budget = (right_edge - left - keep - gap).max(0.0);
+        let mut right = right_edge;
+        let reserve_check = item.checked.is_some() && budget >= check_w;
+        if reserve_check {
+            budget -= check_w + gap;
+        }
+        // A hint too narrow to read is dropped.
+        let hint_space = if item.hint.is_some() { hw.min(budget) } else { 0.0 };
+        let hint = (hint_space >= ui.cell_w).then(|| {
+            let r = band(right - hint_space, right);
+            right -= hint_space + gap;
+            r
+        });
+        let check = reserve_check.then(|| {
+            let r = Rect { x: right - check_w, y: rect.y + (rect.h - check_w) * 0.5, w: check_w, h: check_w };
+            right -= check_w + gap;
+            r
+        });
+        let check = check.filter(|_| item.checked == Some(true));
+        rows.push(RowLayout {
+            rect,
+            hit: if item.enabled { rect } else { empty },
+            label: band(left, right.max(left)),
+            hint,
+            check,
+        });
+    }
+    MenuLayout { panel, rows }
+}
+
+/// Call `f` on surface `sid`'s view (the picker's for [`PICKER_SID`]) with
+/// `cx`. Returns whether there was such a view.
+fn call_view(app: &mut AppState, sid: SurfaceId, cx: &mut EventCx, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
+    let view: &mut dyn View = if sid == PICKER_SID {
+        match app.picker_mut() {
+            Some(v) => v,
+            None => return false,
+        }
+    } else {
+        match app.view_mut(sid) {
+            Some(v) => v,
+            None => return false,
+        }
+    };
+    f(view, cx);
+    true
 }
 
 /// A pane resolved for rendering: its rect, focus, and its surfaces
@@ -940,6 +1093,7 @@ impl State {
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let palette_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let menu_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         // The registry and plugins make up the catalogue the config is checked
         // against.
@@ -1026,6 +1180,7 @@ impl State {
             mono_family,
             font_locale: locale,
             palette_renderer,
+            menu_renderer,
             palette_buffers: Vec::new(),
             palette: None,
             palette_panel: Rect {
@@ -1655,11 +1810,10 @@ impl State {
     /// a redraw (`false` when there is no such view).
     fn view_event(&mut self, sid: SurfaceId, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
         let ui = self.ui();
-        let Some(view) = view_of(&mut self.app, sid) else {
-            return false;
-        };
         let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
-        f(view, &mut cx);
+        if !call_view(&mut self.app, sid, &mut cx, f) {
+            return false;
+        }
         let out = cx.finish();
         let redraw = out.redraw;
         self.apply_outcome(sid, out);
@@ -1689,8 +1843,8 @@ impl State {
                     }
                     self.app.close_surface_id(sid);
                 }
-                Request::FileMenu { target, at } => self.open_file_menu(target, at),
-                Request::Menu { items, at } => self.open_view_menu(sid, items, at),
+                Request::FileMenu { target, at, align } => self.open_file_menu(target, at, align),
+                Request::Menu { items, at, align } => self.open_view_menu(sid, items, at, align),
             }
         }
     }
@@ -1834,6 +1988,11 @@ impl State {
         if self.app.confirm().is_some() {
             return;
         }
+        // A menu takes the click first: one may be open over the picker.
+        if self.menu.is_some() {
+            self.menu_click();
+            return;
+        }
         // The picker is modal: a click in its panel goes to its file
         // browser, a click outside cancels. (Its buttons arm on press.)
         if self.app.picker_open() {
@@ -1854,10 +2013,6 @@ impl State {
         }
         if self.palette.is_some() {
             self.palette_click();
-            return;
-        }
-        if self.menu.is_some() {
-            self.menu_click();
             return;
         }
         let (x, y) = self.cursor;
@@ -1987,7 +2142,7 @@ impl State {
         items.push(MenuRow::new("Rename…", MenuAction::Rename));
         items.push(MenuRow::new("Set directory…", MenuAction::SetDir));
         items.push(MenuRow::new("Close workspace", MenuAction::Close));
-        self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), items));
+        self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), MenuAlign::Left, items));
         self.dirty = true;
     }
 
@@ -1995,11 +2150,7 @@ impl State {
     /// runs on release), or close the menu when the press is outside it.
     fn menu_click(&mut self) {
         let (x, y) = self.cursor;
-        let Some(menu) = self.menu.as_mut() else {
-            return;
-        };
-        menu.armed = menu.rows.iter().position(|r| rect_contains(*r, x, y));
-        if menu.armed.is_none() && !rect_contains(menu.panel, x, y) {
+        if self.menu.as_mut().is_some_and(|m| !m.press(x, y)) {
             self.menu = None;
         }
         self.dirty = true;
@@ -2012,34 +2163,25 @@ impl State {
         let Some(menu) = self.menu.as_mut() else {
             return false;
         };
-        let Some(armed) = menu.armed.take() else {
-            return false;
-        };
-        let over = menu.rows.get(armed).is_some_and(|r| rect_contains(*r, x, y));
-        if !over {
-            return true; // released off the item: cancelled, the menu stays
+        match menu.release(x, y) {
+            MenuRelease::Unarmed => false,
+            MenuRelease::Cancelled => true,
+            MenuRelease::Chosen(action) => {
+                let target = menu.target.clone();
+                self.menu = None;
+                self.apply_menu_action(action, target);
+                self.dirty = true;
+                true
+            }
         }
-        let (action, target) = (menu.items[armed].action, menu.target.clone());
-        self.menu = None;
-        self.apply_menu_action(action, target);
-        self.dirty = true;
-        true
     }
 
     /// Highlight the menu item under the cursor; returns whether it changed.
     fn menu_hover(&mut self) -> bool {
         let (x, y) = self.cursor;
-        let Some(menu) = self.menu.as_mut() else {
-            return false;
-        };
-        let idx = menu.rows.iter().position(|r| rect_contains(*r, x, y));
-        if menu.hover != idx {
-            menu.hover = idx;
-            self.dirty = true;
-            true
-        } else {
-            false
-        }
+        let changed = self.menu.as_mut().is_some_and(|m| m.hover_at(x, y));
+        self.dirty |= changed;
+        changed
     }
 
     fn apply_menu_action(&mut self, action: MenuAction, target: MenuTarget) {
@@ -2048,13 +2190,8 @@ impl State {
                 self.run_file_action(action, &target);
                 return;
             }
-            (MenuAction::View(_), target @ MenuTarget::View(_)) => {
-                let ui = self.ui();
-                let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
-                if let Some(sid) = choose_view_item(&mut self.app, &mut cx, action, &target) {
-                    let out = cx.finish();
-                    self.apply_outcome(sid, out);
-                }
+            (MenuAction::View(id), MenuTarget::View(sid)) => {
+                self.view_event(sid, |v, cx| v.button(cx, id));
                 return;
             }
             (_, MenuTarget::Vtab(target)) => target,
@@ -2085,7 +2222,7 @@ impl State {
     }
 
     /// Open the file menu on `target` at `at`.
-    fn open_file_menu(&mut self, target: FileTarget, at: (f32, f32)) {
+    fn open_file_menu(&mut self, target: FileTarget, at: (f32, f32), align: MenuAlign) {
         if self.app.picker_open() {
             return;
         }
@@ -2099,19 +2236,19 @@ impl State {
             })
             .collect();
         self.palette = None;
-        self.menu = Some(Menu::new(MenuTarget::File(target), at, items));
+        self.menu = Some(Menu::new(MenuTarget::File(target), at, align, items));
         self.dirty = true;
     }
 
-    /// Open surface `sid`'s own menu of `items` at `at`. Not over the picker,
-    /// which draws above menus.
-    fn open_view_menu(&mut self, sid: SurfaceId, items: Vec<MenuItem>, at: (f32, f32)) {
-        if self.app.picker_open() || items.is_empty() {
+    /// Open surface `sid`'s own menu of `items` at `at` (the picker's view's
+    /// too: the menu draws above the picker).
+    fn open_view_menu(&mut self, sid: SurfaceId, items: Vec<MenuItem>, at: (f32, f32), align: MenuAlign) {
+        if items.is_empty() {
             return;
         }
         let items = items.into_iter().map(MenuRow::of_view).collect();
         self.palette = None;
-        self.menu = Some(Menu::new(MenuTarget::View(sid), at, items));
+        self.menu = Some(Menu::new(MenuTarget::View(sid), at, align, items));
         self.dirty = true;
     }
 
@@ -3169,27 +3306,27 @@ impl State {
         placements
     }
 
-    /// Build the context-menu overlay (panel, hover pill, check marks); shape
-    /// item labels and hints into `menu_buffers`; record row/panel rects for
-    /// hit-testing. Returns placements.
+    /// Build the context-menu overlay (panel, hover pill, rules, check marks)
+    /// into `quads`; shape item labels and hints into `menu_buffers`; record
+    /// the hit rects. Returns placements.
     fn build_menu(&mut self, sw: f32, sh: f32, quads: &mut Vec<QuadInstance>) -> Vec<Placement> {
-        let (items, anchor, hover) = match &self.menu {
-            Some(m) => (m.items.clone(), m.anchor, m.hover),
+        let (items, anchor, align, hover) = match &self.menu {
+            Some(m) => (m.items.clone(), m.anchor, m.align, m.hover),
             None => return Vec::new(),
         };
         let metrics = self.metrics();
         let ui = self.ui();
-        let pad = 8.0 * self.scale;
-        let row_h = self.cell_h + 6.0 * self.scale;
-        let gap = self.cell_w;
         let n = items.len();
         while self.menu_buffers.len() < n * 2 {
             let b = Buffer::new(&mut self.text.font_system, metrics);
             self.menu_buffers.push(b);
         }
-        let shape = |buf: &mut Buffer, text: &str, width: f32, color: [u8; 3], fs: &mut FontSystem| -> f32 {
+        // Shaped unbounded, one line each; placements clip them to their
+        // layout rects. Returns the shaped width.
+        let cell_h = self.cell_h;
+        let shape = |buf: &mut Buffer, text: &str, color: [u8; 3], fs: &mut FontSystem| -> f32 {
             buf.set_metrics(metrics);
-            buf.set_size(Some(width.max(1.0)), Some(self.cell_h));
+            buf.set_size(None, Some(cell_h));
             buf.set_rich_text(
                 std::iter::once((text, attrs_for(color))),
                 &Attrs::new().family(Family::SansSerif),
@@ -3199,109 +3336,67 @@ impl State {
             buf.shape_until_scroll(fs, false);
             buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
         };
-        // Hints are shaped first: they are right-aligned, so their widths set
-        // the panel's.
         let mut hint_w = vec![0.0f32; n];
         for (i, item) in items.iter().enumerate() {
+            let color = if item.enabled { [230, 230, 240] } else { theme::DIM };
+            shape(&mut self.menu_buffers[i], &item.label, color, &mut self.text.font_system);
             if let Some(hint) = &item.hint {
-                let buf = &mut self.menu_buffers[n + i];
-                hint_w[i] = shape(buf, hint, sw, theme::TEXT_DIM, &mut self.text.font_system);
+                hint_w[i] = shape(&mut self.menu_buffers[n + i], hint, theme::TEXT_DIM, &mut self.text.font_system);
             }
         }
-        let check_w = if items.iter().any(|i| i.checked.is_some()) { self.cell_h * 0.8 } else { 0.0 };
-        let right_w = items
-            .iter()
-            .zip(&hint_w)
-            .map(|(item, hw)| {
-                let check = if item.checked.is_some() { check_w } else { 0.0 };
-                let hint = if item.hint.is_some() { hw + if check > 0.0 { gap } else { 0.0 } } else { 0.0 };
-                check + hint
-            })
-            .fold(0.0, f32::max);
-        let right_w = if right_w > 0.0 { right_w + gap * 2.0 } else { 0.0 };
-        let maxlen = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(6) as f32;
-        let panel_w = (maxlen * self.cell_w + pad * 3.0 + right_w).min(sw * 0.6);
-        // A rule takes less height than an item.
-        let rule_h = 9.0 * self.scale;
-        let height_of = |a: &MenuAction| if matches!(a, MenuAction::Rule) { rule_h } else { row_h };
-        let panel_h = items.iter().map(|i| height_of(&i.action)).sum::<f32>() + pad;
-        let px = anchor.0.min((sw - panel_w).max(0.0)).max(0.0);
-        let py = anchor.1.min((sh - panel_h).max(0.0)).max(0.0);
+        let layout = menu_layout(&items, &hint_w, anchor, align, (sw, sh), ui);
 
         // The hover pill sits `inset` inside the panel; the panel's corners
         // are the pill's grown by it, so the two curves run parallel.
-        let inset = pad * 0.5;
+        let inset = 4.0 * self.scale;
         let pill_r = theme::pill_radius(ui);
-        let panel = Rect { x: px, y: py, w: panel_w, h: panel_h };
         let border = (theme::hairline(ui), theme::INPUT_BORDER, 1.0);
-        quads.push(round_quad(panel, sw, sh, pill_r + inset, [34, 34, 42], 0.98, Some(border)));
-
-        let mut rows = Vec::with_capacity(n);
+        quads.push(round_quad(layout.panel, sw, sh, pill_r + inset, [34, 34, 42], 0.98, Some(border)));
+        let bounds_of = |r: Rect| TextBounds {
+            left: r.x as i32,
+            top: r.y as i32,
+            right: (r.x + r.w) as i32,
+            bottom: (r.y + r.h) as i32,
+        };
         let mut placements = Vec::with_capacity(n * 2);
-        let mut ry = py + pad * 0.5;
-        for (i, item) in items.iter().enumerate() {
-            let row_y = ry;
-            ry += height_of(&item.action);
+        for (i, (item, row)) in items.iter().zip(&layout.rows).enumerate() {
+            let rect = row.rect;
             if matches!(item.action, MenuAction::Rule) {
+                let pad = 8.0 * self.scale;
                 let line_h = theme::hairline(ui);
                 quads.push(rect_quad(
-                    Rect { x: px + pad, y: row_y + (rule_h - line_h) * 0.5, w: panel_w - pad * 2.0, h: line_h },
+                    Rect { x: rect.x + pad, y: rect.y + (rect.h - line_h) * 0.5, w: rect.w - pad * 2.0, h: line_h },
                     sw,
                     sh,
                     [90, 90, 105],
                     1.0,
                 ));
-                // Not clickable: an empty rect never contains the cursor.
-                rows.push(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
                 continue;
             }
-            let ry = row_y;
-            let rrect = Rect { x: px, y: ry, w: panel_w, h: row_h };
             if hover == Some(i) {
-                let pill = Rect { x: px + inset, w: panel_w - inset * 2.0, ..rrect };
-                quads.push(round_quad(pill, sw, sh, pill_r, self.chrome.accent, 0.5, None));
+                let pill = Rect { x: rect.x + inset, w: rect.w - inset * 2.0, ..rect };
+                quads.push(round_quad(pill, sw, sh, pill_r, theme::HOVER_BG, theme::HOVER_ALPHA, None));
             }
-            let bounds = TextBounds {
-                left: px as i32,
-                top: ry as i32,
-                right: (px + panel_w) as i32,
-                bottom: (ry + row_h) as i32,
-            };
-            let top = ry + (row_h - self.cell_h) * 0.5;
-            // Right to left: the hint against the right edge, the check mark
-            // left of it.
-            let mut right = px + panel_w - pad;
-            if item.hint.is_some() {
-                let color = theme::TEXT_DIM;
-                placements.push(Placement { idx: n + i, left: right - hint_w[i], top, bounds, color });
-                right -= hint_w[i] + gap;
+            let top = rect.y + (rect.h - self.cell_h) * 0.5;
+            if let Some(h) = row.hint {
+                // Right-aligned; a hint cut short keeps its start.
+                let left = (h.x + h.w - hint_w[i]).max(h.x);
+                placements.push(Placement { idx: n + i, left, top, bounds: bounds_of(h), color: theme::TEXT_DIM });
             }
-            if item.checked == Some(true) {
-                let s = check_w;
-                let (x, y) = (right - s, ry + (row_h - s) * 0.5);
+            if let Some(c) = row.check {
                 let w = (1.5 * self.scale).max(1.0);
-                // On the accent hover pill, an accent check would fade out.
-                let color = match (item.enabled, hover == Some(i)) {
-                    (false, _) => theme::DIM,
-                    (true, true) => [230, 230, 240],
-                    (true, false) => self.chrome.accent,
-                };
-                let pts = [(0.15, 0.55), (0.4, 0.8), (0.85, 0.25)].map(|(u, v)| (x + u * s, y + v * s));
+                let color = if item.enabled { self.chrome.accent } else { theme::DIM };
+                let pts = [(0.15, 0.55), (0.4, 0.8), (0.85, 0.25)].map(|(u, v)| (c.x + u * c.w, c.y + v * c.h));
                 for seg in pts.windows(2) {
                     quads.push(line_quad(seg[0], seg[1], w, false, sw, sh, color, 1.0));
                 }
             }
-            // The label is cut short of the check mark and hint.
-            let label_w = if item.checked.is_some() { right - check_w - gap } else { right } - px - pad;
             let color = if item.enabled { [230, 230, 240] } else { theme::DIM };
-            shape(&mut self.menu_buffers[i], &item.label, label_w, color, &mut self.text.font_system);
-            placements.push(Placement { idx: i, left: px + pad, top, bounds, color });
-            rows.push(if item.enabled { rrect } else { Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            placements.push(Placement { idx: i, left: row.label.x, top, bounds: bounds_of(row.label), color });
         }
 
         if let Some(m) = self.menu.as_mut() {
-            m.rows = rows;
-            m.panel = panel;
+            m.place(&layout);
         }
         placements
     }
@@ -3464,6 +3559,13 @@ impl State {
                 }
             }
         }
+        // A context menu is dismissed by Escape (one over the picker before
+        // the picker); other keys pass through.
+        if self.menu.is_some() && matches!(event.logical_key, WKey::Named(NamedKey::Escape)) {
+            self.menu = None;
+            self.dirty = true;
+            return;
+        }
         // The picker, when open, owns the keyboard: Escape cancels,
         // Cmd+Enter confirms, everything else drives its file browser.
         if self.app.picker_open() {
@@ -3488,12 +3590,6 @@ impl State {
         // The palette, when open, owns the keyboard.
         if self.palette.is_some() {
             self.palette_key(event);
-            return;
-        }
-        // A context menu is dismissed by Escape; other keys pass through.
-        if self.menu.is_some() && matches!(event.logical_key, WKey::Named(NamedKey::Escape)) {
-            self.menu = None;
-            self.dirty = true;
             return;
         }
         // Cmd chords: the app's own (settings, keybindings) match first; unbound
@@ -4297,16 +4393,19 @@ impl State {
         } else {
             Vec::new()
         };
-        let menu_placements = if self.menu.is_some() {
-            self.build_menu(sw, sh, &mut frame.top)
-        } else {
-            Vec::new()
-        };
         // Floating picker and confirmation (modal overlays). Their text joins the
         // overlay pass.
         self.build_picker(&mut frame);
         self.build_confirm(&mut frame);
         self.build_tooltip(&mut frame);
+        // The menu draws after every other overlay, quads and text, so one
+        // opened from the picker's view shows above the picker.
+        let mut menu_quads = Vec::new();
+        let menu_placements = if self.menu.is_some() {
+            self.build_menu(sw, sh, &mut menu_quads)
+        } else {
+            Vec::new()
+        };
 
         self.images.prepare(
             &self.device,
@@ -4318,8 +4417,10 @@ impl State {
         );
         let n_bg = frame.bg.len() as u32;
         let n_top = frame.top.len();
+        let n_menu = menu_quads.len();
         let mut quads = std::mem::take(&mut frame.bg);
         quads.extend_from_slice(&frame.top);
+        quads.extend_from_slice(&menu_quads);
         self.upload_quads(&quads);
 
         self.viewport.update(
@@ -4450,8 +4551,9 @@ impl State {
             )
             .context("text prepare")?;
 
-        // Palette, menu and the picker are mutually exclusive; each draws
-        // above everything via the overlay text renderer (each from its own pool).
+        // The palette and the picker are mutually exclusive; each draws above
+        // everything but the menu via the overlay text renderer (each from its
+        // own pool).
         let overlay_areas: Vec<TextArea> = if !palette_placements.is_empty() {
             palette_placements
                 .iter()
@@ -4465,22 +4567,10 @@ impl State {
                     custom_glyphs: &[],
                 })
                 .collect()
-        } else if !menu_placements.is_empty() {
-            menu_placements
-                .iter()
-                .map(|p| TextArea {
-                    buffer: &self.menu_buffers[p.idx],
-                    left: p.left,
-                    top: p.top,
-                    scale: 1.0,
-                    bounds: p.bounds,
-                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                    custom_glyphs: &[],
-                })
-                .collect()
         } else {
             frame.overlay_text.iter().filter_map(area).collect()
         };
+        let has_overlay_text = !overlay_areas.is_empty();
         if !overlay_areas.is_empty() {
             self.palette_renderer
                 .prepare(
@@ -4493,6 +4583,29 @@ impl State {
                     &mut self.swash_cache,
                 )
                 .context("overlay prepare")?;
+        }
+        // The menu's text, in a pass of its own after its quads.
+        if !menu_placements.is_empty() {
+            let areas = menu_placements.iter().map(|p| TextArea {
+                buffer: &self.menu_buffers[p.idx],
+                left: p.left,
+                top: p.top,
+                scale: 1.0,
+                bounds: p.bounds,
+                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+                custom_glyphs: &[],
+            });
+            self.menu_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .context("menu prepare")?;
         }
         // No text pass references the row cache any more: trim it to its cap.
         self.text.row_cache.end_frame();
@@ -4566,13 +4679,19 @@ impl State {
                 pass.draw(0..4, n_bg..total);
             }
             self.images.draw_overlay(&mut pass, self.config.width, self.config.height);
-            if !palette_placements.is_empty()
-                || !menu_placements.is_empty()
-                || !frame.overlay_text.is_empty()
-            {
+            if has_overlay_text {
                 self.palette_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .context("overlay render")?;
+            }
+            if n_menu > 0 {
+                let (start, end) = ((n_bg as usize + n_top) as u32, (n_bg as usize + n_top + n_menu) as u32);
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
+                pass.draw(0..4, start..end);
+                self.menu_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .context("menu render")?;
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -5194,49 +5313,146 @@ mod tests {
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
 
-    /// A view that records the buttons it hears.
-    struct Buttons(Vec<u32>);
+    mod menus {
+        use super::super::{call_view, menu_layout, Menu, MenuAction, MenuRelease, MenuRow, MenuTarget};
+        use crate::app_state::{AppState, Pick, PICKER_SID};
+        use crate::plugin::{testing::UI, EventCx, MenuAlign, MenuItem};
+        use ghostrealm_core::{Rect, SurfaceId};
 
-    impl crate::plugin::View for Buttons {
-        fn plugin(&self) -> &'static str {
-            "buttons"
+        fn centre(r: Rect) -> (f32, f32) {
+            (r.x + r.w / 2.0, r.y + r.h / 2.0)
         }
-        fn paint(&mut self, _cx: &mut crate::plugin::PaintCx, _rect: Rect) {}
-        fn button(&mut self, cx: &mut crate::plugin::EventCx, id: u32) {
-            self.0.push(id);
-            cx.redraw();
+
+        fn rows(items: Vec<MenuItem>) -> Vec<MenuRow> {
+            items.into_iter().map(MenuRow::of_view).collect()
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
+
+        /// A menu as `open_view_menu` makes it, laid out and placed as
+        /// `build_menu` does; with each row's band.
+        fn open(target: MenuTarget, items: Vec<MenuItem>, hint_w: &[f32], align: MenuAlign) -> (Menu, Vec<Rect>) {
+            let mut menu = Menu::new(target, (400.0, 50.0), align, rows(items));
+            let layout = menu_layout(&menu.items, hint_w, menu.anchor, align, (800.0, 600.0), UI);
+            menu.place(&layout);
+            (menu, layout.rows.iter().map(|r| r.rect).collect())
         }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
+
+        #[test]
+        fn only_enabled_items_take_hover_and_clicks_and_fire_on_release_over_the_same_item() {
+            let items = vec![
+                MenuItem::new(1, "Soft wrap").check(true),
+                MenuItem::RULE,
+                MenuItem::new(2, "Autosave").check(false).enable(false),
+                MenuItem::new(3, "Bytes"),
+            ];
+            let (mut m, bands) = open(MenuTarget::View(SurfaceId(5)), items, &[0.0; 4], MenuAlign::Left);
+            let [wrap, rule, autosave, bytes] = [0, 1, 2, 3].map(|i| centre(bands[i]));
+
+            assert!(m.hover_at(wrap.0, wrap.1));
+            assert_eq!(m.hover, Some(0));
+            assert!(!m.hover_at(wrap.0, wrap.1 + 1.0), "same item");
+            for (x, y) in [rule, autosave] {
+                m.hover_at(x, y);
+                assert_eq!(m.hover, None, "a rule or a disabled item takes no hover");
+                // A press on one stays in the menu but arms nothing.
+                assert!(m.press(x, y));
+                assert_eq!(m.release(x, y), MenuRelease::Unarmed);
+            }
+            // Released off the armed item: cancelled.
+            assert!(m.press(wrap.0, wrap.1));
+            assert_eq!(m.release(bytes.0, bytes.1), MenuRelease::Cancelled);
+            // Released over it: chosen.
+            assert!(m.press(bytes.0, bytes.1));
+            assert_eq!(m.release(bytes.0, bytes.1), MenuRelease::Chosen(MenuAction::View(3)));
+            assert!(m.press(wrap.0, wrap.1));
+            assert_eq!(m.release(wrap.0, wrap.1), MenuRelease::Chosen(MenuAction::View(1)));
+            // Outside the panel: the menu closes.
+            assert!(!m.press(m.panel.x - 5.0, wrap.1));
         }
-    }
 
-    #[test]
-    fn choosing_a_view_menu_item_calls_the_views_button_with_its_id() {
-        use super::{choose_view_item, MenuAction, MenuTarget};
-        use crate::app_state::AppState;
-        use crate::plugin::{testing::UI, EventCx};
+        /// The picker's file browser can open a menu (its toggles live in
+        /// `⋯`); the chosen item reaches the picker's view, as `view_event`
+        /// delivers it.
+        #[test]
+        fn a_menu_from_the_pickers_view_dispatches_to_the_picker() {
+            const BTN_HIDDEN: u32 = 1;
+            let mut app = AppState::new();
+            app.open_picker(Pick::ActiveRoot);
+            let items = vec![MenuItem::new(BTN_HIDDEN, "Hidden files").check(false), MenuItem::new(99, "Nothing")];
+            let (mut m, _) = open(MenuTarget::View(PICKER_SID), items, &[0.0; 2], MenuAlign::Right);
+            let cfg = ghostrealm_core::Config::default();
+            let mut choose = |m: &mut Menu, i: usize| {
+                let (x, y) = centre(m.rows[i]);
+                assert!(m.press(x, y));
+                let MenuRelease::Chosen(MenuAction::View(id)) = m.release(x, y) else {
+                    panic!("item {i} wasn't chosen");
+                };
+                let MenuTarget::View(sid) = m.target.clone() else { panic!("a view menu") };
+                let mut cx = EventCx::new(&cfg, UI, Default::default(), None);
+                assert!(call_view(&mut app, sid, &mut cx, |v, cx| v.button(cx, id)), "the picker's view");
+                cx.finish().redraw
+            };
+            assert!(choose(&mut m, 0), "the picker's browser toggled hidden files");
+            assert!(!choose(&mut m, 1), "an id it doesn't know does nothing");
+        }
 
-        let mut app = AppState::new();
-        app.new_view_vtab("v", Box::new(Buttons(Vec::new())));
-        let sid = app.focused_surface().expect("the view's surface");
-        let cfg = ghostrealm_core::Config::default();
-        let mut cx = EventCx::new(&cfg, UI, Default::default(), None);
+        #[test]
+        fn a_right_aligned_menu_ends_at_its_anchor_and_stays_on_screen() {
+            let items = || rows(vec![MenuItem::new(1, "Soft wrap")]);
+            let at = |anchor, align| menu_layout(&items(), &[0.0], anchor, align, (800.0, 600.0), UI).panel;
+            let p = at((400.0, 50.0), MenuAlign::Right);
+            assert_eq!((p.x + p.w, p.y), (400.0, 50.0));
+            let p = at((400.0, 50.0), MenuAlign::Left);
+            assert_eq!((p.x, p.y), (400.0, 50.0));
+            assert_eq!(at((10.0, 50.0), MenuAlign::Right).x, 0.0, "clamped at the left edge");
+            let p = at((790.0, 590.0), MenuAlign::Left);
+            assert!(p.x + p.w <= 800.0 && p.y + p.h <= 600.0, "clamped at the right and bottom");
+        }
 
-        let ran = choose_view_item(&mut app, &mut cx, MenuAction::View(7), &MenuTarget::View(sid));
-        assert_eq!(ran, Some(sid));
-        assert!(cx.finish().redraw, "the view's outcome comes back to apply");
-        let heard = |app: &AppState| app.view(sid).unwrap().downcast_ref::<Buttons>().unwrap().0.clone();
-        assert_eq!(heard(&app), [7]);
+        #[test]
+        fn hint_sits_right_with_the_check_left_of_it_and_a_narrow_menu_cuts_the_hint_first() {
+            let items = || {
+                rows(vec![
+                    MenuItem::new(1, "Show file tree").check(true).with_hint("Shift Cmd Y"),
+                    MenuItem::new(2, "Preview tabs").check(true),
+                    MenuItem::new(3, "Off").check(false),
+                ])
+            };
+            let hint_w = [90.0, 0.0, 0.0];
+            let wide = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (800.0, 600.0), UI);
+            let (r0, r1, r2) = (&wide.rows[0], &wide.rows[1], &wide.rows[2]);
+            let (hint, check) = (r0.hint.unwrap(), r0.check.unwrap());
+            let edge = wide.panel.x + wide.panel.w - 8.0;
+            assert_eq!(hint.x + hint.w, edge, "the hint is flush with the right padding");
+            assert_eq!(hint.w, 90.0, "room for the whole hint");
+            assert!(check.x + check.w <= hint.x, "the check mark is left of the hint");
+            assert!(r0.label.x + r0.label.w <= check.x, "the label stops before the check");
+            assert_eq!(r1.check.unwrap().x + r1.check.unwrap().w, edge, "no hint: the check is at the edge");
+            assert!(r2.check.is_none(), "unchecked: no mark");
+            assert!(r2.label.x + r2.label.w <= edge - UI.cell_h * 0.8, "but its column stays reserved");
 
-        let mut cx = EventCx::new(&cfg, UI, Default::default(), None);
-        let other = MenuTarget::View(SurfaceId(sid.0 + 100));
-        assert_eq!(choose_view_item(&mut app, &mut cx, MenuAction::View(8), &other), None, "no such view");
-        assert_eq!(choose_view_item(&mut app, &mut cx, MenuAction::Close, &MenuTarget::View(sid)), None);
-        assert_eq!(heard(&app), [7], "only a view item on a view runs");
+            // Narrow: the hint is cut, then dropped; nothing goes left of the
+            // padding and the label keeps its minimum.
+            for sw in [300.0, 200.0, 120.0, 60.0, 10.0] {
+                let l = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (sw, 600.0), UI);
+                let left = l.panel.x + 8.0;
+                for r in &l.rows {
+                    assert!(r.label.x >= left && r.label.w >= 0.0);
+                    for part in [r.hint, r.check].into_iter().flatten() {
+                        assert!(part.x >= left, "at {sw}: {part:?} left of the padding");
+                        assert!(part.x >= r.label.x + r.label.w, "at {sw}: overlaps the label");
+                    }
+                }
+                let r0 = &l.rows[0];
+                if let Some(h) = r0.hint {
+                    assert!(h.w >= UI.cell_w && h.w <= 90.0, "too narrow to read is dropped");
+                }
+                let (keep, inner) = (6.0 * UI.cell_w, (l.panel.w - 16.0).max(0.0));
+                assert!(r0.label.w >= keep.min(inner) - 0.01, "at {sw}: label {}", r0.label.w);
+            }
+            let narrow = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (200.0, 600.0), UI);
+            let h = narrow.rows[0].hint;
+            assert!(h.is_none_or(|h| h.w < 90.0), "the hint is cut or dropped: {h:?}");
+        }
     }
 
     #[test]

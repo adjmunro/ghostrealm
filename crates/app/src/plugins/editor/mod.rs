@@ -27,7 +27,7 @@ use crate::syntax;
 use crate::plugin::icons::Icon;
 use crate::plugin::text_edit::{edit_for, Edit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
+    hover_box, rect_contains, theme, EventCx, Font, MenuAlign, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
     Request, RowStyles, View, Waker,
 };
 
@@ -433,6 +433,7 @@ impl EditorView {
             cx.request(Request::FileMenu {
                 target: FileTarget { path, kind: TargetKind::File, origin: Origin::Editor },
                 at,
+                align: MenuAlign::Left,
             });
         }
     }
@@ -978,7 +979,7 @@ impl View for EditorView {
             BTN_MORE => {
                 if let Some(mb) = self.more_hit {
                     let items = self.ribbon_menu(cx.cfg);
-                    cx.request(Request::Menu { items, at: (mb.x, mb.y + mb.h) });
+                    cx.request(Request::Menu { items, at: (mb.x, mb.y + mb.h), align: MenuAlign::Left });
                 }
                 return;
             }
@@ -1358,11 +1359,12 @@ mod tests {
         let name = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_NAME).expect("a name button").0;
         let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Editor };
         let out = h.button(&mut v, BTN_NAME);
-        assert_eq!(out.requests, [Request::FileMenu { target: target.clone(), at: (name.x, name.y + name.h) }]);
+        let at = (name.x, name.y + name.h);
+        assert_eq!(out.requests, [Request::FileMenu { target: target.clone(), at, align: MenuAlign::Left }]);
         // Right-click anywhere on the ribbon; not on the text.
         let at = (RECT.w - 2.0, 3.0);
         let out = h.context_menu(&mut v, at);
-        assert_eq!(out.requests, [Request::FileMenu { target, at }]);
+        assert_eq!(out.requests, [Request::FileMenu { target, at, align: MenuAlign::Left }]);
         assert!(h.context_menu(&mut v, (50.0, 100.0)).requests.is_empty(), "text has no menu");
         // Hovering the name highlights it (the button convention).
         let quads = |h: &Harness| h.frame.bg.len() + h.frame.top.len();
@@ -1385,7 +1387,7 @@ mod tests {
         let more = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_MORE).expect("a ⋯ button").0;
         assert!(more.x + more.w <= RECT.w, "at the right end");
         let menu = |h: &Harness, v: &mut EditorView| match h.button(v, BTN_MORE).requests.as_slice() {
-            [Request::Menu { items, at }] => {
+            [Request::Menu { items, at, .. }] => {
                 assert_eq!(*at, (more.x, more.y + more.h), "opens below the button");
                 items.clone()
             }
