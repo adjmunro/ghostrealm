@@ -468,6 +468,22 @@
   - The file browser's preview colours Markdown but does not draw the styles.
   - Bold has no synthetic fallback: a monospace family without a bold face
     shows the nearest weight (italic is skewed by the shaper).
+  - From GitHub issue #1 (2026-10-16@3443db3e):
+    - Code look: inline code and fenced blocks want a rounded box with a
+      defined border and a calmer colour scheme; the tint (`RunStyle::BOX`,
+      `theme::CODE_BG`) reads as a warning. Compare GitHub and Android Studio.
+    - Headings differ only in weight; they should differ in size. Needs a font
+      size per span, so variable row heights: an architectural change to the
+      row cache, `PaintCx` rows, and every view's row-to-y mapping.
+    - Three view modes per file, switched by a ribbon button: Preview
+      (rendered, read-only), Source (plain, editable), Integrated (source chars
+      with the formatting, editable; Markdown's mixed mode). Extend to other
+      languages: TOML `[table]`s as large headers (they render bold today
+      because TOML and Markdown share `Token::Heading`, which `syntax.rs` maps
+      to bold; the owner likes it, so keep it as the seed); Kotlin top-level
+      classes as H1 shrinking with nesting, functions and non-local properties
+      as H3/H5; a Kotlin Preview could render doc comments and generated
+      diagrams (relationships, method flow).
 - Owner, verbatim:
   > Okay, yeah, I still really want the bold and italics and markdown, so we
   > better plumb that. Try and make it efficient, though. Like, I don't think
@@ -560,6 +576,8 @@
   symbols once an LSP is wired. Clicking a header scrolls so it sits mid-screen.
   Undecided: where the list lives (side panel, ribbon dropdown, palette-like
   popup), nesting, whether it tracks the cursor's current section.
+  GitHub issue #1 proposes the Claude Code app's sticky table of contents:
+  collapsed in a corner, expands on hover, click to jump, unaffected by scroll.
 - Reason: navigate long files (the config included) by structure.
 
 ---
@@ -927,9 +945,15 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] DISCUSSION (design together before building): editor and file browser as one surface
+[2026-10-13T20:25+1300@e9617b8] Editor and file browser as one surface
 
-- Requires: a design session with the owner; do not build yet
+- Requires: the implementation plan (being written separately)
+- Decided (2026-10-16@3443db3e, GitHub issue #1): clone the Claude Code app's
+  file browser and editor: one pinnable file sidebar shared by every tab, file
+  tabs (single-click opens an ephemeral preview tab, double-click a real one),
+  and its filter/search box, plus the other things the issue says the owner
+  likes. The existing preview maybe stays for non-text files (images, audio).
+  The shapes below are the earlier candidates.
 - Detail: Two candidate shapes:
   - One tab, Claude Code style: a show/hide file tree, a filter box (with a
     "? to search in files" hint), and the document.
@@ -945,6 +969,19 @@
   - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.
 - Reason: owner review; the file browser and editor overlap, and the choice
   decides several smaller features.
+- Owner, verbatim (the decision):
+  > What I mean is that the way that the Claude Code file browser does it that
+  > I've highlighted in the issue there is how I think I would like it to work.
+  > That seems to be my conclusion on the um, merging of the editor and the file
+  > browser. I think um, I think that might also invalidate the preview split
+  > stuff. Um, because now we're talking more about a sidebar rather than a
+  > preview. Um, although maybe the preview still exists for non-text files.
+  > Um, and also, like, keeping some parts of the preview, stuff, but um, yeah,
+  > we want to move more towards this kind of integrated with different file
+  > tabs, I think. Basically, I'm I want you to mostly clone what Claude Code
+  > did, and make it look very much like that, apart from a few things. Like,
+  > all of those things in the issue that I've pointed out, that I like, that
+  > means I would like you to add those things, or do those things.
 - Owner, verbatim (the design):
   > Actually maybe the editor and file browser should just be the same thing???
   > I've also attached some pictures. One of them is how Claude Code shows a
@@ -1312,3 +1349,23 @@
   > machine.
 - Reason: CEF should stay current; check whether a new version breaks the build
   without leaving old copies behind.
+
+---
+
+[2026-10-16T21:23+1300@3443db3e] Ribbon overflow menu
+
+- Requires: NO BLOCKERS
+- Detail: A three-dots button in the ribbon lists every ribbon option
+  (soft-wrap, autosave, ...); a config option chooses which of them also show
+  as ribbon icons.
+- Reason: GitHub issue #1; keeps the ribbon usable when narrow.
+
+---
+
+[2026-10-16T21:23+1300@3443db3e] Comment mode
+
+- Requires: NO BLOCKERS
+- Detail: Anchor comment threads to parts of a file (a line or range), shown
+  beside the text. Uses: talking to agents about specific lines, and showing a
+  PR's review threads.
+- Reason: GitHub issue #1 (seen in the Claude Code app).
