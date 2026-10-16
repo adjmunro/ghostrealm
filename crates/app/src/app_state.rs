@@ -151,6 +151,8 @@ enum Leave {
     Quit,
     /// One surface (tab) in a pane.
     Surface(VtabId, PaneId, SurfaceId),
+    /// One document of a surface; the surface too when it was the last.
+    Doc(VtabId, PaneId, SurfaceId, DocId),
     /// A pane and every surface in it.
     Pane(VtabId, PaneId),
     /// A workspace and everything in it.
@@ -995,17 +997,22 @@ impl AppState {
         }
     }
 
-    /// Close the active surface of the focused pane. Closing the last surface of a
-    /// split collapses the pane; closing the last surface of the sole pane leaves
-    /// the workspace on its empty screen. On an empty pane, closing collapses the
-    /// split (when it's one of several) or, if it's the sole pane, closes the
-    /// workspace.
+    /// Close the document the focused pane's active surface shows, and the
+    /// surface with it when that was its last (a view that is its own one
+    /// document closes at once). Closing the last surface of a split
+    /// collapses the pane; closing the last surface of the sole pane leaves
+    /// the workspace on its empty screen. On an empty pane, closing collapses
+    /// the split (when it's one of several) or, if it's the sole pane, closes
+    /// the workspace.
     pub fn close_focused_surface(&mut self) {
         let Some((vt, pane)) = self.focused_pane() else {
             return;
         };
         if let Some(sid) = self.focused_surface() {
-            self.leave(Leave::Surface(vt, pane, sid));
+            self.leave(match self.active_doc(sid) {
+                Some((_, doc)) => Leave::Doc(vt, pane, sid, doc),
+                None => Leave::Surface(vt, pane, sid),
+            });
             return;
         }
         // Empty pane: collapse the split if there are siblings, else close the vtab.
@@ -1056,7 +1063,7 @@ impl AppState {
     /// The surfaces `what` removes, in tree order.
     fn surfaces_in(&self, what: Leave) -> Vec<SurfaceId> {
         let vtabs: Vec<&_> = match what {
-            Leave::Surface(_, _, sid) => return vec![sid],
+            Leave::Surface(_, _, sid) | Leave::Doc(_, _, sid, _) => return vec![sid],
             Leave::Quit => self.tree.vtabs().iter().collect(),
             Leave::Pane(vt, _) | Leave::Vtab(vt) => self.tree.vtab(vt).into_iter().collect(),
         };
@@ -1070,7 +1077,10 @@ impl AppState {
 
     /// The documents `what` removes that have unsaved changes.
     fn unsaved_in(&self, what: Leave) -> Vec<DocRef> {
-        let mut docs: Vec<_> = self.surfaces_in(what).into_iter().flat_map(|sid| self.docs_of(sid)).collect();
+        let mut docs = match what {
+            Leave::Doc(_, _, sid, doc) => vec![(sid, doc)],
+            _ => self.surfaces_in(what).into_iter().flat_map(|sid| self.docs_of(sid)).collect(),
+        };
         docs.retain(|d| self.doc(*d).is_some_and(|v| v.modified()));
         docs
     }
@@ -1137,6 +1147,15 @@ impl AppState {
                 false
             }
             Leave::Surface(vt, pane, sid) => s.tree.close_surface(vt, pane, sid),
+            Leave::Doc(vt, pane, sid, doc) => {
+                if s.views.get_mut(&sid).is_none_or(|v| v.close_doc(doc)) {
+                    return s.tree.close_surface(vt, pane, sid);
+                }
+                if let Some(t) = s.views.get(&sid).and_then(|v| v.title()) {
+                    s.tree.set_surface_title(sid, t, false);
+                }
+                false
+            }
             Leave::Pane(vt, pane) => s.tree.close_pane(vt, pane),
             Leave::Vtab(vt) => s.tree.close_vtab(vt),
         });
@@ -1569,7 +1588,7 @@ pub fn build_registry() -> Registry<AppState> {
         CommandMeta::new(
             "pane.close",
             "Close",
-            "Close the focused tab; collapses the pane, then the workspace, when it was the last",
+            "Close the focused tab, or the file it shows when it holds several; collapses the pane, then the workspace, when it was the last",
         ),
         Box::new(|s: &mut AppState, _| {
             s.close_focused_surface();
@@ -2934,5 +2953,57 @@ mod tests {
         assert!(s.confirm().unwrap().message.contains("a.txt"), "{}", s.confirm().unwrap().message);
         assert_eq!(s.accept_confirm().unwrap(), vec![files[0].clone()], "Overwrite");
         assert_eq!(read(&files[0]), "newold\n");
+    }
+
+    #[test]
+    fn close_closes_the_shown_document_then_the_next_then_the_surface() {
+        let dir = crate::plugin::testing::tmpdir("docs-close");
+        let (mut s, sid, files) = two_docs(&dir);
+        edit_doc(&mut s, (sid, B));
+        s.close_focused_surface();
+        let c = s.confirm().expect("the shown document is unsaved");
+        assert!(c.message.contains("b.txt"), "{}", c.message);
+        assert_eq!((c.accept, c.discard), (Some("Save and Close"), Some("Close Without Saving")));
+        s.cancel_confirm();
+        assert_eq!(s.view(sid).unwrap().docs(), [A, B], "Cancel closes nothing");
+
+        s.close_focused_surface();
+        assert_eq!(s.accept_confirm().unwrap(), vec![files[1].clone()]);
+        assert_eq!(read(&files[1]), "newold\n");
+        assert_eq!(s.view(sid).unwrap().docs(), [A], "only the shown document closed");
+        assert_eq!(surface_count(&s), 1);
+
+        s.close_focused_surface();
+        assert!(s.confirm().is_none(), "a.txt has no changes");
+        assert!(s.view(sid).is_none() && surface_count(&s) == 0, "its last document took the surface");
+    }
+
+    #[test]
+    fn closing_a_document_asks_only_about_it_and_closing_its_surface_about_every_one() {
+        let dir = crate::plugin::testing::tmpdir("docs-close-each");
+        let (mut s, sid, files) = two_docs(&dir);
+        edit_doc(&mut s, (sid, A));
+        s.close_focused_surface();
+        assert!(s.confirm().is_none(), "the shown b.txt has no changes; a.txt's don't count");
+        assert_eq!(s.view(sid).unwrap().docs(), [A]);
+
+        // Save and Close over a file another program wrote asks before
+        // writing, then closes the document.
+        std::fs::write(&files[0], "theirs\n").unwrap();
+        s.close_focused_surface();
+        assert!(s.accept_confirm().unwrap().is_empty());
+        assert_eq!(s.confirm().unwrap().accept, Some("Overwrite"));
+        assert_eq!(s.accept_confirm().unwrap(), vec![files[0].clone()]);
+        assert!(s.view(sid).is_none());
+
+        let (mut s, sid, _) = two_docs(&dir);
+        edit_doc(&mut s, (sid, A));
+        edit_doc(&mut s, (sid, B));
+        let (vt, pane) = s.focused_pane().unwrap();
+        s.close_surface(vt, pane, sid);
+        let c = s.confirm().expect("the tab's close button asks about both");
+        assert!(c.message.starts_with("2 buffers have"), "{}", c.message);
+        s.discard_confirm().unwrap();
+        assert!(s.view(sid).is_none());
     }
 }

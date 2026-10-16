@@ -10,3 +10,4 @@ Mutual project lexicon so we both know what we're talking about. Aim to be consi
 - Panel / Pane: a single terminal-or-editor frame within a workspace. One workspace may be geometrically split into multiple panes horizontally or vertically.
 - Command palette: the popup window that allows the user to search and run command actions from the registry.
 - Command registry: the place where all "actions" an "actor" (user->UI button, user->palette, agent->MCP) can take live for lookup and execution.
+- Document: one file a surface shows (`DocId`). Most views are their own single document; a view can host several (one per file tab). Saving, closing (Cmd+W), and the unsaved-changes questions act per document.

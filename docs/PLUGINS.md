@@ -22,6 +22,22 @@ browser, image viewer, ...) should be too. The API lives in
   every other hook defaults to "not interested". Views live in
   `AppState::views` (headless-safe: the agent channel and tests drive them with no
   window).
+- **Documents**: a view may host several files, each a `View` of its own
+  (file tabs inside one surface). `docs()` lists their `DocId`s (default
+  `[DocId::SELF]`: the view is its one document), `active_doc()` is the one
+  shown, `doc(id)` / `doc_mut(id)` return a hosted one (`None`: the view
+  itself is that document), and `dyn View::document(id)` resolves either
+  case. The app asks documents, not the view, about files: `path`,
+  `modified`, `disk_conflict`, `save_as`, `save_copy`, `reload`,
+  `changed_on_disk`, `autosave`. Save, Save As, and a view's
+  `Request::SaveAs`/`SaveConflict` act on the active document. Close (Cmd+W)
+  asks about the active document's unsaved changes, then calls
+  `close_doc(id)`; it returns whether no document is left, which closes the
+  surface. Closing the surface or quitting asks about every unsaved document.
+  Everything else (input, paint, pump, timers, `files_changed`) reaches the
+  view, which passes it on. `title`, `modified`, `path`,
+  `marked_changed_on_disk`, `write_input`, and `text` default to the active
+  document's.
 
 The app owns the window, GPU, fonts, layout, focus, tab strips, sidebar, and
 overlays. A view owns everything inside its content rect.
@@ -162,7 +178,7 @@ into the overlay layer; it doesn't need to know.
   once the file worker, `file_jobs`, finishes it, which may be after the
   command returned): a listing re-reads, a view of a moved file follows it
   (`file_ops::follow`).
-  `changed_on_disk(path)` is asked, for each open view's `path`, to check
+  `changed_on_disk(path)` is asked, for each open document's `path`, to check
   whether another program wrote the file (the app polls every 2 s while the
   window is focused and on window focus): a view showing it with no unsaved
   changes re-reads it; one with unsaved changes keeps them and marks itself.
