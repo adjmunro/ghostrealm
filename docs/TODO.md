@@ -388,19 +388,16 @@
 
 ---
 
-[2026-10-05T20:35+1300@3f581979] File browser — preview pane follow-ups
+[2026-10-05T20:35+1300@3f581979] Files surface — media follow-ups
 
 - Requires: NO BLOCKERS
-- Detail: The preview (details, text head, images, audio) is in. Remaining:
+- Detail: Images and audio open as a Files surface's `MediaView`. Remaining:
   - **video**: decode + play (an ffmpeg-class dependency decision; spike
     separately). Reuse the audio controls and `PaintCx::image` per frame.
-  - **opening media**: clicking an image/audio file in the browser opens it in
-    the editor (the catch-all). Add an image/audio viewer plugin that claims
-    those paths (the preview's loader and player are the parts to reuse).
-  - **autoplay toggle**: the preview's `autoplay` button is a per-pane override
+  - **autoplay toggle**: the `autoplay` button is a per-document override
     of `[file_browser] preview_autoplay`; write it back to the config instead,
     if that is the wanted behaviour.
-  - **wake, not poll**: the preview polls its loader on a 15 ms timer while a
+  - **wake, not poll**: `MediaView` polls its loader on a 15 ms timer while a
     load is in flight. `View::refresh` (repaint without marking unread) would
     replace the poll once the loader wakes the UI (`OpenCx::waker`) and the
     floating picker's view is refreshed like a pane's.
@@ -798,16 +795,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] File browser: should the preview follow hover?
-
-- Requires: the user tries the behaviour before deciding
-- Detail: Decide whether the preview follows hover, the selection, or a pinned
-  row. See [stack-review-findings-2.md](stack-review-findings-2.md) item 34.
-- Reason: moving the pointer to the preview's controls crosses rows and switches
-  the subject.
-
----
-
 [2026-10-13T19:46+1300@d292715] Reduce dependencies
 
 - Requires: NO BLOCKERS (later work, not now)
@@ -949,22 +936,12 @@
 
 - Requires: the implementation plan (written separately)
 - Decided (2026-10-16@ad13ff26, GitHub issue #1): clone the Claude Code app's
-  file browser and editor: one pinnable file sidebar shared by every tab, file
-  tabs (single-click opens an ephemeral preview tab, double-click a real one),
-  and its filter/search box, plus the other things the issue says the owner
-  likes. The existing preview maybe stays for non-text files (images, audio).
-  The design: the Files surface owns its own sidebar and inner file-tab row;
-  documents are child views.
-- Detail: The candidate shapes (the first was chosen):
-  - One tab, Claude Code style: a show/hide file tree, a filter box (with a
-    "? to search in files" hint), and the document.
-  - The file browser hosts pluggable viewers (image, audio, text preview/editor);
-    the image and audio ones relate to "File browser — preview pane follow-ups".
-  Related, for the plan to cover:
-  - **File-browser pin**: a pin icon. Pinned: opening a file puts the editor in
-    a new tab or split. Unpinned: an integrated editor inside the browser (a
-    back button, or collapse/expand of the browser). Maybe pin left / pin right
-    / unpin. Maybe text previews keep focus on the browser.
+  file browser and editor (DECISION.md). The Files surface exists with its
+  pinnable sidebar, document header, and one document. Remaining: file tabs
+  (single-click opens an ephemeral preview tab, double-click a real one) in
+  the surface's top row, the "? to search in files" box, and the other things
+  the issue says the owner likes.
+- Detail: Related, for the plan to cover:
   - **Markdown**: shown formatted, with the markup symbols still visible and
     editable. This is the "mixed" mode in "Markdown rich text — follow-ups"; the mixed mode is done.
   - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.

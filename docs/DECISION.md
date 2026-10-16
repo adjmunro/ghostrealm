@@ -147,3 +147,13 @@
 - Detail: Strong preference: agent-operated browser or emulator work happens in the background and does not refocus or distract the human. If it can be done in the background, it is.
 - Detail: Web pop-ups: when a human triggers one, it opens as a floating pop-up window above the whole app while the originating tab stays alive (fallback: a new tab), so `window.opener` and OAuth/payment flows work. When an agent triggers one, it opens hidden, in the background. Pop-ups do not open in place.
 - Reason: owner, verbatim: "it's really distracting when the agent keeps on refocusing on a browser to do things or an emulator to do things while I'm trying to do things as a human. So if you can do things in the background, then that's definitely a preference for agent operated stuff."
+
+---
+
+[2026-10-17T07:53+1300@d3b487aa]
+
+- Category: Architecture / files and editing
+- Detail: Shape S1 from GitHub issue #1: one Files surface (plugin `files`) owns a file sidebar (`FileBrowserView`, `Mode::Sidebar`), its own top row (sidebar button; file tabs next), and its documents as child views (`EditorView`, `MediaView`) under a document header. A pane holding only it autohides its tab strip.
+- Detail: Every file open goes to the focused Files surface, else the workspace's last focused one, else a new one. The editor and file browser are no longer surfaces of their own; their command ids and config sections stay.
+- Detail: The browser's split text preview and `[file_browser] open_in` / `preview_min_width` are gone; images and audio are documents.
+- Reason: owner decision on issue #1 (clone the Claude Code app's file panel); alternatives were per-pane file tabs with a window-level sidebar (S2) and a per-workspace explorer (S3).

@@ -1,18 +1,25 @@
 # Plugins.md
 
-How content kinds plug into the app. The terminal, editor, and file browser are
-built on exactly this API (`crates/app/src/plugins/`); a new kind (Git GUI, web
+How content kinds plug into the app. The terminal, the Files surface (with its
+editor and media documents and file sidebar), and the web view are built on
+exactly this API (`crates/app/src/plugins/`); a new kind (Git GUI, web
 browser, image viewer, ...) should be too. The API lives in
 `crates/app/src/plugin/`.
 
 ## Shape
 
 - **`Plugin`**: a content kind, registered once (`plugins::builtin()`). It has an
-  id (`terminal`, `editor`, `file_browser`), a title, and opens **`View`**s.
-  - `open(&OpenCx)`: a fresh view (new shell, empty buffer, browser at the cwd).
+  id (`terminal`, `files`, `editor`, `file_browser`), a title, and opens **`View`**s.
+  - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
   - `opens_path` / `open_path`: claim a file. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
+    The view it returns is a document: the app shows it in a Files surface
+    (`AppState::open_file`: the focused one, else the workspace's last
+    focused one, else a new one), replacing the document there after the
+    unsaved-changes question. `files` claims images and audio (`MediaView`).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
+    A plugin whose views are only documents (`editor`) or parts of another
+    surface (`file_browser`) isn't.
   - `register_commands`: add palette/keybinding/agent commands (`<id>.new` by
     convention).
   - `config_sections`: the config sections the plugin reads, as catalogue
@@ -39,7 +46,10 @@ browser, image viewer, ...) should be too. The API lives in
   tab's close button and closing a pane, workspace, or the app do. Close
   (Cmd+W) asks about the active document's unsaved changes, then calls
   `close_doc(id)`; the surface closes once `docs()` is empty (at once
-  for a view that is its own document). Everything
+  for a view that is its own document). The Files surface
+  (`plugins::files::FilesView`) is the host: it shows one document, which
+  another open replaces under a new id; showing only its sidebar, it has
+  none. Everything
   else (input, paint, pump, timers, `files_changed`) reaches the view, which
   passes it on. `title`, `path`, `write_input`, and `text` default to the
   active document's; `modified` and `marked_changed_on_disk` (the tab's
@@ -128,8 +138,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   popups, such as the editor's hover docs). While `cx.modal` (a palette, menu,
   picker, or confirmation covers the panes) it paints nothing; close popups
   then, so they don't reappear when the modal goes.
-- `tab_strip` says whether the pane shows a strip; a single-tab view may draw its
-  own header (the editor's filename ribbon).
+- Document header: `plugins::files::header::DocHeader` draws a document's
+  details (name, kind and size, modified) in its rect; the document lays
+  out its controls right to left in `DocHeader::control_row`, then paints
+  the header up to them. An `EditorView` draws one when its host sets
+  `set_header(true)` (the Files surface does); `MediaView` always does.
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
 - Text input: `plugin::text_edit` maps keys to edits through the platform's
@@ -179,7 +192,7 @@ into the overlay layer; it doesn't need to know.
   (agent channel).
 - File menu: `context_menu(pos)` is a right-click inside the view; a view with a
   file or folder to act on files `Request::FileMenu { target, at, align }`
-  (the file browser on its rows and empty space, the editor on its ribbon;
+  (the file browser on its rows and empty space, a document on its header;
   its file name button and its `⋯` menu's "File actions…" file the same
   request, the latter right-aligned at `⋯`). `subject` is the file or folder the `file.*`
   commands act on when given no `path` (default: `path`; the browser's is its
@@ -202,7 +215,7 @@ into the overlay layer; it doesn't need to know.
   `Request::SaveConflict`; Reload stops the close or quit. Autosave (`autosave`, idle, blur) must
   skip a view with a `disk_conflict` rather than ask.
 - Effects outside the view go through `cx.request(Request::…)`, applied after
-  the call returns: `OpenFile` (tab or split per `[file_browser] open_in`),
+  the call returns: `OpenFile` (in a Files surface, as for `opens_path`),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
@@ -215,7 +228,7 @@ into the overlay layer; it doesn't need to know.
   so the menu stays over the view); the app keeps it on screen, draws it
   above every overlay (the picker's view can open one), and runs it like the
   file menu (hover highlight, fires on mouse-up). Choosing an item calls
-  `View::button(id)` with the item's `id`, so an item and a ribbon icon that
+  `View::button(id)` with the item's `id`, so an item and a header icon that
   do the same thing share an id. `MenuItem::new(id, label)`, then
   `.check(on)` (a toggle: a check mark when on), `.with_hint(text)` (dim,
   right-aligned: a shortcut or value; cut short on a narrow window),
@@ -223,7 +236,7 @@ into the overlay layer; it doesn't need to know.
   Build the items when the menu opens, so checks show the current state. A
   menu with no enabled item doesn't open; an open menu closes when a
   confirmation appears or the picker opens or closes under it. The editor
-  ribbon's `⋯` lists every ribbon option this way, and the file browser's
+  header's `⋯` lists every header option this way, and the file browser's
   `⋯` what its listing shows.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
@@ -271,7 +284,7 @@ body with that language's line-local highlighter. A view that edits text keeps a
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a
 `SpanCache` so lines still on screen aren't re-highlighted each frame. A view that
-reads a file once (the browser's preview) runs `highlight_lines` on its worker.
+reads a file once runs `highlight_lines` on its worker.
 A highlighter must bound its work per line: a paint highlights every visible line.
 `Highlighter::comment` declares the language's line and block comment tokens
 (`CommentSyntax`); `comment_on` gives a line's, which differs inside an embedded
