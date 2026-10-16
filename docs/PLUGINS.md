@@ -62,9 +62,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool; `Font` picks family + italic/bold.
-- Rows: `row` (cached by content, always shaped) and `budgeted_row` (cached by
-  content, shaped only within the frame's time budget; past it the position redraws
-  last frame's row and the frame is re-requested). Use `budgeted_row` for bulk
+- Rows: `row` (cached by content, always shaped), `row_font` (the same in
+  another `Font`: a sidebar's sans names, keyed by content and family), and
+  `budgeted_row` (cached by content, shaped only within the frame's time
+  budget; past it the position redraws last frame's row and the frame is
+  re-requested). Use `budgeted_row` for bulk
   content (terminal grid, editor text) and build the key with `row_key` from your
   cells so a cache hit costs no allocation.
 - Styled rows: `budgeted_row_styled` takes `RowStyles { runs, cell_w }`, one

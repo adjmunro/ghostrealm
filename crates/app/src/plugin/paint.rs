@@ -968,6 +968,41 @@ impl<'a> PaintCx<'a> {
         });
     }
 
+    /// [`row`](Self::row) shaped in `font` (a sidebar's sans names): cached
+    /// by content and font, so a row redrawn unchanged isn't reshaped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn row_font(
+        &mut self,
+        spans: &[(String, [u8; 3])],
+        font: Font,
+        left: f32,
+        top: f32,
+        shape_w: f32,
+        clip: Rect,
+        color: [u8; 3],
+    ) {
+        let mut face = RunStyle::PLAIN;
+        if font.bold {
+            face = face | RunStyle::BOLD;
+        }
+        if font.italic {
+            face = face | RunStyle::ITALIC;
+        }
+        let styles = if face.is_plain() { Vec::new() } else { vec![face; spans.len()] };
+        let cells = spans.iter().map(|(s, c)| (s.as_str(), *c));
+        let key = self.text.row_cache.row_key_in(cells, &styles, font.family);
+        let (m, lh) = (self.text.metrics, self.text.line_h);
+        let kit = &mut *self.text;
+        kit.row_cache.ensure_in(key, &mut kit.font_system, m, shape_w, lh, spans, &styles, font.family);
+        self.push_text(TextItem {
+            src: TextSrc::Row(key),
+            left,
+            top,
+            bounds: bounds(clip),
+            color,
+        });
+    }
+
     /// Draw the row with content `key` through the row cache, shaping `spans()`
     /// on a miss only while this frame's shaping budget lasts. Past it, the row
     /// shows what this screen position drew last frame (or nothing on a first

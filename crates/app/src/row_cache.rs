@@ -1,4 +1,5 @@
-//! Content-keyed cache of shaped terminal rows.
+//! Content-keyed cache of shaped rows: terminal and editor lines, and list
+//! rows in another family (a sidebar's sans names).
 //!
 //! A terminal row's shaped glyph layout depends only on its cell contents (their
 //! text and foreground colour) and the current font metrics, not on where the row
@@ -149,6 +150,17 @@ impl RowCache {
         cells: impl Iterator<Item = (&'a str, [u8; 3])>,
         styles: &[RunStyle],
     ) -> u64 {
+        self.row_key_in(cells, styles, Family::Monospace)
+    }
+
+    /// [`row_key_styled`](Self::row_key_styled) for a row shaped in `family`.
+    /// Monospace hashes as `row_key_styled` does, so its rows keep their keys.
+    pub fn row_key_in<'a>(
+        &self,
+        cells: impl Iterator<Item = (&'a str, [u8; 3])>,
+        styles: &[RunStyle],
+        family: Family<'static>,
+    ) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.metrics_gen.hash(&mut h);
         for (text, fg) in cells {
@@ -157,6 +169,9 @@ impl RowCache {
         }
         if !styles.is_empty() {
             styles.hash(&mut h);
+        }
+        if family != Family::Monospace {
+            family.hash(&mut h);
         }
         h.finish()
     }
@@ -174,6 +189,23 @@ impl RowCache {
         line_h: f32,
         spans: &[(String, [u8; 3])],
         styles: &[RunStyle],
+    ) {
+        self.ensure_in(key, font_system, metrics, width, line_h, spans, styles, Family::Monospace);
+    }
+
+    /// [`ensure`](Self::ensure) for a row shaped in `family` (keyed with
+    /// [`row_key_in`](Self::row_key_in)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_in(
+        &mut self,
+        key: u64,
+        font_system: &mut FontSystem,
+        metrics: Metrics,
+        width: f32,
+        line_h: f32,
+        spans: &[(String, [u8; 3])],
+        styles: &[RunStyle],
+        family: Family<'static>,
     ) {
         if let Some(&idx) = self.map.get(&key) {
             let now = self.tick();
@@ -214,7 +246,7 @@ impl RowCache {
         buf.set_rich_text(
             spans.iter().enumerate().map(|(i, (t, c))| {
                 let attrs = Attrs::new()
-                    .family(Family::Monospace)
+                    .family(family)
                     .color(Color::rgb(c[0], c[1], c[2]));
                 let attrs = match styles.get(i) {
                     Some(st) => st.apply(attrs),
@@ -222,7 +254,7 @@ impl RowCache {
                 };
                 (t.as_str(), attrs)
             }),
-            &Attrs::new().family(Family::Monospace),
+            &Attrs::new().family(family),
             shaping,
             None,
         );
@@ -425,5 +457,23 @@ mod tests {
         cache.ensure(k0, &mut fs, m, 400.0, 18.0, &span("row0", [9, 9, 9]), &[]);
         cache.end_frame();
         assert_eq!(cache.stats().1, before.1 + 1, "evicted row0 must miss on return");
+    }
+
+    #[test]
+    fn the_font_family_is_part_of_the_key() {
+        let mut fs = FontSystem::new();
+        let m = Metrics::new(15.0, 18.0);
+        let mut cache = RowCache::new(256);
+        let cells = || std::iter::once(("abc", GREY));
+        let mono = cache.row_key_styled(cells(), &[]);
+        assert_eq!(mono, cache.row_key_in(cells(), &[], Family::Monospace), "monospace keys as before");
+        let sans = cache.row_key_in(cells(), &[], Family::SansSerif);
+        assert_ne!(mono, sans);
+        assert_ne!(sans, cache.row_key_in(cells(), &[], Family::Serif));
+        cache.begin_frame(0);
+        cache.ensure(mono, &mut fs, m, 400.0, 18.0, &span("abc", GREY), &[]);
+        cache.ensure_in(sans, &mut fs, m, 400.0, 18.0, &span("abc", GREY), &[], Family::SansSerif);
+        cache.end_frame();
+        assert_eq!(cache.stats(), (0, 2), "each family shapes its own row");
     }
 }
