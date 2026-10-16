@@ -468,7 +468,7 @@
   - The file browser's preview colours Markdown but does not draw the styles.
   - Bold has no synthetic fallback: a monospace family without a bold face
     shows the nearest weight (italic is skewed by the shaper).
-  - From GitHub issue #1 (2026-10-16@3443db3e):
+  - From GitHub issue #1 (2026-10-16@ad13ff26):
     - Code look: inline code and fenced blocks want a rounded box with a
       defined border and a calmer colour scheme; the tint (`RunStyle::BOX`,
       `theme::CODE_BG`) reads as a warning. Compare GitHub and Android Studio.
@@ -947,19 +947,19 @@
 
 [2026-10-13T20:25+1300@e9617b8] Editor and file browser as one surface
 
-- Requires: the implementation plan (being written separately)
-- Decided (2026-10-16@3443db3e, GitHub issue #1): clone the Claude Code app's
+- Requires: the implementation plan (written separately)
+- Decided (2026-10-16@ad13ff26, GitHub issue #1): clone the Claude Code app's
   file browser and editor: one pinnable file sidebar shared by every tab, file
   tabs (single-click opens an ephemeral preview tab, double-click a real one),
   and its filter/search box, plus the other things the issue says the owner
   likes. The existing preview maybe stays for non-text files (images, audio).
-  The shapes below are the earlier candidates.
-- Detail: Two candidate shapes:
+  Design S1: the Files surface owns its own sidebar and inner tab row.
+- Detail: The candidate shapes (the first was chosen):
   - One tab, Claude Code style: a show/hide file tree, a filter box (with a
     "? to search in files" hint), and the document.
   - The file browser hosts pluggable viewers (image, audio, text preview/editor);
     the image and audio ones relate to "File browser — preview pane follow-ups".
-  Related, to settle in the same session:
+  Related, for the plan to cover:
   - **File-browser pin**: a pin icon. Pinned: opening a file puts the editor in
     a new tab or split. Unpinned: an integrated editor inside the browser (a
     back button, or collapse/expand of the browser). Maybe pin left / pin right
@@ -1352,7 +1352,7 @@
 
 ---
 
-[2026-10-16T21:23+1300@3443db3e] Ribbon overflow menu
+[2026-10-16T21:23+1300@ad13ff26] Ribbon overflow menu
 
 - Requires: NO BLOCKERS
 - Detail: A three-dots button in the ribbon lists every ribbon option
@@ -1362,7 +1362,7 @@
 
 ---
 
-[2026-10-16T21:23+1300@3443db3e] Comment mode
+[2026-10-16T21:23+1300@ad13ff26] Comment mode
 
 - Requires: NO BLOCKERS
 - Detail: Anchor comment threads to parts of a file (a line or range), shown
