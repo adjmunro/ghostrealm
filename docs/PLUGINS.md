@@ -180,16 +180,20 @@ into the overlay layer; it doesn't need to know.
   explicit save found the file changed on disk: the app asks before writing),
   `FileMenu` (open the file menu on a target), `Menu` (open the view's own
   menu).
-- View menu: `Request::Menu { items, at }` opens a menu of the view's own at
-  `at` (physical px; clamped on-screen), drawn and run by the app like the
+- View menu: `Request::Menu { items, at, align }` opens a menu of the view's
+  own with its top edge at `at` (physical px) and its left or right edge
+  there per `align` (`MenuAlign::Right` for a button at the view's right end,
+  so the menu stays over the view); the app keeps it on screen, draws it
+  above every overlay (the picker's view can open one), and runs it like the
   file menu (hover highlight, fires on mouse-up). Choosing an item calls
   `View::button(id)` with the item's `id`, so an item and a ribbon icon that
   do the same thing share an id. `MenuItem::new(id, label)`, then
   `.check(on)` (a toggle: a check mark when on), `.with_hint(text)` (dim,
-  right-aligned: a shortcut or value), `.enable(false)` (dim, not choosable);
-  `MenuItem::RULE` separates sections. Build the items when the menu opens,
-  so checks show the current state. Not shown while the picker is open. The
-  editor ribbon's `⋯` lists every ribbon option this way.
+  right-aligned: a shortcut or value; cut short on a narrow window),
+  `.enable(false)` (dim, not choosable); `MenuItem::RULE` separates sections.
+  Build the items when the menu opens, so checks show the current state. The
+  editor ribbon's `⋯` lists every ribbon option this way. `FileMenu` takes
+  an `align` too.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules
