@@ -612,6 +612,26 @@ impl AppState {
         view.docs().contains(&doc).then_some((sid, doc))
     }
 
+    /// Close document `doc` of its view. Returns whether the surface is left
+    /// with no document (so it should close): a view that is its own
+    /// document, or one whose `docs()` is now empty. Otherwise the tab title
+    /// follows the document now shown.
+    fn close_doc(&mut self, (sid, doc): DocRef) -> bool {
+        let Some(view) = self.views.get_mut(&sid) else { return true };
+        if view.doc(doc).is_none() {
+            return true;
+        }
+        let none_left = view.close_doc(doc);
+        let empty = view.docs().is_empty();
+        debug_assert_eq!(none_left, empty, "close_doc's answer disagrees with docs()");
+        if !empty {
+            if let Some(t) = view.title() {
+                self.tree.set_surface_title(sid, t, false);
+            }
+        }
+        empty
+    }
+
     /// Every document of surface `sid`, in its tab order.
     fn docs_of(&self, sid: SurfaceId) -> Vec<DocRef> {
         self.views.get(&sid).map(|v| v.docs().into_iter().map(|d| (sid, d)).collect()).unwrap_or_default()
@@ -1031,8 +1051,8 @@ impl AppState {
         self.leave(Leave::Vtab(id));
     }
 
-    /// Close surface `sid` wherever it is, as the Close command would if it
-    /// were the focused pane's active surface.
+    /// Close surface `sid` wherever it is, whole: every document in it,
+    /// asking first about any with unsaved changes.
     pub fn close_surface_id(&mut self, sid: SurfaceId) {
         let found = self.tree.vtabs().iter().find_map(|v| {
             v.panes().iter().find(|p| p.surfaces.iter().any(|s| s.id == sid)).map(|p| (v.id, p.id))
@@ -1148,11 +1168,8 @@ impl AppState {
             }
             Leave::Surface(vt, pane, sid) => s.tree.close_surface(vt, pane, sid),
             Leave::Doc(vt, pane, sid, doc) => {
-                if s.views.get_mut(&sid).is_none_or(|v| v.close_doc(doc)) {
+                if s.close_doc((sid, doc)) {
                     return s.tree.close_surface(vt, pane, sid);
-                }
-                if let Some(t) = s.views.get(&sid).and_then(|v| v.title()) {
-                    s.tree.set_surface_title(sid, t, false);
                 }
                 false
             }
@@ -2889,6 +2906,11 @@ mod tests {
         s.view_mut(sid).and_then(|v| v.downcast_mut::<DocsView>()).unwrap().active = index;
     }
 
+    fn tab_title(s: &AppState, sid: SurfaceId) -> String {
+        let surfaces = s.tree.vtabs().iter().flat_map(|v| v.panes()).flat_map(|p| p.surfaces.iter());
+        surfaces.filter(|t| t.id == sid).map(|t| t.title.clone()).next().unwrap()
+    }
+
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
     }
@@ -2972,6 +2994,7 @@ mod tests {
         assert_eq!(read(&files[1]), "newold\n");
         assert_eq!(s.view(sid).unwrap().docs(), [A], "only the shown document closed");
         assert_eq!(surface_count(&s), 1);
+        assert_eq!(tab_title(&s, sid), "a.txt", "the tab names the document now shown");
 
         s.close_focused_surface();
         assert!(s.confirm().is_none(), "a.txt has no changes");
@@ -3005,5 +3028,42 @@ mod tests {
         assert!(c.message.starts_with("2 buffers have"), "{}", c.message);
         s.discard_confirm().unwrap();
         assert!(s.view(sid).is_none());
+    }
+
+    #[test]
+    fn closing_a_document_before_the_shown_one_keeps_it_shown() {
+        let dir = crate::plugin::testing::tmpdir("docs-close-earlier");
+        let mut s = AppState::new().with_unsaved_guard();
+        s.new_empty_vtab();
+        let mut docs = Vec::new();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(n), "old\n").unwrap();
+            docs.push(s.view_for_path(Some(editor::ID), &dir.join(n)).unwrap());
+        }
+        let mut view = DocsView::new(docs);
+        view.active = 1;
+        s.open_view_in_focused(Box::new(view));
+        let sid = s.focused_surface().unwrap();
+        assert_eq!(tab_title(&s, sid), "b.txt");
+        let (vt, pane) = s.focused_pane().unwrap();
+        s.leave(Leave::Doc(vt, pane, sid, A));
+        let view = s.view(sid).unwrap();
+        assert_eq!((view.docs(), view.active_doc()), (vec![B, DocId(3)], B));
+        assert_eq!(tab_title(&s, sid), "b.txt");
+    }
+
+    #[test]
+    fn the_tab_shows_unsaved_and_changed_on_disk_for_any_document() {
+        let dir = crate::plugin::testing::tmpdir("docs-markers");
+        let (mut s, sid, files) = two_docs(&dir);
+        let view = s.view(sid).unwrap();
+        assert!(!view.modified() && !view.marked_changed_on_disk());
+        edit_doc(&mut s, (sid, A));
+        std::fs::write(&files[0], "theirs\n").unwrap();
+        assert!(s.check_open_files());
+        let view = s.view(sid).unwrap();
+        assert!(view.modified() && view.marked_changed_on_disk(), "a.txt isn't shown but counts");
+        assert_eq!(view.title().as_deref(), Some("b.txt"), "the title is the shown document's");
+        assert!(!s.doc((sid, B)).unwrap().modified(), "each document answers for itself");
     }
 }

@@ -131,7 +131,8 @@ impl Harness {
 
 /// A view hosting several documents, each a view of its own: the shape of a
 /// Files surface, for tests of the app's per-document handling. Ids start at
-/// 1, so none is [`DocId::SELF`]; keys and paint go to the active document.
+/// 1, so none is [`DocId::SELF`]. It forwards `paint` and `key` to the active
+/// document and `files_changed` to every one; nothing else.
 pub struct DocsView {
     pub docs: Vec<(DocId, Box<dyn View>)>,
     pub active: usize,
@@ -187,7 +188,12 @@ impl View for DocsView {
     }
 
     fn close_doc(&mut self, id: DocId) -> bool {
-        self.docs.retain(|(d, _)| *d != id);
+        if let Some(i) = self.docs.iter().position(|(d, _)| *d == id) {
+            self.docs.remove(i);
+            if i < self.active {
+                self.active -= 1;
+            }
+        }
         self.active = self.active.min(self.docs.len().saturating_sub(1));
         self.docs.is_empty()
     }

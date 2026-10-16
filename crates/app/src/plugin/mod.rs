@@ -127,9 +127,12 @@ pub trait Plugin {
     }
 }
 
-/// One document of a view: a file it shows. Ids are the view's own and stay
-/// fixed while that document is open; a view that is a single document is
-/// [`DocId::SELF`].
+/// One document of a view: a file it shows. Ids are the view's own, never
+/// reused within it, and not positions: a document keeps its id while open,
+/// and one that is replaced (a preview tab showing another file) gets a new
+/// one. The app holds ids across questions (Save As, a save conflict, Close)
+/// and must not reach a different file through a stale one. A view that is
+/// a single document is [`DocId::SELF`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DocId(pub u32);
 
@@ -148,9 +151,13 @@ impl DocId {
 /// the view, about its file: `path`, `modified`, `disk_conflict`, `save_as`,
 /// `save_copy`, `reload`, `changed_on_disk`, `autosave`. Everything else
 /// (input, paint, pump, timers, `files_changed`) goes to the view, which
-/// passes it on to its documents. Where one answer stands for the whole view
-/// (the tab title, the agent channel), the defaults take the active
-/// document's.
+/// passes it on to its documents. A [`Request`] names no document, so the
+/// app applies one to the active document. Where one answer stands for the
+/// whole view, the defaults take the active document's (the tab title, the
+/// agent channel), except the tab's unsaved and changed-on-disk markers,
+/// which show when any document has them: the tab's close button asks about
+/// every one. A view implementing [`doc`](Self::doc) implements
+/// [`doc_mut`](Self::doc_mut) too.
 pub trait View: Any {
     /// The id of the plugin that opened this view.
     fn plugin(&self) -> &'static str;
@@ -160,9 +167,10 @@ pub trait View: Any {
         self.doc(self.active_doc()).and_then(|d| d.title())
     }
 
-    /// Unsaved changes (the tab title shows italic).
+    /// Unsaved changes (the tab title shows italic): in any document, for a
+    /// view hosting several.
     fn modified(&self) -> bool {
-        self.doc(self.active_doc()).is_some_and(|d| d.modified())
+        self.docs().into_iter().any(|id| self.doc(id).is_some_and(|d| d.modified()))
     }
 
     /// The documents the view hosts, in tab order. Empty when it shows no
@@ -183,14 +191,16 @@ pub trait View: Any {
         None
     }
 
-    /// [`doc`](Self::doc), mutably.
+    /// [`doc`](Self::doc), mutably. Required with `doc`: the app reaches a
+    /// document through both.
     fn doc_mut(&mut self, _id: DocId) -> Option<&mut dyn View> {
         None
     }
 
     /// Close document `id`. Its unsaved changes were saved or given up
     /// already (the app asks first). Returns whether the view has no document
-    /// left, which closes its surface.
+    /// left; the app closes the surface when [`docs`](Self::docs) is empty.
+    /// Not called for a view that is its own document: its surface closes.
     fn close_doc(&mut self, _id: DocId) -> bool {
         true
     }
@@ -315,9 +325,9 @@ pub trait View: Any {
     }
 
     /// The view is marked as differing from its file on disk (the tab title
-    /// shows amber).
+    /// shows amber): any document, for a view hosting several.
     fn marked_changed_on_disk(&self) -> bool {
-        self.doc(self.active_doc()).is_some_and(|d| d.marked_changed_on_disk())
+        self.docs().into_iter().any(|id| self.doc(id).is_some_and(|d| d.marked_changed_on_disk()))
     }
 
     /// Whether writing the view's file now would overwrite a version it has

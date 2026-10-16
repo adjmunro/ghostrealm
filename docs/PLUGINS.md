@@ -26,18 +26,24 @@ browser, image viewer, ...) should be too. The API lives in
   (file tabs inside one surface). `docs()` lists their `DocId`s (default
   `[DocId::SELF]`: the view is its one document), `active_doc()` is the one
   shown, `doc(id)` / `doc_mut(id)` return a hosted one (`None`: the view
-  itself is that document), and `dyn View::document(id)` resolves either
-  case. The app asks documents, not the view, about files: `path`,
-  `modified`, `disk_conflict`, `save_as`, `save_copy`, `reload`,
-  `changed_on_disk`, `autosave`. Save, Save As, and a view's
-  `Request::SaveAs`/`SaveConflict` act on the active document. Close (Cmd+W)
-  asks about the active document's unsaved changes, then calls
-  `close_doc(id)`; it returns whether no document is left, which closes the
-  surface. Closing the surface or quitting asks about every unsaved document.
-  Everything else (input, paint, pump, timers, `files_changed`) reaches the
-  view, which passes it on. `title`, `modified`, `path`,
-  `marked_changed_on_disk`, `write_input`, and `text` default to the active
-  document's.
+  itself is that document; implement both or neither), and
+  `dyn View::document(id)` resolves either case. An id is never reused
+  within a view and is not a position: a replaced document (a preview tab
+  showing another file) gets a new id, so a question holding one (Save As, a
+  save conflict, Close) can't reach a different file. The app asks
+  documents, not the view, about files: `path`, `modified`,
+  `disk_conflict`, `save_as`, `save_copy`, `reload`, `changed_on_disk`,
+  `autosave`. A `Request` names no document: the app applies it to the
+  active document (`SaveAs`, `SaveConflict`), except `Close`, which closes
+  the whole surface and asks about every unsaved document in it, as the
+  tab's close button and closing a pane, workspace, or the app do. Close
+  (Cmd+W) asks about the active document's unsaved changes, then calls
+  `close_doc(id)`; the surface closes once `docs()` is empty (at once
+  for a view that is its own document). Everything
+  else (input, paint, pump, timers, `files_changed`) reaches the view, which
+  passes it on. `title`, `path`, `write_input`, and `text` default to the
+  active document's; `modified` and `marked_changed_on_disk` (the tab's
+  italic and amber) to whether any document is.
 
 The app owns the window, GPU, fonts, layout, focus, tab strips, sidebar, and
 overlays. A view owns everything inside its content rect.

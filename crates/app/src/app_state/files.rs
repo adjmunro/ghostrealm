@@ -522,8 +522,7 @@ impl AppState {
         let open = self.docs_under(path);
         self.system.trash(path).with_context(|| format!("can't move {} to the Trash", path.display()))?;
         for (sid, doc) in open {
-            let Some(view) = self.views.get_mut(&sid) else { continue };
-            if !view.close_doc(doc) {
+            if !self.views.contains_key(&sid) || !self.close_doc((sid, doc)) {
                 continue;
             }
             let place = self.tree.vtabs().iter().find_map(|v| {
@@ -1111,6 +1110,8 @@ mod tests {
         run(&mut s, "file.delete", &[("path", &files[1])]).unwrap();
         s.accept_confirm().unwrap();
         assert_eq!(s.view(sid).unwrap().docs(), [DocId(1)], "only b.txt's document closed");
+        let title = s.tree.vtabs()[0].panes()[0].surfaces.iter().find(|t| t.id == sid).unwrap().title.clone();
+        assert_eq!(title, "c.txt", "the tab names the document now shown");
         run(&mut s, "file.delete", &[("path", &d.join("c.txt"))]).unwrap();
         s.accept_confirm().unwrap();
         assert!(s.view(sid).is_none(), "the surface closed with its last document");

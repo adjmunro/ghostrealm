@@ -93,8 +93,9 @@ pub enum Request {
     ///
     /// [`View::button`]: super::View::button
     Menu { items: Vec<MenuItem>, at: (f32, f32), align: MenuAlign },
-    /// Close the view's surface, as the Close command would. A terminal whose
-    /// shell exited asks this on the next key.
+    /// Close the view's whole surface, every document in it, asking first
+    /// about any with unsaved changes (as the tab's close button does). A
+    /// terminal whose shell exited asks this on the next key.
     Close,
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
