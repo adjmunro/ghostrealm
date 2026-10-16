@@ -953,7 +953,8 @@
   tabs (single-click opens an ephemeral preview tab, double-click a real one),
   and its filter/search box, plus the other things the issue says the owner
   likes. The existing preview maybe stays for non-text files (images, audio).
-  Design S1: the Files surface owns its own sidebar and inner tab row.
+  The design: the Files surface owns its own sidebar and inner file-tab row;
+  documents are child views.
 - Detail: The candidate shapes (the first was chosen):
   - One tab, Claude Code style: a show/hide file tree, a filter box (with a
     "? to search in files" hint), and the document.
