@@ -10,12 +10,11 @@
 //! one confirming chooses.
 //!
 //! A wide enough browser shows a [`preview`] of the highlighted (else selected)
-//! entry beside the list; the header's `preview` toggle overrides the width rule.
+//! entry beside the list; the `⋯` menu's Preview overrides the width rule.
 
 pub(crate) mod preview;
 
 use std::any::Any;
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
@@ -25,7 +24,6 @@ use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::fs_tree::{FileRow, FsTree, FsView, GitFilter};
 use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Config, Rect, Registry};
 use ghostrealm_terminal::{Key, KeyPress};
-use glyphon::Family;
 
 use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
@@ -33,7 +31,7 @@ use crate::plugin::icons::{FileKind, Icon};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
-    Request, UiMetrics, View, Waker,
+    MenuItem, Request, UiMetrics, View, Waker,
 };
 use preview::PreviewPane;
 
@@ -48,13 +46,27 @@ const UNMATCHED_FG: [u8; 3] = [175, 175, 188];
 /// the keyboard's, which is the answer.
 const HOVER_SHARE: f32 = 0.5;
 
-/// Header button ids (see [`View::button`]).
+/// Button ids (see [`View::button`]); the `⋯` menu's items reuse them.
 const BTN_PARENT: u32 = 0;
 const BTN_HIDDEN: u32 = 1;
 const BTN_IGNORED: u32 = 2;
-const BTN_GIT: u32 = 3;
-const BTN_VIEW: u32 = 4;
+const BTN_GIT_MODIFIED: u32 = 3;
+const BTN_GIT_UNTRACKED: u32 = 4;
 const BTN_PREVIEW: u32 = 5;
+const BTN_MORE: u32 = 6;
+const BTN_CLEAR: u32 = 7;
+/// `BTN_GROUP + i` shows [`VIEWS`]`[i]`. Past [`preview`]'s ids.
+const BTN_GROUP: u32 = 20;
+
+/// The listings the `⋯` menu offers, with their labels.
+const VIEWS: [(FsView, &str); 6] = [
+    (FsView::Tree, "Tree"),
+    (FsView::Extension, "Group by type"),
+    (FsView::Kind, "Group by kind"),
+    (FsView::GitStatus, "Group by git status"),
+    (FsView::Modified, "Group by date modified"),
+    (FsView::Size, "Group by size"),
+];
 
 /// The preview's share of the browser's width.
 const PREVIEW_SHARE: f32 = 0.45;
@@ -117,7 +129,7 @@ impl Plugin for FileBrowserPlugin {
                     Kind::Int { min: 0, max: 10_000 },
                     Some("900"),
                     "Show the preview (details, text, images, audio) beside the list once the \
-                     browser is at least this many logical px wide. The header's `preview` toggle \
+                     browser is at least this many logical px wide. Preview in the browser's `⋯` menu \
                      overrides it per pane.",
                 ),
                 OptionSpec::new(
@@ -209,6 +221,8 @@ pub struct FileBrowserView {
     preview_shown: bool,
     /// Scroll the chosen entry into view at the next paint.
     reveal_chosen: bool,
+    /// The `⋯` button as last painted, which its menu opens under.
+    more_hit: Option<Rect>,
 }
 
 impl FileBrowserView {
@@ -232,6 +246,7 @@ impl FileBrowserView {
             preview_on: None,
             preview_shown: false,
             reveal_chosen: false,
+            more_hit: None,
             field: FieldMouse::default(),
             name_field: FieldMouse::default(),
         }
@@ -414,19 +429,23 @@ impl FileBrowserView {
     /// [`Mode::Save`]'s file-name row, at the bottom of `rect`. Returns its
     /// height.
     fn paint_name_field(&self, cx: &mut PaintCx, rect: Rect) -> f32 {
-        let scale = cx.ui.scale;
-        let ch = cx.ui.cell_h;
-        let pad = 8.0 * scale;
-        let h = ch + 10.0 * scale;
+        let ui = cx.ui;
+        let pad = (8.0 * ui.scale).round();
+        let h = header_height(ui);
         let row = Rect { x: rect.x, y: rect.y + rect.h - h, w: rect.w, h };
-        cx.fill(row, cx.chrome.sidebar);
-        let label = "Name";
-        let label_w = label.chars().count() as f32 * cx.ui.cell_w;
-        cx.label(label, Family::SansSerif, row.x + pad, row.y + (h - ch) * 0.5, row, theme::LABEL);
-        let inset = 4.0 * scale;
-        let x = row.x + label_w + pad * 2.0;
-        let field = Rect { x, y: row.y + inset, w: (row.x + row.w - pad - x).max(1.0), h: h - inset * 2.0 };
-        let geom = widgets::text_field(cx, field, &self.name, "file name", true);
+        let label = cx.shape("Name", Font::SANS, row.w);
+        cx.place(label, row.x + pad, row.y + (h - ui.cell_h) * 0.5, row, theme::LABEL);
+        let x = (row.x + pad * 2.0 + label.width).round();
+        let field_h = row_height(ui);
+        let field = Rect {
+            x,
+            y: row.y + ((h - field_h) * 0.5).round(),
+            w: (row.x + row.w - pad - x).max(1.0),
+            h: field_h,
+        };
+        field_box(cx, field, cx.focused);
+        let text = Rect { x: field.x + pad * 0.5, w: (field.w - pad).max(1.0), ..field };
+        let geom = widgets::field_text(cx, text, &self.name, "file name", cx.focused);
         self.name_field.painted(cx, geom);
         h
     }
@@ -615,76 +634,50 @@ impl FileBrowserView {
         }
     }
 
-    /// The header: parent button, input field, and the filter/view toggles.
-    /// Returns the header height.
+    /// The header: the parent button, the filter box (a search icon, the
+    /// input, and a clear button once it holds text), and `⋯` (the listing
+    /// options). Returns the header height.
     fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect, value: &LineEdit, editable: bool) -> f32 {
-        let scale = cx.ui.scale;
-        let ch = cx.ui.cell_h;
-        let pad = 8.0 * scale;
-        let header_h = ch + 10.0 * scale;
-        let header = Rect { x: rect.x, y: rect.y, w: rect.w, h: header_h };
-        cx.fill(header, cx.chrome.sidebar);
-        let hy = rect.y + (header_h - ch) * 0.5;
+        let ui = cx.ui;
+        let pad = (8.0 * ui.scale).round();
+        let header_h = header_height(ui);
+        let side = row_height(ui);
+        let y = rect.y + ((header_h - side) * 0.5).round();
 
-        // Parent (..) on the left.
-        let par_w = cx.ui.cell_w * 3.0;
-        let par_hit = Rect { x: rect.x, y: rect.y, w: par_w + pad, h: header_h };
-        let hov = cx.button(par_hit, BTN_PARENT);
-        if hov {
-            cx.highlight(par_hit);
-        }
-        let color = if hov { theme::LABEL_HOVER } else { theme::LABEL };
-        cx.label("..", Family::Monospace, rect.x + pad, hy, par_hit, color);
+        let up = Rect { x: (rect.x + pad * 0.5).round(), y, w: side, h: side };
+        icon_button(cx, up, BTN_PARENT, Icon::ChevronUp, "Parent folder");
+        let more = Rect { x: (rect.x + rect.w - pad * 0.5 - side).round(), ..up };
+        icon_button(cx, more, BTN_MORE, Icon::More, "More options");
+        self.more_hit = Some(more);
 
-        // Toggles on the right, right to left.
-        let t = &self.tree;
-        // An ellipsis on the git controls while their status loads.
-        let loading = |label: &'static str, git: bool| -> Cow<'static, str> {
-            if git && t.git_status_loading() {
-                format!("{label}\u{2026}").into()
-            } else {
-                label.into()
-            }
+        // Saving types into the name field, so this one takes no keys there.
+        let typed_into = self.mode != Mode::Save;
+        let x = up.x + up.w + (pad * 0.5).round();
+        let field = Rect { x, y, w: (more.x - (pad * 0.5).round() - x).max(1.0), h: side };
+        field_box(cx, field, cx.focused && typed_into);
+        let icon_side = (ui.cell_h * 0.8).round();
+        let icon = Rect {
+            x: field.x + pad,
+            y: field.y + ((side - icon_side) * 0.5).round(),
+            w: icon_side,
+            h: icon_side,
         };
-        let git_on = t.git_filter() != GitFilter::All;
-        let toggles = [
-            ("preview".into(), self.preview_shown, BTN_PREVIEW),
-            ("hidden".into(), t.show_hidden(), BTN_HIDDEN),
-            (".gitignore".into(), t.show_gitignored(), BTN_IGNORED),
-            (loading(t.git_filter().label(), git_on), git_on, BTN_GIT),
-            (loading(t.view().label(), t.view() == FsView::GitStatus), t.view() != FsView::Tree, BTN_VIEW),
-        ];
-        // The git filter, grouped views, and preview act on files, which a
-        // directory picker never lists.
-        let file_only = |id: u32| id == BTN_GIT || id == BTN_VIEW || id == BTN_PREVIEW;
-        let dirs_only = self.mode == Mode::PickDir;
-        // Each toggle's hit area is its label plus `tpad` on both sides; the
-        // areas tile, so the padding is also the gap between labels.
-        let tpad = 5.0 * scale;
-        let mut right = rect.x + rect.w - pad;
-        for (label, on, id) in toggles.into_iter().filter(|t| !(dirs_only && file_only(t.2))) {
-            let w = label.chars().count() as f32 * cx.ui.cell_w;
-            let hit = Rect { x: right - w - tpad, y: rect.y, w: w + tpad * 2.0, h: header_h };
-            if cx.button(hit, id) {
-                cx.highlight(hit);
-            }
-            let color = if on { theme::LABEL_HOVER } else { theme::DIM };
-            cx.label(&label, Family::SansSerif, hit.x + tpad * 0.5, hy, hit, color);
-            right -= w + tpad * 2.0;
+        Icon::Search.paint(cx, icon, theme::DIM);
+        let mut text_right = field.x + field.w - pad * 0.5;
+        if typed_into && !value.is_empty() {
+            let clear = Rect { x: field.x + field.w - side, w: side, ..field };
+            icon_button(cx, clear, BTN_CLEAR, Icon::Close, "Clear");
+            text_right = clear.x;
         }
-
-        // The input field fills the space between.
-        let box_x = rect.x + par_w + pad * 2.0;
-        let inset = 4.0 * scale;
-        let field = Rect {
-            x: box_x,
-            y: rect.y + inset,
-            w: (right - box_x - pad).max(1.0),
-            h: header_h - inset * 2.0,
+        let text_x = icon.x + icon.w + pad * 0.5;
+        let text = Rect { x: text_x, w: (text_right - text_x).max(1.0), ..field };
+        // A browser filters; a picker also goes where a typed path leads, so
+        // it shows where it is.
+        let hint = match self.mode {
+            Mode::Browse => "Filter files".to_string(),
+            _ => self.tree.root().display().to_string(),
         };
-        let root = self.tree.root().display().to_string();
-        // Saving types into the name field instead.
-        let geom = widgets::text_field(cx, field, value, &root, self.mode != Mode::Save);
+        let geom = widgets::field_text(cx, text, value, &hint, cx.focused && typed_into);
         if editable {
             self.field.painted(cx, geom);
         } else {
@@ -692,6 +685,65 @@ impl FileBrowserView {
         }
         header_h
     }
+
+    /// The `⋯` menu: what the listing shows, checked as it stands. A
+    /// directory picker lists no files, so it offers only what hides folders.
+    fn options_menu(&self) -> Vec<MenuItem> {
+        let t = &self.tree;
+        let mut items = vec![
+            MenuItem::new(BTN_HIDDEN, "Hidden files").check(t.show_hidden()),
+            MenuItem::new(BTN_IGNORED, "Git-ignored files").check(t.show_gitignored()),
+        ];
+        if self.mode == Mode::PickDir {
+            return items;
+        }
+        // The git choices say so while the status they need loads.
+        let loading = |item: MenuItem| match item.checked == Some(true) && t.git_status_loading() {
+            true => item.with_hint("loading\u{2026}"),
+            false => item,
+        };
+        items.push(MenuItem::RULE);
+        for (id, label, filter) in [
+            (BTN_GIT_MODIFIED, "Only modified", GitFilter::Modified),
+            (BTN_GIT_UNTRACKED, "Only untracked", GitFilter::Untracked),
+        ] {
+            items.push(loading(MenuItem::new(id, label).check(t.git_filter() == filter)));
+        }
+        items.push(MenuItem::RULE);
+        for (i, (view, label)) in VIEWS.into_iter().enumerate() {
+            let item = MenuItem::new(BTN_GROUP + i as u32, label).check(t.view() == view);
+            items.push(if view == FsView::GitStatus { loading(item) } else { item });
+        }
+        items.push(MenuItem::RULE);
+        items.push(MenuItem::new(BTN_PREVIEW, "Preview").check(self.preview_shown));
+        items
+    }
+}
+
+/// A filter or name field's rounded box: outlined, in the focus colour while
+/// typing goes to it.
+fn field_box(cx: &mut PaintCx, r: Rect, focused: bool) {
+    let border = if focused {
+        (theme::focus_ring_w(cx.ui), theme::FIELD_FOCUS_BORDER, 1.0)
+    } else {
+        (theme::hairline(cx.ui), theme::INPUT_BORDER, 1.0)
+    };
+    cx.round_rect(r, theme::box_radius(cx.ui), cx.chrome.background, 1.0, Some(border));
+}
+
+/// An icon button filling `r`: a rounded hover highlight, the icon brighter
+/// under the pointer, and a tooltip naming it.
+fn icon_button(cx: &mut PaintCx, r: Rect, id: u32, icon: Icon, tip: &str) {
+    let hover = cx.button(r, id);
+    if hover {
+        let inset = (2.0 * cx.ui.scale).round();
+        let hl = Rect { x: r.x + inset, y: r.y + inset, w: r.w - inset * 2.0, h: r.h - inset * 2.0 };
+        cx.round_rect(hl, theme::box_radius(cx.ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
+    }
+    cx.tooltip(r, tip);
+    let side = (cx.ui.cell_h * 0.8).round();
+    let at = Rect { x: r.x + ((r.w - side) * 0.5).round(), y: r.y + ((r.h - side) * 0.5).round(), w: side, h: side };
+    icon.paint(cx, at, if hover { theme::GLYPH_HOVER } else { theme::GLYPH });
 }
 
 impl View for FileBrowserView {
@@ -1065,8 +1117,26 @@ impl View for FileBrowserView {
         if self.preview.button(cx, id) {
             return;
         }
+        match id {
+            BTN_MORE => {
+                if let Some(mb) = self.more_hit {
+                    let items = self.options_menu();
+                    cx.request(Request::Menu { items, at: (mb.x + mb.w, mb.y + mb.h), align: MenuAlign::Right });
+                }
+                return;
+            }
+            BTN_CLEAR => {
+                self.tree.set_query("");
+                self.clear_highlight();
+                self.sync_input();
+                cx.redraw();
+                return;
+            }
+            _ => {}
+        }
         let sel = self.sel_path();
         let t = &mut self.tree;
+        let git = |t: &FsTree, f: GitFilter| if t.git_filter() == f { GitFilter::All } else { f };
         match id {
             BTN_PREVIEW => self.preview_on = Some(!self.preview_shown),
             BTN_PARENT => {
@@ -1080,8 +1150,11 @@ impl View for FileBrowserView {
                 let v = t.show_gitignored();
                 t.set_show_gitignored(!v);
             }
-            BTN_GIT => t.cycle_git_filter(),
-            BTN_VIEW => t.cycle_view(),
+            BTN_GIT_MODIFIED => t.set_git_filter(git(t, GitFilter::Modified)),
+            BTN_GIT_UNTRACKED => t.set_git_filter(git(t, GitFilter::Untracked)),
+            id if (BTN_GROUP..BTN_GROUP + VIEWS.len() as u32).contains(&id) => {
+                t.set_view(VIEWS[(id - BTN_GROUP) as usize].0);
+            }
             _ => return,
         }
         self.reselect(sel);
@@ -1143,6 +1216,11 @@ impl FileBrowserView {
 /// A list row's height: roomier than a line of text, like a sidebar's.
 fn row_height(ui: UiMetrics) -> f32 {
     (ui.cell_h + 10.0 * ui.scale).round()
+}
+
+/// The header's height: a row-high filter box with a margin around it.
+fn header_height(ui: UiMetrics) -> f32 {
+    row_height(ui) + (12.0 * ui.scale).round()
 }
 
 /// Where a list row's parts go, in physical px.
@@ -1269,7 +1347,7 @@ mod tests {
     /// The browser's rect in these tests, and the centre of list row `i` in it.
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
     fn row_centre(i: usize) -> (f32, f32) {
-        let header_h = UI.cell_h + 10.0;
+        let header_h = header_height(UI);
         let row_h = row_height(UI);
         (50.0, header_h + i as f32 * row_h + row_h * 0.5)
     }
@@ -1290,7 +1368,7 @@ mod tests {
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
         let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
-        for id in [BTN_PARENT, BTN_HIDDEN, BTN_IGNORED, BTN_GIT, BTN_VIEW] {
+        for id in [BTN_PARENT, BTN_MORE] {
             assert!(ids.contains(&id), "header button {id} registered");
         }
         assert!(v.text().unwrap().contains("adir"), "rows reach the agent text");
@@ -1357,12 +1435,9 @@ mod tests {
         let (d, _) = fixture();
         let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
         let mut h = Harness::new();
-        let frame = h.paint(&mut v, RECT);
-        let ids: Vec<u32> = frame.view_buttons.iter().map(|(_, _, id)| *id).collect();
-        assert!(
-            !ids.contains(&BTN_GIT) && !ids.contains(&BTN_VIEW) && !ids.contains(&BTN_PREVIEW),
-            "no file-only toggles"
-        );
+        h.paint(&mut v, RECT);
+        let ids: Vec<u32> = v.options_menu().iter().map(|i| i.id).collect();
+        assert_eq!(ids, [BTN_HIDDEN, BTN_IGNORED], "no file-only options");
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         let rows: Vec<PathBuf> = v.tree_mut().rows().iter().map(|r| r.path.clone()).collect();
         assert_eq!(rows, vec![d.join("adir")], "expanded adir shows no inner.txt; no b.txt");
@@ -1476,7 +1551,7 @@ mod tests {
 
     /// The list rows a frame draws a pill behind in `color` at `alpha`.
     fn rows_lit_in(frame: &crate::plugin::paint::Frame, color: [u8; 3], alpha: f32) -> Vec<usize> {
-        let (header_h, row_h) = (UI.cell_h + 10.0, row_height(UI));
+        let (header_h, row_h) = (header_height(UI), row_height(UI));
         let want = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, color, alpha).color;
         frame
             .bg
@@ -1530,9 +1605,9 @@ mod tests {
         h.key(&mut v, press(Key::Down));
         h.button(&mut v, BTN_HIDDEN);
         assert_eq!(v.sel, Some(1), "a header toggle");
-        h.button(&mut v, BTN_VIEW);
+        h.button(&mut v, BTN_GROUP + 1);
         assert_eq!(v.sel, Some(1), "grouped, with category rows");
-        h.button(&mut v, BTN_VIEW);
+        h.button(&mut v, BTN_GROUP + 2);
         v.files_changed(&[(d.join("b.txt"), d.join("c.txt"))]);
         assert_eq!(v.sel, Some(1), "a rename");
         // Hover still moves a browser's highlight.
@@ -2009,7 +2084,7 @@ mod tests {
         });
         let mut v = FileBrowserView::new(d.clone()).with_waker(Some(waker));
         let h = Harness::new();
-        h.button(&mut v, BTN_GIT);
+        h.button(&mut v, BTN_GIT_MODIFIED);
         let before = v.text().unwrap();
         assert!(!before.contains("changed.txt"), "no status yet, so nothing passes:\n{before}");
         assert!(v.tree().git_status_loading());
@@ -2324,5 +2399,66 @@ mod tests {
         assert_eq!(names(&mut v), ["Goal.md", "gold.txt"], "lower case matches either case");
         type_in(&mut h, &mut v, "Go");
         assert_eq!(names(&mut v), ["Goal.md"], "a capital matches case");
+    }
+
+    #[test]
+    fn the_more_menu_lists_the_listing_options_checked_and_choosing_one_toggles_it() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let more = v.more_hit.expect("a ⋯ button");
+        let menu = |h: &Harness, v: &mut FileBrowserView| match h.button(v, BTN_MORE).requests.as_slice() {
+            [Request::Menu { items, at, align }] => {
+                assert_eq!((*at, *align), ((more.x + more.w, more.y + more.h), MenuAlign::Right), "under ⋯");
+                items.clone()
+            }
+            other => panic!("expected a menu, got {other:?}"),
+        };
+        let checked = |items: &[MenuItem], id| items.iter().find(|i| i.id == id).and_then(|i| i.checked);
+        let items = menu(&h, &mut v);
+        let hidden = v.tree().show_hidden();
+        assert_eq!(checked(&items, BTN_HIDDEN), Some(hidden));
+        assert_eq!(checked(&items, BTN_IGNORED), Some(v.tree().show_gitignored()));
+        assert_eq!(checked(&items, BTN_GIT_MODIFIED), Some(false));
+        assert_eq!(checked(&items, BTN_GROUP), Some(true), "the tree");
+        assert_eq!(checked(&items, BTN_GROUP + 1), Some(false));
+        assert_eq!(checked(&items, BTN_PREVIEW), Some(false), "too narrow for the preview");
+
+        // Choosing an item calls `button` with its id.
+        h.button(&mut v, BTN_HIDDEN);
+        assert_eq!(v.tree().show_hidden(), !hidden);
+        assert_eq!(checked(&menu(&h, &mut v), BTN_HIDDEN), Some(!hidden));
+        h.button(&mut v, BTN_GIT_MODIFIED);
+        assert_eq!(v.tree().git_filter(), GitFilter::Modified);
+        h.button(&mut v, BTN_GIT_UNTRACKED);
+        assert_eq!(v.tree().git_filter(), GitFilter::Untracked, "one git filter at a time");
+        h.button(&mut v, BTN_GIT_UNTRACKED);
+        assert_eq!(v.tree().git_filter(), GitFilter::All, "choosing the checked one turns it off");
+        h.button(&mut v, BTN_GROUP + 1);
+        assert_eq!(v.tree().view(), FsView::Extension);
+        let items = menu(&h, &mut v);
+        assert_eq!((checked(&items, BTN_GROUP), checked(&items, BTN_GROUP + 1)), (Some(false), Some(true)));
+    }
+
+    #[test]
+    fn the_filter_box_shows_a_clear_button_once_it_holds_text() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        let ids = |h: &mut Harness, v: &mut FileBrowserView| -> Vec<u32> {
+            h.paint(v, RECT).view_buttons.iter().map(|(_, _, id)| *id).collect()
+        };
+        assert!(!ids(&mut h, &mut v).contains(&BTN_CLEAR));
+        h.key(&mut v, press(Key::Char('b')));
+        assert!(ids(&mut h, &mut v).contains(&BTN_CLEAR));
+        let clear = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_CLEAR).unwrap().0;
+        let text = v.field.geom().unwrap().rect;
+        assert!(clear.x >= text.x + text.w && clear.x + clear.w <= RECT.w, "at the box's right end: {clear:?}");
+        let out = h.button(&mut v, BTN_CLEAR);
+        assert!(out.redraw);
+        assert_eq!((v.tree().query(), v.input.text()), ("", ""));
+        assert!(!ids(&mut h, &mut v).contains(&BTN_CLEAR));
+        // The focused box is outlined in the focus colour.
+        let ring = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, theme::FIELD_FOCUS_BORDER, 1.0).color;
+        assert!(h.paint(&mut v, RECT).bg.iter().any(|q| q.border_w > 0.0 && q.border_color == ring));
     }
 }

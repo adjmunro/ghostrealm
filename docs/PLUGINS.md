@@ -195,7 +195,8 @@ into the overlay layer; it doesn't need to know.
   Build the items when the menu opens, so checks show the current state. A
   menu with no enabled item doesn't open; an open menu closes when a
   confirmation appears or the picker opens or closes under it. The editor
-  ribbon's `⋯` lists every ribbon option this way.
+  ribbon's `⋯` lists every ribbon option this way, and the file browser's
+  `⋯` what its listing shows.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules

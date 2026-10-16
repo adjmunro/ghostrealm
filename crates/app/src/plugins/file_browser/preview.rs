@@ -19,7 +19,7 @@ use crate::media;
 use crate::plugin::{rect_contains, theme, EventCx, Font, Image, PaintCx};
 use crate::syntax;
 
-/// Preview button ids, after the browser header's (see `View::button`).
+/// Preview button ids, apart from the browser's (see `View::button`).
 pub const BTN_PLAY: u32 = 10;
 pub const BTN_AUTOPLAY: u32 = 11;
 /// The preview's image within its view (see `PaintCx::image`).
