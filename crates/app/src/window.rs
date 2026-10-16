@@ -347,6 +347,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         self.unsaved.assume_unsaved();
         let Some(state) = &mut self.state else { return };
+        state.drop_stale_menu();
         match event {
             WindowEvent::CloseRequested => {
                 state.request_quit();
@@ -808,6 +809,9 @@ struct Menu {
     rows: Vec<Rect>,
     /// The panel rect (physical px), for click-outside dismissal.
     panel: Rect,
+    /// The picker was open when the menu opened: the menu belongs to it (or
+    /// to what was under it) only while that holds.
+    over_picker: bool,
 }
 
 /// What a left release on an open menu did.
@@ -821,7 +825,7 @@ enum MenuRelease {
 }
 
 impl Menu {
-    fn new(target: MenuTarget, anchor: (f32, f32), align: MenuAlign, items: Vec<MenuRow>) -> Self {
+    fn new(target: MenuTarget, anchor: (f32, f32), align: MenuAlign, items: Vec<MenuRow>, over_picker: bool) -> Self {
         Menu {
             target,
             anchor,
@@ -831,7 +835,20 @@ impl Menu {
             armed: None,
             rows: Vec::new(),
             panel: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            over_picker,
         }
+    }
+
+    /// Whether the menu must close: a confirmation is up (the menu would sit
+    /// over it and take its clicks), or the picker opened or closed under it
+    /// (a `View(PICKER_SID)` menu would act on another picker, or none).
+    fn stale(&self, picker_open: bool, confirming: bool) -> bool {
+        confirming || self.over_picker != picker_open
+    }
+
+    /// Whether any item can be chosen.
+    fn choosable(items: &[MenuRow]) -> bool {
+        items.iter().any(|i| i.enabled)
     }
 
     /// Take the hit rects of `layout`, as drawn.
@@ -891,13 +908,14 @@ struct RowLayout {
 const MENU_LABEL_MIN_COLS: f32 = 6.0;
 
 /// Lay out a menu of `items` opened at `anchor` on a `screen`-sized window.
-/// `hint_w[i]` is item `i`'s hint width as shaped. Labels are sized by
-/// character count; the check-mark and hint columns sit at the right end,
+/// `label_w[i]` and `hint_w[i]` are item `i`'s label and hint widths as
+/// shaped. The check-mark and hint columns sit at the right end,
 /// the hint against the edge and the check mark left of it. On a narrow
 /// window the hint is cut, then dropped, before the label shrinks below
 /// [`MENU_LABEL_MIN_COLS`].
 fn menu_layout(
     items: &[MenuRow],
+    label_w: &[f32],
     hint_w: &[f32],
     anchor: (f32, f32),
     align: MenuAlign,
@@ -911,7 +929,6 @@ fn menu_layout(
     // A rule takes less height than an item.
     let rule_h = 9.0 * ui.scale;
     let check_w = ui.cell_h * 0.8;
-    let label_w = |i: &MenuRow| i.label.chars().count() as f32 * ui.cell_w;
     let right_w = items
         .iter()
         .zip(hint_w)
@@ -923,7 +940,7 @@ fn menu_layout(
         })
         .fold(0.0, f32::max);
     let right_w = if right_w > 0.0 { right_w + gap * 2.0 } else { 0.0 };
-    let maxlen = items.iter().map(label_w).reduce(f32::max).unwrap_or(6.0 * ui.cell_w);
+    let maxlen = label_w.iter().copied().reduce(f32::max).unwrap_or(6.0 * ui.cell_w);
     let panel_w = (maxlen + pad * 3.0 + right_w).min(sw * 0.6);
     let height_of = |i: &MenuRow| if matches!(i.action, MenuAction::Rule) { rule_h } else { row_h };
     let panel_h = items.iter().map(height_of).sum::<f32>() + pad;
@@ -939,12 +956,12 @@ fn menu_layout(
     let (left, right_edge) = (px + pad, (px + panel_w - pad).max(px + pad));
     let mut rows = Vec::with_capacity(items.len());
     let mut y = py + pad * 0.5;
-    for (item, &hw) in items.iter().zip(hint_w) {
+    for ((item, &lw), &hw) in items.iter().zip(label_w).zip(hint_w) {
         let rect = Rect { x: px, y, w: panel_w, h: height_of(item) };
         y += rect.h;
         let band = |x0: f32, x1: f32| Rect { x: x0, y: rect.y, w: (x1 - x0).max(0.0), h: rect.h };
         // What the right end may take, keeping the label its minimum.
-        let keep = label_w(item).min(MENU_LABEL_MIN_COLS * ui.cell_w);
+        let keep = lw.min(MENU_LABEL_MIN_COLS * ui.cell_w);
         let mut budget = (right_edge - left - keep - gap).max(0.0);
         let mut right = right_edge;
         let reserve_check = item.checked.is_some() && budget >= check_w;
@@ -2142,8 +2159,18 @@ impl State {
         items.push(MenuRow::new("Rename…", MenuAction::Rename));
         items.push(MenuRow::new("Set directory…", MenuAction::SetDir));
         items.push(MenuRow::new("Close workspace", MenuAction::Close));
-        self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), MenuAlign::Left, items));
+        let over_picker = self.app.picker_open();
+        self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), MenuAlign::Left, items, over_picker));
         self.dirty = true;
+    }
+
+    /// Close the menu if what it opened over changed (see [`Menu::stale`]).
+    fn drop_stale_menu(&mut self) {
+        let (picker, confirming) = (self.app.picker_open(), self.app.confirm().is_some());
+        if self.menu.as_ref().is_some_and(|m| m.stale(picker, confirming)) {
+            self.menu = None;
+            self.dirty = true;
+        }
     }
 
     /// A left press while the context menu is open: arm the item under it (it
@@ -2236,19 +2263,21 @@ impl State {
             })
             .collect();
         self.palette = None;
-        self.menu = Some(Menu::new(MenuTarget::File(target), at, align, items));
+        let over_picker = self.app.picker_open();
+        self.menu = Some(Menu::new(MenuTarget::File(target), at, align, items, over_picker));
         self.dirty = true;
     }
 
     /// Open surface `sid`'s own menu of `items` at `at` (the picker's view's
     /// too: the menu draws above the picker).
     fn open_view_menu(&mut self, sid: SurfaceId, items: Vec<MenuItem>, at: (f32, f32), align: MenuAlign) {
-        if items.is_empty() {
+        let items: Vec<MenuRow> = items.into_iter().map(MenuRow::of_view).collect();
+        if !Menu::choosable(&items) {
             return;
         }
-        let items = items.into_iter().map(MenuRow::of_view).collect();
         self.palette = None;
-        self.menu = Some(Menu::new(MenuTarget::View(sid), at, align, items));
+        let over_picker = self.app.picker_open();
+        self.menu = Some(Menu::new(MenuTarget::View(sid), at, align, items, over_picker));
         self.dirty = true;
     }
 
@@ -2799,6 +2828,8 @@ impl State {
             Pick::SaveAs(_) => "Save as",
             Pick::SaveCopy(_) => "Save copy as",
         };
+        // Under a menu, nothing in the picker hovers.
+        let cursor = if self.menu.is_some() { (-1.0, -1.0) } else { self.cursor };
         let Some(view) = self.app.picker_mut() else {
             return;
         };
@@ -2806,7 +2837,7 @@ impl State {
             &self.cfg,
             &self.chrome,
             ui,
-            self.cursor,
+            cursor,
             &mut self.text,
             frame,
             Layer::Overlay,
@@ -2963,7 +2994,11 @@ impl State {
             || self.menu.is_some()
             || self.app.picker_open()
             || self.app.confirm().is_some();
-        let tip = frame.tooltip.take().filter(|(_, _, layer)| !modal || *layer == Layer::Overlay);
+        // A menu covers every layer, the picker's too.
+        let tip = frame
+            .tooltip
+            .take()
+            .filter(|(_, _, layer)| self.menu.is_none() && (!modal || *layer == Layer::Overlay));
         let Some((anchor, text, _)) = tip else {
             self.tooltip_hover = None;
             self.tooltip_due = None;
@@ -3336,15 +3371,15 @@ impl State {
             buf.shape_until_scroll(fs, false);
             buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
         };
-        let mut hint_w = vec![0.0f32; n];
+        let (mut label_w, mut hint_w) = (vec![0.0f32; n], vec![0.0f32; n]);
         for (i, item) in items.iter().enumerate() {
             let color = if item.enabled { [230, 230, 240] } else { theme::DIM };
-            shape(&mut self.menu_buffers[i], &item.label, color, &mut self.text.font_system);
+            label_w[i] = shape(&mut self.menu_buffers[i], &item.label, color, &mut self.text.font_system);
             if let Some(hint) = &item.hint {
                 hint_w[i] = shape(&mut self.menu_buffers[n + i], hint, theme::TEXT_DIM, &mut self.text.font_system);
             }
         }
-        let layout = menu_layout(&items, &hint_w, anchor, align, (sw, sh), ui);
+        let layout = menu_layout(&items, &label_w, &hint_w, anchor, align, (sw, sh), ui);
 
         // The hover pill sits `inset` inside the panel; the panel's corners
         // are the pill's grown by it, so the two curves run parallel.
@@ -4108,12 +4143,12 @@ impl State {
         if changed {
             self.dirty = true;
         }
-        // A file job that finished asked a question (Delete): the palette and
-        // menus would swallow its buttons.
+        // A file job that finished asked a question (Delete): the palette
+        // would swallow its buttons.
         if !asking && self.app.confirm().is_some() {
             self.palette = None;
-            self.menu = None;
         }
+        self.drop_stale_menu();
         self.frame_pending = more;
         self.next_frame = Instant::now() + FRAME_INTERVAL;
         // Advance the auto-read dwell; a status change needs a redraw.
@@ -4689,6 +4724,10 @@ impl State {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
                 pass.draw(0..4, start..end);
+            }
+            // Only what was prepared this frame: a renderer replays its last
+            // prepared text otherwise.
+            if !menu_placements.is_empty() {
                 self.menu_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .context("menu render")?;
@@ -5330,8 +5369,9 @@ mod tests {
         /// A menu as `open_view_menu` makes it, laid out and placed as
         /// `build_menu` does; with each row's band.
         fn open(target: MenuTarget, items: Vec<MenuItem>, hint_w: &[f32], align: MenuAlign) -> (Menu, Vec<Rect>) {
-            let mut menu = Menu::new(target, (400.0, 50.0), align, rows(items));
-            let layout = menu_layout(&menu.items, hint_w, menu.anchor, align, (800.0, 600.0), UI);
+            let mut menu = Menu::new(target, (400.0, 50.0), align, rows(items), false);
+            let label_w = vec![80.0; menu.items.len()];
+            let layout = menu_layout(&menu.items, &label_w, hint_w, menu.anchor, align, (800.0, 600.0), UI);
             menu.place(&layout);
             (menu, layout.rows.iter().map(|r| r.rect).collect())
         }
@@ -5396,9 +5436,37 @@ mod tests {
         }
 
         #[test]
+        fn a_menu_closes_when_a_confirmation_appears_or_the_picker_changes_under_it() {
+            let menu = |over_picker| Menu::new(MenuTarget::View(PICKER_SID), (0.0, 0.0), MenuAlign::Left, Vec::new(), over_picker);
+            let (plain, over) = (menu(false), menu(true));
+            assert!(!plain.stale(false, false));
+            assert!(plain.stale(false, true), "a confirmation appeared");
+            assert!(plain.stale(true, false), "the picker opened over it");
+            assert!(!over.stale(true, false));
+            assert!(over.stale(false, false), "its picker closed");
+            assert!(over.stale(true, true));
+        }
+
+        #[test]
+        fn a_menu_needs_a_choosable_item() {
+            let ok = |items| Menu::choosable(&rows(items));
+            assert!(!ok(vec![]));
+            assert!(!ok(vec![MenuItem::RULE, MenuItem::new(1, "Off").enable(false)]));
+            assert!(ok(vec![MenuItem::RULE, MenuItem::new(1, "On")]));
+        }
+
+        #[test]
+        fn a_wide_label_gets_its_shaped_width() {
+            // Wider than its character count in cells (CJK, wide glyphs).
+            let items = rows(vec![MenuItem::new(1, "設定").check(true)]);
+            let l = menu_layout(&items, &[300.0], &[0.0], (0.0, 0.0), MenuAlign::Left, (800.0, 600.0), UI);
+            assert!(l.rows[0].label.w >= 300.0, "{:?}", l.rows[0].label);
+        }
+
+        #[test]
         fn a_right_aligned_menu_ends_at_its_anchor_and_stays_on_screen() {
             let items = || rows(vec![MenuItem::new(1, "Soft wrap")]);
-            let at = |anchor, align| menu_layout(&items(), &[0.0], anchor, align, (800.0, 600.0), UI).panel;
+            let at = |anchor, align| menu_layout(&items(), &[80.0], &[0.0], anchor, align, (800.0, 600.0), UI).panel;
             let p = at((400.0, 50.0), MenuAlign::Right);
             assert_eq!((p.x + p.w, p.y), (400.0, 50.0));
             let p = at((400.0, 50.0), MenuAlign::Left);
@@ -5417,8 +5485,8 @@ mod tests {
                     MenuItem::new(3, "Off").check(false),
                 ])
             };
-            let hint_w = [90.0, 0.0, 0.0];
-            let wide = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (800.0, 600.0), UI);
+            let (label_w, hint_w) = ([112.0, 96.0, 24.0], [90.0, 0.0, 0.0]);
+            let wide = menu_layout(&items(), &label_w, &hint_w, (0.0, 0.0), MenuAlign::Left, (800.0, 600.0), UI);
             let (r0, r1, r2) = (&wide.rows[0], &wide.rows[1], &wide.rows[2]);
             let (hint, check) = (r0.hint.unwrap(), r0.check.unwrap());
             let edge = wide.panel.x + wide.panel.w - 8.0;
@@ -5433,7 +5501,7 @@ mod tests {
             // Narrow: the hint is cut, then dropped; nothing goes left of the
             // padding and the label keeps its minimum.
             for sw in [300.0, 200.0, 120.0, 60.0, 10.0] {
-                let l = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (sw, 600.0), UI);
+                let l = menu_layout(&items(), &label_w, &hint_w, (0.0, 0.0), MenuAlign::Left, (sw, 600.0), UI);
                 let left = l.panel.x + 8.0;
                 for r in &l.rows {
                     assert!(r.label.x >= left && r.label.w >= 0.0);
@@ -5449,7 +5517,7 @@ mod tests {
                 let (keep, inner) = (6.0 * UI.cell_w, (l.panel.w - 16.0).max(0.0));
                 assert!(r0.label.w >= keep.min(inner) - 0.01, "at {sw}: label {}", r0.label.w);
             }
-            let narrow = menu_layout(&items(), &hint_w, (0.0, 0.0), MenuAlign::Left, (200.0, 600.0), UI);
+            let narrow = menu_layout(&items(), &label_w, &hint_w, (0.0, 0.0), MenuAlign::Left, (200.0, 600.0), UI);
             let h = narrow.rows[0].hint;
             assert!(h.is_none_or(|h| h.w < 90.0), "the hint is cut or dropped: {h:?}");
         }

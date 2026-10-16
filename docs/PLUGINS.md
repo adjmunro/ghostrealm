@@ -150,9 +150,10 @@ into the overlay layer; it doesn't need to know.
   autosaves), `path`/`save_as` (Save As), `write_input`/`text`
   (agent channel).
 - File menu: `context_menu(pos)` is a right-click inside the view; a view with a
-  file or folder to act on files `Request::FileMenu { target, at }` (the file
-  browser on its rows and empty space, the editor on its ribbon; its file name
-  button files the same request). `subject` is the file or folder the `file.*`
+  file or folder to act on files `Request::FileMenu { target, at, align }`
+  (the file browser on its rows and empty space, the editor on its ribbon;
+  its file name button and its `⋯` menu's "File actions…" file the same
+  request, the latter right-aligned at `⋯`). `subject` is the file or folder the `file.*`
   commands act on when given no `path` (default: `path`; the browser's is its
   selected entry). `save_copy` backs Save Copy As. `files_changed(moved)` hears
   that the app created, copied, moved, renamed, or deleted files (a copy or move
@@ -191,9 +192,10 @@ into the overlay layer; it doesn't need to know.
   `.check(on)` (a toggle: a check mark when on), `.with_hint(text)` (dim,
   right-aligned: a shortcut or value; cut short on a narrow window),
   `.enable(false)` (dim, not choosable); `MenuItem::RULE` separates sections.
-  Build the items when the menu opens, so checks show the current state. The
-  editor ribbon's `⋯` lists every ribbon option this way. `FileMenu` takes
-  an `align` too.
+  Build the items when the menu opens, so checks show the current state. A
+  menu with no enabled item doesn't open; an open menu closes when a
+  confirmation appears or the picker opens or closes under it. The editor
+  ribbon's `⋯` lists every ribbon option this way.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules
