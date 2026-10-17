@@ -168,3 +168,13 @@
 - Detail: Italic means "preview tab". An unsaved document shows a dot in its tab's close slot, × while the tab is hovered; pane tabs (htabs) do the same, and the document header shows the dot after the name. Changed on disk under unsaved edits stays an amber title.
 - Detail: Closing the shown file tab shows its right neighbour, else its left.
 - Reason: owner decisions on issue #1 (clone the Claude Code app's file panel; unsaved indicator, answered 2026-10-16).
+
+---
+
+[2026-10-17T18:23+1300@5661e9a6]
+
+- Category: Files surface / search
+- Detail: The File sidebar's filter box has two modes: plain text filters names (smart case; `/`, `~`, `.` start a path to complete), and `?` first searches file contents. Search runs `core::search` on a worker over what the sidebar lists (respecting `.gitignore` and its hidden/ignored toggles), skipping binary and >1 MB files, with caps on lines per file, files, and matches; a newer search cancels the older by generation.
+- Detail: Search is smart case unless "match case" is on; "whole word" means no word character touches either end of a match; a plain query is literal, "regex" uses the `regex` crate's syntax.
+- Detail: The `regex` crate is a direct dependency of core (already built through `ignore`).
+- Reason: owner request on issue #1 (the two-mode box and its toggles, cloned from the Claude Code app).

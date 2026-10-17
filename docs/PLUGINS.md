@@ -27,6 +27,16 @@ browser, image viewer, ...) should be too. The API lives in
     open replaces a document with unsaved changes. A document that loses
     the shown tab loses focus (it autosaves if it autosaves then).
     `files` claims images and audio (`MediaView`).
+  - The sidebar's filter box filters names; a query starting with `?`
+    is search mode (`file_browser::search`): `core::search::Searcher`
+    searches the contents of the files the sidebar lists (its hidden and
+    git-ignored toggles), on a worker woken through `OpenCx::waker`, once
+    typing pauses (the view's `deadline`/`tick`). Smart case unless match
+    case is on; whole word and regex toggle in the box. Its results replace
+    the tree. Opening a matching line requests `OpenFile` and leaves the
+    match for the host: the Files surface takes it
+    (`FileBrowserView::take_match`) once the file shows and selects it
+    (`EditorView::reveal`, which also centres the line).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
     A plugin whose views are only documents (`editor`) or parts of another
     surface (`file_browser`) isn't.

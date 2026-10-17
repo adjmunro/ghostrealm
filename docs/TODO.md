@@ -544,6 +544,9 @@
   configurable (the existing `[input] double_tap_window_ms` + remappable actions).
   Later: if the root is a code repo, index code SYMBOLS (via the LSP) and search
   those instead of/along files.
+- Reuse: the popup's content search can run `core::search::Searcher` (the
+  Files sidebar's `?` mode: worker, generation cancel, streamed `FileHits`)
+  and draw its results as `file_browser::search` does.
 - Reason: fast keyboard-only navigation; requested.
 
 ---
@@ -935,7 +938,7 @@
 - Decided (2026-10-16@ad13ff26, GitHub issue #1): clone the Claude Code app's
   file browser and editor (DECISION.md). The Files surface exists with its
   pinnable sidebar, document header, and file tabs (with the preview tab).
-  Remaining: the "? to search in files" box, dragging file tabs to reorder
+  Remaining: dragging file tabs to reorder
   them, the panel controls at the tab row's right end (search, `⋯`,
   maximise, close; issue screenshot img25), and the other things the issue
   says the owner likes.
@@ -1281,7 +1284,9 @@
 
 - Requires: a design decision (scope)
 - Detail: An indexer. Open: a free-text index for Markdown, a symbol index for
-  code, or both.
+  code, or both. `core::search::Searcher` (the sidebar's `?` search) walks
+  and reads every file per query; an index would answer it without the walk,
+  behind the same `SearchQuery` / `FileHits` interface.
 - Owner, verbatim:
   > on the to-do list, we definitely need some kind of indexer. I'm not sure if
   > that would be like a free form text indexer for Markdown or if it would be
