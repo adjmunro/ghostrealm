@@ -63,6 +63,10 @@ const BTN_NAME: u32 = 3;
 const BTN_MORE: u32 = 4;
 /// The `⋯` menu's "File actions…": the file menu, where the `⋯` menu was.
 const BTN_FILE_MENU: u32 = 5;
+/// The view-mode button: steps to the next mode the file offers.
+const BTN_VIEW_MODE: u32 = 6;
+/// The `⋯` menu's mode items: `BTN_SHOW_MODE + i` shows `ViewMode::ALL[i]`.
+const BTN_SHOW_MODE: u32 = 7;
 /// Menu items showing statistic `Stat::ALL[i]` are `BTN_SHOW_STAT + i`.
 const BTN_SHOW_STAT: u32 = 16;
 /// The copy button of the code block opening on line `ln` is
@@ -76,7 +80,9 @@ const _: () = assert!(
         && BTN_SHOW_STAT > BTN_STAT
         && BTN_SHOW_STAT > BTN_NAME
         && BTN_SHOW_STAT > BTN_MORE
-        && BTN_SHOW_STAT > BTN_FILE_MENU,
+        && BTN_SHOW_STAT > BTN_FILE_MENU
+        && BTN_SHOW_STAT > BTN_VIEW_MODE
+        && BTN_SHOW_STAT >= BTN_SHOW_MODE + ViewMode::ALL.len() as u32,
     "the statistic items' ids must not collide with another button's"
 );
 const _: () = assert!(
@@ -86,6 +92,49 @@ const _: () = assert!(
 /// The idle-autosave delay (seconds) when autosave is switched on in the header
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
+
+/// How a document shows its text, stepped by the header's view-mode button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Rendered and read-only.
+    Preview,
+    /// The source with its formatting: styled runs, sized headings, code
+    /// boxes. Editable.
+    Integrated,
+    /// The plain source: highlight colours only, every row one size.
+    /// Editable.
+    Source,
+}
+
+impl ViewMode {
+    /// Every mode, in the button's cycling order.
+    pub const ALL: [ViewMode; 3] = [ViewMode::Preview, ViewMode::Integrated, ViewMode::Source];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewMode::Preview => "Preview",
+            ViewMode::Integrated => "Integrated",
+            ViewMode::Source => "Source",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            ViewMode::Preview => Icon::ViewPreview,
+            ViewMode::Integrated => Icon::ViewMixed,
+            ViewMode::Source => Icon::ViewSource,
+        }
+    }
+}
+
+/// The modes a file highlighted by `h` offers, in cycling order. Integrated
+/// needs a highlighter to format by; without one there is only the source.
+fn modes_for(h: Option<&dyn Highlighter>) -> &'static [ViewMode] {
+    match h {
+        Some(_) => &[ViewMode::Integrated, ViewMode::Source],
+        None => &[ViewMode::Source],
+    }
+}
 
 pub struct EditorPlugin;
 
@@ -163,6 +212,22 @@ impl Plugin for EditorPlugin {
                     .and_then(|v| v.downcast_mut::<EditorView>())
                     .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
                 editor.toggle_comment().map_err(|e| CmdError::Failed(e.into()))?;
+                Ok(CmdOutcome::ok())
+            }),
+        );
+        r.register(
+            CommandMeta::new(
+                "editor.cycle_view_mode",
+                "Cycle View Mode",
+                "Show the focused document in its next view mode (Preview, Integrated, Source: those its language offers)",
+            ),
+            Box::new(move |s: &mut AppState, _| {
+                let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
+                let editor = doc
+                    .and_then(|d| s.doc_mut(d))
+                    .and_then(|v| v.downcast_mut::<EditorView>())
+                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                editor.cycle_view_mode();
                 Ok(CmdOutcome::ok())
             }),
         );
@@ -297,6 +362,9 @@ pub struct EditorView {
     /// Scroll the caret's line to the middle of the body at the next paint
     /// (set by [`Self::reveal`]; only paint knows the body's height).
     center_caret: bool,
+    /// The view mode chosen for this document; `None` (or one its language
+    /// doesn't offer, after a Save As) shows the language's default.
+    mode: Option<ViewMode>,
 }
 
 /// A fenced code block on screen.
@@ -327,6 +395,7 @@ impl EditorView {
             copied: None,
             goal_x: None,
             center_caret: false,
+            mode: None,
             stats,
             seen_edits: buf.edits,
             buf,
@@ -386,6 +455,47 @@ impl EditorView {
         self.buf.cursor = (line, end);
         self.goal_x = None;
         self.center_caret = true;
+    }
+
+    /// The modes this document offers, in cycling order.
+    pub fn view_modes(&self) -> &'static [ViewMode] {
+        modes_for(self.highlighter())
+    }
+
+    /// The mode the document shows in: the one chosen if its language
+    /// offers it, else Integrated where offered, else Source.
+    pub fn view_mode(&self) -> ViewMode {
+        let modes = self.view_modes();
+        match self.mode {
+            Some(m) if modes.contains(&m) => m,
+            _ if modes.contains(&ViewMode::Integrated) => ViewMode::Integrated,
+            _ => ViewMode::Source,
+        }
+    }
+
+    /// Show the document in `mode`, if its language offers it.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_modes().contains(&mode) {
+            self.mode = Some(mode);
+        }
+    }
+
+    /// Show the document in the next mode it offers (from the last, the
+    /// first).
+    pub fn cycle_view_mode(&mut self) {
+        self.set_view_mode(self.next_view_mode());
+    }
+
+    fn next_view_mode(&self) -> ViewMode {
+        let modes = self.view_modes();
+        let at = modes.iter().position(|m| *m == self.view_mode()).unwrap_or(0);
+        modes[(at + 1) % modes.len()]
+    }
+
+    /// The highlighter whose heading levels and code blocks shape the rows:
+    /// none in Source, where every row is one size and unboxed.
+    fn formatter(&self) -> Option<&'static dyn Highlighter> {
+        self.highlighter().filter(|_| self.view_mode() == ViewMode::Integrated)
     }
 
     /// The file's language service, if it has one.
@@ -564,13 +674,22 @@ impl EditorView {
     /// The header's `⋯` menu: every header option, checked as it stands.
     fn header_menu(&self, cfg: &Config) -> Vec<MenuItem> {
         let has_file = self.buf.path.is_some();
-        let mut items = vec![
+        let mut items = Vec::new();
+        let modes = self.view_modes();
+        if modes.len() > 1 {
+            let shown = self.view_mode();
+            for (i, mode) in ViewMode::ALL.into_iter().enumerate().filter(|(_, m)| modes.contains(m)) {
+                items.push(MenuItem::new(BTN_SHOW_MODE + i as u32, mode.name()).check(mode == shown));
+            }
+            items.push(MenuItem::RULE);
+        }
+        items.extend([
             MenuItem::new(BTN_WRAP, "Soft wrap").check(self.wrap_on(cfg)),
             MenuItem::new(BTN_AUTOSAVE, "Autosave")
                 .check(has_file && self.autosave_on(cfg))
                 .enable(has_file),
             MenuItem::RULE,
-        ];
+        ]);
         for (i, stat) in Stat::ALL.into_iter().enumerate() {
             if self.stats.offers(stat) {
                 items.push(MenuItem::new(BTN_SHOW_STAT + i as u32, stat.name()).check(self.stats.shown() == stat));
@@ -608,7 +727,7 @@ impl EditorView {
     /// Lay out the rows from the scroll line in the last paint's layout.
     fn layout_rows(&mut self) {
         let l = self.layout;
-        let h = self.highlighter();
+        let h = self.formatter();
         let (states, buf) = (&mut self.hl_states, &self.buf);
         let span = (l.body.y, l.body.y + l.body.h);
         let name = h.map(|h| h.name());
@@ -619,7 +738,7 @@ impl EditorView {
 
     /// Line `ln`'s scale.
     fn scale_of(&mut self, ln: usize) -> f32 {
-        let h = self.highlighter();
+        let h = self.formatter();
         self.sync_hl_states();
         line_scale(&mut self.hl_states, &self.buf, h, ln)
     }
@@ -668,7 +787,7 @@ impl EditorView {
     /// shows from there, and its scale. A row above the text is the first;
     /// `None` below the text.
     fn visual_row(&mut self, y: f32) -> Option<(RowKind, f32)> {
-        let name = self.highlighter().map(|h| h.name());
+        let name = self.formatter().map(|h| h.name());
         if !self.rows.fresh(self.buf.scroll, self.buf.edits, self.layout.rows, name) {
             self.sync_hl_states();
             self.layout_rows();
@@ -728,7 +847,9 @@ impl EditorView {
         let top = row.y + (row.h - ch) * 0.5;
         // Laid out right to left first: the header's text stops at them.
         let mb = Rect { x: row.x + row.w - side, y: row.y, w: side, h: side };
-        let wb = Rect { x: mb.x - side, ..mb };
+        // The view-mode button, when the file offers more than one mode.
+        let vb = (self.view_modes().len() > 1).then_some(Rect { x: mb.x - side, ..mb });
+        let wb = Rect { x: vb.unwrap_or(mb).x - side, ..mb };
         let ab = Rect { x: wb.x - side, ..wb };
         self.stats.poll();
         let spans = self.stats.spans(&self.buf);
@@ -771,6 +892,17 @@ impl EditorView {
         };
         Icon::More.paint(cx, icon, if more_hover { theme::GLYPH_HOVER } else { theme::GLYPH });
         self.more_hit = Some(mb);
+        // The view-mode button shows the current mode; a click steps on.
+        if let Some(vb) = vb {
+            let on = cx.button(vb, BTN_VIEW_MODE);
+            if on {
+                hover(cx, vb);
+            }
+            let (mode, next) = (self.view_mode(), self.next_view_mode());
+            cx.tooltip(vb, format!("{} view\nClick for {}", mode.name(), next.name()));
+            let icon = Rect { x: vb.x + ((vb.w - icon_side) * 0.5).round(), ..icon };
+            mode.icon().paint(cx, icon, if on { theme::GLYPH_HOVER } else { theme::GLYPH });
+        }
         // Soft-wrap toggle left of it.
         if cx.button(wb, BTN_WRAP) {
             hover(cx, wb);
@@ -1054,6 +1186,8 @@ impl View for EditorView {
         let text_cols = rows_layout.cols(1.0);
         self.layout = Layout { body, text_x, rows: rows_layout };
         let highlighter = self.buf.path.as_deref().and_then(highlight::for_path);
+        // Heading sizes and code boxes come from it; in Source, none.
+        let formatter = self.formatter();
         self.sync_hl_states();
         // Follow the cursor only when it moved (so manual scrolling sticks),
         // fitting lines by their real heights; reset horizontal scroll under
@@ -1064,7 +1198,7 @@ impl View for EditorView {
                 // The lines above the caret's that fit half the body show
                 // above it; following the caret then leaves the scroll be.
                 let mut full = |b: &EditorBuffer, ln: usize| {
-                    let scale = line_scale(states, b, highlighter, ln);
+                    let scale = line_scale(states, b, formatter, ln);
                     rows_layout.rows(&b.lines[ln], scale).len() as f32 * rows_layout.row_h(scale)
                 };
                 let (mut top, mut used) = (self.buf.cursor.0, full(&self.buf, self.buf.cursor.0) * 0.5);
@@ -1079,9 +1213,9 @@ impl View for EditorView {
                 self.buf.scroll = top;
             }
             let cursor = self.buf.cursor;
-            let hcols = (!wrap).then(|| rows_layout.cols(line_scale(states, &self.buf, highlighter, cursor.0)));
+            let hcols = (!wrap).then(|| rows_layout.cols(line_scale(states, &self.buf, formatter, cursor.0)));
             let height = |b: &EditorBuffer, ln: usize| {
-                let scale = line_scale(states, b, highlighter, ln);
+                let scale = line_scale(states, b, formatter, ln);
                 let rows = rows_layout.rows(&b.lines[ln], scale);
                 // The cursor's line counts down to the row its caret is on.
                 let n = match ln == b.cursor.0 {
@@ -1116,11 +1250,11 @@ impl View for EditorView {
         // The hovered block's copy button: painted last, over the caret.
         let mut copy_button = None;
         // Each visible row's place in a fenced block.
-        let roles: Vec<Option<BlockRow>> = match highlighter {
+        let roles: Vec<Option<BlockRow>> = match formatter {
             Some(h) => vis.iter().map(|r| block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, r.ln)).collect(),
             None => Vec::new(),
         };
-        if let Some(h) = highlighter {
+        if let Some(h) = formatter {
             let text_end = text_x + text_cols as f32 * cw;
             // The visible rows of each block: a line's later wrapped rows,
             // and the lines that go on with it until its closing fence.
@@ -1235,8 +1369,10 @@ impl View for EditorView {
                         0
                     };
                     let hl = self.hl_spans.spans(h, line, state);
-                    let block = roles[i].is_some();
-                    syntax::styled_row_spans(line, hl, r.start, r.len, EDITOR_FG, block)
+                    match formatter {
+                        Some(_) => syntax::styled_row_spans(line, hl, r.start, r.len, EDITOR_FG, roles[i].is_some()),
+                        None => (syntax::row_spans(line, hl, r.start, r.len, EDITOR_FG), Vec::new()),
+                    }
                 }
                 None => (vec![(line.chars().skip(r.start).take(r.len).collect(), EDITOR_FG)], Vec::new()),
             };
@@ -1432,7 +1568,7 @@ impl View for EditorView {
         // line's scale: a heading takes as much travel to pass as its row is
         // tall, a base line one cell.
         let layout = RowLayout { cell: (cw, ch), ..self.layout.rows };
-        let h = self.highlighter();
+        let h = self.formatter();
         self.sync_hl_states();
         let mut top = self.buf.scroll as isize;
         let last = self.buf.lines.len().saturating_sub(1) as isize;
@@ -1508,6 +1644,10 @@ impl View for EditorView {
                 let Some(text) = self.block_body(open) else { return };
                 cx.set_clipboard_text(text);
                 self.copied = Some((open, Instant::now() + COPIED_FOR));
+            }
+            BTN_VIEW_MODE => self.cycle_view_mode(),
+            id if (BTN_SHOW_MODE..BTN_SHOW_MODE + ViewMode::ALL.len() as u32).contains(&id) => {
+                self.set_view_mode(ViewMode::ALL[(id - BTN_SHOW_MODE) as usize]);
             }
             BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
             BTN_STAT => self.stats.cycle(),
@@ -3384,5 +3524,82 @@ body
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
         assert_eq!(scales, vec![1.0, 1.0, 1.0, 1.0, 1.0, H1]);
+    }
+
+    /// The view-mode button's hit rect, if the header shows one.
+    fn mode_button(h: &mut Harness, v: &mut EditorView) -> Option<Rect> {
+        h.paint(v, RECT).view_buttons.iter().find(|b| b.2 == BTN_VIEW_MODE).map(|b| b.0)
+    }
+
+    #[test]
+    fn the_mode_button_steps_through_the_modes_the_language_offers() {
+        let mut h = Harness::new();
+        let mut v = hosted(file_view("editor-modes-toml", "a.toml", "[a]\nk = 1\n"));
+        assert_eq!(v.view_mode(), ViewMode::Integrated, "a highlighted file opens formatted");
+        let b = mode_button(&mut h, &mut v).expect("a mode button");
+        let more = h.frame.view_buttons.iter().find(|b| b.2 == BTN_MORE).unwrap().0;
+        assert!(b.x + b.w <= more.x + 0.5, "left of ⋯");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            assert!(h.button(&mut v, BTN_VIEW_MODE).redraw);
+            seen.push(v.view_mode());
+        }
+        assert_eq!(seen, [ViewMode::Source, ViewMode::Integrated, ViewMode::Source]);
+        // The `⋯` menu lists the same modes, the shown one checked.
+        let out = h.button(&mut v, BTN_MORE);
+        let [Request::Menu { items, .. }] = out.requests.as_slice() else { panic!("a menu") };
+        let modes: Vec<(&str, Option<bool>)> =
+            items.iter().filter(|i| i.id >= BTN_SHOW_MODE && i.id < BTN_SHOW_STAT).map(|i| (i.label.as_str(), i.checked)).collect();
+        assert_eq!(modes, [("Integrated", Some(false)), ("Source", Some(true))]);
+        h.button(&mut v, BTN_SHOW_MODE + 1);
+        assert_eq!(v.view_mode(), ViewMode::Integrated);
+        // A file with no highlighter has only its source: no button, no items.
+        let mut plain = hosted(file_view("editor-modes-txt", "a.txt", "x"));
+        assert_eq!(plain.view_mode(), ViewMode::Source);
+        assert!(mode_button(&mut h, &mut plain).is_none());
+        let out = h.button(&mut plain, BTN_MORE);
+        let [Request::Menu { items, .. }] = out.requests.as_slice() else { panic!("a menu") };
+        assert!(items.iter().all(|i| i.id < BTN_SHOW_MODE || i.id >= BTN_SHOW_STAT));
+    }
+
+    #[test]
+    fn source_draws_every_row_plain_at_one_size_with_no_boxes() {
+        let mut h = Harness::new();
+        let text = "# Title\n**bold** `code` [l](u)\n```\nx\n```\nend";
+        let mut v = markdown_view("editor-md-source", text);
+        paint_plain(&mut h, &mut v);
+        assert!(text_rows(&h).iter().any(|r| r.1 > 1.0));
+        assert!(!code_boxes(&h).is_empty());
+        let second_row = |h: &Harness| h.frame.text.iter().filter(|t| t.left == 4.0 * UI.cell_w).nth(1).unwrap().src;
+        let integrated = (bg_rects(&h).len(), second_row(&h));
+        v.set_view_mode(ViewMode::Source);
+        paint_plain(&mut h, &mut v);
+        assert!(text_rows(&h).iter().all(|r| r.1 == 1.0), "{:?}", text_rows(&h));
+        assert!(code_boxes(&h).is_empty(), "no code boxes");
+        // No underline or box quads: the rows carry colours only.
+        assert!(bg_rects(&h).len() < integrated.0);
+        assert_ne!(second_row(&h), integrated.1, "the row is keyed without styles");
+        let rows: Vec<f32> = text_rows(&h).into_iter().map(|r| r.0).collect();
+        let want: Vec<f32> = (0..6).map(|i| i as f32 * UI.cell_h).collect();
+        assert_eq!(rows, want, "uniform rows");
+        // A click maps through base-size columns on the heading's line.
+        h.mouse(&mut v, MouseEvent::Down { pos: at(0, 3), clicks: 1, button: MouseButton::Left });
+        assert_eq!(v.buf.cursor, (0, 3));
+    }
+
+    #[test]
+    fn switching_between_integrated_and_source_keeps_the_top_line() {
+        let mut h = Harness::new();
+        let text: String = (0..60).map(|i| if i % 5 == 0 { format!("# H{i}\n") } else { format!("line {i}\n") }).collect();
+        let mut v = markdown_view("editor-md-switch", &text);
+        v.buf.scroll = 23;
+        paint_plain(&mut h, &mut v);
+        v.cycle_view_mode();
+        assert_eq!(v.view_mode(), ViewMode::Source);
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buf.scroll, 23);
+        v.cycle_view_mode();
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buf.scroll, 23);
     }
 }
