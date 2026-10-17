@@ -286,6 +286,9 @@ pub struct EditorView {
     /// columns from the text's left edge, and the caret it last placed: a
     /// caret moved any other way starts a new run.
     goal_x: Option<(f32, Pos)>,
+    /// Scroll the caret's line to the middle of the body at the next paint
+    /// (set by [`Self::reveal`]; only paint knows the body's height).
+    center_caret: bool,
 }
 
 /// A fenced code block on screen.
@@ -315,6 +318,7 @@ impl EditorView {
             hover_open: None,
             copied: None,
             goal_x: None,
+            center_caret: false,
             stats,
             seen_edits: buf.edits,
             buf,
@@ -361,6 +365,19 @@ impl EditorView {
     pub fn set_header(&mut self, on: bool) {
         self.header_on = on;
         self.header.refresh(self.buf.path.as_deref());
+    }
+
+    /// Select columns `cols` (chars) of line `line`, both clamped to the
+    /// text, with the caret at the end, and scroll the line to the middle of
+    /// the view at the next paint (a search result opened at its match).
+    pub fn reveal(&mut self, line: usize, cols: std::ops::Range<usize>) {
+        let line = line.min(self.buf.lines.len() - 1);
+        let len = self.buf.line_len(line);
+        let (start, end) = (cols.start.min(len), cols.end.min(len));
+        self.buf.anchor = (start != end).then_some((line, start));
+        self.buf.cursor = (line, end);
+        self.goal_x = None;
+        self.center_caret = true;
     }
 
     /// The file's language service, if it has one.
@@ -1035,6 +1052,24 @@ impl View for EditorView {
         // wrap; keep vertical scroll in bounds.
         {
             let states = &mut self.hl_states;
+            if std::mem::take(&mut self.center_caret) {
+                // The lines above the caret's that fit half the body show
+                // above it; following the caret then leaves the scroll be.
+                let mut full = |b: &EditorBuffer, ln: usize| {
+                    let scale = line_scale(states, b, highlighter, ln);
+                    rows_layout.rows(&b.lines[ln], scale).len() as f32 * rows_layout.row_h(scale)
+                };
+                let (mut top, mut used) = (self.buf.cursor.0, full(&self.buf, self.buf.cursor.0) * 0.5);
+                while top > 0 {
+                    let h = full(&self.buf, top - 1);
+                    if used + h > body.h * 0.5 {
+                        break;
+                    }
+                    used += h;
+                    top -= 1;
+                }
+                self.buf.scroll = top;
+            }
             let cursor = self.buf.cursor;
             let hcols = (!wrap).then(|| rows_layout.cols(line_scale(states, &self.buf, highlighter, cursor.0)));
             let height = |b: &EditorBuffer, ln: usize| {
@@ -3106,6 +3141,30 @@ mod tests {
         assert!(all.iter().any(|r| near(*r, caret)), "the caret, cut: {caret:?}");
         let sel = (text_x + 2.0 * cw, y, 3.0 * cw, RECT.h - y);
         assert!(all.iter().any(|r| near(*r, sel)), "the selection, cut: {sel:?}");
+    }
+
+    #[test]
+    fn reveal_selects_the_range_and_centres_its_line() {
+        let mut h = Harness::new();
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut v = view_with(&text);
+        paint_plain(&mut h, &mut v);
+        v.reveal(60, 5..7);
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buffer().selection(), Some(((60, 5), (60, 7))));
+        assert_eq!(v.buffer().cursor, (60, 7));
+        let rows_vis = (RECT.h / UI.cell_h) as usize;
+        let above = 60 - v.buffer().scroll;
+        assert!(above.abs_diff(rows_vis / 2) <= 1, "{above} rows above of {rows_vis}");
+        // Clamped to the text; near the top it can't centre.
+        v.reveal(2, 4..99);
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buffer().selection(), Some(((2, 4), (2, 6))));
+        assert_eq!(v.buffer().scroll, 0);
+        // A later paint doesn't pull the scroll back.
+        v.buf.scroll = 40;
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buffer().scroll, 40);
     }
 
     #[test]
