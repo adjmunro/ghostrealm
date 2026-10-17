@@ -53,6 +53,16 @@ pub(super) enum Hit {
 /// What a search was started with: a change to any of it starts another.
 type Started = (SearchQuery, PathBuf, WalkOptions);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowKind {
+    File,
+    Line(usize),
+    More,
+}
+
+/// A result row by its file and kind (a line by its number).
+type RowId = (PathBuf, RowKind);
+
 /// Search mode's state, kept while the sidebar filters or browses so the
 /// toggles stay as they were left.
 pub(super) struct Search {
@@ -64,6 +74,9 @@ pub(super) struct Search {
     error: Option<String>,
     /// The git filter is on and its status isn't in yet: the search waits.
     awaiting_git: bool,
+    /// Search again though nothing about the search changed: the files did.
+    /// The results shown stay until the new ones are in.
+    stale: bool,
     /// When typing paused long enough for the search to run.
     due: Option<Instant>,
     started: Option<Started>,
@@ -88,6 +101,7 @@ impl Search {
             regex: false,
             error: None,
             awaiting_git: false,
+            stale: false,
             due: None,
             started: None,
             rows: Vec::new(),
@@ -109,6 +123,7 @@ impl Search {
         self.due = None;
         self.error = None;
         self.awaiting_git = false;
+        self.stale = false;
         self.clear_rows();
     }
 
@@ -119,7 +134,11 @@ impl Search {
         self.scroll = 0.0;
     }
 
+    /// Rebuild the rows from the results, keeping the highlighted and the
+    /// opened row where they are listed still (a refresh's results replace
+    /// the old ones whole).
     fn rebuild_rows(&mut self) {
+        let (sel, chosen) = (self.sel.and_then(|i| self.row_id(i)), self.chosen.and_then(|i| self.row_id(i)));
         self.rows.clear();
         for (i, f) in self.searcher.results().files.iter().enumerate() {
             self.rows.push(Hit::File(i));
@@ -128,6 +147,18 @@ impl Search {
                 self.rows.push(Hit::More(i));
             }
         }
+        let find = |id: Option<RowId>| id.and_then(|id| (0..self.rows.len()).find(|i| self.row_id(*i) == Some(id.clone())));
+        (self.sel, self.chosen) = (find(sel), find(chosen));
+    }
+
+    /// What row `idx` shows, the same across two searches' results.
+    fn row_id(&self, idx: usize) -> Option<RowId> {
+        let files = &self.searcher.results().files;
+        Some(match *self.rows.get(idx)? {
+            Hit::File(i) => (files.get(i)?.path.clone(), RowKind::File),
+            Hit::Line(i, j) => (files.get(i)?.path.clone(), RowKind::Line(files[i].lines.get(j)?.line)),
+            Hit::More(i) => (files.get(i)?.path.clone(), RowKind::More),
+        })
     }
 }
 
@@ -189,16 +220,26 @@ impl FileBrowserView {
             return;
         }
         let walk = self.walk_options();
-        let awaiting_git = self.tree.git_status_awaited();
+        let awaiting_git = walk.only.is_some() && self.tree.git_status_awaited();
         let started = (self.search_query(), self.tree.root().to_path_buf(), walk);
-        if self.search.started.as_ref() == Some(&started) && self.search.awaiting_git == awaiting_git {
+        let same = self.search.started.as_ref() == Some(&started) && self.search.awaiting_git == awaiting_git;
+        let s = &mut self.search;
+        let refresh = same && std::mem::take(&mut s.stale);
+        if same && !refresh {
             return;
         }
-        let s = &mut self.search;
+        let (query, root, walk) = &started;
+        if refresh && s.error.is_none() && !query.text.is_empty() && !awaiting_git {
+            // Keeps the rows, scroll, and highlight until the new results
+            // are in.
+            if let Err(e) = s.searcher.refresh(root, query, walk.clone()) {
+                s.error = Some(e);
+            }
+            return;
+        }
         s.clear_rows();
         s.error = None;
         s.awaiting_git = awaiting_git;
-        let (query, root, walk) = &started;
         if query.text.is_empty() || awaiting_git {
             s.searcher.cancel();
         } else if let Err(e) = s.searcher.start(root, query, walk.clone()) {
@@ -207,18 +248,23 @@ impl FileBrowserView {
         s.started = Some(started);
     }
 
-    /// Search again once typing would have paused: the files changed.
+    /// Search again once typing would have paused: the files changed. The
+    /// results shown stay until the new ones are in.
     pub fn rerun_search(&mut self) {
         if self.searching() {
-            self.search.started = None;
+            self.search.stale = true;
             self.search.due = Some(Instant::now() + DEBOUNCE);
         }
     }
 
-    /// The tree's git status changed: a search under the git filter covers
-    /// other files now (unless typing is about to search anyway).
-    pub(super) fn git_status_changed(&mut self) {
-        if self.searching() && self.search.due.is_none() {
+    /// After the tree polled its git status (`changed`: a new one came in):
+    /// a search waiting for it runs, and one under the git filter covers
+    /// the files it passes now (unless typing is about to search anyway).
+    /// Decided from state, as anything that reads the tree may have taken
+    /// the status in first.
+    pub(super) fn git_status_polled(&mut self, changed: bool) {
+        let arrived = self.search.awaiting_git && !self.tree.git_status_awaited();
+        if self.searching() && self.search.due.is_none() && (arrived || changed) {
             self.run_search();
         }
     }
@@ -288,6 +334,8 @@ impl FileBrowserView {
                 }
                 let n = self.search.rows.len();
                 if n == 0 {
+                    // Its notes (searching, an invalid regex) show.
+                    cx.redraw();
                     return Some(ran);
                 }
                 let idx = self.search.sel.unwrap_or(1.min(n - 1));
@@ -395,7 +443,7 @@ impl FileBrowserView {
                     Hit::File(i) => {
                         let f = &files[i];
                         FileKind::of(&f.path).paint(cx, g.icon(0, ry));
-                        let count = f.total.to_string();
+                        let count = format!("{}{}", f.total, if f.partial { "+" } else { "" });
                         let shaped = cx.shape(&count, Font::SANS, list.w);
                         let count_x = (right - shaped.width).round();
                         cx.place(shaped, count_x, ty, list, theme::TEXT_DIM);
@@ -419,18 +467,20 @@ impl FileBrowserView {
                         let l = &f.lines[j];
                         let (text, ranges) = fit_line(&l.text, l.start > 0, l.cut_end, &l.ranges, cols);
                         let spans = [(text, theme::TEXT)];
-                        cx.row(&spans, tx, ty, list.w, text_clip, theme::TEXT);
-                        // Placed where the shaped row put its glyphs, so wide
-                        // and combining chars line up too.
+                        // Shaped to the box's width: a right-to-left line ends
+                        // at its right edge rather than past it.
+                        let shape_w = (text_clip.x + text_clip.w - tx).max(1.0);
+                        cx.row(&spans, tx, ty, shape_w, text_clip, theme::TEXT);
+                        // Placed where the shaped row put its glyphs, so wide,
+                        // combining, and right-to-left text line up too.
                         let key = cx.row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
                         let byte = |col: usize| spans[0].0.char_indices().nth(col).map_or(spans[0].0.len(), |(b, _)| b);
                         for r in ranges {
-                            let (Some(x0), Some(x1)) = (cx.row_x(key, byte(r.start)), cx.row_x(key, byte(r.end))) else {
-                                continue;
-                            };
-                            let x = (tx + x0).round();
-                            let pill = Rect { x, y: ty.round(), w: (tx + x1).round() - x, h: cx.ui.cell_h.round() };
-                            cx.round_rect(pill, theme::box_radius(cx.ui), theme::MATCH_BG, theme::MATCH_ALPHA, None);
+                            for (x0, w) in cx.row_spans_x(key, byte(r.start)..byte(r.end)) {
+                                let x = (tx + x0).round();
+                                let pill = Rect { x, y: ty.round(), w: (tx + x0 + w).round() - x, h: cx.ui.cell_h.round() };
+                                cx.round_rect(pill, theme::box_radius(cx.ui), theme::MATCH_BG, theme::MATCH_ALPHA, None);
+                            }
                         }
                     }
                     Hit::More(_) => {
@@ -460,7 +510,7 @@ impl FileBrowserView {
         if s.awaiting_git {
             return Some(("Loading git status\u{2026}".to_string(), theme::DIM));
         }
-        if s.started.is_none() || s.due.is_some() || !r.done {
+        if s.started.is_none() || s.due.is_some() || !r.done || s.searcher.refreshing() {
             return Some(("Searching\u{2026}".to_string(), theme::DIM));
         }
         if r.files.is_empty() {
@@ -502,10 +552,10 @@ impl FileBrowserView {
     /// hide.
     pub(super) fn paint_toggles(&self, cx: &mut PaintCx, field: Rect, text_x: f32, right: f32) -> f32 {
         let w = (cx.ui.cell_w * 3.0).round();
-        if right - w * 3.0 - text_x < MIN_TEXT_COLS * cx.ui.cell_w {
-            return right;
-        }
         let s = &self.search;
+        if right - w * 3.0 - text_x < MIN_TEXT_COLS * cx.ui.cell_w {
+            return self.paint_toggles_dot(cx, field, right);
+        }
         let mut x = right;
         for (id, label, tip, on, underline) in [
             (BTN_REGEX, ".*", "Use regular expression", s.regex, false),
@@ -516,6 +566,28 @@ impl FileBrowserView {
             toggle_button(cx, Rect { x, w, ..field }, id, label, tip, on, underline);
         }
         x
+    }
+}
+
+impl FileBrowserView {
+    /// In a box too narrow for the toggles: a dot left of `right` while any
+    /// is on, its tooltip naming them, so the state isn't hidden. Returns
+    /// its left edge (`right` with none on).
+    fn paint_toggles_dot(&self, cx: &mut PaintCx, field: Rect, right: f32) -> f32 {
+        let s = &self.search;
+        let on: Vec<&str> = [(s.match_case, "Match case"), (s.whole_word, "Match whole word"), (s.regex, "Use regular expression")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        if on.is_empty() {
+            return right;
+        }
+        let slot = Rect { x: right - cx.ui.cell_w.round() * 2.0, w: cx.ui.cell_w.round() * 2.0, ..field };
+        let d = (cx.ui.cell_h * 0.35).round();
+        let dot = Rect { x: slot.x + ((slot.w - d) * 0.5).round(), y: slot.y + ((slot.h - d) * 0.5).round(), w: d, h: d };
+        cx.round_rect(dot, d * 0.5, cx.chrome.accent, 1.0, None);
+        cx.tooltip(slot, on.join(", "));
+        slot.x
     }
 }
 
@@ -792,7 +864,7 @@ mod tests {
         let h = Harness::new();
         type_in(&h, &mut v, "?hitch");
         let (used, out) = h.key(&mut v, press(Key::Enter));
-        assert!(used && out.requests.is_empty(), "nothing found yet, nothing opened");
+        assert!(used && out.redraw && out.requests.is_empty(), "nothing found yet, nothing opened");
         assert!(v.search.due.is_none() && v.search.started.is_some(), "the search runs at once");
         settle(&h, &mut v);
         let (_, out) = h.key(&mut v, press(Key::Enter));
@@ -800,14 +872,89 @@ mod tests {
     }
 
     #[test]
-    fn the_toggles_hide_in_a_narrow_box() {
+    fn the_toggles_hide_in_a_narrow_box_leaving_a_dot_while_one_is_on() {
         let (_d, mut v) = fixture();
         let mut h = Harness::new();
         type_in(&h, &mut v, "?");
-        h.paint(&mut v, Rect { w: 160.0, ..RECT });
+        let narrow = Rect { w: 160.0, ..RECT };
+        h.paint(&mut v, narrow);
         assert!(!ids(&h).contains(&BTN_MATCH_CASE), "{:?}", ids(&h));
+        let accent = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, h.chrome.accent, 1.0).color;
+        let dot = |h: &Harness| h.frame.bg.iter().any(|q| q.color == accent && q.radius > 0.0);
+        assert!(!dot(&h), "nothing on: no dot");
         h.paint(&mut v, RECT);
         assert!(ids(&h).contains(&BTN_MATCH_CASE));
+        h.button(&mut v, BTN_MATCH_CASE);
+        h.button(&mut v, BTN_REGEX);
+        h.paint(&mut v, narrow);
+        assert!(dot(&h));
+        // Its tooltip names what is on.
+        let d = h.frame.bg.iter().find(|q| q.color == accent && q.radius > 0.0).unwrap();
+        let x = (d.pos[0] + 1.0) * 0.5 * h.frame.screen.0;
+        let y = (1.0 - d.pos[1]) * 0.5 * h.frame.screen.1;
+        h.cursor = (x + 1.0, y + 1.0);
+        let tip = h.paint(&mut v, narrow).tooltip.clone().expect("a tooltip").1;
+        assert_eq!(tip, "Match case, Use regular expression");
+    }
+
+    #[test]
+    fn a_right_to_left_line_lights_its_match_where_it_was_drawn() {
+        let d = tmpdir("fb-search-rtl");
+        std::fs::write(d.join("r.txt"), "\u{5e9}\u{5dc}\u{5d5}\u{5dd} abc\n").unwrap();
+        let mut v = FileBrowserView::new(d);
+        let mut h = Harness::new();
+        type_in(&h, &mut v, "?abc");
+        settle(&h, &mut v);
+        let frame = h.paint(&mut v, RECT);
+        let want = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, theme::MATCH_BG, theme::MATCH_ALPHA).color;
+        let x = frame
+            .bg
+            .iter()
+            .find(|q| q.color == want)
+            .map(|q| (q.pos[0] + 1.0) * 0.5 * frame.screen.0)
+            .expect("a lit match");
+        // Where the row drew "abc" (bytes 9..12, after four 2-byte letters
+        // and a space): the line's order is reversed, so not five columns
+        // in from where the row starts.
+        let line = "\u{5e9}\u{5dc}\u{5d5}\u{5dd} abc";
+        let item = h.frame.text.iter().find(|t| {
+            h.text.buffer(t.src).is_some_and(|b| b.layout_runs().any(|r| r.text == line))
+        });
+        let item = item.expect("the line drawn");
+        let run = h.text.buffer(item.src).and_then(|b| b.layout_runs().next()).unwrap();
+        let glyph_x = run.glyphs.iter().filter(|g| g.start >= 9).map(|g| g.x).fold(f32::MAX, f32::min);
+        assert!((x - (item.left + glyph_x)).abs() <= 1.0, "{x} vs {}", item.left + glyph_x);
+        assert!((x - (item.left + 5.0 * UI.cell_w)).abs() > 4.0, "not where columns would put it");
+    }
+
+    #[test]
+    fn under_the_git_filter_the_search_runs_once_the_status_is_in() {
+        let d = tmpdir("fb-search-git");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        std::fs::write(d.join("clean.txt"), "hit").unwrap();
+        std::fs::write(d.join("changed.txt"), "hit").unwrap();
+        assert!(git(&["add", "-A"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
+        std::fs::write(d.join("changed.txt"), "hit again").unwrap();
+        let mut v = FileBrowserView::new(d.clone());
+        let h = Harness::new();
+        h.button(&mut v, super::super::BTN_GIT_MODIFIED);
+        type_in(&h, &mut v, "?hit");
+        h.tick(&mut v, Instant::now() + DEBOUNCE * 2);
+        assert!(v.search.awaiting_git);
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.search.awaiting_git || !v.search.searcher.results().done {
+            assert!(Instant::now() < until, "the status comes in and the search runs");
+            v.refresh();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let files: Vec<PathBuf> = v.search.searcher.results().files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(files, [d.join("changed.txt")]);
     }
 
     #[test]

@@ -948,19 +948,16 @@ impl<'a> PaintCx<'a> {
         self.text.row_cache.buffer(key)?.layout_runs().next().map(|r| r.line_y)
     }
 
-    /// Where byte `byte` of the row-cache row `key` starts, from the row's
-    /// left edge, as shaped: the left of the cluster holding it, or the
-    /// row's right end at or past its last. `None` until it is shaped.
-    pub fn row_x(&self, key: u64, byte: usize) -> Option<f32> {
-        let run = self.text.row_cache.buffer(key)?.layout_runs().next()?;
-        let mut end = 0.0f32;
-        for g in run.glyphs {
-            if g.end > byte {
-                return Some(g.x);
-            }
-            end = end.max(g.x + g.w);
-        }
-        Some(end)
+    /// Where bytes `bytes` of the row-cache row `key` were drawn, as
+    /// shaped: `(x, width)` from the row's left edge, one span per visually
+    /// contiguous piece (a range crossing a change of direction can be two).
+    /// Empty until the row is shaped.
+    pub fn row_spans_x(&self, key: u64, bytes: std::ops::Range<usize>) -> Vec<(f32, f32)> {
+        use glyphon::cosmic_text::Cursor;
+        let Some(buf) = self.text.row_cache.buffer(key) else { return Vec::new() };
+        buf.layout_runs()
+            .flat_map(|run| run.highlight(Cursor::new(run.line_i, bytes.start), Cursor::new(run.line_i, bytes.end)))
+            .collect()
     }
 
     /// How far below a monospace row's top its baseline sits, at the frame's

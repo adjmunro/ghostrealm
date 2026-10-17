@@ -1217,9 +1217,7 @@ impl View for FileBrowserView {
 
     fn refresh(&mut self) -> bool {
         let tree = self.tree.poll();
-        if tree {
-            self.git_status_changed();
-        }
+        self.git_status_polled(tree);
         self.poll_search() || tree
     }
 

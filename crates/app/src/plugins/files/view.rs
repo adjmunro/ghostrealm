@@ -282,9 +282,11 @@ impl FilesView {
     }
 
     /// After an open: when the sidebar's search opened the shown file at a
-    /// match, select the match there. Spent either way. A document with
-    /// unsaved edits may differ from the file searched: the match is found
-    /// again on its line, else the caret goes to the line's start.
+    /// match, select the match there. Spent either way. The document may
+    /// differ from the file as searched (unsaved edits, or a save since), so
+    /// the match is found again on its line: the one at the searched
+    /// columns, else the line's first, else the caret goes to the line's
+    /// start.
     fn select_match(&mut self) {
         let Some(m) = self.sidebar.take_match() else { return };
         let Some(t) = self.docs.get_mut(self.active) else { return };
@@ -292,16 +294,13 @@ impl FilesView {
             return;
         }
         let Some(editor) = t.view.downcast_mut::<EditorView>() else { return };
-        let buf = editor.buffer();
-        let cols = match buf.modified {
-            false => m.cols,
-            true => {
-                let text = buf.lines.get(m.line).map_or("", String::as_str);
-                let found = m.query.matcher().ok().and_then(|q| q.find_iter(text).into_iter().next());
-                let col = |b: usize| text[..b].chars().count();
-                found.map_or(0..0, |r| col(r.start)..col(r.end))
-            }
+        let text = editor.buffer().lines.get(m.line).map_or("", String::as_str);
+        let col = |b: usize| text[..b].chars().count();
+        let found: Vec<std::ops::Range<usize>> = match m.query.matcher() {
+            Ok(q) => q.find_iter(text).into_iter().map(|r| col(r.start)..col(r.end)).collect(),
+            Err(_) => Vec::new(),
         };
+        let cols = found.iter().find(|r| **r == m.cols).or(found.first()).cloned().unwrap_or(0..0);
         editor.reveal(m.line, cols);
     }
 
@@ -1419,6 +1418,75 @@ mod tests {
         assert!(v.sidebar().deadline(&h.cfg).is_none());
         h.paint(&mut v, RECT);
         assert!(v.sidebar().deadline(&h.cfg).is_some(), "the search is due again");
+    }
+
+    /// Search `v`'s sidebar for `query` and wait for the results.
+    fn search_sidebar(h: &Harness, v: &mut FilesView, query: &str) {
+        for c in query.chars() {
+            h.key(v, press(Key::Char(c)));
+        }
+        settle_search(h, v);
+    }
+
+    /// Run the sidebar's due search and wait until it is done.
+    fn settle_search(h: &Harness, v: &mut FilesView) {
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            h.tick(v, Instant::now() + std::time::Duration::from_secs(1));
+            v.refresh();
+            if v.sidebar().deadline(&h.cfg).is_none() && !v.sidebar_mut().text().unwrap().contains("Searching") {
+                return;
+            }
+            assert!(Instant::now() < until, "the search finishes");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_match_after_an_autosave_selects_it_and_keeps_the_list() {
+        let (d, mut v) = fixture(&Session::default());
+        std::fs::write(d.join("c.txt"), "x\nline\n").unwrap();
+        let mut h = Harness::new();
+        h.focus(&mut v, true);
+        search_sidebar(&h, &mut v, "?line");
+        h.paint(&mut v, RECT);
+        // Rows: a.md, "body line", c.txt, "line".
+        h.mouse(&mut v, down(sidebar_row(1)));
+        let a = v.show_doc(editor(&d.join("a.md")));
+        h.paint(&mut v, RECT);
+        // Into the document, edit before the match, then click the match
+        // again: the keys move to the sidebar, which autosaves first.
+        let doc = v.layout.doc.unwrap();
+        h.mouse(&mut v, down((doc.x + 40.0, doc.y + 60.0)));
+        assert!(!v.sidebar_has_keys());
+        let b = v.doc_mut(a).and_then(|d| d.downcast_mut::<EditorView>()).unwrap().buffer_mut();
+        b.select_line_at(1);
+        b.insert_str("xx body line");
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, down(sidebar_row(1)));
+        let ed = |v: &FilesView| {
+            let b = v.doc_view().and_then(|d| d.downcast_ref::<EditorView>()).unwrap().buffer();
+            (b.modified, b.selection())
+        };
+        assert!(!ed(&v).0, "saved as the keys left");
+        assert!(v.show_path(&d.join("a.md")));
+        assert_eq!(ed(&v).1, Some(((1, 8), (1, 12))), "found again in the saved text");
+        // The save searches again; the list stays (no jump to an empty
+        // list) and keeps the opened row selected.
+        h.paint(&mut v, RECT);
+        let listed = v.sidebar_mut().text().unwrap();
+        assert!(listed.contains("a.md (1)") && listed.contains("c.txt (1)"), "{listed}");
+        let selected = |h: &mut Harness, v: &mut FilesView| {
+            let want = crate::plugin::paint::rect_quad(RECT, 1.0, 1.0, theme::ROW_SELECTED_BG, theme::ROW_SELECTED_ALPHA).color;
+            let frame = h.paint(v, RECT);
+            frame.bg.iter().filter(|q| q.color == want && q.radius > 0.0).map(|q| (1.0 - q.pos[1]) * 0.5 * frame.screen.1).collect::<Vec<f32>>()
+        };
+        let before = selected(&mut h, &mut v);
+        assert_eq!(before.len(), 1);
+        settle_search(&h, &mut v);
+        assert_eq!(selected(&mut h, &mut v), before, "the same row, after the new results");
+        let listed = v.sidebar_mut().text().unwrap();
+        assert!(listed.contains("  2: xx body line"), "{listed}");
     }
 
     #[test]
