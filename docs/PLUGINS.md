@@ -171,6 +171,26 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   Its decorations measure `cell_w * s` per char and `line_h * s` tall. The
   caller lays out the row `line_h * s` high and its columns `cell_w * s`
   wide.
+- Blocks: `block(key, spans, width, left, top, clip) -> Option<f32>` draws
+  word-wrapped proportional text `width` wide (a Preview's paragraph)
+  through the `BlockCache`, keyed by `key` (`block_key(&spans)`, or any
+  hash covering the spans' text, faces, sizes, colours, and tags), the
+  width in whole pixels, and the metrics. Each `BlockSpan` carries its
+  `Font`, size and line height (a line is as tall as its tallest span),
+  colour, and a `metadata` tag its glyphs keep; `\n` starts a line, and a
+  word wider than the block breaks between glyphs. Lines start at the left
+  edge, right-to-left ones too. Shaping is budgeted as `budgeted_row`'s is:
+  past the budget the frame is re-requested and the block draws as last
+  laid out at another width (returning that height) or draws nothing
+  (`None`: lay it out at `block_estimate(&spans, width)`). A block seen
+  at a new width is laid out again from its old shaping, not reshaped.
+  `measure_block` shapes (within the budget) without drawing, to lay out
+  what follows; `block_height(key, width)` reads a shaped block's height.
+  `block_rects(key, width, tag)` gives the rects (from the block's
+  top-left, a line tall) of each run of glyphs tagged `tag` on a line:
+  inline code boxes, link hit areas. `block_hit(key, width, x, y)` gives
+  the byte offset (into the spans' joined text) nearest a point and the
+  tag of the glyph under it (0 if none).
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).

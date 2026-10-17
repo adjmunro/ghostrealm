@@ -4501,13 +4501,14 @@ impl State {
             None
         };
 
-        // Frame text references the row cache or the scratch pool; borrow those
-        // fields alone so the font system stays free for `prepare`.
-        let (row_cache, scratch) = (&self.text.row_cache, &self.text.scratch);
+        // Frame text references the row or block cache or the scratch pool;
+        // borrow those fields alone so the font system stays free for `prepare`.
+        let (row_cache, block_cache, scratch) = (&self.text.row_cache, &self.text.block_cache, &self.text.scratch);
         let area = |p: &TextItem| {
             let buffer = match p.src {
                 TextSrc::Row(key) => row_cache.buffer(key),
                 TextSrc::Scratch(idx) => scratch.get(idx),
+                TextSrc::Block(slot) => block_cache.buffer(slot),
             }?;
             Some(TextArea {
                 buffer,
@@ -4642,8 +4643,10 @@ impl State {
                 )
                 .context("menu prepare")?;
         }
-        // No text pass references the row cache any more: trim it to its cap.
+        // No text pass references the row or block cache any more: trim them
+        // to their caps.
         self.text.row_cache.end_frame();
+        self.text.block_cache.end_frame();
 
         let target = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -6038,8 +6041,7 @@ mod tests {
     /// and rasterised as glyphon does for a `TextArea` of that scale.
     fn draw_row_scaled(text: &str, style: crate::row_cache::RunStyle, scale: f32) -> Vec<u8> {
         use crate::plugin::testing::{Harness, UI};
-        use crate::plugin::{Layer, PaintCx, RowStyles, TextSrc};
-        use glyphon::cosmic_text::{SwashCache, SwashContent};
+        use crate::plugin::{Layer, PaintCx, RowStyles};
 
         const DIM: u32 = 192;
         let mut h = Harness::new();
@@ -6074,14 +6076,29 @@ mod tests {
             .collect();
         let bg = wgpu::Color { r: 0.02, g: 0.02, b: 0.03, a: 1.0 };
         let mut px = pollster::block_on(render_quads(&quads, DIM, bg));
+        composite_text(&mut h, &mut px, DIM, fg);
+        px
+    }
+
+    /// Composite the frame's cached rows and blocks onto `px` (`dim` square,
+    /// RGBA8) on the CPU, placed and rasterised as glyphon does; `fg` for
+    /// glyphs with no colour of their own.
+    fn composite_text(h: &mut crate::plugin::testing::Harness, px: &mut [u8], dim: u32, fg: [u8; 3]) {
+        use crate::plugin::TextSrc;
+        use glyphon::cosmic_text::{SwashCache, SwashContent};
+
         let mut swash = SwashCache::new();
+        let (rows, blocks, fs) = (&h.text.row_cache, &h.text.block_cache, &mut h.text.font_system);
         for item in &h.frame.text {
-            let TextSrc::Row(key) = item.src else { continue };
-            let buffer = h.text.row_cache.buffer(key).expect("shaped row");
-            for run in buffer.layout_runs() {
+            let buffer = match item.src {
+                TextSrc::Row(key) => rows.buffer(key),
+                TextSrc::Block(slot) => blocks.buffer(slot),
+                TextSrc::Scratch(_) => continue,
+            };
+            for run in buffer.expect("shaped text").layout_runs() {
                 for g in run.glyphs {
                     let p = g.physical((item.left, item.top), item.scale);
-                    let Some(img) = swash.get_image(&mut h.text.font_system, p.cache_key).as_ref() else {
+                    let Some(img) = swash.get_image(fs, p.cache_key).as_ref() else {
                         continue;
                     };
                     if img.content != SwashContent::Mask {
@@ -6092,10 +6109,10 @@ mod tests {
                         let x = p.x + img.placement.left + (i as u32 % img.placement.width) as i32;
                         let line_y = (run.line_y * item.scale).round() as i32;
                         let y = line_y + p.y - img.placement.top + (i as u32 / img.placement.width) as i32;
-                        if x < 0 || y < 0 || x >= DIM as i32 || y >= DIM as i32 {
+                        if x < 0 || y < 0 || x >= dim as i32 || y >= dim as i32 {
                             continue;
                         }
-                        let o = ((y as u32 * DIM + x as u32) * 4) as usize;
+                        let o = ((y as u32 * dim + x as u32) * 4) as usize;
                         for k in 0..3 {
                             let old = px[o + k] as u32;
                             px[o + k] = ((c[k] as u32 * *a as u32 + old * (255 - *a as u32)) / 255) as u8;
@@ -6104,7 +6121,43 @@ mod tests {
                 }
             }
         }
-        px
+    }
+
+    /// A wrapped block draws its ink on several lines, all inside the rect
+    /// it was laid out in.
+    #[test]
+    fn a_block_draws_ink_within_its_rect() {
+        use crate::plugin::testing::{Harness, UI};
+        use crate::plugin::{BlockSpan, Font, Layer, PaintCx};
+
+        const DIM: u32 = 192;
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let fg = [220, 220, 230];
+        let spans = vec![BlockSpan::new("Wrapped serif words in a narrow block", Font::SERIF, 14.0, 18.0, fg)];
+        let (left, top, width) = (20.0, 30.0, 100.0);
+        let full = Rect { x: 0.0, y: 0.0, w: DIM as f32, h: DIM as f32 };
+        let height = {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            let key = cx.block_key(&spans);
+            cx.block(key, || spans.clone(), width, left, top, full).expect("shaped within the budget")
+        };
+        assert!(height >= 3.0 * 18.0, "wrapped onto several lines: {height}");
+        let bg = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let mut px = pollster::block_on(render_quads(&[], DIM, bg));
+        composite_text(&mut h, &mut px, DIM, fg);
+        let mut lines = std::collections::BTreeSet::new();
+        for (i, p) in px.chunks(4).enumerate() {
+            if p[0] > 60 {
+                let (x, y) = ((i as u32 % DIM) as f32, (i as u32 / DIM) as f32);
+                assert!(x >= left - 1.0 && x <= left + width + 1.0, "ink at x {x}");
+                assert!(y >= top && y <= top + height, "ink at y {y}");
+                lines.insert(((y - top) / 18.0) as u32);
+            }
+        }
+        assert!(lines.len() >= 3, "ink on each line: {lines:?}");
     }
 
     /// Bold, italic, underline, and a code box each change the pixels of a row; a

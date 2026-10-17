@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod app_state;
+pub mod block_cache;
 pub mod clicks;
 pub mod config_watch;
 pub mod dividers;

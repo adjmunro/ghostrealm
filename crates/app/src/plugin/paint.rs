@@ -2,7 +2,8 @@
 //!
 //! A frame is built into a [`Frame`]: quads in two layers (under text, over
 //! text), images, and text items that reference either the content-keyed
-//! [`RowCache`] or a per-frame scratch buffer pool in the shared [`TextKit`].
+//! [`RowCache`], the [`BlockCache`], or a per-frame scratch buffer pool in the
+//! shared [`TextKit`].
 //! The app turns the frame into GPU draws after every view has painted. Nothing
 //! here touches the GPU, so views can be painted (and tested) headless.
 
@@ -17,11 +18,16 @@ use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style,
 use winit::window::CursorIcon;
 
 use super::{rect_contains, theme, UiMetrics};
+use crate::block_cache::{BlockCache, BlockSpan};
 use crate::row_cache::{RowCache, RunStyle};
 
 /// Shape at least this many missed rows per frame regardless of the time budget,
 /// so a backlog always makes forward progress even on an already-slow frame.
 const MIN_SHAPES_PER_FRAME: usize = 8;
+
+/// Soft cap on cached blocks ([`BlockCache`]): a few screens of a long
+/// document at two widths.
+const BLOCK_CACHE_CAP: usize = 1024;
 
 /// Focused-pane / panel border thickness, in physical pixels.
 pub const BORDER: f32 = 2.0;
@@ -203,6 +209,12 @@ impl Font {
         italic: false,
         bold: false,
     };
+    /// A serif face: the Preview's body text.
+    pub const SERIF: Font = Font {
+        family: Family::Serif,
+        italic: false,
+        bold: false,
+    };
 
     pub fn italic(self, on: bool) -> Self {
         Font { italic: on, ..self }
@@ -212,7 +224,7 @@ impl Font {
         Font { bold: on, ..self }
     }
 
-    fn attrs(self) -> Attrs<'static> {
+    pub(crate) fn attrs(self) -> Attrs<'static> {
         let mut a = Attrs::new().family(self.family);
         if self.italic {
             a = a.style(Style::Italic);
@@ -241,6 +253,8 @@ pub enum TextSrc {
     Row(u64),
     /// A slot in the [`TextKit`]'s per-frame scratch pool.
     Scratch(usize),
+    /// A wrapped block in the [`BlockCache`], by slot key.
+    Block(u64),
 }
 
 /// One piece of text placed this frame.
@@ -479,10 +493,12 @@ impl Frame {
 }
 
 /// The app's shared text machinery: the one `FontSystem`, the content-keyed row
-/// cache, a per-frame scratch buffer pool, and the per-frame shaping budget.
+/// and block caches, a per-frame scratch buffer pool, and the per-frame shaping
+/// budget.
 pub struct TextKit {
     pub font_system: FontSystem,
     pub row_cache: RowCache,
+    pub block_cache: BlockCache,
     /// Buffers shaped this frame, indexed by [`TextSrc::Scratch`]. A field (not
     /// a getter) so the text pass can borrow it beside `font_system`.
     pub(crate) scratch: Vec<Buffer>,
@@ -503,6 +519,7 @@ impl TextKit {
         TextKit {
             font_system,
             row_cache: RowCache::new(row_cache_cap),
+            block_cache: BlockCache::new(BLOCK_CACHE_CAP),
             scratch: Vec::new(),
             scratch_used: 0,
             prev_rows: HashMap::new(),
@@ -519,6 +536,7 @@ impl TextKit {
     /// `budget` of wall-clock time for shaping cache-missed budgeted rows.
     pub fn begin_frame(&mut self, metrics_gen: u64, metrics: Metrics, line_h: f32, budget: Duration) {
         self.row_cache.begin_frame(metrics_gen);
+        self.block_cache.begin_frame(metrics_gen);
         self.metrics = metrics;
         self.line_h = line_h;
         self.scratch_used = 0;
@@ -530,7 +548,7 @@ impl TextKit {
 
     /// Finish painting. Returns whether any budgeted row was deferred (the frame
     /// needs a follow-up to finish shaping). Call before the text pass; the row
-    /// cache's own `end_frame` runs after it.
+    /// and block caches' own `end_frame` runs after it.
     pub fn finish_paint(&mut self) -> bool {
         std::mem::swap(&mut self.prev_rows, &mut self.cur_rows);
         self.deferred
@@ -541,6 +559,38 @@ impl TextKit {
         match src {
             TextSrc::Row(key) => self.row_cache.buffer(key),
             TextSrc::Scratch(idx) => self.scratch.get(idx),
+            TextSrc::Block(slot) => self.block_cache.buffer(slot),
+        }
+    }
+
+    /// Whether the frame's shaping budget allows another cache miss.
+    fn may_shape(&self) -> bool {
+        self.shaped < MIN_SHAPES_PER_FRAME || Instant::now() < self.shape_deadline
+    }
+
+    /// Content `key` laid out `width` wide: its slot key and height, shaping
+    /// `spans()` on a miss while the frame's budget lasts. Past it the frame is
+    /// marked deferred and, with `stale`, the block's latest layout at another
+    /// width stands in; `None` if there is none.
+    fn budgeted_block(
+        &mut self,
+        key: u64,
+        width: f32,
+        stale: bool,
+        spans: impl FnOnce() -> Vec<BlockSpan>,
+    ) -> Option<(u64, f32)> {
+        if let Some(hit) = self.block_cache.touch(key, width) {
+            return Some(hit);
+        }
+        if self.may_shape() {
+            self.shaped += 1;
+            return Some(self.block_cache.shape(key, &mut self.font_system, width, spans));
+        }
+        self.deferred = true;
+        if stale {
+            self.block_cache.touch_latest(key)
+        } else {
+            None
         }
     }
 
@@ -561,7 +611,7 @@ impl TextKit {
             // Hit: no shaping, just refresh recency.
             self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &[], &[]);
             key
-        } else if self.shaped < MIN_SHAPES_PER_FRAME || Instant::now() < self.shape_deadline {
+        } else if self.may_shape() {
             let spans = spans();
             self.row_cache.ensure(key, &mut self.font_system, m, shape_w, lh, &spans, styles);
             self.shaped += 1;
@@ -1246,6 +1296,76 @@ impl<'a> PaintCx<'a> {
         }
     }
 
+    /// Content key for a block of `spans` ([`block`](Self::block)): their
+    /// text, faces, sizes, colours, and tags.
+    pub fn block_key(&self, spans: &[BlockSpan]) -> u64 {
+        crate::block_cache::block_key(spans)
+    }
+
+    /// Draw a block of word-wrapped proportional text `width` wide with its
+    /// top-left at `(left, top)`, clipped to `clip`, through the block cache.
+    /// `key` identifies what `spans()` would return ([`block_key`](Self::block_key),
+    /// or any hash covering the same); the block is shaped once per key and
+    /// width, only while this frame's shaping budget lasts. Returns the height
+    /// drawn. Past the budget the frame is re-requested and the block draws
+    /// as last laid out at another width, returning that height, or draws
+    /// nothing and returns `None` (lay it out at
+    /// [`block_estimate`](Self::block_estimate)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn block(
+        &mut self,
+        key: u64,
+        spans: impl FnOnce() -> Vec<BlockSpan>,
+        width: f32,
+        left: f32,
+        top: f32,
+        clip: Rect,
+    ) -> Option<f32> {
+        let (slot, height) = self.text.budgeted_block(key, width, true, spans)?;
+        self.push_text(TextItem {
+            src: TextSrc::Block(slot),
+            left,
+            top,
+            bounds: bounds(clip),
+            // Every span bakes its own colour.
+            color: [0, 0, 0],
+            scale: 1.0,
+        });
+        Some(height)
+    }
+
+    /// Shape a block `width` wide without drawing it (to lay out what comes
+    /// after it), within this frame's shaping budget: its height, or `None`
+    /// past the budget.
+    pub fn measure_block(&mut self, key: u64, spans: impl FnOnce() -> Vec<BlockSpan>, width: f32) -> Option<f32> {
+        self.text.budgeted_block(key, width, false, spans).map(|(_, h)| h)
+    }
+
+    /// The height of block `key` laid out `width` wide, if it is shaped.
+    pub fn block_height(&self, key: u64, width: f32) -> Option<f32> {
+        self.text.block_cache.height(key, width)
+    }
+
+    /// Roughly how tall `spans` lay out `width` wide, without shaping them.
+    pub fn block_estimate(&self, spans: &[BlockSpan], width: f32) -> f32 {
+        crate::block_cache::estimate_height(spans, width)
+    }
+
+    /// Where block `key`'s glyphs tagged `tag` were laid out `width` wide,
+    /// relative to its top-left: a rect per run of them on a line, the line's
+    /// height (an inline code box, a link's hit area). Empty until shaped.
+    pub fn block_rects(&self, key: u64, width: f32, tag: u32) -> Vec<Rect> {
+        self.text.block_cache.rects(key, width, tag)
+    }
+
+    /// The text position in block `key` (`width` wide) nearest `(x, y)`,
+    /// relative to its top-left, as a byte offset into its spans' joined
+    /// text, and the tag of the glyph under the point (0 if none is). `None`
+    /// until shaped.
+    pub fn block_hit(&self, key: u64, width: f32, x: f32, y: f32) -> Option<(usize, u32)> {
+        self.text.block_cache.hit(key, width, x, y)
+    }
+
     /// Paint `f` above every pane's content (a view's popups): its quads and
     /// text go to the overlay pass. Nothing paints while a modal is open: it
     /// would draw over (or under the dim of) the modal.
@@ -1302,6 +1422,99 @@ mod tests {
         }
         assert!(h.text.finish_paint(), "some rows were deferred");
         assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
+
+    fn block_spans(text: &str) -> Vec<BlockSpan> {
+        vec![BlockSpan::new(text, Font::SERIF, 14.0, 18.0, [200; 3])]
+    }
+
+    /// `block` queues its cached buffer at its top-left, clipped to its clip,
+    /// and returns the height it laid out; the queries read the same entry.
+    #[test]
+    fn a_block_queues_its_text_with_its_bounds() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let clip = Rect { x: 10.0, y: 20.0, w: 300.0, h: 40.0 };
+        let spans = block_spans("A paragraph long enough to wrap onto a second line here");
+        let (key, height) = {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            let key = cx.block_key(&spans);
+            let height = cx.block(key, || spans.clone(), 200.0, 12.0, 15.0, clip).unwrap();
+            assert_eq!(cx.block_height(key, 200.0), Some(height));
+            assert_eq!(cx.block_height(key, 150.0), None, "not shaped at that width");
+            assert!(cx.block_estimate(&spans, 200.0) > 18.0, "an estimate of more than a line");
+            (key, height)
+        };
+        assert!(height > 18.0, "wrapped: {height}");
+        let [item] = h.frame.text[..] else { panic!("one text item") };
+        assert!(matches!(item.src, TextSrc::Block(_)));
+        assert_eq!((item.left, item.top, item.scale), (12.0, 15.0, 1.0));
+        assert_eq!(item.bounds, bounds(clip));
+        let buf = h.text.buffer(item.src).expect("the item's buffer");
+        assert!(std::ptr::eq(buf, h.text.block_cache.get(key, 200.0).unwrap()));
+    }
+
+    /// Past the shaping budget a new block draws nothing and returns `None`,
+    /// a block shaped before at another width draws that layout, and the
+    /// frame is marked deferred; the next frame shapes what was left.
+    #[test]
+    fn the_shaping_budget_defers_blocks_to_the_next_frame() {
+        let mut h = Harness::new();
+        let clip = Rect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 };
+        let n = MIN_SHAPES_PER_FRAME + 1;
+        let texts: Vec<String> = (0..n).map(|i| format!("block {i}")).collect();
+        let paint = |h: &mut Harness, width: f32| -> Vec<Option<f32>> {
+            h.frame.text.clear();
+            h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::ZERO);
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let spans = block_spans(t);
+                    let key = cx.block_key(&spans);
+                    cx.block(key, || spans, width, 0.0, i as f32 * 20.0, clip)
+                })
+                .collect()
+        };
+        let first = paint(&mut h, 300.0);
+        assert!(first[..MIN_SHAPES_PER_FRAME].iter().all(Option::is_some));
+        assert_eq!(first[MIN_SHAPES_PER_FRAME], None, "past the budget");
+        assert_eq!(h.frame.text.len(), MIN_SHAPES_PER_FRAME, "the deferred block draws nothing");
+        assert!(h.text.finish_paint());
+
+        let second = paint(&mut h, 300.0);
+        assert!(second.iter().all(Option::is_some), "hits cost no budget; the rest shapes");
+        assert!(!h.text.finish_paint());
+
+        // At a new width each block lays out again, the first few within the
+        // budget; the rest stand in with their old layout.
+        let shaped = paint(&mut h, 250.0);
+        assert!(shaped.iter().all(Option::is_some));
+        assert_eq!(h.frame.text.len(), n);
+        assert!(h.text.finish_paint());
+        let spans = block_spans(&texts[n - 1]);
+        assert!(h.text.block_cache.height(crate::block_cache::block_key(&spans), 250.0).is_none());
+    }
+
+    /// `measure_block` shapes for layout without queueing text.
+    #[test]
+    fn measure_block_shapes_without_drawing() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let spans = block_spans("measured");
+        let mut cx = PaintCx::new(
+            &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+        );
+        let key = cx.block_key(&spans);
+        let height = cx.measure_block(key, || spans.clone(), 200.0);
+        assert_eq!(height, Some(18.0));
+        assert_eq!(cx.block_height(key, 200.0), height);
+        assert!(h.frame.text.is_empty());
     }
 
     /// A run of adjacent `BOX` spans draws one rounded, outlined box, padded

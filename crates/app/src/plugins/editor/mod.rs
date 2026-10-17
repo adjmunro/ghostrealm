@@ -3068,7 +3068,7 @@ mod tests {
         let heading = h.frame.text.iter().find(|t| t.left == text_x).unwrap();
         let baseline = |src| match src {
             TextSrc::Row(key) => h.text.row_cache.buffer(key).unwrap().layout_runs().next().unwrap().line_y,
-            TextSrc::Scratch(_) => panic!("a cached row"),
+            TextSrc::Scratch(_) | TextSrc::Block(_) => panic!("a cached row"),
         };
         let (b_num, b_head) = (baseline(nums[0].src), baseline(heading.src));
         assert_eq!(nums[0].scale, 1.0);
