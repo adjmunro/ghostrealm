@@ -296,6 +296,30 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   (Cmd+Up/Down) scroll; no key edits. A double click switches to
   Integrated with the caret at the block's first line. Text can't be
   selected yet (TODO.md).
+- Table of contents (`plugins::editor::toc`): a document with two headings
+  or more (one has nothing to move between) in an area at least 30 cells
+  wide shows its outline at the top-left, where scrolling never moves it, in
+  every view mode: Integrated and Source list the buffer's `Outline`,
+  Preview its top-level heading blocks (not in a list or quote, as the
+  highlighter takes them). Collapsed, a rail 2.5 cells wide left of the
+  gutter (in Preview, in the column's left margin, three cells) holds a dash
+  per heading, narrower by level (1.5, 1.2, 0.9, then 0.6 cells), the
+  current section's (the last heading at or above the top line) in the
+  accent colour; past 24 headings it shows a window of them around the
+  current one, a dot at an end with more past it. Only the dashes take
+  presses (the rest of the rail is the gutter's). The pointer resting on the
+  dashes 200 ms opens a panel over the content (`cx.above`), clipped to the
+  document area (so never over the header): a row per heading, its title
+  indented by level, the current one bright, a hover pill per row, the wheel
+  scrolling it when it is too tall. A row or dash fires on release and
+  jumps: Integrated and Source put the heading's line at the top with the
+  caret at its start (a section reads down from its heading), Preview its
+  block. A jump or Escape (keys reach the focused document only) closes it
+  (it opens again only once the pointer has left it), as do leaving it for
+  300 ms, the pointer leaving the view, a press elsewhere, and a modal. The
+  open panel registers its rows before the content's buttons, so they take
+  the clicks where they cover a link or a copy button, and no copy button
+  shows while it is open.
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
 - Text input: `plugin::text_edit` maps keys to edits through the platform's

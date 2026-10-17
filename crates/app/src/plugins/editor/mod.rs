@@ -8,6 +8,7 @@ mod stats;
 pub mod lang;
 pub mod md_preview;
 mod rows;
+mod toc;
 pub mod wrap;
 
 use std::any::Any;
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::highlight::{self, BlockRow, Highlighter, SpanCache, StateCache};
+use ghostrealm_core::outline::{Outline, OutlineItem};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -38,6 +40,7 @@ pub use buffer::EditorBuffer;
 use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
 use rows::{RowKind, RowLayout, RowTable, TextRow};
+use toc::Toc;
 
 pub const ID: &str = "editor";
 
@@ -73,8 +76,12 @@ const BTN_SHOW_STAT: u32 = 16;
 /// The copy button of the code block opening on line `ln` is
 /// `BTN_COPY_BLOCK + ln`: tied to the block, not to where it is on screen.
 const BTN_COPY_BLOCK: u32 = 256;
+/// The table of contents' rows and dashes: `BTN_TOC + i` jumps to its item
+/// `i`. Past every copy button's id: a document has at most
+/// `buffer::MAX_FILE_BYTES` lines.
+const BTN_TOC: u32 = 1 << 29;
 /// A Preview's links take the ids from [`md_preview::BTN_LINK`] up, past
-/// every copy button's.
+/// every copy button's and the table of contents'.
 use md_preview::BTN_LINK;
 /// How long a code block's copy button shows a check mark after a copy.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
@@ -93,7 +100,10 @@ const _: () = assert!(
     BTN_COPY_BLOCK >= BTN_SHOW_STAT + Stat::ALL.len() as u32,
     "the copy buttons' ids must not collide with a statistic item's"
 );
-const _: () = assert!(BTN_LINK > BTN_COPY_BLOCK, "a copy button's id is its block's line past BTN_COPY_BLOCK");
+const _: () = assert!(
+    BTN_COPY_BLOCK as u64 + buffer::MAX_FILE_BYTES <= BTN_TOC as u64 && BTN_TOC < BTN_LINK,
+    "a copy button's id is its block's line past BTN_COPY_BLOCK, a table of contents item's its index past BTN_TOC"
+);
 /// The idle-autosave delay (seconds) when autosave is switched on in the header
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -374,6 +384,10 @@ pub struct EditorView {
     mode: Option<ViewMode>,
     /// The rendered document, in Preview.
     preview: md_preview::Preview,
+    /// The buffer's headings, for the table of contents in Integrated and
+    /// Source (Preview's come from its blocks).
+    outline: Outline,
+    toc: Toc,
 }
 
 /// A fenced code block on screen.
@@ -406,6 +420,8 @@ impl EditorView {
             center_caret: false,
             mode: None,
             preview: md_preview::Preview::new(waker),
+            outline: Outline::default(),
+            toc: Toc::default(),
             stats,
             seen_edits: buf.edits,
             buf,
@@ -522,6 +538,39 @@ impl EditorView {
     /// none in Source, where every row is one size and unboxed.
     fn formatter(&self) -> Option<&'static dyn Highlighter> {
         self.highlighter().filter(|_| self.view_mode() == ViewMode::Integrated)
+    }
+
+    /// The headings the table of contents lists in Integrated and Source,
+    /// outlined again if the buffer changed (see [`Outline::update`]).
+    fn outline_items(&mut self, now: Instant) -> &[OutlineItem] {
+        let Some(h) = self.highlighter() else { return &[] };
+        self.sync_hl_states();
+        self.outline.update(h, &self.buf.lines, self.buf.edits, &mut self.hl_states, now);
+        self.outline.items()
+    }
+
+    /// The Preview's table of contents in `body`, the section at the top of
+    /// the view current.
+    fn paint_preview_toc(&mut self, cx: &mut PaintCx, body: Rect) {
+        let top = self.preview.top_line().unwrap_or(0);
+        let items = self.preview.outline();
+        self.toc.paint(cx, body, items, toc::current(items, top), BTN_TOC);
+    }
+
+    /// Bring heading line `line` to the top of the view (in Integrated and
+    /// Source with the caret at its start): a section reads down from its
+    /// heading, so the top shows the most of it.
+    fn jump_to(&mut self, line: usize) {
+        if self.view_mode() == ViewMode::Preview {
+            self.preview.show_line(line);
+            return;
+        }
+        let line = line.min(self.buf.lines.len() - 1);
+        self.buf.end_undo_run();
+        self.buf.cursor = (line, 0);
+        self.buf.anchor = None;
+        self.goal_x = None;
+        self.buf.scroll = line;
     }
 
     /// The file's language service, if it has one.
@@ -1206,21 +1255,40 @@ impl View for EditorView {
             self.code_blocks.clear();
             self.hover_block = None;
             self.layout.body = body;
+            // The open panel's rows take clicks over the links under them;
+            // the dashes draw over the page's background.
+            let toc_first = self.toc.is_open();
+            if toc_first {
+                self.paint_preview_toc(cx, body);
+            }
             let src = md_preview::Source {
                 lines: &self.buf.lines,
                 edits: self.buf.edits,
                 copied: md_preview::copied_line(self.copied),
             };
+            // Under the open panel the page takes no hover (its copy
+            // buttons would draw over the panel).
+            let cursor = cx.cursor;
+            if toc_first || self.toc.contains(cursor) {
+                cx.cursor = (f32::MIN, f32::MIN);
+            }
             self.preview.paint(cx, body, &src, self.buf.path.as_deref());
+            cx.cursor = cursor;
+            if !toc_first {
+                self.paint_preview_toc(cx, body);
+            }
             return;
         }
         let total_lines = self.buf.lines.len();
         let gutter_w = gutter_width(cx.cfg, total_lines, cw);
+        // The table of contents' rail, left of the gutter (none without
+        // headings enough).
+        let rail = toc::rail_w(cx.ui, body, self.outline_items(Instant::now()).len());
         // With no gutter, half a cell before the text holds a code block's
         // left edge.
         let inset = if gutter_w > 0.0 { 0.0 } else { (cw * 0.5).round() };
-        let text_x = body.x + gutter_w + inset;
-        let text_w = (body.w - gutter_w - inset).max(1.0);
+        let text_x = body.x + rail + gutter_w + inset;
+        let text_w = (body.w - rail - gutter_w - inset).max(1.0);
         let rows_layout = RowLayout { text_w, cell: (cw, ch), wrap };
         let text_cols = rows_layout.cols(1.0);
         self.layout = Layout { body, text_x, rows: rows_layout };
@@ -1340,7 +1408,8 @@ impl View for EditorView {
                 let rect = paint_code_block(cx, body, (text_x, text_end), (top, bottom), (open_top, open_bottom));
                 let first_ln = vis[first].ln;
                 self.code_blocks.push(ShownBlock { rect, first: first_ln });
-                if cx.modal || !cx.hovered(rect) {
+                // The open panel draws under the copy button's quads.
+                if cx.modal || !cx.hovered(rect) || self.toc.is_open() || self.toc.contains(cx.cursor) {
                     continue;
                 }
                 self.hover_block = Some(first_ln);
@@ -1427,7 +1496,7 @@ impl View for EditorView {
         // size whatever the row's: on a heading's baseline (read from its own
         // shaped row, whose faces set it), so the number reads as that line's.
         if gutter_w > 0.0 {
-            let gutter = Rect { x: body.x, y: body.y, w: gutter_w, h: body.h };
+            let gutter = Rect { x: body.x + rail, y: body.y, w: gutter_w, h: body.h };
             let mut digits = None;
             for (r, key) in vis.iter().zip(&keys).filter(|(r, _)| r.start == 0) {
                 let top = match r.scale == 1.0 {
@@ -1495,6 +1564,11 @@ impl View for EditorView {
                 }
             }
         }
+        // Before the copy button, so the open panel's rows take the clicks
+        // where they cover it.
+        let top = self.buf.scroll;
+        let items = if highlighter.is_some() { self.outline.items() } else { &[] };
+        self.toc.paint(cx, body, items, toc::current(items, top), BTN_TOC);
         if let Some((rect, top, id, copied)) = copy_button {
             paint_copy_button(cx, rect, top, id, copied);
         }
@@ -1505,6 +1579,11 @@ impl View for EditorView {
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         if self.dismiss_popup() {
             cx.redraw();
+        }
+        if self.toc.is_open() && k.key == Key::Escape && k.mods == Default::default() {
+            self.toc.dismiss();
+            cx.redraw();
+            return true;
         }
         let m = k.mods;
         // The Preview is read-only: it scrolls, and saves.
@@ -1553,6 +1632,22 @@ impl View for EditorView {
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
         if event.is_other_button() {
             return;
+        }
+        match *event {
+            MouseEvent::Move { pos } => self.toc.pointer(pos, Instant::now()),
+            MouseEvent::Leave { .. } => {
+                if self.toc.leave() {
+                    cx.redraw();
+                }
+            }
+            // The table of contents' buttons take a press on it; a press
+            // anywhere else closes it.
+            MouseEvent::Down { pos, .. } if self.toc.contains(pos) => return,
+            MouseEvent::Down { .. } if self.toc.is_open() => {
+                self.toc.close();
+                cx.redraw();
+            }
+            _ => {}
         }
         if self.view_mode() == ViewMode::Preview {
             if let MouseEvent::Down { pos, clicks, .. } = *event {
@@ -1604,12 +1699,14 @@ impl View for EditorView {
                 }
             }
             MouseEvent::Move { pos: (x, y) } => {
-                let at = self.char_at(x, y);
+                // Text under the table of contents isn't the pointer's.
+                let over_toc = self.toc.contains((x, y));
+                let at = if over_toc { None } else { self.char_at(x, y) };
                 if self.lang.as_mut().is_some_and(|l| l.pointer(at, Instant::now())) {
                     cx.redraw();
                 }
                 // A code block's copy button shows while the pointer is over it.
-                let block = self.code_blocks.iter().find(|b| rect_contains(b.rect, x, y)).map(|b| b.first);
+                let block = self.code_blocks.iter().find(|b| !over_toc && rect_contains(b.rect, x, y)).map(|b| b.first);
                 if block != self.hover_block {
                     self.hover_block = block;
                     cx.redraw();
@@ -1624,7 +1721,11 @@ impl View for EditorView {
         }
     }
 
-    fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), dx: f32, dy: f32) {
+    fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), dx: f32, dy: f32) {
+        if self.toc.scroll(pos, dy) {
+            cx.redraw();
+            return;
+        }
         if self.view_mode() == ViewMode::Preview {
             if dy.is_finite() && self.preview.scroll_by(-dy) {
                 cx.request_frame();
@@ -1719,6 +1820,11 @@ impl View for EditorView {
                 }
                 return;
             }
+            id if id >= BTN_TOC => {
+                let Some(line) = self.toc.target(id - BTN_TOC) else { return };
+                self.jump_to(line);
+                self.toc.dismiss();
+            }
             id if id >= BTN_COPY_BLOCK => {
                 let open = (id - BTN_COPY_BLOCK) as usize;
                 let text = match self.view_mode() {
@@ -1762,10 +1868,18 @@ impl View for EditorView {
     fn deadline(&self, cfg: &Config) -> Option<Instant> {
         let hover = self.lang.as_ref().and_then(Lang::deadline);
         let copied = self.copied.map(|(_, until)| until);
-        self.autosave_deadline(cfg).into_iter().chain(hover).chain(copied).min()
+        let toc = self.toc.deadline().into_iter().chain(self.outline.due());
+        self.autosave_deadline(cfg).into_iter().chain(hover).chain(copied).chain(toc).min()
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
+        if self.toc.tick(now) {
+            cx.redraw();
+        }
+        if self.outline.due().is_some_and(|due| now >= due) {
+            self.outline_items(now);
+            cx.redraw();
+        }
         if self.copied.is_some_and(|(_, until)| now >= until) {
             self.copied = None;
             cx.redraw();
@@ -3252,7 +3366,9 @@ mod tests {
 
     /// The text column's items as `(top, scale)`, top to bottom.
     fn text_rows(h: &Harness) -> Vec<(f32, f32)> {
-        let text_x = 4.0 * UI.cell_w;
+        // Line numbers sit left of the text, whose edge moves right with the
+        // table of contents' rail.
+        let text_x = h.frame.text.iter().map(|t| t.left).fold(f32::MIN, f32::max);
         h.frame.text.iter().filter(|t| t.left == text_x).map(|t| (t.top, t.scale)).collect()
     }
 

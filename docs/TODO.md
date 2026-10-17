@@ -564,18 +564,17 @@
 
 ---
 
-[2026-10-13@13e2bda] Editor — section outline (jump to a header)
+[2026-10-13@13e2bda] Editor — table of contents follow-ups
 
-- Requires: per-language header extraction — a hook on the `Highlighter` trait
-  (`ghostrealm_core::highlight`) for simple formats; the LSP (document symbols)
-  for code
-- Detail: Not a minimap: a list of the file's section headers that jumps to one.
-  Headers per language: TOML `[table]` / `[[array]]`, Markdown `#` headings, code
-  symbols once an LSP is wired. Clicking a header scrolls so it sits mid-screen.
-  Undecided: where the list lives (side panel, header dropdown, palette-like
-  popup), nesting, whether it tracks the cursor's current section.
-  GitHub issue #1 proposes the Claude Code app's sticky table of contents:
-  collapsed in a corner, expands on hover, click to jump, unaffected by scroll.
+- Requires: code symbols need the LSP (document symbols)
+- Detail: The sticky table of contents lists Markdown headings and TOML
+  tables (PLUGINS.md "Table of contents"). Not yet: code files' symbols once
+  an LSP is wired (a second outline source beside the highlighter's);
+  setext headings in Integrated and Source (the highlighter is line-local;
+  Preview lists them). Undecided: whether the current section follows the
+  caret rather than the top line; keyboard use (a command or chord that
+  opens the panel, arrows and Enter in it); folding a heading's subsections
+  in the panel.
 - Reason: navigate long files (the config included) by structure.
 
 ---

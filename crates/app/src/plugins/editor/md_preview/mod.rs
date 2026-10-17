@@ -19,6 +19,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
 use ghostrealm_core::highlight;
+use ghostrealm_core::outline::OutlineItem;
 use ghostrealm_core::Rect;
 use ghostrealm_terminal::{Key, KeyPress};
 use winit::window::CursorIcon;
@@ -159,6 +160,9 @@ pub struct Preview {
     /// bottom).
     body: Rect,
     shown: Vec<(usize, f32, f32)>,
+    /// The headings of the blocks, and the edit count they are of.
+    outline: Vec<OutlineItem>,
+    outlined: Option<u64>,
 }
 
 impl Preview {
@@ -176,7 +180,29 @@ impl Preview {
             scrolled_up: false,
             body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             shown: Vec::new(),
+            outline: Vec::new(),
+            outlined: None,
         }
+    }
+
+    /// The headings of the blocks shown, for the table of contents: those
+    /// outside lists and quotes, as the editor's outline takes them.
+    pub fn outline(&mut self) -> &[OutlineItem] {
+        if self.outlined != self.parsed {
+            self.outlined = self.parsed;
+            self.outline = self
+                .blocks
+                .iter()
+                .filter(|b| b.indent == 0 && b.quote == 0)
+                .filter_map(|b| match &b.kind {
+                    Kind::Heading(level, runs) => {
+                        Some(OutlineItem { line: b.line, level: *level, text: parse::plain(runs).trim().to_string() })
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+        &self.outline
     }
 
     /// Parse the text if it changed since last parsed: at once if short,
@@ -748,7 +774,8 @@ fn percent_decode(s: &str) -> String {
 fn look_of(cx: &PaintCx, body: Rect) -> Look {
     let mono = cx.metrics().font_size;
     let size = (mono * BODY_SCALE).round();
-    let pad = 2.0 * cx.ui.cell_w;
+    // The table of contents' rail fits in the left margin.
+    let pad = 3.0 * cx.ui.cell_w;
     let width = (body.w - 2.0 * pad).min(COLUMN_MAX * size).max(1.0).round();
     Look {
         size,
