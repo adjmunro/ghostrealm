@@ -474,13 +474,23 @@ heading's `#` count, where the highlighter marks a heading; TOML: `[a]` 1,
 size the editor draws the row at (H1 1.8, H2 1.5, H3 1.25, H4 1.1, else 1).
 `Highlighter::heading_title` gives a heading's title without its markup
 (Markdown: no `#`s, closing `#`s, inline markers, or link targets; TOML: the
-key between the brackets). `ghostrealm_core::outline` lists a document's
+key between the brackets); `has_headings` says the language has headings
+at all (Markdown, TOML). `ghostrealm_core::outline` lists a document's
 headings (`OutlineItem { line, level, text }`) from the two; an `Outline`
-keeps them per edit count, sharing the view's `StateCache` so an edit
-re-checks only the lines from it on (about 1 ms for 13,500 lines in a
-release build; the first pass, which highlights every line, about 14 ms),
-and outlines a document of `DEBOUNCE_LINES` (2,000) lines or more again only
-once edits pause for `DEBOUNCE` (300 ms), keeping the last outline meanwhile.
+keeps them per edit count. Its cost grows with the document: a pass
+asks every line, threading the highlight state (a release build's first
+pass takes about 0.85 ms per 1,000 Markdown lines, 850 ms for a million;
+an edit that opens or closes a code fence re-highlights everything after
+it). Below `WORKER_LINES` (10,000 lines, under about 10 ms) it outlines on
+the UI thread, sharing the view's `StateCache`, so an edit re-checks only
+the lines from it on (about 1 ms for 13,500 lines); from it, on a worker
+woken through the waker, one job at a time (edits made meanwhile outline
+once it lands), the UI thread paying only for one copy of the text (about
+11 ms for a million lines). A document of `DEBOUNCE_LINES` (2,000) lines
+or more outlines again only once edits pause for `DEBOUNCE` (300 ms).
+Meanwhile it keeps the last outline, its headings below the first edited
+line moved by the change in the line count, so a jump still lands on
+them; `reset` drops it (the document lost its highlighter).
 The editor keeps the monospace grid: each paint lays out a `RowTable` of
 `VisualRow { kind: Text { ln, start, len } | Widget { after_ln, id }, y, h,
 scale }` from the scroll line, and every mapping between screen y and text

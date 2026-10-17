@@ -94,6 +94,10 @@ impl Highlighter for Markdown {
         (hashes <= 6 && c.get(indent + hashes).is_none_or(|x| *x == ' ')).then_some(hashes as u8)
     }
 
+    fn has_headings(&self) -> bool {
+        true
+    }
+
     /// The heading's text without its `#`s, its closing `#`s (a run after a
     /// space, ending the line), or its inline markup's markers and link
     /// targets: `## A *b* [c](d) ##` is "A b c".

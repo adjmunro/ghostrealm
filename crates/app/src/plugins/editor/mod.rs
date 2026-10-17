@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::highlight::{self, BlockRow, Highlighter, SpanCache, StateCache};
-use ghostrealm_core::outline::{Outline, OutlineItem};
+use ghostrealm_core::outline::Outline;
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
 };
@@ -419,8 +419,8 @@ impl EditorView {
             goal_x: None,
             center_caret: false,
             mode: None,
-            preview: md_preview::Preview::new(waker),
-            outline: Outline::default(),
+            preview: md_preview::Preview::new(waker.clone()),
+            outline: Outline::new(waker),
             toc: Toc::default(),
             stats,
             seen_edits: buf.edits,
@@ -540,13 +540,16 @@ impl EditorView {
         self.highlighter().filter(|_| self.view_mode() == ViewMode::Integrated)
     }
 
-    /// The headings the table of contents lists in Integrated and Source,
-    /// outlined again if the buffer changed (see [`Outline::update`]).
-    fn outline_items(&mut self, now: Instant) -> &[OutlineItem] {
-        let Some(h) = self.highlighter() else { return &[] };
+    /// Outline the buffer again if it changed (see [`Outline::update`]);
+    /// without a highlighter, forget the outline. Returns whether the
+    /// headings changed.
+    fn update_outline(&mut self, now: Instant) -> bool {
+        let Some(h) = self.highlighter() else {
+            self.outline.reset();
+            return false;
+        };
         self.sync_hl_states();
-        self.outline.update(h, &self.buf.lines, self.buf.edits, &mut self.hl_states, now);
-        self.outline.items()
+        self.outline.update(h, &self.buf.lines, self.buf.edits, &mut self.hl_states, now)
     }
 
     /// The Preview's table of contents in `body`, the section at the top of
@@ -726,6 +729,7 @@ impl EditorView {
     fn sync_hl_states(&mut self) {
         if let Some(row) = self.buf.dirty_from.take() {
             self.hl_states.dirty_from(row);
+            self.outline.dirty_from(row);
         }
     }
 
@@ -1283,7 +1287,8 @@ impl View for EditorView {
         let gutter_w = gutter_width(cx.cfg, total_lines, cw);
         // The table of contents' rail, left of the gutter (none without
         // headings enough).
-        let rail = toc::rail_w(cx.ui, body, self.outline_items(Instant::now()).len());
+        self.update_outline(Instant::now());
+        let rail = toc::rail_w(cx.ui, body, self.outline.items().len());
         // With no gutter, half a cell before the text holds a code block's
         // left edge.
         let inset = if gutter_w > 0.0 { 0.0 } else { (cw * 0.5).round() };
@@ -1567,7 +1572,7 @@ impl View for EditorView {
         // Before the copy button, so the open panel's rows take the clicks
         // where they cover it.
         let top = self.buf.scroll;
-        let items = if highlighter.is_some() { self.outline.items() } else { &[] };
+        let items = self.outline.items();
         self.toc.paint(cx, body, items, toc::current(items, top), BTN_TOC);
         if let Some((rect, top, id, copied)) = copy_button {
             paint_copy_button(cx, rect, top, id, copied);
@@ -1876,8 +1881,7 @@ impl View for EditorView {
         if self.toc.tick(now) {
             cx.redraw();
         }
-        if self.outline.due().is_some_and(|due| now >= due) {
-            self.outline_items(now);
+        if self.outline.due().is_some_and(|due| now >= due) && self.update_outline(now) {
             cx.redraw();
         }
         if self.copied.is_some_and(|(_, until)| now >= until) {
@@ -1899,7 +1903,7 @@ impl View for EditorView {
     }
 
     fn refresh(&mut self) -> bool {
-        let stats = self.stats.poll() | self.preview.poll();
+        let stats = self.stats.poll() | self.preview.poll() | self.outline.poll();
         let lines = &self.buf.lines;
         stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }

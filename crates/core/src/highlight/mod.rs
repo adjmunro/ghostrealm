@@ -179,6 +179,13 @@ pub trait Highlighter: Sync {
         None
     }
 
+    /// Whether the language has headings ([`Self::heading_level`]), so a
+    /// surface keeps room for an outline whatever a document holds. False
+    /// by default.
+    fn has_headings(&self) -> bool {
+        false
+    }
+
     /// The title of `line`, a heading per [`Self::heading_level`], as an
     /// outline lists it: without the markup that makes it a heading. The
     /// trimmed line by default.

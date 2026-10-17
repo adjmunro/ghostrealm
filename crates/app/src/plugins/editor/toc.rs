@@ -649,4 +649,40 @@ mod tests {
         h.paint(&mut v, RECT);
         assert_eq!(buttons(&h).len(), 3);
     }
+
+    #[test]
+    fn losing_the_highlighter_drops_a_waiting_outline() {
+        let mut h = Harness::new();
+        let text = format!("# A\n{}# B\n", "text\n".repeat(ghostrealm_core::outline::DEBOUNCE_LINES));
+        let mut v = doc("toc-lost", "doc.md", &text);
+        h.paint(&mut v, RECT);
+        v.buffer_mut().insert_str("# New\n");
+        v.note_edits();
+        h.paint(&mut v, RECT);
+        assert!(v.deadline(&h.cfg).is_some(), "the outline waits");
+        let plain = tmpdir("toc-lost").join("doc.txt");
+        v.save_as(plain).unwrap();
+        h.paint(&mut v, RECT);
+        assert_eq!(v.deadline(&h.cfg), None, "nothing left to wait for, so no tick repaints");
+        assert!(buttons(&h).is_empty());
+    }
+
+    #[test]
+    fn a_jump_while_the_outline_waits_lands_on_the_moved_heading() {
+        let mut h = Harness::new();
+        let text = format!("# A\n{}# B\n", "text\n".repeat(ghostrealm_core::outline::DEBOUNCE_LINES));
+        let mut v = doc("toc-moved", "doc.md", &text);
+        h.paint(&mut v, RECT);
+        let b = ghostrealm_core::outline::DEBOUNCE_LINES + 1;
+        let buf = v.buffer_mut();
+        buf.cursor = (1, 0);
+        buf.insert_str("one\ntwo\nthree\n");
+        v.note_edits();
+        h.paint(&mut v, RECT);
+        assert!(v.deadline(&h.cfg).is_some(), "not outlined again yet");
+        let (i, _) = buttons(&h)[1];
+        h.button(&mut v, BTN_TOC + i);
+        assert_eq!(v.buffer().cursor, (b + 3, 0));
+        assert_eq!(v.buffer().lines[b + 3], "# B");
+    }
 }

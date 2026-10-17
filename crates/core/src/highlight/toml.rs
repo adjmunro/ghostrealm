@@ -34,6 +34,10 @@ impl Highlighter for Toml {
         Some((1 + dots.min(2) as u8 + u8::from(array)).min(3))
     }
 
+    fn has_headings(&self) -> bool {
+        true
+    }
+
     /// The table's key as written, between its brackets.
     fn heading_title(&self, line: &str) -> String {
         let Some((array, _, end)) = header(line) else { return line.trim().to_string() };
@@ -44,9 +48,10 @@ impl Highlighter for Toml {
 
 /// `line` as a table header (`[a.b]`, `[[a]]`): whether it is an array of
 /// tables, how many dots separate its key parts, and the key's length in
-/// bytes (it starts after the opening brackets of the trimmed line). A header closes its
-/// brackets and has only a comment after them; a key holds no `,` (an array
-/// value continued on its own line, `[1, 2],`, is not a header).
+/// bytes (it starts after the opening brackets of the trimmed line). A
+/// header closes its brackets and has only a comment after them; a key holds
+/// no `,` (an array value continued on its own line, `[1, 2],`, is not a
+/// header).
 fn header(line: &str) -> Option<(bool, usize, usize)> {
     let head = line.trim_start().strip_prefix('[')?;
     let (array, head) = match head.strip_prefix('[') {
