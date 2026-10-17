@@ -448,6 +448,15 @@ gives a line's outline level when it heads a section (Markdown: an ATX
 heading's `#` count, where the highlighter marks a heading; TOML: `[a]` 1,
 `[a.b]` and `[[a]]` 2, deeper 3); `syntax::heading_scale` maps it to the
 size the editor draws the row at (H1 1.8, H2 1.5, H3 1.25, H4 1.1, else 1).
+`Highlighter::heading_title` gives a heading's title without its markup
+(Markdown: no `#`s, closing `#`s, inline markers, or link targets; TOML: the
+key between the brackets). `ghostrealm_core::outline` lists a document's
+headings (`OutlineItem { line, level, text }`) from the two; an `Outline`
+keeps them per edit count, sharing the view's `StateCache` so an edit
+re-checks only the lines from it on (about 1 ms for 13,500 lines in a
+release build; the first pass, which highlights every line, about 14 ms),
+and outlines a document of `DEBOUNCE_LINES` (2,000) lines or more again only
+once edits pause for `DEBOUNCE` (300 ms), keeping the last outline meanwhile.
 The editor keeps the monospace grid: each paint lays out a `RowTable` of
 `VisualRow { kind: Text { ln, start, len } | Widget { after_ln, id }, y, h,
 scale }` from the scroll line, and every mapping between screen y and text

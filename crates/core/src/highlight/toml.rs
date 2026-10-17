@@ -30,16 +30,24 @@ impl Highlighter for Toml {
     /// A table header: `[a]` is 1, each dotted key part and an array of
     /// tables' second bracket one deeper (`[a.b]` and `[[a]]` 2), at most 3.
     fn heading_level(&self, line: &str, _state: State) -> Option<u8> {
-        let (array, dots) = header(line)?;
+        let (array, dots, _) = header(line)?;
         Some((1 + dots.min(2) as u8 + u8::from(array)).min(3))
+    }
+
+    /// The table's key as written, between its brackets.
+    fn heading_title(&self, line: &str) -> String {
+        let Some((array, _, end)) = header(line) else { return line.trim().to_string() };
+        let open = if array { 2 } else { 1 };
+        line.trim_start()[open..open + end].trim().to_string()
     }
 }
 
 /// `line` as a table header (`[a.b]`, `[[a]]`): whether it is an array of
-/// tables, and how many dots separate its key parts. A header closes its
+/// tables, how many dots separate its key parts, and the key's length in
+/// bytes (it starts after the opening brackets of the trimmed line). A header closes its
 /// brackets and has only a comment after them; a key holds no `,` (an array
 /// value continued on its own line, `[1, 2],`, is not a header).
-fn header(line: &str) -> Option<(bool, usize)> {
+fn header(line: &str) -> Option<(bool, usize, usize)> {
     let head = line.trim_start().strip_prefix('[')?;
     let (array, head) = match head.strip_prefix('[') {
         Some(rest) => (true, rest),
@@ -65,7 +73,7 @@ fn header(line: &str) -> Option<(bool, usize)> {
                 let rest = &head[i + 1..];
                 let rest = if array { rest.strip_prefix(']')? } else { rest };
                 let rest = rest.trim_start();
-                return (rest.is_empty() || rest.starts_with('#')).then_some((array, dots));
+                return (rest.is_empty() || rest.starts_with('#')).then_some((array, dots, i));
             }
             _ => {}
         }

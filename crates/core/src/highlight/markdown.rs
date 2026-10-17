@@ -77,6 +77,11 @@ impl Highlighter for Markdown {
     /// An ATX heading's level (its `#` count), where [`block`] marks one: at
     /// the top level only, so not in a code block, a quote or a list item.
     fn heading_level(&self, line: &str, state: State) -> Option<u8> {
+        // An outline asks of every line: most aren't headings, and need no
+        // chars collected to say so.
+        if !line.trim_start_matches(' ').starts_with('#') {
+            return None;
+        }
         let c: Vec<char> = line.chars().collect();
         if state != 0 && !leaves(&c, state) {
             return None;
@@ -87,6 +92,24 @@ impl Highlighter for Markdown {
         }
         let hashes = run_of(&c, indent, '#');
         (hashes <= 6 && c.get(indent + hashes).is_none_or(|x| *x == ' ')).then_some(hashes as u8)
+    }
+
+    /// The heading's text without its `#`s, its closing `#`s (a run after a
+    /// space, ending the line), or its inline markup's markers and link
+    /// targets: `## A *b* [c](d) ##` is "A b c".
+    fn heading_title(&self, line: &str) -> String {
+        let c: Vec<char> = line.chars().collect();
+        let mut end = c.len() - c.iter().rev().take_while(|x| x.is_whitespace()).count();
+        let closing = c[..end].iter().rev().take_while(|x| **x == '#').count();
+        if closing > 0 && (closing == end || c[end - closing - 1] == ' ') {
+            end -= closing;
+        }
+        let (spans, _) = self.line(line, 0);
+        let mut title = String::new();
+        for s in spans.iter().filter(|s| !matches!(s.token, Token::Marker | Token::Url)) {
+            title.extend(&c[s.start.min(end)..s.end.min(end)]);
+        }
+        title.trim().to_string()
     }
 
     fn block_row(&self, line: &str, state_in: State, state_out: State) -> Option<BlockRow> {

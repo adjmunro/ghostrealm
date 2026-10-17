@@ -178,6 +178,13 @@ pub trait Highlighter: Sync {
     fn heading_level(&self, _line: &str, _state: State) -> Option<u8> {
         None
     }
+
+    /// The title of `line`, a heading per [`Self::heading_level`], as an
+    /// outline lists it: without the markup that makes it a heading. The
+    /// trimmed line by default.
+    fn heading_title(&self, line: &str) -> String {
+        line.trim().to_string()
+    }
 }
 
 /// Every registered highlighter.

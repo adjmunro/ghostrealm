@@ -12,6 +12,7 @@ pub mod ghostty;
 pub mod git;
 pub mod highlight;
 pub mod line_diff;
+pub mod outline;
 pub mod registry;
 pub mod search;
 pub mod tree;
