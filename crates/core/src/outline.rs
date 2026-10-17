@@ -30,10 +30,15 @@ pub struct OutlineItem {
 /// The headings of `lines` per `h`. `state_in(ln)` is the state line `ln`
 /// enters with (from a [`StateCache`]), asked in ascending order and only
 /// of a highlighter that carries state.
-pub fn outline(h: &dyn Highlighter, lines: &[String], mut state_in: impl FnMut(usize) -> u32) -> Vec<OutlineItem> {
+pub fn outline<S: AsRef<str>>(
+    h: &dyn Highlighter,
+    lines: &[S],
+    mut state_in: impl FnMut(usize) -> u32,
+) -> Vec<OutlineItem> {
     let carries = h.carries_state();
     let mut items = Vec::new();
     for (ln, line) in lines.iter().enumerate() {
+        let line = line.as_ref();
         let state = if carries { state_in(ln) } else { 0 };
         if let Some(level) = h.heading_level(line, state) {
             items.push(OutlineItem { line: ln, level, text: h.heading_title(line) });
@@ -62,11 +67,14 @@ pub struct Outline {
     items: Vec<OutlineItem>,
     /// The edit count and highlighter `items` are of.
     of: Option<(u64, &'static str)>,
+    /// The edit count and highlighter last asked for: a worker's outline of
+    /// an older one leaves this to outline next.
+    wanted: Option<(u64, &'static str)>,
     /// An edit count not yet outlined, and when it was first seen.
     pending: Option<(u64, Instant)>,
-    /// The document's line count `items` are placed for, and the first line
-    /// edited since.
+    /// The document's line count `items` are placed for.
     lines_at: usize,
+    /// The first line edited since `items` were placed.
     dirty: Option<usize>,
     /// The outline on the worker: what it is of, the line count it read,
     /// the first line edited since it read them, and its result.
@@ -118,6 +126,11 @@ impl Outline {
                 let job = self.job.take().expect("a job");
                 self.of = Some(job.of);
                 (self.lines_at, self.dirty) = (job.lines_at, job.dirty);
+                // Edits made while it ran outline once they pause, as any
+                // edit does.
+                if let Some((edits, _)) = self.wanted.filter(|w| *w != job.of) {
+                    self.pending = Some((edits, Instant::now()));
+                }
                 let changed = items != self.items;
                 self.items = items;
                 changed
@@ -146,15 +159,19 @@ impl Outline {
         states: &mut StateCache,
         now: Instant,
     ) -> bool {
-        let mut changed = self.poll();
         let of = (edits, h.name());
+        self.wanted = Some(of);
+        let mut changed = self.poll();
         if self.of == Some(of) {
+            self.pending = None;
             return changed;
         }
-        changed |= self.shift(lines.len());
+        changed |= self.shift(h, lines);
         let fresh = self.of.is_none_or(|(_, name)| name != h.name());
         let worker = lines.len() >= WORKER_LINES;
         if worker && self.job.is_some() {
+            // Its result asks again (`poll`): nothing to wait for till then.
+            self.pending = None;
             return changed;
         }
         if !fresh && lines.len() >= DEBOUNCE_LINES {
@@ -174,6 +191,8 @@ impl Outline {
             self.spawn(h, lines, of);
             return changed;
         }
+        // Newer than anything a worker still running would bring.
+        self.job = None;
         self.of = Some(of);
         (self.lines_at, self.dirty) = (lines.len(), None);
         let items = outline(h, lines, |ln| states.state_in(h, lines, edits, ln));
@@ -183,17 +202,27 @@ impl Outline {
     }
 
     /// Move the items below the first edited line by the change in the line
-    /// count since they were placed. Returns whether any moved.
-    fn shift(&mut self, len: usize) -> bool {
+    /// count since they were placed, and one on that line whose title now
+    /// shows that far down (lines put in before its text). Returns whether
+    /// any moved.
+    fn shift(&mut self, h: &dyn Highlighter, lines: &[String]) -> bool {
         let Some(dirty) = self.dirty.take() else { return false };
-        let delta = len as isize - self.lines_at as isize;
-        self.lines_at = len;
+        let delta = lines.len() as isize - self.lines_at as isize;
+        self.lines_at = lines.len();
         if delta == 0 {
             return false;
         }
+        let title_at = |ln: usize| lines.get(ln).map(|l| h.heading_title(l));
         let mut moved = false;
-        for item in self.items.iter_mut().filter(|i| i.line > dirty) {
-            item.line = item.line.saturating_add_signed(delta).max(dirty);
+        for item in self.items.iter_mut().filter(|i| i.line >= dirty) {
+            let to = item.line.saturating_add_signed(delta).max(dirty);
+            if item.line == dirty {
+                let left = title_at(item.line).as_ref() != Some(&item.text);
+                if delta < 0 || !left || title_at(to).as_ref() != Some(&item.text) {
+                    continue;
+                }
+            }
+            item.line = to;
             moved = true;
         }
         moved
@@ -207,11 +236,11 @@ impl Outline {
         let (tx, rx) = mpsc::channel();
         let waker = self.waker.clone();
         std::thread::spawn(move || {
-            let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            let lines: Vec<&str> = text.split('\n').collect();
             let (mut next, mut state) = (0, 0);
             let items = outline(h, &lines, |ln| {
                 while next < ln {
-                    state = h.line(&lines[next], state).1;
+                    state = h.line(lines[next], state).1;
                     next += 1;
                 }
                 state
@@ -450,11 +479,120 @@ mod tests {
         lines[6] = "# six".into();
         assert!(!o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE * 3));
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE * 3), "edit 1's outline lands");
-        assert!(!o.working(), "edit 2 waits for its pause");
-        o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE * 5);
+        // Edit 1's outline lands; edit 2's pause counts from then.
+        assert!(o.poll());
+        let due = o.due().expect("edit 2 waits for its pause");
+        assert!(!o.working());
+        o.update(&Markdown, &lines, 2, &mut states, due);
+        assert!(o.working());
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
         o.poll();
         assert_eq!(o.items().len(), WORKER_LINES / 1_000 + 2);
+    }
+
+    /// Wait for the worker's outline and take it. Returns whether the items
+    /// changed.
+    fn land(o: &mut Outline) -> bool {
+        let start = Instant::now();
+        while o.working() {
+            if o.poll() {
+                return true;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the worker finishes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    fn worker_doc() -> Vec<String> {
+        let heading = |i: usize| if i.is_multiple_of(1_000) { format!("# {i}") } else { "text".into() };
+        (0..WORKER_LINES * 2).map(heading).collect()
+    }
+
+    #[test]
+    fn edits_made_while_the_worker_runs_are_outlined_after_it_even_when_it_changes_nothing() {
+        let mut lines = worker_doc();
+        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        o.update(&Markdown, &lines, 0, &mut states, now);
+        land(&mut o);
+        // Edit 1 changes no heading; edit 2, while its job runs, adds one.
+        lines[5] = "more text".into();
+        o.dirty_from(5);
+        o.update(&Markdown, &lines, 1, &mut states, now);
+        o.update(&Markdown, &lines, 1, &mut states, now + DEBOUNCE);
+        assert!(o.working());
+        lines[7] = "# new".into();
+        o.dirty_from(7);
+        o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE);
+        assert!(!land(&mut o), "edit 1's outline is the same");
+        let due = o.due().expect("edit 2 still to outline");
+        o.update(&Markdown, &lines, 2, &mut states, due);
+        assert!(land(&mut o));
+        assert!(o.items().iter().any(|i| i.text == "new"));
+    }
+
+    #[test]
+    fn a_worker_outline_older_than_a_synchronous_one_is_dropped() {
+        let mut lines = worker_doc();
+        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        o.update(&Markdown, &lines, 0, &mut states, now);
+        assert!(o.working());
+        lines = vec!["# only".into(), "# two".into()];
+        o.dirty_from(0);
+        o.update(&Markdown, &lines, 1, &mut states, now);
+        assert_eq!(o.items().len(), 2);
+        assert!(!o.working() && !land(&mut o));
+        assert_eq!(o.items().len(), 2);
+    }
+
+    #[test]
+    fn growing_past_the_worker_threshold_while_a_job_runs_leaves_no_past_deadline() {
+        let mut lines = worker_doc();
+        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        o.update(&Markdown, &lines, 0, &mut states, now);
+        land(&mut o);
+        // Edit 1 starts a job after its pause.
+        lines[5] = "more".into();
+        o.dirty_from(5);
+        o.update(&Markdown, &lines, 1, &mut states, now);
+        o.update(&Markdown, &lines, 1, &mut states, now + DEBOUNCE);
+        assert!(o.working());
+        // Edit 2 makes it shorter than the worker's threshold: it waits.
+        let tail = lines.split_off(WORKER_LINES / 2);
+        o.dirty_from(WORKER_LINES / 2);
+        o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE);
+        assert_eq!(o.due(), Some(now + DEBOUNCE * 2));
+        // Edit 3 makes it long again while the job runs.
+        lines.extend(tail);
+        o.update(&Markdown, &lines, 3, &mut states, now + DEBOUNCE * 2);
+        assert_eq!(o.due(), None, "the job's result asks again; no tick meanwhile");
+        land(&mut o);
+        // Unless the job had finished by edit 3, which then started its own.
+        if let Some(due) = o.due() {
+            o.update(&Markdown, &lines, 3, &mut states, due);
+            land(&mut o);
+        }
+        assert_eq!(o.due(), None);
+        assert_eq!(o.items().len(), WORKER_LINES * 2 / 1_000);
+    }
+
+    #[test]
+    fn lines_put_in_before_a_headings_text_move_it_while_waiting() {
+        let heading = |i: usize| if i == 100 { "# H".to_string() } else { "text".into() };
+        let mut lines: Vec<String> = (0..DEBOUNCE_LINES + 100).map(heading).collect();
+        let (mut o, mut states, now) = (Outline::default(), StateCache::default(), Instant::now());
+        o.update(&Markdown, &lines, 0, &mut states, now);
+        // Enter at the heading's start: its line is the first edited.
+        lines.insert(100, String::new());
+        states.dirty_from(100);
+        o.dirty_from(100);
+        o.update(&Markdown, &lines, 1, &mut states, now);
+        assert_eq!(o.items()[0].line, 101);
+        // Enter at its end: it stays.
+        lines.insert(102, String::new());
+        states.dirty_from(101);
+        o.dirty_from(101);
+        o.update(&Markdown, &lines, 2, &mut states, now);
+        assert_eq!(o.items()[0].line, 101);
     }
 }

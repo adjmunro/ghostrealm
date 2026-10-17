@@ -727,17 +727,22 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_from_the_dashes_leaves_the_caret_be() {
+    fn a_drag_from_the_panel_leaves_the_caret_be() {
         let mut h = Harness::new();
         let mut v = doc("toc-drag", "doc.md", &sections(20));
-        h.paint(&mut v, RECT);
-        let (_, dash) = buttons(&h)[1];
+        open(&mut h, &mut v);
+        // Its padding: no row's button takes the press, so the view gets it.
+        let panel = v.toc.panel.unwrap();
+        let pad = (panel.x + 2.0, panel.y + 1.0);
+        assert!(buttons(&h).iter().all(|(_, r)| !rect_contains(*r, pad.0, pad.1)));
         let left = MouseButton::Left;
-        h.mouse(&mut v, MouseEvent::Down { pos: centre(dash), clicks: 1, button: left });
+        h.mouse(&mut v, MouseEvent::Down { pos: pad, clicks: 1, button: left });
         h.mouse(&mut v, MouseEvent::Drag { pos: (200.0, 100.0), button: left });
         h.mouse(&mut v, MouseEvent::Up { pos: (200.0, 100.0), dragged: true, button: left });
         assert_eq!((v.buffer().cursor, v.buffer().anchor), ((0, 0), None));
         // The next press is the text's again.
+        h.mouse(&mut v, MouseEvent::Leave { pos: (900.0, 0.0) });
+        h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Down { pos: (200.0, 100.0), clicks: 1, button: left });
         assert_ne!(v.buffer().cursor, (0, 0));
     }

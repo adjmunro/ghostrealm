@@ -567,17 +567,17 @@
 [2026-10-13@13e2bda] Editor — table of contents follow-ups
 
 - Requires: code symbols need the LSP (document symbols)
-- Detail: The sticky table of contents lists Markdown headings and TOML
-  tables (PLUGINS.md "Table of contents"). Not yet: code files' symbols once
-  an LSP is wired (a second outline source beside the highlighter's);
-  setext headings in Integrated and Source (the highlighter is line-local;
-  Preview lists them). Titles can differ between the modes: Integrated and
-  Source strip what the line-local highlighter marks (a link it doesn't
-  recognise keeps its brackets), Preview takes pulldown-cmark's text
-  (escapes resolved, reference links, HTML dropped). Undecided: whether the current section follows the
-  caret rather than the top line; keyboard use (a command or chord that
-  opens the panel, arrows and Enter in it); folding a heading's subsections
-  in the panel.
+- Detail: The sticky table of contents lists Markdown headings and TOML tables
+  (PLUGINS.md "Table of contents"). Not yet: code files' symbols once an LSP
+  is wired (a second outline source beside the highlighter's); setext headings
+  in Integrated and Source (the highlighter is line-local; Preview lists
+  them). Titles can differ between the modes: Integrated and Source strip what
+  the line-local highlighter marks (a link it doesn't recognise keeps its
+  brackets), Preview takes pulldown-cmark's text (escapes resolved, reference
+  links, HTML dropped). Undecided: whether the current section follows the
+  caret rather than the top line; keyboard use (a command or chord that opens
+  the panel, arrows and Enter in it); folding a heading's subsections in the
+  panel.
 - Reason: navigate long files (the config included) by structure.
 
 ---

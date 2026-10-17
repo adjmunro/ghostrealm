@@ -546,10 +546,10 @@ impl EditorView {
     }
 
     /// Outline the buffer again if it changed (see [`Outline::update`]);
-    /// without a highlighter, forget the outline. Returns whether the
-    /// headings changed.
+    /// without a highlighter whose language has headings, forget the
+    /// outline. Returns whether the headings changed.
     fn update_outline(&mut self, now: Instant) -> bool {
-        let Some(h) = self.highlighter() else {
+        let Some(h) = self.highlighter().filter(|h| h.has_headings()) else {
             self.outline.reset();
             return false;
         };
@@ -2912,6 +2912,27 @@ mod tests {
     }
 
     #[test]
+    fn with_the_rail_on_screen_boxes_copy_buttons_and_selections_start_at_the_text() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-rail", "text\n```\ncode\n```");
+        h.paint(&mut v, RECT);
+        let rail = toc::rail_w(UI, RECT, true);
+        let text_x = rail + 4.0 * UI.cell_w;
+        let pad = (UI.cell_w * 0.5).round();
+        assert_eq!(code_boxes(&h)[0].0, text_x - pad, "the box reaches half a cell left of the text");
+        h.cursor = (text_x + UI.cell_w, 2.0 * UI.cell_h + 1.0);
+        h.paint(&mut v, RECT);
+        let (b, _) = copy_buttons(&h)[0];
+        assert!(b.x > text_x && b.x + b.w <= RECT.w, "{b:?}");
+        v.buf.anchor = Some((0, 0));
+        v.buf.cursor = (0, 4);
+        h.paint(&mut v, RECT);
+        let sel = crate::plugin::paint::round_quad(RECT, 1.0, 1.0, 0.0, h.chrome.accent, 0.35, None).color;
+        let r = bg_rects(&h).into_iter().zip(&h.frame.bg).find(|(_, q)| q.color == sel).expect("a selection").0;
+        assert_eq!(r, (text_x, 0.0, 4.0 * UI.cell_w, UI.cell_h));
+    }
+
+    #[test]
     fn a_block_past_the_viewport_is_open_at_that_edge() {
         let mut h = Harness::new();
         let body: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
@@ -2938,7 +2959,7 @@ mod tests {
 
     /// The copy buttons painted, as (hit rect, id).
     fn copy_buttons(h: &Harness) -> Vec<(Rect, u32)> {
-        h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_COPY_BLOCK).map(|b| (b.0, b.2)).collect()
+        h.frame.view_buttons.iter().filter(|b| (BTN_COPY_BLOCK..BTN_TOC).contains(&b.2)).map(|b| (b.0, b.2)).collect()
     }
 
     /// Paint `v` with the pointer at `at`, and copy with the button there.
