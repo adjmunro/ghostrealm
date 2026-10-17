@@ -252,6 +252,10 @@ pub struct TextItem {
     pub bounds: TextBounds,
     /// Colour for glyphs whose spans didn't bake one in.
     pub color: [u8; 3],
+    /// How much larger than shaped the glyphs draw, from `(left, top)` (a
+    /// heading row). The renderer rasterises at this size, so the row stays
+    /// shaped (and cached) at the frame's metrics.
+    pub scale: f32,
 }
 
 /// Pixels a view shows with [`PaintCx::image`]: tightly packed BGRA, sRGB-encoded,
@@ -625,18 +629,30 @@ pub struct Shaped {
 }
 
 /// The per-span styles of a row passed to the row-drawing calls: one
-/// [`RunStyle`] per span, and the monospace cell width the decorations measure
-/// spans with. A row with no styled span passes [`NONE`](Self::NONE), which
-/// carries nothing and costs nothing.
+/// [`RunStyle`] per span, the monospace cell width the decorations measure
+/// spans with, and the row's draw [`scale`](TextItem::scale). A row with no
+/// styled span passes [`NONE`](Self::NONE) (or [`scaled`](Self::scaled) it),
+/// which carries nothing and costs nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct RowStyles<'a> {
     pub runs: &'a [RunStyle],
+    /// The cell width at scale 1: decorations multiply it by `scale`.
     pub cell_w: f32,
+    pub scale: f32,
 }
 
-impl RowStyles<'_> {
+impl<'a> RowStyles<'a> {
     /// An unstyled row.
-    pub const NONE: RowStyles<'static> = RowStyles { runs: &[], cell_w: 0.0 };
+    pub const NONE: RowStyles<'static> = RowStyles { runs: &[], cell_w: 0.0, scale: 1.0 };
+
+    pub fn new(runs: &'a [RunStyle], cell_w: f32) -> Self {
+        RowStyles { runs, cell_w, scale: 1.0 }
+    }
+
+    /// These styles on a row drawn `scale` times its shaped size.
+    pub fn scaled(self, scale: f32) -> Self {
+        RowStyles { scale, ..self }
+    }
 }
 
 /// What a view paints with. Everything is in physical pixels.
@@ -955,6 +971,7 @@ impl<'a> PaintCx<'a> {
             top,
             bounds: bounds(clip),
             color,
+            scale: 1.0,
         });
     }
 
@@ -1014,6 +1031,7 @@ impl<'a> PaintCx<'a> {
             top,
             bounds: bounds(clip),
             color,
+            scale: 1.0,
         });
     }
 
@@ -1049,6 +1067,7 @@ impl<'a> PaintCx<'a> {
             top,
             bounds: bounds(clip),
             color,
+            scale: 1.0,
         });
     }
 
@@ -1074,8 +1093,9 @@ impl<'a> PaintCx<'a> {
 
     /// [`budgeted_row`](Self::budgeted_row) for a row with styled spans:
     /// `styles` (from [`row_key_styled`](Self::row_key_styled)'s key) picks the
-    /// bold/italic faces and draws underlines and `BOX` backgrounds as quads.
-    /// `RowStyles::NONE` is the unstyled path and adds no work.
+    /// bold/italic faces and draws underlines and `BOX` backgrounds as quads,
+    /// all drawn at `styles.scale`. A row without runs (`RowStyles::NONE`,
+    /// scaled or not) is the unstyled path and adds no work.
     #[allow(clippy::too_many_arguments)]
     pub fn budgeted_row_styled(
         &mut self,
@@ -1098,6 +1118,7 @@ impl<'a> PaintCx<'a> {
             top,
             bounds: bounds(clip),
             color,
+            scale: styles.scale,
         });
     }
 
@@ -1132,14 +1153,18 @@ impl<'a> PaintCx<'a> {
             top,
             bounds: bounds(clip),
             color,
+            scale: styles.scale,
         });
     }
 
     /// The quads under a styled row: a rounded, outlined code box behind each
     /// run of `BOX` spans and a thin line under `UNDERLINE` spans, each as
-    /// wide as its characters at the styles' cell width, clipped to `clip`.
+    /// wide as its characters at the styles' (scaled) cell width, clipped to
+    /// `clip`.
     fn decorate(&mut self, spans: &[(String, [u8; 3])], styles: RowStyles, left: f32, top: f32, clip: Rect) {
-        let (line_h, size) = (self.text.line_h, self.text.metrics.font_size);
+        let line_h = self.text.line_h * styles.scale;
+        let size = self.text.metrics.font_size * styles.scale;
+        let cell_w = styles.cell_w * styles.scale;
         let thick = (size / 14.0).round().max(1.0);
         // Each span's x range, unclipped.
         let mut x = left;
@@ -1147,7 +1172,7 @@ impl<'a> PaintCx<'a> {
             .iter()
             .map(|(text, _)| {
                 let x0 = x;
-                x += text.chars().count() as f32 * styles.cell_w;
+                x += text.chars().count() as f32 * cell_w;
                 (x0, x)
             })
             .collect();
@@ -1155,7 +1180,7 @@ impl<'a> PaintCx<'a> {
         // is one span of code), outset a little into the cells either side
         // (a code span's backticks), so it pads its text without moving the
         // grid. Drawn whole and clipped, so a cut box keeps its corners.
-        let pad = (styles.cell_w * 0.25).round().max(1.0);
+        let pad = (cell_w * 0.25).round().max(1.0);
         // A row not scrolled sideways has nothing left of its first column,
         // so a box starting there (code wrapped onto this row) keeps its
         // left edge in the padding before it.
@@ -1234,7 +1259,7 @@ mod tests {
         h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::ZERO);
         let clip = Rect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 };
         let runs = [RunStyle::UNDERLINE];
-        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        let styles = RowStyles::new(&runs, UI.cell_w);
         let rows = MIN_SHAPES_PER_FRAME + 4;
         {
             let mut cx = PaintCx::new(
@@ -1260,7 +1285,7 @@ mod tests {
         let spans: Vec<(String, [u8; 3])> =
             ["a `", "co", "de", "` b `", "x"].iter().map(|t| (t.to_string(), [200; 3])).collect();
         let runs = [RunStyle::PLAIN, RunStyle::BOX, RunStyle::BOX, RunStyle::PLAIN, RunStyle::BOX];
-        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        let styles = RowStyles::new(&runs, UI.cell_w);
         // The clip ends inside the second box (columns 12..13, padded).
         let clip = Rect { x: 0.0, y: 0.0, w: 12.5 * UI.cell_w, h: 100.0 };
         {
@@ -1284,6 +1309,36 @@ mod tests {
         assert_eq!(boxes[0].clip, [-pad, 0.0, clip.w, 100.0], "clipped, keeping its shape");
     }
 
+    /// A scaled row's decorations measure its scaled cells: a box as wide and
+    /// tall as its characters drawn at that scale, an underline at its foot,
+    /// and its text item carries the scale.
+    #[test]
+    fn a_scaled_rows_decorations_measure_scaled_cells() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let spans: Vec<(String, [u8; 3])> = ["ab", "cd"].iter().map(|t| (t.to_string(), [200; 3])).collect();
+        let runs = [RunStyle::BOX, RunStyle::UNDERLINE];
+        let styles = RowStyles::new(&runs, UI.cell_w).scaled(2.0);
+        let clip = Rect { x: 0.0, y: 0.0, w: 400.0, h: 100.0 };
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            let key = cx.row_key_styled(spans.iter().map(|(t, c)| (t.as_str(), *c)), styles);
+            cx.budgeted_row_styled(key, || spans.clone(), styles, 0.0, 0.0, 400.0, clip, [200; 3]);
+        }
+        let (cw, line_h) = (2.0 * UI.cell_w, 2.0 * UI.cell_h);
+        let pad = (cw * 0.25).round();
+        let boxed = &h.frame.bg[0];
+        let border = theme::hairline(UI);
+        assert_eq!((boxed.px[0], boxed.px[1]), (2.0 * cw + 2.0 * pad, line_h - 2.0 * border));
+        let under = &h.frame.bg[1];
+        let y = |q: &QuadInstance| ((1.0 - q.pos[1]) / 2.0 * 600.0 * 100.0).round() / 100.0;
+        assert_eq!(under.px[0], 2.0 * cw, "under the two scaled cells");
+        assert!(y(under) > UI.cell_h && y(under) < line_h, "at the scaled row's foot: {}", y(under));
+        assert_eq!(h.frame.text[0].scale, 2.0);
+    }
+
     /// Code wrapped onto the start of a row keeps its box's left edge; a row
     /// scrolled sideways clips at its text.
     #[test]
@@ -1291,7 +1346,7 @@ mod tests {
         let mut h = Harness::new();
         h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
         let runs = [RunStyle::BOX];
-        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        let styles = RowStyles::new(&runs, UI.cell_w);
         let clip = Rect { x: 32.0, y: 0.0, w: 200.0, h: 100.0 };
         {
             let mut cx = PaintCx::new(

@@ -4513,7 +4513,7 @@ impl State {
                 buffer,
                 left: p.left,
                 top: p.top,
-                scale: 1.0,
+                scale: p.scale,
                 bounds: p.bounds,
                 default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
                 custom_glyphs: &[],
@@ -6027,10 +6027,16 @@ mod tests {
         assert!(edge[2] > 10 && edge[2] < 245, "antialiased curve, got {edge:?}");
     }
 
-    /// Paint one 192x24 monospace row of `text` in `style` and rasterise it: the
-    /// frame's under-text quads on the GPU, then the shaped glyphs composited on
-    /// the CPU. RGBA8 pixels.
+    /// Paint one monospace row of `text` in `style` and rasterise it into a
+    /// 192px square: the frame's under-text quads on the GPU, then the shaped
+    /// glyphs composited on the CPU. RGBA8 pixels.
     fn draw_row(text: &str, style: crate::row_cache::RunStyle) -> Vec<u8> {
+        draw_row_scaled(text, style, 1.0)
+    }
+
+    /// [`draw_row`] drawn `scale` times its shaped size, its glyphs placed
+    /// and rasterised as glyphon does for a `TextArea` of that scale.
+    fn draw_row_scaled(text: &str, style: crate::row_cache::RunStyle, scale: f32) -> Vec<u8> {
         use crate::plugin::testing::{Harness, UI};
         use crate::plugin::{Layer, PaintCx, RowStyles, TextSrc};
         use glyphon::cosmic_text::{SwashCache, SwashContent};
@@ -6041,7 +6047,8 @@ mod tests {
         let clip = Rect { x: 0.0, y: 0.0, w: DIM as f32, h: DIM as f32 };
         let fg = [220, 220, 230];
         let runs = [style];
-        let styles = if style.is_plain() { RowStyles::NONE } else { RowStyles { runs: &runs, cell_w: UI.cell_w } };
+        let styles = if style.is_plain() { RowStyles::NONE } else { RowStyles::new(&runs, UI.cell_w) };
+        let styles = styles.scaled(scale);
         {
             let mut cx = PaintCx::new(
                 &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
@@ -6073,7 +6080,7 @@ mod tests {
             let buffer = h.text.row_cache.buffer(key).expect("shaped row");
             for run in buffer.layout_runs() {
                 for g in run.glyphs {
-                    let p = g.physical((item.left, item.top), 1.0);
+                    let p = g.physical((item.left, item.top), item.scale);
                     let Some(img) = swash.get_image(&mut h.text.font_system, p.cache_key).as_ref() else {
                         continue;
                     };
@@ -6083,7 +6090,8 @@ mod tests {
                     let c = g.color_opt.map_or(fg, |c| [c.r(), c.g(), c.b()]);
                     for (i, a) in img.data.iter().enumerate() {
                         let x = p.x + img.placement.left + (i as u32 % img.placement.width) as i32;
-                        let y = (run.line_y as i32) + p.y - img.placement.top + (i as u32 / img.placement.width) as i32;
+                        let line_y = (run.line_y * item.scale).round() as i32;
+                        let y = line_y + p.y - img.placement.top + (i as u32 / img.placement.width) as i32;
                         if x < 0 || y < 0 || x >= DIM as i32 || y >= DIM as i32 {
                             continue;
                         }
@@ -6117,6 +6125,32 @@ mod tests {
             assert_ne!(draw_row(text, style), plain, "{name} looks like plain text");
         }
         assert_ne!(draw_row(text, RunStyle::BOLD), draw_row(text, RunStyle::ITALIC));
+    }
+
+    /// A row drawn at a heading's scale inks more rows and columns than the
+    /// same row at scale 1, and its underline sits lower and is wider.
+    #[test]
+    fn a_scaled_row_draws_taller_and_wider_ink() {
+        use crate::row_cache::RunStyle;
+        const DIM: usize = 192;
+        // (top, bottom, left, right) of the pixels brighter than the background.
+        let ink = |px: &[u8]| {
+            let mut b = (usize::MAX, 0, usize::MAX, 0);
+            for (i, p) in px.chunks(4).enumerate() {
+                if p[0] > 60 {
+                    let (x, y) = (i % DIM, i / DIM);
+                    b = (b.0.min(y), b.1.max(y), b.2.min(x), b.3.max(x));
+                }
+            }
+            b
+        };
+        let plain = ink(&draw_row("Hg", RunStyle::PLAIN));
+        let big = ink(&draw_row_scaled("Hg", RunStyle::PLAIN, 1.8));
+        let (h1, h2) = ((plain.1 - plain.0) as f32, (big.1 - big.0) as f32);
+        assert!(h2 > h1 * 1.5, "taller ink: {plain:?} vs {big:?}");
+        assert!(big.3 - big.2 > (plain.3 - plain.2) * 3 / 2, "wider ink: {plain:?} vs {big:?}");
+        let under = ink(&draw_row_scaled("Hg", RunStyle::UNDERLINE, 1.8));
+        assert!(under.1 > plain.1 + 6, "the underline follows the scaled row: {under:?}");
     }
 
     /// A code box draws its hairline border brighter than its fill, and the

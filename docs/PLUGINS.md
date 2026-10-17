@@ -131,7 +131,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   re-requested). Use `budgeted_row` for bulk
   content (terminal grid, editor text) and build the key with `row_key` from your
   cells so a cache hit costs no allocation.
-- Styled rows: `budgeted_row_styled` takes `RowStyles { runs, cell_w }`, one
+- Styled rows: `budgeted_row_styled` takes `RowStyles { runs, cell_w, scale }`
+  (`RowStyles::new(runs, cell_w)`, `.scaled(s)`), one
   `RunStyle` (`BOLD`, `ITALIC`, `UNDERLINE`, `BOX`, combined with `|`) per span,
   keyed with `row_key_styled`. Bold/italic pick the face at shaping (cosmic-text
   uses the nearest weight, and skews an italic when the family has none);
@@ -142,6 +143,13 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   (`budgeted_row` does): it keys, shapes, and draws as before and carries no
   style data. Build `runs` only for rows that use a style
   (`syntax::styled_row_spans` returns it empty otherwise).
+- Scaled rows: `RowStyles::scaled(s)` (also on `NONE`) draws the row `s`
+  times its shaped size from its top-left: the frame's `TextItem.scale`
+  becomes glyphon's `TextArea.scale`, which rasterises the glyphs at that
+  size, so the row is still shaped and cached once at the frame's metrics.
+  Its decorations measure `cell_w * s` per char and `line_h * s` tall. The
+  caller lays out the row `line_h * s` high and its columns `cell_w * s`
+  wide.
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).

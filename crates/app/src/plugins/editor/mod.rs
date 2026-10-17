@@ -1136,7 +1136,7 @@ impl View for EditorView {
                 }
                 None => (vec![(text.clone(), EDITOR_FG)], Vec::new()),
             };
-            let styles = RowStyles { runs: &styles, cell_w: cw };
+            let styles = RowStyles::new(&styles, cw);
             let key = cx.row_key_styled(spans.iter().map(|(s, c)| (s.as_str(), *c)), styles);
             // Wide enough for the whole row, so layout is hscroll-independent.
             let shape_w = (len as f32 * cw).max(text_w);
