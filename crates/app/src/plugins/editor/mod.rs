@@ -1285,10 +1285,10 @@ impl View for EditorView {
         }
         let total_lines = self.buf.lines.len();
         let gutter_w = gutter_width(cx.cfg, total_lines, cw);
-        // The table of contents' rail, left of the gutter (none without
-        // headings enough).
+        // The table of contents' rail, left of the gutter.
         self.update_outline(Instant::now());
-        let rail = toc::rail_w(cx.ui, body, self.outline.items().len());
+        let highlighter = self.buf.path.as_deref().and_then(highlight::for_path);
+        let rail = toc::rail_w(cx.ui, body, highlighter.is_some_and(|h| h.has_headings()));
         // With no gutter, half a cell before the text holds a code block's
         // left edge.
         let inset = if gutter_w > 0.0 { 0.0 } else { (cw * 0.5).round() };
@@ -1297,7 +1297,6 @@ impl View for EditorView {
         let rows_layout = RowLayout { text_w, cell: (cw, ch), wrap };
         let text_cols = rows_layout.cols(1.0);
         self.layout = Layout { body, text_x, rows: rows_layout };
-        let highlighter = self.buf.path.as_deref().and_then(highlight::for_path);
         // Heading sizes and code boxes come from it; in Source, none.
         let formatter = self.formatter();
         self.sync_hl_states();
@@ -2040,8 +2039,17 @@ mod tests {
         (text_x + col as f32 * UI.cell_w, row as f32 * UI.cell_h + 1.0)
     }
 
-    fn paint_plain(h: &mut Harness, v: &mut EditorView) {
-        h.paint(v, RECT);
+    fn paint_plain<'h>(h: &'h mut Harness, v: &mut EditorView) -> &'h crate::plugin::Frame {
+        let rect = rect_of(v);
+        h.paint(v, rect)
+    }
+
+    /// `RECT`, reaching the table of contents' rail further left for a
+    /// document whose language has headings: its text then sits where a
+    /// plain document's does, so one set of positions serves both.
+    fn rect_of(v: &EditorView) -> Rect {
+        let rail = toc::rail_w(UI, RECT, v.highlighter().is_some_and(|h| h.has_headings()));
+        Rect { x: RECT.x - rail, w: RECT.w + rail, ..RECT }
     }
 
     /// `v` with the document header, as a Files surface shows it.
@@ -2210,7 +2218,7 @@ mod tests {
     fn a_hosted_editor_draws_its_header_with_the_wrap_toggle_above_the_text() {
         let mut v = hosted(view_with("hello"));
         let mut h = Harness::new();
-        let frame = h.paint(&mut v, RECT);
+        let frame = paint_plain(&mut h, &mut v);
         assert!(frame.view_buttons.iter().any(|(_, _, id)| *id == BTN_WRAP));
         assert!(h.texts().iter().any(|t| t == "Text"), "the kind: {:?}", h.texts());
         let header_h = crate::plugins::files::header::DocHeader::height(UI);
@@ -2225,7 +2233,7 @@ mod tests {
         let mut v = hosted(view_with("one two"));
         v.buf.path = Some(tmpdir("editor-stat").join("f.txt"));
         let mut h = Harness::new();
-        let buttons = h.paint(&mut v, RECT).view_buttons.clone();
+        let buttons = paint_plain(&mut h, &mut v).view_buttons.clone();
         let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
         let (stat, disk) = (at(BTN_STAT), at(BTN_AUTOSAVE));
         assert!((stat.x + stat.w - disk.x).abs() < 1.0, "hit areas abut, never overlap");
@@ -2241,7 +2249,7 @@ mod tests {
 ").unwrap();
         let mut v = hosted(EditorView::new(EditorBuffer::open(path.clone()).unwrap()));
         let mut h = Harness::new();
-        let name = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_NAME).expect("a name button").0;
+        let name = paint_plain(&mut h, &mut v).view_buttons.iter().find(|b| b.2 == BTN_NAME).expect("a name button").0;
         let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Document };
         let out = h.button(&mut v, BTN_NAME);
         let at = (name.x, name.y + name.h);
@@ -2254,10 +2262,10 @@ mod tests {
         // Hovering the name highlights it (the button convention).
         let quads = |h: &Harness| h.frame.bg.len() + h.frame.top.len();
         h.cursor = (name.x + 1.0, name.y + 1.0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         let hovered = quads(&h);
         h.cursor = (-1.0, -1.0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert!(hovered > quads(&h), "hover adds a highlight quad");
     }
 
@@ -2269,7 +2277,7 @@ mod tests {
         let mut h = Harness::new();
         h.cfg.editor.soft_wrap = false;
         (h.cfg.editor.autosave_after, h.cfg.editor.autosave_on_unfocus) = (0, false);
-        let buttons = h.paint(&mut v, RECT).view_buttons.clone();
+        let buttons = paint_plain(&mut h, &mut v).view_buttons.clone();
         let more = buttons.iter().find(|b| b.2 == BTN_MORE).expect("a ⋯ button").0;
         let others = buttons.iter().filter(|b| b.2 != BTN_MORE);
         assert!(others.clone().count() >= 3);
@@ -2315,7 +2323,7 @@ mod tests {
     fn a_scratch_buffers_more_menu_offers_autosave_disabled() {
         let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         let out = h.button(&mut v, BTN_MORE);
         let [Request::Menu { items, .. }] = out.requests.as_slice() else {
             panic!("expected a menu");
@@ -2329,7 +2337,7 @@ mod tests {
     fn a_scratch_buffer_or_an_editor_without_a_header_has_no_file_menu() {
         let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
-        let frame = h.paint(&mut v, RECT);
+        let frame = paint_plain(&mut h, &mut v);
         assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_NAME), "no file, no menu");
         assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty());
         let path = tmpdir("editor-menu-strip").join("f.txt");
@@ -2422,7 +2430,7 @@ mod tests {
     fn a_scratch_buffer_shows_autosave_off_and_inert() {
         let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
-        let frame = h.paint(&mut v, RECT);
+        let frame = paint_plain(&mut h, &mut v);
         assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_AUTOSAVE), "no toggle to click");
         assert_eq!(v.autosave_tip(&Config::default()), "Autosave off (no file)");
     }
@@ -2431,10 +2439,10 @@ mod tests {
     fn hovering_the_wrap_toggle_offers_a_tooltip() {
         let mut v = hosted(view_with("x"));
         let mut h = Harness::new();
-        let wrap = h.paint(&mut v, RECT).view_buttons.iter().find(|b| b.2 == BTN_WRAP).unwrap().0;
+        let wrap = paint_plain(&mut h, &mut v).view_buttons.iter().find(|b| b.2 == BTN_WRAP).unwrap().0;
         assert!(h.frame.tooltip.is_none(), "not hovered");
         h.cursor = (wrap.x + 1.0, wrap.y + 1.0);
-        let tip = h.paint(&mut v, RECT).tooltip.clone().map(|t| t.1);
+        let tip = paint_plain(&mut h, &mut v).tooltip.clone().map(|t| t.1);
         assert_eq!(tip.as_deref(), Some("Soft wrap"));
     }
 
@@ -2759,7 +2767,7 @@ mod tests {
         for scroll in [0, 20, 52] {
             v.buf.scroll = scroll;
             h.key(&mut v, press(Key::Char('x')));
-            let drawn = h.paint(&mut v, RECT).text.len();
+            let drawn = paint_plain(&mut h, &mut v).text.len();
             assert!(drawn >= rows.min(60 - scroll) - 1, "scroll {scroll}: {drawn} rows");
         }
     }
@@ -2898,7 +2906,8 @@ mod tests {
         paint_plain(&mut h, &mut v);
         let b = code_boxes(&h)[0];
         assert!(b.1 < 0.0 && b.1 + b.3 > RECT.h, "open at both edges: {b:?}");
-        assert_eq!(h.frame.bg.iter().find(|q| q.border_w > 0.0).unwrap().clip, [0.0, 0.0, RECT.w, RECT.h]);
+        let r = rect_of(&v);
+        assert_eq!(h.frame.bg.iter().find(|q| q.border_w > 0.0).unwrap().clip, [r.x, r.y, r.x + r.w, r.y + r.h]);
         // Scrolled to its end: open top, closed bottom.
         v.buf.scroll = 35;
         v.buf.cursor = (40, 0);
@@ -2913,9 +2922,11 @@ mod tests {
     }
 
     /// Paint `v` with the pointer at `at`, and copy with the button there.
+    /// `rect` reaches left over any rail, as [`rect_of`]'s does.
     fn copy_at(h: &mut Harness, v: &mut EditorView, rect: Rect, at: (f32, f32)) -> Option<String> {
         h.cursor = at;
-        h.paint(v, rect);
+        let rail = RECT.x - rect_of(v).x;
+        h.paint(v, Rect { x: rect.x - rail, w: rect.w + rail, ..rect });
         let (_, id) = *copy_buttons(h).first()?;
         *h.clipboard.borrow_mut() = None;
         h.button(v, id);
@@ -2980,7 +2991,7 @@ mod tests {
         paint_plain(&mut h, &mut v);
         assert!(pill_colors(&h).is_empty(), "no pill while the pointer is away");
         h.cursor = at(1, 0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         let layers = pill_colors(&h);
         assert_eq!(layers.len(), 2, "{layers:?}");
         assert_eq!(layers[0].0[3], 1.0, "an opaque base");
@@ -2997,7 +3008,7 @@ mod tests {
         let mut h = Harness::new();
         let mut v = markdown_view("editor-md-blank-body", "```\n  \n```\n");
         h.cursor = at(1, 0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert!(copy_buttons(&h).is_empty(), "a body of blank rows has nothing to copy");
         // An unclosed quoted block ends at its last row with text, `>` aside.
         let mut v = markdown_view("editor-md-quoted-open", "> ```\n> a\n>\n> \nafter");
@@ -3012,10 +3023,10 @@ mod tests {
         let mut v = markdown_view("editor-md-hover-painted", "```\na\n```\nafter");
         let mut h = Harness::new();
         h.cursor = at(1, 0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert!(!h.mouse(&mut v, MouseEvent::Move { pos: at(1, 1) }).redraw, "already shown");
         h.cursor = (-1.0, -1.0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert!(h.mouse(&mut v, MouseEvent::Move { pos: at(1, 1) }).redraw, "not shown yet");
     }
 
@@ -3024,19 +3035,19 @@ mod tests {
         let mut v = markdown_view("editor-md-copied", "```\na\n```");
         let mut h = Harness::new();
         h.cursor = at(1, 0);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         let quads = |h: &Harness| h.frame.top.len();
         let copy = quads(&h);
         let (_, id) = copy_buttons(&h)[0];
         let out = h.button(&mut v, id);
         assert!(out.redraw);
         assert_eq!(h.clipboard.borrow().as_deref(), Some("a"));
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert_ne!(quads(&h), copy, "the check mark replaces the copy icon");
         let due = v.deadline(&h.cfg).expect("a deadline to put the icon back");
         assert!(h.tick(&mut v, due).redraw);
         assert_eq!(v.deadline(&h.cfg), None);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert_eq!(quads(&h), copy);
     }
 
@@ -3045,7 +3056,7 @@ mod tests {
         let mut h = Harness::new();
         let mut v = markdown_view("editor-md-copy-empty", "```\n```\n");
         h.cursor = at(0, 1);
-        h.paint(&mut v, RECT);
+        paint_plain(&mut h, &mut v);
         assert!(copy_buttons(&h).is_empty());
         *h.clipboard.borrow_mut() = Some("kept".into());
         h.button(&mut v, BTN_COPY_BLOCK);

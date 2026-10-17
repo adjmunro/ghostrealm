@@ -70,13 +70,18 @@ pub struct Toc {
     measured: Option<(u64, f32)>,
 }
 
-/// The rail's width left of the text in `area` for an outline of `items`
-/// headings: none below [`MIN_ITEMS`] or in a narrow area.
-pub fn rail_w(ui: UiMetrics, area: Rect, items: usize) -> f32 {
-    if items < MIN_ITEMS || area.w < MIN_COLS * ui.cell_w {
+/// The rail's width left of the text in `area` for a document whose
+/// language has headings or not: none in a narrow area. Kept whatever the
+/// headings, so the text doesn't move as the second comes or goes.
+pub fn rail_w(ui: UiMetrics, area: Rect, has_headings: bool) -> f32 {
+    if !has_headings || !wide(ui, area) {
         return 0.0;
     }
     (RAIL_CELLS * ui.cell_w).round()
+}
+
+fn wide(ui: UiMetrics, area: Rect) -> bool {
+    area.w >= MIN_COLS * ui.cell_w
 }
 
 fn dash_w(ui: UiMetrics, level: u8) -> f32 {
@@ -206,7 +211,7 @@ impl Toc {
         self.column = None;
         self.panel = None;
         self.lines.clear();
-        if cx.modal || rail_w(cx.ui, area, items.len()) == 0.0 {
+        if cx.modal || items.len() < MIN_ITEMS || !wide(cx.ui, area) {
             self.close();
             return;
         }
@@ -427,17 +432,42 @@ mod tests {
     }
 
     #[test]
-    fn fewer_than_two_headings_show_no_table_of_contents() {
+    fn fewer_than_two_headings_show_no_dashes_but_keep_the_rail() {
         let mut h = Harness::new();
         let mut v = doc("toc-one", "doc.md", "# Only\ntext\n```\n## code\n```\n");
         h.paint(&mut v, RECT);
         assert!(buttons(&h).is_empty());
         assert!(dashes(&h).is_empty());
-        let text_x = h.frame.text.iter().map(|t| t.left).fold(f32::MIN, f32::max);
-        assert_eq!(text_x, 4.0 * UI.cell_w, "no rail: the text keeps its place");
+        let rail = (RAIL_CELLS * UI.cell_w).round();
+        assert_eq!(text_x(&h), rail + 4.0 * UI.cell_w, "the rail stays for a language with headings");
         let mut v = doc("toc-plain", "doc.txt", "# a\n# b\n");
         h.paint(&mut v, RECT);
         assert!(buttons(&h).is_empty(), "a file with no highlighter has no outline");
+        assert_eq!(text_x(&h), 4.0 * UI.cell_w, "nor a rail");
+        let mut v = doc("toc-narrow", "doc.md", &sections(2));
+        h.paint(&mut v, Rect { w: MIN_COLS * UI.cell_w - 1.0, ..RECT });
+        assert!(buttons(&h).is_empty(), "too narrow");
+        assert_eq!(text_x(&h), 4.0 * UI.cell_w);
+    }
+
+    #[test]
+    fn a_second_heading_brings_the_dashes_without_moving_the_text() {
+        let mut h = Harness::new();
+        let mut v = doc("toc-second", "doc.md", "# One\ntext\n");
+        h.paint(&mut v, RECT);
+        let before = text_x(&h);
+        let b = v.buffer_mut();
+        b.cursor = (1, 4);
+        b.insert_str("\n## Two");
+        v.note_edits();
+        h.paint(&mut v, RECT);
+        assert_eq!(dashes(&h).len(), 2);
+        assert_eq!(text_x(&h), before);
+    }
+
+    /// The text's left edge: line numbers sit left of it.
+    fn text_x(h: &Harness) -> f32 {
+        h.frame.text.iter().map(|t| t.left).fold(f32::MIN, f32::max)
     }
 
     #[test]
@@ -609,8 +639,8 @@ mod tests {
         assert_eq!(v.buffer().cursor, (0, 0), "the dash's button takes the press");
         // Row 0 is the H1 (29 px tall), then a base row per line.
         let line = 1 + ((y - 29.0) / UI.cell_h) as usize;
-        // Right of the rail and the gutter (line numbers sit left of the text).
-        let text_x = h.frame.text.iter().map(|t| t.left).fold(f32::MIN, f32::max);
+        // Right of the rail and the gutter.
+        let text_x = text_x(&h);
         assert_eq!(text_x, 20.0 + 5.0 * UI.cell_w, "the rail, then a gutter for three digits");
         h.mouse(&mut v, down((text_x + 2.0 * UI.cell_w, y)));
         assert_eq!(v.buffer().cursor, (line, 2));

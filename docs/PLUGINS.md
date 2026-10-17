@@ -302,7 +302,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   every view mode: Integrated and Source list the buffer's `Outline`,
   Preview its top-level heading blocks (not in a list or quote, as the
   highlighter takes them). Collapsed, a rail 2.5 cells wide left of the
-  gutter (in Preview, in the column's left margin, three cells) holds a dash
+  gutter (in Preview, in the column's left margin, three cells; kept for
+  every document of a language with headings in an area that wide, so the
+  text doesn't move as the second heading comes or goes) holds a dash
   per heading, narrower by level (1.5, 1.2, 0.9, then 0.6 cells), the
   current section's (the last heading at or above the top line) in the
   accent colour; past 24 headings it shows a window of them around the
