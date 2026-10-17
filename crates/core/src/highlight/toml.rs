@@ -48,8 +48,14 @@ fn header(line: &str) -> Option<(bool, usize)> {
     // Dots and brackets inside a quoted key part are part of its name.
     let mut quote = None;
     let mut dots = 0;
-    for (i, c) in head.char_indices() {
+    let mut chars = head.char_indices();
+    while let Some((i, c)) = chars.next() {
         match (quote, c) {
+            // A basic (`"`) string escapes the char after `\`; a literal
+            // (`'`) one has no escapes.
+            (Some('"'), '\\') => {
+                chars.next();
+            }
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') => quote = Some(c),
@@ -189,6 +195,9 @@ mod tests {
         assert_eq!(level("[a.b.c.d]"), Some(3), "capped");
         assert_eq!(level("[[a.b]]"), Some(3));
         assert_eq!(level("[a.\"b.c\"]"), Some(2), "a quoted dot is part of the key");
+        assert_eq!(level(r#"["a\"b"]"#), Some(1), "an escaped quote stays in the key");
+        assert_eq!(level(r#"[a."x\"y"]"#), Some(2));
+        assert_eq!(level(r"['a\'.b]"), Some(2), "a literal key has no escapes: it ends at its next quote");
         for line in ["key = [1, 2]", "# [commented]", "", "plain", "  [1, 2],", "[1.5, 2.5],", "[", "[a", "[[a]", "[a] x", "[]]"] {
             assert_eq!(level(line), None, "{line:?}");
         }

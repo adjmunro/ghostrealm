@@ -99,7 +99,7 @@ impl RowTable {
     /// Lay out `lines` from line `scroll`, the first row's top at `top`,
     /// until a row starts at or past `bottom`. `scale_of(ln)` is line `ln`'s
     /// scale under the highlighter named `highlighter`.
-        pub fn build(
+    pub fn build(
         lines: &[String],
         scroll: usize,
         edits: u64,

@@ -339,8 +339,8 @@ The editor keeps the monospace grid: each paint lays out a `RowTable` of
 scale }` from the scroll line, and every mapping between screen y and text
 (clicks, selection, caret, diagnostics, popup anchor, code boxes, line
 numbers) reads it. A row's columns are `cell_w * scale` wide (so a soft-wrapped
-heading wraps at fewer columns) and `cell_h * scale` tall, rounded to whole
-pixels; decorations over the rows are clipped to the text body. Line numbers
+heading wraps at fewer columns) and `cell_h * scale` tall (a scaled row's
+height is rounded to whole pixels); decorations over the rows are clipped to the text body. Line numbers
 stay base size on the heading's baseline (`PaintCx::row_baseline` of its
 shaped row). Scrolling stays a top line;
 `EditorBuffer::follow_cursor` fits lines by their heights. `Widget` rows

@@ -282,6 +282,10 @@ pub struct EditorView {
     /// The opening line of the code block last copied, and until when its
     /// button shows a check mark.
     copied: Option<(usize, Instant)>,
+    /// Where on screen a run of Up/Down moves keeps the caret, in base
+    /// columns from the text's left edge, and the caret it last placed: a
+    /// caret moved any other way starts a new run.
+    goal_x: Option<(f32, Pos)>,
 }
 
 /// A fenced code block on screen.
@@ -310,6 +314,7 @@ impl EditorView {
             hover_block: None,
             hover_open: None,
             copied: None,
+            goal_x: None,
             stats,
             seen_edits: buf.edits,
             buf,
@@ -587,28 +592,44 @@ impl EditorView {
         });
     }
 
-    /// The scale of the cursor's line.
-    fn cursor_scale(&mut self) -> f32 {
+    /// Line `ln`'s scale.
+    fn scale_of(&mut self, ln: usize) -> f32 {
         let h = self.highlighter();
         self.sync_hl_states();
-        line_scale(&mut self.hl_states, &self.buf, h, self.buf.cursor.0)
+        line_scale(&mut self.hl_states, &self.buf, h, ln)
     }
 
-    /// After a move up or down from `(line, col)` (drawn at scale `from`),
-    /// put the caret at the column nearest where it was on screen: the
-    /// buffer moves by column, and a column's width differs between rows of
-    /// different scales.
-    fn keep_caret_x(&mut self, ((line, col), from): (Pos, f32)) {
+    /// How far right of the text's left edge `(ln, col)` shows, in base
+    /// columns: its column in its visual row (laid out as the row table
+    /// lays it), less the horizontal scroll, at its line's scale. Negative
+    /// when scrolled off to the left.
+    fn screen_x(&mut self, (ln, col): Pos) -> f32 {
+        let scale = self.scale_of(ln);
+        let rows = self.layout.rows.rows(&self.buf.lines[ln], scale);
+        let start = rows.iter().rev().map(|(start, _)| *start).find(|start| *start <= col).unwrap_or(0);
+        (col as f32 - start as f32 - self.buf.hscroll as f32) * scale
+    }
+
+    /// Move the caret up or down a line by `edit`, keeping it at the run's
+    /// goal x. The buffer moves by column, but a column's width differs
+    /// between rows of different scales, and a short line would cut the
+    /// column short for the lines after it. The target column is on the
+    /// line's first visual row.
+    fn move_vertically(&mut self, edit: Edit, cx: &mut EventCx) -> bool {
+        let goal = match self.goal_x {
+            Some((x, at)) if at == self.buf.cursor => x,
+            _ => self.screen_x(self.buf.cursor),
+        };
+        let line = self.buf.cursor.0;
+        let used = self.buf.apply(edit, cx).used();
         let ln = self.buf.cursor.0;
-        let to = self.cursor_scale();
-        if ln == line || to == from {
-            return;
+        if ln != line {
+            let to = self.scale_of(ln);
+            let col = (self.buf.hscroll as f32 + goal / to).round().max(0.0) as usize;
+            self.buf.cursor.1 = col.min(self.buf.line_len(ln));
         }
-        // Columns from the viewport's left edge: the horizontal scroll counts
-        // columns at each row's own scale.
-        let hs = self.buf.hscroll;
-        let shown = col.saturating_sub(hs) as f32 * from / to;
-        self.buf.cursor.1 = (hs + shown.round() as usize).min(self.buf.line_len(ln));
+        self.goal_x = Some((goal, self.buf.cursor));
+        used
     }
 
     /// The highlighter for the buffer's file, if any.
@@ -1286,12 +1307,7 @@ impl View for EditorView {
                 true
             }
             _ => match edit_for(k) {
-                Some(edit @ Edit::Move { to: Motion::Up | Motion::Down, .. }) => {
-                    let from = (self.buf.cursor, self.cursor_scale());
-                    let used = self.buf.apply(edit, cx).used();
-                    self.keep_caret_x(from);
-                    used
-                }
+                Some(edit @ Edit::Move { to: Motion::Up | Motion::Down, .. }) => self.move_vertically(edit, cx),
                 Some(edit) => self.buf.apply(edit, cx).used(),
                 None => false,
             },
@@ -1366,15 +1382,24 @@ impl View for EditorView {
 
     fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), dx: f32, dy: f32) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
-        self.scroll_accum += dy;
-        // The wheel moves the top line by its own row's height: a heading
-        // takes as much travel to pass as it is tall, a base row one cell.
+        if dy.is_finite() {
+            self.scroll_accum += dy;
+        }
+        // The wheel moves the top line by the height of one row at that
+        // line's scale: a heading takes as much travel to pass as its row is
+        // tall, a base line one cell.
         let layout = RowLayout { cell: (cw, ch), ..self.layout.rows };
         let h = self.highlighter();
         self.sync_hl_states();
         let mut top = self.buf.scroll as isize;
+        let last = self.buf.lines.len().saturating_sub(1) as isize;
         loop {
             let up = self.scroll_accum > 0.0;
+            // At either end the travel left has nothing to move.
+            if (up && top <= 0) || (!up && top >= last) {
+                self.scroll_accum = 0.0;
+                break;
+            }
             let ln = if up { top - 1 } else { top };
             let scale = usize::try_from(ln).map_or(1.0, |ln| line_scale(&mut self.hl_states, &self.buf, h, ln));
             let step = layout.row_h(scale);
@@ -3152,6 +3177,92 @@ mod tests {
         h.key(&mut v, press(Key::Up));
         h.key(&mut v, press(Key::Up));
         assert_eq!(v.buffer().cursor, (0, 5));
+    }
+
+    #[test]
+    fn a_run_of_up_and_down_keeps_its_column_across_short_lines() {
+        let mut h = Harness::new();
+        let mut v = view_with("a long first line
+ab
+another long line");
+        paint_plain(&mut h, &mut v);
+        v.buf.cursor = (0, 10);
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (1, 2), "cut short by the short line");
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (2, 10), "the run's column comes back");
+        // Any other motion starts a new run.
+        h.key(&mut v, press(Key::Left));
+        h.key(&mut v, press(Key::Up));
+        h.key(&mut v, press(Key::Up));
+        assert_eq!(v.buffer().cursor, (0, 9));
+    }
+
+    #[test]
+    fn a_run_through_a_heading_returns_to_its_column_without_snapping() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-goal", "body text here
+# Title here
+body text here");
+        paint_plain(&mut h, &mut v);
+        // Column 3 is 24px in: 1.67 H1 columns, which rounds to 2 and back to 4.
+        v.buf.cursor = (0, 3);
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (1, 2));
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (2, 3), "from the goal, not the heading's column");
+    }
+
+    #[test]
+    fn a_caret_scrolled_off_to_the_left_keeps_its_offset() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-goal-left", "# Title here at length
+body text here at length");
+        v.soft_wrap = Some(false);
+        paint_plain(&mut h, &mut v);
+        v.buf.hscroll = 10;
+        v.buf.cursor = (1, 1);
+        // 9 base columns left of the view's edge: 5 H1 columns.
+        h.key(&mut v, press(Key::Up));
+        assert_eq!(v.buffer().cursor, (0, 5));
+    }
+
+    #[test]
+    fn a_wrapped_rows_on_screen_column_carries_to_the_next_line() {
+        let mut h = Harness::new();
+        // 46 columns: the first line's second row starts at column 46.
+        let mut v = view_with(&format!("{}
+short line here", "x".repeat(60)));
+        v.soft_wrap = Some(true);
+        paint_plain(&mut h, &mut v);
+        v.buf.cursor = (0, 50);
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (1, 4));
+    }
+
+    #[test]
+    fn scrolling_up_past_a_heading_takes_its_rows_height() {
+        let h = Harness::new();
+        let mut hh = Harness::new();
+        let mut v = markdown_view("editor-md-wheel-mixed", &"body
+# H
+body
+".repeat(5));
+        paint_plain(&mut hh, &mut v);
+        v.buf.scroll = 2;
+        h.scroll(&mut v, (10.0, 10.0), UI.cell_h);
+        assert_eq!(v.buffer().scroll, 2, "a cell of travel doesn't bring the heading back");
+        h.scroll(&mut v, (10.0, 10.0), R1 - UI.cell_h);
+        assert_eq!(v.buffer().scroll, 1, "its row's height does");
+        h.scroll(&mut v, (10.0, 10.0), UI.cell_h);
+        assert_eq!(v.buffer().scroll, 0, "a body line takes a cell");
+        // Travel past the top is dropped, not saved for the way back.
+        h.scroll(&mut v, (10.0, 10.0), 10.0 * UI.cell_h);
+        h.scroll(&mut v, (10.0, 10.0), -UI.cell_h);
+        assert_eq!(v.buffer().scroll, 1);
+        h.scroll(&mut v, (10.0, 10.0), f32::NAN);
+        h.scroll(&mut v, (10.0, 10.0), -R1);
+        assert_eq!(v.buffer().scroll, 2, "a non-finite delta is ignored");
     }
 
     #[test]
