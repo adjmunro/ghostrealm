@@ -137,7 +137,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool, laid out from the left (right-to-left text too);
-  `Font` picks family + italic/bold. `cut_to_fit` ends text too wide for a
+  `Font` picks family + italic/bold (`Font::SERIF` is the Preview's body
+  face: `[editor] preview_font` if installed, else New York, then Georgia,
+  on macOS and fontconfig's serif elsewhere, else the sans; the fast-boot
+  font set holds New York, so another family shows once the full set
+  loads). `cut_to_fit` ends text too wide for a
   width in an ellipsis, cut at a cluster boundary.
 - Rows: `row` (cached by content, always shaped), `row_font` (the same in
   another `Font`: a sidebar's sans names, keyed by content and family), and

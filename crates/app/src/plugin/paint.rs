@@ -209,7 +209,10 @@ impl Font {
         italic: false,
         bold: false,
     };
-    /// A serif face: the Preview's body text.
+    /// The Preview's body face: the app points `Family::Serif` at
+    /// `[editor] preview_font` if it is installed, else the platform's serif
+    /// (New York, else Georgia, on macOS; fontconfig's elsewhere), else the
+    /// sans.
     pub const SERIF: Font = Font {
         family: Family::Serif,
         italic: false,

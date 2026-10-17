@@ -156,6 +156,7 @@ mod tests {
         let cat = super::catalogue(&build_registry());
         let mut cfg = Config { chrome: Some(Default::default()), ..Default::default() };
         cfg.workspace.default_directory = Some("~".into());
+        cfg.editor.preview_font = Some("Georgia".into());
         let toml::Value::Table(all) = toml::Value::try_from(&cfg).unwrap() else {
             unreachable!()
         };
@@ -167,6 +168,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_preview_font_parses_and_is_checked() {
+        let cat = super::catalogue(&build_registry());
+        let (cfg, findings) = parse("[editor]\npreview_font = \"Iowan Old Style\"\n", &cat);
+        assert_eq!(findings, vec![]);
+        assert_eq!(cfg.unwrap().editor.preview_font.as_deref(), Some("Iowan Old Style"));
+        let (cfg, findings) = parse("[editor]\npreview_font = 3\n", &cat);
+        assert_eq!(findings.len(), 1, "not a string");
+        assert_eq!(cfg.unwrap().editor.preview_font, None, "dropped");
     }
 
     #[test]

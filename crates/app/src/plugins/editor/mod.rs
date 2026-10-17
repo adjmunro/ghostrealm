@@ -214,6 +214,14 @@ impl Plugin for EditorPlugin {
                     Some("15"),
                     "Save a modified file after this many seconds without edits (0 = off).",
                 ),
+                OptionSpec::new(
+                    "preview_font",
+                    Kind::Str,
+                    None,
+                    "The font family of a Preview's body text. Unset means New York (else Georgia) \
+                     on macOS, fontconfig's serif elsewhere; a family that isn't installed falls \
+                     back to that.",
+                ),
             ],
         )]
     }

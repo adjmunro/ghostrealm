@@ -231,7 +231,7 @@ pub enum LineNumbers {
 }
 
 /// `[editor]`
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Editor {
     /// Line-number gutter mode.
@@ -245,6 +245,9 @@ pub struct Editor {
     pub autosave_on_unfocus: bool,
     /// Save a modified file after this many seconds of no edits (0 = off).
     pub autosave_after: u32,
+    /// The font family of a Preview's body text. `None` (unset) means the
+    /// platform's serif.
+    pub preview_font: Option<String>,
 }
 
 impl Default for Editor {
@@ -255,6 +258,7 @@ impl Default for Editor {
             soft_wrap: true,
             autosave_on_unfocus: true,
             autosave_after: 15,
+            preview_font: None,
         }
     }
 }
