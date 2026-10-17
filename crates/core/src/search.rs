@@ -44,9 +44,13 @@ const WAKE_EVERY: Duration = Duration::from_millis(30);
 /// How many lines of a file go by between checks that the search is still
 /// wanted.
 const LINES_PER_CHECK: usize = 256;
-/// How many whole-word rejections one line may take before the rest of it
-/// is given up: each costs a regex search.
-const MAX_REJECTED: usize = 10_000;
+/// How many bytes one line's rejected whole-word matches may span before
+/// the rest of the line is given up: the search starts again after each,
+/// so a greedy regex rejected over and over would rescan the line each time.
+pub const REJECT_SCAN_BUDGET: usize = 4 * 1024 * 1024;
+/// How many rejections go by between checks that the search is still
+/// wanted.
+const REJECTS_PER_CHECK: usize = 64;
 
 /// How letter case counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -145,7 +149,13 @@ pub struct Matcher {
 impl Matcher {
     /// The matches in `line`, as byte ranges: see [`Matches`].
     pub fn matches<'a>(&'a self, line: &'a str) -> Matches<'a> {
-        Matches { matcher: self, line, at: 0, rejected: 0 }
+        Matches { matcher: self, line, at: 0, rejected: 0, scanned: 0, partial: false, current: None }
+    }
+
+    /// [`Self::matches`], giving up once `current` says the search is no
+    /// longer wanted (asked every few rejections).
+    pub fn matches_while<'a>(&'a self, line: &'a str, current: &'a dyn Fn() -> bool) -> Matches<'a> {
+        Matches { current: Some(current), ..self.matches(line) }
     }
 
     /// Every match in `line`, collected.
@@ -157,13 +167,32 @@ impl Matcher {
 /// A line's matches as byte ranges, left to right, none empty and none
 /// overlapping. A whole-word match a word character touches is skipped,
 /// and the search goes on past the word it starts in (any match starting
-/// inside that word fails the same way); after [`MAX_REJECTED`] of those
-/// the line has no more matches.
+/// inside that word fails the same way). Once the rejected matches span
+/// [`REJECT_SCAN_BUDGET`] bytes, or the search is no longer wanted, the
+/// line has no more matches and is [`partial`](Self::partial).
 pub struct Matches<'a> {
     matcher: &'a Matcher,
     line: &'a str,
     at: usize,
     rejected: usize,
+    /// Bytes searched again for rejected matches.
+    scanned: usize,
+    partial: bool,
+    current: Option<&'a dyn Fn() -> bool>,
+}
+
+impl Matches<'_> {
+    /// Whether matching stopped before the end of the line: there may be
+    /// more matches than it gave.
+    pub fn partial(&self) -> bool {
+        self.partial
+    }
+
+    fn give_up(&mut self) -> Option<Range<usize>> {
+        self.partial = true;
+        self.at = self.line.len() + 1;
+        None
+    }
 }
 
 impl Iterator for Matches<'_> {
@@ -179,9 +208,10 @@ impl Iterator for Matches<'_> {
             }
             if self.matcher.whole_word && !whole_word(line, m.range()) {
                 self.rejected += 1;
-                if self.rejected > MAX_REJECTED {
-                    self.at = line.len() + 1;
-                    return None;
+                self.scanned += m.end() - self.at;
+                let unwanted = self.rejected.is_multiple_of(REJECTS_PER_CHECK) && self.current.is_some_and(|c| !c());
+                if self.scanned > REJECT_SCAN_BUDGET || unwanted {
+                    return self.give_up();
                 }
                 self.at = past_word(line, m.start());
                 continue;
@@ -250,6 +280,9 @@ pub struct FileHits {
     pub total_lines: usize,
     /// The first [`LINES_PER_FILE`] of them.
     pub lines: Vec<LineHit>,
+    /// A line's matching stopped early ([`Matches::partial`]): the totals
+    /// are a floor.
+    pub partial: bool,
 }
 
 impl FileHits {
@@ -317,12 +350,16 @@ pub struct Searcher {
     /// this moves past the walk's own.
     live: Arc<AtomicU64>,
     results: SearchResults,
+    /// What [`Self::results`] shows while a [`Self::refresh`] runs: the
+    /// results it replaces, until it is done.
+    stale: Option<SearchResults>,
 }
 
 impl Searcher {
     /// A searcher that calls `waker` (from its worker) when results arrive.
     pub fn new(waker: Option<Waker>) -> Self {
-        Searcher { waker, worker: None, live: Arc::new(AtomicU64::new(0)), results: SearchResults::default() }
+        let live = Arc::new(AtomicU64::new(0));
+        Searcher { waker, worker: None, live, results: SearchResults::default(), stale: None }
     }
 
     /// Search the files under `root` for `query`, dropping the last search's
@@ -345,10 +382,20 @@ impl Searcher {
         Ok(())
     }
 
+    /// Search again (the files changed), showing the results so far until
+    /// the new search is done, so a list doesn't empty and refill.
+    pub fn refresh(&mut self, root: &Path, query: &SearchQuery, walk: WalkOptions) -> Result<(), String> {
+        let shown = self.stale.take().unwrap_or_else(|| std::mem::take(&mut self.results));
+        self.start(root, query, walk)?;
+        self.stale = Some(shown);
+        Ok(())
+    }
+
     /// Stop the current search and drop its results.
     pub fn cancel(&mut self) {
         self.live.fetch_add(1, Ordering::SeqCst);
         self.results = SearchResults::default();
+        self.stale = None;
     }
 
     /// Take in what the worker found for the current search. Returns whether
@@ -370,14 +417,22 @@ impl Searcher {
                 Event::Done(stopped) => {
                     self.results.done = true;
                     self.results.stopped = stopped;
+                    self.stale = None;
                 }
             }
         }
         changed
     }
 
+    /// Whether a [`Self::refresh`] is running (its old results shown).
+    pub fn refreshing(&self) -> bool {
+        self.stale.is_some()
+    }
+
+    /// The current search's results, or while a refresh runs, those it
+    /// replaces.
     pub fn results(&self) -> &SearchResults {
-        &self.results
+        self.stale.as_ref().unwrap_or(&self.results)
     }
 }
 
@@ -435,17 +490,93 @@ impl Throttle {
     }
 }
 
-/// Walk `job.root`, sending each file's hits, then `Done` unless a newer
-/// search took over. Errs once the searcher is gone.
-fn run(job: &Job, live: &AtomicU64, out: &Sender<(u64, Event)>, waker: Option<&Waker>) -> Result<(), ()> {
-    let current = || live.load(Ordering::SeqCst) == job.generation;
-    let wake = || {
-        if let Some(w) = waker {
+/// What to do after a file.
+enum Flow {
+    Go,
+    /// Stop: a cap was reached.
+    Stop(Stop),
+    /// Stop: a newer search took over.
+    Quit,
+}
+
+/// One search's run on the worker: what it found so far and how it
+/// reports.
+struct Run<'a> {
+    job: &'a Job,
+    live: &'a AtomicU64,
+    out: &'a Sender<(u64, Event)>,
+    waker: Option<&'a Waker>,
+    throttle: Throttle,
+    files: usize,
+    matches: usize,
+}
+
+impl Run<'_> {
+    fn current(&self) -> bool {
+        self.live.load(Ordering::SeqCst) == self.job.generation
+    }
+
+    fn wake(&self) {
+        if let Some(w) = self.waker {
             w();
         }
+    }
+
+    /// Before each entry: quit for a newer search, and wake for a result
+    /// the throttle held back.
+    fn tick(&mut self) -> bool {
+        if self.throttle.due(Instant::now()) {
+            self.wake();
+        }
+        self.current()
+    }
+
+    /// Search the file at `path` and send its hits. Errs once the searcher
+    /// is gone.
+    fn file(&mut self, path: &Path) -> Result<Flow, ()> {
+        let live = self.live;
+        let generation = self.job.generation;
+        let current = move || live.load(Ordering::SeqCst) == generation;
+        let hits = match search_file(path, &self.job.matcher, &current) {
+            Searched::Hits(hits) => hits,
+            Searched::Nothing => return Ok(Flow::Go),
+            Searched::Stopped => return Ok(Flow::Quit),
+        };
+        self.files += 1;
+        self.matches += hits.total;
+        self.out.send((generation, Event::Hits(hits))).map_err(|_| ())?;
+        if self.throttle.sent(Instant::now()) {
+            self.wake();
+        }
+        Ok(match self.files >= MAX_FILES || self.matches >= MAX_MATCHES {
+            true => Flow::Stop(Stop::Results),
+            false => Flow::Go,
+        })
+    }
+}
+
+/// Search `job.root`'s files (or `job.walk.only`), sending each file's
+/// hits, then `Done` unless a newer search took over. Errs once the
+/// searcher is gone.
+fn run(job: &Job, live: &AtomicU64, out: &Sender<(u64, Event)>, waker: Option<&Waker>) -> Result<(), ()> {
+    let mut run = Run { job, live, out, waker, throttle: Throttle::default(), files: 0, matches: 0 };
+    let stopped = match &job.walk.only {
+        Some(only) => search_set(&mut run, only)?,
+        None => search_walk(&mut run)?,
     };
-    let mut throttle = Throttle::default();
-    let mut walk = walk_builder(&job.root, job.walk.show_hidden, job.walk.show_gitignored);
+    let Some(stopped) = stopped else { return Ok(()) };
+    if run.current() {
+        out.send((job.generation, Event::Done(stopped))).map_err(|_| ())?;
+        run.wake();
+    }
+    Ok(())
+}
+
+/// Search the files a walk of the root lists. `None`: a newer search took
+/// over.
+fn search_walk(run: &mut Run) -> Result<Option<Stop>, ()> {
+    let walk_opts = &run.job.walk;
+    let mut walk = walk_builder(&run.job.root, walk_opts.show_hidden, walk_opts.show_gitignored);
     // A folder's files before its subfolders, so the files nearest the root
     // come first; each by name, ignoring case. The sort sees only paths, so
     // each entry's kind and key are looked up once and kept.
@@ -456,26 +587,18 @@ fn run(job: &Job, live: &AtomicU64, out: &Sender<(u64, Event)>, waker: Option<&W
             if let Some(k) = keys.get(p) {
                 return k.clone();
             }
-            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let k = (p.is_dir(), name);
+            let k = (p.is_dir(), lower_name(p));
             keys.insert(p.to_path_buf(), k.clone());
             k
         };
         key(a).cmp(&key(b))
     });
-    let (mut files, mut matches, mut seen) = (0, 0, 0);
-    let mut stopped = Stop::No;
-    for entry in walk.build().flatten() {
-        if !current() {
-            return Ok(());
+    for (seen, entry) in walk.build().flatten().enumerate() {
+        if !run.tick() {
+            return Ok(None);
         }
-        if throttle.due(Instant::now()) {
-            wake();
-        }
-        seen += 1;
-        if seen > MAX_WALK_ENTRIES {
-            stopped = Stop::Walk;
-            break;
+        if seen >= MAX_WALK_ENTRIES {
+            return Ok(Some(Stop::Walk));
         }
         // Links to files are searched; links to folders aren't followed (the
         // walk doesn't), so a link can't loop.
@@ -484,30 +607,66 @@ fn run(job: &Job, live: &AtomicU64, out: &Sender<(u64, Event)>, waker: Option<&W
             Some(t) => t.is_file(),
             None => false,
         };
-        if !is_file || job.walk.only.as_ref().is_some_and(|only| !only.contains(entry.path())) {
+        if !is_file {
             continue;
         }
-        let hits = match search_file(entry.path(), &job.matcher, &current) {
-            Searched::Hits(hits) => hits,
-            Searched::Nothing => continue,
-            Searched::Stopped => return Ok(()),
+        match run.file(entry.path())? {
+            Flow::Go => {}
+            Flow::Stop(stop) => return Ok(Some(stop)),
+            Flow::Quit => return Ok(None),
+        }
+    }
+    Ok(Some(Stop::No))
+}
+
+/// Search the files of `only` under the root, in the walk's order: no
+/// walk, so a few files in a big tree are quick. Hidden ones are left out
+/// unless shown, as the walk would. `None`: a newer search took over.
+fn search_set(run: &mut Run, only: &BTreeSet<PathBuf>) -> Result<Option<Stop>, ()> {
+    let root = run.job.root.clone();
+    let hidden = |p: &Path| {
+        let rel = p.strip_prefix(&root).unwrap_or(p);
+        rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    };
+    let mut files: Vec<&PathBuf> = only
+        .iter()
+        .filter(|p| p.starts_with(&root) && (run.job.walk.show_hidden || !hidden(p)))
+        .collect();
+    files.sort_by(|a, b| walk_order(a, b));
+    for path in files {
+        if !run.tick() {
+            return Ok(None);
+        }
+        if !path.is_file() {
+            continue;
+        }
+        match run.file(path)? {
+            Flow::Go => {}
+            Flow::Stop(stop) => return Ok(Some(stop)),
+            Flow::Quit => return Ok(None),
+        }
+    }
+    Ok(Some(Stop::No))
+}
+
+fn lower_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
+/// Two files' order in the walk: at the first folder they differ in, the
+/// one directly in it first, then by name, ignoring case.
+fn walk_order(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let (ca, cb): (Vec<_>, Vec<_>) = (a.components().collect(), b.components().collect());
+    for i in 0..ca.len().min(cb.len()) {
+        if ca[i] == cb[i] {
+            continue;
+        }
+        let key = |c: &[std::path::Component], i: usize| {
+            (i + 1 < c.len(), c[i].as_os_str().to_string_lossy().to_lowercase())
         };
-        files += 1;
-        matches += hits.total;
-        out.send((job.generation, Event::Hits(hits))).map_err(|_| ())?;
-        if throttle.sent(Instant::now()) {
-            wake();
-        }
-        if files >= MAX_FILES || matches >= MAX_MATCHES {
-            stopped = Stop::Results;
-            break;
-        }
+        return key(&ca, i).cmp(&key(&cb, i));
     }
-    if current() {
-        out.send((job.generation, Event::Done(stopped))).map_err(|_| ())?;
-        wake();
-    }
-    Ok(())
+    ca.len().cmp(&cb.len())
 }
 
 /// What searching one file found.
@@ -532,21 +691,34 @@ fn search_file(path: &Path, matcher: &Matcher, current: &dyn Fn() -> bool) -> Se
     }
     // The editor opens only UTF-8, so a match elsewhere couldn't be shown.
     let Ok(text) = String::from_utf8(bytes) else { return Searched::Nothing };
-    let mut hits = FileHits { path: path.to_path_buf(), total: 0, total_lines: 0, lines: Vec::new() };
+    let mut hits = FileHits { path: path.to_path_buf(), total: 0, total_lines: 0, lines: Vec::new(), partial: false };
     for (n, line) in text.split('\n').enumerate() {
         if n % LINES_PER_CHECK == 0 && !current() {
             return Searched::Stopped;
         }
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let mut found = matcher.matches(line);
-        let Some(first) = found.next() else { continue };
+        let mut found = matcher.matches_while(line, current);
+        let first = found.next();
+        if found.partial() {
+            if !current() {
+                return Searched::Stopped;
+            }
+            hits.partial = true;
+        }
+        let Some(first) = first else { continue };
         hits.total_lines += 1;
         if hits.lines.len() < LINES_PER_FILE {
             let (hit, count) = line_hit(n, line, first, &mut found);
             hits.lines.push(hit);
             hits.total += count;
         } else {
-            hits.total += 1 + found.count();
+            hits.total += 1 + found.by_ref().count();
+        }
+        if found.partial() {
+            if !current() {
+                return Searched::Stopped;
+            }
+            hits.partial = true;
         }
     }
     match hits.total {
@@ -688,6 +860,76 @@ mod tests {
         let at = Instant::now();
         assert_eq!(found(&q, &line), ["a"]);
         assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+        // Many cheap rejections stay within the budget: no match is lost.
+        let q = SearchQuery { whole_word: true, ..query("a") };
+        assert_eq!(found(&q, &format!("{} a", "xa ".repeat(20_000))), ["a"]);
+    }
+
+    #[test]
+    fn rejections_that_rescan_the_line_stop_at_the_budget() {
+        // Each `x.*y` runs to the line's end and is rejected (an `a` before
+        // its `x`): without a budget, a rescan of the line per `x`.
+        let line = format!("{}y", "ax ".repeat(300_000));
+        let q = SearchQuery { whole_word: true, regex: true, ..query("x.*y") };
+        let m = q.matcher().unwrap();
+        let at = Instant::now();
+        let mut it = m.matches(&line);
+        assert_eq!(it.next(), None);
+        assert!(it.partial(), "given up, not finished");
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+        // A search no longer wanted gives up within a few rejections.
+        let asked = std::cell::Cell::new(0);
+        let current = || {
+            asked.set(asked.get() + 1);
+            false
+        };
+        let q = SearchQuery { whole_word: true, ..query("a") };
+        let m = q.matcher().unwrap();
+        let line = "xa ".repeat(100_000);
+        let mut it = m.matches_while(&line, &current);
+        assert_eq!(it.next(), None);
+        assert!(it.partial());
+        assert_eq!((asked.get(), it.rejected), (1, REJECTS_PER_CHECK));
+    }
+
+    #[test]
+    fn a_file_with_a_line_given_up_is_partial_and_a_newer_search_isnt_held_up() {
+        let d = tmpdir();
+        let line = format!("{}y\nxy\n", "ax ".repeat(300_000));
+        fs::write(d.join("p.txt"), &line).unwrap();
+        let q = SearchQuery { whole_word: true, regex: true, ..query("x.*y") };
+        let r = search(&d, &q, WalkOptions::default());
+        let f = &r.files[0];
+        assert!(f.partial);
+        assert_eq!((f.total, f.lines[0].line), (1, 1));
+        let small = tmpdir();
+        fs::write(small.join("s.txt"), "a").unwrap();
+        let mut s = Searcher::new(None);
+        s.start(&d, &q, WalkOptions::default()).unwrap();
+        let at = Instant::now();
+        s.start(&small, &query("a"), WalkOptions::default()).unwrap();
+        assert_eq!(wait(&mut s).files.len(), 1);
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+    }
+
+    #[test]
+    fn a_refresh_shows_the_old_results_until_it_is_done() {
+        let d = tmpdir();
+        fs::write(d.join("a.txt"), "hit").unwrap();
+        let mut s = Searcher::new(None);
+        s.start(&d, &query("hit"), WalkOptions::default()).unwrap();
+        wait(&mut s);
+        fs::write(d.join("b.txt"), "hit").unwrap();
+        s.refresh(&d, &query("hit"), WalkOptions::default()).unwrap();
+        assert_eq!((s.results().files.len(), s.results().done), (1, true), "the old results meanwhile");
+        assert!(s.refreshing());
+        let until = Instant::now() + Duration::from_secs(10);
+        while s.results().files.len() < 2 {
+            assert!(Instant::now() < until, "the refresh finishes");
+            s.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(s.results().done, "swapped in whole, once done");
     }
 
     #[test]
@@ -771,6 +1013,15 @@ mod tests {
         let only = Some(Arc::new(BTreeSet::from([d.join("Z.txt"), d.join("A").join("x.txt")])));
         let r = search(&d, &query("hit"), WalkOptions { only, ..WalkOptions::default() });
         assert_eq!(names(&r, &d), ["Z.txt", "A/x.txt"]);
+        // A set is searched as the walk would order it, hidden files left
+        // out unless shown; an empty one finishes at once.
+        let set = [d.join("b.txt"), d.join("A").join("x.txt"), d.join(".hidden"), d.join("Z.txt")];
+        let only = Some(Arc::new(BTreeSet::from(set)));
+        let r = search(&d, &query("hit"), WalkOptions { only, ..WalkOptions::default() });
+        assert_eq!(names(&r, &d), ["b.txt", "Z.txt", "A/x.txt"]);
+        let only = Some(Arc::new(BTreeSet::new()));
+        let r = search(&d, &query("hit"), WalkOptions { only, ..WalkOptions::default() });
+        assert!(r.files.is_empty() && r.done);
     }
 
     #[test]
