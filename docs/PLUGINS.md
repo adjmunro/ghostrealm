@@ -101,6 +101,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   translucent guides so they don't overlap. Size pills, boxes, and borders
   with `theme::pill_radius`, `box_radius`, `hairline`, and `focus_ring_w`,
   which scale with `cx.ui`.
+- `over_text(|cx| ...)` draws every quad painted inside it over the text, as
+  `fill_top` does: a control floating on text (a code block's copy button).
 - Clipping: `with_clip(rect, |cx| ...)` clips every quad painted inside it
   (fills, borders, rounded rects, strokes, icons) and every `button` hit
   rect, nesting by intersection. Clip a scrolled list's rows to the list so
@@ -112,7 +114,7 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   returns `Folder`; check `is_dir` first and use `FileKind::Folder { open }`
   for a directory (`.git` itself maps to `Git`). `kind.paint(cx, rect)` draws
   it in its colour; `Icon::paint(cx, rect, colour)` draws a UI icon
-  (chevrons, sidebar toggle, `⋯`, view modes, copy, search, close). An icon
+  (chevrons, sidebar toggle, `⋯`, view modes, copy, check, search, close). An icon
   fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool, laid out from the left (right-to-left text too);

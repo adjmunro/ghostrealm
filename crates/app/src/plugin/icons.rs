@@ -176,13 +176,15 @@ pub enum Icon {
     /// View mode Integrated (`<•>`: source and preview mixed).
     ViewMixed,
     Copy,
+    /// A check mark: done (a copy that succeeded).
+    Check,
     Search,
     Close,
 }
 
 impl Icon {
     /// Every icon, for tests and galleries.
-    pub const ALL: [Icon; 11] = [
+    pub const ALL: [Icon; 12] = [
         Icon::ChevronRight,
         Icon::ChevronDown,
         Icon::ChevronUp,
@@ -192,6 +194,7 @@ impl Icon {
         Icon::ViewSource,
         Icon::ViewMixed,
         Icon::Copy,
+        Icon::Check,
         Icon::Search,
         Icon::Close,
     ];
@@ -236,6 +239,7 @@ impl Icon {
                 p.rect(2.0, 11.0 - w, 3.0, w, 0.0, c, 1.0);
                 p.outline(5.0, 5.0, 9.0, 9.0, 1.5, c);
             }
+            Icon::Check => p.polyline(&[(3.0, 8.5), (6.5, 12.0), (13.0, 4.5)], c),
             Icon::Search => {
                 p.ring(7.0, 7.0, 9.0, c);
                 p.line((10.4, 10.4), (13.8, 13.8), c);

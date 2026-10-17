@@ -660,6 +660,8 @@ pub struct PaintCx<'a> {
     clip: Option<Rect>,
     /// Added to button and image ids ([`with_id_base`](Self::with_id_base)).
     id_base: u32,
+    /// Quads go over the text ([`over_text`](Self::over_text)).
+    over_text: bool,
 }
 
 impl<'a> PaintCx<'a> {
@@ -687,6 +689,7 @@ impl<'a> PaintCx<'a> {
             owner,
             clip: None,
             id_base: 0,
+            over_text: false,
         }
     }
 
@@ -732,6 +735,14 @@ impl<'a> PaintCx<'a> {
         out
     }
 
+    /// Paint `f` with its quads over the text, as [`fill_top`](Self::fill_top)
+    /// draws: a control floating on text (a code block's copy button).
+    pub fn over_text(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.over_text, true);
+        f(self);
+        self.over_text = outer;
+    }
+
     /// `r` within the clip, or `None` if nothing of it shows.
     fn clipped(&self, r: Rect) -> Option<Rect> {
         match self.clip {
@@ -767,7 +778,7 @@ impl<'a> PaintCx<'a> {
                 q.clip = [c.x, c.y, c.x + c.w, c.y + c.h];
             }
         }
-        match (top, self.layer) {
+        match (top || self.over_text, self.layer) {
             (false, Layer::Base) => self.frame.bg.push(q),
             _ => self.frame.top.push(q),
         }
