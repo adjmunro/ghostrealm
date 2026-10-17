@@ -60,9 +60,12 @@ browser, image viewer, ...) should be too. The API lives in
   decides (a view that is its own document closes at once). The Files
   surface (`plugins::files::FilesView`) is the host: a tab per document
   (`plugins::files::tabs`), the shown one filled (a name two tabs share
-  gets its folder after it, dim; a long one ends in an ellipsis; the full
-  path is the tab's tooltip), and switching tabs selects the file in the
-  sidebar; a file tab's close slot,
+  gets, dim after it, the shortest end of its folder's path that tells
+  them apart, cut before the name is; a long name ends in an ellipsis; the
+  full path is the tab's tooltip). Switching tabs selects the file in the
+  sidebar only where its listing shows it with no filter typed (it never
+  clears the filter, expands, re-roots, or scrolls there); an open reveals
+  it; a file tab's close slot,
   a middle click on it, and Cmd+W close one tab, and closing the shown
   tab shows its right neighbour, else its left. It keeps its sidebar when
   its last document closes (showing only its sidebar, it has none, and
@@ -113,7 +116,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool, laid out from the left (right-to-left text too);
-  `Font` picks family + italic/bold.
+  `Font` picks family + italic/bold. `cut_to_fit` ends text too wide for a
+  width in an ellipsis, cut at a cluster boundary.
 - Rows: `row` (cached by content, always shaped), `row_font` (the same in
   another `Font`: a sidebar's sans names, keyed by content and family), and
   `budgeted_row` (cached by content, shaped only within the frame's time
@@ -164,7 +168,7 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   reloads, or follows its file; never from `paint`); the document lays
   out its controls right to left in `DocHeader::control_row`, then paints
   the header up to them. Unsaved, a dot follows the name, as in the file
-  tab. An `EditorView` draws one when its host sets
+  tab; a name too long for the header ends in an ellipsis before it. An `EditorView` draws one when its host sets
   `set_header(true)` (the Files surface does); `MediaView` always does.
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.

@@ -3,11 +3,13 @@
 //! shrink, the widest first, down to a minimum; past that the row scrolls
 //! sideways (wheel or trackpad over it), keeping the active tab in view.
 
+use std::path::{Component, Path, PathBuf};
+
 use ghostrealm_core::Rect;
 
 use crate::plugin::icons::{FileKind, Icon};
 use crate::plugin::paint::intersect;
-use crate::plugin::{theme, DocId, Font, PaintCx, Shaped};
+use crate::plugin::{theme, DocId, Font, PaintCx};
 
 /// The tabs' button ids, past the surface's own and below the sidebar's
 /// (see [`button_id`]).
@@ -50,40 +52,62 @@ pub(super) fn from_button(id: u32, end: u32) -> Option<DocId> {
     (TAB_IDS..end).contains(&id).then(|| DocId(id - TAB_IDS))
 }
 
-/// Disambiguating suffixes for `titles`: for each title another one shares,
-/// the last component of its `dirs` entry (its file's folder).
-pub(super) fn suffixes(titles: &[String], dirs: &[Option<String>]) -> Vec<Option<String>> {
-    titles
-        .iter()
-        .zip(dirs)
-        .map(|(t, dir)| {
-            let shared = titles.iter().filter(|o| *o == t).count() > 1;
-            dir.clone().filter(|_| shared)
+/// Disambiguating suffixes for `titles` of files in `dirs`: for each title
+/// another one shares, the shortest end of its folder's path that no other
+/// file of that title has (`a/src` beside `b/src`), `/` for the root.
+pub(super) fn suffixes(titles: &[String], dirs: &[Option<PathBuf>]) -> Vec<Option<String>> {
+    (0..titles.len())
+        .map(|i| {
+            let dir = dirs[i].as_deref()?;
+            let others: Vec<&Path> = (0..titles.len())
+                .filter(|j| *j != i && titles[*j] == titles[i])
+                .filter_map(|j| dirs[j].as_deref())
+                .collect();
+            if others.is_empty() {
+                return None;
+            }
+            let n = parts(dir).len();
+            let k = (1..=n).find(|k| others.iter().all(|o| tail(o, *k) != tail(dir, *k))).unwrap_or(n);
+            Some(tail(dir, k))
         })
         .collect()
 }
 
-/// `spans` shaped in `font` to fit `avail` (physical px): whole if they fit,
-/// else the first span cut short with an ellipsis and the rest dropped.
-fn shape_fitting(cx: &mut PaintCx, spans: &[(String, [u8; 3])], font: Font, avail: f32) -> Shaped {
-    let whole = cx.shape_spans(spans, font, avail.max(1.0) * 4.0);
-    if whole.width <= avail || spans.is_empty() {
-        return whole;
+fn parts(dir: &Path) -> Vec<String> {
+    dir.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The last `k` names of `dir`'s path, `/`-joined; all of them from the root
+/// with a leading `/`, which alone is the root.
+fn tail(dir: &Path, k: usize) -> String {
+    let parts = parts(dir);
+    let k = k.min(parts.len());
+    let end = parts[parts.len() - k..].join("/");
+    match k == parts.len() && dir.has_root() {
+        true => format!("/{end}"),
+        false => end,
     }
-    let (name, color) = &spans[0];
-    let chars: Vec<char> = name.chars().collect();
-    let cut = |n: usize| vec![(chars[..n].iter().collect::<String>() + "\u{2026}", *color)];
-    // The most chars that fit with the ellipsis.
-    let (mut lo, mut hi) = (0, chars.len());
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if cx.shape_spans(&cut(mid), font, avail.max(1.0) * 4.0).width <= avail {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+}
+
+/// A tab's title spans fitting `avail` (physical px): whole if they fit;
+/// else the title whole and the dim suffix cut; else, when even the title
+/// alone doesn't fit, the title cut and no suffix.
+fn fitting_spans(cx: &mut PaintCx, tab: &TabInfo, font: Font, avail: f32) -> Vec<(String, [u8; 3])> {
+    let color = if tab.changed { theme::WARN } else { theme::TEXT };
+    let title_w = cx.shape(&tab.title, font, avail.max(1.0)).width;
+    let suffix = tab.suffix.as_ref().map(|d| format!(" \u{00b7} {d}"));
+    match suffix {
+        Some(suffix) if title_w <= avail => {
+            let suffix = cx.cut_to_fit(&suffix, font, avail - title_w);
+            vec![(tab.title.clone(), color), (suffix, theme::TEXT_DIM)]
         }
+        _ => vec![(cx.cut_to_fit(&tab.title, font, avail), color)],
     }
-    cx.shape_spans(&cut(lo), font, avail.max(1.0) * 4.0)
 }
 
 /// Widths for tabs wanting `natural` (each at most its own) whose sum fits
@@ -189,20 +213,12 @@ impl TabRow {
         let icon = (ui.cell_h * 0.9).round();
         let close = ui.cell_h.round();
         let inset = (3.0 * s).round();
-        let spans: Vec<Vec<(String, [u8; 3])>> = tabs
-            .iter()
-            .map(|t| {
-                let color = if t.changed { theme::WARN } else { theme::TEXT };
-                let mut spans = vec![(t.title.clone(), color)];
-                spans.extend(t.suffix.as_ref().map(|d| (format!(" \u{00b7} {d}"), theme::TEXT_DIM)));
-                spans
-            })
-            .collect();
         let natural: Vec<f32> = tabs
             .iter()
-            .zip(&spans)
-            .map(|(t, sp)| {
-                let name = cx.shape_spans(sp, Font::SANS.italic(t.preview), TAB_MAX_W * s).width;
+            .map(|t| {
+                let font = Font::SANS.italic(t.preview);
+                let suffix = t.suffix.as_ref().map(|d| format!(" \u{00b7} {d}")).unwrap_or_default();
+                let name = cx.shape(&format!("{}{suffix}", t.title), font, TAB_MAX_W * s).width;
                 (pad * 2.0 + icon + space + name + space + close).min(TAB_MAX_W * s).ceil()
             })
             .collect();
@@ -236,7 +252,7 @@ impl TabRow {
 
         let radius = theme::pill_radius(ui);
         cx.with_clip(area, |cx| {
-            for ((tab, spans), (off, w)) in tabs.iter().zip(&spans).zip(offsets.iter().zip(&widths)) {
+            for (tab, (off, w)) in tabs.iter().zip(offsets.iter().zip(&widths)) {
                 let pill = Rect { x: area.x + off - self.scroll, y: area.y + inset, w: *w, h: area.h - inset * 2.0 };
                 self.pills.push((tab.id, pill));
                 if pill.x + pill.w <= area.x || pill.x >= area.x + area.w {
@@ -246,8 +262,10 @@ impl TabRow {
                 // Registered before anything else here: the slot wins its clicks.
                 let slot_hover = cx.button(slot, button_id(tab.id));
                 let hover = cx.hovered(pill) && cx.hovered(area);
-                if let Some(path) = &tab.path {
-                    cx.tooltip(pill, path.clone());
+                // Only the part in view: a pill scrolled past the row's edge
+                // mustn't take the sidebar button's tooltip.
+                if let (Some(path), Some(seen)) = (&tab.path, intersect(pill, area)) {
+                    cx.tooltip(seen, path.clone());
                 }
                 if Some(tab.id) == active {
                     cx.round_rect(pill, radius, theme::TAB_ACTIVE_BG, theme::TAB_ACTIVE_ALPHA, None);
@@ -260,7 +278,9 @@ impl TabRow {
                 let name_clip = Rect { x: name_x, y: pill.y, w: (slot.x - space * 0.5 - name_x).max(0.0), h: pill.h };
                 if let Some(clip) = intersect(name_clip, area) {
                     let top = pill.y + ((pill.h - ui.cell_h) * 0.5).round();
-                    let name = shape_fitting(cx, spans, Font::SANS.italic(tab.preview), name_clip.w);
+                    let font = Font::SANS.italic(tab.preview);
+                    let spans = fitting_spans(cx, tab, font, name_clip.w);
+                    let name = cx.shape_spans(&spans, font, name_clip.w.max(1.0));
                     cx.place(name, name_x, top, clip, theme::TEXT);
                 }
                 // Unsaved: a dot, until the pointer is over the tab and the
@@ -308,9 +328,11 @@ mod tests {
     }
 
     #[test]
-    fn only_shared_titles_get_their_folder() {
-        let titles = ["mod.rs", "a.md", "mod.rs"].map(String::from);
-        let dirs = [Some("files"), Some("docs"), Some("editor")].map(|d| d.map(String::from));
-        assert_eq!(suffixes(&titles, &dirs), [Some("files".into()), None, Some("editor".into())]);
+    fn only_shared_titles_get_the_shortest_path_that_tells_them_apart() {
+        let titles = ["mod.rs", "a.md", "mod.rs", "x.rs", "x.rs", "r.txt", "r.txt"].map(String::from);
+        let dirs = ["/p/files", "/p/docs", "/p/editor", "/p/a/src", "/p/b/src", "/", "/p"]
+            .map(|d| Some(PathBuf::from(d)));
+        let want = [Some("files"), None, Some("editor"), Some("a/src"), Some("b/src"), Some("/"), Some("/p")];
+        assert_eq!(suffixes(&titles, &dirs), want.map(|w| w.map(String::from)));
     }
 }

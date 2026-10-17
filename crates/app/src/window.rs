@@ -392,7 +392,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 let left = state.hover.left_window(state.mouse_down);
-                if state.send_leave(left) {
+                let mut redraw = state.send_leave(left);
+                // No pane tab is hovered now: an unsaved one's dot comes back.
+                if state.htab_hover.take().is_some() {
+                    state.dirty = true;
+                    redraw = true;
+                }
+                if redraw {
                     state.window.request_redraw();
                 }
             }
@@ -2089,6 +2095,9 @@ impl State {
         let now = self.htab_under_cursor();
         let changed = now != self.htab_hover;
         self.htab_hover = now;
+        if changed {
+            self.dirty = true;
+        }
         changed
     }
 
@@ -4290,7 +4299,9 @@ impl State {
                         std::iter::once((title.as_str(), title_attrs)),
                         &Attrs::new().family(Family::SansSerif),
                         Shaping::Advanced,
-                        None,
+                        // An RTL title would otherwise sit against the
+                        // buffer's right edge, past where it is clipped.
+                        Some(glyphon::cosmic_text::Align::Left),
                     );
                     buf.shape_until_scroll(&mut self.text.font_system, false);
                     strip_placements.push(Placement {
@@ -4314,9 +4325,9 @@ impl State {
                             w: close_w,
                             h: *strip_h,
                         };
-                        let tab = Rect { x: tab_x, y: pr.rect.y, w: tab_w, h: *strip_h };
-                        let hover = |r: Rect| rect_contains(r, self.cursor.0, self.cursor.1);
-                        let slot = close_slot(hit, unsaved, hover(tab), hover(hit), self.cell_h, (sw, sh));
+                        let tab_hovered = self.htab_hover == Some((pr.id, i));
+                        let slot_hovered = tab_hovered && rect_contains(hit, self.cursor.0, self.cursor.1);
+                        let slot = close_slot(hit, unsaved, tab_hovered, slot_hovered, self.cell_h, (sw, sh));
                         frame.bg.extend(slot.quads);
                         if let Some(color) = slot.cross {
                             close_placements.push(Placement {

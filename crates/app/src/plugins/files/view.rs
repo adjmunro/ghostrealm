@@ -254,11 +254,20 @@ impl FilesView {
             self.docs[i].view.shown(true);
         }
         self.active = i;
-        self.reveal_active();
+        self.select_active();
     }
 
-    /// Select the shown document's file in the sidebar (leaving the keys
-    /// where they are).
+    /// After a tab switch: select the shown document's file in the sidebar
+    /// if it lists it now (no filter typed), changing nothing else there,
+    /// keys included ([`FileBrowserView::select_listed`]).
+    fn select_active(&mut self) {
+        if let Some(p) = self.docs.get(self.active).and_then(|t| t.view.path()) {
+            self.sidebar.select_listed(&p);
+        }
+    }
+
+    /// After an open: show the shown document's file in the sidebar,
+    /// expanding folders or re-rooting to it ([`FileBrowserView::reveal`]).
     fn reveal_active(&mut self) {
         let path = self.docs.get(self.active).and_then(|t| t.view.path());
         if let Some(p) = path.filter(|p| self.sidebar.chosen() != Some(p.as_path())) {
@@ -513,13 +522,7 @@ impl FilesView {
         let area = Rect { x, y: row.y, w: (row.x + row.w - inset - x).max(0.0), h: row.h - line };
         let paths: Vec<Option<PathBuf>> = self.docs.iter().map(|t| t.view.path()).collect();
         let titles: Vec<String> = self.docs.iter().map(|t| t.view.title().unwrap_or_default()).collect();
-        let dirs: Vec<Option<String>> = paths
-            .iter()
-            .map(|p| {
-                let dir = p.as_deref()?.parent()?.file_name()?;
-                Some(dir.to_string_lossy().into_owned())
-            })
-            .collect();
+        let dirs: Vec<Option<PathBuf>> = paths.iter().map(|p| Some(p.as_deref()?.parent()?.to_path_buf())).collect();
         let suffixes = tabs::suffixes(&titles, &dirs);
         let infos: Vec<TabInfo> = self
             .docs
@@ -591,7 +594,7 @@ impl View for FilesView {
             if let Some(t) = self.docs.get_mut(self.active).filter(|_| self.visible) {
                 t.view.shown(true);
             }
-            self.reveal_active();
+            self.select_active();
         }
         if self.docs.is_empty() {
             self.focus = Part::Sidebar;
@@ -1452,12 +1455,16 @@ mod tests {
         let mut h = Harness::new();
         // The dot: a disc, 0.45 of a row high.
         let dot = (UI.cell_h * 0.45).round();
+        h.paint(&mut v, RECT);
         // In the tab row: the document's header shows one too.
-        let in_row = |q: &&crate::plugin::paint::QuadInstance| (1.0 - q.pos[1]) / 2.0 * 600.0 < 28.0;
+        let area = v.tabs.area().unwrap();
         let dots = |h: &Harness| {
+            let in_row = |q: &&crate::plugin::paint::QuadInstance| {
+                let y = (1.0 - q.pos[1]) / 2.0 * h.frame.screen.1;
+                y >= area.y && y < area.y + area.h
+            };
             h.frame.bg.iter().filter(in_row).filter(|q| q.px == [dot, dot] && q.radius == dot * 0.5).count()
         };
-        h.paint(&mut v, RECT);
         assert_eq!(dots(&h), 0);
         assert!(v.write_input(b"x"), "edits the shown 2.txt");
         h.paint(&mut v, RECT);
@@ -1557,6 +1564,75 @@ mod tests {
         assert_eq!(v.sidebar().chosen(), Some(d.join("2.txt").as_path()));
         v.close_doc(ids[1]);
         assert_eq!(v.sidebar().chosen(), Some(d.join("1.txt").as_path()), "and closing one");
+
+        // A file the listing doesn't show (in a folder not expanded) isn't
+        // revealed by a switch: the selection stays, the folder closed.
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub").join("3.txt"), "3").unwrap();
+        v.sidebar_mut().tree_mut().refresh();
+        let sub = v.show_doc(editor(&d.join("sub").join("3.txt")));
+        assert!(v.sidebar().tree().is_expanded(&d.join("sub")), "an open reveals it");
+        v.sidebar_mut().tree_mut().toggle_dir(&d.join("sub"));
+        v.cycle_tab(-1);
+        v.cycle_tab(1);
+        assert_eq!(v.active_doc(), sub);
+        assert_eq!(v.sidebar().chosen(), Some(d.join("1.txt").as_path()));
+        assert!(!v.sidebar().tree().is_expanded(&d.join("sub")));
+    }
+
+    #[test]
+    fn a_suffix_too_long_is_cut_before_the_name() {
+        let (d, mut v) = fixture(&Session::default());
+        let long = "folder".repeat(15);
+        for dir in [format!("x{long}"), format!("y{long}")] {
+            std::fs::create_dir(d.join(&dir)).unwrap();
+            std::fs::write(d.join(&dir).join("mod.rs"), "").unwrap();
+            v.show_doc(editor(&d.join(&dir).join("mod.rs")));
+        }
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let texts = h.texts();
+        let cut = |p: char| texts.iter().any(|t| t.starts_with(&format!("mod.rs \u{00b7} {p}folder")) && t.ends_with('\u{2026}'));
+        assert!(cut('x') && cut('y'), "{texts:?}");
+    }
+
+    #[test]
+    fn a_typed_filter_survives_switching_and_closing_tabs() {
+        let (d, mut v) = fixture(&Session::default());
+        let ids = tabs_of(&d, &mut v, &["1.txt", "2.txt"]);
+        let h = Harness::new();
+        v.focus_sidebar();
+        h.key(&mut v, press(Key::Char('b')));
+        assert_eq!(v.sidebar().tree().query(), "b");
+        v.cycle_tab(1);
+        assert_eq!(v.sidebar().tree().query(), "b", "a switch keeps it");
+        v.focus_sidebar();
+        v.close_doc(ids[0]);
+        assert_eq!(v.sidebar().tree().query(), "b", "Cmd+W keeps it");
+    }
+
+    #[test]
+    fn a_tab_scrolled_past_the_rows_left_edge_leaves_the_sidebar_buttons_tooltip() {
+        let (d, mut v) = fixture(&Session::default());
+        let names: Vec<String> = (0..12).map(|i| format!("a-rather-long-file-name-{i:02}.txt")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ids = tabs_of(&d, &mut v, &refs);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let area = v.tabs.area().unwrap();
+        let row = (area.x + 10.0, area.y + 5.0);
+        h.scroll(&mut v, row, 10_000.0);
+        h.scroll(&mut v, row, -45.0);
+        h.paint(&mut v, RECT);
+        let first = v.tabs.pill(ids[0]).unwrap();
+        assert!(first.x < area.x && first.x + first.w > area.x, "the first tab straddles the edge: {first:?}");
+        // On the sidebar button (left of the row), under the first tab's
+        // unclipped pill.
+        h.cursor = (17.0, area.y + area.h * 0.5);
+        assert!(h.cursor.0 < area.x && h.cursor.0 > first.x);
+        h.paint(&mut v, RECT);
+        let tip = h.frame.tooltip.as_ref().map(|t| t.1.clone());
+        assert_eq!(tip.as_deref(), Some("Hide the sidebar"));
     }
 
     #[test]

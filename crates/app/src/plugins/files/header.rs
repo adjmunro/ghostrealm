@@ -100,7 +100,12 @@ impl DocHeader {
         let mut y = r.y + top;
 
         let font = Font::SANS.bold(true);
-        let name = cx.shape(text.name, font, clip.w);
+        // Unsaved, the dot after the name always shows: the name ends in an
+        // ellipsis first.
+        let d = (ch * 0.45).round();
+        let dot_room = if text.modified { d + side * 0.5 } else { 0.0 };
+        let fits = cx.cut_to_fit(text.name, font, clip.x + clip.w - x - dot_room);
+        let name = cx.shape(&fits, font, clip.w.max(1.0));
         let name_rect = Rect {
             x: x - side * 0.5,
             y: (y - 4.0 * ui.scale).round(),
@@ -120,11 +125,8 @@ impl DocHeader {
         let color = if text.changed_on_disk { theme::WARN } else { theme::TEXT };
         cx.place(name, x, y, clip, color);
         if text.modified {
-            let d = (ch * 0.45).round();
             let dot = Rect { x: (x + name.width + side * 0.5).round(), y: y + ((ch - d) * 0.5).round(), w: d, h: d };
-            if dot.x + dot.w <= clip.x + clip.w {
-                cx.round_rect(dot, d * 0.5, theme::TEXT, 1.0, None);
-            }
+            cx.round_rect(dot, d * 0.5, theme::TEXT, 1.0, None);
         }
         y += ch * 1.4;
 
@@ -271,6 +273,11 @@ mod tests {
         assert_eq!(dots(h.paint(&mut v, r), side), 0);
         v.3 = true;
         assert_eq!(dots(h.paint(&mut v, r), side), 1);
+        // A name too long for the header ends in an ellipsis, the dot after it.
+        let long: &'static str = Box::leak("long".repeat(60).into_boxed_str());
+        v.2 = Some(long);
+        assert_eq!(dots(h.paint(&mut v, r), side), 1);
+        assert!(h.texts().iter().any(|t| t.starts_with("longlong") && t.ends_with('\u{2026}')), "{:?}", h.texts());
     }
 
     #[test]

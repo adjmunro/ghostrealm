@@ -284,6 +284,15 @@ impl FileBrowserView {
         self.reveal_chosen = true;
     }
 
+    /// Select `path` when the listing shows it now with no filter typed;
+    /// otherwise nothing changes. Never clears the filter, re-roots, expands
+    /// a folder, or scrolls (unlike [`Self::reveal`]).
+    pub fn select_listed(&mut self, path: &Path) {
+        if self.tree.query().is_empty() && self.tree.rows().iter().any(|r| !r.is_category && r.path == path) {
+            self.chosen = Some(path.to_path_buf());
+        }
+    }
+
     /// Take the tree's query into the input when the tree changed it (navigation
     /// clears it).
     fn sync_input(&mut self) {

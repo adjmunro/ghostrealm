@@ -912,6 +912,28 @@ impl<'a> PaintCx<'a> {
         self.text.shape_scratch(&spans, font.into(), width, true)
     }
 
+    /// `text` as it fits in `avail` (physical px) in `font`: whole, else cut
+    /// at a cluster boundary with an ellipsis after it (just the ellipsis
+    /// when nothing else fits). Measured from one shaping of the whole text.
+    pub fn cut_to_fit(&mut self, text: &str, font: impl Into<Font>, avail: f32) -> String {
+        let font = font.into();
+        let whole = self.shape(text, font, avail.max(1.0));
+        if whole.width <= avail {
+            return text.to_string();
+        }
+        let ellipsis = self.shape("\u{2026}", font, avail.max(1.0)).width;
+        let limit = avail - ellipsis;
+        let cut = self
+            .text
+            .buffer(TextSrc::Scratch(whole.idx))
+            .and_then(|b| {
+                let mut glyphs = b.layout_runs().flat_map(|r| r.glyphs.iter());
+                glyphs.find(|g| g.x + g.w > limit).map(|g| g.start)
+            })
+            .unwrap_or(text.len());
+        format!("{}\u{2026}", text[..cut].trim_end())
+    }
+
     /// Draw shaped text with its top-left at `(left, top)`, clipped to `clip`.
     pub fn place(&mut self, shaped: Shaped, left: f32, top: f32, clip: Rect, color: [u8; 3]) {
         self.push_text(TextItem {
