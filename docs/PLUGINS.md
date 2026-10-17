@@ -11,7 +11,9 @@ browser, image viewer, ...) should be too. The API lives in
 - **`Plugin`**: a content kind, registered once (`plugins::builtin()`). It has an
   id (`terminal`, `files`, `editor`, `file_browser`), a title, and opens **`View`**s.
   - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
-  - `opens_path` / `open_path`: claim a file. Opening a file asks plugins in
+  - `opens_path` / `open_path`: claim a file. The app opens only a regular
+    file of at most 50 MB (`editor::buffer::MAX_FILE_BYTES`), or a missing
+    one as a new file: a device or FIFO would never end or would block. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
     The view it returns is a document: the app shows it in a tab of a Files
     surface (`FilesView::show_doc`), or shows the tab of a file one has
@@ -270,7 +272,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   links (accent, underlined; `md_preview::target` says where one goes: an
   `http`, `https`, or `mailto` URL to the system's handler,
   `Request::OpenUrl`; a path, relative to the document's folder, or a
-  `file:` URL's, to a Files surface; any other scheme nowhere, its hover
+  `file:` URL's, to a Files surface if it is a regular file, or to the
+  sidebar if a folder (nothing else: a device or FIFO never ends); any
+  other scheme nowhere, its hover
   saying so, since a handler for it could run something; a link that goes
   somewhere is a `button`, `BTN_LINK` plus its block and tag, that opens on
   release), and struck text. Code blocks are
@@ -361,7 +365,8 @@ into the overlay layer; it doesn't need to know.
   the call returns: `OpenFile` (in a Files surface, as for `opens_path`),
   `OpenUrl` (the system's handler for an `http`, `https`, or `mailto` URL,
   through `file_ops::System` so tests never launch one; `AppState::open_url`
-  refuses every other scheme, whoever asks),
+  refuses every other scheme, whoever asks), `ShowInSidebar` (a folder,
+  selected in a Files surface's sidebar),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an

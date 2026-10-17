@@ -6,7 +6,7 @@
 //! same glyphon text path the terminal uses, and routes key input here when the
 //! focused surface is an editor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ghostrealm_core::highlight::CommentSyntax;
 
@@ -205,12 +205,13 @@ impl EditorBuffer {
     }
 
     /// Load `path` into a buffer. A missing file starts empty (a new file).
-    /// Any other read error (not UTF-8, unreadable, a directory) fails: an
-    /// empty buffer bound to the file would overwrite it on save.
+    /// Any other read error (not UTF-8, unreadable, a directory, not a
+    /// regular file, past [`MAX_FILE_BYTES`]) fails: an empty buffer bound
+    /// to the file would overwrite it on save.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         // Before reading: a write in between then shows as a change.
         let disk = Stamp::of(&path);
-        let lines = match std::fs::read_to_string(&path) {
+        let lines = match read_text(&path) {
             Ok(text) => split_lines(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![String::new()],
             Err(e) => return Err(e),
@@ -902,7 +903,7 @@ impl EditorBuffer {
     pub fn reload(&mut self) -> std::io::Result<bool> {
         let Some(path) = &self.path else { return Ok(false) };
         self.disk = Stamp::of(path);
-        let lines = match std::fs::read_to_string(path) {
+        let lines = match read_text(path) {
             Ok(text) => split_lines(&text),
             Err(e) => {
                 self.changed_on_disk = true;
@@ -1008,6 +1009,32 @@ pub(crate) fn split_lines(text: &str) -> Vec<String> {
         lines.push(String::new());
     }
     lines
+}
+
+/// The largest file the editor reads: a whole file sits in memory as lines.
+pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// `path`'s text, if it is a regular file of at most [`MAX_FILE_BYTES`].
+/// A device (`/dev/zero`) or a FIFO would never end, or block the UI on
+/// open, so neither is read.
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        let what = if meta.is_dir() { "a folder" } else { "not a regular file" };
+        return Err(Error::new(ErrorKind::InvalidInput, format!("{} is {what}", path.display())));
+    }
+    let too_big = || Error::new(ErrorKind::InvalidData, format!("{} is over {} MB", path.display(), MAX_FILE_BYTES >> 20));
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(too_big());
+    }
+    // It may have grown since: read no further than the cap.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(too_big());
+    }
+    String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -1702,5 +1729,27 @@ mod tests {
         let mut e = EditorBuffer::scratch();
         e.insert_char('x');
         assert!(!e.save().unwrap(), "a scratch buffer has nowhere to save");
+    }
+
+    #[test]
+    fn devices_folders_and_huge_files_are_not_read() {
+        let d = crate::plugin::testing::tmpdir("buf-irregular");
+        #[cfg(unix)]
+        assert!(EditorBuffer::open(PathBuf::from("/dev/zero")).is_err(), "a device never ends");
+        assert!(EditorBuffer::open(d.clone()).is_err(), "a folder");
+        let big = d.join("big.txt");
+        std::fs::File::create(&big).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+        let err = EditorBuffer::open(big).err().expect("over the cap");
+        assert!(err.to_string().contains("over 50 MB"), "{err}");
+        assert!(EditorBuffer::open(d.join("new.txt")).is_ok(), "a missing file is a new one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let fifo = crate::plugin::testing::tmpdir("buf-fifo").join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(EditorBuffer::open(fifo).is_err());
     }
 }

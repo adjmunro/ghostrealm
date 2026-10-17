@@ -1860,6 +1860,11 @@ impl State {
         for req in out.requests {
             match req {
                 Request::OpenFile(path) => self.open_requested_file(sid, path),
+                Request::ShowInSidebar(path) => {
+                    if let Err(e) = self.app.show_in_browser(&path) {
+                        eprintln!("ghostrealm: show {}: {e:#}", path.display());
+                    }
+                }
                 Request::OpenUrl(url) => {
                     if let Err(e) = self.app.open_url(&url) {
                         eprintln!("ghostrealm: open {url}: {e:#}");

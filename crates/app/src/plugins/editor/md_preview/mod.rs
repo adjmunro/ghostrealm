@@ -511,11 +511,17 @@ impl Preview {
     }
 
     /// What the link with button id `BTN_LINK + i` asks, resolved against
-    /// the document at `doc` ([`target`]).
+    /// the document at `doc` ([`target`]): a folder shows in the sidebar; a
+    /// path that is missing or not a regular file (a device, a FIFO) opens
+    /// nothing.
     pub fn open_link(&mut self, i: u32, doc: Option<&Path>) -> Option<Request> {
         match target(&self.link(i)?, doc)? {
             Target::Web(url) => Some(Request::OpenUrl(url)),
-            Target::File(path) => Some(Request::OpenFile(path)),
+            Target::File(path) => match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => Some(Request::OpenFile(path)),
+                Ok(m) if m.is_dir() => Some(Request::ShowInSidebar(path)),
+                _ => None,
+            },
             Target::Blocked(_) | Target::InPage => None,
         }
     }
@@ -1126,6 +1132,7 @@ mod tests {
     #[test]
     fn a_link_opens_its_file_beside_the_document_or_its_url_on_release() {
         let (mut v, path) = previewed("pv-link", "See [goal](GOAL.md) or [web](https://x.org/a).\n");
+        std::fs::write(path.parent().unwrap().join("GOAL.md"), "# Goal\n").unwrap();
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let links: Vec<(Rect, u32)> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| (b.0, b.2)).collect();
@@ -1150,7 +1157,7 @@ mod tests {
         h.paint(&mut v, RECT);
         let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
         assert_eq!(links.len(), 1, "only the file: link opens");
-        assert_eq!(h.button(&mut v, links[0]).requests, [Request::OpenFile("/tmp".into())]);
+        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar("/tmp".into())], "a folder");
         let item = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Block(_))).unwrap();
         let b = h.text.buffer(item.src).unwrap();
         let g = b.layout_runs().flat_map(|r| r.glyphs.iter().cloned()).find(|g| g.metadata == 2).unwrap();
@@ -1158,6 +1165,20 @@ mod tests {
         h.paint(&mut v, RECT);
         assert_eq!(h.frame.tooltip.as_ref().map(|t| t.1.as_str()), Some("Not opened: smb: links"));
         assert!(h.frame.view_buttons.iter().all(|b| b.2 < BTN_LINK || b.2 == links[0]));
+    }
+
+    #[test]
+    fn a_folder_link_shows_in_the_sidebar_and_a_device_or_missing_file_opens_nothing() {
+        let (mut v, path) = previewed("pv-dir", "[d](sub) [z](/dev/zero) [m](missing.md)\n");
+        let dir = path.parent().unwrap().join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
+        assert_eq!(links.len(), 3);
+        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar(dir)]);
+        assert!(h.button(&mut v, links[1]).requests.is_empty(), "/dev/zero never opens");
+        assert!(h.button(&mut v, links[2]).requests.is_empty());
     }
 
     #[test]

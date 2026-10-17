@@ -73,6 +73,9 @@ pub enum Request {
     /// Open this URL with the system's handler for its scheme (a link to a
     /// web page).
     OpenUrl(String),
+    /// Show this folder selected in a Files surface's sidebar (a link to a
+    /// folder).
+    ShowInSidebar(PathBuf),
     /// The view wrote this file (the app hot-reloads it if it is the config).
     Saved(PathBuf),
     /// A view hosted in the floating picker chose this path: the picker confirms
