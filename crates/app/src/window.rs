@@ -1118,7 +1118,9 @@ impl State {
                 // named (fontconfig's) stays: the Preview falls back to it.
                 db.set_monospace_family("Noto Sans Mono");
                 db.set_sans_serif_family("Open Sans");
-                (FontSystem::new_with_locale_and_db(locale.clone(), db), None, None)
+                // And its locale, so fallback order stays as it would be.
+                let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+                (FontSystem::new_with_locale_and_db(locale, db), None, None)
             }
         };
         let serif_alias = font_system.db().family_name(&Family::Serif).to_owned();
@@ -1137,7 +1139,9 @@ impl State {
         let registry = build_registry();
         let catalogue = Arc::new(crate::settings::catalogue(&registry));
         let cfg = ghostrealm_core::config::load_or_create(&catalogue).unwrap_or_default();
-        pin_preview_serif(font_system.db_mut(), cfg.editor.preview_font.as_deref(), &serif_alias);
+        // Only a full DB (the synchronous load) can say a family isn't installed.
+        let full_db = mono_family.is_none();
+        pin_preview_serif(font_system.db_mut(), cfg.editor.preview_font.as_deref(), &serif_alias, full_db);
         let chrome = cfg.resolved_chrome();
         let double_tap_window = Duration::from_millis(cfg.input.double_tap_window_ms as u64);
         let (cell_w, cell_h) = measure_cell(
@@ -1308,7 +1312,8 @@ impl State {
         let serif = cfg.editor.preview_font.as_deref();
         let serif_changed = serif != self.cfg.editor.preview_font.as_deref();
         if serif_changed {
-            pin_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias);
+            let full_db = self.pending_fonts.is_none();
+            pin_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db);
         }
         if serif_changed || (cw - self.cell_w).abs() > 0.01 || (ch - self.cell_h).abs() > 0.01 {
             self.cell_w = cw;
@@ -1423,7 +1428,7 @@ impl State {
             db.set_monospace_family(fam.clone());
         }
         self.serif_alias = db.family_name(&Family::Serif).to_owned();
-        pin_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias);
+        pin_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true);
         self.text.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
         // Cell metrics should be unchanged (same pinned monospace); re-measure in
         // case the fuller DB resolves the family to a different face.
@@ -5167,18 +5172,35 @@ fn installed_family(db: &glyphon::cosmic_text::fontdb::Database, name: &str) -> 
 
 /// Point `Family::Serif` (the Preview's body face, `Font::SERIF`) at
 /// `configured` if it is installed, else the platform's serif, else the
-/// sans. `alias` is the serif the DB named as it loaded, read before the
-/// first pin replaces it. Returns the family pinned.
+/// sans, else any proportional family `db` has. `alias` is the serif the DB
+/// named as it loaded, read before the first pin replaces it. With
+/// `report_missing` (`db` holds every installed font), a `configured` family
+/// it lacks is reported. Returns the family pinned.
 fn pin_preview_serif(
     db: &mut glyphon::cosmic_text::fontdb::Database,
     configured: Option<&str>,
     alias: &str,
+    report_missing: bool,
 ) -> String {
-    let family = configured
+    let sans = db.family_name(&Family::SansSerif).to_owned();
+    let family = platform_serifs(alias)
         .into_iter()
-        .chain(platform_serifs(alias))
+        .chain([sans.as_str()])
         .find_map(|name| installed_family(db, name))
-        .unwrap_or_else(|| db.family_name(&Family::SansSerif).to_owned());
+        .or_else(|| {
+            let mut faces = db.faces().filter(|f| !f.monospaced).chain(db.faces());
+            faces.find_map(|f| f.families.first()).map(|(name, _)| name.clone())
+        })
+        .unwrap_or_else(|| sans.clone());
+    let family = match configured {
+        Some(name) => installed_family(db, name).unwrap_or_else(|| {
+            if report_missing {
+                eprintln!("ghostrealm: [editor] preview_font \"{name}\" isn't installed; using {family}");
+            }
+            family
+        }),
+        None => family,
+    };
     db.set_serif_family(family.clone());
     family
 }
@@ -5820,12 +5842,12 @@ mod tests {
         use glyphon::cosmic_text::fontdb::Style;
         let (mut db, _) = super::curated_font_db().unwrap();
         let alias = db.family_name(&Family::Serif).to_owned();
-        assert_eq!(super::pin_preview_serif(&mut db, None, &alias), ".New York");
+        assert_eq!(super::pin_preview_serif(&mut db, None, &alias, false), ".New York");
         assert_eq!(db.family_name(&Family::Serif), ".New York");
         let styles: Vec<Style> =
             db.faces().filter(|f| f.families.iter().any(|(n, _)| n == ".New York")).map(|f| f.style).collect();
         assert!(styles.contains(&Style::Normal) && styles.contains(&Style::Italic), "{styles:?}");
-        assert_eq!(super::pin_preview_serif(&mut db, Some("No Such Face"), &alias), ".New York");
+        assert_eq!(super::pin_preview_serif(&mut db, Some("No Such Face"), &alias, false), ".New York");
         // Its one upright file is variable: bold sets the weight axis, which
         // widens the text.
         let mut fs = FontSystem::new_with_locale_and_db("en-US".into(), db);
@@ -5847,18 +5869,26 @@ mod tests {
         let mut db = glyphon::cosmic_text::fontdb::Database::new();
         db.load_system_fonts();
         let alias = db.family_name(&Family::Serif).to_owned();
-        assert_eq!(super::pin_preview_serif(&mut db, Some("georgia"), &alias), "Georgia");
-        assert_eq!(super::pin_preview_serif(&mut db, Some("New York"), &alias), ".New York");
-        assert_eq!(super::pin_preview_serif(&mut db, None, &alias), ".New York");
+        assert_eq!(super::pin_preview_serif(&mut db, Some("georgia"), &alias, true), "Georgia");
+        assert_eq!(super::pin_preview_serif(&mut db, Some("New York"), &alias, true), ".New York");
+        assert_eq!(super::pin_preview_serif(&mut db, None, &alias, false), ".New York");
     }
 
-    /// With no serif installed, the Preview's serif is the sans.
+    /// With no serif installed, the Preview's serif is the sans if installed,
+    /// else a proportional family the DB has (not a name it lacks).
     #[test]
-    fn with_no_serif_the_preview_falls_back_to_the_sans() {
+    fn with_no_serif_the_preview_falls_back_to_an_installed_family() {
         let mut db = glyphon::cosmic_text::fontdb::Database::new();
         db.set_sans_serif_family("Some Sans");
-        assert_eq!(super::pin_preview_serif(&mut db, Some("Georgia"), "Times New Roman"), "Some Sans");
-        assert_eq!(db.family_name(&Family::Serif), "Some Sans");
+        assert_eq!(super::pin_preview_serif(&mut db, Some("Georgia"), "Times New Roman", false), "Some Sans");
+        assert_eq!(db.family_name(&Family::Serif), "Some Sans", "an empty DB has nothing better");
+        if cfg!(target_os = "macos") {
+            db.load_font_file("/System/Library/Fonts/Menlo.ttc").unwrap();
+            db.load_font_file("/System/Library/Fonts/Helvetica.ttc").unwrap();
+            assert_eq!(super::pin_preview_serif(&mut db, None, "Times New Roman", false), "Helvetica");
+            db.set_sans_serif_family("helvetica");
+            assert_eq!(super::pin_preview_serif(&mut db, None, "Times New Roman", false), "Helvetica");
+        }
     }
 
     #[test]
