@@ -285,7 +285,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   the column, or shared out when too wide; cells wrap). A view keeps each
   block's height (an estimate until drawn) and scrolls in pixels from an
   anchor block, so blocks above it settling to their shaped heights never
-  move what shows. The wheel, arrows, Page Up/Down, Space, and Home/End
+  move what shows; the anchor block itself keeps its lower part in place
+  when measured off its estimate, and its share above the top through a
+  resize. Blocks more than three screens from the view drop their spans
+  (kept heights stay); a code block keeps its highlighted rows through a
+  resize; a table lays out its rows out of view without drawing them. The wheel, arrows, Page Up/Down, Space, and Home/End
   (Cmd+Up/Down) scroll; no key edits. A double click switches to
   Integrated with the caret at the block's first line. Text can't be
   selected yet (TODO.md).

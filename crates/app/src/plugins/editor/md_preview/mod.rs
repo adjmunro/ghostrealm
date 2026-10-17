@@ -40,6 +40,9 @@ const PARSE_INLINE_MAX: usize = 64 * 1024;
 const BODY_SCALE: f32 = 1.15;
 /// Line height, times the text size.
 const LEADING: f32 = 1.5;
+/// How many screens' worth of blocks either side of the view keep their
+/// spans and rows.
+const KEEP_SCREENS: f32 = 3.0;
 /// The reading column's widest, in body text sizes.
 const COLUMN_MAX: f32 = 46.0;
 
@@ -87,10 +90,13 @@ struct Text {
 #[derive(Clone, Debug)]
 enum Prep {
     Text { text: Text, marker: Option<MarkerPrep> },
-    Code { rows: Vec<Vec<(String, [u8; 3])>> },
+    /// Highlighted rows, and whether any has text (else no copy button).
+    /// They don't depend on the look, so they outlive a change of it.
+    Code { rows: Vec<Vec<(String, [u8; 3])>>, has_body: bool },
     /// The header row first. `cols`: the column widths at the look's width,
-    /// once measured.
-    Table { cells: Vec<Vec<Text>>, cols: Option<Vec<f32>> },
+    /// once measured; `rows_h`: each row's height, once measured, so rows
+    /// out of view lay out without drawing.
+    Table { cells: Vec<Vec<Text>>, cols: Option<Vec<f32>>, rows_h: Vec<Option<f32>> },
     Rule,
 }
 
@@ -362,7 +368,7 @@ impl Preview {
         let w = text_width(&self.blocks[i], look);
         match self.prep(i) {
             Prep::Text { text, .. } => estimate_height(&text.spans, w),
-            Prep::Code { rows } => code_height(rows.len(), look),
+            Prep::Code { rows, .. } => code_height(rows.len(), look),
             Prep::Table { cells, .. } => cells.len() as f32 * (look.line_h + 2.0 * cell_pad(look).1),
             Prep::Rule => rule_height(look),
         }
@@ -429,7 +435,12 @@ impl Preview {
             let index = self.anchor.index;
             let frac = self.laid.get(index).and_then(|l| l.height).map(|(h, _)| self.anchor.offset / h.max(1.0));
             self.look = Some(look);
-            self.laid.iter_mut().for_each(|l| *l = Laid::default());
+            for l in &mut self.laid {
+                l.height = None;
+                if !matches!(l.prep, Some(Prep::Code { .. })) {
+                    l.prep = None;
+                }
+            }
             if let (Some(f), true) = (frac, index < self.blocks.len()) {
                 self.anchor.offset = f * self.slot_h(index);
                 self.anchor_frac = Some(f);
@@ -472,6 +483,7 @@ impl Preview {
         if grew && i == self.blocks.len() {
             cx.request_frame();
         }
+        self.release_far(i, body.h * KEEP_SCREENS);
     }
 
     /// Draw block `i` with its content's top-left at `(left + indent, top)`.
@@ -505,13 +517,13 @@ impl Preview {
                 }
                 paint_text(cx, text, (x, top, w), body, look, links)
             }
-            Prep::Code { rows } => {
-                let copied = src.copied == Some(line);
-                Some(paint_code(cx, rows, lang.as_deref(), (x, top, w), body, line, copied, look))
+            Prep::Code { rows, has_body } => {
+                let copy = has_body.then_some((line, src.copied == Some(line)));
+                Some(paint_code(cx, rows, lang.as_deref(), (x, top, w), body, copy, look))
             }
-            Prep::Table { cells, cols } => {
+            Prep::Table { cells, cols, rows_h } => {
                 let cols = cols.get_or_insert_with(|| column_widths(cx, cells, w, look));
-                paint_table(cx, cells, cols, (x, top), body, look, links)
+                paint_table(cx, cells, cols, rows_h, (x, top), body, look, links)
             }
             Prep::Rule => {
                 let line = theme::hairline(cx.ui);
@@ -522,6 +534,30 @@ impl Preview {
         };
         self.laid[i].prep = Some(prep);
         out
+    }
+
+    /// Drop the spans and rows of blocks more than `keep` px above the
+    /// anchor or below `end` (the first block not drawn), keeping their
+    /// heights: they are built again if they come back into view. A block
+    /// never laid out counts a line tall.
+    fn release_far(&mut self, end: usize, keep: f32) {
+        let line = self.look.map_or(1.0, |l| l.line_h);
+        let mut near = self.anchor.index;
+        let mut above = 0.0;
+        while near > 0 && above < keep {
+            near -= 1;
+            above += self.laid[near].height.map_or(line, |h| h.0);
+        }
+        let mut far = end;
+        let mut below = 0.0;
+        while far < self.blocks.len() && below < keep {
+            below += self.laid[far].height.map_or(line, |h| h.0);
+            far += 1;
+        }
+        let (head, tail) = self.laid.split_at_mut(far.max(near));
+        for l in head[..near].iter_mut().chain(tail) {
+            l.prep = None;
+        }
     }
 
     /// The anchor block was just measured at `h` (it was `old`): keep what
@@ -812,15 +848,16 @@ fn prepare(block: &Block, look: &Look) -> Prep {
             let span = BlockSpan::new(text.clone(), Font::MONO, look.mono, look.cell.1, theme::TEXT_DIM);
             Prep::Text { text: Text { key: block_key(std::slice::from_ref(&span)), spans: vec![span], tags: Vec::new() }, marker: None }
         }
-        Kind::Code { lang, text } => Prep::Code { rows: code_rows(lang.as_deref(), text) },
+        Kind::Code { lang, text } => code_prep(code_rows(lang.as_deref(), text)),
         // Metadata, not content: boxed as code, dim.
-        Kind::FrontMatter(text) => Prep::Code {
-            rows: text.split('\n').map(|l| vec![(l.strip_suffix('\r').unwrap_or(l).to_string(), theme::TEXT_DIM)]).collect(),
-        },
+        Kind::FrontMatter(text) => code_prep(
+            text.split('\n').map(|l| vec![(l.strip_suffix('\r').unwrap_or(l).to_string(), theme::TEXT_DIM)]).collect(),
+        ),
         Kind::Table { head, rows } => {
             let mut cells = vec![head.iter().map(|c| body(c, true)).collect::<Vec<_>>()];
             cells.extend(rows.iter().map(|r| r.iter().map(|c| body(c, false)).collect()));
-            Prep::Table { cells, cols: None }
+            let rows_h = vec![None; cells.len()];
+            Prep::Table { cells, cols: None, rows_h }
         }
         Kind::Rule => Prep::Rule,
     }
@@ -829,6 +866,11 @@ fn prepare(block: &Block, look: &Look) -> Prep {
 fn plain_text(text: &str, font: Font, look: &Look, color: [u8; 3]) -> Text {
     let span = BlockSpan::new(text, font, look.size, look.line_h, color);
     Text { key: block_key(std::slice::from_ref(&span)), spans: vec![span], tags: Vec::new() }
+}
+
+fn code_prep(rows: Vec<Vec<(String, [u8; 3])>>) -> Prep {
+    let has_body = rows.iter().any(|r| r.iter().any(|(s, _)| !s.trim().is_empty()));
+    Prep::Code { rows, has_body }
 }
 
 /// A code block's rows, coloured by its language's highlighter if it has
@@ -937,17 +979,16 @@ fn paint_marker(cx: &mut PaintCx, m: &MarkerPrep, x: f32, top: f32, clip: Rect, 
 
 /// A code block: the editor's code box `w` wide at `(x, top)`, its rows
 /// highlighted and clipped to the box (a long line runs out of view), its
-/// language and a copy button (`BTN_COPY_BLOCK + line`) at the top right.
+/// language and, with `copy` (the block's line, and whether it was just
+/// copied), a copy button (`BTN_COPY_BLOCK + line`) at the top right.
 /// Returns its height.
-#[allow(clippy::too_many_arguments)]
 fn paint_code(
     cx: &mut PaintCx,
     rows: &[Vec<(String, [u8; 3])>],
     lang: Option<&str>,
     (x, top, w): (f32, f32, f32),
     clip: Rect,
-    line: usize,
-    copied: bool,
+    copy: Option<(usize, bool)>,
     look: &Look,
 ) -> f32 {
     let h = code_height(rows.len(), look);
@@ -974,10 +1015,10 @@ fn paint_code(
     // language left of it.
     let first = rect.y + py;
     let side = look.cell.1;
-    let has_body = rows.iter().any(|r| r.iter().any(|(s, _)| !s.trim().is_empty()));
-    let id = u32::try_from(line).ok().and_then(|l| super::BTN_COPY_BLOCK.checked_add(l));
-    if let (true, Some(id)) = (has_body, id) {
-        paint_copy_button(cx, shown, first, id, copied);
+    if let Some((line, copied)) = copy {
+        if let Some(id) = u32::try_from(line).ok().and_then(|l| super::BTN_COPY_BLOCK.checked_add(l)) {
+            paint_copy_button(cx, shown, first, id, copied);
+        }
     }
     if let Some(lang) = lang {
         let label = cx.shape(lang, Font::SANS, rect.w);
@@ -1020,10 +1061,12 @@ fn column_widths(cx: &mut PaintCx, cells: &[Vec<Text>], w: f32, look: &Look) -> 
 /// A table with its top-left at `(x, top)`: a bordered box, the header row
 /// tinted and bold, a rule under each row. Returns its height, `None` while
 /// any cell is unshaped.
+#[allow(clippy::too_many_arguments)]
 fn paint_table(
     cx: &mut PaintCx,
     cells: &[Vec<Text>],
     cols: &[f32],
+    rows_h: &mut [Option<f32>],
     (x, top): (f32, f32),
     clip: Rect,
     look: &Look,
@@ -1037,20 +1080,39 @@ fn paint_table(
     let mut rules = Vec::new();
     let mut head_h = 0.0;
     for (r, row) in cells.iter().enumerate() {
+        // A row out of view is laid out, not drawn: its height as measured
+        // before, else measured now.
+        let known = rows_h[r];
+        let out_of_view = y > clip.y + clip.h || known.is_some_and(|h| y + h < clip.y);
         let mut row_h: f32 = look.line_h;
+        let mut row_shaped = true;
         let mut cx_x = x;
         for (c, text) in row.iter().enumerate() {
             let cw = cols.get(c).copied().unwrap_or(0.0);
-            match paint_text(cx, text, (cx_x + px, y + py, (cw - 2.0 * px).max(1.0)), clip, look, links) {
+            let w = (cw - 2.0 * px).max(1.0);
+            let h = match (out_of_view, known) {
+                (true, Some(_)) => Some(0.0),
+                (true, None) => cx.measure_block(text.key, || text.spans.clone(), w),
+                (false, _) => paint_text(cx, text, (cx_x + px, y + py, w), clip, look, links),
+            };
+            match h {
                 Some(h) => row_h = row_h.max(h),
                 None => {
-                    shaped = false;
-                    row_h = row_h.max(estimate_height(&text.spans, cw - 2.0 * px));
+                    row_shaped = false;
+                    row_h = row_h.max(estimate_height(&text.spans, w));
                 }
             }
             cx_x += cw;
         }
-        y += row_h + 2.0 * py;
+        let row_h = match (out_of_view, known) {
+            (true, Some(h)) => h,
+            _ => row_h + 2.0 * py,
+        };
+        if row_shaped {
+            rows_h[r] = Some(row_h);
+        }
+        shaped &= row_shaped;
+        y += row_h;
         if r == 0 {
             head_h = y - top;
         }
@@ -1416,6 +1478,53 @@ mod tests {
             assert!(Instant::now() < deadline, "never caught up");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn a_long_tables_rows_out_of_view_are_laid_out_not_drawn() {
+        let rows: String = (0..200).map(|i| format!("| r{i} | v{i} |\n")).collect();
+        let (mut v, _) = previewed("pv-table-rows", &format!("| a | b |\n|---|---|\n{rows}"));
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let cells = |h: &Harness| drawn(h).iter().filter(|d| d.0.starts_with('r')).count();
+        // Rows out of view measure within the frame's shaping budget.
+        while !v.preview.laid[0].height.unwrap().1 {
+            h.paint(&mut v, RECT);
+        }
+        let first = cells(&h);
+        assert!(first > 0 && first < 200, "only rows in view: {first}");
+        let height = v.preview.laid[0].height.unwrap();
+        h.paint(&mut v, RECT);
+        assert!(cells(&h) <= first);
+        assert_eq!(v.preview.laid[0].height.unwrap(), height, "the table keeps its height");
+        assert!(height.1, "measured");
+        assert!(height.0 > 200.0 * 20.0, "every row counts: {height:?}");
+    }
+
+    #[test]
+    fn a_resize_keeps_a_code_blocks_rows_and_far_blocks_drop_their_spans() {
+        let text: String = std::iter::once("```toml\na = 1\n```\n\n".to_string())
+            .chain((0..300).map(|i| format!("Paragraph {i}.\n\n")))
+            .collect();
+        let (mut v, _) = previewed("pv-release", &text);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let rows_at = |v: &EditorView| match v.preview.laid[0].prep.as_ref() {
+            Some(Prep::Code { rows, .. }) => Some(rows.as_ptr()),
+            _ => None,
+        };
+        let before = rows_at(&v).expect("highlighted");
+        h.paint(&mut v, Rect { w: 300.0, ..RECT });
+        assert_eq!(rows_at(&v), Some(before), "not highlighted again");
+        h.key(&mut v, press(Key::End));
+        h.paint(&mut v, RECT);
+        assert!(v.preview.laid[0].prep.is_none() && v.preview.laid[5].prep.is_none(), "far above: dropped");
+        assert!(v.preview.laid.last().unwrap().prep.is_some());
+        h.key(&mut v, press(Key::Home));
+        h.paint(&mut v, RECT);
+        assert!(h.texts().iter().any(|t| t == "a = 1"), "built again in view");
+        let last = v.preview.laid.last().unwrap();
+        assert!(last.prep.is_none() && last.height.is_some(), "dropped, its height kept");
     }
 
     #[test]
