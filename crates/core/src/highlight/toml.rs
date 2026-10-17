@@ -30,26 +30,41 @@ impl Highlighter for Toml {
     /// A table header: `[a]` is 1, each dotted key part and an array of
     /// tables' second bracket one deeper (`[a.b]` and `[[a]]` 2), at most 3.
     fn heading_level(&self, line: &str, _state: State) -> Option<u8> {
-        let head = line.trim_start().strip_prefix('[')?;
-        let (array, head) = match head.strip_prefix('[') {
-            Some(rest) => (true, rest),
-            None => (false, head),
-        };
-        // Dots inside a quoted key part don't nest.
-        let mut quote = None;
-        let mut depth = 1u8;
-        for c in head.chars() {
-            match (quote, c) {
-                (Some(q), c) if c == q => quote = None,
-                (Some(_), _) => {}
-                (None, '"' | '\'') => quote = Some(c),
-                (None, '.') => depth = depth.saturating_add(1),
-                (None, ']') => break,
-                _ => {}
-            }
-        }
-        Some((depth + u8::from(array)).min(3))
+        let (array, dots) = header(line)?;
+        Some((1 + dots.min(2) as u8 + u8::from(array)).min(3))
     }
+}
+
+/// `line` as a table header (`[a.b]`, `[[a]]`): whether it is an array of
+/// tables, and how many dots separate its key parts. A header closes its
+/// brackets and has only a comment after them; a key holds no `,` (an array
+/// value continued on its own line, `[1, 2],`, is not a header).
+fn header(line: &str) -> Option<(bool, usize)> {
+    let head = line.trim_start().strip_prefix('[')?;
+    let (array, head) = match head.strip_prefix('[') {
+        Some(rest) => (true, rest),
+        None => (false, head),
+    };
+    // Dots and brackets inside a quoted key part are part of its name.
+    let mut quote = None;
+    let mut dots = 0;
+    for (i, c) in head.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '.') => dots += 1,
+            (None, ',' | '[') => return None,
+            (None, ']') => {
+                let rest = &head[i + 1..];
+                let rest = if array { rest.strip_prefix(']')? } else { rest };
+                let rest = rest.trim_start();
+                return (rest.is_empty() || rest.starts_with('#')).then_some((array, dots));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// One token per char of `line`.
@@ -67,7 +82,7 @@ fn tokens(line: &str) -> Vec<Token> {
         return tok;
     }
     // Section header `[..]` (possibly `[[..]]`).
-    if chars[ts] == '[' {
+    if chars[ts] == '[' && header(line).is_some() {
         tok[ts..].fill(Token::Heading);
         return tok;
     }
@@ -174,9 +189,18 @@ mod tests {
         assert_eq!(level("[a.b.c.d]"), Some(3), "capped");
         assert_eq!(level("[[a.b]]"), Some(3));
         assert_eq!(level("[a.\"b.c\"]"), Some(2), "a quoted dot is part of the key");
-        for line in ["key = [1, 2]", "# [commented]", "", "plain"] {
+        for line in ["key = [1, 2]", "# [commented]", "", "plain", "  [1, 2],", "[1.5, 2.5],", "[", "[a", "[[a]", "[a] x", "[]]"] {
             assert_eq!(level(line), None, "{line:?}");
         }
+    }
+
+    #[test]
+    fn an_array_value_on_its_own_line_is_not_coloured_as_a_table() {
+        assert!(tokens("[editor] # note")[..8].iter().all(|t| *t == Token::Heading));
+        for line in ["  [1, 2],", "[1.5, 2.5],", "["] {
+            assert!(!tokens(line).contains(&Token::Heading), "{line:?}");
+        }
+        assert_eq!(at("[1.5, 2.5],", "1.5"), Token::Number);
     }
 
     #[test]
