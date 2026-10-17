@@ -190,3 +190,12 @@
 - Detail: A Preview link to a path (or a `file:` URL's path) opens in a Files surface, never in another program. Only `http`, `https`, and `mailto` URLs go to the system's handler (`Request::OpenUrl`), and `AppState::open_url` enforces the same list for every caller; any other scheme is not opened, and the link's hover says so.
 - Reason (links): `open`/`xdg-open` runs whatever a scheme maps to (an app bundle or script by `file:`, `smb:` mounts, app schemes), so a document must not choose it.
 - Reason: owner decisions on issue #1 (one cycling button like Claude's eye icon; the third, Integrated mode; serif body; pulldown-cmark approved).
+
+---
+
+[2026-10-18T05:18+1300@e3a7c9e]
+
+- Category: UX / document header
+- Detail: A document header's `⋯` menu lists every option of its document. `[editor] header_icons`, an ordered list of option ids (`statistic`, `autosave`, `soft_wrap`, `view_mode`, `autoplay`), picks which also show as icons left of `⋯`, in that order; a document shows the icons of the listed options it has. Default: `["statistic", "autosave", "soft_wrap", "view_mode"]`.
+- Detail: Named for the document header (GLOSSARY.md), not "ribbon". An unknown or repeated id is a config warning at that entry and is dropped; the rest apply.
+- Reason: owner, verbatim (GitHub issue #1): "I like the three dots menu … Perhaps we can use the three dots to show all the options (including softwrap and autosave) and then the config toml can specify which ones we want to actually show as icons in the ribbon as well, outside of the triple dot submenu."

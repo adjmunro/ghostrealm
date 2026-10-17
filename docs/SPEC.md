@@ -17,7 +17,7 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 ```
 crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input routing
   src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
-  src/plugins/       first-party plugins: terminal, editor, file_browser
+  src/plugins/       first-party plugins: terminal, files (+ editor, file_browser), web
 crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree, syntax highlighters
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
@@ -44,7 +44,7 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
   scene (unified compositing; no native subviews), which also keeps it
   cross-platform.
 - **App ↔ content seam:** every surface's content is a plugin `View` (terminal,
-  editor, file browser). The app owns layout, focus, chrome, and input routing;
+  Files surface, web page). The app owns layout, focus, chrome, and input routing;
   views paint immediate-mode through `PaintCx` and take input through `EventCx`.
   Contract: [PLUGINS.md](PLUGINS.md).
 
@@ -53,12 +53,32 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
 Per frame: every view is pumped (a terminal checks its VT worker's published
 grid); then each pane's active view paints into a `Frame`: quads under text, images,
 text items, quads over text, overlay images, overlay text. The app draws the quads
-via an instanced quad pipeline, images via a textured-quad pipeline (a texture per
-view image, re-uploaded only when its version changes and freed once undrawn), and
-the text via glyphon. Text is either a content-keyed shaped row
-from the shared `RowCache` (shaped within a per-frame time budget) or a per-frame
-scratch buffer. A terminal snapshots only when its grid changed and resizes its
-PTY only when its cell grid changes.
+via an instanced quad pipeline (rounded corners and borders by an SDF in the
+shader), images via a textured-quad pipeline (a texture per view image,
+re-uploaded only when its version changes and freed once undrawn), and the text
+via glyphon. Text comes from one of three places:
+
+- **Rows** (`RowCache`): one monospace line, keyed by content and shaped
+  within a per-frame time budget (terminal grid, editor text, lists). A row
+  may carry run styles (bold, italic, underline, code box) and a scale: a
+  scaled row (an Integrated heading) is shaped once at the frame's metrics and
+  rasterised larger (glyphon's `TextArea.scale`).
+- **Blocks** (`BlockCache`): word-wrapped proportional text with per-span
+  font, size, colour, and tags (a Preview paragraph), keyed by content, width,
+  and metrics, under the same budget; an unshaped block lays out at an
+  estimated height.
+- **Scratch** buffers for one-off labels, reshaped each frame.
+
+A terminal snapshots only when its grid changed and resizes its PTY only when
+its cell grid changes.
+
+Files are shown by the **Files surface** (plugin `files`): a file sidebar, a
+file tab per document, and each document under its document header. A text
+document is an `EditorView` in one of its language's view modes: Source and
+Integrated draw the buffer as rows (Integrated with styles, scaled heading
+rows, and code boxes) through a per-paint `RowTable` that maps screen y to
+text; Preview (Markdown) draws parsed blocks. Images and audio are a
+`MediaView`. Contract and details: [PLUGINS.md](PLUGINS.md).
 
 Status/`needs_input` sourcing (planned): Enter-submission = optimistic busy;
 PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
@@ -90,6 +110,9 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       with diagnostics and hover docs in the editor from the config language
       server. Follow-ups: completion, resolve Ghostty themes for inheritance
       (TODO.md).
+- [x] Files surface (GitHub issue #1): file sidebar with name filter and `?`
+      search, file tabs with a preview tab, document header with configurable
+      icons, view modes with a Markdown Preview, and a table of contents.
 
 Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
 sidebar/inbox, palette, config, and the agent channel are all in and tested.

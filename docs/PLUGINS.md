@@ -2,14 +2,14 @@
 
 How content kinds plug into the app. The terminal, the Files surface (with its
 editor and media documents and file sidebar), and the web view are built on
-exactly this API (`crates/app/src/plugins/`); a new kind (Git GUI, web
-browser, image viewer, ...) should be too. The API lives in
+exactly this API (`crates/app/src/plugins/`); a new kind (a Git GUI, ...)
+should be too. The API lives in
 `crates/app/src/plugin/`.
 
 ## Shape
 
 - **`Plugin`**: a content kind, registered once (`plugins::builtin()`). It has an
-  id (`terminal`, `files`, `editor`, `file_browser`), a title, and opens **`View`**s.
+  id (`terminal`, `files`, `editor`, `file_browser`, `web`), a title, and opens **`View`**s.
   - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
   - `opens_path` / `open_path`: claim a file. The app opens only a regular
     file, or a missing one as a new file: a device or FIFO would never end
@@ -136,7 +136,7 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   returns `Folder`; check `is_dir` first and use `FileKind::Folder { open }`
   for a directory (`.git` itself maps to `Git`). `kind.paint(cx, rect)` draws
   it in its colour; `Icon::paint(cx, rect, colour)` draws a UI icon
-  (chevrons, sidebar toggle, `⋯`, view modes, copy, check, search, close). An icon
+  (chevrons, sidebar toggle, `⋯`, view modes, copy, check, search, close, play). An icon
   fills the largest square centred in `rect`; give it about a row's height.
 - One-off text: `shape` / `shape_spans` → `place`, or `label`. Shaped into a
   per-frame scratch pool, laid out from the left (right-to-left text too);
@@ -240,8 +240,14 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   `refresh(path)` last read (call it when the document shows, saves,
   reloads, or follows its file; never from `paint`); the document lays
   out its controls right to left in `DocHeader::control_row`, then paints
-  the header up to them. Unsaved, a dot follows the name, as in the file
-  tab; a name too long for the header ends in an ellipsis before it. An `EditorView` draws one when its host sets
+  the header up to them. The controls are `⋯` at the right end (a menu of
+  every option the document has) and, left of it in order, an icon for each
+  option `[editor] header_icons` (`HeaderIcon`) lists that the document
+  has: an editor's statistic, autosave, soft wrap, and view mode (default:
+  all four), an audio document's autoplay. The list is read at paint, so a
+  config reload changes open headers. Unsaved, a dot follows the name, as
+  in the file tab; a name too long for the header ends in an ellipsis
+  before it. An `EditorView` draws one when its host sets
   `set_header(true)` (the Files surface does); `MediaView` always does.
 - View modes: an `EditorView` document shows in one `ViewMode` of those
   its language offers (`view_modes`): Markdown all three (Preview,
@@ -422,9 +428,9 @@ into the overlay layer; it doesn't need to know.
   `.enable(false)` (dim, not choosable); `MenuItem::RULE` separates sections.
   Build the items when the menu opens, so checks show the current state. A
   menu with no enabled item doesn't open; an open menu closes when a
-  confirmation appears or the picker opens or closes under it. The editor
-  header's `⋯` lists every header option this way, and the file browser's
-  `⋯` what its listing shows.
+  confirmation appears or the picker opens or closes under it. A document
+  header's `⋯` lists every option of its document this way, and the file
+  browser's `⋯` what its listing shows.
 - `cx.redraw()` repaints; `cx.request_frame()` repaints on the paced clock.
 
 ## Rules
@@ -442,8 +448,10 @@ into the overlay layer; it doesn't need to know.
 A plugin's options live in its own `[section]` of the config file. Describe
 each in `config_sections` with a `SectionSpec` of `OptionSpec`s
 (`ghostrealm_core::config`): its `Kind` (bool, ranged int/number, enum with a
-description per value, path, colour, chord), default, and description. The
-loader drops or clamps entries that don't fit, and the config file's language
+description per value, an ordered list of such values (`EnumList`), path,
+colour, chord), default, and description. The loader drops or clamps entries
+that don't fit (a list's unknown or repeated entries one by one, with a
+warning at each), and the config file's language
 service flags them and shows the docs on hover. A test checks every typed
 config field is catalogued and every documented default is the real one.
 
@@ -509,7 +517,9 @@ height is rounded to whole pixels); decorations over the rows are clipped to the
 stay base size on the heading's baseline (`PaintCx::row_baseline` of its
 shaped row). Scrolling stays a top line;
 `EditorBuffer::follow_cursor` fits lines by their heights. `Widget` rows
-(nothing places one yet) are where a view's own rows between lines go.
+(nothing places one yet) are where a view's own rows between lines go:
+comment threads, and maybe deleted lines (TODO.md "Comment mode", "Editor
+— inline git change highlights").
 A view that edits text keeps a `StateCache` (only
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a
