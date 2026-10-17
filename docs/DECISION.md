@@ -178,3 +178,14 @@
 - Detail: Search is smart case unless "match case" is on (in regex mode only literal uppercase counts, as in ripgrep: not `\W` or `\p{Lu}`). "Whole word" follows VS Code: an end of the match that is a word character must have no word character beside it, so `foo(` matches in `foo(x)` and `-x` in `a-x`. Matching one line may take only so long (`LINE_TIME_BUDGET`, 1 s: some regexes rescan the line from each start); past it the line's matching stops, the file stays listed even with no match found, and its count shows as a floor (`12+`, `0+`). A plain query is literal; "regex" uses the `regex` crate's syntax.
 - Detail: `regex` and `regex-syntax` are direct dependencies of core (already built through `ignore`).
 - Reason: owner request on issue #1 (the two-mode box and its toggles, cloned from the Claude Code app).
+
+---
+
+[2026-10-17T23:58+1300@dd14e905]
+
+- Category: UX / files and editing
+- Detail: A document has three view modes, Preview (rendered, read-only), Integrated (source with formatting, editable), and Source (plain, editable), stepped by one header button (Preview → Integrated → Source) whose icon shows the current mode; the `⋯` menu and `editor.cycle_view_mode` do the same. A language offers only the modes it supports: Markdown all three, other highlighted languages Integrated and Source, others Source. Markdown opens in Integrated.
+- Detail: Preview body text is serif (`[editor] preview_font`, else New York / Georgia / fontconfig's serif) at 1.15 times the editor's size; code stays monospace.
+- Detail: Markdown parses with `pulldown-cmark` (CommonMark + GFM tables, task lists, strikethrough; no default features) into a flat block list; inline below 64 KiB, else on a worker.
+- Detail: A Preview link to a path opens in a Files surface; any other scheme goes to the system's handler (`Request::OpenUrl`).
+- Reason: owner decisions on issue #1 (one cycling button like Claude's eye icon; the third, Integrated mode; serif body; pulldown-cmark approved).

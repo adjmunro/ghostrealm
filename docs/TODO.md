@@ -447,15 +447,23 @@
   the fence's language (a line-local highlighter such as `toml`); the markers
   stay visible, editable, and dimmed. The style rides in `RunStyle`s per span
   through the row cache and `PaintCx` (PLUGINS.md); rows with no styled span
-  carry none. Remaining:
-  - A toggle button switches mixed <-> fully-formatted (markers hidden; needs
-    cursor-column mapping over hidden text).
+  carry none. DONE: three view modes per document, stepped by one header
+  button (also the `⋯` menu and `editor.cycle_view_mode`): Preview
+  (rendered, read-only; Markdown only, with copy buttons on code blocks and
+  links that open), Integrated (the mixed mode), Source (colours only).
+  Remaining:
+  - Preview: selecting and copying text; images and embeds (alt text shows
+    for now); `#anchor` links within the document; a double click edits at
+    the block's first line, not at the word clicked; table column alignment
+    (`:-:`) is ignored; a quoted list indents its quote and list levels in
+    one fixed order.
   - A Markdown feature checks whether a link/image target exists (a local file
     on disk; a reachable URL needs a network decision) and flags broken ones
     with inline error markers.
   - Code blocks: horizontal scroll inside a block (without soft wrap, a long
-    line runs out of its box); for shell-flavoured blocks, a run button in
-    the left gutter for each runnable command; an LSP for the fence's
+    line runs out of its box; in Preview always); for shell-flavoured
+    blocks, a run button in the left gutter for each runnable command; an
+    LSP for the fence's
     language; highlighting a fence in a stateful language (Markdown in
     Markdown) needs the inner state carried too; see "DISCUSSION: syntax
     highlighting direction".
@@ -463,19 +471,11 @@
   - Nesting: the highlighter gives each char one token, so emphasis inside
     strong (or a link or heading) loses the outer style; needs a token set per
     char, or style flags on spans.
-  - The file browser's preview colours Markdown but does not draw the styles.
   - Bold has no synthetic fallback: a monospace family without a bold face
     shows the nearest weight (italic is skewed by the shaper).
   - From GitHub issue #1 (2026-10-16@ad13ff26):
-    - Headings differ only in weight; they should differ in size. Needs a font
-      size per span, so variable row heights: an architectural change to the
-      row cache, `PaintCx` rows, and every view's row-to-y mapping.
-    - Three view modes per file, switched by a header button: Preview
-      (rendered, read-only), Source (plain, editable), Integrated (source chars
-      with the formatting, editable; Markdown's mixed mode). Extend to other
-      languages: TOML `[table]`s as large headers (they render bold today
-      because TOML and Markdown share `Token::Heading`, which `syntax.rs` maps
-      to bold; the owner likes it, so keep it as the seed); Kotlin top-level
+    - View modes for other languages (Integrated and Source exist for every
+      highlighted one, Preview for Markdown): Kotlin top-level
       classes as H1 shrinking with nesting, functions and non-local properties
       as H3/H5; a Kotlin Preview could render doc comments and generated
       diagrams (relationships, method flow).
@@ -927,7 +927,7 @@
   - Failures (name taken, nothing to paste, Trash refused) reach stderr only;
     see "User-visible error surface".
 - Not in the menu: **GitHub permalinks** (see "GitHub permalinks"), Open
-  Markdown Preview (Markdown is formatted in the editor).
+  Markdown Preview (the document header's view-mode button shows it).
 - Reason: the first menu covers the owner's list; these are the edges.
 
 ---

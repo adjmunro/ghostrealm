@@ -240,6 +240,47 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   the header up to them. Unsaved, a dot follows the name, as in the file
   tab; a name too long for the header ends in an ellipsis before it. An `EditorView` draws one when its host sets
   `set_header(true)` (the Files surface does); `MediaView` always does.
+- View modes: an `EditorView` document shows in one `ViewMode` of those
+  its language offers (`view_modes`): Markdown all three (Preview,
+  Integrated, Source), another highlighted language Integrated and Source,
+  a file with no highlighter Source only. Each document keeps its own; it
+  opens in Integrated where offered. The header's view-mode button (only
+  with two modes or more) shows the mode's icon (`ViewPreview`,
+  `ViewMixed`, `ViewSource`) and steps to the next, its tooltip naming both;
+  the `⋯` menu lists the modes, the shown one checked; and
+  `editor.cycle_view_mode` steps the focused document. Integrated draws the
+  styles, heading sizes, and code boxes described under "Syntax
+  highlighting"; Source the highlight colours only, every row base size and
+  unboxed. Switching keeps the source line at the top of the view at the
+  top of the next; `reveal` (a search match) leaves Preview for Integrated,
+  where a selection shows. `text` (the agent's) is the buffer whatever the
+  mode.
+- Preview (`plugins::editor::md_preview`): the buffer rendered read-only,
+  unsaved edits included. `parse` turns Markdown (pulldown-cmark:
+  CommonMark, GFM tables, task lists, strikethrough) into a flat list of
+  blocks (heading, paragraph, list item, code, table, rule, HTML as its
+  source), each with its source line, list indent, and quote depth. A text
+  under 64 KiB parses at once (well under a millisecond in a release
+  build); a longer one on a worker woken through the waker, the old blocks
+  showing until it is done. Blocks lay out in a centred column at most 46
+  body sizes wide: body text in `Font::SERIF` at 1.15 times the editor's
+  size (a serif reads small beside the monospace), headings bold at
+  `heading_scale`, each text block one `cx.block` whose spans tag inline
+  code (a pill behind its `block_rects`, monospace at the editor's size),
+  links (accent, underlined; each a `button` that opens on release: a URL
+  in the system's handler, `Request::OpenUrl`; a path, relative to the
+  document's folder, in a Files surface), and struck text. Code blocks are
+  the editor's code box with their rows highlighted by the fence's
+  language through the row cache, clipped to the box, the language and the
+  editor's copy button at the top right; tables a bordered box, the header
+  row tinted and bold, columns as wide as their widest cell (stretched to
+  the column, or shared out when too wide; cells wrap). A view keeps each
+  block's height (an estimate until drawn) and scrolls in pixels from an
+  anchor block, so blocks above it settling to their shaped heights never
+  move what shows. The wheel, arrows, Page Up/Down, Space, and Home/End
+  (Cmd+Up/Down) scroll; no key edits. A double click switches to
+  Integrated with the caret at the block's first line. Text can't be
+  selected yet (TODO.md).
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
 - Text input: `plugin::text_edit` maps keys to edits through the platform's
@@ -314,6 +355,8 @@ into the overlay layer; it doesn't need to know.
   skip a view with a `disk_conflict` rather than ask.
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (in a Files surface, as for `opens_path`),
+  `OpenUrl` (the system's handler for the URL's scheme, through
+  `file_ops::System` so tests never launch one),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
