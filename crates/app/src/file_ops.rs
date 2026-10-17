@@ -53,9 +53,37 @@ impl System for HostSystem {
         run(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }, [path.as_os_str()])
     }
 
+    /// Doesn't wait: a handler that is slow to start (a browser launching)
+    /// would stall the UI. A thread reaps the child.
     fn open_url(&self, url: &str) -> Result<()> {
-        run(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }, [OsStr::new(url)])
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let mut child = std::process::Command::new(program)
+            .arg(url)
+            .spawn()
+            .with_context(|| format!("can't run `{program}`"))?;
+        std::thread::spawn(move || child.wait());
+        Ok(())
     }
+}
+
+/// The schemes a link may hand to the system's handler: the web and mail.
+/// Any other (`file:` to an app or script, `smb:`, an app's own scheme)
+/// could run something.
+const WEB_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+/// The scheme of `url` (RFC 3986: a letter, then letters, digits, `+`,
+/// `-`, `.`), if it has one.
+pub fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once(':')?;
+    let mut c = scheme.chars();
+    let first = c.next()?;
+    (first.is_ascii_alphabetic() && c.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))).then_some(scheme)
+}
+
+/// Whether `url` may go to the system's handler: its scheme is one of
+/// [`WEB_SCHEMES`] (any case).
+pub fn is_web_url(url: &str) -> bool {
+    url_scheme(url).is_some_and(|s| WEB_SCHEMES.iter().any(|w| s.eq_ignore_ascii_case(w)))
 }
 
 fn run<'a>(program: &str, args: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {

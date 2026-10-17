@@ -4,7 +4,7 @@
 //! becomes each block's indent and quote depth, so the Preview lays the
 //! document out as one column of blocks it can scroll by index.
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 /// How a run of inline text is set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -221,6 +221,8 @@ impl Builder {
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
+            // An email autolink's target is the bare address.
+            Tag::Link { link_type: LinkType::Email, dest_url, .. } => self.links.push(format!("mailto:{dest_url}")),
             Tag::Link { dest_url, .. } => self.links.push(dest_url.to_string()),
             Tag::Image { .. } => self.image += 1,
             _ => {}
@@ -474,6 +476,13 @@ mod tests {
                 (" j", s, None),
             ]
         );
+    }
+
+    #[test]
+    fn an_email_autolink_targets_mailto() {
+        let [Kind::Paragraph(runs)] = &kinds("<me@x.org> <https://x.org>")[..] else { panic!() };
+        let links: Vec<Option<&str>> = runs.iter().map(|r| r.link.as_deref()).collect();
+        assert_eq!(links, [Some("mailto:me@x.org"), None, Some("https://x.org")]);
     }
 
     #[test]

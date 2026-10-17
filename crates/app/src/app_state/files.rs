@@ -50,8 +50,12 @@ impl AppState {
     }
 
     /// Open `url` with the system's handler for it (a view's
-    /// `Request::OpenUrl`).
+    /// `Request::OpenUrl`): only a web or mail URL
+    /// ([`file_ops::is_web_url`]), whoever asks.
     pub fn open_url(&self, url: &str) -> Result<()> {
+        if !file_ops::is_web_url(url) {
+            bail!("not opening {url}: only http, https, and mailto links open outside the app");
+        }
         self.system.open_url(url)
     }
 
@@ -948,10 +952,25 @@ mod tests {
     }
 
     #[test]
-    fn a_url_opens_through_the_system() {
+    fn only_web_and_mail_urls_reach_the_system() {
         let (s, calls) = app();
-        s.open_url("https://example.com/a?b").unwrap();
-        assert_eq!(*calls.borrow(), ["url https://example.com/a?b"]);
+        for url in ["https://example.com/a?b", "HTTP://x.org", "mailto:me@x.org"] {
+            s.open_url(url).unwrap();
+        }
+        for url in [
+            "file:///Applications/Calculator.app",
+            "smb://host/share",
+            "ssh://host",
+            "vscode://file/x",
+            "-a:x",
+            "1http://x",
+            "javascript:alert(1)",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(s.open_url(url).is_err(), "{url}");
+        }
+        assert_eq!(*calls.borrow(), ["url https://example.com/a?b", "url HTTP://x.org", "url mailto:me@x.org"]);
     }
 
     #[test]

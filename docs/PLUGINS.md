@@ -267,9 +267,13 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   size (a serif reads small beside the monospace), headings bold at
   `heading_scale`, each text block one `cx.block` whose spans tag inline
   code (a pill behind its `block_rects`, monospace at the editor's size),
-  links (accent, underlined; each a `button` that opens on release: a URL
-  in the system's handler, `Request::OpenUrl`; a path, relative to the
-  document's folder, in a Files surface), and struck text. Code blocks are
+  links (accent, underlined; `md_preview::target` says where one goes: an
+  `http`, `https`, or `mailto` URL to the system's handler,
+  `Request::OpenUrl`; a path, relative to the document's folder, or a
+  `file:` URL's, to a Files surface; any other scheme nowhere, its hover
+  saying so, since a handler for it could run something; a link that goes
+  somewhere is a `button`, `BTN_LINK` plus its block and tag, that opens on
+  release), and struck text. Code blocks are
   the editor's code box with their rows highlighted by the fence's
   language through the row cache, clipped to the box, the language and the
   editor's copy button at the top right; tables a bordered box, the header
@@ -355,8 +359,9 @@ into the overlay layer; it doesn't need to know.
   skip a view with a `disk_conflict` rather than ask.
 - Effects outside the view go through `cx.request(Request::…)`, applied after
   the call returns: `OpenFile` (in a Files surface, as for `opens_path`),
-  `OpenUrl` (the system's handler for the URL's scheme, through
-  `file_ops::System` so tests never launch one),
+  `OpenUrl` (the system's handler for an `http`, `https`, or `mailto` URL,
+  through `file_ops::System` so tests never launch one; `AppState::open_url`
+  refuses every other scheme, whoever asks),
   `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an

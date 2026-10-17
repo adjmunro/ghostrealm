@@ -1211,7 +1211,7 @@ impl View for EditorView {
                 edits: self.buf.edits,
                 copied: md_preview::copied_line(self.copied),
             };
-            self.preview.paint(cx, body, &src);
+            self.preview.paint(cx, body, &src, self.buf.path.as_deref());
             return;
         }
         let total_lines = self.buf.lines.len();

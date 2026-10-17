@@ -43,9 +43,14 @@ const LEADING: f32 = 1.5;
 /// The reading column's widest, in body text sizes.
 const COLUMN_MAX: f32 = 46.0;
 
-/// The first button id of the links drawn; a link's id is this plus its
-/// place among the links painted last.
+/// The first button id of the links drawn. A link's id is this plus its
+/// block's index shifted past [`TAG_BITS`], plus its tag: tied to the link,
+/// not to where it painted.
 pub const BTN_LINK: u32 = 1 << 30;
+/// The bits of a link's id that hold its tag: a block's links past
+/// `1 << TAG_BITS` tags, or a block past `1 << 20`, get no button.
+const TAG_BITS: u32 = 10;
+const MAX_LINK_BLOCK: usize = 1 << 20;
 
 /// What the per-block layouts were made for: a change starts them over.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,11 +143,10 @@ pub struct Preview {
     anchor: Anchor,
     /// A source line to bring to the top once the blocks are in.
     goto_line: Option<usize>,
-    /// The last paint's body, blocks on screen (index, slot top, bottom),
-    /// and links (by button id from [`BTN_LINK`]).
+    /// The last paint's body, and blocks on screen (index, slot top,
+    /// bottom).
     body: Rect,
     shown: Vec<(usize, f32, f32)>,
-    links: Vec<String>,
 }
 
 impl Preview {
@@ -158,7 +162,6 @@ impl Preview {
             goto_line: None,
             body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             shown: Vec::new(),
-            links: Vec::new(),
         }
     }
 
@@ -253,8 +256,20 @@ impl Preview {
     }
 
     /// The target of the link with button id `BTN_LINK + i`.
-    pub fn link(&self, i: u32) -> Option<&str> {
-        self.links.get(i as usize).map(String::as_str)
+    fn link(&mut self, i: u32) -> Option<String> {
+        let (block, tag) = ((i >> TAG_BITS) as usize, i & ((1 << TAG_BITS) - 1));
+        if block >= self.blocks.len() || self.look.is_none() {
+            return None;
+        }
+        let texts: Vec<&Text> = match self.prep(block) {
+            Prep::Text { text, .. } => vec![&*text],
+            Prep::Table { cells, .. } => cells.iter().flatten().collect(),
+            _ => Vec::new(),
+        };
+        texts.iter().flat_map(|t| &t.tags).find_map(|(t, kind)| match kind {
+            Tag::Link(url) if t.get() == tag => Some(url.clone()),
+            _ => None,
+        })
     }
 
     /// The body of the code block starting on source line `line`.
@@ -381,11 +396,10 @@ impl Preview {
     }
 
     /// Draw the document into `body`.
-    pub fn paint(&mut self, cx: &mut PaintCx, body: Rect, src: &Source) {
+    pub fn paint(&mut self, cx: &mut PaintCx, body: Rect, src: &Source, doc: Option<&Path>) {
         cx.fill(body, EDITOR_BG);
         self.body = body;
         self.shown.clear();
-        self.links.clear();
         self.sync(src);
         if self.parsed.is_none() {
             let ch = cx.ui.cell_h;
@@ -414,7 +428,7 @@ impl Preview {
         while i < self.blocks.len() && y < body.y + body.h {
             let g = gap(&self.blocks, i, &look);
             let top = y + g;
-            let content = self.paint_block(cx, i, left, top, &look, src);
+            let content = self.paint_block(cx, i, left, top, &look, src, doc);
             let measured = content.is_some();
             let h = g + content.unwrap_or_else(|| self.estimate(i, &look));
             if self.laid[i].height.is_some_and(|(old, _)| (old - h).abs() > 0.5) {
@@ -434,7 +448,17 @@ impl Preview {
 
     /// Draw block `i` with its content's top-left at `(left + indent, top)`.
     /// Returns its content's height, `None` while unshaped.
-    fn paint_block(&mut self, cx: &mut PaintCx, i: usize, left: f32, top: f32, look: &Look, src: &Source) -> Option<f32> {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_block(
+        &mut self,
+        cx: &mut PaintCx,
+        i: usize,
+        left: f32,
+        top: f32,
+        look: &Look,
+        src: &Source,
+        doc: Option<&Path>,
+    ) -> Option<f32> {
         let block = &self.blocks[i];
         let x = left + indent_x(block, look);
         let w = text_width(block, look);
@@ -443,15 +467,15 @@ impl Preview {
             _ => None,
         });
         let body = self.body;
-        let mut links = std::mem::take(&mut self.links);
-        // Out while it draws (`self` lends its links), back after.
+        let links = Links { block: i, doc };
+        // Out while it draws, back after.
         let mut prep = self.laid[i].prep.take().unwrap_or_else(|| prepare(block, look));
         let out = match &mut prep {
             Prep::Text { text, marker } => {
                 if let Some(m) = marker {
                     paint_marker(cx, m, x - list_indent(look), top, body, look);
                 }
-                paint_text(cx, text, (x, top, w), body, look, &mut links)
+                paint_text(cx, text, (x, top, w), body, look, links)
             }
             Prep::Code { rows } => {
                 let copied = src.copied == Some(line);
@@ -459,7 +483,7 @@ impl Preview {
             }
             Prep::Table { cells, cols } => {
                 let cols = cols.get_or_insert_with(|| column_widths(cx, cells, w, look));
-                paint_table(cx, cells, cols, (x, top), body, look, &mut links)
+                paint_table(cx, cells, cols, (x, top), body, look, links)
             }
             Prep::Rule => {
                 let line = theme::hairline(cx.ui);
@@ -469,7 +493,6 @@ impl Preview {
             }
         };
         self.laid[i].prep = Some(prep);
-        self.links = links;
         out
     }
 
@@ -487,23 +510,55 @@ impl Preview {
         }
     }
 
-    /// Resolve the link with button id `BTN_LINK + i` against the document
-    /// at `doc`: a web URL opens in the system's handler, a path (relative
-    /// to the document's folder) in a Files surface. An in-page `#anchor`
-    /// does nothing yet.
-    pub fn open_link(&self, i: u32, doc: Option<&Path>) -> Option<Request> {
-        link_request(self.link(i)?, doc)
+    /// What the link with button id `BTN_LINK + i` asks, resolved against
+    /// the document at `doc` ([`target`]).
+    pub fn open_link(&mut self, i: u32, doc: Option<&Path>) -> Option<Request> {
+        match target(&self.link(i)?, doc)? {
+            Target::Web(url) => Some(Request::OpenUrl(url)),
+            Target::File(path) => Some(Request::OpenFile(path)),
+            Target::Blocked(_) | Target::InPage => None,
+        }
     }
 }
 
-/// What a link target asks: [`Preview::open_link`].
-fn link_request(url: &str, doc: Option<&Path>) -> Option<Request> {
+/// Where a link goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// An `http`, `https`, or `mailto` URL: the system's handler opens it.
+    Web(String),
+    /// A local path (relative to the document's folder, or a `file:` URL):
+    /// it opens in the app, never in another program.
+    File(PathBuf),
+    /// Any other scheme: not opened, as it could run something.
+    Blocked(String),
+    /// `#anchor`: within the document (not followed yet).
+    InPage,
+}
+
+/// Where link `url` in the document at `doc` goes; `None` for a relative
+/// path with no document folder to resolve it against.
+pub fn target(url: &str, doc: Option<&Path>) -> Option<Target> {
     if url.starts_with('#') || url.is_empty() {
-        return None;
+        return Some(Target::InPage);
     }
-    let scheme = url.split_once(':').map(|(s, _)| s);
-    if scheme.is_some_and(|s| s.len() > 1 && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))) {
-        return Some(Request::OpenUrl(url.to_string()));
+    if let Some(scheme) = crate::file_ops::url_scheme(url) {
+        if crate::file_ops::is_web_url(url) {
+            return Some(Target::Web(url.to_string()));
+        }
+        if !scheme.eq_ignore_ascii_case("file") {
+            return Some(Target::Blocked(scheme.to_ascii_lowercase()));
+        }
+        // `file:///p`, `file://localhost/p`, `file:/p`.
+        let rest = &url[scheme.len() + 1..];
+        let path = match rest.strip_prefix("//") {
+            Some(r) => r.strip_prefix("localhost").unwrap_or(r),
+            None => rest,
+        };
+        let path = PathBuf::from(percent_decode(path.split(['#', '?']).next().unwrap_or(path)));
+        return match path.is_absolute() {
+            true => Some(Target::File(path)),
+            false => Some(Target::Blocked("file".into())),
+        };
     }
     let path = url.split(['#', '?']).next().unwrap_or(url);
     let path = PathBuf::from(percent_decode(path));
@@ -511,7 +566,26 @@ fn link_request(url: &str, doc: Option<&Path>) -> Option<Request> {
         true => path,
         false => doc?.parent()?.join(path),
     };
-    Some(Request::OpenFile(path))
+    Some(Target::File(path))
+}
+
+/// What a link's hover says: where it goes, or why it doesn't.
+fn link_tip(url: &str, doc: Option<&Path>) -> String {
+    match target(url, doc) {
+        Some(Target::Web(u)) => u,
+        Some(Target::File(p)) => p.display().to_string(),
+        Some(Target::Blocked(s)) => format!("Not opened: {s}: links"),
+        Some(Target::InPage) => format!("{url} (links within the document don't follow yet)"),
+        None => format!("{url} (no folder to find it from: save the document first)"),
+    }
+}
+
+/// Which links a text block's tags are: its block (for their button ids)
+/// and its document (for their hover).
+#[derive(Clone, Copy)]
+struct Links<'a> {
+    block: usize,
+    doc: Option<&'a Path>,
 }
 
 /// `%XX` escapes decoded (a link to a file whose name has spaces); a
@@ -606,14 +680,14 @@ fn cell_pad(look: &Look) -> (f32, f32) {
 
 /// Spans for a block's inline runs in `font` at `size` (line height
 /// `line_h`), in `color`: inline code monospace at the editor's size, links
-/// in the accent, each code span and link tagged.
-fn inline_text(runs: &[Inline], font: Font, size: f32, line_h: f32, color: [u8; 3], look: &Look) -> Text {
+/// in the accent, each code span and link tagged from `next` up (a table's
+/// cells share one count, so a tag names one link in the block).
+fn inline_text(runs: &[Inline], font: Font, size: f32, line_h: f32, color: [u8; 3], look: &Look, next: &mut u32) -> Text {
     let mut spans = Vec::with_capacity(runs.len());
     let mut tags: Vec<(NonZeroU32, Tag)> = Vec::new();
-    let mut next = 1u32;
     let mut new_tag = |tags: &mut Vec<(NonZeroU32, Tag)>, tag: Tag| {
-        let t = NonZeroU32::new(next).expect("tags count from 1");
-        next += 1;
+        let t = NonZeroU32::new(*next).expect("tags count from 1");
+        *next += 1;
         tags.push((t, tag));
         t
     };
@@ -662,14 +736,15 @@ fn inline_text(runs: &[Inline], font: Font, size: f32, line_h: f32, color: [u8; 
 /// Block `block`'s spans and rows.
 fn prepare(block: &Block, look: &Look) -> Prep {
     let color = if block.quote > 0 { theme::TEXT_DIM } else { EDITOR_FG };
-    let body = |runs: &[Inline]| inline_text(runs, Font::SERIF, look.size, look.line_h, color, look);
+    let next = &mut 1;
+    let mut body = |runs: &[Inline], bold: bool| inline_text(runs, Font::SERIF.bold(bold), look.size, look.line_h, color, look, next);
     match &block.kind {
         Kind::Heading(level, runs) => {
             let size = (look.size * syntax::heading_scale(Some(*level))).round();
-            let text = inline_text(runs, Font::SERIF.bold(true), size, (size * 1.3).round(), color, look);
+            let text = inline_text(runs, Font::SERIF.bold(true), size, (size * 1.3).round(), color, look, &mut 1);
             Prep::Text { text, marker: None }
         }
-        Kind::Paragraph(runs) => Prep::Text { text: body(runs), marker: None },
+        Kind::Paragraph(runs) => Prep::Text { text: body(runs, false), marker: None },
         Kind::Item(marker, runs) => {
             let marker = match *marker {
                 Marker::Task(done) => MarkerPrep::Task(done),
@@ -679,7 +754,7 @@ fn prepare(block: &Block, look: &Look) -> Prep {
                 }
                 Marker::Number(n) => MarkerPrep::Text(plain_text(&format!("{n}."), Font::SERIF, look, theme::TEXT_DIM)),
             };
-            Prep::Text { text: body(runs), marker: Some(marker) }
+            Prep::Text { text: body(runs, false), marker: Some(marker) }
         }
         Kind::Html(text) => {
             let span = BlockSpan::new(text.clone(), Font::MONO, look.mono, look.cell.1, theme::TEXT_DIM);
@@ -687,9 +762,8 @@ fn prepare(block: &Block, look: &Look) -> Prep {
         }
         Kind::Code { lang, text } => Prep::Code { rows: code_rows(lang.as_deref(), text) },
         Kind::Table { head, rows } => {
-            let head = head.iter().map(|c| inline_text(c, Font::SERIF.bold(true), look.size, look.line_h, color, look));
-            let mut cells = vec![head.collect::<Vec<_>>()];
-            cells.extend(rows.iter().map(|r| r.iter().map(|c| body(c)).collect()));
+            let mut cells = vec![head.iter().map(|c| body(c, true)).collect::<Vec<_>>()];
+            cells.extend(rows.iter().map(|r| r.iter().map(|c| body(c, false)).collect()));
             Prep::Table { cells, cols: None }
         }
         Kind::Rule => Prep::Rule,
@@ -723,7 +797,7 @@ fn paint_text(
     (x, top, w): (f32, f32, f32),
     clip: Rect,
     look: &Look,
-    links: &mut Vec<String>,
+    links: Links,
 ) -> Option<f32> {
     let laid = cx.block(text.key, || text.spans.clone(), w, x, top, clip)?;
     let line = theme::hairline(cx.ui);
@@ -745,14 +819,18 @@ fn paint_text(
                 }
             }
             Tag::Link(url) => {
-                let id = BTN_LINK + links.len() as u32;
-                links.push(url.clone());
+                // A link that goes nowhere gets no button, only its hover.
+                let opens = matches!(target(url, links.doc), Some(Target::Web(_) | Target::File(_)));
+                let id = (links.block < MAX_LINK_BLOCK && tag.get() < 1 << TAG_BITS && opens)
+                    .then(|| BTN_LINK + ((links.block as u32) << TAG_BITS) + tag.get());
                 let mut hover = false;
                 for r in &rects {
                     if let Some(hit) = intersect(*r, clip) {
-                        hover |= cx.button(hit, id);
-                        cx.cursor(hit, CursorIcon::Pointer);
-                        cx.tooltip(hit, url.clone());
+                        if let Some(id) = id {
+                            hover |= cx.button(hit, id);
+                            cx.cursor(hit, CursorIcon::Pointer);
+                        }
+                        cx.tooltip(hit, link_tip(url, links.doc));
                     }
                 }
                 let thick = (look.size / 14.0).round().max(1.0);
@@ -893,7 +971,7 @@ fn paint_table(
     (x, top): (f32, f32),
     clip: Rect,
     look: &Look,
-    links: &mut Vec<String>,
+    links: Links,
 ) -> Option<f32> {
     let (px, py) = cell_pad(look);
     let hair = theme::hairline(cx.ui);
@@ -1066,6 +1144,23 @@ mod tests {
     }
 
     #[test]
+    fn a_link_to_another_scheme_has_no_button_and_says_why() {
+        let (mut v, _) = previewed("pv-blocked", "[app](file:///tmp) [s](smb://h/x) and more\n");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
+        assert_eq!(links.len(), 1, "only the file: link opens");
+        assert_eq!(h.button(&mut v, links[0]).requests, [Request::OpenFile("/tmp".into())]);
+        let item = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Block(_))).unwrap();
+        let b = h.text.buffer(item.src).unwrap();
+        let g = b.layout_runs().flat_map(|r| r.glyphs.iter().cloned()).find(|g| g.metadata == 2).unwrap();
+        h.cursor = (item.left + g.x + 1.0, item.top + 4.0);
+        h.paint(&mut v, RECT);
+        assert_eq!(h.frame.tooltip.as_ref().map(|t| t.1.as_str()), Some("Not opened: smb: links"));
+        assert!(h.frame.view_buttons.iter().all(|b| b.2 < BTN_LINK || b.2 == links[0]));
+    }
+
+    #[test]
     fn keys_scroll_the_preview_and_never_edit_the_text() {
         let text: String = (0..80).map(|i| format!("Paragraph {i}.\n\n")).collect();
         let (mut v, _) = previewed("pv-keys", &text);
@@ -1225,7 +1320,10 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while !v.refresh() {
+        // `refresh` also hears other background work (the header's
+        // statistic): wait for the parse itself.
+        while !v.preview.is_current(v.buf.edits) {
+            v.refresh();
             assert!(Instant::now() < deadline, "the parse never finished");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -1235,16 +1333,30 @@ mod tests {
     }
 
     #[test]
-    fn links_resolve_to_files_beside_the_document_or_urls() {
+    fn links_go_to_files_beside_the_document_or_web_and_mail_urls_only() {
         let doc = Path::new("/w/docs/a.md");
-        let open = |u: &str| link_request(u, Some(doc));
-        assert_eq!(open("https://x.org/a"), Some(Request::OpenUrl("https://x.org/a".into())));
-        assert_eq!(open("mailto:me@x.org"), Some(Request::OpenUrl("mailto:me@x.org".into())));
-        assert_eq!(open("GOAL.md"), Some(Request::OpenFile("/w/docs/GOAL.md".into())));
-        assert_eq!(open("../src/my%20file.rs#L3"), Some(Request::OpenFile("/w/docs/../src/my file.rs".into())));
-        assert_eq!(open("/etc/hosts"), Some(Request::OpenFile("/etc/hosts".into())));
-        assert_eq!(open("#heading"), None);
-        assert_eq!(link_request("a.md", None), None, "a scratch buffer has no folder");
+        let to = |u: &str| target(u, Some(doc));
+        let web = |u: &str| Some(Target::Web(u.into()));
+        let file = |p: &str| Some(Target::File(p.into()));
+        let blocked = |s: &str| Some(Target::Blocked(s.into()));
+        assert_eq!(to("https://x.org/a"), web("https://x.org/a"));
+        assert_eq!(to("HTTP://x.org"), web("HTTP://x.org"));
+        assert_eq!(to("mailto:me@x.org"), web("mailto:me@x.org"));
+        assert_eq!(to("GOAL.md"), file("/w/docs/GOAL.md"));
+        assert_eq!(to("../src/my%20file.rs#L3"), file("/w/docs/../src/my file.rs"));
+        assert_eq!(to("/etc/hosts"), file("/etc/hosts"));
+        // A `file:` URL is a path the app opens itself, never the system.
+        assert_eq!(to("file:///Applications/Calculator.app"), file("/Applications/Calculator.app"));
+        assert_eq!(to("file://localhost/tmp/a%20b.md"), file("/tmp/a b.md"));
+        assert_eq!(to("file:relative"), blocked("file"));
+        for (url, scheme) in [("smb://host/s", "smb"), ("SSH://h", "ssh"), ("vscode://x", "vscode"), ("javascript:x", "javascript")] {
+            assert_eq!(to(url), blocked(scheme), "{url}");
+        }
+        // Not a scheme (it starts with no letter): a relative path.
+        assert_eq!(to("-a:x"), file("/w/docs/-a:x"));
+        assert_eq!(to("#heading"), Some(Target::InPage));
+        assert_eq!(target("a.md", None), None, "a scratch buffer has no folder");
+        assert_eq!(link_tip("ssh://h", Some(doc)), "Not opened: ssh: links");
     }
 
     #[test]
