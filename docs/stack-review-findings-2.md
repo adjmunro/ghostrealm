@@ -81,12 +81,6 @@ against `f59386c`.
     the app with the original tab kept alive (fallback: a new tab); an
     agent-triggered popup opens hidden in the background. See DECISION.md
     (UX principle / agent-operated surfaces); work tracked in TODO.md.
-34. **The preview follows hover.** Moving the mouse to the preview's controls
-    crosses rows, switches the subject and pauses the track; in Browse mode,
-    clicking an audio row opens the editor. Decision needed: follow the
-    selection (as Finder does), pin to the chosen row, or hold the subject while
-    the pointer travels to the preview? The user will try the behaviour before
-    deciding; tracked in TODO.md.
 
 ## Terminal input
 

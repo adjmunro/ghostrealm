@@ -60,14 +60,9 @@
 [2026-09-15@1d4d22e]
 
 - Requires: NO BLOCKERS
-- Detail: DONE: drag to select terminal text (highlight), copy on release and via
-  Cmd+C (arboard clipboard); mouse-wheel scrollback; the vtab right-click context
-  menu; mouse reporting to programs that enable tracking (left button, drag, hover,
-  vertical wheel; Shift keeps selection/scroll local). Still to do: the plugin API
-  delivers only the left button, so right/middle clicks and horizontal wheel are
-  never reported; alternate scroll (mode 1007: wheel -> arrow keys on the alternate
-  screen when tracking is off) is not implemented. (Click-to-position is skipped —
-  not meaningful for a shell.)
+- Detail: Terminal mouse reporting misses the horizontal wheel, and alternate
+  scroll (mode 1007: wheel -> arrow keys on the alternate screen when tracking
+  is off) is not implemented.
 - Reason: expected terminal UX; TUI apps want mouse events.
 
 ---
@@ -98,29 +93,12 @@
 
 ---
 
-[2026-09-15@1641f11] Sidebar context menu + new-tab button; mark-unread
-
-- Requires: NO BLOCKERS (a popup-menu widget now exists in window.rs: `Menu`)
-- Detail: DONE: right-click a sidebar vtab opens a context menu with the
-  state-appropriate mark read/unread, Dismiss (when needs_input), and Close; a "+"
-  new-tab button sits below the last vtab. Remaining: Rename (needs a single-line
-  input overlay bound to the target vtab — reuse the palette input in a rename
-  mode) and Pin (the tree has no pin/ordering concept yet).
-- Reason: brief's per-vtab context actions; discoverability.
-
----
-
-[2026-09-15@<uncommitted>] Text-editor pane — follow-ups
+[2026-09-15@1641f11] Sidebar context menu: Pin
 
 - Requires: NO BLOCKERS
-- Detail: A minimal editor surface exists (`app::editor::EditorBuffer`): terminal OR
-  editor; editor.new / editor.open <path>; typing/editing; Cmd+S save; selection
-  (Shift+Arrow/Home/End) + copy/cut/paste (Cmd+C/X/V) + line/doc nav (Cmd+arrows),
-  rendered with a highlight + cursor bar. Follow-ups: a modified/unsaved indicator +
-  save-as prompt for scratch buffers; mouse click-to-position + drag-select in the
-  editor; word motion (Option+Arrow) in the editor; horizontal scroll for long
-  lines; and (later) the shell-LSP idea (IDEAS.md).
-- Reason: requested; expands the app beyond terminals.
+- Detail: The workspace menu has no Pin (the tree has no pin/ordering concept
+  yet; how pins combine with inbox sections and manual order is undecided).
+- Reason: brief's per-vtab context actions; discoverability.
 
 ---
 
@@ -157,15 +135,12 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Naming — rename "vertical tabs" → "workspaces"
+[2026-09-15@2e8e8c7] Naming — rename `vtab` → workspace in the code
 
 - Requires: NO BLOCKERS
-- Detail: In the UI, call vertical tabs "workspaces". Command labels are confusing:
-  "New Tab" / "Close Tab" / "Rename Tab" act on vertical tabs, not the pane's
-  horizontal tabs. Rename to New Workspace / Close Workspace / Rename Workspace, and
-  the pane htab actions to "New/Close Terminal Tab". Consider a scope prefix in
-  palette labels (e.g. leading `[workspace]` / `[terminal tab]`). Update GLOSSARY.md.
-  Internally, rename vtab → "workspace tab" where reasonable.
+- Detail: The UI says workspace; the code still says `vtab` / `Vtab` /
+  `VtabId`. Rename it to "workspace tab" where reasonable. Open: a scope
+  prefix in palette labels (e.g. leading `[workspace]` / `[terminal tab]`).
 - Reason: reduce confusion; consistent vocabulary (we already call it a workspace).
 
 ---
@@ -224,14 +199,14 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Splits — discoverability, close and split buttons
+[2026-09-15@2e8e8c7] Splits — close and split buttons
 
 - Requires: NO BLOCKERS
-- Detail: (1) Split commands are hard to find (buried below the palette fold) — add
-  default keybindings and surface them. (2) A close "x" on a pane and split
-  right/left/up/down buttons (owner's words in "DISCUSSION: editor and file
-  browser as one surface"). Resize handles and free ratios are done; split
+- Detail: A close "x" on a pane and split right/left/up/down buttons. Split
   ratios are not saved between runs (nothing in the workspace tree is).
+- Owner, verbatim:
+  > Splits probably need an 'x' icon? And maybe also a split right/left/up/down
+  > button(s)?
 - Reason: expected tiling UX.
 
 ---
@@ -256,28 +231,6 @@
   to reorder (the tree stores workspaces in an ordered Vec — reordering needs a move
   op + drag handling in the sidebar).
 - Reason: the email-inbox model + reordering.
-
----
-
-[2026-09-15@2e8e8c7] ARCHITECTURE — VT off the UI thread — DONE (92d5ca0)
-
-- DONE: `ThreadedTerminal` runs each terminal's VT+PTY on a worker thread; the UI
-  only renders + sends input messages and reads published `Grid` snapshots. No VT
-  parsing or snapshotting on the UI thread. AppState.surfaces hold ThreadedTerminal.
-- Verify on a real display: heavy `eza --tree` should no longer beachball, and
-  workspace/pane switching should stay responsive mid-flood.
-- Follow-ups (optional): rate-limit the worker's grid builds under a sustained flood
-  (it currently builds per drained batch — fine, off the UI thread, but wasteful);
-  recycle the UI's consumed grids back to the worker; kill the child on drop.
-
----
-
-[2026-09-15@2e8e8c7] Taller workspace tabs showing the pinned directory
-
-- Requires: NO BLOCKERS (workspaces have a root directory: `Vtab.root_dir`)
-- Detail: Make the sidebar workspace rows taller and show the directory each is
-  pinned to (its root dir) under/next to the name.
-- Reason: visibility of a workspace's cwd; pairs with the per-workspace root dir.
 
 ---
 
@@ -326,9 +279,7 @@
 [2026-09-18@6577576]
 
 - Requires: NO BLOCKERS
-- Detail: Soft-wrap follow-ups. Editor soft-wrap + its toggle in the document
-  header are DONE: greedy word-wrap, gutter/cursor/selection/click all wrap-aware,
-  `[editor] soft_wrap` default on. REMAINING: (1) a terminal toggle, if wanted
+- Detail: Soft-wrap follow-ups. (1) A terminal toggle, if wanted
   (terminals already wrap to their column count, so a terminal toggle would
   need a ghostty reflow/no-wrap mode — likely skip). (2) Wrapped editors
   re-shape visible rows via the row cache but char-substring keys mean many small
@@ -363,26 +314,13 @@
 
 ---
 
-[2026-09-29@19e0239] File browser — alternate views (grouped)
+[2026-09-29@19e0239] File browser — flat "recent" and "largest files" views
 
 - Requires: NO BLOCKERS (extends `core::fs_tree::FsTree`, already headless)
-- Detail: A `view` field on `FsTree` selects how `rows()` groups the recursive
-  subtree into fake collapsible categories (rendered like directories, not real),
-  with a header toggle to switch. Views to build:
-  - **by extension** (requested): one category per extension (`.kt`,
-    `.gradle.kts`, `.jpg`); expand to list every file of that type.
-  - **by kind** (higher level): group extensions into Images / Video / Audio /
-    Documents / Code / Archives / Data / Other — great for a Downloads folder.
-  - **by git status**: Modified / Untracked / Staged / Clean categories.
-  - **modified**: Today / This week / This month / Older buckets by
-    modification time. Lists every file; it is a grouping, not a filter.
-  - **by size**: tiny / small / large / huge buckets; plus a flat "largest files".
-  - **recent**: flat, newest-first across the tree.
-  DISAMBIGUATION for any flat/grouped view: when two shown files share a name,
-  prefix each with the minimal distinguishing ancestor (grayed) — walk up from the
-  leaf while the candidate segment is shared by another shown file, stop at the
-  first that differs (Kotlin `util` packages sharing a/b/c climb to the module:
-  `source` vs `network`). Show that segment before the file name in dim text.
+- Detail: The grouped views (`FsView`: extension, kind, git status, modified,
+  size) exist. Not yet: two flat lists across the tree, **recent**
+  (newest-first) and **largest files**, with the same dim disambiguating
+  prefix the grouped views show.
 - Reason: navigate by kind/status/date, not just by folder; requested + brainstorm.
 
 ---
@@ -441,17 +379,8 @@
 [2026-09-29@6641e98] Markdown rich text — follow-ups
 
 - Requires: NO BLOCKERS
-- Detail: DONE: **mixed** mode. Strong/headings bold, emphasis italic, link text
-  underlined, inline code in a rounded, outlined box, fenced blocks in one
-  such box the text area's width with a copy button, the body highlighted in
-  the fence's language (a line-local highlighter such as `toml`); the markers
-  stay visible, editable, and dimmed. The style rides in `RunStyle`s per span
-  through the row cache and `PaintCx` (PLUGINS.md); rows with no styled span
-  carry none. DONE: three view modes per document, stepped by one header
-  button (also the `⋯` menu and `editor.cycle_view_mode`): Preview
-  (rendered, read-only; Markdown only, with copy buttons on code blocks and
-  links that open), Integrated (the mixed mode), Source (colours only).
-  Remaining:
+- Detail: Markdown shows in three view modes (Preview, Integrated, Source;
+  PLUGINS.md "View modes"). Remaining:
   - Preview: selecting and copying text; images and embeds (alt text shows
     for now); `#anchor` links within the document; a double click edits at
     the block's first line, not at the word clicked; table column alignment
@@ -473,12 +402,6 @@
     char, or style flags on spans.
   - Bold has no synthetic fallback: a monospace family without a bold face
     shows the nearest weight (italic is skewed by the shaper).
-  - From GitHub issue #1 (2026-10-16@ad13ff26):
-    - View modes for other languages (Integrated and Source exist for every
-      highlighted one, Preview for Markdown): Kotlin top-level
-      classes as H1 shrinking with nesting, functions and non-local properties
-      as H3/H5; a Kotlin Preview could render doc comments and generated
-      diagrams (relationships, method flow).
 - Owner, verbatim:
   > Okay, yeah, I still really want the bold and italics and markdown, so we
   > better plumb that. Try and make it efficient, though. Like, I don't think
@@ -501,11 +424,7 @@
 [2026-09-30@7d132a83] Plugin architecture — follow-ups
 
 - Requires: NO BLOCKERS
-- Detail: DONE: `Plugin`/`View` API (`app::plugin`), immediate-mode `PaintCx`,
-  `EventCx` + request queue, headless test harness; terminal, editor, and file
-  browser are plugins; the picker and `<id>.new` commands come from the registry;
-  files open with the first plugin that claims the path (PLUGINS.md). Remaining:
-  (1) move the rest of the app's own chrome (sidebar, tab strips, palette,
+- Detail: Remaining: (1) move the rest of the app's own chrome (sidebar, tab strips, palette,
   menu) onto `PaintCx` as the empty-pane picker and dir picker already are,
   retiring their per-widget buffer pools; (2) extract the API
   into its own crate for out-of-tree Rust plugins — needs commands registered
@@ -513,10 +432,8 @@
   plugin already documents its sections (`Plugin::config_sections`), but the typed
   fields still live on `core::Config`; a plugin should deserialize its own section; (4) view-scoped
   commands and keybindings (e.g. editor-only chords in `[keybindings]`, palette
-  entries that act on the focused view); (5) a web-browser plugin — a CEF/webview
-  composites its own surface, so `PaintCx` needs a textured-quad primitive fed by a
-  per-view texture (acceptable for non-hot panels, not the terminal); (6) dynamic
-  loading / WASM for third-party plugins, if ever.
+  entries that act on the focused view); (6) dynamic loading / WASM for
+  third-party plugins, if ever.
 - Reason: finish the uniform-plugin model and open it to new kinds.
 ---
 
@@ -602,7 +519,8 @@
   markers, later phantom rows — painted for visible rows only; (2) providers
   that produce decorations for a buffer. Git is the first provider (HEAD text +
   line hunks + intra-line diff); LSP diagnostics and the section outline can
-  feed the same layer later. The editor never knows about git.
+  feed the same layer later. The editor never knows about git. Comment mode's
+  thread markers share the gutter slot.
 - Reason: see what changed since the last commit in place, not just how much.
 
 ---
@@ -833,15 +751,14 @@
   - Keybinding ids without quotes: confirm flattening nested tables (TODO
     "Keybinding ids without quotes").
   - [stack-review-findings-2.md](stack-review-findings-2.md) items 15 (load-time
-    findings), 24 (stuck mount), 34 (preview follows hover; the owner will try
-    it first), 36 (unbracketed paste),
+    findings), 24 (stuck mount), 36 (unbracketed paste),
     and the "To confirm" note in [stack-review-findings.md](stack-review-findings.md).
   - The open design items: the profile scope controls and picker (TODO "Web —
-    profiles"), syntax highlighting direction, editor and file browser as one
-    surface.
+    profiles"), syntax highlighting direction.
   Decided in the review rounds and no longer open: Chromium sandbox on, web
   profile location, pop-up handling, shell exit, Delete = Trash, GitHub
-  permalinks (future), the file-browser date view naming.
+  permalinks (future), the file-browser date view naming, the Files surface
+  (GitHub issue #1).
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -934,22 +851,15 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] Editor and file browser as one surface
+[2026-10-13T20:25+1300@e9617b8] Files surface — remaining from GitHub issue #1
 
-- Requires: the implementation plan (written separately)
-- Decided (2026-10-16@ad13ff26, GitHub issue #1): clone the Claude Code app's
-  file browser and editor (DECISION.md). The Files surface exists with its
-  pinnable sidebar, document header, and file tabs (with the preview tab).
-  Remaining: dragging file tabs to reorder
-  them, the panel controls at the tab row's right end (search, `⋯`,
-  maximise, close; issue screenshot img25), and the other things the issue
-  says the owner likes.
-- Detail: Related, for the plan to cover:
-  - **Markdown**: shown formatted, with the markup symbols still visible and
-    editable. This is the "mixed" mode in "Markdown rich text — follow-ups"; the mixed mode is done.
-  - **Splits**: a close "x" on a pane, and split right/left/up/down buttons.
-- Reason: owner review; the file browser and editor overlap, and the choice
-  decides several smaller features.
+- Requires: NO BLOCKERS
+- Detail: The Files surface (DECISION.md) is built. Not yet: dragging file
+  tabs to reorder them, and the panel controls at the tab row's right end
+  (search, `⋯`, maximise, close; issue screenshot img25). Pane close and
+  split buttons: "Splits — close and split buttons".
+- Reason: owner review; clone the Claude Code app's file panel, plus what
+  the issue says the owner likes.
 - Owner, verbatim (the decision):
   > What I mean is that the way that the Claude Code file browser does it that
   > I've highlighted in the issue there is how I think I would like it to work.
@@ -989,9 +899,6 @@
   > a collapse/expand button for the file browser). maybe even pin left, pin
   > right, unpin? Maybe that's how we do the previews for text files? we just
   > stay focused on the browser?
-- Owner, verbatim (splits):
-  > Splits probably need an 'x' icon? And maybe also a split right/left/up/down
-  > button(s)?
 
 ---
 
@@ -1335,20 +1242,44 @@
 
 ---
 
-[2026-10-16T21:23+1300@ad13ff26] Header icons by config
-
-- Requires: NO BLOCKERS
-- Detail: The document header's `⋯` lists every option (soft wrap, autosave,
-  the statistic). Remaining: a config option (`[editor] ribbon`) choosing which
-  of them also show as header icons.
-- Reason: GitHub issue #1; keeps the header usable when narrow.
-
----
-
 [2026-10-16T21:23+1300@ad13ff26] Comment mode
 
-- Requires: NO BLOCKERS
+- Requires: where threads are stored (decision pending: local sidecar, in
+  the repo, GitHub only, or local plus PR threads)
 - Detail: Anchor comment threads to parts of a file (a line or range), shown
   beside the text. Uses: talking to agents about specific lines, and showing a
   PR's review threads.
+- Hooks the editor already has or plans:
+  - A thread draws as a `RowKind::Widget { after_ln, id }` row in the
+    editor's `RowTable` (PLUGINS.md "Syntax highlighting"), its height its
+    own: every y-to-text mapping already reads the table, so clicks and the
+    caret skip it. Nothing places one yet.
+  - A gutter decoration slot (a marker per line, with hover and click) shared
+    with "Editor — inline git change highlights": both are providers to the
+    same decoration layer.
+  - A `CommentStore` keyed by path + line anchor + a hash of the anchored
+    lines' content, so a thread finds its lines again after edits (and shows
+    as outdated when they are gone).
+  - `comments.*` agent commands (list, add, reply, resolve), within the
+    agent channel's access scope.
+  - PR review threads read and written through `gh` (its auth, no token of
+    our own), mapped onto the same anchors.
 - Reason: GitHub issue #1 (seen in the Claude Code app).
+
+---
+
+[2026-10-18T05:18+1300@e3a7c9e] View modes for other languages
+
+- Requires: Kotlin highlighting or a language server (document symbols)
+- Detail: Integrated sizes a row by `Highlighter::heading_level`, and Preview
+  exists for Markdown only. Per language:
+  - Integrated formatting: give a language headings through its highlighter's
+    `heading_level`, or from LSP document symbols where a server runs. Kotlin:
+    top-level classes as H1, shrinking with nesting; functions and non-local
+    properties as H3/H5. The same levels feed the outline and table of
+    contents.
+  - A code Preview: render doc comments (KDoc, rustdoc) as Markdown between
+    the declarations, plus generated diagrams (class relationships, method
+    flow). It would be a `ViewMode::Preview` for that language, read-only
+    like Markdown's.
+- Reason: GitHub issue #1.

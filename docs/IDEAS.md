@@ -28,11 +28,7 @@ terminal — completions/diagnostics from a shell language server (or shellcheck
 diagnostics). Open questions: how to hook into the live command line without a real
 editor buffer (the shell owns the line), whether to intercept before the PTY or run
 it against a scratch buffer, and how it interacts with the shell's own completion.
-Likely pairs with the basic text-editor pane (TODO) where we *do* own the buffer.
-
----
-
-Built-in web browser pane
+Likely pairs with the editor, where we *do* own the buffer.
 
 ---
 
