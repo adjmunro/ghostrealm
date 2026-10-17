@@ -74,6 +74,21 @@ impl Highlighter for Markdown {
         }
     }
 
+    /// An ATX heading's level (its `#` count), where [`block`] marks one: at
+    /// the top level only, so not in a code block, a quote or a list item.
+    fn heading_level(&self, line: &str, state: State) -> Option<u8> {
+        let c: Vec<char> = line.chars().collect();
+        if state != 0 && !leaves(&c, state) {
+            return None;
+        }
+        let indent = run_of(&c, 0, ' ');
+        if indent > 3 || c.get(indent) != Some(&'#') {
+            return None;
+        }
+        let hashes = run_of(&c, indent, '#');
+        (hashes <= 6 && c.get(indent + hashes).is_none_or(|x| *x == ' ')).then_some(hashes as u8)
+    }
+
     fn block_row(&self, line: &str, state_in: State, state_out: State) -> Option<BlockRow> {
         // A line leaving the fence's container ends it, and may open another.
         let inside = state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in);
@@ -613,6 +628,31 @@ mod tests {
         assert_eq!(lex("####### seven"), vec![run("####### seven", Plain)]);
         assert_eq!(lex("   ## ok"), vec![run("   ", Plain), run("##", Marker), run(" ok", Heading)]);
         assert_eq!(lex("    ## code"), vec![run("    ## code", Plain)]);
+    }
+
+    #[test]
+    fn heading_levels_count_the_hashes_where_a_heading_is_marked() {
+        let level = |l: &str, st| Markdown.heading_level(l, st);
+        for n in 1..=6u8 {
+            assert_eq!(level(&format!("{} T", "#".repeat(n as usize)), 0), Some(n));
+        }
+        assert_eq!(level("#", 0), Some(1), "an empty heading");
+        assert_eq!(level("   ## ok", 0), Some(2));
+        for line in ["####### seven", "#nospace", "    # indented code", "> # quoted", "- # item", "text # not"] {
+            assert_eq!(level(line, 0), None, "{line:?}");
+        }
+        // In a fence a `#` line is code; leaving a list item's fence, it heads again.
+        let (_, inside) = Markdown.line("```", 0);
+        assert_eq!(level("# code", inside), None);
+        let (_, listed) = Markdown.line("- ```js", 0);
+        assert_eq!(level("  # still code", listed), None);
+        assert_eq!(level("# after the list", listed), Some(1));
+        let (_, quoted) = Markdown.line("> ```", 0);
+        assert_eq!(level("# after the quote", quoted), Some(1));
+        // Every line `heading_level` names, `line` marks as a heading.
+        for (line, st) in [("## a", 0), ("# after the list", listed)] {
+            assert!(Markdown.line(line, st).0.iter().any(|s| s.token == Heading), "{line:?}");
+        }
     }
 
     #[test]

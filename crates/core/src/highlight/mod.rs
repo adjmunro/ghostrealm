@@ -171,6 +171,13 @@ pub trait Highlighter: Sync {
     fn block_row(&self, _line: &str, _state_in: State, _state_out: State) -> Option<BlockRow> {
         None
     }
+
+    /// The outline level of `line` entering with `state`, 1 the outermost,
+    /// when it heads a section (a Markdown heading, a TOML table): a surface
+    /// may draw it larger. `None` by default.
+    fn heading_level(&self, _line: &str, _state: State) -> Option<u8> {
+        None
+    }
 }
 
 /// Every registered highlighter.
