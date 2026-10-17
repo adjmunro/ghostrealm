@@ -948,6 +948,21 @@ impl<'a> PaintCx<'a> {
         self.text.row_cache.buffer(key)?.layout_runs().next().map(|r| r.line_y)
     }
 
+    /// Where byte `byte` of the row-cache row `key` starts, from the row's
+    /// left edge, as shaped: the left of the cluster holding it, or the
+    /// row's right end at or past its last. `None` until it is shaped.
+    pub fn row_x(&self, key: u64, byte: usize) -> Option<f32> {
+        let run = self.text.row_cache.buffer(key)?.layout_runs().next()?;
+        let mut end = 0.0f32;
+        for g in run.glyphs {
+            if g.end > byte {
+                return Some(g.x);
+            }
+            end = end.max(g.x + g.w);
+        }
+        Some(end)
+    }
+
     /// How far below a monospace row's top its baseline sits, at the frame's
     /// metrics: what lines up text of two sizes (a row drawn at a scale `s`
     /// has its baseline `s` times as far down).

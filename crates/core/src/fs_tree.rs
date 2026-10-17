@@ -358,6 +358,25 @@ impl FsTree {
         self.uses_git() && self.git_status.as_ref().is_none_or(|(g, _)| *g != self.git_generation)
     }
 
+    /// The files the git filter passes, for a search over what the tree
+    /// lists: `None` with no git filter. The status is asked for here; until
+    /// it arrives ([`git_status_awaited`](Self::git_status_awaited)) no file
+    /// passes.
+    pub fn git_filter_files(&mut self) -> Option<BTreeSet<PathBuf>> {
+        let filter = self.git_filter;
+        if filter == GitFilter::All {
+            return None;
+        }
+        self.request_git_status();
+        let passes = |s: &GitState| match filter {
+            GitFilter::Modified => s.modified,
+            GitFilter::Untracked => s.untracked,
+            GitFilter::All => true,
+        };
+        let map = self.git_status.as_ref().map(|(_, m)| m);
+        Some(map.into_iter().flatten().filter(|(_, s)| passes(s)).map(|(p, _)| p.clone()).collect())
+    }
+
     /// Whether the rows depend on git status.
     fn uses_git(&self) -> bool {
         self.git_filter != GitFilter::All || self.view == FsView::GitStatus
@@ -1218,6 +1237,19 @@ mod tests {
         woken.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(t.poll());
         assert_eq!(file_names(&mut t), ["changed.txt", "clean.txt"]);
+    }
+
+    #[test]
+    fn the_git_filter_names_its_files_for_a_search_once_the_status_is_in() {
+        let Some(d) = repo_with_a_change() else { return };
+        let (mut t, woken) = tree_with_waker(&d);
+        assert_eq!(t.git_filter_files(), None, "no filter: every file");
+        t.set_git_filter(GitFilter::Modified);
+        assert_eq!(t.git_filter_files(), Some(BTreeSet::new()), "nothing until the status is in");
+        assert!(t.git_status_awaited());
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        t.poll();
+        assert_eq!(t.git_filter_files(), Some(BTreeSet::from([d.join("changed.txt")])));
     }
 
     #[test]

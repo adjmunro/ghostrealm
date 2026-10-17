@@ -5,9 +5,10 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghostrealm_core::search::{Case, SearchQuery, Searcher, WalkOptions};
+use ghostrealm_core::search::{Case, SearchQuery, Searcher, Stop, WalkOptions};
 use ghostrealm_core::Rect;
 use ghostrealm_terminal::{Key, KeyPress};
 
@@ -23,6 +24,22 @@ pub(super) const BTN_WHOLE_WORD: u32 = 9;
 pub(super) const BTN_REGEX: u32 = 10;
 /// Chars kept before a match when a line is cut to show it.
 const LEAD: usize = 6;
+/// The fewest columns the filter box keeps for its text: narrower, the
+/// toggles hide.
+const MIN_TEXT_COLS: f32 = 8.0;
+
+/// The match a search result opened its file at, for the host to select
+/// once the file shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchAt {
+    pub path: PathBuf,
+    /// From 0.
+    pub line: usize,
+    /// Chars, as the file on disk had it.
+    pub cols: Range<usize>,
+    /// The search that found it, to find it again in text edited since.
+    pub query: SearchQuery,
+}
 
 /// A result row: a file's header, one of its matching lines, or the note
 /// that it has more.
@@ -45,6 +62,8 @@ pub(super) struct Search {
     pub(super) regex: bool,
     /// Why the query doesn't compile (an invalid regex).
     error: Option<String>,
+    /// The git filter is on and its status isn't in yet: the search waits.
+    awaiting_git: bool,
     /// When typing paused long enough for the search to run.
     due: Option<Instant>,
     started: Option<Started>,
@@ -56,9 +75,8 @@ pub(super) struct Search {
     /// The row opened last: the selected look.
     chosen: Option<usize>,
     scroll: f32,
-    /// The match the last open was for: its file, line, and columns, for the
-    /// host to select once the file shows ([`FileBrowserView::take_match`]).
-    pending: Option<(PathBuf, usize, Range<usize>)>,
+    /// The match the last open was for ([`FileBrowserView::take_match`]).
+    pub(super) pending: Option<MatchAt>,
 }
 
 impl Search {
@@ -69,6 +87,7 @@ impl Search {
             whole_word: false,
             regex: false,
             error: None,
+            awaiting_git: false,
             due: None,
             started: None,
             rows: Vec::new(),
@@ -89,6 +108,7 @@ impl Search {
         self.started = None;
         self.due = None;
         self.error = None;
+        self.awaiting_git = false;
         self.clear_rows();
     }
 
@@ -131,8 +151,14 @@ impl FileBrowserView {
         }
     }
 
-    fn walk_options(&self) -> WalkOptions {
-        WalkOptions { show_hidden: self.tree.show_hidden(), show_gitignored: self.tree.show_gitignored() }
+    /// The files the search covers: those the tree lists, git filter
+    /// included.
+    fn walk_options(&mut self) -> WalkOptions {
+        WalkOptions {
+            show_hidden: self.tree.show_hidden(),
+            show_gitignored: self.tree.show_gitignored(),
+            only: self.tree.git_filter_files().map(Arc::new),
+        }
     }
 
     /// After the input changed: search (once typing pauses) or filter.
@@ -162,27 +188,38 @@ impl FileBrowserView {
         if !self.searching() {
             return;
         }
-        let started = (self.search_query(), self.tree.root().to_path_buf(), self.walk_options());
-        if self.search.started.as_ref() == Some(&started) {
+        let walk = self.walk_options();
+        let awaiting_git = self.tree.git_status_awaited();
+        let started = (self.search_query(), self.tree.root().to_path_buf(), walk);
+        if self.search.started.as_ref() == Some(&started) && self.search.awaiting_git == awaiting_git {
             return;
         }
         let s = &mut self.search;
         s.clear_rows();
         s.error = None;
+        s.awaiting_git = awaiting_git;
         let (query, root, walk) = &started;
-        if query.text.is_empty() {
+        if query.text.is_empty() || awaiting_git {
             s.searcher.cancel();
-        } else if let Err(e) = s.searcher.start(root, query, *walk) {
+        } else if let Err(e) = s.searcher.start(root, query, walk.clone()) {
             s.error = Some(e);
         }
         s.started = Some(started);
     }
 
     /// Search again once typing would have paused: the files changed.
-    pub(super) fn rerun_search(&mut self) {
+    pub fn rerun_search(&mut self) {
         if self.searching() {
             self.search.started = None;
             self.search.due = Some(Instant::now() + DEBOUNCE);
+        }
+    }
+
+    /// The tree's git status changed: a search under the git filter covers
+    /// other files now (unless typing is about to search anyway).
+    pub(super) fn git_status_changed(&mut self) {
+        if self.searching() && self.search.due.is_none() {
+            self.run_search();
         }
     }
 
@@ -207,8 +244,8 @@ impl FileBrowserView {
     }
 
     /// The match the last open from the results was for, if it opened a
-    /// matching line: its file, line (from 0), and columns (chars). Spent.
-    pub fn take_match(&mut self) -> Option<(PathBuf, usize, Range<usize>)> {
+    /// matching line. Spent.
+    pub fn take_match(&mut self) -> Option<MatchAt> {
         self.search.pending.take()
     }
 
@@ -225,9 +262,10 @@ impl FileBrowserView {
             }
             None => return,
         };
+        let query = self.search.started.as_ref().map(|(q, ..)| q.clone()).unwrap_or_default();
         self.search.chosen = Some(idx);
-        self.search.pending = at.map(|(line, cols)| (path.clone(), line, cols));
-        self.open_file(cx, path);
+        self.open_file(cx, path.clone());
+        self.search.pending = at.map(|(line, cols)| MatchAt { path, line, cols, query });
     }
 
     /// Search mode's keys: Up/Down move the highlight through the results,
@@ -242,9 +280,15 @@ impl FileBrowserView {
                 self.ensure_hit_visible();
             }
             Key::Enter if !(m.super_ || m.alt || m.ctrl) => {
+                // Typing not yet searched: search now. A changed search has
+                // no results yet, so Enter then opens nothing.
+                let ran = self.search.due.is_some();
+                if ran {
+                    self.run_search();
+                }
                 let n = self.search.rows.len();
                 if n == 0 {
-                    return Some(false);
+                    return Some(ran);
                 }
                 let idx = self.search.sel.unwrap_or(1.min(n - 1));
                 self.open_hit(cx, idx);
@@ -372,17 +416,22 @@ impl FileBrowserView {
                         cx.label(&num, Font::MONO, nx, ty, text_clip, theme::DIM);
                         let tx = (num_x + (digits + 1) as f32 * cw).round();
                         let cols = ((text_clip.x + text_clip.w - tx) / cw).floor().max(0.0) as usize;
-                        let (text, ranges) = fit_line(&f.lines[j].text, f.lines[j].start > 0, &f.lines[j].ranges, cols);
+                        let l = &f.lines[j];
+                        let (text, ranges) = fit_line(&l.text, l.start > 0, l.cut_end, &l.ranges, cols);
+                        let spans = [(text, theme::TEXT)];
+                        cx.row(&spans, tx, ty, list.w, text_clip, theme::TEXT);
+                        // Placed where the shaped row put its glyphs, so wide
+                        // and combining chars line up too.
+                        let key = cx.row_key(spans.iter().map(|(s, c)| (s.as_str(), *c)));
+                        let byte = |col: usize| spans[0].0.char_indices().nth(col).map_or(spans[0].0.len(), |(b, _)| b);
                         for r in ranges {
-                            let pill = Rect {
-                                x: (tx + r.start as f32 * cw).round(),
-                                y: ty.round(),
-                                w: ((r.end - r.start) as f32 * cw).round(),
-                                h: cx.ui.cell_h.round(),
+                            let (Some(x0), Some(x1)) = (cx.row_x(key, byte(r.start)), cx.row_x(key, byte(r.end))) else {
+                                continue;
                             };
+                            let x = (tx + x0).round();
+                            let pill = Rect { x, y: ty.round(), w: (tx + x1).round() - x, h: cx.ui.cell_h.round() };
                             cx.round_rect(pill, theme::box_radius(cx.ui), theme::MATCH_BG, theme::MATCH_ALPHA, None);
                         }
-                        cx.row(&[(text, theme::TEXT)], tx, ty, list.w, text_clip, theme::TEXT);
                     }
                     Hit::More(_) => {
                         cx.label("More matches in this file.", Font::SANS, g.text_x(0), ty, text_clip, theme::DIM);
@@ -408,13 +457,21 @@ impl FileBrowserView {
         if self.search_query().text.is_empty() {
             return Some(("Type to search in files".to_string(), theme::DIM));
         }
+        if s.awaiting_git {
+            return Some(("Loading git status\u{2026}".to_string(), theme::DIM));
+        }
         if s.started.is_none() || s.due.is_some() || !r.done {
             return Some(("Searching\u{2026}".to_string(), theme::DIM));
         }
         if r.files.is_empty() {
             return Some(("No results".to_string(), theme::DIM));
         }
-        r.capped.then(|| (format!("Showing the first {} matches in {} files", r.matches, r.files.len()), theme::DIM))
+        let note = match r.stopped {
+            Stop::No => return None,
+            Stop::Results => format!("Showing the first {} matches in {} files", r.matches, r.files.len()),
+            Stop::Walk => "Stopped early: too many files to search".to_string(),
+        };
+        Some((note, theme::DIM))
     }
 
     /// The results as text (the agent channel): the query, then each file
@@ -440,9 +497,14 @@ impl FileBrowserView {
     }
 
     /// The header's toggles, right to left from `right` in `field`'s row:
-    /// regex, whole word, match case. Returns their left edge.
-    pub(super) fn paint_toggles(&self, cx: &mut PaintCx, field: Rect, right: f32) -> f32 {
+    /// regex, whole word, match case. Returns their left edge: `right` when
+    /// they'd leave the text left of `text_x` too few columns, as they then
+    /// hide.
+    pub(super) fn paint_toggles(&self, cx: &mut PaintCx, field: Rect, text_x: f32, right: f32) -> f32 {
         let w = (cx.ui.cell_w * 3.0).round();
+        if right - w * 3.0 - text_x < MIN_TEXT_COLS * cx.ui.cell_w {
+            return right;
+        }
         let s = &self.search;
         let mut x = right;
         for (id, label, tip, on, underline) in [
@@ -490,8 +552,15 @@ fn toggle_button(cx: &mut PaintCx, r: Rect, id: u32, label: &str, tip: &str, on:
 /// A matching line as it fits `cols` columns, and its match ranges there
 /// (chars): leading indentation dropped (unless `cut`, the text starting
 /// mid-line), tabs as one space, and, when too long, cut to show its first
-/// match with a few chars before it, an ellipsis marking each cut end.
-pub(super) fn fit_line(text: &str, cut: bool, ranges: &[Range<usize>], cols: usize) -> (String, Vec<Range<usize>>) {
+/// match with a few chars before it, an ellipsis marking each cut end
+/// (`cut_end`: the text stops before the line does).
+pub(super) fn fit_line(
+    text: &str,
+    cut: bool,
+    cut_end: bool,
+    ranges: &[Range<usize>],
+    cols: usize,
+) -> (String, Vec<Range<usize>>) {
     let chars: Vec<char> = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let first = ranges.first().cloned().unwrap_or(0..0);
     let lead = match cut {
@@ -510,8 +579,8 @@ pub(super) fn fit_line(text: &str, cut: bool, ranges: &[Range<usize>], cols: usi
         cut_left |= start > 0;
     }
     let room = cols - usize::from(cut_left);
-    let cut_right = body.len() - start > room;
-    let end = if cut_right { start + room - 1 } else { body.len() };
+    let cut_right = cut_end || body.len() - start > room;
+    let end = if cut_right { (start + room - 1).min(body.len()) } else { body.len() };
     let mut out = String::new();
     if cut_left {
         out.push('\u{2026}');
@@ -677,14 +746,17 @@ mod tests {
             })
             .collect();
         assert_eq!(lit.len(), 4, "{lit:?}");
-        // "one Hit": the match at column 4 of row 1, three columns wide.
+        // Placed by the shaped glyphs, at the test font's advance (not
+        // `cell_w`): "one Hit" lights three chars at column 4 of row 1.
+        let (x, y, w) = lit[0];
+        let adv = w / 3.0;
+        let near = |a: f32, b: f32| (a - b).abs() <= 1.5;
         let g = RowGeom::new(UI, Rect { y: header_height(UI), ..RECT });
         let tx = (g.text_x(0) + 2.0 * UI.cell_w).round();
-        let (x, y, w) = lit[0];
-        assert_eq!((x, w), (tx + 4.0 * UI.cell_w, 3.0 * UI.cell_w));
+        assert!(adv > 4.0 && near(x, tx + 4.0 * adv), "{lit:?} at {tx} + n * {adv}");
         assert!(y > g.list.y + g.row_h && y < g.list.y + 2.0 * g.row_h);
         // "  two hit hit" loses its indent: matches at 4 and 8.
-        assert_eq!((lit[1].0, lit[2].0), (tx + 4.0 * UI.cell_w, tx + 8.0 * UI.cell_w));
+        assert!(near(lit[1].0, tx + 4.0 * adv) && near(lit[2].0, tx + 8.0 * adv), "{lit:?}");
     }
 
     #[test]
@@ -696,21 +768,58 @@ mod tests {
         h.paint(&mut v, RECT);
         let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(2), clicks: 1, button: MouseButton::Left });
         assert_eq!(out.requests, [Request::OpenFile(d.join("a.txt"))]);
-        assert_eq!(v.take_match(), Some((d.join("a.txt"), 1, 6..9)));
+        let taken = |v: &mut FileBrowserView| v.take_match().map(|m| (m.path, m.line, m.cols, m.query.text));
+        assert_eq!(taken(&mut v), Some((d.join("a.txt"), 1, 6..9, "hit".to_string())));
         assert_eq!(v.chosen(), Some(d.join("a.txt").as_path()));
         // A file's header opens it with no match to select.
         let out = h.mouse(&mut v, MouseEvent::Down { pos: row_centre(3), clicks: 1, button: MouseButton::Left });
         assert_eq!(out.requests, [Request::OpenFile(d.join("sub").join("b.md"))]);
-        assert_eq!(v.take_match(), None);
+        assert_eq!(taken(&mut v), None);
         // Down moves through the rows; Enter opens the highlighted one.
         h.key(&mut v, press(Key::Down));
         let (used, out) = h.key(&mut v, press(Key::Enter));
         assert!(used);
         assert_eq!(out.requests, [Request::OpenFile(d.join("sub").join("b.md"))]);
-        assert_eq!(v.take_match(), Some((d.join("sub").join("b.md"), 0, 0..3)));
+        assert_eq!(taken(&mut v), Some((d.join("sub").join("b.md"), 0, 0..3, "hit".to_string())));
         // The agent reads the results.
         let text = v.text().unwrap();
         assert!(text.starts_with("?hit\na.txt (3)\n  1: one Hit\n"), "{text}");
+    }
+
+    #[test]
+    fn enter_while_typing_pauses_searches_first() {
+        let (d, mut v) = fixture();
+        let h = Harness::new();
+        type_in(&h, &mut v, "?hitch");
+        let (used, out) = h.key(&mut v, press(Key::Enter));
+        assert!(used && out.requests.is_empty(), "nothing found yet, nothing opened");
+        assert!(v.search.due.is_none() && v.search.started.is_some(), "the search runs at once");
+        settle(&h, &mut v);
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(out.requests, [Request::OpenFile(d.join("sub").join("b.md"))], "then its first match");
+    }
+
+    #[test]
+    fn the_toggles_hide_in_a_narrow_box() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        type_in(&h, &mut v, "?");
+        h.paint(&mut v, Rect { w: 160.0, ..RECT });
+        assert!(!ids(&h).contains(&BTN_MATCH_CASE), "{:?}", ids(&h));
+        h.paint(&mut v, RECT);
+        assert!(ids(&h).contains(&BTN_MATCH_CASE));
+    }
+
+    #[test]
+    fn under_the_git_filter_the_search_waits_for_the_status() {
+        let (_d, mut v) = fixture();
+        let mut h = Harness::new();
+        h.button(&mut v, super::super::BTN_GIT_MODIFIED);
+        type_in(&h, &mut v, "?hit");
+        h.tick(&mut v, Instant::now() + DEBOUNCE * 2);
+        h.paint(&mut v, RECT);
+        assert!(h.texts().iter().any(|t| t == "Loading git status\u{2026}"), "{:?}", h.texts());
+        assert!(v.search.rows.is_empty());
     }
 
     #[test]
@@ -727,20 +836,20 @@ mod tests {
 
     #[test]
     fn a_line_drops_its_indent_and_fits_whole_when_it_can() {
-        let (text, ranges) = fit_line("    let x = 1;", false, &[8..9], 40);
+        let (text, ranges) = fit_line("    let x = 1;", false, false, &[8..9], 40);
         assert_eq!((text.as_str(), ranges), ("let x = 1;", vec![4..5]));
     }
 
     #[test]
     fn a_long_line_ends_in_an_ellipsis_or_is_cut_before_its_match() {
         let line = "the quick brown fox jumps over the lazy dog";
-        let (text, ranges) = fit_line(line, false, &[4..9], 12);
+        let (text, ranges) = fit_line(line, false, false, &[4..9], 12);
         assert_eq!((text.as_str(), ranges), ("the quick b\u{2026}", vec![4..9]));
-        let (text, ranges) = fit_line(line, false, &[35..39, 40..43], 12);
+        let (text, ranges) = fit_line(line, false, false, &[35..39, 40..43], 12);
         assert_eq!(text, "\u{2026}r the lazy\u{2026}");
         assert_eq!(ranges, vec![7..11]);
         // A line the search cut starts with an ellipsis.
-        let (text, ranges) = fit_line("abc", true, &[0..1], 12);
-        assert_eq!((text.as_str(), ranges), ("\u{2026}abc", vec![1..2]));
+        let (text, ranges) = fit_line("abc", true, true, &[0..1], 12);
+        assert_eq!((text.as_str(), ranges), ("\u{2026}abc\u{2026}", vec![1..2]));
     }
 }

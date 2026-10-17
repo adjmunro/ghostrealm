@@ -14,6 +14,8 @@
 
 mod search;
 
+pub use search::MatchAt;
+
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -414,6 +416,8 @@ impl FileBrowserView {
     fn open_file(&mut self, cx: &mut EventCx, path: PathBuf) {
         match self.mode {
             Mode::Sidebar => {
+                // Only a matching line's open leaves a match (set after this).
+                self.search.pending = None;
                 self.chosen = Some(path.clone());
                 self.opens += 1;
                 cx.request(Request::OpenFile(path));
@@ -690,10 +694,10 @@ impl FileBrowserView {
             icon_button(cx, clear, BTN_CLEAR, Icon::Close, "Clear", theme::GLYPH);
             text_right = clear.x;
         }
-        if self.searching() {
-            text_right = self.paint_toggles(cx, field, text_right);
-        }
         let text_x = icon.x + icon.w + pad * 0.5;
+        if self.searching() {
+            text_right = self.paint_toggles(cx, field, text_x, text_right);
+        }
         let text = Rect { x: text_x, w: (text_right - text_x).max(1.0), ..field };
         let hint = self.hint();
         let geom = widgets::field_text(cx, text, value, &hint, cx.focused && typed_into);
@@ -1213,6 +1217,9 @@ impl View for FileBrowserView {
 
     fn refresh(&mut self) -> bool {
         let tree = self.tree.poll();
+        if tree {
+            self.git_status_changed();
+        }
         self.poll_search() || tree
     }
 

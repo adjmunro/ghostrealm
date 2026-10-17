@@ -2,19 +2,22 @@
 //!
 //! A [`SearchQuery`] compiles to one regex (a plain query is escaped). The
 //! [`Searcher`] runs it on a worker thread over the files a walk lists
-//! (respecting `.gitignore` and the hidden/ignored toggles), skipping binary
-//! and large files, and streams one [`FileHits`] per file with a match. Each
+//! (respecting `.gitignore`, the hidden/ignored toggles, and optionally a
+//! set of files such as the git filter's), skipping binary, non-UTF-8, and
+//! large files, and streams one [`FileHits`] per file with a match. Each
 //! search has a generation: starting another stops the walk of the one
 //! before, and its late results are dropped.
 
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexBuilder};
+use regex_syntax::ast::{Ast, ClassSet, ClassSetItem};
 
 use crate::fs_tree::{walk_builder, Waker};
 
@@ -24,8 +27,11 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub const LINES_PER_FILE: usize = 5;
 /// The search stops after this many files with a match...
 pub const MAX_FILES: usize = 500;
-/// ...or this many matches in all.
+/// ...or this many matches in all...
 pub const MAX_MATCHES: usize = 20_000;
+/// ...or after walking this many entries, so a huge tree can't keep it
+/// going.
+pub const MAX_WALK_ENTRIES: usize = 100_000;
 /// A kept line longer than this (chars) is cut to a window this long around
 /// its first match, so a minified file doesn't ship megabyte lines.
 pub const MAX_LINE_CHARS: usize = 400;
@@ -35,6 +41,12 @@ const LINE_LEAD: usize = 80;
 const BINARY_PROBE: usize = 8 * 1024;
 /// The least time between two wakes while results stream in.
 const WAKE_EVERY: Duration = Duration::from_millis(30);
+/// How many lines of a file go by between checks that the search is still
+/// wanted.
+const LINES_PER_CHECK: usize = 256;
+/// How many whole-word rejections one line may take before the rest of it
+/// is given up: each costs a regex search.
+const MAX_REJECTED: usize = 10_000;
 
 /// How letter case counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,27 +63,26 @@ pub enum Case {
 pub struct SearchQuery {
     pub text: String,
     pub case: Case,
-    /// Match only where no word character touches either end.
+    /// Match only where the match's edges are word edges: an end that is a
+    /// word character has no word character beside it (so `foo(` matches in
+    /// `foo(x)`).
     pub whole_word: bool,
     /// `text` is a regular expression; otherwise it is literal.
     pub regex: bool,
 }
 
 impl SearchQuery {
-    /// Whether matching is case-sensitive. Smart case looks past escapes in
-    /// a regex, so `\W` or `\S` doesn't make it sensitive.
+    /// Whether matching is case-sensitive. Smart case counts the uppercase
+    /// letters the query matches literally: in a regex, not those of an
+    /// escape or class name (`\W`, `\p{Lu}`), as ripgrep does.
     pub fn case_sensitive(&self) -> bool {
         match self.case {
             Case::Sensitive => true,
             Case::Insensitive => false,
-            Case::Smart => {
-                let mut escaped = false;
-                self.text.chars().any(|c| {
-                    let upper = c.is_uppercase() && !(self.regex && escaped);
-                    escaped = self.regex && c == '\\' && !escaped;
-                    upper
-                })
+            Case::Smart if self.regex => {
+                regex_syntax::ast::parse::Parser::new().parse(&self.text).is_ok_and(|ast| has_upper(&ast))
             }
+            Case::Smart => self.text.chars().any(char::is_uppercase),
         }
     }
 
@@ -83,6 +94,36 @@ impl SearchQuery {
             .build()
             .map_err(|e| regex_error(&e))?;
         Ok(Matcher { re, whole_word: self.whole_word })
+    }
+}
+
+/// Whether `ast` matches an uppercase letter literally.
+fn has_upper(ast: &Ast) -> bool {
+    match ast {
+        Ast::Literal(l) => l.c.is_uppercase(),
+        Ast::ClassBracketed(c) => set_has_upper(&c.kind),
+        Ast::Repetition(r) => has_upper(&r.ast),
+        Ast::Group(g) => has_upper(&g.ast),
+        Ast::Alternation(a) => a.asts.iter().any(has_upper),
+        Ast::Concat(c) => c.asts.iter().any(has_upper),
+        _ => false,
+    }
+}
+
+fn set_has_upper(set: &ClassSet) -> bool {
+    match set {
+        ClassSet::Item(item) => item_has_upper(item),
+        ClassSet::BinaryOp(op) => set_has_upper(&op.lhs) || set_has_upper(&op.rhs),
+    }
+}
+
+fn item_has_upper(item: &ClassSetItem) -> bool {
+    match item {
+        ClassSetItem::Literal(l) => l.c.is_uppercase(),
+        ClassSetItem::Range(r) => r.start.c.is_uppercase() || r.end.c.is_uppercase(),
+        ClassSetItem::Bracketed(c) => set_has_upper(&c.kind),
+        ClassSetItem::Union(u) => u.items.iter().any(item_has_upper),
+        _ => false,
     }
 }
 
@@ -102,27 +143,53 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    /// The matches in `line`, as byte ranges, left to right, none empty and
-    /// none overlapping. Whole-word matching retries one char further on
-    /// after a match a word character touches, so an overlapping match that
-    /// stands alone is still found.
+    /// The matches in `line`, as byte ranges: see [`Matches`].
+    pub fn matches<'a>(&'a self, line: &'a str) -> Matches<'a> {
+        Matches { matcher: self, line, at: 0, rejected: 0 }
+    }
+
+    /// Every match in `line`, collected.
     pub fn find_iter(&self, line: &str) -> Vec<Range<usize>> {
-        let mut out = Vec::new();
-        let mut at = 0;
-        while at <= line.len() {
-            let Some(m) = self.re.find_at(line, at) else { break };
+        self.matches(line).collect()
+    }
+}
+
+/// A line's matches as byte ranges, left to right, none empty and none
+/// overlapping. A whole-word match a word character touches is skipped,
+/// and the search goes on past the word it starts in (any match starting
+/// inside that word fails the same way); after [`MAX_REJECTED`] of those
+/// the line has no more matches.
+pub struct Matches<'a> {
+    matcher: &'a Matcher,
+    line: &'a str,
+    at: usize,
+    rejected: usize,
+}
+
+impl Iterator for Matches<'_> {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        let line = self.line;
+        while self.at <= line.len() {
+            let m = self.matcher.re.find_at(line, self.at)?;
             if m.is_empty() {
-                at = next_char(line, m.start());
+                self.at = next_char(line, m.start());
                 continue;
             }
-            if self.whole_word && !stands_alone(line, m.range()) {
-                at = next_char(line, m.start());
+            if self.matcher.whole_word && !whole_word(line, m.range()) {
+                self.rejected += 1;
+                if self.rejected > MAX_REJECTED {
+                    self.at = line.len() + 1;
+                    return None;
+                }
+                self.at = past_word(line, m.start());
                 continue;
             }
-            out.push(m.range());
-            at = m.end();
+            self.at = m.end();
+            return Some(m.range());
         }
-        out
+        None
     }
 }
 
@@ -131,15 +198,30 @@ fn next_char(s: &str, i: usize) -> usize {
     s[i..].chars().next().map_or(i + 1, |c| i + c.len_utf8())
 }
 
+/// The byte index after the run of word characters starting at `i`, or
+/// after the char there when it isn't one.
+fn past_word(s: &str, i: usize) -> usize {
+    let run: usize = s[i..].chars().take_while(|c| is_word(*c)).map(char::len_utf8).sum();
+    if run == 0 {
+        next_char(s, i)
+    } else {
+        i + run
+    }
+}
+
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Whether no word character sits right before or right after `r` in `s`.
-fn stands_alone(s: &str, r: Range<usize>) -> bool {
+/// Whether `r` in `s` is whole words: each end that is a word character
+/// has no word character beside it.
+fn whole_word(s: &str, r: Range<usize>) -> bool {
+    let m = &s[r.clone()];
+    let first = m.chars().next().is_some_and(is_word);
+    let last = m.chars().next_back().is_some_and(is_word);
     let before = s[..r.start].chars().next_back().is_some_and(is_word);
     let after = s[r.end..].chars().next().is_some_and(is_word);
-    !before && !after
+    !(first && before) && !(last && after)
 }
 
 /// A matching line as kept.
@@ -150,6 +232,8 @@ pub struct LineHit {
     /// The column (chars) in the line that `text` starts at: 0 unless the
     /// line was cut ([`MAX_LINE_CHARS`]).
     pub start: usize,
+    /// The line goes on past `text` (it was cut).
+    pub cut_end: bool,
     /// The line, or the window of it kept, without its line ending.
     pub text: String,
     /// The matches in `text`, as char ranges.
@@ -175,11 +259,25 @@ impl FileHits {
     }
 }
 
-/// Which entries the walk lists, as the sidebar's toggles say.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Which files the walk searches, as the sidebar lists them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WalkOptions {
     pub show_hidden: bool,
     pub show_gitignored: bool,
+    /// Only these files (the git filter's), when given.
+    pub only: Option<Arc<BTreeSet<PathBuf>>>,
+}
+
+/// Why a search ended before the walk did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stop {
+    /// It didn't.
+    #[default]
+    No,
+    /// At [`MAX_FILES`] or [`MAX_MATCHES`].
+    Results,
+    /// At [`MAX_WALK_ENTRIES`].
+    Walk,
 }
 
 /// What the current search has found so far.
@@ -190,13 +288,12 @@ pub struct SearchResults {
     pub matches: usize,
     /// The walk finished (or stopped at a cap).
     pub done: bool,
-    /// It stopped at [`MAX_FILES`] or [`MAX_MATCHES`].
-    pub capped: bool,
+    pub stopped: Stop,
 }
 
 enum Event {
     Hits(FileHits),
-    Done { capped: bool },
+    Done(Stop),
 }
 
 /// The worker's ends: jobs in, events (tagged with their search's
@@ -270,9 +367,9 @@ impl Searcher {
                     self.results.matches += hits.total;
                     self.results.files.push(hits);
                 }
-                Event::Done { capped } => {
+                Event::Done(stopped) => {
                     self.results.done = true;
-                    self.results.capped = capped;
+                    self.results.stopped = stopped;
                 }
             }
         }
@@ -310,98 +407,195 @@ fn spawn(waker: Option<Waker>, live: Arc<AtomicU64>) -> Worker {
     (jobs, events)
 }
 
+/// Paces the wakes while results stream in: the first result wakes at
+/// once, later ones at most every [`WAKE_EVERY`], and one held back wakes
+/// once that has passed even if no other result follows.
+#[derive(Default)]
+struct Throttle {
+    last: Option<Instant>,
+    /// A result was sent since the last wake.
+    pending: bool,
+}
+
+impl Throttle {
+    /// A result was sent at `now`: whether to wake.
+    fn sent(&mut self, now: Instant) -> bool {
+        self.pending = true;
+        self.due(now)
+    }
+
+    /// Whether a result held back should wake now.
+    fn due(&mut self, now: Instant) -> bool {
+        let wake = self.pending && self.last.is_none_or(|t| now.duration_since(t) >= WAKE_EVERY);
+        if wake {
+            self.last = Some(now);
+            self.pending = false;
+        }
+        wake
+    }
+}
+
 /// Walk `job.root`, sending each file's hits, then `Done` unless a newer
 /// search took over. Errs once the searcher is gone.
 fn run(job: &Job, live: &AtomicU64, out: &Sender<(u64, Event)>, waker: Option<&Waker>) -> Result<(), ()> {
     let current = || live.load(Ordering::SeqCst) == job.generation;
-    let mut woke = Instant::now();
-    let wake = |force: bool, woke: &mut Instant| {
-        if let Some(w) = waker.filter(|_| force || woke.elapsed() >= WAKE_EVERY) {
+    let wake = || {
+        if let Some(w) = waker {
             w();
-            *woke = Instant::now();
         }
     };
+    let mut throttle = Throttle::default();
     let mut walk = walk_builder(&job.root, job.walk.show_hidden, job.walk.show_gitignored);
     // A folder's files before its subfolders, so the files nearest the root
-    // come first; each by name, ignoring case.
-    walk.sort_by_file_path(|a, b| {
-        a.is_dir().cmp(&b.is_dir()).then_with(|| {
-            let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-            name(a).cmp(&name(b))
-        })
+    // come first; each by name, ignoring case. The sort sees only paths, so
+    // each entry's kind and key are looked up once and kept.
+    let keys: Mutex<HashMap<PathBuf, (bool, String)>> = Mutex::default();
+    walk.sort_by_file_path(move |a, b| {
+        let mut keys = keys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = |p: &Path| {
+            if let Some(k) = keys.get(p) {
+                return k.clone();
+            }
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let k = (p.is_dir(), name);
+            keys.insert(p.to_path_buf(), k.clone());
+            k
+        };
+        key(a).cmp(&key(b))
     });
-    let (mut files, mut matches, mut capped) = (0, 0, false);
+    let (mut files, mut matches, mut seen) = (0, 0, 0);
+    let mut stopped = Stop::No;
     for entry in walk.build().flatten() {
         if !current() {
             return Ok(());
         }
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
+        if throttle.due(Instant::now()) {
+            wake();
+        }
+        seen += 1;
+        if seen > MAX_WALK_ENTRIES {
+            stopped = Stop::Walk;
+            break;
+        }
+        // Links to files are searched; links to folders aren't followed (the
+        // walk doesn't), so a link can't loop.
+        let is_file = match entry.file_type() {
+            Some(t) if t.is_symlink() => entry.path().is_file(),
+            Some(t) => t.is_file(),
+            None => false,
+        };
+        if !is_file || job.walk.only.as_ref().is_some_and(|only| !only.contains(entry.path())) {
             continue;
         }
-        let Some(hits) = search_file(entry.path(), &job.matcher) else { continue };
+        let hits = match search_file(entry.path(), &job.matcher, &current) {
+            Searched::Hits(hits) => hits,
+            Searched::Nothing => continue,
+            Searched::Stopped => return Ok(()),
+        };
         files += 1;
         matches += hits.total;
         out.send((job.generation, Event::Hits(hits))).map_err(|_| ())?;
-        wake(false, &mut woke);
+        if throttle.sent(Instant::now()) {
+            wake();
+        }
         if files >= MAX_FILES || matches >= MAX_MATCHES {
-            capped = true;
+            stopped = Stop::Results;
             break;
         }
     }
     if current() {
-        out.send((job.generation, Event::Done { capped })).map_err(|_| ())?;
-        wake(true, &mut woke);
+        out.send((job.generation, Event::Done(stopped))).map_err(|_| ())?;
+        wake();
     }
     Ok(())
 }
 
-/// `path`'s matches, or `None` for a file with none, a binary or large
-/// one, or one that can't be read.
-fn search_file(path: &Path, matcher: &Matcher) -> Option<FileHits> {
-    if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() as u64 > MAX_FILE_BYTES || bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut hits = FileHits { path: path.to_path_buf(), total: 0, total_lines: 0, lines: Vec::new() };
-    for (n, line) in text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let found = matcher.find_iter(line);
-        if found.is_empty() {
-            continue;
-        }
-        hits.total += found.len();
-        hits.total_lines += 1;
-        if hits.lines.len() < LINES_PER_FILE {
-            hits.lines.push(line_hit(n, line, &found));
-        }
-    }
-    (hits.total > 0).then_some(hits)
+/// What searching one file found.
+enum Searched {
+    Hits(FileHits),
+    /// No match, or a file not searched (binary, not UTF-8, large, unreadable).
+    Nothing,
+    /// A newer search took over partway.
+    Stopped,
 }
 
-/// Line `n` (`line`) with its byte-range matches `found`, as kept: char
-/// ranges, and a long line cut to a window from a little before its first
-/// match.
-fn line_hit(n: usize, line: &str, found: &[Range<usize>]) -> LineHit {
-    let col = |b: usize| line[..b].chars().count();
-    let chars = line.chars().count();
-    let first = col(found[0].start);
-    let start = match chars > MAX_LINE_CHARS {
-        true => first.saturating_sub(LINE_LEAD).min(chars - MAX_LINE_CHARS),
-        false => 0,
+/// Search `path`, checking every [`LINES_PER_CHECK`] lines that the search
+/// is still `current`.
+fn search_file(path: &Path, matcher: &Matcher, current: &dyn Fn() -> bool) -> Searched {
+    let Ok(meta) = std::fs::metadata(path) else { return Searched::Nothing };
+    if meta.len() > MAX_FILE_BYTES {
+        return Searched::Nothing;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return Searched::Nothing };
+    if bytes.len() as u64 > MAX_FILE_BYTES || bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) {
+        return Searched::Nothing;
+    }
+    // The editor opens only UTF-8, so a match elsewhere couldn't be shown.
+    let Ok(text) = String::from_utf8(bytes) else { return Searched::Nothing };
+    let mut hits = FileHits { path: path.to_path_buf(), total: 0, total_lines: 0, lines: Vec::new() };
+    for (n, line) in text.split('\n').enumerate() {
+        if n % LINES_PER_CHECK == 0 && !current() {
+            return Searched::Stopped;
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut found = matcher.matches(line);
+        let Some(first) = found.next() else { continue };
+        hits.total_lines += 1;
+        if hits.lines.len() < LINES_PER_FILE {
+            let (hit, count) = line_hit(n, line, first, &mut found);
+            hits.lines.push(hit);
+            hits.total += count;
+        } else {
+            hits.total += 1 + found.count();
+        }
+    }
+    match hits.total {
+        0 => Searched::Nothing,
+        _ => Searched::Hits(hits),
+    }
+}
+
+/// Line `n` (`line`) as kept, from its first match `first` and the rest
+/// `found` (byte ranges, in order), with how many matches it has: a long
+/// line is cut to a window from a little before its first match, and only
+/// the matches in the window are kept, as char ranges. One pass over the
+/// line: each range's columns count on from the last one's.
+fn line_hit(n: usize, line: &str, first: Range<usize>, found: &mut dyn Iterator<Item = Range<usize>>) -> (LineHit, usize) {
+    let (start, end, cut_end, start_col) = if line.len() <= MAX_LINE_CHARS {
+        (0, line.len(), false, 0)
+    } else {
+        let chars = line.chars().count();
+        let first_col = line[..first.start].chars().count();
+        let start = match chars > MAX_LINE_CHARS {
+            true => first_col.saturating_sub(LINE_LEAD).min(chars - MAX_LINE_CHARS),
+            false => 0,
+        };
+        let mut bytes = line.char_indices().map(|(b, _)| b).skip(start);
+        let start_b = bytes.next().unwrap_or(line.len());
+        let end_b = bytes.nth(MAX_LINE_CHARS - 1).unwrap_or(line.len());
+        (start_b, end_b, end_b < line.len(), start)
     };
-    let end = (start + MAX_LINE_CHARS).min(chars);
-    let text: String = line.chars().skip(start).take(end - start).collect();
-    let ranges = found
-        .iter()
-        .map(|r| col(r.start)..col(r.end))
-        .filter(|r| r.start < end && r.end > start)
-        .map(|r| r.start.max(start) - start..r.end.min(end) - start)
-        .collect();
-    LineHit { line: n, start, text, ranges }
+    let window = &line[start..end];
+    // The byte (in `window`) and column a range's columns count on from.
+    let (mut at, mut col) = (0, 0);
+    let mut col_of = |b: usize| {
+        col += window[at..b].chars().count();
+        at = b;
+        col
+    };
+    let mut ranges = Vec::new();
+    let mut count = 0;
+    for r in std::iter::once(first).chain(found) {
+        count += 1;
+        if r.start >= end || r.end <= start {
+            continue;
+        }
+        let (s, e) = (r.start.max(start) - start, r.end.min(end) - start);
+        let s = col_of(s);
+        ranges.push(s..col_of(e));
+    }
+    let hit = LineHit { line: n, start: start_col, cut_end, text: window.to_string(), ranges };
+    (hit, count)
 }
 
 #[cfg(test)]
@@ -460,6 +654,11 @@ mod tests {
         assert_eq!(found(&regex, " FOO"), [" FOO"]);
         let escaped_slash = SearchQuery { regex: true, ..query(r"\\Foo") };
         assert!(escaped_slash.case_sensitive(), "after an escaped backslash a letter counts");
+        for (pattern, sensitive) in [(r"\p{Lu}x", false), (r"[A-Z]x", true), (r"(?:a|B)", true)] {
+            let q = SearchQuery { regex: true, ..query(pattern) };
+            assert_eq!(q.case_sensitive(), sensitive, "{pattern}");
+        }
+        assert!(query(r"\W").case_sensitive(), "a plain query's every uppercase letter counts");
     }
 
     #[test]
@@ -471,15 +670,24 @@ mod tests {
     }
 
     #[test]
-    fn whole_word_needs_no_word_character_either_side() {
+    fn whole_word_needs_word_edges_where_the_match_has_word_ends() {
         let q = SearchQuery { whole_word: true, ..query("ab") };
         assert_eq!(found(&q, "ab abc cab ab_ (ab) ab"), ["ab", "ab", "ab"]);
         // A query ending in a non-word char still matches.
         let q = SearchQuery { whole_word: true, ..query("a.") };
         assert_eq!(found(&q, "a. ba."), ["a."]);
-        // A rejected match doesn't hide an overlapping one that stands alone.
+        // A non-word end needs no edge beside it.
         let q = SearchQuery { whole_word: true, regex: true, ..query("-?x") };
-        assert_eq!(found(&q, "a-x"), ["x"]);
+        assert_eq!(found(&q, "a-x"), ["-x"]);
+        let q = SearchQuery { whole_word: true, ..query("foo(") };
+        assert_eq!(found(&q, "foo(x) afoo(y)"), ["foo("]);
+        // After a match inside a word is rejected, the search goes on past
+        // the word, so a long run of rejections stays linear.
+        let q = SearchQuery { whole_word: true, regex: true, ..query(r"a\w*") };
+        let line = format!("{} a", "ba".repeat(100_000));
+        let at = Instant::now();
+        assert_eq!(found(&q, &line), ["a"]);
+        assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
     }
 
     #[test]
@@ -511,23 +719,41 @@ mod tests {
         assert_eq!(names(&r, &d), ["a.txt"]);
         let f = &r.files[0];
         assert_eq!((f.total, f.total_lines, f.lines.len(), f.more()), (16, 8, LINES_PER_FILE, true));
-        assert_eq!(f.lines[1], LineHit { line: 1, start: 0, text: "é1 hit hit".into(), ranges: vec![3..6, 7..10] });
+        let want = LineHit { line: 1, start: 0, cut_end: false, text: "é1 hit hit".into(), ranges: vec![3..6, 7..10] };
+        assert_eq!(f.lines[1], want);
         assert_eq!(r.matches, 16);
-        assert!(!r.capped);
+        assert_eq!(r.stopped, Stop::No);
     }
 
     #[test]
     fn a_long_line_is_cut_around_its_first_match() {
         let line = format!("{}needle{}", "x".repeat(1000), "y".repeat(1000));
-        let found = [Range { start: 1000, end: 1006 }];
-        let hit = line_hit(3, &line, &found);
-        assert_eq!(hit.start, 1000 - LINE_LEAD);
+        let (hit, count) = line_hit(3, &line, 1000..1006, &mut std::iter::empty());
+        assert_eq!((hit.start, hit.cut_end, count), (1000 - LINE_LEAD, true, 1));
         assert_eq!(hit.text.chars().count(), MAX_LINE_CHARS);
         assert_eq!(hit.ranges, [Range { start: LINE_LEAD, end: LINE_LEAD + 6 }]);
+        // Near its end, the window ends with the line.
+        let (hit, _) = line_hit(0, &line, 1990..1992, &mut std::iter::empty());
+        assert!(!hit.cut_end && hit.text.ends_with("yy"));
     }
 
     #[test]
-    fn the_walk_respects_gitignore_and_the_hidden_toggle_and_orders_files_first() {
+    fn a_megabyte_line_of_matches_is_quick() {
+        let d = tmpdir();
+        let line = "é a".repeat(MAX_FILE_BYTES as usize / 5);
+        fs::write(d.join("min.js"), &line).unwrap();
+        let at = Instant::now();
+        let r = search(&d, &query("a"), WalkOptions::default());
+        // Tolerant: a debug build on a busy machine, not a benchmark.
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+        let hit = &r.files[0].lines[0];
+        assert_eq!(r.files[0].total, MAX_FILE_BYTES as usize / 5);
+        assert!(hit.cut_end && hit.ranges.len() <= MAX_LINE_CHARS);
+        assert_eq!(hit.ranges[0], Range { start: 2, end: 3 });
+    }
+
+    #[test]
+    fn the_walk_respects_gitignore_the_toggles_and_a_file_set_and_orders_files_first() {
         let d = tmpdir();
         fs::create_dir(d.join(".git")).unwrap();
         fs::write(d.join(".gitignore"), "ignored.txt\n").unwrap();
@@ -539,15 +765,30 @@ mod tests {
         fs::write(d.join("Z.txt"), "hit").unwrap();
         let r = search(&d, &query("hit"), WalkOptions::default());
         assert_eq!(names(&r, &d), ["b.txt", "Z.txt", "A/x.txt"]);
-        let all = WalkOptions { show_hidden: true, show_gitignored: true };
+        let all = WalkOptions { show_hidden: true, show_gitignored: true, only: None };
         let r = search(&d, &query("hit"), all);
         assert_eq!(names(&r, &d), [".hidden", "b.txt", "ignored.txt", "Z.txt", "A/x.txt"]);
+        let only = Some(Arc::new(BTreeSet::from([d.join("Z.txt"), d.join("A").join("x.txt")])));
+        let r = search(&d, &query("hit"), WalkOptions { only, ..WalkOptions::default() });
+        assert_eq!(names(&r, &d), ["Z.txt", "A/x.txt"]);
     }
 
     #[test]
-    fn binary_and_large_files_are_skipped() {
+    fn links_to_files_are_searched_and_links_to_folders_are_not_followed() {
+        let d = tmpdir();
+        fs::create_dir(d.join("real")).unwrap();
+        fs::write(d.join("real").join("f.txt"), "hit").unwrap();
+        std::os::unix::fs::symlink(d.join("real").join("f.txt"), d.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&d, d.join("real").join("loop")).unwrap();
+        let r = search(&d, &query("hit"), WalkOptions::default());
+        assert_eq!(names(&r, &d), ["link.txt", "real/f.txt"]);
+    }
+
+    #[test]
+    fn binary_non_utf8_and_large_files_are_skipped() {
         let d = tmpdir();
         fs::write(d.join("bin"), b"hit\0hit").unwrap();
+        fs::write(d.join("latin1.txt"), b"hit \xe9").unwrap();
         let mut big = "hit\n".repeat(10).into_bytes();
         big.resize(MAX_FILE_BYTES as usize + 1, b'x');
         fs::write(d.join("big.txt"), big).unwrap();
@@ -564,7 +805,8 @@ mod tests {
         }
         let r = search(&d, &query("hit"), WalkOptions::default());
         assert_eq!(r.files.len(), MAX_FILES);
-        assert!(r.capped && r.done);
+        assert!(r.done);
+        assert_eq!(r.stopped, Stop::Results);
     }
 
     #[test]
@@ -586,6 +828,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         s.poll();
         assert!(s.results().files.is_empty() && !s.results().done);
+    }
+
+    #[test]
+    fn a_result_held_back_wakes_once_the_pause_has_passed() {
+        let t0 = Instant::now();
+        let mut t = Throttle::default();
+        assert!(t.sent(t0), "the first result wakes at once");
+        assert!(!t.sent(t0 + Duration::from_millis(5)), "the next is held back");
+        assert!(!t.due(t0 + Duration::from_millis(20)), "still within the pause");
+        assert!(t.due(t0 + WAKE_EVERY), "a slow tail still wakes for it");
+        assert!(!t.due(t0 + WAKE_EVERY * 3), "nothing left to wake for");
     }
 
     #[test]

@@ -1198,6 +1198,7 @@ version = "0.0.0"
 dependencies = [
  "ignore",
  "regex",
+ "regex-syntax",
  "serde",
  "toml",
 ]

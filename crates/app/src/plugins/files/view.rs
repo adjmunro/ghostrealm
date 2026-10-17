@@ -70,6 +70,9 @@ struct DocTab {
     /// next one replaces it. Editing it, or a double click on it or its
     /// file, keeps it.
     ephemeral: bool,
+    /// Whether it had unsaved changes when last looked at: once it hasn't,
+    /// it was saved (or reloaded), and a search's results may be stale.
+    was_modified: bool,
 }
 
 /// Where the last paint put things.
@@ -172,7 +175,8 @@ impl FilesView {
         let id = DocId(self.next_id);
         self.next_id += 1;
         let before = self.keys();
-        let tab = DocTab { id, view, ephemeral: preview };
+        let was_modified = view.modified();
+        let tab = DocTab { id, view, ephemeral: preview, was_modified };
         let at = match self.docs.iter().position(|t| t.ephemeral).filter(|_| preview) {
             Some(i) => {
                 self.docs[i] = tab;
@@ -278,23 +282,43 @@ impl FilesView {
     }
 
     /// After an open: when the sidebar's search opened the shown file at a
-    /// match, select the match there. Spent either way.
+    /// match, select the match there. Spent either way. A document with
+    /// unsaved edits may differ from the file searched: the match is found
+    /// again on its line, else the caret goes to the line's start.
     fn select_match(&mut self) {
-        let Some((path, line, cols)) = self.sidebar.take_match() else { return };
+        let Some(m) = self.sidebar.take_match() else { return };
         let Some(t) = self.docs.get_mut(self.active) else { return };
-        if t.view.path().is_some_and(|p| same_file(&p, &path)) {
-            if let Some(editor) = t.view.downcast_mut::<EditorView>() {
-                editor.reveal(line, cols);
-            }
+        if !t.view.path().is_some_and(|p| same_file(&p, &m.path)) {
+            return;
         }
+        let Some(editor) = t.view.downcast_mut::<EditorView>() else { return };
+        let buf = editor.buffer();
+        let cols = match buf.modified {
+            false => m.cols,
+            true => {
+                let text = buf.lines.get(m.line).map_or("", String::as_str);
+                let found = m.query.matcher().ok().and_then(|q| q.find_iter(text).into_iter().next());
+                let col = |b: usize| text[..b].chars().count();
+                found.map_or(0..0, |r| col(r.start)..col(r.end))
+            }
+        };
+        editor.reveal(m.line, cols);
     }
 
-    /// Keep every preview tab whose document has been edited.
+    /// Keep every preview tab whose document has been edited, and search
+    /// the sidebar's results again once a document saves.
     fn settle(&mut self) {
+        let mut saved = false;
         for t in &mut self.docs {
-            if t.ephemeral && t.view.modified() {
+            let modified = t.view.modified();
+            if t.ephemeral && modified {
                 t.ephemeral = false;
             }
+            saved |= t.was_modified && !modified;
+            t.was_modified = modified;
+        }
+        if saved {
+            self.sidebar.rerun_search();
         }
     }
 
@@ -673,7 +697,10 @@ impl View for FilesView {
 
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
         let part = self.part_with_keys();
+        // Like the click, a match left by an open that never showed is
+        // stale once anything else happens.
         self.clicked = None;
+        self.sidebar.take_match();
         let used = self.on_part(cx, part, |v, cx| v.key(cx, k)).unwrap_or(false);
         self.settle();
         used
@@ -683,6 +710,7 @@ impl View for FilesView {
         match *event {
             MouseEvent::Down { pos, clicks, button } => {
                 self.clicked = None;
+                self.sidebar.take_match();
                 if let Some(id) = self.tabs.tab_at(pos) {
                     if button != MouseButton::Right {
                         self.press = Some(Press::Tab(id, button));
@@ -1371,6 +1399,50 @@ mod tests {
         assert!(v.show_path(&d.join("a.md")));
         assert!(!v.is_preview(a));
         assert_eq!(buffer(&v), Some(((1, 5), (1, 9))));
+        // Unsaved edits: the match is found again on its line...
+        let edit = |v: &mut FilesView, line: &str| {
+            let b = v.doc_mut(a).and_then(|d| d.downcast_mut::<EditorView>()).unwrap().buffer_mut();
+            b.select_line_at(1);
+            b.insert_str(line);
+        };
+        edit(&mut v, "xx body line");
+        h.mouse(&mut v, down(sidebar_row(1)));
+        assert!(v.show_path(&d.join("a.md")));
+        assert_eq!(buffer(&v), Some(((1, 8), (1, 12))));
+        // ...else the caret goes to the line's start.
+        edit(&mut v, "gone");
+        h.mouse(&mut v, down(sidebar_row(1)));
+        assert!(v.show_path(&d.join("a.md")));
+        assert_eq!((buffer(&v), v.doc_view().and_then(|d| d.downcast_ref::<EditorView>()).unwrap().buffer().cursor), (None, (1, 0)));
+        // Saving searches again.
+        v.doc_mut(a).and_then(|d| d.downcast_mut::<EditorView>()).unwrap().buffer_mut().save().unwrap();
+        assert!(v.sidebar().deadline(&h.cfg).is_none());
+        h.paint(&mut v, RECT);
+        assert!(v.sidebar().deadline(&h.cfg).is_some(), "the search is due again");
+    }
+
+    #[test]
+    fn a_match_whose_open_never_showed_is_dropped_by_the_next_event() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        for c in "?line".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        while v.text().unwrap().contains("Searching") {
+            assert!(Instant::now() < until, "the search finishes");
+            h.tick(&mut v, Instant::now() + std::time::Duration::from_secs(1));
+            v.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, down(sidebar_row(1)));
+        // The open failed: nothing showed. A key later, a palette open of
+        // the file selects nothing.
+        h.key(&mut v, press(Key::Down));
+        v.show_doc(editor(&d.join("a.md")));
+        let ed = v.doc_view().and_then(|d| d.downcast_ref::<EditorView>()).unwrap();
+        assert_eq!((ed.buffer().selection(), ed.buffer().cursor), (None, (0, 0)));
     }
 
     #[test]
