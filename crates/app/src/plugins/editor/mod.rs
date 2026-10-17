@@ -73,6 +73,9 @@ const BTN_SHOW_STAT: u32 = 16;
 /// The copy button of the code block opening on line `ln` is
 /// `BTN_COPY_BLOCK + ln`: tied to the block, not to where it is on screen.
 const BTN_COPY_BLOCK: u32 = 256;
+/// A Preview's links take the ids from [`md_preview::BTN_LINK`] up, past
+/// every copy button's.
+use md_preview::BTN_LINK;
 /// How long a code block's copy button shows a check mark after a copy.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
 const _: () = assert!(
@@ -90,6 +93,7 @@ const _: () = assert!(
     BTN_COPY_BLOCK >= BTN_SHOW_STAT + Stat::ALL.len() as u32,
     "the copy buttons' ids must not collide with a statistic item's"
 );
+const _: () = assert!(BTN_LINK > BTN_COPY_BLOCK, "a copy button's id is its block's line past BTN_COPY_BLOCK");
 /// The idle-autosave delay (seconds) when autosave is switched on in the header
 /// but `[editor] autosave_after` is 0.
 const AUTOSAVE_AFTER_DEFAULT: u32 = 15;
@@ -128,10 +132,12 @@ impl ViewMode {
     }
 }
 
-/// The modes a file highlighted by `h` offers, in cycling order. Integrated
-/// needs a highlighter to format by; without one there is only the source.
+/// The modes a file highlighted by `h` offers, in cycling order: Preview
+/// for Markdown, which has a renderer; Integrated needs a highlighter to
+/// format by; without one there is only the source.
 fn modes_for(h: Option<&dyn Highlighter>) -> &'static [ViewMode] {
     match h {
+        Some(h) if h.name() == "markdown" => &ViewMode::ALL,
         Some(_) => &[ViewMode::Integrated, ViewMode::Source],
         None => &[ViewMode::Source],
     }
@@ -366,6 +372,8 @@ pub struct EditorView {
     /// The view mode chosen for this document; `None` (or one its language
     /// doesn't offer, after a Save As) shows the language's default.
     mode: Option<ViewMode>,
+    /// The rendered document, in Preview.
+    preview: md_preview::Preview,
 }
 
 /// A fenced code block on screen.
@@ -385,7 +393,7 @@ impl EditorView {
     /// Like [`Self::new`], waking the UI with `waker` when background work
     /// (the header's statistic) finishes.
     pub fn with_waker(buf: EditorBuffer, waker: Option<Waker>) -> Self {
-        let mut stats = Stats::new(waker);
+        let mut stats = Stats::new(waker.clone());
         stats.fetch_head(buf.path.clone());
         EditorView {
             hl_states: StateCache::default(),
@@ -397,6 +405,7 @@ impl EditorView {
             goal_x: None,
             center_caret: false,
             mode: None,
+            preview: md_preview::Preview::new(waker),
             stats,
             seen_edits: buf.edits,
             buf,
@@ -449,6 +458,10 @@ impl EditorView {
     /// text, with the caret at the end, and scroll the line to the middle of
     /// the view at the next paint (a search result opened at its match).
     pub fn reveal(&mut self, line: usize, cols: std::ops::Range<usize>) {
+        // A selection shows only in the source.
+        if self.view_mode() == ViewMode::Preview {
+            self.mode = Some(ViewMode::Integrated);
+        }
         let line = line.min(self.buf.lines.len() - 1);
         let len = self.buf.line_len(line);
         let (start, end) = (cols.start.min(len), cols.end.min(len));
@@ -474,11 +487,23 @@ impl EditorView {
         }
     }
 
-    /// Show the document in `mode`, if its language offers it.
+    /// Show the document in `mode`, if its language offers it, keeping the
+    /// source line at the top of the view at the top of the new one.
     pub fn set_view_mode(&mut self, mode: ViewMode) {
-        if self.view_modes().contains(&mode) {
-            self.mode = Some(mode);
+        if !self.view_modes().contains(&mode) {
+            return;
         }
+        match (self.view_mode(), mode) {
+            (from, to) if from == to => {}
+            (ViewMode::Preview, _) => {
+                if let Some(line) = self.preview.top_line() {
+                    self.buf.scroll = line.min(self.buf.lines.len().saturating_sub(1));
+                }
+            }
+            (_, ViewMode::Preview) => self.preview.show_line(self.buf.scroll),
+            _ => {}
+        }
+        self.mode = Some(mode);
     }
 
     /// Show the document in the next mode it offers (from the last, the
@@ -1176,6 +1201,19 @@ impl View for EditorView {
             body = Rect { y: rect.y + header_h, h: (rect.h - header_h).max(1.0), ..rect };
         }
 
+        if self.view_mode() == ViewMode::Preview {
+            self.dismiss_popup();
+            self.code_blocks.clear();
+            self.hover_block = None;
+            self.layout.body = body;
+            let src = md_preview::Source {
+                lines: &self.buf.lines,
+                edits: self.buf.edits,
+                copied: md_preview::copied_line(self.copied),
+            };
+            self.preview.paint(cx, body, &src);
+            return;
+        }
         let total_lines = self.buf.lines.len();
         let gutter_w = gutter_width(cx.cfg, total_lines, cw);
         // With no gutter, half a cell before the text holds a code block's
@@ -1469,6 +1507,19 @@ impl View for EditorView {
             cx.redraw();
         }
         let m = k.mods;
+        // The Preview is read-only: it scrolls, and saves.
+        let save = m.super_ && matches!(k.key, Key::Char(c) if c.eq_ignore_ascii_case(&'s'));
+        if self.view_mode() == ViewMode::Preview && !save {
+            return match self.preview.key(k) {
+                Some(moved) => {
+                    if moved {
+                        cx.request_frame();
+                    }
+                    true
+                }
+                None => false,
+            };
+        }
         let used = match k.key {
             Key::Char(c) if m.super_ && c.eq_ignore_ascii_case(&'s') => {
                 if m.shift {
@@ -1501,6 +1552,19 @@ impl View for EditorView {
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
         if event.is_other_button() {
+            return;
+        }
+        if self.view_mode() == ViewMode::Preview {
+            if let MouseEvent::Down { pos, clicks, .. } = *event {
+                if let Some(md_preview::Action::EditAt(line)) = self.preview.press(pos, clicks) {
+                    self.mode = Some(ViewMode::Integrated);
+                    self.buf.cursor = (line.min(self.buf.lines.len() - 1), 0);
+                    self.buf.anchor = None;
+                    self.goal_x = None;
+                    self.center_caret = true;
+                    cx.redraw();
+                }
+            }
             return;
         }
         match *event {
@@ -1561,6 +1625,12 @@ impl View for EditorView {
     }
 
     fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), dx: f32, dy: f32) {
+        if self.view_mode() == ViewMode::Preview {
+            if dy.is_finite() && self.preview.scroll_by(-dy) {
+                cx.request_frame();
+            }
+            return;
+        }
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         if dy.is_finite() {
             self.scroll_accum += dy;
@@ -1640,9 +1710,22 @@ impl View for EditorView {
                 }
                 return;
             }
+            // The release of a double click that left the Preview opens nothing.
+            id if id >= BTN_LINK => {
+                if self.view_mode() == ViewMode::Preview {
+                    if let Some(r) = self.preview.open_link(id - BTN_LINK, self.buf.path.as_deref()) {
+                        cx.request(r);
+                    }
+                }
+                return;
+            }
             id if id >= BTN_COPY_BLOCK => {
                 let open = (id - BTN_COPY_BLOCK) as usize;
-                let Some(text) = self.block_body(open) else { return };
+                let text = match self.view_mode() {
+                    ViewMode::Preview => self.preview.code_text(open),
+                    _ => self.block_body(open),
+                };
+                let Some(text) = text else { return };
                 cx.set_clipboard_text(text);
                 self.copied = Some((open, Instant::now() + COPIED_FOR));
             }
@@ -1702,7 +1785,7 @@ impl View for EditorView {
     }
 
     fn refresh(&mut self) -> bool {
-        let stats = self.stats.poll();
+        let stats = self.stats.poll() | self.preview.poll();
         let lines = &self.buf.lines;
         stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
