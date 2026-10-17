@@ -175,26 +175,33 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   Its decorations measure `cell_w * s` per char and `line_h * s` tall. The
   caller lays out the row `line_h * s` high and its columns `cell_w * s`
   wide.
-- Blocks: `block(key, spans, width, left, top, clip) -> Option<f32>` draws
-  word-wrapped proportional text `width` wide (a Preview's paragraph)
+- Blocks: `block(key, spans, width, left, top, clip) -> Option<BlockLayout>`
+  draws word-wrapped proportional text `width` wide (a Preview's paragraph)
   through the `BlockCache`, keyed by `key` (`block_key(&spans)`, or any
-  hash covering the spans' text, faces, sizes, colours, and tags), the
-  width in whole pixels, and the metrics. Each `BlockSpan` carries its
-  `Font`, size and line height (a line is as tall as its tallest span),
-  colour, and a `metadata` tag its glyphs keep; `\n` starts a line, and a
-  word wider than the block breaks between glyphs. Lines start at the left
-  edge, right-to-left ones too. Shaping is budgeted as `budgeted_row`'s is:
-  past the budget the frame is re-requested and the block draws as last
-  laid out at another width (returning that height) or draws nothing
-  (`None`: lay it out at `block_estimate(&spans, width)`). A block seen
-  at a new width is laid out again from its old shaping, not reshaped.
-  `measure_block` shapes (within the budget) without drawing, to lay out
-  what follows; `block_height(key, width)` reads a shaped block's height.
-  `block_rects(key, width, tag)` gives the rects (from the block's
-  top-left, a line tall) of each run of glyphs tagged `tag` on a line:
-  inline code boxes, link hit areas. `block_hit(key, width, x, y)` gives
-  the byte offset (into the spans' joined text) nearest a point and the
-  tag of the glyph under it (0 if none).
+  hash covering the spans' text, faces, sizes, colours, and tags; a
+  colour change reshapes), the width in whole pixels, and the metrics.
+  Each `BlockSpan` carries its `Font`, size and line height (each at least
+  1 px; a line is as tall as its tallest span), colour, and an optional
+  `NonZeroU32` tag its glyphs keep (spans sharing a tag read back as one,
+  so give each link its own); `\n` starts a line, and a word wider than
+  the block breaks between glyphs. Lines start at the left edge,
+  right-to-left ones too. One block may be cached at several widths (two
+  panes); at a new width it is laid out again from its entry nearest that
+  width not drawn this frame, else shaped anew, so a pane whose width
+  holds keeps its entry. Shaping is budgeted as `budgeted_row`'s is: past
+  the budget the frame is re-requested and the block draws its entry
+  nearest the width (`BlockLayout::width` says which; read its rects and
+  hits at that width, since at the width asked they are empty until it
+  shapes) or draws nothing (`None`: lay it out at
+  `block_estimate(&spans, width)`). `measure_block` shapes within the
+  budget without drawing (`None` past it), to lay out what follows.
+  `block_height(key, width)` reads a cached height; an idle block may be
+  evicted or laid out at another width, so a view keeps the heights its
+  layout uses. `block_rects(key, width, tag)` gives the rects (from the
+  block's top-left, a line tall) of each run of glyphs tagged `tag` on a
+  line: inline code boxes, link hit areas. `block_hit(key, width, x, y)`
+  gives the byte offset (into the spans' joined text) nearest a point and
+  the tag of the glyph under it, if any.
 - Buttons: `button(rect, id)` registers a hit rect and returns hover; the app
   fires `View::button(id)` on mouse-up over the same button. An icon-only
   button names itself with `tooltip(rect, text)` (shown after a short hover).

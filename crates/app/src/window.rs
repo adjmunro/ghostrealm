@@ -6253,7 +6253,8 @@ mod tests {
     }
 
     /// A wrapped block draws its ink on several lines, all inside the rect
-    /// it was laid out in.
+    /// it was laid out in. (The harness's one font stands in for every
+    /// family.)
     #[test]
     fn a_block_draws_ink_within_its_rect() {
         use crate::plugin::testing::{Harness, UI};
@@ -6263,7 +6264,7 @@ mod tests {
         let mut h = Harness::new();
         h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
         let fg = [220, 220, 230];
-        let spans = vec![BlockSpan::new("Wrapped serif words in a narrow block", Font::SERIF, 14.0, 18.0, fg)];
+        let spans = vec![BlockSpan::new("Wrapped words in a narrow block of text", Font::SANS, 14.0, 18.0, fg)];
         let (left, top, width) = (20.0, 30.0, 100.0);
         let full = Rect { x: 0.0, y: 0.0, w: DIM as f32, h: DIM as f32 };
         let height = {
@@ -6271,7 +6272,7 @@ mod tests {
                 &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
             );
             let key = cx.block_key(&spans);
-            cx.block(key, || spans.clone(), width, left, top, full).expect("shaped within the budget")
+            cx.block(key, || spans.clone(), width, left, top, full).expect("shaped within the budget").height
         };
         assert!(height >= 3.0 * 18.0, "wrapped onto several lines: {height}");
         let bg = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };

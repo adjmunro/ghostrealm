@@ -52,7 +52,7 @@ pub use paint::{
     Font, Frame, Image, ImageItem, ImageSource, Layer, PaintCx, RowStyles, Shaped, TextItem, TextKit,
     TextSrc,
 };
-pub use crate::block_cache::BlockSpan;
+pub use crate::block_cache::{BlockLayout, BlockSpan};
 pub use crate::row_cache::RunStyle;
 
 /// Called from any thread to wake the UI (it schedules a paced redraw).

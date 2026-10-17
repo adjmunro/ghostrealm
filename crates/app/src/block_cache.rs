@@ -3,11 +3,13 @@
 //!
 //! Unlike a [`RowCache`](crate::row_cache::RowCache) row, a block's layout
 //! depends on its width (that is where it wraps), so an entry is keyed by its
-//! content, the width it was laid out at, and the metrics generation. A block
-//! seen again at a new width is laid out again from its old entry's shaping
-//! when that entry isn't in use this frame (a resize), rather than reshaped.
+//! content, the width it was laid out at, and the metrics generation. The
+//! same content may be cached at several widths (two panes). A block seen at
+//! a new width is laid out again from the shaping of its entry nearest that
+//! width that isn't in use this frame (a resize), rather than reshaped; an
+//! entry drawn this frame stays at its width.
 //!
-//! Each span carries its own face, size, colour, and a `metadata` tag that its
+//! Each span carries its own face, size, colour, and an optional tag that its
 //! glyphs keep, so a caller can find where tagged text (inline code, a link)
 //! was laid out after wrapping.
 //!
@@ -16,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
 
 use ghostrealm_core::Rect;
 use glyphon::cosmic_text::{Align, Cursor};
@@ -29,25 +32,27 @@ pub struct BlockSpan {
     /// May hold `\n`: each one starts a new line of the block.
     pub text: String,
     pub font: Font,
-    /// Font size, physical px.
+    /// Font size, physical px (at least 1).
     pub size: f32,
-    /// Line height, physical px. A wrapped line is as tall as its tallest span.
+    /// Line height, physical px (at least 1). A wrapped line is as tall as its
+    /// tallest span.
     pub line_h: f32,
     pub color: [u8; 3],
     /// Kept by every glyph of the span, for
     /// [`PaintCx::block_rects`](crate::plugin::PaintCx::block_rects) and
-    /// [`block_hit`](crate::plugin::PaintCx::block_hit); 0 for plain text.
-    pub metadata: u32,
+    /// [`block_hit`](crate::plugin::PaintCx::block_hit). Spans sharing a tag
+    /// read back as one: give each link its own.
+    pub tag: Option<NonZeroU32>,
 }
 
 impl BlockSpan {
     pub fn new(text: impl Into<String>, font: Font, size: f32, line_h: f32, color: [u8; 3]) -> Self {
-        BlockSpan { text: text.into(), font, size, line_h, color, metadata: 0 }
+        BlockSpan { text: text.into(), font, size, line_h, color, tag: None }
     }
 
-    /// This span with its glyphs tagged `metadata`.
-    pub fn tagged(self, metadata: u32) -> Self {
-        BlockSpan { metadata, ..self }
+    /// This span with its glyphs tagged `tag`.
+    pub fn tagged(self, tag: NonZeroU32) -> Self {
+        BlockSpan { tag: Some(tag), ..self }
     }
 
     fn hash_into(&self, h: &mut impl Hasher) {
@@ -56,7 +61,13 @@ impl BlockSpan {
         (self.font.bold, self.font.italic).hash(h);
         (self.size.to_bits(), self.line_h.to_bits()).hash(h);
         self.color.hash(h);
-        self.metadata.hash(h);
+        self.tag.hash(h);
+    }
+
+    /// The span's size and line height, kept to at least a pixel (cosmic-text
+    /// rejects zero).
+    fn metrics(&self) -> Metrics {
+        Metrics::new(self.size.max(1.0), self.line_h.max(1.0))
     }
 }
 
@@ -79,19 +90,20 @@ pub fn estimate_height(spans: &[BlockSpan], width: f32) -> f32 {
     let width = layout_width(width);
     // An empty line is as tall as the first span's, as the buffer lays it out.
     let end_line = |advance: f32, line_h: f32| {
-        let line_h = if line_h > 0.0 { line_h } else { first.line_h };
+        let line_h = if line_h > 0.0 { line_h } else { first.metrics().line_height };
         (advance / width).ceil().max(1.0) * line_h
     };
     let (mut height, mut advance, mut line_h) = (0.0, 0.0, 0.0_f32);
     for s in spans {
+        let m = s.metrics();
         for (i, piece) in s.text.split('\n').enumerate() {
             if i > 0 {
                 height += end_line(advance, line_h);
                 (advance, line_h) = (0.0, 0.0);
             }
             if !piece.is_empty() {
-                advance += piece.chars().count() as f32 * s.size * 0.5;
-                line_h = line_h.max(s.line_h);
+                advance += piece.chars().count() as f32 * m.font_size * 0.5;
+                line_h = line_h.max(m.line_height);
             }
         }
     }
@@ -104,6 +116,17 @@ fn layout_width(width: f32) -> f32 {
     width.round().max(1.0)
 }
 
+/// How a block was laid out: what [`PaintCx::block`](crate::plugin::PaintCx::block)
+/// drew.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockLayout {
+    pub height: f32,
+    /// The width it was laid out at, in whole pixels: the one asked for, or,
+    /// for a block standing in past the shaping budget, another. Its rects and
+    /// hits are read at this width.
+    pub width: f32,
+}
+
 /// One shaped block and when it was last used.
 struct Slot {
     /// Its map key: content, width, metrics generation.
@@ -111,7 +134,7 @@ struct Slot {
     /// The caller's content key.
     content: u64,
     buf: Buffer,
-    height: f32,
+    layout: BlockLayout,
     /// Monotonic clock value at the slot's last use; higher = more recent.
     used: u64,
 }
@@ -119,9 +142,9 @@ struct Slot {
 pub struct BlockCache {
     /// Slot key -> index into `slab`.
     map: HashMap<u64, usize>,
-    /// Content key -> the slot laid out for it most recently, at any width:
-    /// what a resize lays out again, and what a deferred block draws.
-    latest: HashMap<u64, usize>,
+    /// Content key -> its slots, at their several widths: what a resize lays
+    /// out again, and what a deferred block draws.
+    by_content: HashMap<u64, Vec<usize>>,
     /// Shaped blocks at stable indices (freed slots are recycled, never shifted).
     slab: Vec<Slot>,
     /// Indices of `slab` slots not currently mapped, whose `Buffer` is reusable.
@@ -130,6 +153,9 @@ pub struct BlockCache {
     /// `clock` when the current frame began: a slot with `used > frame_start`
     /// was touched this frame and must not be evicted or laid out again.
     frame_start: u64,
+    /// Slots touched this frame: with every live slot touched, `end_frame`
+    /// has nothing to evict.
+    touched: usize,
     metrics_gen: u64,
     /// Soft cap on live slots, trimmed in `end_frame`.
     cap: usize,
@@ -141,11 +167,12 @@ impl BlockCache {
     pub fn new(cap: usize) -> Self {
         BlockCache {
             map: HashMap::new(),
-            latest: HashMap::new(),
+            by_content: HashMap::new(),
             slab: Vec::new(),
             free: Vec::new(),
             clock: 0,
             frame_start: 0,
+            touched: 0,
             metrics_gen: 0,
             cap: cap.max(1),
             hits: 0,
@@ -156,18 +183,28 @@ impl BlockCache {
     /// Start a frame; a new `metrics_gen` drops every block.
     pub fn begin_frame(&mut self, metrics_gen: u64) {
         self.frame_start = self.clock;
+        self.touched = 0;
         if metrics_gen != self.metrics_gen {
             self.metrics_gen = metrics_gen;
             self.map.clear();
-            self.latest.clear();
+            self.by_content.clear();
             self.free.clear();
             self.slab.clear();
         }
     }
 
-    fn tick(&mut self) -> u64 {
+    /// Mark slot `idx` used now.
+    fn use_slot(&mut self, idx: usize) {
         self.clock = self.clock.wrapping_add(1);
-        self.clock
+        let slot = &mut self.slab[idx];
+        if slot.used <= self.frame_start {
+            self.touched += 1;
+        }
+        slot.used = self.clock;
+    }
+
+    fn idle(&self, idx: usize) -> bool {
+        self.slab[idx].used <= self.frame_start
     }
 
     /// Cache hits / misses since construction.
@@ -194,9 +231,9 @@ impl BlockCache {
         self.slot(key, width).map(|s| &s.buf)
     }
 
-    /// The laid-out height of content `key` at `width`, if shaped.
+    /// The laid-out height of content `key` at `width`, while it is cached.
     pub fn height(&self, key: u64, width: f32) -> Option<f32> {
-        self.slot(key, width).map(|s| s.height)
+        self.slot(key, width).map(|s| s.layout.height)
     }
 
     /// The buffer a [`TextSrc::Block`](crate::plugin::TextSrc::Block) draws.
@@ -205,42 +242,49 @@ impl BlockCache {
     }
 
     /// Mark content `key` at `width` used this frame. Returns its slot key and
-    /// height if it is shaped.
-    pub fn touch(&mut self, key: u64, width: f32) -> Option<(u64, f32)> {
+    /// layout if it is shaped.
+    pub fn touch(&mut self, key: u64, width: f32) -> Option<(u64, BlockLayout)> {
         let slot_key = self.slot_key(key, width);
         let &idx = self.map.get(&slot_key)?;
-        let now = self.tick();
-        self.slab[idx].used = now;
+        self.use_slot(idx);
         self.hits += 1;
-        Some((slot_key, self.slab[idx].height))
+        Some((slot_key, self.slab[idx].layout))
     }
 
-    /// The slot last laid out for content `key` at any width, marked used
-    /// this frame: its slot key and height.
-    pub fn touch_latest(&mut self, key: u64) -> Option<(u64, f32)> {
-        let &idx = self.latest.get(&key)?;
-        let now = self.tick();
-        let slot = &mut self.slab[idx];
-        slot.used = now;
-        Some((slot.key, slot.height))
+    /// Content `key`'s slot laid out nearest `width` wide, of those passing
+    /// `keep`.
+    fn nearest(&self, key: u64, width: f32, keep: impl Fn(usize) -> bool) -> Option<usize> {
+        let dist = |i: &usize| (self.slab[*i].layout.width - width).abs();
+        self.by_content.get(&key)?.iter().copied().filter(|&i| keep(i)).min_by(|a, b| dist(a).total_cmp(&dist(b)))
     }
 
-    /// Lay out content `key` at `width`: from the shaping of its latest slot
-    /// at another width if that slot isn't in use this frame, else shaping
-    /// `spans()` into a slot of its own. Returns the slot key and height.
+    /// Content `key`'s slot laid out nearest `width` wide, marked used this
+    /// frame: its slot key and layout. What stands in for a block the
+    /// shaping budget defers.
+    pub fn touch_nearest(&mut self, key: u64, width: f32) -> Option<(u64, BlockLayout)> {
+        let idx = self.nearest(key, layout_width(width), |_| true)?;
+        self.use_slot(idx);
+        Some((self.slab[idx].key, self.slab[idx].layout))
+    }
+
+    /// Lay out content `key` at `width`: a hit if it already is, else from
+    /// the shaping of its slot nearest that width that isn't in use this
+    /// frame, else shaping `spans()` into a slot of its own. Returns the slot
+    /// key and layout.
     pub fn shape(
         &mut self,
         key: u64,
         font_system: &mut FontSystem,
         width: f32,
         spans: impl FnOnce() -> Vec<BlockSpan>,
-    ) -> (u64, f32) {
+    ) -> (u64, BlockLayout) {
+        if let Some(hit) = self.touch(key, width) {
+            return hit;
+        }
         let slot_key = self.slot_key(key, width);
         let width = layout_width(width);
         self.misses += 1;
-        let now = self.tick();
-        let reuse = self.latest.get(&key).copied().filter(|&i| self.slab[i].used <= self.frame_start);
-        let idx = match reuse {
+        let idx = match self.nearest(key, width, |i| self.idle(i)) {
             Some(idx) => {
                 self.map.remove(&self.slab[idx].key);
                 let buf = &mut self.slab[idx].buf;
@@ -250,15 +294,18 @@ impl BlockCache {
             }
             None => {
                 let spans = spans();
-                let first = spans.first().map_or(Metrics::new(1.0, 1.0), |s| Metrics::new(s.size, s.line_h));
+                let first = spans.first().map_or(Metrics::new(1.0, 1.0), BlockSpan::metrics);
                 let idx = match self.free.pop() {
                     Some(i) => i,
                     None => {
                         let buf = Buffer::new(font_system, first);
-                        self.slab.push(Slot { key: slot_key, content: key, buf, height: 0.0, used: now });
+                        let layout = BlockLayout { height: 0.0, width };
+                        self.slab.push(Slot { key: slot_key, content: key, buf, layout, used: 0 });
                         self.slab.len() - 1
                     }
                 };
+                self.slab[idx].used = 0;
+                self.by_content.entry(key).or_default().push(idx);
                 let buf = &mut self.slab[idx].buf;
                 // An empty line takes the buffer's metrics: the first span's.
                 buf.set_metrics(first);
@@ -273,8 +320,8 @@ impl BlockCache {
                             .font
                             .attrs()
                             .color(Color::rgb(s.color[0], s.color[1], s.color[2]))
-                            .metrics(Metrics::new(s.size, s.line_h))
-                            .metadata(s.metadata as usize);
+                            .metrics(s.metrics())
+                            .metadata(s.tag.map_or(0, |t| t.get() as usize));
                         (s.text.as_str(), attrs)
                     }),
                     &default,
@@ -288,25 +335,26 @@ impl BlockCache {
             }
         };
         let slot = &mut self.slab[idx];
-        slot.height = slot.buf.layout_runs().last().map_or(0.0, |r| r.line_top + r.line_height);
+        let height = slot.buf.layout_runs().last().map_or(0.0, |r| r.line_top + r.line_height);
+        slot.layout = BlockLayout { height, width };
         slot.key = slot_key;
         slot.content = key;
-        slot.used = now;
         self.map.insert(slot_key, idx);
-        self.latest.insert(key, idx);
-        (slot_key, slot.height)
+        self.use_slot(idx);
+        (slot_key, self.slab[idx].layout)
     }
 
     /// Where the glyphs tagged `tag` of content `key` at `width` were laid out,
     /// relative to the block's top-left: one rect per run of tagged glyphs on a
     /// line, the line's height. Empty until shaped.
-    pub fn rects(&self, key: u64, width: f32, tag: u32) -> Vec<Rect> {
+    pub fn rects(&self, key: u64, width: f32, tag: NonZeroU32) -> Vec<Rect> {
         let Some(buf) = self.get(key, width) else { return Vec::new() };
+        let tag = tag.get() as usize;
         let mut out = Vec::new();
         for run in buf.layout_runs() {
             let mut cur: Option<(f32, f32)> = None;
             for g in run.glyphs {
-                if g.metadata == tag as usize {
+                if g.metadata == tag {
                     let (x0, x1) = cur.unwrap_or((g.x, g.x));
                     cur = Some((x0.min(g.x), x1.max(g.x + g.w)));
                 } else if let Some((x0, x1)) = cur.take() {
@@ -322,9 +370,9 @@ impl BlockCache {
 
     /// The text position nearest `(x, y)` (relative to the block's top-left)
     /// in content `key` at `width`, as a byte offset into the spans' joined
-    /// text, and the tag of the glyph under the point (0 if none is). `None`
-    /// until shaped.
-    pub fn hit(&self, key: u64, width: f32, x: f32, y: f32) -> Option<(usize, u32)> {
+    /// text, and the tag of the glyph under the point (`None` if no glyph or
+    /// an untagged one is). `None` until shaped.
+    pub fn hit(&self, key: u64, width: f32, x: f32, y: f32) -> Option<(usize, Option<NonZeroU32>)> {
         let buf = self.get(key, width)?;
         let Cursor { line, index, .. } = buf.hit(x, y)?;
         let line_start: usize =
@@ -333,7 +381,7 @@ impl BlockCache {
             .layout_runs()
             .find(|r| y >= r.line_top && y < r.line_top + r.line_height)
             .and_then(|r| r.glyphs.iter().find(|g| x >= g.x && x < g.x + g.w))
-            .map_or(0, |g| g.metadata as u32);
+            .and_then(|g| NonZeroU32::new(g.metadata as u32));
         Some((line_start + index, tag))
     }
 
@@ -341,7 +389,7 @@ impl BlockCache {
     /// Blocks touched this frame are never dropped.
     pub fn end_frame(&mut self) {
         let live = self.map.len();
-        if live <= self.cap {
+        if live <= self.cap || self.touched >= live {
             return;
         }
         let mut stale: Vec<(u64, usize)> = self
@@ -352,10 +400,13 @@ impl BlockCache {
             .collect();
         stale.sort_unstable_by_key(|(used, _)| *used);
         for (_, idx) in stale.into_iter().take(live - self.cap) {
-            let slot = &self.slab[idx];
-            self.map.remove(&slot.key);
-            if self.latest.get(&slot.content) == Some(&idx) {
-                self.latest.remove(&slot.content);
+            let (key, content) = (self.slab[idx].key, self.slab[idx].content);
+            self.map.remove(&key);
+            if let Some(slots) = self.by_content.get_mut(&content) {
+                slots.retain(|&i| i != idx);
+                if slots.is_empty() {
+                    self.by_content.remove(&content);
+                }
             }
             self.free.push(idx);
         }
@@ -364,28 +415,36 @@ impl BlockCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use super::*;
 
     const GREY: [u8; 3] = [200, 200, 200];
+
+    /// One system font scan for every test here.
+    fn fonts() -> MutexGuard<'static, FontSystem> {
+        static FS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
+        FS.get_or_init(|| Mutex::new(FontSystem::new())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tag(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
 
     fn para(text: &str) -> Vec<BlockSpan> {
         vec![BlockSpan::new(text, Font::SANS, 15.0, 20.0, GREY)]
     }
 
-    /// Shape `spans` at `width` (a miss) or touch them (a hit), as `PaintCx::block` does.
+    /// Lay out `spans` at `width`, as `PaintCx::block` does within its budget.
     fn ensure(cache: &mut BlockCache, fs: &mut FontSystem, spans: &[BlockSpan], width: f32) -> f32 {
-        let key = block_key(spans);
-        match cache.touch(key, width) {
-            Some((_, h)) => h,
-            None => cache.shape(key, fs, width, || spans.to_vec()).1,
-        }
+        cache.shape(block_key(spans), fs, width, || spans.to_vec()).1.height
     }
 
     const LOREM: &str = "The quick brown fox jumps over the lazy dog and keeps on running far away";
 
     #[test]
     fn identical_content_hits_without_reshaping() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         ensure(&mut cache, &mut fs, &para("hello world"), 300.0);
@@ -394,6 +453,7 @@ mod tests {
         ensure(&mut cache, &mut fs, &para("hello world"), 300.0);
         cache.end_frame();
         assert_eq!(cache.stats(), (1, 1));
+        assert_eq!(cache.slab.len(), 1, "a hit keeps its one slot");
     }
 
     #[test]
@@ -408,7 +468,8 @@ mod tests {
             BlockSpan { size: 16.0, ..base.clone() },
             BlockSpan { line_h: 22.0, ..base.clone() },
             BlockSpan { color: [1, 2, 3], ..base.clone() },
-            base.clone().tagged(1),
+            base.clone().tagged(tag(1)),
+            base.clone().tagged(tag(2)),
         ];
         let keys: Vec<u64> = variants.iter().map(|s| block_key(std::slice::from_ref(s))).collect();
         for (i, a) in keys.iter().enumerate() {
@@ -434,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_metrics_change_invalidates() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         ensure(&mut cache, &mut fs, &para("abc"), 300.0);
@@ -446,7 +507,7 @@ mod tests {
 
     #[test]
     fn the_cap_evicts_blocks_idle_since_a_past_frame() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(4);
         cache.begin_frame(0);
         for i in 0..8 {
@@ -462,7 +523,7 @@ mod tests {
         assert_eq!(cache.map.len(), 4);
         assert!(cache.get(block_key(&para("block 7")), 300.0).is_some(), "recently used kept");
         assert!(cache.get(block_key(&para("block 0")), 300.0).is_none(), "oldest dropped");
-        assert!(!cache.latest.contains_key(&block_key(&para("block 0"))), "and forgotten");
+        assert!(!cache.by_content.contains_key(&block_key(&para("block 0"))), "and forgotten");
         let before = cache.stats();
         cache.begin_frame(0);
         ensure(&mut cache, &mut fs, &para("block 0"), 300.0);
@@ -471,7 +532,7 @@ mod tests {
 
     #[test]
     fn a_narrower_block_wraps_taller() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         let spans = para(LOREM);
@@ -488,16 +549,17 @@ mod tests {
 
     #[test]
     fn a_resize_lays_out_the_idle_entry_again() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         let spans = para(LOREM);
         let key = block_key(&spans);
         cache.begin_frame(0);
-        ensure(&mut cache, &mut fs, &spans, 400.0);
+        let wide = ensure(&mut cache, &mut fs, &spans, 400.0);
         cache.end_frame();
         cache.begin_frame(0);
-        let (_, h) = cache.shape(key, &mut fs, 150.0, || panic!("laid out from the old shaping"));
-        assert!(h > 20.0);
+        let (_, laid) = cache.shape(key, &mut fs, 150.0, || panic!("laid out from the old shaping"));
+        assert!(laid.height > wide, "narrower is taller: {} vs {wide}", laid.height);
+        assert_eq!(laid.width, 150.0);
         assert!(cache.get(key, 400.0).is_none(), "the old width's entry moved");
         // In use this frame, an entry isn't moved: another width shapes its own.
         let mut built = false;
@@ -509,9 +571,50 @@ mod tests {
         assert!(cache.get(key, 150.0).is_some() && cache.get(key, 90.0).is_some());
     }
 
+    /// Two panes show one block: only A resizes. B keeps hitting its entry,
+    /// and A lays out its own (the nearest idle width) again each frame.
+    #[test]
+    fn a_resize_in_one_pane_leaves_anothers_entry_alone() {
+        let mut fs = fonts();
+        let mut cache = BlockCache::new(16);
+        let spans = para(LOREM);
+        let key = block_key(&spans);
+        cache.begin_frame(0);
+        ensure(&mut cache, &mut fs, &spans, 300.0);
+        ensure(&mut cache, &mut fs, &spans, 500.0);
+        cache.end_frame();
+        for frame in 1..6 {
+            cache.begin_frame(0);
+            let a = 300.0 - frame as f32 * 10.0;
+            let (_, laid) = cache.shape(key, &mut fs, a, || panic!("A lays out its own entry again"));
+            assert_eq!(laid.width, a);
+            let (hits, _) = cache.stats();
+            cache.touch(key, 500.0).expect("B hits");
+            assert_eq!(cache.stats().0, hits + 1);
+            cache.end_frame();
+            assert_eq!(cache.slab.len(), 2, "no slot leaks");
+        }
+    }
+
+    /// The stand-in for a deferred block is its entry nearest the width asked.
+    #[test]
+    fn the_stand_in_is_the_nearest_width() {
+        let mut fs = fonts();
+        let mut cache = BlockCache::new(16);
+        let spans = para(LOREM);
+        let key = block_key(&spans);
+        cache.begin_frame(0);
+        for w in [100.0, 300.0, 600.0] {
+            ensure(&mut cache, &mut fs, &spans, w);
+        }
+        assert_eq!(cache.touch_nearest(key, 380.0).unwrap().1.width, 300.0);
+        assert_eq!(cache.touch_nearest(key, 520.0).unwrap().1.width, 600.0);
+        assert!(cache.touch_nearest(block_key(&para("other")), 300.0).is_none());
+    }
+
     #[test]
     fn per_span_sizes_reach_the_glyphs() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         let spans = vec![
@@ -528,18 +631,28 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_size_is_kept_to_a_pixel() {
+        let mut fs = fonts();
+        let mut cache = BlockCache::new(16);
+        cache.begin_frame(0);
+        let spans = vec![BlockSpan::new("x", Font::SANS, 0.0, 0.0, GREY)];
+        assert_eq!(ensure(&mut cache, &mut fs, &spans, 100.0), 1.0);
+        assert_eq!(estimate_height(&spans, 100.0), 1.0);
+    }
+
+    #[test]
     fn rects_cover_exactly_the_tagged_glyphs_across_a_wrap() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         let spans = vec![
             BlockSpan::new("plain words here ", Font::SANS, 15.0, 20.0, GREY),
-            BlockSpan::new("tagged across the wrap", Font::SANS, 15.0, 20.0, GREY).tagged(7),
+            BlockSpan::new("tagged across the wrap", Font::SANS, 15.0, 20.0, GREY).tagged(tag(7)),
             BlockSpan::new(" plain again", Font::SANS, 15.0, 20.0, GREY),
         ];
         ensure(&mut cache, &mut fs, &spans, 200.0);
         let key = block_key(&spans);
-        let rects = cache.rects(key, 200.0, 7);
+        let rects = cache.rects(key, 200.0, tag(7));
         assert!(rects.len() >= 2, "a rect on each line the tag reaches: {rects:?}");
         let buf = cache.get(key, 200.0).unwrap();
         for run in buf.layout_runs() {
@@ -549,32 +662,32 @@ mod tests {
                 assert_eq!(inside, g.metadata == 7, "glyph at byte {} of line {}", g.start, run.line_i);
             }
         }
-        assert!(cache.rects(key, 200.0, 9).is_empty());
+        assert!(cache.rects(key, 200.0, tag(9)).is_empty());
     }
 
     #[test]
     fn a_hit_finds_the_byte_and_tag_under_the_point() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         let spans = vec![
             BlockSpan::new("first line\nsee ", Font::SANS, 15.0, 20.0, GREY),
-            BlockSpan::new("link", Font::SANS, 15.0, 20.0, GREY).tagged(3),
+            BlockSpan::new("link", Font::SANS, 15.0, 20.0, GREY).tagged(tag(3)),
         ];
         ensure(&mut cache, &mut fs, &spans, 400.0);
         let key = block_key(&spans);
-        let link = cache.rects(key, 400.0, 3)[0];
-        let (byte, tag) = cache.hit(key, 400.0, link.x + 1.0, link.y + 10.0).unwrap();
-        assert_eq!((byte, tag), ("first line\nsee ".len(), 3));
-        let (byte, tag) = cache.hit(key, 400.0, 1.0, 10.0).unwrap();
-        assert_eq!((byte, tag), (0, 0));
-        let (_, tag) = cache.hit(key, 400.0, 390.0, 30.0).unwrap();
-        assert_eq!(tag, 0, "past the line's end is no glyph");
+        let link = cache.rects(key, 400.0, tag(3))[0];
+        let (byte, at) = cache.hit(key, 400.0, link.x + 1.0, link.y + 10.0).unwrap();
+        assert_eq!((byte, at), ("first line\nsee ".len(), Some(tag(3))));
+        let (byte, at) = cache.hit(key, 400.0, 1.0, 10.0).unwrap();
+        assert_eq!((byte, at), (0, None));
+        let (_, at) = cache.hit(key, 400.0, 390.0, 30.0).unwrap();
+        assert_eq!(at, None, "past the line's end is no glyph");
     }
 
     #[test]
     fn an_rtl_paragraph_starts_at_the_left() {
-        let mut fs = FontSystem::new();
+        let mut fs = fonts();
         let mut cache = BlockCache::new(16);
         cache.begin_frame(0);
         let spans = para("\u{05e9}\u{05dc}\u{05d5}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd}");

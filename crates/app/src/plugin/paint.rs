@@ -8,6 +8,7 @@
 //! here touches the GPU, so views can be painted (and tested) headless.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style,
 use winit::window::CursorIcon;
 
 use super::{rect_contains, theme, UiMetrics};
-use crate::block_cache::{BlockCache, BlockSpan};
+use crate::block_cache::{BlockCache, BlockLayout, BlockSpan};
 use crate::row_cache::{RowCache, RunStyle};
 
 /// Shape at least this many missed rows per frame regardless of the time budget,
@@ -571,17 +572,17 @@ impl TextKit {
         self.shaped < MIN_SHAPES_PER_FRAME || Instant::now() < self.shape_deadline
     }
 
-    /// Content `key` laid out `width` wide: its slot key and height, shaping
+    /// Content `key` laid out `width` wide: its slot key and layout, shaping
     /// `spans()` on a miss while the frame's budget lasts. Past it the frame is
-    /// marked deferred and, with `stale`, the block's latest layout at another
-    /// width stands in; `None` if there is none.
+    /// marked deferred and, with `stale`, the block's layout at the nearest
+    /// other width stands in; `None` if there is none.
     fn budgeted_block(
         &mut self,
         key: u64,
         width: f32,
         stale: bool,
         spans: impl FnOnce() -> Vec<BlockSpan>,
-    ) -> Option<(u64, f32)> {
+    ) -> Option<(u64, BlockLayout)> {
         if let Some(hit) = self.block_cache.touch(key, width) {
             return Some(hit);
         }
@@ -591,7 +592,7 @@ impl TextKit {
         }
         self.deferred = true;
         if stale {
-            self.block_cache.touch_latest(key)
+            self.block_cache.touch_nearest(key, width)
         } else {
             None
         }
@@ -1309,11 +1310,11 @@ impl<'a> PaintCx<'a> {
     /// top-left at `(left, top)`, clipped to `clip`, through the block cache.
     /// `key` identifies what `spans()` would return ([`block_key`](Self::block_key),
     /// or any hash covering the same); the block is shaped once per key and
-    /// width, only while this frame's shaping budget lasts. Returns the height
-    /// drawn. Past the budget the frame is re-requested and the block draws
-    /// as last laid out at another width, returning that height, or draws
-    /// nothing and returns `None` (lay it out at
-    /// [`block_estimate`](Self::block_estimate)).
+    /// width, only while this frame's shaping budget lasts. Returns how it was
+    /// laid out. Past the budget the frame is re-requested and the block draws
+    /// as laid out at the nearest other width (the returned `width`; read its
+    /// rects and hits there), or draws nothing and returns `None` (lay it out
+    /// at [`block_estimate`](Self::block_estimate)).
     #[allow(clippy::too_many_arguments)]
     pub fn block(
         &mut self,
@@ -1323,8 +1324,8 @@ impl<'a> PaintCx<'a> {
         left: f32,
         top: f32,
         clip: Rect,
-    ) -> Option<f32> {
-        let (slot, height) = self.text.budgeted_block(key, width, true, spans)?;
+    ) -> Option<BlockLayout> {
+        let (slot, layout) = self.text.budgeted_block(key, width, true, spans)?;
         self.push_text(TextItem {
             src: TextSrc::Block(slot),
             left,
@@ -1334,17 +1335,19 @@ impl<'a> PaintCx<'a> {
             color: [0, 0, 0],
             scale: 1.0,
         });
-        Some(height)
+        Some(layout)
     }
 
     /// Shape a block `width` wide without drawing it (to lay out what comes
     /// after it), within this frame's shaping budget: its height, or `None`
     /// past the budget.
     pub fn measure_block(&mut self, key: u64, spans: impl FnOnce() -> Vec<BlockSpan>, width: f32) -> Option<f32> {
-        self.text.budgeted_block(key, width, false, spans).map(|(_, h)| h)
+        self.text.budgeted_block(key, width, false, spans).map(|(_, l)| l.height)
     }
 
-    /// The height of block `key` laid out `width` wide, if it is shaped.
+    /// The height of block `key` laid out `width` wide, while the cache holds
+    /// it: an idle block may be evicted or moved to another width, so keep
+    /// the heights a layout depends on.
     pub fn block_height(&self, key: u64, width: f32) -> Option<f32> {
         self.text.block_cache.height(key, width)
     }
@@ -1357,15 +1360,15 @@ impl<'a> PaintCx<'a> {
     /// Where block `key`'s glyphs tagged `tag` were laid out `width` wide,
     /// relative to its top-left: a rect per run of them on a line, the line's
     /// height (an inline code box, a link's hit area). Empty until shaped.
-    pub fn block_rects(&self, key: u64, width: f32, tag: u32) -> Vec<Rect> {
+    pub fn block_rects(&self, key: u64, width: f32, tag: NonZeroU32) -> Vec<Rect> {
         self.text.block_cache.rects(key, width, tag)
     }
 
     /// The text position in block `key` (`width` wide) nearest `(x, y)`,
     /// relative to its top-left, as a byte offset into its spans' joined
-    /// text, and the tag of the glyph under the point (0 if none is). `None`
-    /// until shaped.
-    pub fn block_hit(&self, key: u64, width: f32, x: f32, y: f32) -> Option<(usize, u32)> {
+    /// text, and the tag of the glyph under the point (`None` if no glyph or
+    /// an untagged one is). `None` until shaped.
+    pub fn block_hit(&self, key: u64, width: f32, x: f32, y: f32) -> Option<(usize, Option<NonZeroU32>)> {
         self.text.block_cache.hit(key, width, x, y)
     }
 
@@ -1428,7 +1431,7 @@ mod tests {
     }
 
     fn block_spans(text: &str) -> Vec<BlockSpan> {
-        vec![BlockSpan::new(text, Font::SERIF, 14.0, 18.0, [200; 3])]
+        vec![BlockSpan::new(text, Font::SANS, 14.0, 18.0, [200; 3])]
     }
 
     /// `block` queues its cached buffer at its top-left, clipped to its clip,
@@ -1444,7 +1447,9 @@ mod tests {
                 &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
             );
             let key = cx.block_key(&spans);
-            let height = cx.block(key, || spans.clone(), 200.0, 12.0, 15.0, clip).unwrap();
+            let laid = cx.block(key, || spans.clone(), 200.0, 12.0, 15.0, clip).unwrap();
+            assert_eq!(laid.width, 200.0);
+            let height = laid.height;
             assert_eq!(cx.block_height(key, 200.0), Some(height));
             assert_eq!(cx.block_height(key, 150.0), None, "not shaped at that width");
             assert!(cx.block_estimate(&spans, 200.0) > 18.0, "an estimate of more than a line");
@@ -1468,7 +1473,7 @@ mod tests {
         let clip = Rect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 };
         let n = MIN_SHAPES_PER_FRAME + 1;
         let texts: Vec<String> = (0..n).map(|i| format!("block {i}")).collect();
-        let paint = |h: &mut Harness, width: f32| -> Vec<Option<f32>> {
+        let paint = |h: &mut Harness, width: f32| -> Vec<Option<BlockLayout>> {
             h.frame.text.clear();
             h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::ZERO);
             let mut cx = PaintCx::new(
@@ -1495,9 +1500,11 @@ mod tests {
         assert!(!h.text.finish_paint());
 
         // At a new width each block lays out again, the first few within the
-        // budget; the rest stand in with their old layout.
+        // budget; the rest stand in with their old layout, and say so.
         let shaped = paint(&mut h, 250.0);
-        assert!(shaped.iter().all(Option::is_some));
+        let widths: Vec<f32> = shaped.iter().map(|l| l.unwrap().width).collect();
+        assert!(widths[..MIN_SHAPES_PER_FRAME].iter().all(|w| *w == 250.0));
+        assert_eq!(widths[MIN_SHAPES_PER_FRAME], 300.0, "the stand-in's width");
         assert_eq!(h.frame.text.len(), n);
         assert!(h.text.finish_paint());
         let spans = block_spans(&texts[n - 1]);
