@@ -143,6 +143,9 @@ pub struct Preview {
     anchor: Anchor,
     /// A source line to bring to the top once the blocks are in.
     goto_line: Option<usize>,
+    /// After a resize, the share of the anchor block above the top, until
+    /// the block is measured at the new width.
+    anchor_frac: Option<f32>,
     /// The last paint's body, and blocks on screen (index, slot top,
     /// bottom).
     body: Rect,
@@ -160,6 +163,7 @@ impl Preview {
             laid: Vec::new(),
             anchor: Anchor::default(),
             goto_line: None,
+            anchor_frac: None,
             body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             shown: Vec::new(),
         }
@@ -167,9 +171,12 @@ impl Preview {
 
     /// Parse the text if it changed since last parsed: at once if short,
     /// else on a worker, showing the blocks as they were until it is done.
+    /// One parse runs at a time: edits made meanwhile parse once it lands.
+    /// The lines are joined here: cloning them for the worker to join costs
+    /// more than the join (an allocation per line against one copy).
     fn sync(&mut self, src: &Source) {
         self.poll();
-        if self.parsed == Some(src.edits) || self.job.as_ref().is_some_and(|(e, _)| *e == src.edits) {
+        if self.parsed == Some(src.edits) || self.job.is_some() {
             return;
         }
         let len: usize = src.lines.iter().map(|l| l.len() + 1).sum();
@@ -216,6 +223,9 @@ impl Preview {
         self.laid = vec![Laid::default(); blocks.len()];
         self.blocks = blocks;
         self.parsed = Some(edits);
+        // They index the old blocks.
+        self.shown.clear();
+        self.anchor_frac = None;
     }
 
     /// Whether the blocks shown are of edit count `edits`.
@@ -226,6 +236,10 @@ impl Preview {
     /// The source line at the top of the view: the anchor block's, or the
     /// next block's once more than half of it has scrolled past.
     pub fn top_line(&self) -> Option<usize> {
+        // A line asked for but not yet shown is where the top will be.
+        if self.goto_line.is_some() {
+            return self.goto_line;
+        }
         let Anchor { index, offset } = self.anchor;
         let block = self.blocks.get(index)?;
         let past_half = self.laid[index].height.is_some_and(|(h, _)| offset > h * 0.5);
@@ -252,7 +266,7 @@ impl Preview {
             return None;
         }
         let i = self.block_at(y)?;
-        Some(Action::EditAt(self.blocks[i].line))
+        Some(Action::EditAt(self.blocks.get(i)?.line))
     }
 
     /// The target of the link with button id `BTN_LINK + i`.
@@ -408,8 +422,16 @@ impl Preview {
         }
         let look = look_of(cx, body);
         if self.look != Some(look) {
+            // The anchor block keeps the same share of it above the top
+            // as it reflows (exact once it is measured again).
+            let index = self.anchor.index;
+            let frac = self.laid.get(index).and_then(|l| l.height).map(|(h, _)| self.anchor.offset / h.max(1.0));
             self.look = Some(look);
             self.laid.iter_mut().for_each(|l| *l = Laid::default());
+            if let (Some(f), true) = (frac, index < self.blocks.len()) {
+                self.anchor.offset = f * self.slot_h(index);
+                self.anchor_frac = Some(f);
+            }
         }
         if let Some(line) = self.goto_line.take() {
             let index = self.blocks.partition_point(|b| b.line <= line).saturating_sub(1);
@@ -431,10 +453,14 @@ impl Preview {
             let content = self.paint_block(cx, i, left, top, &look, src, doc);
             let measured = content.is_some();
             let h = g + content.unwrap_or_else(|| self.estimate(i, &look));
-            if self.laid[i].height.is_some_and(|(old, _)| (old - h).abs() > 0.5) {
+            let old = self.laid[i].height;
+            if old.is_some_and(|(old, _)| (old - h).abs() > 0.5) {
                 grew = true;
             }
             self.laid[i].height = Some((h, measured));
+            if i == self.anchor.index && measured {
+                self.settle_anchor(old, h, cx);
+            }
             self.paint_quotes(cx, i, left, (y, top, y + h), &look);
             self.shown.push((i, y, y + h));
             y += h;
@@ -494,6 +520,24 @@ impl Preview {
         };
         self.laid[i].prep = Some(prep);
         out
+    }
+
+    /// The anchor block was just measured at `h` (it was `old`): keep what
+    /// shows at the top where it was. Scrolled into from below, its offset
+    /// counted from its estimated height; after a resize, it keeps its
+    /// share. Repaints next frame with the new offset.
+    fn settle_anchor(&mut self, old: Option<(f32, bool)>, h: f32, cx: &mut PaintCx) {
+        let before = self.anchor.offset;
+        if let Some(f) = self.anchor_frac.take() {
+            self.anchor.offset = f * h;
+        } else if let Some((old, false)) = old {
+            if before > 0.0 {
+                self.anchor.offset = (before + h - old).clamp(0.0, (h - 1.0).max(0.0));
+            }
+        }
+        if (self.anchor.offset - before).abs() > 0.5 {
+            cx.request_frame();
+        }
     }
 
     /// Block `i`'s quote bars: one per quote it is in, joined to the bars
@@ -1287,6 +1331,85 @@ mod tests {
         h.scroll(&mut v, (10.0, 10.0), 10.0);
         h.paint(&mut v, RECT);
         assert_eq!(top_of(&h, &name), y + 10.0);
+    }
+
+    /// A Preview of 30 wrapping paragraphs, scrolled `dy` px down.
+    fn scrolled(tag: &str, dy: f32) -> (EditorView, Harness) {
+        let text: String = (0..30).map(|i| format!("Paragraph {i} with enough words in it to wrap at a narrower width.\n\n")).collect();
+        let (mut v, _) = previewed(tag, &text);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        h.scroll(&mut v, (10.0, 10.0), -dy);
+        h.paint(&mut v, RECT);
+        (v, h)
+    }
+
+    #[test]
+    fn the_anchor_block_measured_off_its_estimate_keeps_its_bottom_part_in_place() {
+        let (mut v, mut h) = scrolled("pv-anchor-self", 260.0);
+        let Anchor { index, offset } = v.preview.anchor;
+        assert!(offset > 0.0);
+        let measured = v.preview.laid[index].height.unwrap().0;
+        // As if scrolled up into it while only estimated, 20 px short.
+        v.preview.laid[index].height = Some((measured - 20.0, false));
+        h.paint(&mut v, RECT);
+        assert_eq!(v.preview.anchor, Anchor { index, offset: offset + 20.0 });
+        assert!(h.frame.wants_frame, "repaints at the new offset");
+    }
+
+    #[test]
+    fn a_resize_keeps_the_anchor_blocks_share_above_the_top() {
+        let (mut v, mut h) = scrolled("pv-anchor-resize", 260.0);
+        let Anchor { index, offset } = v.preview.anchor;
+        let share = offset / v.preview.laid[index].height.unwrap().0;
+        let narrow = Rect { w: 260.0, ..RECT };
+        h.paint(&mut v, narrow);
+        h.paint(&mut v, narrow);
+        let a = v.preview.anchor;
+        assert_eq!(a.index, index);
+        let (hgt, measured) = v.preview.laid[index].height.unwrap();
+        assert!(measured);
+        assert!((a.offset / hgt - share).abs() < 0.01, "{} vs {share}", a.offset / hgt);
+    }
+
+    #[test]
+    fn a_press_after_a_reparse_never_reads_a_stale_block() {
+        let (mut v, mut h) = scrolled("pv-stale", 0.0);
+        let y = v.preview.shown.last().unwrap().1 + 1.0;
+        v.preview.adopt(parse::parse("one"), 99);
+        assert_eq!(v.preview.press((60.0, y), 2), None);
+        h.paint(&mut v, RECT);
+    }
+
+    #[test]
+    fn a_line_asked_for_is_the_top_line_before_it_shows() {
+        let mut p = Preview::new(None);
+        p.show_line(7);
+        assert_eq!(p.top_line(), Some(7));
+    }
+
+    #[test]
+    fn edits_during_a_parse_coalesce_into_one_more() {
+        let text: String = (0..4000).map(|i| format!("Paragraph number {i}.\n\n")).collect();
+        let (mut v, _) = previewed("pv-coalesce", &text);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let first = v.preview.job.as_ref().map(|j| j.0);
+        assert_eq!(first, Some(v.buf.edits));
+        for _ in 0..3 {
+            v.write_input(b"x");
+            h.paint(&mut v, RECT);
+            if let (Some(j), None) = (&v.preview.job, v.preview.parsed) {
+                assert_eq!(Some(j.0), first, "no second parse while the first runs");
+            }
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !v.preview.is_current(v.buf.edits) {
+            v.refresh();
+            h.paint(&mut v, RECT);
+            assert!(Instant::now() < deadline, "never caught up");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     #[test]
