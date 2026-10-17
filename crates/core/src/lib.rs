@@ -13,6 +13,7 @@ pub mod git;
 pub mod highlight;
 pub mod line_diff;
 pub mod registry;
+pub mod search;
 pub mod tree;
 
 pub use config::{Chrome, CloseOnExit, Config, Inbox, LineNumbers, Side, Web};

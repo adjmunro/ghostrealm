@@ -914,19 +914,25 @@ impl FsTree {
         entries
     }
 
-    /// A walk builder honouring the current toggles. `hidden(true)` *skips* hidden
-    /// files, so it is the negation of `show_hidden`; likewise for gitignore.
+    /// A walk builder honouring the current toggles.
     fn walk_builder(&self, dir: &Path) -> ignore::WalkBuilder {
-        let mut b = ignore::WalkBuilder::new(dir);
-        b.hidden(!self.show_hidden)
-            .git_ignore(!self.show_gitignored)
-            .git_global(!self.show_gitignored)
-            .git_exclude(!self.show_gitignored)
-            .ignore(!self.show_gitignored)
-            .parents(true)
-            .follow_links(false);
-        b
+        walk_builder(dir, self.show_hidden, self.show_gitignored)
     }
+}
+
+/// A walk builder over `dir` that lists hidden and git-ignored entries only
+/// when asked. `hidden(true)` *skips* hidden files, so it is the negation of
+/// `show_hidden`; likewise for gitignore.
+pub(crate) fn walk_builder(dir: &Path, show_hidden: bool, show_gitignored: bool) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(dir);
+    b.hidden(!show_hidden)
+        .git_ignore(!show_gitignored)
+        .git_global(!show_gitignored)
+        .git_exclude(!show_gitignored)
+        .ignore(!show_gitignored)
+        .parents(true)
+        .follow_links(false);
+    b
 }
 
 /// Whether an entry is a directory, resolving a symlink to its target: listings
