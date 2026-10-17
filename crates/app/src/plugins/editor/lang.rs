@@ -230,9 +230,9 @@ fn to_lsp(lines: &[String], (line, col): Pos, enc: ghostrealm_lsp::Encoding) -> 
     Position { line: line as u32, character }
 }
 
-/// Paint `popup` below the character whose cell's top-left is `anchor` (above
-/// it when there's no room below), kept inside `area`.
-pub fn paint_popup(cx: &mut PaintCx, popup: &Popup, anchor: (f32, f32), area: Rect) {
+/// Paint `popup` below the character whose cell's top-left and row height
+/// are `anchor` (above it when there's no room below), kept inside `area`.
+pub fn paint_popup(cx: &mut PaintCx, popup: &Popup, anchor: (f32, f32, f32), area: Rect) {
     let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
     let pad = 6.0 * cx.ui.scale;
     let max_cols = (((area.w - 2.0 * pad) / cw).floor().max(10.0) as usize).min(POPUP_COLS);
@@ -246,7 +246,7 @@ pub fn paint_popup(cx: &mut PaintCx, popup: &Popup, anchor: (f32, f32), area: Re
     let cols = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
     let w = cols as f32 * cw + 2.0 * pad;
     let h = rows.len() as f32 * ch + 2.0 * pad;
-    let below = anchor.1 + ch;
+    let below = anchor.1 + anchor.2;
     let y = if below + h <= area.y + area.h || anchor.1 - h < area.y {
         below
     } else {

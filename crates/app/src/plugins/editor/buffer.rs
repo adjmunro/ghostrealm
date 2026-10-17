@@ -845,19 +845,34 @@ impl EditorBuffer {
         self.touch(row);
     }
 
-    /// Scroll to keep the cursor visible — vertically within `rows` lines, and
-    /// (when `hcols` is `Some`, i.e. soft-wrap off) horizontally within `hcols`
-    /// columns — but only when the cursor actually moved since the last follow, so
-    /// manual scrolling (which leaves the cursor put) isn't yanked back each frame.
-    pub fn follow_cursor(&mut self, rows: usize, hcols: Option<usize>) {
+    /// Scroll to keep the cursor visible — vertically within `body_h` px,
+    /// line `ln` taking `height(self, ln)` (for the cursor's line, down to the
+    /// bottom of the cursor's row), and (when `hcols` is `Some`, i.e.
+    /// soft-wrap off) horizontally within `hcols` columns — but only when the
+    /// cursor actually moved since the last follow, so manual scrolling (which
+    /// leaves the cursor put) isn't yanked back each frame. The scroll stays a
+    /// top line: the cursor's line shows from its top, even when it alone is
+    /// taller than the body.
+    pub fn follow_cursor(&mut self, body_h: f32, mut height: impl FnMut(&Self, usize) -> f32, hcols: Option<usize>) {
         if self.cursor == self.last_cursor {
             return;
         }
-        let rows = rows.max(1);
         if self.cursor.0 < self.scroll {
             self.scroll = self.cursor.0;
-        } else if self.cursor.0 >= self.scroll + rows {
-            self.scroll = self.cursor.0 + 1 - rows;
+        } else {
+            // Walk up from the cursor while the lines fit: bounded by the
+            // body's height, however far the cursor jumped.
+            let (mut top, mut used) = (self.cursor.0, height(self, self.cursor.0));
+            while top > self.scroll {
+                let h = height(self, top - 1);
+                // Slack for the float sum of fractional row heights.
+                if used + h > body_h + 0.01 {
+                    break;
+                }
+                used += h;
+                top -= 1;
+            }
+            self.scroll = top;
         }
         if let Some(cols) = hcols {
             let cols = cols.max(1);
@@ -1606,21 +1621,43 @@ mod tests {
         for _ in 0..30 {
             e.insert_newline();
         }
+        let unit = |_: &EditorBuffer, _| 1.0;
         // cursor at row 30; a 10-row window scrolls to keep it visible.
-        e.follow_cursor(10, None);
-        assert!(e.scroll <= 30 && e.scroll + 10 > 30);
+        e.follow_cursor(10.0, unit, None);
+        assert_eq!(e.scroll, 21, "the cursor on the last row");
         // Manual scroll away from the cursor is NOT yanked back (cursor unchanged).
         e.scroll = 5;
-        e.follow_cursor(10, None);
+        e.follow_cursor(10.0, unit, None);
         assert_eq!(e.scroll, 5, "manual scroll sticks when the cursor hasn't moved");
         // Moving the cursor makes the view follow again.
         e.cursor.0 = 0;
-        e.follow_cursor(10, None);
+        e.follow_cursor(10.0, unit, None);
         assert_eq!(e.scroll, 0, "moving to the top scrolls back up");
         // Horizontal follow when soft-wrap is off (hcols = Some).
         e.cursor = (0, 200);
-        e.follow_cursor(10, Some(20));
+        e.follow_cursor(10.0, unit, Some(20));
         assert!(e.hscroll <= 200 && e.hscroll + 20 > 200);
+    }
+
+    #[test]
+    fn follow_cursor_fits_lines_by_their_heights() {
+        let mut e = EditorBuffer::scratch();
+        for _ in 0..30 {
+            e.insert_newline();
+        }
+        // Every third line is three rows tall.
+        let tall = |_: &EditorBuffer, ln: usize| if ln.is_multiple_of(3) { 3.0 } else { 1.0 };
+        e.follow_cursor(10.0, tall, None);
+        // Lines 24..=30 are 3+1+1+3+1+1+3 = 13 tall; 25..=30 are 10.
+        assert_eq!(e.scroll, 25);
+        // A line taller than the body shows from its top.
+        e.cursor.0 = 27;
+        e.follow_cursor(2.0, tall, None);
+        assert_eq!(e.scroll, 27);
+        // A move within what fits leaves the scroll.
+        e.cursor.0 = 28;
+        e.follow_cursor(10.0, tall, None);
+        assert_eq!(e.scroll, 27);
     }
 
     #[test]

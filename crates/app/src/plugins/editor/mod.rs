@@ -6,6 +6,7 @@
 pub mod buffer;
 mod stats;
 pub mod lang;
+mod rows;
 pub mod wrap;
 
 use std::any::Any;
@@ -35,7 +36,7 @@ use crate::plugins::files::header::{text_kind, DocHeader, HeaderText};
 pub use buffer::EditorBuffer;
 use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
-use wrap::wrap_line;
+use rows::{RowKind, RowLayout, RowTable, TextRow};
 
 pub const ID: &str = "editor";
 
@@ -225,8 +226,8 @@ struct Layout {
     body: Rect,
     /// Left edge of the text (right of the gutter).
     text_x: f32,
-    /// Columns per visual row when soft-wrapping, else `usize::MAX`.
-    wrap_cols: usize,
+    /// How lines break into rows.
+    rows: RowLayout,
 }
 
 pub struct EditorView {
@@ -248,6 +249,9 @@ pub struct EditorView {
     seen_edits: u64,
     last_edit_at: Option<Instant>,
     layout: Layout,
+    /// The rows the last paint laid out (relaid when an event finds them
+    /// stale).
+    rows: RowTable,
     /// Draw the document header above the text: the view is a Files
     /// surface's document.
     header_on: bool,
@@ -317,8 +321,9 @@ impl EditorView {
             layout: Layout {
                 body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 text_x: 0.0,
-                wrap_cols: usize::MAX,
+                rows: RowLayout { text_w: 0.0, cell: (0.0, 0.0), wrap: false },
             },
+            rows: RowTable::default(),
             lang: None,
             header_on: false,
             header: DocHeader::default(),
@@ -570,46 +575,52 @@ impl EditorView {
         }
     }
 
-    /// The visual row at height `y`, from the last paint's layout (wrap- and
-    /// scroll-aware): its logical line, the column it starts at, and how many
-    /// characters it shows from there. `None` below the text.
-    fn visual_row(&self, y: f32, cell_h: f32) -> Option<(usize, usize, usize)> {
+    /// Lay out the rows from the scroll line in the last paint's layout.
+    fn layout_rows(&mut self) {
         let l = self.layout;
-        let e = &self.buf;
-        let row_off = ((y - l.body.y) / cell_h).floor().max(0.0) as usize;
-        // Walk visual rows from the scroll top to the one at `y`, as paint does.
-        let mut vidx = 0usize;
-        for ln in e.scroll..e.lines.len() {
-            if l.wrap_cols == usize::MAX {
-                if vidx == row_off {
-                    // Unwrapped rows are shifted left by hscroll; a line shorter
-                    // than that shows nothing and starts at its end.
-                    let len = e.line_len(ln);
-                    return Some((ln, e.hscroll.min(len), len.saturating_sub(e.hscroll)));
-                }
-                vidx += 1;
-            } else {
-                for (text, start) in wrap_line(&e.lines[ln], l.wrap_cols) {
-                    if vidx == row_off {
-                        return Some((ln, start, text.chars().count()));
-                    }
-                    vidx += 1;
-                }
-            }
+        let h = self.buf.path.as_deref().and_then(highlight::for_path);
+        let (states, buf) = (&mut self.hl_states, &self.buf);
+        let span = (l.body.y, l.body.y + l.body.h);
+        self.rows = RowTable::build(&buf.lines, buf.scroll, buf.edits, l.rows, span, |ln| line_scale(states, buf, h, ln));
+    }
+
+    /// The row at height `y` in the last paint's layout (wrap-, scroll- and
+    /// size-aware), relaid if a scroll or an edit since has made it stale:
+    /// its logical line, the column it starts at, how many characters it
+    /// shows from there, and its scale. A row above the text is the first;
+    /// `None` below the text.
+    fn visual_row(&mut self, y: f32) -> Option<(RowKind, f32)> {
+        if !self.rows.fresh(self.buf.scroll, self.buf.edits, self.layout.rows) {
+            self.sync_hl_states();
+            self.layout_rows();
         }
-        None
+        let row = *self.rows.at(y)?;
+        let kind = match row.kind {
+            // Unwrapped rows are shifted left by hscroll; a line shorter than
+            // that shows nothing and starts at its end.
+            RowKind::Text { ln, len, .. } if !self.layout.rows.wrap => {
+                let hs = self.buf.hscroll;
+                RowKind::Text { ln, start: hs.min(len), len: len.saturating_sub(hs) }
+            }
+            kind => kind,
+        };
+        Some((kind, row.scale))
     }
 
     /// The `(line, col)` caret position nearest a point; a point below the
-    /// text lands at the end of the last line.
-    fn pos_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32) -> Option<Pos> {
+    /// text lands at the end of the last line, one on a widget at the end of
+    /// the line above it.
+    fn pos_at(&mut self, x: f32, y: f32) -> Option<Pos> {
         let l = self.layout;
         if !rect_contains(l.body, x, y) {
             return None;
         }
-        let col_off = ((x - l.text_x) / cell_w).round().max(0.0) as usize;
-        match self.visual_row(y, cell_h) {
-            Some((ln, start, len)) => Some((ln, (start + col_off).min(start + len))),
+        match self.visual_row(y) {
+            Some((RowKind::Text { ln, start, len }, scale)) => {
+                let col_off = ((x - l.text_x) / (l.rows.cell.0 * scale)).round().max(0.0) as usize;
+                Some((ln, (start + col_off).min(start + len)))
+            }
+            Some((RowKind::Widget { after_ln, .. }, _)) => Some((after_ln, self.buf.line_len(after_ln))),
             None => {
                 let last = self.buf.lines.len().saturating_sub(1);
                 Some((last, self.buf.line_len(last)))
@@ -618,13 +629,13 @@ impl EditorView {
     }
 
     /// The character under a point, if it is over one.
-    fn char_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32) -> Option<Pos> {
+    fn char_at(&mut self, x: f32, y: f32) -> Option<Pos> {
         let l = self.layout;
         if !rect_contains(l.body, x, y) || x < l.text_x {
             return None;
         }
-        let col_off = ((x - l.text_x) / cell_w).floor() as usize;
-        let (ln, start, len) = self.visual_row(y, cell_h)?;
+        let (RowKind::Text { ln, start, len }, scale) = self.visual_row(y)? else { return None };
+        let col_off = ((x - l.text_x) / (l.rows.cell.0 * scale)).floor() as usize;
         (col_off < len).then_some((ln, start + col_off))
     }
 
@@ -705,6 +716,12 @@ impl EditorView {
         cx.tooltip(sb, self.stats.tip());
         cx.place(stat, stat_left, top, sb, theme::TEXT_DIM);
     }
+}
+
+/// How much larger than the base cell line `ln` draws: every line at the
+/// base size.
+fn line_scale(_states: &mut StateCache, _buf: &EditorBuffer, _h: Option<&dyn Highlighter>, _ln: usize) -> f32 {
+    1.0
 }
 
 /// Where line `ln` sits in a fenced block ([`Highlighter::block_row`]);
@@ -945,7 +962,6 @@ impl View for EditorView {
             body = Rect { y: rect.y + header_h, h: (rect.h - header_h).max(1.0), ..rect };
         }
 
-        let rows_vis = (body.h / ch).floor().max(1.0) as usize;
         let total_lines = self.buf.lines.len();
         let gutter_w = gutter_width(cx.cfg, total_lines, cw);
         // With no gutter, half a cell before the text holds a code block's
@@ -953,45 +969,48 @@ impl View for EditorView {
         let inset = if gutter_w > 0.0 { 0.0 } else { (cw * 0.5).round() };
         let text_x = body.x + gutter_w + inset;
         let text_w = (body.w - gutter_w - inset).max(1.0);
-        let text_cols = ((text_w / cw).floor() as usize).max(1);
-        let wrap_cols = if wrap { text_cols } else { usize::MAX };
-        self.layout = Layout { body, text_x, wrap_cols };
-        // Follow the cursor only when it moved (so manual scrolling sticks);
-        // reset horizontal scroll under wrap; keep vertical scroll in bounds.
-        self.buf.follow_cursor(rows_vis, if wrap { None } else { Some(text_cols) });
+        let rows_layout = RowLayout { text_w, cell: (cw, ch), wrap };
+        let text_cols = rows_layout.cols(1.0);
+        self.layout = Layout { body, text_x, rows: rows_layout };
+        let highlighter = self.buf.path.as_deref().and_then(highlight::for_path);
+        self.sync_hl_states();
+        // Follow the cursor only when it moved (so manual scrolling sticks),
+        // fitting lines by their real heights; reset horizontal scroll under
+        // wrap; keep vertical scroll in bounds.
+        {
+            let states = &mut self.hl_states;
+            let cursor = self.buf.cursor;
+            let hcols = (!wrap).then(|| rows_layout.cols(line_scale(states, &self.buf, highlighter, cursor.0)));
+            let height = |b: &EditorBuffer, ln: usize| {
+                let scale = line_scale(states, b, highlighter, ln);
+                let rows = rows_layout.rows(&b.lines[ln], scale);
+                // The cursor's line counts down to the row its caret is on.
+                let n = match ln == b.cursor.0 {
+                    true => rows.iter().rposition(|(start, _)| *start <= b.cursor.1).map_or(rows.len(), |i| i + 1),
+                    false => rows.len(),
+                };
+                n as f32 * rows_layout.row_h(scale)
+            };
+            self.buf.follow_cursor(body.h, height, hcols);
+        }
         if wrap {
             self.buf.hscroll = 0;
         }
         self.buf.clamp_scroll_bounds();
+        self.layout_rows();
 
-        self.sync_hl_states();
         let e = &self.buf;
-        let (scroll, cursor, sel) = (e.scroll, e.cursor, e.selection());
+        let (cursor, sel) = (e.cursor, e.selection());
         // Unwrapped rows hold their whole line, shaped once, drawn shifted left
         // by hscroll and clipped — moving the viewport rather than reshaping.
-        let hscroll_px = e.hscroll as f32 * cw;
-        let highlighter = e.path.as_deref().and_then(highlight::for_path);
+        // A row's columns are its scale times the base cell wide.
+        let col_w = |r: &TextRow| cw * r.scale;
+        let hscroll = e.hscroll;
+        let hscroll_px = move |r: &TextRow| hscroll as f32 * col_w(r);
         cx.fill(body, EDITOR_BG);
 
-        // Visible visual rows: (logical line, text, start col, y).
-        let bottom = body.y + body.h;
-        let mut vis: Vec<(usize, String, usize, f32)> = Vec::new();
-        let mut vy = body.y;
-        'lines: for ln in scroll..(scroll + rows_vis).min(e.lines.len()) {
-            let line = &e.lines[ln];
-            let rows = if wrap {
-                wrap_line(line, wrap_cols)
-            } else {
-                vec![(line.clone(), 0)]
-            };
-            for (text, start) in rows {
-                if vy >= bottom {
-                    break 'lines;
-                }
-                vis.push((ln, text, start, vy));
-                vy += ch;
-            }
-        }
+        // Visible text rows, top to bottom.
+        let vis: Vec<TextRow> = self.rows.text_rows().collect();
 
         self.code_blocks.clear();
         self.hover_block = None;
@@ -999,7 +1018,7 @@ impl View for EditorView {
         let mut copy_button = None;
         // Each visible row's place in a fenced block.
         let roles: Vec<Option<BlockRow>> = match highlighter {
-            Some(h) => vis.iter().map(|(ln, ..)| block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, *ln)).collect(),
+            Some(h) => vis.iter().map(|r| block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, r.ln)).collect(),
             None => Vec::new(),
         };
         if let Some(h) = highlighter {
@@ -1014,7 +1033,7 @@ impl View for EditorView {
                 };
                 let first = i;
                 while i + 1 < vis.len()
-                    && (vis[i + 1].0 == vis[i].0
+                    && (vis[i + 1].ln == vis[i].ln
                         || roles[i] != Some(BlockRow::Close)
                             && matches!(roles[i + 1], Some(BlockRow::Body | BlockRow::Close)))
                 {
@@ -1022,32 +1041,32 @@ impl View for EditorView {
                 }
                 let mut last = i;
                 i += 1;
-                let open_top = role != BlockRow::Open || vis[first].2 != 0;
+                let open_top = role != BlockRow::Open || vis[first].start != 0;
                 let open_bottom = last + 1 == vis.len() && {
-                    let (ln, text, start, _) = &vis[last];
-                    start + text.chars().count() < e.lines[*ln].chars().count()
+                    let r = &vis[last];
+                    r.start + r.len < e.lines[r.ln].chars().count()
                         || roles[last] != Some(BlockRow::Close)
                             && matches!(
-                                block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, ln + 1),
+                                block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, r.ln + 1),
                                 Some(BlockRow::Body | BlockRow::Close)
                             )
                 };
                 // An unclosed block ends at its last line with text, as its
                 // copy does.
                 if !open_bottom && roles[last] != Some(BlockRow::Close) {
-                    let open = block_open(&mut self.hl_states, &mut self.hl_spans, e, h, vis[first].0);
+                    let open = block_open(&mut self.hl_states, &mut self.hl_spans, e, h, vis[first].ln);
                     let container = open.map(|o| Container::of(&e.lines[o]));
                     while last > first
                         && roles[last] == Some(BlockRow::Body)
-                        && container.is_some_and(|c| c.strip(&e.lines[vis[last].0]).trim().is_empty())
+                        && container.is_some_and(|c| c.strip(&e.lines[vis[last].ln]).trim().is_empty())
                     {
                         last -= 1;
                     }
                 }
-                let top = vis[first].3;
-                let bottom = vis[last].3 + ch;
+                let top = vis[first].y;
+                let bottom = vis[last].bottom();
                 let rect = paint_code_block(cx, body, (text_x, text_end), (top, bottom), (open_top, open_bottom));
-                let first_ln = vis[first].0;
+                let first_ln = vis[first].ln;
                 self.code_blocks.push(ShownBlock { rect, first: first_ln });
                 if cx.modal || !cx.hovered(rect) {
                     continue;
@@ -1073,82 +1092,76 @@ impl View for EditorView {
         }
 
         if cx.cfg.editor.cursor_line {
-            for (ln, _, _, y) in &vis {
-                if *ln == cursor.0 {
-                    let r = Rect { x: body.x, y: *y, w: body.w, h: ch };
-                    cx.fill_alpha(r, EDITOR_CURSOR_LINE, EDITOR_CURSOR_LINE_ALPHA);
-                }
+            for r in vis.iter().filter(|r| r.ln == cursor.0) {
+                let rect = Rect { x: body.x, y: r.y, w: body.w, h: r.h };
+                cx.fill_alpha(rect, EDITOR_CURSOR_LINE, EDITOR_CURSOR_LINE_ALPHA);
             }
         }
         // Selection, intersected with each row and clipped to the text area so it
         // never paints the gutter or a neighbouring pane.
         if let Some(((sr, sc), (er, ec))) = sel {
-            for (ln, text, start, y) in &vis {
-                let ln = *ln;
-                if ln < sr || ln > er {
+            for r in &vis {
+                if r.ln < sr || r.ln > er {
                     continue;
                 }
-                let first = if ln == sr { sc } else { 0 }.max(*start);
-                let last = if ln == er { ec } else { usize::MAX }.min(start + text.chars().count());
+                let first = if r.ln == sr { sc } else { 0 }.max(r.start);
+                let last = if r.ln == er { ec } else { usize::MAX }.min(r.start + r.len);
                 if last > first {
-                    let x0 = (text_x + (first - start) as f32 * cw - hscroll_px).max(text_x);
-                    let x1 = (text_x + (last - start) as f32 * cw - hscroll_px).min(body.x + body.w);
+                    let x0 = (text_x + (first - r.start) as f32 * col_w(r) - hscroll_px(r)).max(text_x);
+                    let x1 = (text_x + (last - r.start) as f32 * col_w(r) - hscroll_px(r)).min(body.x + body.w);
                     if x1 > x0 {
-                        let r = Rect { x: x0, y: *y, w: x1 - x0, h: ch };
-                        cx.fill_alpha(r, cx.chrome.accent, 0.35);
+                        let rect = Rect { x: x0, y: r.y, w: x1 - x0, h: r.h };
+                        cx.fill_alpha(rect, cx.chrome.accent, 0.35);
                     }
                 }
             }
         }
-        // Line numbers, on each logical line's first visual row.
+        // Line numbers, on each logical line's first visual row, at the base
+        // size whatever the row's.
         if gutter_w > 0.0 {
             let gutter = Rect { x: body.x, y: body.y, w: gutter_w, h: body.h };
-            for (ln, _, start, y) in &vis {
-                if *start != 0 {
-                    continue;
-                }
-                let is_cur = *ln == cursor.0;
+            for r in vis.iter().filter(|r| r.start == 0) {
+                let is_cur = r.ln == cursor.0;
                 let num = match cx.cfg.editor.line_numbers {
-                    LineNumbers::Relative if !is_cur => (cursor.0 as isize - *ln as isize).unsigned_abs(),
-                    _ => ln + 1,
+                    LineNumbers::Relative if !is_cur => (cursor.0 as isize - r.ln as isize).unsigned_abs(),
+                    _ => r.ln + 1,
                 };
                 let s = num.to_string();
                 let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
                 let left = text_x - cw - s.chars().count() as f32 * cw;
-                cx.row(&[(s, color)], left, *y, gutter_w, gutter, color);
+                cx.row(&[(s, color)], left, r.y, gutter_w, gutter, color);
             }
         }
         // Text, one cache-keyed row per visual row (wrapped sub-rows stay
         // cache-friendly), shaped within the frame's budget.
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
-        for (i, (ln, text, start, y)) in vis.iter().enumerate() {
-            let len = text.chars().count();
+        for (i, r) in vis.iter().enumerate() {
+            let line = &e.lines[r.ln];
             let (spans, styles) = match highlighter {
                 Some(h) => {
                     let state = if h.carries_state() {
-                        self.hl_states.state_in(h, &e.lines, e.edits, *ln)
+                        self.hl_states.state_in(h, &e.lines, e.edits, r.ln)
                     } else {
                         0
                     };
-                    let hl = self.hl_spans.spans(h, &e.lines[*ln], state);
+                    let hl = self.hl_spans.spans(h, line, state);
                     let block = roles[i].is_some();
-                    syntax::styled_row_spans(&e.lines[*ln], hl, *start, len, EDITOR_FG, block)
+                    syntax::styled_row_spans(line, hl, r.start, r.len, EDITOR_FG, block)
                 }
-                None => (vec![(text.clone(), EDITOR_FG)], Vec::new()),
+                None => (vec![(line.chars().skip(r.start).take(r.len).collect(), EDITOR_FG)], Vec::new()),
             };
-            let styles = RowStyles::new(&styles, cw);
+            let styles = RowStyles::new(&styles, cw).scaled(r.scale);
             let key = cx.row_key_styled(spans.iter().map(|(s, c)| (s.as_str(), *c)), styles);
             // Wide enough for the whole row, so layout is hscroll-independent.
-            let shape_w = (len as f32 * cw).max(text_w);
-            cx.budgeted_row_styled(key, || spans, styles, text_x - hscroll_px, *y, shape_w, text_clip, EDITOR_FG);
+            let shape_w = (r.len as f32 * cw).max(text_w);
+            let left = text_x - hscroll_px(r);
+            cx.budgeted_row_styled(key, || spans, styles, left, r.y, shape_w, text_clip, EDITOR_FG);
         }
         // Cursor bar on the cursor line's last visual row that its column reaches.
-        if let Some((_, _, start, y)) =
-            vis.iter().rev().find(|(ln, _, start, _)| *ln == cursor.0 && *start <= cursor.1)
-        {
-            let x = text_x + (cursor.1 - start) as f32 * cw - hscroll_px;
+        if let Some(r) = vis.iter().rev().find(|r| r.ln == cursor.0 && r.start <= cursor.1) {
+            let x = text_x + (cursor.1 - r.start) as f32 * col_w(r) - hscroll_px(r);
             if x >= text_x && x < body.x + body.w {
-                cx.fill_top(Rect { x, y: *y, w: 2.0 * scale, h: ch }, cx.chrome.accent, 0.9);
+                cx.fill_top(Rect { x, y: r.y, w: 2.0 * scale, h: r.h }, cx.chrome.accent, 0.9);
             }
         }
         if !cx.hovered(body) {
@@ -1159,36 +1172,34 @@ impl View for EditorView {
             // Diagnostics: an underline under each visual row's part of the span.
             let thick = (1.5 * scale).max(1.0);
             for (start, end, color) in lang.underlines(lines) {
-                for (i, (ln, text, row_start, y)) in vis.iter().enumerate() {
-                    if *ln < start.0 || *ln > end.0 {
+                for (i, r) in vis.iter().enumerate() {
+                    if r.ln < start.0 || r.ln > end.0 {
                         continue;
                     }
                     // The span's part of this line, cut to this visual row. A line's
                     // last row runs on past its text, so a span there (e.g. a missing
                     // value) still shows.
-                    let from = if *ln == start.0 { start.1 } else { 0 };
-                    let to = if *ln == end.0 { end.1 } else { lines[*ln].chars().count() };
-                    let last_row = vis.get(i + 1).is_none_or(|next| next.0 != *ln);
-                    let row_end = if last_row { usize::MAX } else { row_start + text.chars().count() };
-                    let (a, b) = (from.max(*row_start), to.min(row_end));
+                    let from = if r.ln == start.0 { start.1 } else { 0 };
+                    let to = if r.ln == end.0 { end.1 } else { lines[r.ln].chars().count() };
+                    let last_row = vis.get(i + 1).is_none_or(|next| next.ln != r.ln);
+                    let row_end = if last_row { usize::MAX } else { r.start + r.len };
+                    let (a, b) = (from.max(r.start), to.min(row_end));
                     if b <= a {
                         continue;
                     }
-                    let x0 = (text_x + (a - row_start) as f32 * cw - hscroll_px).max(text_x);
-                    let x1 = (text_x + (b - row_start) as f32 * cw - hscroll_px).min(body.x + body.w);
+                    let x0 = (text_x + (a - r.start) as f32 * col_w(r) - hscroll_px(r)).max(text_x);
+                    let x1 = (text_x + (b - r.start) as f32 * col_w(r) - hscroll_px(r)).min(body.x + body.w);
                     if x1 > x0 {
-                        cx.fill_top(Rect { x: x0, y: y + ch - thick, w: x1 - x0, h: thick }, color, 0.9);
+                        cx.fill_top(Rect { x: x0, y: r.bottom() - thick, w: x1 - x0, h: thick }, color, 0.9);
                     }
                 }
             }
             if let Some(popup) = &lang.popup {
                 let (line, col) = popup.at;
-                let row = vis.iter().find(|(ln, text, start, _)| {
-                    *ln == line && *start <= col && col <= start + text.chars().count()
-                });
-                if let Some((_, _, start, y)) = row {
-                    let x = text_x + (col - start) as f32 * cw - hscroll_px;
-                    paint_popup(cx, popup, (x, *y), body);
+                let row = vis.iter().find(|r| r.ln == line && r.start <= col && col <= r.start + r.len);
+                if let Some(r) = row {
+                    let x = text_x + (col - r.start) as f32 * col_w(r) - hscroll_px(r);
+                    paint_popup(cx, popup, (x, r.y, r.h), body);
                 }
             }
         }
@@ -1237,21 +1248,20 @@ impl View for EditorView {
         if event.is_other_button() {
             return;
         }
-        let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         match *event {
             // A press moves the cursor and anchors a potential selection; one only
             // shows once the cursor is dragged away.
             MouseEvent::Down { pos: (x, y), clicks, .. } => {
                 self.dismiss_popup();
                 self.buf.end_undo_run();
-                if let Some(p) = self.pos_at(x, y, cw, ch) {
+                if let Some(p) = self.pos_at(x, y) {
                     self.buf.cursor = p;
                     self.buf.anchor = Some(p);
                     // A double-click selects the word under the pointer (the
                     // character it is over, not the nearest caret); a triple-click
                     // the line. The release keeps either.
                     if clicks == 2 {
-                        let over = self.char_at(x, y, cw, ch).unwrap_or(p);
+                        let over = self.char_at(x, y).unwrap_or(p);
                         self.buf.select_word_at(over);
                     } else if clicks >= 3 {
                         self.buf.select_line_at(p.0);
@@ -1260,7 +1270,7 @@ impl View for EditorView {
                 }
             }
             MouseEvent::Drag { pos: (x, y), .. } => {
-                if let Some(p) = self.pos_at(x, y, cw, ch) {
+                if let Some(p) = self.pos_at(x, y) {
                     if self.buf.cursor != p {
                         self.buf.cursor = p;
                         cx.redraw();
@@ -1275,7 +1285,7 @@ impl View for EditorView {
                 }
             }
             MouseEvent::Move { pos: (x, y) } => {
-                let at = self.char_at(x, y, cw, ch);
+                let at = self.char_at(x, y);
                 if self.lang.as_mut().is_some_and(|l| l.pointer(at, Instant::now())) {
                     cx.redraw();
                 }
