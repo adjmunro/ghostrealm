@@ -735,8 +735,10 @@ impl<'a> PaintCx<'a> {
         out
     }
 
-    /// Paint `f` with its quads over the text, as [`fill_top`](Self::fill_top)
-    /// draws: a control floating on text (a code block's copy button).
+    /// Paint `f` with its quads over the panes' text, as
+    /// [`fill_top`](Self::fill_top) draws: a control floating on text (a code
+    /// block's copy button). Text placed in `f` still draws under them, and
+    /// the app's own top items (focus border, overlays) draw over them.
     pub fn over_text(&mut self, f: impl FnOnce(&mut Self)) {
         let outer = std::mem::replace(&mut self.over_text, true);
         f(self);

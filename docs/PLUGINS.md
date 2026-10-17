@@ -101,8 +101,12 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   translucent guides so they don't overlap. Size pills, boxes, and borders
   with `theme::pill_radius`, `box_radius`, `hairline`, and `focus_ring_w`,
   which scale with `cx.ui`.
-- `over_text(|cx| ...)` draws every quad painted inside it over the text, as
-  `fill_top` does: a control floating on text (a code block's copy button).
+- `over_text(|cx| ...)` draws every quad painted inside it over the panes'
+  text, as `fill_top` does: a control floating on text (a code block's copy
+  button). Only base-layer quads move; in a popup (`above`) quads already sit
+  under the popup's text. They still draw under the app's later top items
+  (focus border, palette, picker dim, tooltips, menus), and text placed inside
+  the closure stays under them, so paint the control last.
 - Clipping: `with_clip(rect, |cx| ...)` clips every quad painted inside it
   (fills, borders, rounded rects, strokes, icons) and every `button` hit
   rect, nesting by intersection. Clip a scrolled list's rows to the list so

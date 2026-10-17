@@ -267,9 +267,14 @@ pub struct EditorView {
     hl_spans: SpanCache,
     /// The code blocks on screen, as last painted.
     code_blocks: Vec<ShownBlock>,
-    /// The first line on screen of the code block under the pointer: its
-    /// copy button shows only then.
+    /// The first line on screen of the code block the last paint found under
+    /// the pointer (and showed its copy button): a pointer move that changes
+    /// it repaints.
     hover_block: Option<usize>,
+    /// For the hovered block, keyed on its first line on screen and the
+    /// buffer's edit count: its opening line and whether its body has text,
+    /// so a hovered block deep in a long one isn't walked back every frame.
+    hover_open: Option<((usize, u64), Option<usize>, bool)>,
     /// The opening line of the code block last copied, and until when its
     /// button shows a check mark.
     copied: Option<(usize, Instant)>,
@@ -299,6 +304,7 @@ impl EditorView {
             hl_spans: SpanCache::default(),
             code_blocks: Vec::new(),
             hover_block: None,
+            hover_open: None,
             copied: None,
             stats,
             seen_edits: buf.edits,
@@ -492,36 +498,7 @@ impl EditorView {
     fn block_body(&mut self, open: usize) -> Option<String> {
         let h = self.buf.path.as_deref().and_then(highlight::for_path)?;
         self.sync_hl_states();
-        let (states, spans, buf) = (&mut self.hl_states, &mut self.hl_spans, &self.buf);
-        let mut role = |ln| block_row_of(states, spans, buf, h, ln);
-        if role(open)? != BlockRow::Open {
-            return None;
-        }
-        let mut last = open;
-        while role(last) != Some(BlockRow::Close) && matches!(role(last + 1), Some(BlockRow::Body | BlockRow::Close)) {
-            last += 1;
-        }
-        let closed = role(last) == Some(BlockRow::Close);
-        let end = if closed { last } else { last + 1 };
-        let fence: Vec<char> = buf.lines[open].chars().collect();
-        let (quotes, at) = quote_markers(&fence, usize::MAX);
-        let indent = fence[at..].iter().position(|c| matches!(c, '`' | '~')).unwrap_or(0);
-        let mut rows: Vec<String> = (open + 1..end)
-            .map(|i| {
-                let line = buf.lines[i].strip_suffix('\r').unwrap_or(&buf.lines[i]);
-                let c: Vec<char> = line.chars().collect();
-                let (_, at) = quote_markers(&c, quotes);
-                let spaces = c[at..].iter().take(indent).take_while(|c| **c == ' ').count();
-                c[at + spaces..].iter().collect()
-            })
-            .collect();
-        if !closed {
-            while rows.last().is_some_and(|r| r.trim().is_empty()) {
-                rows.pop();
-            }
-        }
-        let body = rows.join("\n");
-        (!body.trim().is_empty()).then_some(body)
+        block_text(&mut self.hl_states, &mut self.hl_spans, &self.buf, h, open)
     }
 
     /// Tell the highlight state cache which lines the edits since it last
@@ -745,6 +722,64 @@ fn block_row_of(
     h.block_row(line, state, next)
 }
 
+/// The body of the fenced block opening on line `open`, as
+/// [`EditorView::block_body`] describes.
+fn block_text(
+    states: &mut StateCache,
+    spans: &mut SpanCache,
+    buf: &EditorBuffer,
+    h: &dyn Highlighter,
+    open: usize,
+) -> Option<String> {
+    let mut role = |ln| block_row_of(states, spans, buf, h, ln);
+    if role(open)? != BlockRow::Open {
+        return None;
+    }
+    let mut last = open;
+    while role(last) != Some(BlockRow::Close) && matches!(role(last + 1), Some(BlockRow::Body | BlockRow::Close)) {
+        last += 1;
+    }
+    let closed = role(last) == Some(BlockRow::Close);
+    let end = if closed { last } else { last + 1 };
+    let container = Container::of(&buf.lines[open]);
+    let mut rows: Vec<String> = (open + 1..end).map(|i| container.strip(&buf.lines[i])).collect();
+    if !closed {
+        while rows.last().is_some_and(|r| r.trim().is_empty()) {
+            rows.pop();
+        }
+    }
+    let body = rows.join("\n");
+    (!body.trim().is_empty()).then_some(body)
+}
+
+/// What a fenced block's rows sit in, read from its opening fence: how many
+/// quote markers, and its container's indent (the fence's own, or a list
+/// item's content column).
+#[derive(Clone, Copy)]
+struct Container {
+    quotes: usize,
+    indent: usize,
+}
+
+impl Container {
+    fn of(fence: &str) -> Self {
+        let c: Vec<char> = fence.chars().collect();
+        let (quotes, at) = quote_markers(&c, usize::MAX);
+        let indent = c[at..].iter().position(|c| matches!(c, '`' | '~')).unwrap_or(0);
+        Container { quotes, indent }
+    }
+
+    /// A body row's own text: without a trailing `\r`, the quote markers
+    /// (each with one optional space), and up to the indent in spaces.
+    fn strip(self, line: &str) -> String {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let c: Vec<char> = line.chars().collect();
+        let (_, at) = quote_markers(&c, self.quotes);
+        let spaces = c[at..].iter().take(self.indent).take_while(|c| **c == ' ').count();
+        c[at + spaces..].iter().collect()
+    }
+}
+
 /// Up to `max` block-quote markers at the start of `c` (`>`, after up to
 /// three spaces, with one optional space after it): how many, and the char
 /// index past them.
@@ -817,15 +852,18 @@ fn paint_copy_button(cx: &mut PaintCx, block: Rect, top: f32, id: u32, copied: b
     let line = theme::hairline(cx.ui);
     let side = ch;
     let b = Rect { x: (block.x + block.w - line * 2.0 - side).round(), y: top.round(), w: side, h: side };
-    let hover = cx.button(b, id);
-    cx.tooltip(b, if copied { "Copied" } else { "Copy code" });
     let pill = hover_box(b, side);
     let radius = theme::box_radius(cx.ui);
-    let fill = over(EDITOR_BG, theme::CODE_BOX_BG, theme::CODE_BOX_ALPHA);
     let border = Some((line, theme::CODE_BOX_BORDER, theme::CODE_BOX_BORDER_ALPHA));
     cx.with_clip(block, |cx| {
+        let hover = cx.button(b, id);
+        cx.tooltip(b, if copied { "Copied" } else { "Copy code" });
         cx.over_text(|cx| {
-            cx.round_rect(pill, radius, fill, 1.0, border);
+            // The box's look, layered as the box is (the GPU blends in
+            // linear light, so a premixed colour wouldn't match), on an
+            // opaque base that hides the glyphs under it.
+            cx.round_rect(pill, radius, EDITOR_BG, 1.0, None);
+            cx.round_rect(pill, radius, theme::CODE_BOX_BG, theme::CODE_BOX_ALPHA, border);
             if hover {
                 cx.round_rect(pill, radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
             }
@@ -844,11 +882,6 @@ fn paint_copy_button(cx: &mut PaintCx, block: Rect, top: f32, id: u32, copied: b
             if copied { Icon::Check } else { Icon::Copy }.paint(cx, icon, color);
         });
     });
-}
-
-/// `fg` at `alpha` over `bg`, as an opaque colour.
-fn over(bg: [u8; 3], fg: [u8; 3], alpha: f32) -> [u8; 3] {
-    std::array::from_fn(|i| (bg[i] as f32 + (fg[i] as f32 - bg[i] as f32) * alpha).round() as u8)
 }
 
 /// The floppy-disk icon's side, in rows.
@@ -961,6 +994,9 @@ impl View for EditorView {
         }
 
         self.code_blocks.clear();
+        self.hover_block = None;
+        // The hovered block's copy button: painted last, over the caret.
+        let mut copy_button = None;
         // Each visible row's place in a fenced block.
         let roles: Vec<Option<BlockRow>> = match highlighter {
             Some(h) => vis.iter().map(|(ln, ..)| block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, *ln)).collect(),
@@ -996,9 +1032,15 @@ impl View for EditorView {
                                 Some(BlockRow::Body | BlockRow::Close)
                             )
                 };
-                // An unclosed block ends at its last line with text.
+                // An unclosed block ends at its last line with text, as its
+                // copy does.
                 if !open_bottom && roles[last] != Some(BlockRow::Close) {
-                    while last > first && roles[last] == Some(BlockRow::Body) && vis[last].1.trim().is_empty() {
+                    let open = block_open(&mut self.hl_states, &mut self.hl_spans, e, h, vis[first].0);
+                    let container = open.map(|o| Container::of(&e.lines[o]));
+                    while last > first
+                        && roles[last] == Some(BlockRow::Body)
+                        && container.is_some_and(|c| c.strip(&e.lines[vis[last].0]).trim().is_empty())
+                    {
                         last -= 1;
                     }
                 }
@@ -1010,15 +1052,22 @@ impl View for EditorView {
                 if cx.modal || !cx.hovered(rect) {
                     continue;
                 }
-                let Some(open) = block_open(&mut self.hl_states, &mut self.hl_spans, e, h, first_ln) else {
-                    continue;
+                self.hover_block = Some(first_ln);
+                let key = (first_ln, e.edits);
+                let (open, has_body) = match self.hover_open {
+                    Some((k, open, has_body)) if k == key => (open, has_body),
+                    _ => {
+                        let open = block_open(&mut self.hl_states, &mut self.hl_spans, e, h, first_ln);
+                        let has_body = open
+                            .is_some_and(|o| block_text(&mut self.hl_states, &mut self.hl_spans, e, h, o).is_some());
+                        self.hover_open = Some((key, open, has_body));
+                        (open, has_body)
+                    }
                 };
-                let has_body =
-                    matches!(block_row_of(&mut self.hl_states, &mut self.hl_spans, e, h, open + 1), Some(BlockRow::Body));
-                let id = u32::try_from(open).ok().and_then(|o| BTN_COPY_BLOCK.checked_add(o));
-                if let (true, Some(id)) = (has_body, id) {
+                let id = open.and_then(|o| u32::try_from(o).ok()).and_then(|o| BTN_COPY_BLOCK.checked_add(o));
+                if let (true, Some(open), Some(id)) = (has_body, open, id) {
                     let copied = self.copied.is_some_and(|(o, until)| o == open && Instant::now() < until);
-                    paint_copy_button(cx, rect, top, id, copied);
+                    copy_button = Some((rect, top, id, copied));
                 }
             }
         }
@@ -1105,42 +1154,46 @@ impl View for EditorView {
         if !cx.hovered(body) {
             self.dismiss_popup();
         }
-        let Some(lang) = &self.lang else { return };
-        let lines = &self.buf.lines;
-        // Diagnostics: an underline under each visual row's part of the span.
-        let thick = (1.5 * scale).max(1.0);
-        for (start, end, color) in lang.underlines(lines) {
-            for (i, (ln, text, row_start, y)) in vis.iter().enumerate() {
-                if *ln < start.0 || *ln > end.0 {
-                    continue;
+        if let Some(lang) = &self.lang {
+            let lines = &self.buf.lines;
+            // Diagnostics: an underline under each visual row's part of the span.
+            let thick = (1.5 * scale).max(1.0);
+            for (start, end, color) in lang.underlines(lines) {
+                for (i, (ln, text, row_start, y)) in vis.iter().enumerate() {
+                    if *ln < start.0 || *ln > end.0 {
+                        continue;
+                    }
+                    // The span's part of this line, cut to this visual row. A line's
+                    // last row runs on past its text, so a span there (e.g. a missing
+                    // value) still shows.
+                    let from = if *ln == start.0 { start.1 } else { 0 };
+                    let to = if *ln == end.0 { end.1 } else { lines[*ln].chars().count() };
+                    let last_row = vis.get(i + 1).is_none_or(|next| next.0 != *ln);
+                    let row_end = if last_row { usize::MAX } else { row_start + text.chars().count() };
+                    let (a, b) = (from.max(*row_start), to.min(row_end));
+                    if b <= a {
+                        continue;
+                    }
+                    let x0 = (text_x + (a - row_start) as f32 * cw - hscroll_px).max(text_x);
+                    let x1 = (text_x + (b - row_start) as f32 * cw - hscroll_px).min(body.x + body.w);
+                    if x1 > x0 {
+                        cx.fill_top(Rect { x: x0, y: y + ch - thick, w: x1 - x0, h: thick }, color, 0.9);
+                    }
                 }
-                // The span's part of this line, cut to this visual row. A line's
-                // last row runs on past its text, so a span there (e.g. a missing
-                // value) still shows.
-                let from = if *ln == start.0 { start.1 } else { 0 };
-                let to = if *ln == end.0 { end.1 } else { lines[*ln].chars().count() };
-                let last_row = vis.get(i + 1).is_none_or(|next| next.0 != *ln);
-                let row_end = if last_row { usize::MAX } else { row_start + text.chars().count() };
-                let (a, b) = (from.max(*row_start), to.min(row_end));
-                if b <= a {
-                    continue;
-                }
-                let x0 = (text_x + (a - row_start) as f32 * cw - hscroll_px).max(text_x);
-                let x1 = (text_x + (b - row_start) as f32 * cw - hscroll_px).min(body.x + body.w);
-                if x1 > x0 {
-                    cx.fill_top(Rect { x: x0, y: y + ch - thick, w: x1 - x0, h: thick }, color, 0.9);
+            }
+            if let Some(popup) = &lang.popup {
+                let (line, col) = popup.at;
+                let row = vis.iter().find(|(ln, text, start, _)| {
+                    *ln == line && *start <= col && col <= start + text.chars().count()
+                });
+                if let Some((_, _, start, y)) = row {
+                    let x = text_x + (col - start) as f32 * cw - hscroll_px;
+                    paint_popup(cx, popup, (x, *y), body);
                 }
             }
         }
-        if let Some(popup) = &lang.popup {
-            let (line, col) = popup.at;
-            let row = vis.iter().find(|(ln, text, start, _)| {
-                *ln == line && *start <= col && col <= start + text.chars().count()
-            });
-            if let Some((_, _, start, y)) = row {
-                let x = text_x + (col - start) as f32 * cw - hscroll_px;
-                paint_popup(cx, popup, (x, *y), body);
-            }
+        if let Some((rect, top, id, copied)) = copy_button {
+            paint_copy_button(cx, rect, top, id, copied);
         }
     }
 
@@ -2389,9 +2442,10 @@ mod tests {
         let buttons = copy_buttons(&h);
         assert_eq!(buttons.len(), 1);
         let (b, id) = buttons[0];
-        assert_eq!((b.y, id), (UI.cell_h, BTN_COPY_BLOCK + 1));
+        // Its hit rect is cut to the box, which starts a hairline into the row.
+        assert_eq!((b.y, id), (UI.cell_h + theme::hairline(UI), BTN_COPY_BLOCK + 1));
         assert!(b.x + b.w <= RECT.w, "inside the box");
-        assert!(!h.frame.top.is_empty(), "the button is drawn over the text");
+        assert_eq!(pill_colors(&h).len(), 2, "the button's pill is drawn over the text");
         // Each block's body: no fences, the quote's own marker only, the
         // list item's content column, the fence's indent (the rest kept),
         // and an unclosed block without its trailing blank rows.
@@ -2412,6 +2466,62 @@ mod tests {
         h.cursor = (-1.0, -1.0);
         h.paint(&mut v, tall);
         assert!(copy_buttons(&h).is_empty());
+    }
+
+    /// The over-text quads in the copy button pill's two layers: the
+    /// editor's background, opaque, then the code box's fill.
+    fn pill_colors(h: &Harness) -> Vec<([f32; 4], f32)> {
+        use crate::plugin::paint::round_quad;
+        let r = Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+        let base = round_quad(r, 1.0, 1.0, 0.0, EDITOR_BG, 1.0, None).color;
+        let fill = round_quad(r, 1.0, 1.0, 0.0, theme::CODE_BOX_BG, theme::CODE_BOX_ALPHA, None).color;
+        h.frame.top.iter().filter(|q| q.color == base || q.color == fill).map(|q| (q.color, q.border_w)).collect()
+    }
+
+    #[test]
+    fn the_copy_pill_layers_the_box_look_over_an_opaque_base_after_the_caret() {
+        let mut v = markdown_view("editor-md-pill", "```\na\n```");
+        let mut h = Harness::new();
+        paint_plain(&mut h, &mut v);
+        assert!(pill_colors(&h).is_empty(), "no pill while the pointer is away");
+        h.cursor = at(1, 0);
+        h.paint(&mut v, RECT);
+        let layers = pill_colors(&h);
+        assert_eq!(layers.len(), 2, "{layers:?}");
+        assert_eq!(layers[0].0[3], 1.0, "an opaque base");
+        assert_eq!(layers[1].0[3], theme::CODE_BOX_ALPHA, "then the box's fill");
+        assert!(layers[1].1 > 0.0, "with the box's border");
+        // The caret (the cursor is at the start of line 0) is drawn first.
+        let caret = h.frame.top.iter().position(|q| q.px[0] == 2.0 * UI.scale).expect("a caret");
+        let pill = h.frame.top.iter().position(|q| q.color[3] == 1.0 && q.radius > 0.0).unwrap();
+        assert!(caret < pill, "the button covers the caret");
+    }
+
+    #[test]
+    fn a_blank_bodied_or_quoted_unclosed_block_trims_as_its_copy_does() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-blank-body", "```\n  \n```\n");
+        h.cursor = at(1, 0);
+        h.paint(&mut v, RECT);
+        assert!(copy_buttons(&h).is_empty(), "a body of blank rows has nothing to copy");
+        // An unclosed quoted block ends at its last row with text, `>` aside.
+        let mut v = markdown_view("editor-md-quoted-open", "> ```\n> a\n>\n> \nafter");
+        paint_plain(&mut h, &mut v);
+        let b = code_boxes(&h)[0];
+        assert_eq!(((b.1 + b.3) / UI.cell_h).round(), 2.0, "{b:?}");
+        assert_eq!(copy_at(&mut h, &mut v, RECT, at(1, 3)).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_move_compares_with_the_block_last_painted_as_hovered() {
+        let mut v = markdown_view("editor-md-hover-painted", "```\na\n```\nafter");
+        let mut h = Harness::new();
+        h.cursor = at(1, 0);
+        h.paint(&mut v, RECT);
+        assert!(!h.mouse(&mut v, MouseEvent::Move { pos: at(1, 1) }).redraw, "already shown");
+        h.cursor = (-1.0, -1.0);
+        h.paint(&mut v, RECT);
+        assert!(h.mouse(&mut v, MouseEvent::Move { pos: at(1, 1) }).redraw, "not shown yet");
     }
 
     #[test]
