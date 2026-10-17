@@ -1019,7 +1019,15 @@ pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 /// open, so neither is read.
 pub fn read_text(path: &Path) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind, Read};
-    let meta = std::fs::metadata(path)?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    // A FIFO's open waits for a writer; non-blocking, it returns at once
+    // (and is then refused below). A regular file reads as usual.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let mut file = open.open(path)?;
+    // Of what was opened, not of a path that may since name another.
+    let meta = file.metadata()?;
     if !meta.is_file() {
         let what = if meta.is_dir() { "a folder" } else { "not a regular file" };
         return Err(Error::new(ErrorKind::InvalidInput, format!("{} is {what}", path.display())));
@@ -1030,7 +1038,7 @@ pub fn read_text(path: &Path) -> std::io::Result<String> {
     }
     // It may have grown since: read no further than the cap.
     let mut bytes = Vec::with_capacity(meta.len() as usize);
-    std::fs::File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    (&mut file).take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(too_big());
     }

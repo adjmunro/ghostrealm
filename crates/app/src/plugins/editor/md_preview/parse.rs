@@ -51,9 +51,8 @@ pub enum Kind {
     Rule,
     /// Raw HTML, shown as its source.
     Html(String),
-    /// A YAML metadata block (`---` fenced: front matter), as its source
-    /// without the fences. pulldown-cmark takes one after a blank line
-    /// anywhere, not only at the top.
+    /// Front matter: a `---` fenced block opening the document, as its
+    /// source without the fences.
     FrontMatter(String),
 }
 
@@ -71,12 +70,16 @@ pub struct Block {
 
 /// Parse `text` into blocks.
 pub fn parse(text: &str) -> Vec<Block> {
-    let opts = Options::ENABLE_TABLES
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    let mut b = Builder::new(text);
-    for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let (front, rest, base) = match front_matter(text) {
+        Some((body, rest, lines)) => (Some(body), rest, lines),
+        None => (None, text, 0),
+    };
+    let mut b = Builder::new(rest, base);
+    if let Some(body) = front {
+        b.push_block(Kind::FrontMatter(body), 0);
+    }
+    for (event, range) in Parser::new_ext(rest, opts).into_offset_iter() {
         let line = b.line_of(range.start);
         b.event(event, line);
     }
@@ -100,6 +103,8 @@ struct TableBuild {
 }
 
 struct Builder {
+    /// The source line the parsed text starts on (past any front matter).
+    base: usize,
     line_starts: Vec<usize>,
     blocks: Vec<Block>,
     /// Each open list's next number (`None`: unordered).
@@ -119,9 +124,11 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(text: &str) -> Self {
+    /// A builder for `text`, which starts on source line `base`.
+    fn new(text: &str, base: usize) -> Self {
         let line_starts = std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
         Builder {
+            base,
             line_starts,
             blocks: Vec::new(),
             lists: Vec::new(),
@@ -140,7 +147,7 @@ impl Builder {
     }
 
     fn line_of(&self, offset: usize) -> usize {
-        self.line_starts.partition_point(|&s| s <= offset).saturating_sub(1)
+        self.base + self.line_starts.partition_point(|&s| s <= offset).saturating_sub(1)
     }
 
     fn event(&mut self, event: Event, line: usize) {
@@ -199,7 +206,7 @@ impl Builder {
                 };
                 self.code = Some((lang, String::new(), line));
             }
-            Tag::HtmlBlock | Tag::MetadataBlock(_) => {
+            Tag::HtmlBlock => {
                 self.flush();
                 self.html = Some((String::new(), line));
             }
@@ -254,11 +261,6 @@ impl Builder {
             TagEnd::HtmlBlock => {
                 if let Some((text, line)) = self.html.take() {
                     self.emit(Kind::Html(text.trim_end().to_string()), line);
-                }
-            }
-            TagEnd::MetadataBlock(_) => {
-                if let Some((text, line)) = self.html.take() {
-                    self.emit(Kind::FrontMatter(text.trim_end().to_string()), line);
                 }
             }
             TagEnd::List(_) => {
@@ -355,6 +357,34 @@ impl Builder {
         let indent = self.lists.len().min(u8::MAX as usize) as u8;
         self.blocks.push(Block { kind, line, indent, quote: self.quote });
     }
+}
+
+/// Front matter at the very start of `text` (after a byte order mark, if
+/// any): a `---` line, a first line with text, then up to a closing `---`
+/// or `...` line. Returns its body, the text after it, and how many lines
+/// it took. Only here: a `---` later is a rule (or a setext underline).
+fn front_matter(text: &str) -> Option<(String, &str, usize)> {
+    let start = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = start.split_inclusive('\n');
+    let fence = |l: &str| l.trim_end_matches(['\n', '\r']).trim_end().to_string();
+    if fence(lines.next()?) != "---" {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut taken = start.find('\n')? + 1;
+    for (i, line) in lines.enumerate() {
+        taken += line.len();
+        let l = fence(line);
+        if i == 0 && l.trim().is_empty() {
+            return None;
+        }
+        if i > 0 && (l == "---" || l == "...") {
+            let rest = &start[taken..];
+            return Some((body.join("\n"), rest, i + 2));
+        }
+        body.push(line.trim_end_matches(['\n', '\r']).to_string());
+    }
+    None
 }
 
 /// The plain text of `runs`.
@@ -515,11 +545,41 @@ mod tests {
 
     #[test]
     fn front_matter_is_one_block_not_a_rule_and_a_heading() {
-        let blocks = parse("---\ntitle: A\ntags: [x]\n---\n# Body\n");
-        let got: Vec<(Kind, usize)> = blocks.into_iter().map(|b| (b.kind, b.line)).collect();
-        assert_eq!(got[0], (Kind::FrontMatter("title: A\ntags: [x]".into()), 0));
-        assert!(matches!(&got[1], (Kind::Heading(1, _), 4)), "{got:?}");
-        assert_eq!(got.len(), 2);
+        for text in ["---\ntitle: A\ntags: [x]\n---\n# Body\n", "\u{feff}---\r\ntitle: A\r\ntags: [x]\r\n...\r\n# Body\r\n"] {
+            let got: Vec<(Kind, usize)> = parse(text).into_iter().map(|b| (b.kind, b.line)).collect();
+            assert_eq!(got[0], (Kind::FrontMatter("title: A\ntags: [x]".into()), 0), "{text:?}");
+            assert!(matches!(&got[1], (Kind::Heading(1, _), 4)), "{got:?}");
+            assert_eq!(got.len(), 2);
+        }
+        // Not front matter: a blank first line, or no closing fence.
+        for text in ["---\n\na: b\n---\n", "---\na: b\n"] {
+            assert!(!parse(text).iter().any(|b| matches!(b.kind, Kind::FrontMatter(_))), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_rule_before_a_heading_later_on_is_a_rule_and_a_heading() {
+        let text = "# Title\n\nIntro.\n\n---\n## Part 2\n\nBody text.\n\n- a list\n\n---\n## Part 3\n";
+        let got: Vec<(String, usize)> = parse(text)
+            .into_iter()
+            .map(|b| match b.kind {
+                Kind::Heading(l, r) => (format!("h{l} {}", plain(&r)), b.line),
+                Kind::Paragraph(r) => (format!("p {}", plain(&r)), b.line),
+                Kind::Item(_, r) => (format!("li {}", plain(&r)), b.line),
+                k => (format!("{k:?}"), b.line),
+            })
+            .collect();
+        let want = [
+            ("h1 Title", 0),
+            ("p Intro.", 2),
+            ("Rule", 4),
+            ("h2 Part 2", 5),
+            ("p Body text.", 7),
+            ("li a list", 9),
+            ("Rule", 11),
+            ("h2 Part 3", 12),
+        ];
+        assert_eq!(got, want.map(|(s, l)| (s.to_string(), l)));
     }
 
     #[test]

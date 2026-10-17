@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn a_device_a_folder_or_a_huge_file_doesnt_open_and_changes_nothing() {
+    fn a_device_a_folder_or_a_huge_text_file_doesnt_open_and_changes_nothing() {
         let (mut s, d) = app("open-irregular");
         let big = d.join("big.log");
         std::fs::File::create(&big).unwrap().set_len(crate::plugins::editor::buffer::MAX_FILE_BYTES + 1).unwrap();
@@ -249,6 +249,11 @@ mod tests {
         assert!(s.open_file(&d).is_err());
         assert!(s.open_file(&big).is_err());
         assert_eq!(surfaces(&s), 0, "nothing opened");
+        // The cap is the editor's: a large image still opens (as media).
+        let png = d.join("big.png");
+        std::fs::File::create(&png).unwrap().set_len(crate::plugins::editor::buffer::MAX_FILE_BYTES + 1).unwrap();
+        s.open_file(&png).unwrap();
+        assert_eq!(surfaces(&s), 1);
     }
 
     #[test]

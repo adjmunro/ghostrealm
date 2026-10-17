@@ -510,16 +510,11 @@ impl AppState {
     /// A view of `path` from plugin `id`, or else from the first plugin that
     /// claims the path: the document a Files surface shows.
     fn view_for_path(&self, id: Option<&str>, path: &Path) -> Result<Box<dyn View>> {
-        // A device or FIFO would never end or would block the UI on open;
-        // a huge file would fill memory. A missing one is a new file.
-        if let Ok(meta) = std::fs::metadata(path) {
-            if !meta.is_file() {
-                anyhow::bail!("{} isn't a regular file", path.display());
-            }
-            let max = crate::plugins::editor::buffer::MAX_FILE_BYTES;
-            if meta.len() > max {
-                anyhow::bail!("{} is over {} MB", path.display(), max >> 20);
-            }
+        // A device or FIFO would never end or would block the UI on open.
+        // A missing one is a new file. Size caps are each plugin's (the
+        // editor's in `read_text`; media decode shrinks).
+        if std::fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+            anyhow::bail!("{} isn't a regular file", path.display());
         }
         let plugin = self
             .plugins

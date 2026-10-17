@@ -56,14 +56,28 @@ impl System for HostSystem {
     /// Doesn't wait: a handler that is slow to start (a browser launching)
     /// would stall the UI. A thread reaps the child.
     fn open_url(&self, url: &str) -> Result<()> {
-        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        let mut child = std::process::Command::new(program)
-            .arg(url)
-            .spawn()
-            .with_context(|| format!("can't run `{program}`"))?;
+        let mut cmd = url_command(url);
+        let mut child = cmd.spawn().with_context(|| format!("can't run `{}`", cmd.get_program().to_string_lossy()))?;
         std::thread::spawn(move || child.wait());
         Ok(())
     }
+}
+
+/// The command that hands `url` to the system's handler. macOS `open`
+/// without `-u` takes an argument naming an existing path as that path
+/// (`https:/evil.app` in the working directory would run), so `-u` makes it
+/// a URL. The child starts at `/` with no stdin, so a relative path never
+/// resolves against the app's directory and it never reads the app's input.
+fn url_command(url: &str) -> std::process::Command {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("-u");
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    cmd.arg(url).current_dir("/").stdin(std::process::Stdio::null());
+    cmd
 }
 
 /// The schemes a link may hand to the system's handler: the web and mail.
@@ -647,6 +661,19 @@ pub mod tests {
             std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn a_url_goes_to_the_handler_as_a_url_from_the_root_with_no_stdin() {
+        let cmd = url_command("https:/evil.app");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        if cfg!(target_os = "macos") {
+            assert_eq!(cmd.get_program(), "open");
+            assert_eq!(args, ["-u", "https:/evil.app"], "never a path");
+        } else {
+            assert_eq!((cmd.get_program(), args), (OsStr::new("xdg-open"), vec![OsStr::new("https:/evil.app")]));
+        }
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
     }
 
     #[test]

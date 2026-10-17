@@ -149,9 +149,10 @@ pub struct Preview {
     anchor: Anchor,
     /// A source line to bring to the top once the blocks are in.
     goto_line: Option<usize>,
-    /// After a resize, the share of the anchor block above the top, until
-    /// the block is measured at the new width.
-    anchor_frac: Option<f32>,
+    /// After a resize, the anchor block (by index) and its share above the
+    /// top, until it is measured at the new width. Any other move of the
+    /// anchor drops it.
+    anchor_frac: Option<(usize, f32)>,
     /// The last paint's body, and blocks on screen (index, slot top,
     /// bottom).
     body: Rect,
@@ -309,6 +310,7 @@ impl Preview {
             return false;
         }
         let before = self.anchor;
+        self.anchor_frac = None;
         self.anchor.offset += dy;
         self.normalize();
         self.clamp_bottom();
@@ -337,6 +339,7 @@ impl Preview {
         if m.ctrl || m.alt || (m.super_ && !matches!(k.key, Key::Up | Key::Down)) {
             return None;
         }
+        self.anchor_frac = None;
         let moved = if dy == f32::NEG_INFINITY {
             let before = self.anchor;
             self.anchor = Anchor::default();
@@ -441,14 +444,16 @@ impl Preview {
                     l.prep = None;
                 }
             }
-            if let (Some(f), true) = (frac, index < self.blocks.len()) {
+            // A line asked for sets the top itself.
+            if let (Some(f), true, None) = (frac, index < self.blocks.len(), self.goto_line) {
                 self.anchor.offset = f * self.slot_h(index);
-                self.anchor_frac = Some(f);
+                self.anchor_frac = Some((index, f));
             }
         }
         if let Some(line) = self.goto_line.take() {
             let index = self.blocks.partition_point(|b| b.line <= line).saturating_sub(1);
             self.anchor = Anchor { index, offset: 0.0 };
+            self.anchor_frac = None;
         }
         if self.blocks.is_empty() {
             return;
@@ -566,7 +571,8 @@ impl Preview {
     /// share. Repaints next frame with the new offset.
     fn settle_anchor(&mut self, old: Option<(f32, bool)>, h: f32, cx: &mut PaintCx) {
         let before = self.anchor.offset;
-        if let Some(f) = self.anchor_frac.take() {
+        let frac = self.anchor_frac.take().filter(|(i, _)| *i == self.anchor.index);
+        if let Some((_, f)) = frac {
             self.anchor.offset = f * h;
         } else if let Some((old, false)) = old {
             if before > 0.0 {
@@ -1438,6 +1444,22 @@ mod tests {
         let (hgt, measured) = v.preview.laid[index].height.unwrap();
         assert!(measured);
         assert!((a.offset / hgt - share).abs() < 0.01, "{} vs {share}", a.offset / hgt);
+    }
+
+    #[test]
+    fn a_resize_while_editing_leaves_the_line_asked_for_at_the_top() {
+        let (mut v, mut h) = scrolled("pv-anchor-away", 260.0);
+        assert!(v.preview.anchor.offset > 0.0, "mid-block");
+        v.set_view_mode(ViewMode::Integrated);
+        v.buf.scroll = 40;
+        let narrow = Rect { w: 260.0, ..RECT };
+        h.paint(&mut v, narrow);
+        v.set_view_mode(ViewMode::Preview);
+        h.paint(&mut v, narrow);
+        h.paint(&mut v, narrow);
+        let want = v.preview.blocks.partition_point(|b| b.line <= 40) - 1;
+        assert_eq!(v.preview.anchor, Anchor { index: want, offset: 0.0 });
+        assert_eq!(v.preview.top_line(), Some(40));
     }
 
     #[test]

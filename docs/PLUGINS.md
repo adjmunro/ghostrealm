@@ -12,8 +12,9 @@ browser, image viewer, ...) should be too. The API lives in
   id (`terminal`, `files`, `editor`, `file_browser`), a title, and opens **`View`**s.
   - `open(&OpenCx)`: a fresh view (new shell, empty buffer, Files surface at the cwd).
   - `opens_path` / `open_path`: claim a file. The app opens only a regular
-    file of at most 50 MB (`editor::buffer::MAX_FILE_BYTES`), or a missing
-    one as a new file: a device or FIFO would never end or would block. Opening a file asks plugins in
+    file, or a missing one as a new file: a device or FIFO would never end
+    or would block. The editor reads at most 50 MB
+    (`editor::buffer::MAX_FILE_BYTES`); a larger text file doesn't open. Opening a file asks plugins in
     registration order; the first claim wins, so catch-alls (the editor) go last.
     The view it returns is a document: the app shows it in a tab of a Files
     surface (`FilesView::show_doc`), or shows the tab of a file one has
@@ -261,7 +262,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   unsaved edits included. `parse` turns Markdown (pulldown-cmark:
   CommonMark, GFM tables, task lists, strikethrough) into a flat list of
   blocks (heading, paragraph, list item, code, table, rule, HTML as its
-  source), each with its source line, list indent, and quote depth. A text
+  source; front matter, a `---` block
+  opening the document, dim in a code box), each with its source line, list indent, and quote depth. A text
   under 64 KiB parses at once (well under a millisecond in a release
   build); a longer one on a worker woken through the waker, the old blocks
   showing until it is done. Blocks lay out in a centred column at most 46
