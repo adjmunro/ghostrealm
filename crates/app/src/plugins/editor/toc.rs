@@ -152,7 +152,8 @@ impl Toc {
         }
     }
 
-    /// The pointer left the view: close at once.
+    /// The pointer left the view, or the view lost the keys or went off
+    /// screen: close, and stop waiting to open.
     pub fn leave(&mut self) -> bool {
         let was = self.open;
         self.close();
@@ -250,15 +251,16 @@ impl Toc {
             for slot in 0..slots {
                 let i = first + slot;
                 let y = top + slot as f32 * pitch;
+                // A dot stands for its slot's heading too: it jumps there.
+                let hit = Rect { x: area.x, y: column.y + slot as f32 * pitch, w: rail, h: pitch };
+                let hov = cx.button(hit, base + i as u32);
                 let more = (slot == 0 && first > 0) || (slot + 1 == slots && first + slots < items.len());
                 if more {
                     let d = thick + 1.0;
                     let dot = Rect { x, y: y + ((thick - d) * 0.5).round(), w: d, h: d };
-                    cx.round_rect(dot, d * 0.5, theme::DIM, 1.0, None);
+                    cx.round_rect(dot, d * 0.5, if hov { theme::GLYPH_HOVER } else { theme::DIM }, 1.0, None);
                     continue;
                 }
-                let hit = Rect { x: area.x, y: column.y + slot as f32 * pitch, w: rail, h: pitch };
-                let hov = cx.button(hit, base + i as u32);
                 let color = match (Some(i) == current, hov) {
                     (true, _) => cx.chrome.accent,
                     (false, true) => theme::GLYPH_HOVER,
@@ -314,7 +316,8 @@ impl Toc {
                 w
             }
         };
-        let x = area.x + (cw * 0.25).round();
+        // From the rail's left edge, so it covers the rail.
+        let x = area.x;
         let y = area.y + (ch * 0.25).round();
         let max_w = (area.x + area.w - x - (cw * 0.25).round()).min(PANEL_MAX_CELLS * cw);
         let w = (title_x + content_w + 2.0 * pad_x).min(max_w).max((16.0 * cw).min(max_w)).round();
@@ -408,6 +411,11 @@ mod tests {
         let rail = RAIL_CELLS * UI.cell_w;
         let in_rail = |q: &&crate::plugin::paint::QuadInstance| q.radius > 0.0 && (q.pos[0] + 1.0) / 2.0 * sw < rail;
         h.frame.bg.iter().filter(in_rail).map(|q| (q.px[0], q.color)).collect()
+    }
+
+    /// A dot's width: the dashes' thickness and a pixel.
+    fn theme_dot(_h: &Harness) -> f32 {
+        dash_pitch(UI).1 + 1.0
     }
 
     fn color(c: [u8; 3]) -> [f32; 4] {
@@ -507,13 +515,15 @@ mod tests {
         let rect = Rect { h: 600.0, ..RECT };
         h.paint(&mut v, rect);
         let ids: Vec<u32> = buttons(&h).iter().map(|b| b.0).collect();
-        assert_eq!(ids, (0..MAX_DASHES as u32 - 1).collect::<Vec<_>>(), "the last slot is a dot: more below");
+        assert_eq!(ids, (0..MAX_DASHES as u32).collect::<Vec<_>>(), "a dot takes presses for its slot's heading");
+        assert_eq!(dashes(&h).last().map(|d| d.0), Some(theme_dot(&h)), "the last slot is a dot: more below");
         v.buffer_mut().scroll = 60;
         h.paint(&mut v, rect);
         let ids: Vec<u32> = buttons(&h).iter().map(|b| b.0).collect();
-        assert_eq!(ids.len(), MAX_DASHES - 2, "dots at both ends");
+        assert_eq!(ids.len(), MAX_DASHES);
         assert!(ids.contains(&30), "the current section keeps its dash: {ids:?}");
-        assert_eq!(dashes(&h).len(), MAX_DASHES);
+        let widths: Vec<f32> = dashes(&h).iter().map(|d| d.0).collect();
+        assert_eq!((widths[0], widths[MAX_DASHES - 1]), (theme_dot(&h), theme_dot(&h)), "dots at both ends");
     }
 
     #[test]
@@ -714,5 +724,48 @@ mod tests {
         h.button(&mut v, BTN_TOC + i);
         assert_eq!(v.buffer().cursor, (b + 3, 0));
         assert_eq!(v.buffer().lines[b + 3], "# B");
+    }
+
+    #[test]
+    fn a_drag_from_the_dashes_leaves_the_caret_be() {
+        let mut h = Harness::new();
+        let mut v = doc("toc-drag", "doc.md", &sections(20));
+        h.paint(&mut v, RECT);
+        let (_, dash) = buttons(&h)[1];
+        let left = MouseButton::Left;
+        h.mouse(&mut v, MouseEvent::Down { pos: centre(dash), clicks: 1, button: left });
+        h.mouse(&mut v, MouseEvent::Drag { pos: (200.0, 100.0), button: left });
+        h.mouse(&mut v, MouseEvent::Up { pos: (200.0, 100.0), dragged: true, button: left });
+        assert_eq!((v.buffer().cursor, v.buffer().anchor), ((0, 0), None));
+        // The next press is the text's again.
+        h.mouse(&mut v, MouseEvent::Down { pos: (200.0, 100.0), clicks: 1, button: left });
+        assert_ne!(v.buffer().cursor, (0, 0));
+    }
+
+    #[test]
+    fn losing_the_keys_or_the_screen_closes_it_and_stops_the_wait() {
+        let mut h = Harness::new();
+        let mut v = doc("toc-hidden", "doc.md", &sections(20));
+        open(&mut h, &mut v);
+        h.focus(&mut v, false);
+        assert!(!v.toc.is_open());
+        h.paint(&mut v, RECT);
+        h.mouse(&mut v, MouseEvent::Move { pos: h.cursor });
+        assert!(v.deadline(&h.cfg).is_some(), "resting on the dashes again");
+        v.shown(false);
+        assert_eq!(v.deadline(&h.cfg), None, "off screen, it doesn't open");
+        open(&mut h, &mut v);
+        v.shown(false);
+        assert!(!v.toc.is_open());
+    }
+
+    #[test]
+    fn the_panel_covers_the_rail() {
+        let mut h = Harness::new();
+        let mut v = doc("toc-cover", "doc.md", &sections(20));
+        open(&mut h, &mut v);
+        let panel = v.toc.panel.unwrap();
+        assert_eq!(panel.x, RECT.x);
+        assert!(panel.x + panel.w > RAIL_CELLS * UI.cell_w);
     }
 }

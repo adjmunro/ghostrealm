@@ -304,24 +304,27 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   highlighter takes them). Collapsed, a rail 2.5 cells wide left of the
   gutter (in Preview, in the column's left margin, three cells; kept for
   every document of a language with headings in an area that wide, so the
-  text doesn't move as the second heading comes or goes) holds a dash
-  per heading, narrower by level (1.5, 1.2, 0.9, then 0.6 cells), the
-  current section's (the last heading at or above the top line) in the
-  accent colour; past 24 headings it shows a window of them around the
-  current one, a dot at an end with more past it. Only the dashes take
-  presses (the rest of the rail is the gutter's). The pointer resting on the
-  dashes 200 ms opens a panel over the content (`cx.above`), clipped to the
-  document area (so never over the header): a row per heading, its title
-  indented by level, the current one bright, a hover pill per row, the wheel
-  scrolling it when it is too tall. A row or dash fires on release and
-  jumps: Integrated and Source put the heading's line at the top with the
-  caret at its start (a section reads down from its heading), Preview its
-  block. A jump or Escape (keys reach the focused document only) closes it
-  (it opens again only once the pointer has left it), as do leaving it for
-  300 ms, the pointer leaving the view, a press elsewhere, and a modal. The
-  open panel registers its rows before the content's buttons, so they take
-  the clicks where they cover a link or a copy button, and no copy button
-  shows while it is open.
+  text doesn't move as the second heading comes or goes) holds a dash per
+  heading, narrower by level (1.5, 1.2, 0.9, then 0.6 cells), the current
+  section's (the last heading at or above the top line) in the accent
+  colour; past 24 headings it shows a window of them around the current one,
+  a dot at an end with more past it. Only the dashes and dots take presses
+  (a dot jumps to the heading its slot stands for; the rest of the rail is
+  the gutter's), and a drag begun on them is theirs, not the text's. The
+  pointer resting on the dashes 200 ms opens a panel over the content
+  (`cx.above`) from the rail's left edge, clipped to the document area (so
+  never over the header): a row per heading, its title indented by level,
+  the current one bright, a hover pill per row, the wheel scrolling it when
+  it is too tall. A row or dash fires on release and jumps: Integrated and
+  Source put the heading's line at the top with the caret at its start (a
+  section reads down from its heading), Preview its block. A jump or Escape
+  (keys reach the focused document only) closes it (it opens again only once
+  the pointer has left it), as do leaving it for 300 ms, the pointer leaving
+  the view, a press elsewhere, a modal, the document losing the keys, and
+  its going off screen (which also stops the wait to open). The open panel
+  registers its rows before the content's buttons, so they take the clicks
+  where they cover a link or a copy button, and no copy button shows while
+  it is open.
 - Colours: `cx.chrome` (configurable background/sidebar/accent) and
   `plugin::theme` (fixed UI tokens). Widgets: `plugin::widgets::text_field`.
 - Text input: `plugin::text_edit` maps keys to edits through the platform's

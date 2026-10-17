@@ -77,8 +77,8 @@ const BTN_SHOW_STAT: u32 = 16;
 /// `BTN_COPY_BLOCK + ln`: tied to the block, not to where it is on screen.
 const BTN_COPY_BLOCK: u32 = 256;
 /// The table of contents' rows and dashes: `BTN_TOC + i` jumps to its item
-/// `i`. Past every copy button's id: a document has at most
-/// `buffer::MAX_FILE_BYTES` lines.
+/// `i`. Between the copy buttons' ids and the links': a document has at
+/// most `buffer::MAX_FILE_BYTES` lines, and an outline as many items.
 const BTN_TOC: u32 = 1 << 29;
 /// A Preview's links take the ids from [`md_preview::BTN_LINK`] up, past
 /// every copy button's and the table of contents'.
@@ -101,7 +101,8 @@ const _: () = assert!(
     "the copy buttons' ids must not collide with a statistic item's"
 );
 const _: () = assert!(
-    BTN_COPY_BLOCK as u64 + buffer::MAX_FILE_BYTES <= BTN_TOC as u64 && BTN_TOC < BTN_LINK,
+    BTN_COPY_BLOCK as u64 + buffer::MAX_FILE_BYTES <= BTN_TOC as u64
+        && BTN_TOC as u64 + buffer::MAX_FILE_BYTES <= BTN_LINK as u64,
     "a copy button's id is its block's line past BTN_COPY_BLOCK, a table of contents item's its index past BTN_TOC"
 );
 /// The idle-autosave delay (seconds) when autosave is switched on in the header
@@ -388,6 +389,9 @@ pub struct EditorView {
     /// Source (Preview's come from its blocks).
     outline: Outline,
     toc: Toc,
+    /// The press under way began on the table of contents: its drag and
+    /// release aren't the text's.
+    toc_press: bool,
 }
 
 /// A fenced code block on screen.
@@ -422,6 +426,7 @@ impl EditorView {
             preview: md_preview::Preview::new(waker.clone()),
             outline: Outline::new(waker),
             toc: Toc::default(),
+            toc_press: false,
             stats,
             seen_edits: buf.edits,
             buf,
@@ -1646,7 +1651,12 @@ impl View for EditorView {
             }
             // The table of contents' buttons take a press on it; a press
             // anywhere else closes it.
-            MouseEvent::Down { pos, .. } if self.toc.contains(pos) => return,
+            MouseEvent::Down { pos, .. } if self.toc.contains(pos) => {
+                self.toc_press = true;
+                return;
+            }
+            MouseEvent::Drag { .. } if self.toc_press => return,
+            MouseEvent::Up { .. } if std::mem::take(&mut self.toc_press) => return,
             MouseEvent::Down { .. } if self.toc.is_open() => {
                 self.toc.close();
                 cx.redraw();
@@ -1862,10 +1872,20 @@ impl View for EditorView {
     }
 
     fn focus_changed(&mut self, cx: &mut EventCx, focused: bool) {
+        if !focused && self.toc.leave() {
+            cx.redraw();
+        }
         if !focused && self.autosave_on_unfocus(cx.cfg) {
             if let Some(path) = self.save_if_modified() {
                 cx.request(Request::Saved(path));
             }
+        }
+    }
+
+    /// Off screen, the table of contents closes and stops waiting to open.
+    fn shown(&mut self, visible: bool) {
+        if !visible {
+            self.toc.leave();
         }
     }
 
