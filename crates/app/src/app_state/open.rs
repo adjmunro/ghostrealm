@@ -240,6 +240,19 @@ mod tests {
     }
 
     #[test]
+    fn a_link_to_an_open_file_by_another_spelling_shows_its_tab() {
+        let (mut s, d) = app("open-canonical");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.md"), "a").unwrap();
+        s.open_file(&d.join("a.md")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        // What a Preview link to `sub/../a.md` asks for.
+        let canon = std::fs::canonicalize(d.join("sub/../a.md")).unwrap();
+        s.open_file_from(sid, &canon).unwrap();
+        assert_eq!(tabs(&s, sid), [d.join("a.md")], "the open tab, not a second");
+    }
+
+    #[test]
     fn a_device_a_folder_or_a_huge_text_file_doesnt_open_and_changes_nothing() {
         let (mut s, d) = app("open-irregular");
         let big = d.join("big.log");

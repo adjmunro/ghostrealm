@@ -262,9 +262,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   unsaved edits included. `parse` turns Markdown (pulldown-cmark:
   CommonMark, GFM tables, task lists, strikethrough) into a flat list of
   blocks (heading, paragraph, list item, code, table, rule, HTML as its
-  source; front matter, a `---` block
-  opening the document, dim in a code box), each with its source line, list indent, and quote depth. A text
-  under 64 KiB parses at once (well under a millisecond in a release
+  source; front matter, a `---` block opening the document, dim in a
+  code box), each with its source line, list indent, and quote depth. A
+  text under 64 KiB parses at once (well under a millisecond in a release
   build); a longer one on a worker woken through the waker, the old blocks
   showing until it is done. Blocks lay out in a centred column at most 46
   body sizes wide: body text in `Font::SERIF` at 1.15 times the editor's
@@ -274,10 +274,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   links (accent, underlined; `md_preview::target` says where one goes: an
   `http`, `https`, or `mailto` URL to the system's handler,
   `Request::OpenUrl`; a path, relative to the document's folder, or a
-  `file:` URL's, to a Files surface if it is a regular file, or to the
-  sidebar if a folder (nothing else: a device or FIFO never ends); any
-  other scheme nowhere, its hover
-  saying so, since a handler for it could run something; a link that goes
+  `file:` URL's, made canonical, to a Files surface if a regular file (a
+  non-media one only up to the editor's 50 MB), or to the sidebar if a
+  folder (nothing else: a device or FIFO never ends); a `mailto:` URL
+  keeps only `subject`, `body`, `cc`, and `bcc`; any other scheme
+  nowhere, its hover saying so, since a handler for it could run something; a link that goes
   somewhere is a `button`, `BTN_LINK` plus its block and tag, that opens on
   release), and struck text. Code blocks are
   the editor's code box with their rows highlighted by the fence's

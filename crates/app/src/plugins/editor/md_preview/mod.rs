@@ -153,6 +153,8 @@ pub struct Preview {
     /// top, until it is measured at the new width. Any other move of the
     /// anchor drops it.
     anchor_frac: Option<(usize, f32)>,
+    /// The last scroll went up: a block entered from below.
+    scrolled_up: bool,
     /// The last paint's body, and blocks on screen (index, slot top,
     /// bottom).
     body: Rect,
@@ -171,6 +173,7 @@ impl Preview {
             anchor: Anchor::default(),
             goto_line: None,
             anchor_frac: None,
+            scrolled_up: false,
             body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             shown: Vec::new(),
         }
@@ -311,6 +314,7 @@ impl Preview {
         }
         let before = self.anchor;
         self.anchor_frac = None;
+        self.scrolled_up = dy < 0.0;
         self.anchor.offset += dy;
         self.normalize();
         self.clamp_bottom();
@@ -340,6 +344,7 @@ impl Preview {
             return None;
         }
         self.anchor_frac = None;
+        self.scrolled_up = false;
         let moved = if dy == f32::NEG_INFINITY {
             let before = self.anchor;
             self.anchor = Anchor::default();
@@ -454,6 +459,7 @@ impl Preview {
             let index = self.blocks.partition_point(|b| b.line <= line).saturating_sub(1);
             self.anchor = Anchor { index, offset: 0.0 };
             self.anchor_frac = None;
+            self.scrolled_up = false;
         }
         if self.blocks.is_empty() {
             return;
@@ -476,12 +482,17 @@ impl Preview {
                 grew = true;
             }
             self.laid[i].height = Some((h, measured));
+            let mut moved = 0.0;
             if i == self.anchor.index && measured {
+                let before = self.anchor.offset;
                 self.settle_anchor(old, h, cx);
+                moved = self.anchor.offset - before;
             }
             self.paint_quotes(cx, i, left, (y, top, y + h), &look);
             self.shown.push((i, y, y + h));
-            y += h;
+            // What follows draws at the settled offset now, so only the
+            // anchor block is a frame behind.
+            y += h - moved;
             i += 1;
         }
         // Measuring may leave the end short of the bottom: settle next frame.
@@ -565,16 +576,17 @@ impl Preview {
         }
     }
 
-    /// The anchor block was just measured at `h` (it was `old`): keep what
-    /// shows at the top where it was. Scrolled into from below, its offset
-    /// counted from its estimated height; after a resize, it keeps its
-    /// share. Repaints next frame with the new offset.
+    /// The anchor block was just measured at `h` (it was `old`): keep the
+    /// edge the view entered it from in place. Scrolled up into, its offset
+    /// counted from its estimated height, so its bottom stays; scrolled
+    /// down into, its top already does. After a resize, it keeps its share.
+    /// Repaints next frame with the new offset.
     fn settle_anchor(&mut self, old: Option<(f32, bool)>, h: f32, cx: &mut PaintCx) {
         let before = self.anchor.offset;
         let frac = self.anchor_frac.take().filter(|(i, _)| *i == self.anchor.index);
         if let Some((_, f)) = frac {
             self.anchor.offset = f * h;
-        } else if let Some((old, false)) = old {
+        } else if let (Some((old, false)), true) = (old, self.scrolled_up) {
             if before > 0.0 {
                 self.anchor.offset = (before + h - old).clamp(0.0, (h - 1.0).max(0.0));
             }
@@ -599,19 +611,9 @@ impl Preview {
     }
 
     /// What the link with button id `BTN_LINK + i` asks, resolved against
-    /// the document at `doc` ([`target`]): a folder shows in the sidebar; a
-    /// path that is missing or not a regular file (a device, a FIFO) opens
-    /// nothing.
+    /// the document at `doc` ([`resolve`]).
     pub fn open_link(&mut self, i: u32, doc: Option<&Path>) -> Option<Request> {
-        match target(&self.link(i)?, doc)? {
-            Target::Web(url) => Some(Request::OpenUrl(url)),
-            Target::File(path) => match std::fs::metadata(&path) {
-                Ok(m) if m.is_file() => Some(Request::OpenFile(path)),
-                Ok(m) if m.is_dir() => Some(Request::ShowInSidebar(path)),
-                _ => None,
-            },
-            Target::Blocked(_) | Target::InPage => None,
-        }
+        resolve(&self.link(i)?, doc).0
     }
 }
 
@@ -636,6 +638,9 @@ pub fn target(url: &str, doc: Option<&Path>) -> Option<Target> {
         return Some(Target::InPage);
     }
     if let Some(scheme) = crate::file_ops::url_scheme(url) {
+        if scheme.eq_ignore_ascii_case("mailto") {
+            return Some(Target::Web(mailto(url)));
+        }
         if crate::file_ops::is_web_url(url) {
             return Some(Target::Web(url.to_string()));
         }
@@ -663,14 +668,51 @@ pub fn target(url: &str, doc: Option<&Path>) -> Option<Target> {
     Some(Target::File(path))
 }
 
-/// What a link's hover says: where it goes, or why it doesn't.
-fn link_tip(url: &str, doc: Option<&Path>) -> String {
-    match target(url, doc) {
-        Some(Target::Web(u)) => u,
-        Some(Target::File(p)) => p.display().to_string(),
-        Some(Target::Blocked(s)) => format!("Not opened: {s}: links"),
-        Some(Target::InPage) => format!("{url} (links within the document don't follow yet)"),
-        None => format!("{url} (no folder to find it from: save the document first)"),
+/// A `mailto:` URL keeping only the header fields a mail client fills in
+/// a draft from (`subject`, `body`, `cc`, `bcc`): others (`attach`,
+/// `from`, custom headers) are a document's to choose, not the user's.
+fn mailto(url: &str) -> String {
+    let Some((to, query)) = url.split_once('?') else { return url.to_string() };
+    let keep: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            ["subject", "body", "cc", "bcc"].iter().any(|k| key.eq_ignore_ascii_case(k))
+        })
+        .collect();
+    match keep.is_empty() {
+        true => to.to_string(),
+        false => format!("{to}?{}", keep.join("&")),
+    }
+}
+
+/// What a click on link `url` (in the document at `doc`) asks, if
+/// anything, and what its hover says: where it goes, or why it doesn't. A
+/// path is made canonical (no `..`, links resolved), so the sidebar
+/// selects it and an open tab of it is reused. A folder shows in the
+/// sidebar; a missing path, a device or FIFO, and a non-media file past
+/// the editor's cap open nothing.
+fn resolve(url: &str, doc: Option<&Path>) -> (Option<Request>, String) {
+    let path = match target(url, doc) {
+        Some(Target::Web(u)) => return (Some(Request::OpenUrl(u.clone())), u),
+        Some(Target::File(p)) => p,
+        Some(Target::Blocked(s)) => return (None, format!("Not opened: {s}: links")),
+        Some(Target::InPage) => return (None, format!("{url} (links within the document don't follow yet)")),
+        None => return (None, format!("{url} (no folder to find it from: save the document first)")),
+    };
+    let Ok(path) = std::fs::canonicalize(&path) else {
+        return (None, format!("Not found: {}", path.display()));
+    };
+    let max = super::buffer::MAX_FILE_BYTES;
+    let shown = path.display().to_string();
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_dir() => (Some(Request::ShowInSidebar(path)), shown),
+        Ok(m) if !m.is_file() => (None, format!("Not opened: {shown} isn't a regular file")),
+        Ok(m) if m.len() > max && !crate::plugins::files::media::is_media(&path) => {
+            (None, format!("Not opened: file over {} MB", max >> 20))
+        }
+        Ok(_) => (Some(Request::OpenFile(path)), shown),
+        Err(_) => (None, format!("Not found: {shown}")),
     }
 }
 
@@ -924,7 +966,8 @@ fn paint_text(
             }
             Tag::Link(url) => {
                 // A link that goes nowhere gets no button, only its hover.
-                let opens = matches!(target(url, links.doc), Some(Target::Web(_) | Target::File(_)));
+                let (request, tip) = resolve(url, links.doc);
+                let opens = request.is_some();
                 let id = (links.block < MAX_LINK_BLOCK && tag.get() < 1 << TAG_BITS && opens)
                     .then(|| BTN_LINK + ((links.block as u32) << TAG_BITS) + tag.get());
                 let mut hover = false;
@@ -934,7 +977,7 @@ fn paint_text(
                             hover |= cx.button(hit, id);
                             cx.cursor(hit, CursorIcon::Pointer);
                         }
-                        cx.tooltip(hit, link_tip(url, links.doc));
+                        cx.tooltip(hit, tip.clone());
                     }
                 }
                 let thick = (look.size / 14.0).round().max(1.0);
@@ -1256,7 +1299,8 @@ mod tests {
         let links: Vec<(Rect, u32)> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| (b.0, b.2)).collect();
         assert_eq!(links.len(), 2);
         let out = h.button(&mut v, links[0].1);
-        assert_eq!(out.requests, [Request::OpenFile(path.parent().unwrap().join("GOAL.md"))]);
+        let goal = std::fs::canonicalize(path.parent().unwrap().join("GOAL.md")).unwrap();
+        assert_eq!(out.requests, [Request::OpenFile(goal)]);
         let out = h.button(&mut v, links[1].1);
         assert_eq!(out.requests, [Request::OpenUrl("https://x.org/a".into())]);
         // Hovering one highlights it.
@@ -1275,7 +1319,8 @@ mod tests {
         h.paint(&mut v, RECT);
         let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
         assert_eq!(links.len(), 1, "only the file: link opens");
-        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar("/tmp".into())], "a folder");
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar(tmp)], "a folder");
         let item = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Block(_))).unwrap();
         let b = h.text.buffer(item.src).unwrap();
         let g = b.layout_runs().flat_map(|r| r.glyphs.iter().cloned()).find(|g| g.metadata == 2).unwrap();
@@ -1286,17 +1331,37 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_link_shows_in_the_sidebar_and_a_device_or_missing_file_opens_nothing() {
-        let (mut v, path) = previewed("pv-dir", "[d](sub) [z](/dev/zero) [m](missing.md)\n");
-        let dir = path.parent().unwrap().join("sub");
-        std::fs::create_dir_all(&dir).unwrap();
+    fn link_targets_are_canonical_and_only_openable_ones_get_a_button() {
+        let text = "[d](sub/x/..) [f](sub/../other.md) [z](/dev/zero) [m](missing.md) [big](big.txt) [img](big.png)\n";
+        let (mut v, path) = previewed("pv-dir", text);
+        let d = path.parent().unwrap();
+        std::fs::create_dir_all(d.join("sub/x")).unwrap();
+        std::fs::write(d.join("other.md"), "o").unwrap();
+        let max = crate::plugins::editor::buffer::MAX_FILE_BYTES;
+        for big in ["big.txt", "big.png"] {
+            std::fs::File::create(d.join(big)).unwrap().set_len(max + 1).unwrap();
+        }
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
-        assert_eq!(links.len(), 3);
-        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar(dir)]);
-        assert!(h.button(&mut v, links[1]).requests.is_empty(), "/dev/zero never opens");
-        assert!(h.button(&mut v, links[2]).requests.is_empty());
+        assert_eq!(links.len(), 3, "the folder, the file, and the (media) image");
+        let canon = |p: &str| std::fs::canonicalize(d.join(p)).unwrap();
+        assert_eq!(h.button(&mut v, links[0]).requests, [Request::ShowInSidebar(canon("sub"))], "no ..");
+        assert_eq!(h.button(&mut v, links[1]).requests, [Request::OpenFile(canon("other.md"))]);
+        assert_eq!(h.button(&mut v, links[2]).requests, [Request::OpenFile(canon("big.png"))]);
+        let tip = |url: &str| resolve(url, Some(&path)).1;
+        assert_eq!(tip("big.txt"), "Not opened: file over 50 MB");
+        assert!(tip("/dev/zero").starts_with("Not opened:"), "{}", tip("/dev/zero"));
+        assert!(tip("missing.md").starts_with("Not found:"));
+    }
+
+    #[test]
+    fn a_mailto_link_keeps_only_draft_fields() {
+        let to = |u: &str| target(u, None);
+        let web = |u: &str| Some(Target::Web(u.into()));
+        assert_eq!(to("mailto:a@x.org?subject=Hi&attach=/etc/passwd&BCC=b@x.org&from=c"), web("mailto:a@x.org?subject=Hi&BCC=b@x.org"));
+        assert_eq!(to("MAILTO:a@x.org?attach=x"), web("MAILTO:a@x.org"));
+        assert_eq!(to("mailto:a@x.org"), web("mailto:a@x.org"));
     }
 
     #[test]
@@ -1419,16 +1484,28 @@ mod tests {
     }
 
     #[test]
-    fn the_anchor_block_measured_off_its_estimate_keeps_its_bottom_part_in_place() {
+    fn the_anchor_block_measured_off_its_estimate_keeps_the_edge_it_was_entered_from() {
+        // Scrolled down into it: its top stays.
         let (mut v, mut h) = scrolled("pv-anchor-self", 260.0);
         let Anchor { index, offset } = v.preview.anchor;
         assert!(offset > 0.0);
         let measured = v.preview.laid[index].height.unwrap().0;
-        // As if scrolled up into it while only estimated, 20 px short.
+        v.preview.laid[index].height = Some((measured - 20.0, false));
+        h.paint(&mut v, RECT);
+        assert_eq!(v.preview.anchor, Anchor { index, offset });
+        // Scrolled up into it: its bottom stays, and what follows draws at
+        // the settled offset in the same paint.
+        h.scroll(&mut v, (10.0, 10.0), 5.0);
+        h.paint(&mut v, RECT);
+        let Anchor { index, offset } = v.preview.anchor;
+        let next = v.preview.shown[1];
+        let measured = v.preview.laid[index].height.unwrap().0;
         v.preview.laid[index].height = Some((measured - 20.0, false));
         h.paint(&mut v, RECT);
         assert_eq!(v.preview.anchor, Anchor { index, offset: offset + 20.0 });
-        assert!(h.frame.wants_frame, "repaints at the new offset");
+        assert!(h.frame.wants_frame, "the anchor block repaints at the new offset");
+        // Where it drew under the 20 px short estimate: it doesn't move.
+        assert_eq!(v.preview.shown[1].1, next.1 - 20.0, "the next block didn't move");
     }
 
     #[test]
@@ -1486,11 +1563,15 @@ mod tests {
         h.paint(&mut v, RECT);
         let first = v.preview.job.as_ref().map(|j| j.0);
         assert_eq!(first, Some(v.buf.edits));
+        // Across paints with edits between, the job in flight stays the
+        // first until it lands.
         for _ in 0..3 {
+            let before = (v.preview.job.as_ref().map(|j| j.0), v.preview.parsed);
             v.write_input(b"x");
             h.paint(&mut v, RECT);
-            if let (Some(j), None) = (&v.preview.job, v.preview.parsed) {
-                assert_eq!(Some(j.0), first, "no second parse while the first runs");
+            let after = (v.preview.job.as_ref().map(|j| j.0), v.preview.parsed);
+            if after.1 == before.1 {
+                assert_eq!(after.0, before.0, "no second parse while one runs");
             }
         }
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -1510,7 +1591,9 @@ mod tests {
         h.paint(&mut v, RECT);
         let cells = |h: &Harness| drawn(h).iter().filter(|d| d.0.starts_with('r')).count();
         // Rows out of view measure within the frame's shaping budget.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while !v.preview.laid[0].height.unwrap().1 {
+            assert!(Instant::now() < deadline, "the rows never measured");
             h.paint(&mut v, RECT);
         }
         let first = cells(&h);
@@ -1647,7 +1730,7 @@ mod tests {
         assert_eq!(to("-a:x"), file("/w/docs/-a:x"));
         assert_eq!(to("#heading"), Some(Target::InPage));
         assert_eq!(target("a.md", None), None, "a scratch buffer has no folder");
-        assert_eq!(link_tip("ssh://h", Some(doc)), "Not opened: ssh: links");
+        assert_eq!(resolve("ssh://h", Some(doc)).1, "Not opened: ssh: links");
     }
 
     #[test]
