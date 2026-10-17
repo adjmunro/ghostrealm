@@ -19,7 +19,7 @@
 //! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
 //! unmarked, so a pathological line costs a bounded number of scans.
 
-use super::{runs, CommentSyntax, Highlighter, Span, State, Token, ALL, LANGUAGES};
+use super::{runs, BlockRow, CommentSyntax, Highlighter, Span, State, Token, ALL, LANGUAGES};
 
 pub struct Markdown;
 
@@ -74,8 +74,15 @@ impl Highlighter for Markdown {
         }
     }
 
-    fn block(&self, line: &str, state_in: State, state_out: State) -> bool {
-        state_out != 0 || (state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in))
+    fn block_row(&self, line: &str, state_in: State, state_out: State) -> Option<BlockRow> {
+        // A line leaving the fence's container ends it, and may open another.
+        let inside = state_in != 0 && !leaves(&line.chars().collect::<Vec<_>>(), state_in);
+        match (inside, state_out != 0) {
+            (true, true) => Some(BlockRow::Body),
+            (true, false) => Some(BlockRow::Close),
+            (false, true) => Some(BlockRow::Open),
+            (false, false) => None,
+        }
     }
 }
 
@@ -721,10 +728,16 @@ mod tests {
     fn markdown_marks_fence_rows_as_a_block() {
         let (_, open) = lex_in("```toml", 0);
         let (_, inside) = lex_in("a = 1", open);
-        assert!(Markdown.block("```toml", 0, open), "the opening fence");
-        assert!(Markdown.block("a = 1", open, inside), "a body line");
-        assert!(Markdown.block("```", inside, 0), "the closing fence");
-        assert!(!Markdown.block("text", 0, 0), "prose");
+        assert_eq!(Markdown.block_row("```toml", 0, open), Some(BlockRow::Open));
+        assert_eq!(Markdown.block_row("a = 1", open, inside), Some(BlockRow::Body));
+        assert_eq!(Markdown.block_row("```", inside, 0), Some(BlockRow::Close));
+        assert_eq!(Markdown.block_row("text", 0, 0), None, "prose");
+        // A fence that leaves an unclosed one's container opens a new block.
+        let (_, listed) = lex_in("- ```", 0);
+        let (_, listed) = lex_in("  a", listed);
+        let (_, top) = lex_in("```", listed);
+        assert_ne!(top, 0);
+        assert_eq!(Markdown.block_row("```", listed, top), Some(BlockRow::Open));
     }
 
     #[test]
@@ -738,10 +751,10 @@ mod tests {
         {
             let (_, s) = lex_in(open, 0);
             let (_, s) = lex_in(body, s);
-            assert!(Markdown.block(close, s, lex_in(close, s).1), "{close:?} closes the block");
+            assert_eq!(Markdown.block_row(close, s, lex_in(close, s).1), Some(BlockRow::Close), "{close:?}");
             let (_, out) = lex_in(after, s);
             assert_eq!(out, 0, "{after:?} ends the fence");
-            assert!(!Markdown.block(after, s, out), "{after:?} after {open:?} is prose");
+            assert_eq!(Markdown.block_row(after, s, out), None, "{after:?} after {open:?} is prose");
         }
     }
 

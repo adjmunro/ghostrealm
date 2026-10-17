@@ -115,6 +115,17 @@ pub fn language_for_path(path: &Path) -> Option<&'static Language> {
 /// document.
 pub type State = u32;
 
+/// A line's place in a block drawn as a unit ([`Highlighter::block_row`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockRow {
+    /// The line opening a block: a fence and its info string.
+    Open,
+    /// A line inside it.
+    Body,
+    /// The line closing it: the closing fence.
+    Close,
+}
+
 pub trait Highlighter: Sync {
     /// A stable name; a cache is invalidated when the name changes.
     fn name(&self) -> &'static str;
@@ -152,11 +163,13 @@ pub trait Highlighter: Sync {
         0
     }
 
-    /// Whether `line`, entering with `state_in` and leaving with `state_out`,
-    /// belongs to a block drawn as a unit (a fenced code block, including its
-    /// fences).
-    fn block(&self, _line: &str, _state_in: State, _state_out: State) -> bool {
-        false
+    /// Where `line`, entering with `state_in` and leaving with `state_out`,
+    /// sits in a block drawn as a unit (a fenced code block, including its
+    /// fences); `None` outside one. A block ends at its [`BlockRow::Close`],
+    /// or (left unclosed) at the last [`BlockRow::Body`] before a line that
+    /// is neither.
+    fn block_row(&self, _line: &str, _state_in: State, _state_out: State) -> Option<BlockRow> {
+        None
     }
 }
 
