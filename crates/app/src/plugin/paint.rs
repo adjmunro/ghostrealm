@@ -1154,6 +1154,10 @@ impl<'a> PaintCx<'a> {
         // (a code span's backticks), so it pads its text without moving the
         // grid. Drawn whole and clipped, so a cut box keeps its corners.
         let pad = (styles.cell_w * 0.25).round().max(1.0);
+        // A row not scrolled sideways has nothing left of its first column,
+        // so a box starting there (code wrapped onto this row) keeps its
+        // left edge in the padding before it.
+        let box_clip = if left >= clip.x { Rect { x: clip.x - pad, w: clip.w + pad, ..clip } } else { clip };
         let inset = theme::hairline(self.ui);
         let border = Some((theme::hairline(self.ui), theme::CODE_BOX_BORDER, theme::CODE_BOX_BORDER_ALPHA));
         let radius = theme::box_radius(self.ui);
@@ -1174,7 +1178,7 @@ impl<'a> PaintCx<'a> {
             }
             let (bx0, bx1) = ((x0 - pad).round(), (x1 + pad).round());
             let r = Rect { x: bx0, y: top + inset, w: bx1 - bx0, h: (line_h - 2.0 * inset).max(1.0) };
-            self.with_clip(clip, |cx| {
+            self.with_clip(box_clip, |cx| {
                 cx.round_rect(r, radius, theme::CODE_BOX_BG, theme::CODE_BOX_ALPHA, border);
             });
         }
@@ -1275,7 +1279,30 @@ mod tests {
         for q in boxes {
             assert_eq!((q.radius, q.border_w), (theme::box_radius(UI), border));
         }
-        assert_eq!(boxes[0].clip, [0.0, 0.0, clip.w, 100.0], "clipped, keeping its shape");
+        assert_eq!(boxes[0].clip, [-pad, 0.0, clip.w, 100.0], "clipped, keeping its shape");
+    }
+
+    /// Code wrapped onto the start of a row keeps its box's left edge; a row
+    /// scrolled sideways clips at its text.
+    #[test]
+    fn a_box_at_a_rows_first_column_keeps_its_left_edge_unless_scrolled() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let runs = [RunStyle::BOX];
+        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        let clip = Rect { x: 32.0, y: 0.0, w: 200.0, h: 100.0 };
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            for (left, top) in [(32.0, 0.0), (24.0, 16.0)] {
+                let spans = vec![("code".to_string(), [200; 3])];
+                let key = cx.row_key_styled(spans.iter().map(|(t, c)| (t.as_str(), *c)), styles);
+                cx.budgeted_row_styled(key, || spans.clone(), styles, left, top, 400.0, clip, [200; 3]);
+            }
+        }
+        let clips: Vec<f32> = h.frame.bg.iter().map(|q| q.clip[0]).collect();
+        assert_eq!(clips, [30.0, 32.0]);
     }
 
     /// A hosted view's buttons and images carry its host's id base, nested
