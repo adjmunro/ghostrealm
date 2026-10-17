@@ -230,6 +230,24 @@ pub enum LineNumbers {
     Relative,
 }
 
+/// A document option that can also show as an icon in the document header
+/// (`[editor] header_icons`). Every option is always in the header's `⋯`
+/// menu; a document shows the icons of the listed options it has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderIcon {
+    /// The statistic (word count, ...; a click cycles it).
+    Statistic,
+    /// The autosave toggle.
+    Autosave,
+    /// The soft-wrap toggle.
+    SoftWrap,
+    /// The view-mode button, when the document has more than one mode.
+    ViewMode,
+    /// The autoplay toggle of an audio document.
+    Autoplay,
+}
+
 /// `[editor]`
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -248,6 +266,8 @@ pub struct Editor {
     /// The font family of a Preview's body text. `None` (unset) means the
     /// platform's serif.
     pub preview_font: Option<String>,
+    /// The options a document header also shows as icons, left to right.
+    pub header_icons: Vec<HeaderIcon>,
 }
 
 impl Default for Editor {
@@ -259,6 +279,7 @@ impl Default for Editor {
             autosave_on_unfocus: true,
             autosave_after: 15,
             preview_font: None,
+            header_icons: vec![HeaderIcon::Statistic, HeaderIcon::Autosave, HeaderIcon::SoftWrap, HeaderIcon::ViewMode],
         }
     }
 }

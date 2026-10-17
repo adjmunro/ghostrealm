@@ -1,6 +1,7 @@
 //! The document header: the details of the file a document shows (its name,
 //! kind and size, and when it was modified) above it, with the document's
-//! own controls (its ribbon icons and `⋯`) at the right of the name's line.
+//! own controls (the icons `[editor] header_icons` lists, and `⋯`) at the
+//! right of the name's line.
 //! A document paints its controls first, right to left, then the header's
 //! text up to where they start.
 

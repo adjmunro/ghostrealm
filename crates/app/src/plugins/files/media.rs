@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ghostrealm_core::{Config, Rect};
+use ghostrealm_core::{Config, HeaderIcon, Rect};
 use glyphon::Family;
 
 use super::header::{DocHeader, HeaderText};
@@ -310,13 +310,17 @@ impl MediaView {
         cx.request(Request::FileMenu { target, at, align });
     }
 
-    /// The header with `⋯` at its right end. Returns the header's height.
+    /// The header with `⋯` at its right end and, for a track that
+    /// `[editor] header_icons` lists it for, the autoplay toggle left of it.
+    /// Returns the header's height.
     fn paint_header(&mut self, cx: &mut PaintCx, rect: Rect) -> f32 {
         let h = DocHeader::height(cx.ui);
         let r = Rect { h, ..rect };
         let row = DocHeader::control_row(cx.ui, r);
         let side = row.h;
         let mb = Rect { x: row.x + row.w - side, y: row.y, w: side, h: side };
+        let listed = cx.cfg.editor.header_icons.contains(&HeaderIcon::Autoplay);
+        let ab = (listed && self.audio_path().is_some()).then_some(Rect { x: mb.x - side, ..mb });
         // The header's background goes first: `⋯` draws over it.
         let (kind, extra, name) = (self.kind(), self.extra(), self.name());
         let text = HeaderText {
@@ -327,21 +331,30 @@ impl MediaView {
             changed_on_disk: false,
             extra,
         };
-        self.name_hit = Some(self.header.paint(cx, r, mb.x, &text, Some(BTN_NAME)));
-        let hover = cx.button(mb, BTN_MORE);
-        if hover {
-            cx.round_rect(hover_box(mb, side), theme::box_radius(cx.ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
-        }
-        cx.tooltip(mb, "More options");
+        self.name_hit = Some(self.header.paint(cx, r, ab.unwrap_or(mb).x, &text, Some(BTN_NAME)));
+        let radius = theme::box_radius(cx.ui);
         let icon_side = (cx.ui.cell_h * 0.8).round();
-        let icon = Rect {
-            x: mb.x + ((mb.w - icon_side) * 0.5).round(),
-            y: mb.y + ((mb.h - icon_side) * 0.5).round(),
+        let icon_in = |b: Rect| Rect {
+            x: b.x + ((b.w - icon_side) * 0.5).round(),
+            y: b.y + ((b.h - icon_side) * 0.5).round(),
             w: icon_side,
             h: icon_side,
         };
-        Icon::More.paint(cx, icon, if hover { theme::GLYPH_HOVER } else { theme::GLYPH });
+        let hover = cx.button(mb, BTN_MORE);
+        if hover {
+            cx.round_rect(hover_box(mb, side), radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
+        }
+        cx.tooltip(mb, "More options");
+        Icon::More.paint(cx, icon_in(mb), if hover { theme::GLYPH_HOVER } else { theme::GLYPH });
         self.more_hit = Some(mb);
+        if let Some(ab) = ab {
+            if cx.button(ab, BTN_AUTOPLAY) {
+                cx.round_rect(hover_box(ab, side), radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
+            }
+            cx.tooltip(ab, "Autoplay");
+            let color = if self.autoplay_on(cx.cfg) { cx.chrome.accent } else { theme::GLYPH };
+            Icon::Play.paint(cx, icon_in(ab), color);
+        }
         self.header_rect = Some(r);
         h
     }
@@ -778,6 +791,34 @@ mod tests {
         let out = h.button(&mut v, BTN_MORE);
         let Some(Request::Menu { items, .. }) = out.requests.first() else { panic!("a menu") };
         assert_eq!(items.iter().find(|i| i.id == BTN_AUTOPLAY).and_then(|i| i.checked), Some(false));
+    }
+
+    #[test]
+    fn a_track_shows_the_autoplay_icon_in_its_header_when_listed() {
+        let (mut h, mut v, _) = track(false);
+        let header = DocHeader::height(crate::plugin::testing::UI);
+        let in_header = |h: &mut Harness, v: &mut MediaView| -> Vec<u32> {
+            let mut b: Vec<(Rect, u32)> = h
+                .paint(v, RECT)
+                .view_buttons
+                .iter()
+                .filter(|b| b.0.y + b.0.h <= header && b.2 != BTN_NAME)
+                .map(|b| (b.0, b.2))
+                .collect();
+            b.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+            b.into_iter().map(|b| b.1).collect()
+        };
+        assert_eq!(in_header(&mut h, &mut v), [BTN_MORE], "not listed by default");
+        h.cfg.editor.header_icons = vec![HeaderIcon::SoftWrap, HeaderIcon::Autoplay];
+        assert_eq!(in_header(&mut h, &mut v), [BTN_AUTOPLAY, BTN_MORE]);
+        h.button(&mut v, BTN_AUTOPLAY);
+        assert!(v.autoplay_on(&h.cfg));
+        // An image has no autoplay.
+        let d = tmpdir("media-icons");
+        std::fs::write(d.join("c.png"), media::testing::png(4, 2, [0, 0, 255, 255])).unwrap();
+        let mut img = MediaView::open(d.join("c.png"));
+        settle(&h, &mut img);
+        assert_eq!(in_header(&mut h, &mut img), [BTN_MORE]);
     }
 
     #[test]

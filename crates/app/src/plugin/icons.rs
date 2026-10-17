@@ -180,11 +180,13 @@ pub enum Icon {
     Check,
     Search,
     Close,
+    /// Play (an outlined triangle): autoplay.
+    Play,
 }
 
 impl Icon {
     /// Every icon, for tests and galleries.
-    pub const ALL: [Icon; 12] = [
+    pub const ALL: [Icon; 13] = [
         Icon::ChevronRight,
         Icon::ChevronDown,
         Icon::ChevronUp,
@@ -197,6 +199,7 @@ impl Icon {
         Icon::Check,
         Icon::Search,
         Icon::Close,
+        Icon::Play,
     ];
 
     /// Draw the icon into (a square centred in) `r` in `color`, under the text.
@@ -248,6 +251,7 @@ impl Icon {
                 p.line((4.5, 4.5), (11.5, 11.5), c);
                 p.line((11.5, 4.5), (4.5, 11.5), c);
             }
+            Icon::Play => p.polyline(&[(5.0, 3.5), (12.5, 8.0), (5.0, 12.5), (5.0, 3.5)], c),
         }
     }
 }

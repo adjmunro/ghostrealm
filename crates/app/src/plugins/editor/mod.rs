@@ -20,7 +20,7 @@ use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::highlight::{self, BlockRow, Highlighter, SpanCache, StateCache};
 use ghostrealm_core::outline::Outline;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, LineNumbers, Rect, Registry,
+    ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, HeaderIcon, LineNumbers, Rect, Registry,
 };
 use ghostrealm_lsp::Client;
 use ghostrealm_terminal::{Key, KeyPress};
@@ -272,6 +272,13 @@ impl Plugin for EditorPlugin {
             ("absolute", "Every line shows its number."),
             ("relative", "Distance from the cursor's line; the cursor's line shows its number."),
         ];
+        const HEADER_ICONS: &[(&str, &str)] = &[
+            ("statistic", "The file's line, word, or byte count, or its changes since the last commit; a click shows the next."),
+            ("autosave", "The autosave toggle."),
+            ("soft_wrap", "The soft-wrap toggle."),
+            ("view_mode", "The view-mode button (Preview, Integrated, Source), where a file has more than one."),
+            ("autoplay", "The autoplay toggle of an audio file."),
+        ];
         vec![SectionSpec::options(
             "editor",
             "The text editor.",
@@ -304,6 +311,14 @@ impl Plugin for EditorPlugin {
                     "The font family of a Preview's body text. Unset means New York (else Georgia) \
                      on macOS, fontconfig's serif elsewhere; a family that isn't installed falls \
                      back to that.",
+                ),
+                OptionSpec::new(
+                    "header_icons",
+                    Kind::EnumList(HEADER_ICONS),
+                    Some("[\"statistic\", \"autosave\", \"soft_wrap\", \"view_mode\"]"),
+                    "The options a document's header also shows as icons, in this order, left of \
+                     its `⋯` menu. The `⋯` menu holds every option either way; a document shows \
+                     the icons of the options it has.",
                 ),
             ],
         )]
@@ -922,25 +937,36 @@ impl EditorView {
     }
 
     /// The document header: the file's details, with the controls at the
-    /// right of the name's line: a statistic (click to cycle), the autosave
-    /// and soft-wrap toggles, and `⋯` (a menu of every option).
+    /// right of the name's line: the icons `[editor] header_icons` lists that
+    /// this document has (a statistic, the autosave and soft-wrap toggles, the
+    /// view-mode button), in that order, and `⋯` (a menu of every option).
     fn paint_header(&mut self, cx: &mut PaintCx, r: Rect, wrap: bool) {
-        let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
+        let ch = cx.ui.cell_h;
         let row = DocHeader::control_row(cx.ui, r);
         let side = row.h;
-        let top = row.y + (row.h - ch) * 0.5;
         // Laid out right to left first: the header's text stops at them.
         let mb = Rect { x: row.x + row.w - side, y: row.y, w: side, h: side };
-        // The view-mode button, when the file offers more than one mode.
-        let vb = (self.view_modes().len() > 1).then_some(Rect { x: mb.x - side, ..mb });
-        let wb = Rect { x: vb.unwrap_or(mb).x - side, ..mb };
-        let ab = Rect { x: wb.x - side, ..wb };
         self.stats.poll();
-        let spans = self.stats.spans(&self.buf);
-        let stat = cx.shape_spans(&spans, Font::SANS, r.w);
         let gap = 6.0 * cx.ui.scale;
-        let stat_left = ab.x - gap - stat.width;
-        let sb = Rect { x: stat_left - gap, y: row.y, w: stat.width + gap * 2.0, h: row.h };
+        let mut left = mb.x;
+        let mut icons: Vec<(HeaderIcon, Rect)> = Vec::new();
+        let mut stat = None;
+        let cfg = cx.cfg;
+        for &icon in cfg.editor.header_icons.iter().rev() {
+            let w = match icon {
+                HeaderIcon::ViewMode if self.view_modes().len() < 2 => continue,
+                HeaderIcon::Autoplay => continue,
+                HeaderIcon::Statistic => {
+                    let spans = self.stats.spans(&self.buf);
+                    let shaped = cx.shape_spans(&spans, Font::SANS, r.w);
+                    stat = Some(shaped);
+                    shaped.width + gap * 2.0
+                }
+                _ => side,
+            };
+            left -= w;
+            icons.push((icon, Rect { x: left, y: row.y, w, h: side }));
+        }
 
         let e = &self.buf;
         let title = e.title();
@@ -953,7 +979,7 @@ impl EditorView {
             changed_on_disk: e.changed_on_disk,
             extra: None,
         };
-        let name = self.header.paint(cx, r, sb.x, &text, Some(BTN_NAME));
+        let name = self.header.paint(cx, r, left, &text, Some(BTN_NAME));
         self.name_hit = e.path.is_some().then_some(name);
         self.header_rect = Some(r);
 
@@ -961,55 +987,67 @@ impl EditorView {
         let hover = |cx: &mut PaintCx, b: Rect| {
             cx.round_rect(hover_box(b, side), radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
         };
+        let icon_side = (ch * 0.8).round();
+        let icon_in = |b: Rect| Rect {
+            x: b.x + ((b.w - icon_side) * 0.5).round(),
+            y: b.y + ((b.h - icon_side) * 0.5).round(),
+            w: icon_side,
+            h: icon_side,
+        };
         // `⋯`, pinned to the right end.
         let more_hover = cx.button(mb, BTN_MORE);
         if more_hover {
             hover(cx, mb);
         }
         cx.tooltip(mb, "More options");
-        let icon_side = (ch * 0.8).round();
-        let icon = Rect {
-            x: mb.x + ((mb.w - icon_side) * 0.5).round(),
-            y: mb.y + ((mb.h - icon_side) * 0.5).round(),
-            w: icon_side,
-            h: icon_side,
-        };
-        Icon::More.paint(cx, icon, if more_hover { theme::GLYPH_HOVER } else { theme::GLYPH });
+        Icon::More.paint(cx, icon_in(mb), if more_hover { theme::GLYPH_HOVER } else { theme::GLYPH });
         self.more_hit = Some(mb);
-        // The view-mode button shows the current mode; a click steps on.
-        if let Some(vb) = vb {
-            let on = cx.button(vb, BTN_VIEW_MODE);
-            if on {
-                hover(cx, vb);
+        for (icon, b) in icons {
+            match icon {
+                // The view-mode button shows the current mode; a click steps on.
+                HeaderIcon::ViewMode => {
+                    let on = cx.button(b, BTN_VIEW_MODE);
+                    if on {
+                        hover(cx, b);
+                    }
+                    let (mode, next) = (self.view_mode(), self.next_view_mode());
+                    cx.tooltip(b, format!("{} view\nClick for {}", mode.name(), next.name()));
+                    mode.icon().paint(cx, icon_in(b), if on { theme::GLYPH_HOVER } else { theme::GLYPH });
+                }
+                HeaderIcon::SoftWrap => {
+                    if cx.button(b, BTN_WRAP) {
+                        hover(cx, b);
+                    }
+                    cx.tooltip(b, "Soft wrap");
+                    let color = if wrap { cx.chrome.accent } else { theme::GLYPH };
+                    let top = row.y + (row.h - ch) * 0.5;
+                    cx.label("\u{21a9}", Font::MONO, b.x + (b.w - cx.ui.cell_w) * 0.5, top, b, color);
+                }
+                // A floppy disk: green on, grey off. A buffer with no file
+                // never autosaves, so there it is off and inert.
+                HeaderIcon::Autosave => {
+                    let has_file = self.buf.path.is_some();
+                    if has_file && cx.button(b, BTN_AUTOSAVE) {
+                        hover(cx, b);
+                    }
+                    cx.tooltip(b, self.autosave_tip(cx.cfg));
+                    let disk = if has_file && self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
+                    paint_floppy(cx, b, FLOPPY * ch, disk);
+                }
+                // The statistic (click to cycle), its hit area its whole box,
+                // so it never overlaps a neighbour's.
+                HeaderIcon::Statistic => {
+                    let Some(stat) = stat else { continue };
+                    if cx.button(b, BTN_STAT) {
+                        cx.round_rect(b, radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
+                    }
+                    cx.tooltip(b, self.stats.tip());
+                    let top = row.y + (row.h - ch) * 0.5;
+                    cx.place(stat, b.x + gap, top, b, theme::TEXT_DIM);
+                }
+                HeaderIcon::Autoplay => {}
             }
-            let (mode, next) = (self.view_mode(), self.next_view_mode());
-            cx.tooltip(vb, format!("{} view\nClick for {}", mode.name(), next.name()));
-            let icon = Rect { x: vb.x + ((vb.w - icon_side) * 0.5).round(), ..icon };
-            mode.icon().paint(cx, icon, if on { theme::GLYPH_HOVER } else { theme::GLYPH });
         }
-        // Soft-wrap toggle left of it.
-        if cx.button(wb, BTN_WRAP) {
-            hover(cx, wb);
-        }
-        cx.tooltip(wb, "Soft wrap");
-        let wb_color = if wrap { cx.chrome.accent } else { theme::GLYPH };
-        cx.label("\u{21a9}", Font::MONO, wb.x + (wb.w - cw) * 0.5, top, wb, wb_color);
-        // Autosave toggle (a floppy disk: green on, grey off) left of it; a
-        // buffer with no file never autosaves, so there it is off and inert.
-        let has_file = self.buf.path.is_some();
-        if has_file && cx.button(ab, BTN_AUTOSAVE) {
-            hover(cx, ab);
-        }
-        cx.tooltip(ab, self.autosave_tip(cx.cfg));
-        let disk = if has_file && self.autosave_on(cx.cfg) { theme::ON } else { theme::DIM };
-        paint_floppy(cx, ab, FLOPPY * ch, disk);
-        // The statistic (click to cycle), right-aligned against the disk's
-        // whole button (not just the glyph), so their hit areas never overlap.
-        if cx.button(sb, BTN_STAT) {
-            cx.round_rect(sb, radius, theme::HOVER_BG, theme::HOVER_ALPHA, None);
-        }
-        cx.tooltip(sb, self.stats.tip());
-        cx.place(stat, stat_left, top, sb, theme::TEXT_DIM);
     }
 }
 
@@ -3816,6 +3854,61 @@ body
         let out = h.button(&mut plain, BTN_MORE);
         let [Request::Menu { items, .. }] = out.requests.as_slice() else { panic!("a menu") };
         assert!(items.iter().all(|i| i.id < BTN_SHOW_MODE || i.id >= BTN_SHOW_STAT));
+    }
+
+    /// The header's controls (not the name) left to right.
+    fn header_controls(h: &mut Harness, v: &mut EditorView) -> Vec<u32> {
+        let mut b: Vec<(Rect, u32)> =
+            h.paint(v, RECT).view_buttons.iter().filter(|b| b.2 != BTN_NAME).map(|b| (b.0, b.2)).collect();
+        b.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+        b.into_iter().map(|b| b.1).collect()
+    }
+
+    #[test]
+    fn header_icons_are_the_configured_options_in_order_and_the_menu_keeps_every_option() {
+        let mut h = Harness::new();
+        let mut v = hosted(markdown_view("editor-header-icons", "# a\n"));
+        assert_eq!(
+            header_controls(&mut h, &mut v),
+            [BTN_STAT, BTN_AUTOSAVE, BTN_WRAP, BTN_VIEW_MODE, BTN_MORE],
+            "the default"
+        );
+        // A config change applies on the next paint.
+        h.cfg.editor.header_icons = vec![HeaderIcon::ViewMode, HeaderIcon::Autoplay, HeaderIcon::Statistic];
+        assert_eq!(header_controls(&mut h, &mut v), [BTN_VIEW_MODE, BTN_STAT, BTN_MORE], "autoplay isn't an editor's");
+        let stat = h.frame.view_buttons.iter().find(|b| b.2 == BTN_STAT).unwrap().0;
+        let more = h.frame.view_buttons.iter().find(|b| b.2 == BTN_MORE).unwrap().0;
+        assert!((stat.x + stat.w - more.x).abs() < 1.0, "the icons close up");
+        h.cfg.editor.header_icons.clear();
+        assert_eq!(header_controls(&mut h, &mut v), [BTN_MORE]);
+        let name = h.frame.view_buttons.iter().find(|b| b.2 == BTN_NAME).unwrap().0;
+        assert!(name.x + name.w <= more.x + 0.5);
+        let out = h.button(&mut v, BTN_MORE);
+        let [Request::Menu { items, .. }] = out.requests.as_slice() else { panic!("a menu") };
+        for id in [BTN_SHOW_MODE, BTN_WRAP, BTN_AUTOSAVE, BTN_SHOW_STAT, BTN_FILE_MENU] {
+            assert!(items.iter().any(|i| i.id == id), "{id} is in the menu");
+        }
+        // A hidden option's menu item still works.
+        let wrap = v.wrap_on(&h.cfg);
+        h.button(&mut v, BTN_WRAP);
+        assert_eq!(v.wrap_on(&h.cfg), !wrap);
+    }
+
+    #[test]
+    fn header_icons_parse_and_unknown_ids_are_flagged() {
+        let cat = crate::settings::catalogue(&crate::app_state::build_registry());
+        let text = "[editor]\nheader_icons = [\"soft_wrap\", \"ribbon\", \"view_mode\"]\n";
+        let (cfg, findings) = ghostrealm_core::config::parse(text, &cat);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("unknown entry \"ribbon\""), "{}", findings[0].message);
+        assert_eq!(cfg.unwrap().editor.header_icons, [HeaderIcon::SoftWrap, HeaderIcon::ViewMode], "the rest apply");
+        let doc = cat.section("editor").unwrap().option("header_icons").unwrap().hover("editor");
+        assert!(doc.contains("\"autoplay\": "), "{doc}");
+        // Every catalogued id is a typed option.
+        let text = "[editor]\nheader_icons = [\"statistic\", \"autosave\", \"soft_wrap\", \"view_mode\", \"autoplay\"]\n";
+        let (cfg, findings) = ghostrealm_core::config::parse(text, &cat);
+        assert_eq!(findings, vec![]);
+        assert_eq!(cfg.unwrap().editor.header_icons.len(), 5);
     }
 
     #[test]
