@@ -80,6 +80,10 @@ pub struct Outline {
     /// the first line edited since it read them, and its result.
     job: Option<Job>,
     waker: Option<Waker>,
+    /// Tests hold this to keep a worker's result back, so they can act
+    /// while it runs whatever the machine's speed.
+    #[cfg(test)]
+    gate: Option<std::sync::Arc<std::sync::Mutex<()>>>,
 }
 
 struct Job {
@@ -106,7 +110,13 @@ impl Outline {
     /// nothing waiting.
     pub fn reset(&mut self) {
         let waker = self.waker.take();
+        #[cfg(test)]
+        let gate = self.gate.take();
         *self = Outline::new(waker);
+        #[cfg(test)]
+        {
+            self.gate = gate;
+        }
     }
 
     /// Lines before `row` are unchanged by the edits since the last update,
@@ -235,7 +245,11 @@ impl Outline {
         let text = lines.join("\n");
         let (tx, rx) = mpsc::channel();
         let waker = self.waker.clone();
+        #[cfg(test)]
+        let gate = self.gate.clone();
         std::thread::spawn(move || {
+            #[cfg(test)]
+            let _held = gate.as_ref().map(|g| g.lock());
             let lines: Vec<&str> = text.split('\n').collect();
             let (mut next, mut state) = (0, 0);
             let items = outline(h, &lines, |ln| {
@@ -453,6 +467,7 @@ mod tests {
 
     #[test]
     fn a_very_long_document_outlines_on_a_worker_one_job_at_a_time() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
         let (tx, rx) = mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
         let waker: Waker = std::sync::Arc::new(move || {
@@ -464,6 +479,7 @@ mod tests {
         lines[3] = "```".into();
         lines[2] = "# in a fence".into();
         let (mut o, mut states, now) = (Outline::new(Some(waker)), StateCache::default(), Instant::now());
+        o.gate = Some(gate.clone());
         assert!(!o.update(&Markdown, &lines, 0, &mut states, now), "not on the UI thread");
         assert!(o.working() && o.items().is_empty());
         rx.recv_timeout(Duration::from_secs(10)).expect("the worker wakes the UI");
@@ -474,10 +490,13 @@ mod tests {
         lines[5] = "# five".into();
         o.update(&Markdown, &lines, 1, &mut states, now);
         assert!(!o.working(), "waits for the edits to pause");
+        let held = gate.lock().unwrap();
         o.update(&Markdown, &lines, 1, &mut states, now + DEBOUNCE);
         assert!(o.working());
         lines[6] = "# six".into();
         assert!(!o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE * 3));
+        assert!(o.working(), "held: still edit 1's job");
+        drop(held);
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
         // Edit 1's outline lands; edit 2's pause counts from then.
         assert!(o.poll());
@@ -504,6 +523,15 @@ mod tests {
         false
     }
 
+    /// An outline whose worker holds its result while the returned gate is
+    /// locked.
+    fn gated() -> (Outline, std::sync::Arc<std::sync::Mutex<()>>) {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut o = Outline::new(None);
+        o.gate = Some(gate.clone());
+        (o, gate)
+    }
+
     fn worker_doc() -> Vec<String> {
         let heading = |i: usize| if i.is_multiple_of(1_000) { format!("# {i}") } else { "text".into() };
         (0..WORKER_LINES * 2).map(heading).collect()
@@ -512,18 +540,21 @@ mod tests {
     #[test]
     fn edits_made_while_the_worker_runs_are_outlined_after_it_even_when_it_changes_nothing() {
         let mut lines = worker_doc();
-        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        let ((mut o, gate), mut states, now) = (gated(), StateCache::default(), Instant::now());
         o.update(&Markdown, &lines, 0, &mut states, now);
         land(&mut o);
         // Edit 1 changes no heading; edit 2, while its job runs, adds one.
         lines[5] = "more text".into();
         o.dirty_from(5);
         o.update(&Markdown, &lines, 1, &mut states, now);
+        let held = gate.lock().unwrap();
         o.update(&Markdown, &lines, 1, &mut states, now + DEBOUNCE);
         assert!(o.working());
         lines[7] = "# new".into();
         o.dirty_from(7);
         o.update(&Markdown, &lines, 2, &mut states, now + DEBOUNCE);
+        assert!(o.working(), "held: still edit 1's job");
+        drop(held);
         assert!(!land(&mut o), "edit 1's outline is the same");
         let due = o.due().expect("edit 2 still to outline");
         o.update(&Markdown, &lines, 2, &mut states, due);
@@ -534,13 +565,15 @@ mod tests {
     #[test]
     fn a_worker_outline_older_than_a_synchronous_one_is_dropped() {
         let mut lines = worker_doc();
-        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        let ((mut o, gate), mut states, now) = (gated(), StateCache::default(), Instant::now());
+        let held = gate.lock().unwrap();
         o.update(&Markdown, &lines, 0, &mut states, now);
         assert!(o.working());
         lines = vec!["# only".into(), "# two".into()];
         o.dirty_from(0);
         o.update(&Markdown, &lines, 1, &mut states, now);
         assert_eq!(o.items().len(), 2);
+        drop(held);
         assert!(!o.working() && !land(&mut o));
         assert_eq!(o.items().len(), 2);
     }
@@ -548,13 +581,14 @@ mod tests {
     #[test]
     fn growing_past_the_worker_threshold_while_a_job_runs_leaves_no_past_deadline() {
         let mut lines = worker_doc();
-        let (mut o, mut states, now) = (Outline::new(None), StateCache::default(), Instant::now());
+        let ((mut o, gate), mut states, now) = (gated(), StateCache::default(), Instant::now());
         o.update(&Markdown, &lines, 0, &mut states, now);
         land(&mut o);
         // Edit 1 starts a job after its pause.
         lines[5] = "more".into();
         o.dirty_from(5);
         o.update(&Markdown, &lines, 1, &mut states, now);
+        let held = gate.lock().unwrap();
         o.update(&Markdown, &lines, 1, &mut states, now + DEBOUNCE);
         assert!(o.working());
         // Edit 2 makes it shorter than the worker's threshold: it waits.
@@ -566,12 +600,12 @@ mod tests {
         lines.extend(tail);
         o.update(&Markdown, &lines, 3, &mut states, now + DEBOUNCE * 2);
         assert_eq!(o.due(), None, "the job's result asks again; no tick meanwhile");
+        assert!(o.working(), "held: still edit 1's job");
+        drop(held);
         land(&mut o);
-        // Unless the job had finished by edit 3, which then started its own.
-        if let Some(due) = o.due() {
-            o.update(&Markdown, &lines, 3, &mut states, due);
-            land(&mut o);
-        }
+        let due = o.due().expect("edit 3 to outline");
+        o.update(&Markdown, &lines, 3, &mut states, due);
+        land(&mut o);
         assert_eq!(o.due(), None);
         assert_eq!(o.items().len(), WORKER_LINES * 2 / 1_000);
     }
