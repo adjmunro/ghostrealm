@@ -1337,8 +1337,24 @@ impl View for EditorView {
     fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), dx: f32, dy: f32) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         self.scroll_accum += dy;
-        let lines = (self.scroll_accum / ch).trunc() as isize;
-        self.scroll_accum -= lines as f32 * ch;
+        // The wheel moves the top line by its own row's height: a heading
+        // takes as much travel to pass as it is tall, a base row one cell.
+        let layout = RowLayout { cell: (cw, ch), ..self.layout.rows };
+        let h = self.highlighter();
+        self.sync_hl_states();
+        let mut top = self.buf.scroll as isize;
+        loop {
+            let up = self.scroll_accum > 0.0;
+            let ln = if up { top - 1 } else { top };
+            let scale = usize::try_from(ln).map_or(1.0, |ln| line_scale(&mut self.hl_states, &self.buf, h, ln));
+            let step = layout.row_h(scale);
+            if self.scroll_accum.abs() < step {
+                break;
+            }
+            self.scroll_accum -= step.copysign(self.scroll_accum);
+            top += if up { -1 } else { 1 };
+        }
+        let lines = self.buf.scroll as isize - top;
         let e = &mut self.buf;
         let mut changed = false;
         if lines != 0 {
@@ -3089,6 +3105,26 @@ mod tests {
         let pos = (text_x + 3.0 * cw + 1.0, 5.0);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
         assert_eq!(v.buffer().cursor, (0, 5));
+    }
+
+    #[test]
+    fn the_wheel_passes_a_heading_in_its_own_height() {
+        let h = Harness::new();
+        let mut hh = Harness::new();
+        let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
+        let mut v = markdown_view("editor-md-wheel", &text);
+        paint_plain(&mut hh, &mut v);
+        h.scroll(&mut v, (10.0, 10.0), -UI.cell_h);
+        assert_eq!(v.buffer().scroll, 0, "a base row's travel doesn't pass an H1 row");
+        h.scroll(&mut v, (10.0, 10.0), -(R1 - UI.cell_h));
+        assert_eq!(v.buffer().scroll, 1, "an H1 row's does");
+        h.scroll(&mut v, (10.0, 10.0), R1);
+        assert_eq!(v.buffer().scroll, 0, "and back");
+        // Base rows move a line per cell.
+        let mut plain = markdown_view("editor-md-wheel-plain", &"x\n".repeat(20));
+        paint_plain(&mut hh, &mut plain);
+        h.scroll(&mut plain, (10.0, 10.0), -2.0 * UI.cell_h);
+        assert_eq!(plain.buffer().scroll, 2);
     }
 
     #[test]
