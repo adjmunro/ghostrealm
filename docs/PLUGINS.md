@@ -129,8 +129,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   `RunStyle` (`BOLD`, `ITALIC`, `UNDERLINE`, `BOX`, combined with `|`) per span,
   keyed with `row_key_styled`. Bold/italic pick the face at shaping (cosmic-text
   uses the nearest weight, and skews an italic when the family has none);
-  underline and `BOX` (a tinted background) are quads drawn under the glyphs,
-  `cell_w` per char. A row with no styled span passes `RowStyles::NONE`
+  underline and `BOX` (a rounded box outlined in `theme::CODE_BOX_*`, one per
+  run of adjacent boxed spans, padded a little into the cells either side) are
+  quads drawn under the glyphs, `cell_w` per char. A row with no styled span passes `RowStyles::NONE`
   (`budgeted_row` does): it keys, shapes, and draws as before and carries no
   style data. Build `runs` only for rows that use a style
   (`syntax::styled_row_spans` returns it empty otherwise).

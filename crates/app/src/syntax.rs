@@ -17,7 +17,8 @@ pub fn color(token: Token, plain: [u8; 3]) -> [u8; 3] {
         Token::Marker => [100, 130, 108],
         Token::Strong => [235, 205, 160],
         Token::Emphasis => [190, 165, 215],
-        Token::Code => [215, 150, 125],
+        // Near the text colour: the code box, not a hue, sets code apart.
+        Token::Code => [200, 206, 218],
         Token::Link => [100, 170, 235],
         Token::Url => [85, 125, 170],
         Token::Quote => [150, 160, 180],

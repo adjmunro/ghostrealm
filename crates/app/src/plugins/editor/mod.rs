@@ -2012,7 +2012,8 @@ mod tests {
         paint_plain(&mut h, &mut v);
         let boxes: Vec<_> = bg_rects(&h).into_iter().filter(|r| !base.contains(r) && r.3 > 3.0).collect();
         assert_eq!(boxes.len(), 1, "{boxes:?}");
-        assert_eq!((boxes[0].0, boxes[0].2), (text_x + 3.0 * cw, 4.0 * cw), "the code text, not the backticks");
+        // Around the code text, padded a little into the backticks' cells.
+        assert_eq!((boxes[0].0, boxes[0].2), (text_x + 3.0 * cw - 2.0, 4.0 * cw + 4.0));
     }
 
     #[test]

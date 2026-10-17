@@ -1122,25 +1122,54 @@ impl<'a> PaintCx<'a> {
         });
     }
 
-    /// The quads under a styled row: a tinted box behind `BOX` spans and a thin
-    /// line under `UNDERLINE` spans, each as wide as its characters at the
-    /// styles' cell width, clipped to `clip`.
+    /// The quads under a styled row: a rounded, outlined code box behind each
+    /// run of `BOX` spans and a thin line under `UNDERLINE` spans, each as
+    /// wide as its characters at the styles' cell width, clipped to `clip`.
     fn decorate(&mut self, spans: &[(String, [u8; 3])], styles: RowStyles, left: f32, top: f32, clip: Rect) {
         let (line_h, size) = (self.text.line_h, self.text.metrics.font_size);
         let thick = (size / 14.0).round().max(1.0);
+        // Each span's x range, unclipped.
         let mut x = left;
-        for ((text, color), style) in spans.iter().zip(styles.runs) {
-            let w = text.chars().count() as f32 * styles.cell_w;
-            let (x0, x1) = (x.max(clip.x), (x + w).min(clip.x + clip.w));
-            x += w;
+        let ranges: Vec<(f32, f32)> = spans
+            .iter()
+            .map(|(text, _)| {
+                let x0 = x;
+                x += text.chars().count() as f32 * styles.cell_w;
+                (x0, x)
+            })
+            .collect();
+        // One box per run of adjacent boxed spans (a code span split by colour
+        // is one span of code), outset a little into the cells either side
+        // (a code span's backticks), so it pads its text without moving the
+        // grid. Drawn whole and clipped, so a cut box keeps its corners.
+        let pad = (styles.cell_w * 0.25).round().max(1.0);
+        let inset = theme::hairline(self.ui);
+        let border = Some((theme::hairline(self.ui), theme::CODE_BOX_BORDER, theme::CODE_BOX_BORDER_ALPHA));
+        let radius = theme::box_radius(self.ui);
+        let mut i = 0;
+        while i < spans.len() {
+            if !styles.runs[i].contains(RunStyle::BOX) {
+                i += 1;
+                continue;
+            }
+            let x0 = ranges[i].0;
+            while i + 1 < spans.len() && styles.runs[i + 1].contains(RunStyle::BOX) {
+                i += 1;
+            }
+            let x1 = ranges[i].1;
+            i += 1;
             if x1 <= x0 {
                 continue;
             }
-            if style.contains(RunStyle::BOX) {
-                let r = Rect { x: x0, y: top + 1.0, w: x1 - x0, h: (line_h - 2.0).max(1.0) };
-                self.fill_alpha(r, theme::CODE_BG, theme::CODE_BG_ALPHA);
-            }
-            if style.contains(RunStyle::UNDERLINE) {
+            let (bx0, bx1) = ((x0 - pad).round(), (x1 + pad).round());
+            let r = Rect { x: bx0, y: top + inset, w: bx1 - bx0, h: (line_h - 2.0 * inset).max(1.0) };
+            self.with_clip(clip, |cx| {
+                cx.round_rect(r, radius, theme::CODE_BOX_BG, theme::CODE_BOX_ALPHA, border);
+            });
+        }
+        for (((_, color), style), (x0, x1)) in spans.iter().zip(styles.runs).zip(ranges) {
+            let (x0, x1) = (x0.max(clip.x), x1.min(clip.x + clip.w));
+            if x1 > x0 && style.contains(RunStyle::UNDERLINE) {
                 let r = Rect { x: x0, y: top + line_h - 2.0 * thick, w: x1 - x0, h: thick };
                 self.fill_alpha(r, *color, 1.0);
             }
@@ -1203,6 +1232,39 @@ mod tests {
         }
         assert!(h.text.finish_paint(), "some rows were deferred");
         assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
+
+    /// A run of adjacent `BOX` spans draws one rounded, outlined box, padded
+    /// into the cells either side and clipped (not cut) to the row's clip.
+    #[test]
+    fn boxed_spans_draw_one_rounded_outlined_box_per_run() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let spans: Vec<(String, [u8; 3])> =
+            ["a `", "co", "de", "` b `", "x"].iter().map(|t| (t.to_string(), [200; 3])).collect();
+        let runs = [RunStyle::PLAIN, RunStyle::BOX, RunStyle::BOX, RunStyle::PLAIN, RunStyle::BOX];
+        let styles = RowStyles { runs: &runs, cell_w: UI.cell_w };
+        // The clip ends inside the second box (columns 12..13, padded).
+        let clip = Rect { x: 0.0, y: 0.0, w: 12.5 * UI.cell_w, h: 100.0 };
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            let key = cx.row_key_styled(spans.iter().map(|(t, c)| (t.as_str(), *c)), styles);
+            cx.budgeted_row_styled(key, || spans.clone(), styles, 0.0, 0.0, 400.0, clip, [200; 3]);
+        }
+        let boxes = &h.frame.bg;
+        assert_eq!(boxes.len(), 2, "one box per run of boxed spans");
+        let pad = 2.0;
+        let x = |q: &QuadInstance| ((q.pos[0] + 1.0) / 2.0 * 800.0 * 100.0).round() / 100.0;
+        assert_eq!((x(&boxes[0]), boxes[0].px[0]), (3.0 * UI.cell_w - pad, 4.0 * UI.cell_w + 2.0 * pad));
+        assert_eq!((x(&boxes[1]), boxes[1].px[0]), (12.0 * UI.cell_w - pad, UI.cell_w + 2.0 * pad));
+        let border = theme::hairline(UI);
+        assert_eq!(boxes[1].px[1], UI.cell_h - 2.0 * border, "inset from the row's edges");
+        for q in boxes {
+            assert_eq!((q.radius, q.border_w), (theme::box_radius(UI), border));
+        }
+        assert_eq!(boxes[0].clip, [0.0, 0.0, clip.w, 100.0], "clipped, keeping its shape");
     }
 
     /// A hosted view's buttons and images carry its host's id base, nested

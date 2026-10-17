@@ -54,11 +54,13 @@ pub const GUIDE: [u8; 3] = [255, 255, 255];
 pub const GUIDE_ALPHA: f32 = 0.10;
 /// A code box (inline code, a fenced block): fill at [`CODE_BOX_ALPHA`] over
 /// the background, outlined in [`CODE_BOX_BORDER`] at
-/// [`CODE_BOX_BORDER_ALPHA`].
+/// [`CODE_BOX_BORDER_ALPHA`]. Neutral and low in contrast, so the outline
+/// defines the box rather than the fill: over the editor's background the
+/// fill lifts it by about 12 levels and the border by about 27.
 pub const CODE_BOX_BG: [u8; 3] = [255, 255, 255];
-pub const CODE_BOX_ALPHA: f32 = 0.05;
+pub const CODE_BOX_ALPHA: f32 = 0.055;
 pub const CODE_BOX_BORDER: [u8; 3] = [255, 255, 255];
-pub const CODE_BOX_BORDER_ALPHA: f32 = 0.14;
+pub const CODE_BOX_BORDER_ALPHA: f32 = 0.12;
 /// A text field's border while it has keyboard focus.
 pub const FIELD_FOCUS_BORDER: [u8; 3] = [110, 140, 210];
 

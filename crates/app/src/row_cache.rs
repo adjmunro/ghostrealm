@@ -37,7 +37,8 @@ impl RunStyle {
     pub const BOLD: RunStyle = RunStyle(1);
     pub const ITALIC: RunStyle = RunStyle(2);
     pub const UNDERLINE: RunStyle = RunStyle(4);
-    /// A tinted box behind the span (inline code).
+    /// A rounded, outlined box behind the span (inline code); adjacent boxed
+    /// spans share one.
     pub const BOX: RunStyle = RunStyle(8);
 
     pub fn contains(self, other: RunStyle) -> bool {
