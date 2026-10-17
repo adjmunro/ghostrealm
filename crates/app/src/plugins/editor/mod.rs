@@ -6,6 +6,7 @@
 pub mod buffer;
 mod stats;
 pub mod lang;
+pub mod md_preview;
 mod rows;
 pub mod wrap;
 

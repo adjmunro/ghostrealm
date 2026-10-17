@@ -26,6 +26,8 @@ sys-locale = "0.3.2"
 # File browser preview: still-image decode, and audio playback (symphonia codecs).
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav"] }
+# Markdown Preview: CommonMark + GFM tables, task lists, strikethrough.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
