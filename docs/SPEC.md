@@ -113,6 +113,7 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 - [x] Files surface (GitHub issue #1): file sidebar with name filter and `?`
       search, file tabs with a preview tab, document header with configurable
       icons, view modes with a Markdown Preview, and a table of contents.
+      Follow-ups: TODO.md.
 
 Remaining polish is tracked in [TODO.md](TODO.md). The core loop, splits, tabs,
 sidebar/inbox, palette, config, and the agent channel are all in and tested.

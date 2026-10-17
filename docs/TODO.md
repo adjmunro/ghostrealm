@@ -110,7 +110,7 @@
 
 [2026-09-15@2e8e8c7] Scroll lag — pacing landed; deeper cost is the render itself (P1 follow-up)
 
-- Requires: the worker-thread architecture (below) for the full fix
+- Requires: NO BLOCKERS (the VT worker thread landed in 92d5ca0)
 - Detail: DONE (b173b08): wheel events now apply the scroll to the VT immediately but
   pace the redraw through the frame clock (frame_pending) instead of an immediate
   request_redraw per event, so a flick coalesces into ~one render/frame instead of a
@@ -118,6 +118,9 @@
   reshapes newly-revealed rows on the UI thread (~fine in release, heavier in debug);
   the worker-thread architecture removes that from the UI thread entirely. Verify the
   feel after that lands; if still stuttery, profile the snapshot/reshape.
+  Two worker follow-ups remain: rate-limit its grid builds under a sustained
+  flood (it builds a grid per drained batch), and recycle the grids the UI has
+  consumed instead of allocating new ones.
 - Reason: user's #1 priority — scroll must feel instant.
 
 ---
@@ -320,7 +323,8 @@
 - Detail: The grouped views (`FsView`: extension, kind, git status, modified,
   size) exist. Not yet: two flat lists across the tree, **recent**
   (newest-first) and **largest files**, with the same dim disambiguating
-  prefix the grouped views show.
+  prefix the grouped views show; and a **Staged** group in the git status view
+  (it has Modified, Untracked and Unchanged).
 - Reason: navigate by kind/status/date, not just by folder; requested + brainstorm.
 
 ---
