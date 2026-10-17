@@ -49,6 +49,12 @@ impl AppState {
         self
     }
 
+    /// Open `url` with the system's handler for it (a view's
+    /// `Request::OpenUrl`).
+    pub fn open_url(&self, url: &str) -> Result<()> {
+        self.system.open_url(url)
+    }
+
     /// The file menu for `target`.
     pub fn file_menu(&self, target: &FileTarget) -> Vec<MenuEntry> {
         let env = MenuEnv {
@@ -939,6 +945,13 @@ mod tests {
             *calls.borrow(),
             [format!("reveal {}", d.join("a.txt").display()), format!("open {}", d.join("a.txt").display())]
         );
+    }
+
+    #[test]
+    fn a_url_opens_through_the_system() {
+        let (s, calls) = app();
+        s.open_url("https://example.com/a?b").unwrap();
+        assert_eq!(*calls.borrow(), ["url https://example.com/a?b"]);
     }
 
     #[test]

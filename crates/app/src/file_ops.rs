@@ -18,6 +18,8 @@ pub trait System {
     fn reveal(&self, path: &Path) -> Result<()>;
     /// Open `path` with the system's default application.
     fn open_default(&self, path: &Path) -> Result<()>;
+    /// Open `url` with the system's handler for its scheme (a browser).
+    fn open_url(&self, url: &str) -> Result<()>;
 }
 
 /// The real thing.
@@ -49,6 +51,10 @@ impl System for HostSystem {
 
     fn open_default(&self, path: &Path) -> Result<()> {
         run(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }, [path.as_os_str()])
+    }
+
+    fn open_url(&self, url: &str) -> Result<()> {
+        run(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }, [OsStr::new(url)])
     }
 }
 
@@ -599,6 +605,11 @@ pub mod tests {
 
         fn open_default(&self, path: &Path) -> Result<()> {
             self.calls.borrow_mut().push(format!("open {}", path.display()));
+            Ok(())
+        }
+
+        fn open_url(&self, url: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("url {url}"));
             Ok(())
         }
     }

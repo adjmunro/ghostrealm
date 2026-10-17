@@ -70,6 +70,9 @@ pub enum Request {
     /// workspace's last focused one, else a new one), with whichever plugin
     /// claims the path.
     OpenFile(PathBuf),
+    /// Open this URL with the system's handler for its scheme (a link to a
+    /// web page).
+    OpenUrl(String),
     /// The view wrote this file (the app hot-reloads it if it is the config).
     Saved(PathBuf),
     /// A view hosted in the floating picker chose this path: the picker confirms

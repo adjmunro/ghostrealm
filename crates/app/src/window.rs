@@ -1860,6 +1860,11 @@ impl State {
         for req in out.requests {
             match req {
                 Request::OpenFile(path) => self.open_requested_file(sid, path),
+                Request::OpenUrl(url) => {
+                    if let Err(e) = self.app.open_url(&url) {
+                        eprintln!("ghostrealm: open {url}: {e:#}");
+                    }
+                }
                 Request::Saved(path) => self.saved(path),
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}
