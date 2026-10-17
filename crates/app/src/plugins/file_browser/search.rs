@@ -41,6 +41,32 @@ pub struct MatchAt {
     pub query: SearchQuery,
 }
 
+impl MatchAt {
+    /// Where the match is in `line` (its line's text now, which may differ
+    /// from the file searched), in chars: the match at [`Self::cols`], else
+    /// the line's first, else nothing at the line's start. Stops at the
+    /// first match from `cols` on, counting chars as it goes, so a long
+    /// line of matches costs one pass.
+    pub fn cols_in(&self, line: &str) -> Range<usize> {
+        let Ok(matcher) = self.query.matcher() else { return 0..0 };
+        let (mut at, mut col) = (0, 0);
+        let mut col_of = |b: usize| {
+            col += line[at..b].chars().count();
+            at = b;
+            col
+        };
+        let mut first = None;
+        for r in matcher.matches(line) {
+            let cols = col_of(r.start)..col_of(r.end);
+            let first = first.get_or_insert_with(|| cols.clone());
+            if cols.start >= self.cols.start {
+                return if cols == self.cols { cols } else { first.clone() };
+            }
+        }
+        first.unwrap_or(0..0)
+    }
+}
+
 /// A result row: a file's header, one of its matching lines, or the note
 /// that it has more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,11 +160,19 @@ impl Search {
         self.scroll = 0.0;
     }
 
+    /// The highlighted and the opened row as [`RowId`]s, read against the
+    /// results the rows were built from: take them before the results
+    /// change.
+    fn marked_ids(&self) -> (Option<RowId>, Option<RowId>) {
+        (self.sel.and_then(|i| self.row_id(i)), self.chosen.and_then(|i| self.row_id(i)))
+    }
+
     /// Rebuild the rows from the results, keeping the highlighted and the
-    /// opened row where they are listed still (a refresh's results replace
-    /// the old ones whole).
-    fn rebuild_rows(&mut self) {
-        let (sel, chosen) = (self.sel.and_then(|i| self.row_id(i)), self.chosen.and_then(|i| self.row_id(i)));
+    /// opened row (`marked`, from [`Self::marked_ids`] before the results
+    /// changed) where they are listed still: a refresh's results replace the
+    /// old ones whole, so their indices mean other rows.
+    fn rebuild_rows(&mut self, marked: (Option<RowId>, Option<RowId>)) {
+        let (sel, chosen) = marked;
         self.rows.clear();
         for (i, f) in self.searcher.results().files.iter().enumerate() {
             self.rows.push(Hit::File(i));
@@ -238,6 +272,7 @@ impl FileBrowserView {
             return;
         }
         s.clear_rows();
+        s.stale = false;
         s.error = None;
         s.awaiting_git = awaiting_git;
         if query.text.is_empty() || awaiting_git {
@@ -271,9 +306,10 @@ impl FileBrowserView {
 
     /// Take in streamed results. Returns whether they changed.
     pub(super) fn poll_search(&mut self) -> bool {
+        let marked = self.search.marked_ids();
         let changed = self.search.searcher.poll();
         if changed {
-            self.search.rebuild_rows();
+            self.search.rebuild_rows(marked);
         }
         changed
     }
@@ -518,7 +554,10 @@ impl FileBrowserView {
         }
         let note = match r.stopped {
             Stop::No => return None,
-            Stop::Results => format!("Showing the first {} matches in {} files", r.matches, r.files.len()),
+            Stop::Results => {
+                let floor = if r.partial { "+" } else { "" };
+                format!("Showing the first {}{floor} matches in {} files", r.matches, r.files.len())
+            }
             Stop::Walk => "Stopped early: too many files to search".to_string(),
         };
         Some((note, theme::DIM))
@@ -531,7 +570,7 @@ impl FileBrowserView {
         let root = self.search_root();
         for f in &self.search.searcher.results().files {
             let rel = f.path.strip_prefix(root).unwrap_or(&f.path);
-            out.push_str(&format!("{} ({})\n", rel.display(), f.total));
+            out.push_str(&format!("{} ({}{})\n", rel.display(), f.total, if f.partial { "+" } else { "" }));
             for l in &f.lines {
                 out.push_str(&format!("  {}: {}\n", l.line + 1, l.text.trim()));
             }
@@ -967,6 +1006,62 @@ mod tests {
         h.paint(&mut v, RECT);
         assert!(h.texts().iter().any(|t| t == "Loading git status\u{2026}"), "{:?}", h.texts());
         assert!(v.search.rows.is_empty());
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_marked_rows_on_their_file_and_line() {
+        let (d, mut v) = fixture();
+        let mut h = Harness::new();
+        type_in(&h, &mut v, "?hit");
+        settle(&h, &mut v);
+        h.paint(&mut v, RECT);
+        // Rows: a.txt, its two lines, sub/b.md, its line. Open b.md's line;
+        // highlight a.txt's second.
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(4), clicks: 1, button: MouseButton::Left });
+        v.search.sel = Some(2);
+        let ids = |v: &FileBrowserView| (v.search.row_id(v.search.sel.unwrap()), v.search.row_id(v.search.chosen.unwrap()));
+        let before = ids(&v);
+        // A file sorted before them appears, and the files are searched again.
+        std::fs::write(d.join("0.txt"), "hit\nhit\n").unwrap();
+        v.files_changed(&[]);
+        h.tick(&mut v, Instant::now() + DEBOUNCE * 2);
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.search.searcher.refreshing() || v.search.searcher.results().files.len() < 3 {
+            assert!(Instant::now() < until, "the refresh finishes");
+            v.refresh();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(v.search.rows.len(), 8, "0.txt's three rows added");
+        assert_eq!((v.search.sel, v.search.chosen), (Some(5), Some(7)));
+        assert_eq!(ids(&v), before);
+        // And one dropped.
+        std::fs::remove_file(d.join("0.txt")).unwrap();
+        v.files_changed(&[]);
+        h.tick(&mut v, Instant::now() + DEBOUNCE * 2);
+        while v.search.searcher.refreshing() || v.search.searcher.results().files.len() > 2 {
+            assert!(Instant::now() < until, "the refresh finishes");
+            v.refresh();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!((v.search.sel, v.search.chosen), (Some(2), Some(4)));
+        assert_eq!(ids(&v), before);
+    }
+
+    #[test]
+    fn a_match_is_found_again_in_one_pass_over_a_long_line() {
+        let line = "a ".repeat(1024 * 1024 / 2);
+        let query = SearchQuery { text: "a".into(), ..SearchQuery::default() };
+        let near_end = (line.len() / 2 - 10) * 2;
+        let m = MatchAt { path: PathBuf::new(), line: 0, cols: near_end..near_end + 1, query };
+        let at = Instant::now();
+        assert_eq!(m.cols_in(&line), near_end..near_end + 1);
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+        // Gone from its columns: the line's first; none: the line's start.
+        let moved = MatchAt { cols: 4..5, ..m.clone() };
+        assert_eq!(moved.cols_in("a xx a a"), 0..1, "none at 4: the first");
+        assert_eq!(moved.cols_in("a xxa a"), 4..5, "still at 4");
+        assert_eq!(moved.cols_in(" xa"), 2..3);
+        assert_eq!(moved.cols_in("none"), 0..0);
     }
 
     #[test]

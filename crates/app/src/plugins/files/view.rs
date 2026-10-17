@@ -294,13 +294,7 @@ impl FilesView {
             return;
         }
         let Some(editor) = t.view.downcast_mut::<EditorView>() else { return };
-        let text = editor.buffer().lines.get(m.line).map_or("", String::as_str);
-        let col = |b: usize| text[..b].chars().count();
-        let found: Vec<std::ops::Range<usize>> = match m.query.matcher() {
-            Ok(q) => q.find_iter(text).into_iter().map(|r| col(r.start)..col(r.end)).collect(),
-            Err(_) => Vec::new(),
-        };
-        let cols = found.iter().find(|r| **r == m.cols).or(found.first()).cloned().unwrap_or(0..0);
+        let cols = m.cols_in(editor.buffer().lines.get(m.line).map_or("", String::as_str));
         editor.reveal(m.line, cols);
     }
 

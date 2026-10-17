@@ -73,6 +73,10 @@ impl std::ops::BitOr for RunStyle {
 struct Slot {
     key: u64,
     buf: Buffer,
+    /// Its layout depends on the width it was shaped at, which the key
+    /// leaves out (a monospace row with non-ASCII text, unaligned: a
+    /// right-to-left one sits against the right edge).
+    sized: bool,
     /// Monotonic clock value at the slot's last use; higher = more recent.
     used: u64,
 }
@@ -211,8 +215,16 @@ impl RowCache {
     ) {
         if let Some(&idx) = self.map.get(&key) {
             let now = self.tick();
-            self.slab[idx].used = now;
+            let slot = &mut self.slab[idx];
+            slot.used = now;
             self.hits += 1;
+            // Laid out again at the new width (not reshaped), so such a row
+            // follows its box as it resizes.
+            let width = width.max(1.0);
+            if slot.sized && slot.buf.size().0 != Some(width) {
+                slot.buf.set_size(Some(width), Some(line_h));
+                slot.buf.shape_until_scroll(font_system, false);
+            }
             return;
         }
         self.misses += 1;
@@ -223,6 +235,7 @@ impl RowCache {
                 self.slab.push(Slot {
                     key,
                     buf: Buffer::new(font_system, metrics),
+                    sized: false,
                     used: now,
                 });
                 self.slab.len() - 1
@@ -248,6 +261,7 @@ impl RowCache {
         // depend on it. Monospace grid rows place each cell where the grid
         // says, so they keep the default.
         let align = if mono { None } else { Some(Align::Left) };
+        slot.sized = mono && shaping == Shaping::Advanced;
         let buf = &mut slot.buf;
         buf.set_metrics(metrics);
         buf.set_wrap(Wrap::None);
@@ -484,6 +498,25 @@ mod tests {
         cache.ensure_in(sans, &mut fs, m, 400.0, 18.0, &span("abc", GREY), &[], Family::SansSerif);
         cache.end_frame();
         assert_eq!(cache.stats(), (0, 2), "each family shapes its own row");
+    }
+
+    #[test]
+    fn a_monospace_rtl_row_follows_its_width_on_a_hit() {
+        let mut fs = FontSystem::new();
+        let m = Metrics::new(15.0, 18.0);
+        let mut cache = RowCache::new(256);
+        let line = "\u{05e9}\u{05dc}\u{05d5}\u{05dd} abc";
+        let key = cache.row_key(std::iter::once((line, GREY)));
+        let right = |cache: &RowCache| {
+            let buf = cache.buffer(key).unwrap();
+            buf.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x + g.w)).fold(0.0, f32::max)
+        };
+        cache.begin_frame(0);
+        cache.ensure(key, &mut fs, m, 400.0, 18.0, &span(line, GREY), &[]);
+        assert!((right(&cache) - 400.0).abs() < 1.0, "against the right edge: {}", right(&cache));
+        cache.ensure(key, &mut fs, m, 200.0, 18.0, &span(line, GREY), &[]);
+        assert!((right(&cache) - 200.0).abs() < 1.0, "follows the narrower width: {}", right(&cache));
+        assert_eq!(cache.stats(), (1, 1), "laid out again, not reshaped as a miss");
     }
 
     #[test]

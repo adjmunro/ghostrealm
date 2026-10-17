@@ -145,7 +145,10 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   budget; past it the position redraws last frame's row and the frame is
   re-requested). Use `budgeted_row` for bulk
   content (terminal grid, editor text) and build the key with `row_key` from your
-  cells so a cache hit costs no allocation. `row_spans_x(key, bytes)` is where
+  cells so a cache hit costs no allocation. The key leaves out the shaping
+  width: a row whose layout depends on it (monospace with non-ASCII text,
+  where a right-to-left line sits against the right edge) is laid out again
+  at a new width on a hit, not reshaped. `row_spans_x(key, bytes)` is where
   a shaped row drew a byte range (a span per visual piece): place marks over
   a row's text with it, not `col * cell_w`, so wide, combining, and
   right-to-left text line up.
