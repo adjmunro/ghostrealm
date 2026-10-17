@@ -289,7 +289,9 @@ impl Preview {
     /// The body of the code block starting on source line `line`.
     pub fn code_text(&self, line: usize) -> Option<String> {
         self.blocks.iter().find_map(|b| match &b.kind {
-            Kind::Code { text, .. } if b.line == line && !text.trim().is_empty() => Some(text.clone()),
+            Kind::Code { text, .. } | Kind::FrontMatter(text) if b.line == line && !text.trim().is_empty() => {
+                Some(text.clone())
+            }
             _ => None,
         })
     }
@@ -811,6 +813,10 @@ fn prepare(block: &Block, look: &Look) -> Prep {
             Prep::Text { text: Text { key: block_key(std::slice::from_ref(&span)), spans: vec![span], tags: Vec::new() }, marker: None }
         }
         Kind::Code { lang, text } => Prep::Code { rows: code_rows(lang.as_deref(), text) },
+        // Metadata, not content: boxed as code, dim.
+        Kind::FrontMatter(text) => Prep::Code {
+            rows: text.split('\n').map(|l| vec![(l.strip_suffix('\r').unwrap_or(l).to_string(), theme::TEXT_DIM)]).collect(),
+        },
         Kind::Table { head, rows } => {
             let mut cells = vec![head.iter().map(|c| body(c, true)).collect::<Vec<_>>()];
             cells.extend(rows.iter().map(|r| r.iter().map(|c| body(c, false)).collect()));
@@ -1443,6 +1449,16 @@ mod tests {
         assert!(left("Action") > left("Chord") + 40.0, "columns");
         assert!(left("quoted") > left("Chord"), "a quote indents past its bar");
         assert!(left("done") > left("Chord"), "an item indents past its marker");
+    }
+
+    #[test]
+    fn front_matter_shows_dim_in_a_code_box() {
+        let (mut v, _) = previewed("pv-front", "---\ntitle: A\n---\n# Body\n");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let row = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Row(_)) && h.text.buffer(t.src).unwrap().layout_runs().any(|r| r.text == "title: A"));
+        assert!(row.is_some(), "a monospace row: {:?}", h.texts());
+        assert_eq!(drawn(&h).iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["Body"], "no rule, no extra heading");
     }
 
     #[test]

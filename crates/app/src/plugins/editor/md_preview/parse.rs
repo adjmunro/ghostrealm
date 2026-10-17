@@ -51,6 +51,10 @@ pub enum Kind {
     Rule,
     /// Raw HTML, shown as its source.
     Html(String),
+    /// A YAML metadata block (`---` fenced: front matter), as its source
+    /// without the fences. pulldown-cmark takes one after a blank line
+    /// anywhere, not only at the top.
+    FrontMatter(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,7 +71,10 @@ pub struct Block {
 
 /// Parse `text` into blocks.
 pub fn parse(text: &str) -> Vec<Block> {
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     let mut b = Builder::new(text);
     for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
         let line = b.line_of(range.start);
@@ -192,7 +199,7 @@ impl Builder {
                 };
                 self.code = Some((lang, String::new(), line));
             }
-            Tag::HtmlBlock => {
+            Tag::HtmlBlock | Tag::MetadataBlock(_) => {
                 self.flush();
                 self.html = Some((String::new(), line));
             }
@@ -247,6 +254,11 @@ impl Builder {
             TagEnd::HtmlBlock => {
                 if let Some((text, line)) = self.html.take() {
                     self.emit(Kind::Html(text.trim_end().to_string()), line);
+                }
+            }
+            TagEnd::MetadataBlock(_) => {
+                if let Some((text, line)) = self.html.take() {
+                    self.emit(Kind::FrontMatter(text.trim_end().to_string()), line);
                 }
             }
             TagEnd::List(_) => {
@@ -499,6 +511,15 @@ mod tests {
                 (Kind::Html("<div>\nhi\n</div>".into()), 0, 6),
             ]
         );
+    }
+
+    #[test]
+    fn front_matter_is_one_block_not_a_rule_and_a_heading() {
+        let blocks = parse("---\ntitle: A\ntags: [x]\n---\n# Body\n");
+        let got: Vec<(Kind, usize)> = blocks.into_iter().map(|b| (b.kind, b.line)).collect();
+        assert_eq!(got[0], (Kind::FrontMatter("title: A\ntags: [x]".into()), 0));
+        assert!(matches!(&got[1], (Kind::Heading(1, _), 4)), "{got:?}");
+        assert_eq!(got.len(), 2);
     }
 
     #[test]
