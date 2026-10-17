@@ -941,6 +941,13 @@ impl<'a> PaintCx<'a> {
         self.text.shape_scratch(&spans, font.into(), width, true)
     }
 
+    /// How far below the top of the row-cache row `key` its baseline sits,
+    /// as shaped (drawn at a scale `s`, `s` times as far); `None` until it is
+    /// shaped. Its faces (bold, a fallback font) set it.
+    pub fn row_baseline(&self, key: u64) -> Option<f32> {
+        self.text.row_cache.buffer(key)?.layout_runs().next().map(|r| r.line_y)
+    }
+
     /// How far below a monospace row's top its baseline sits, at the frame's
     /// metrics: what lines up text of two sizes (a row drawn at a scale `s`
     /// has its baseline `s` times as far down).

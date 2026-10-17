@@ -578,10 +578,18 @@ impl EditorView {
     /// Lay out the rows from the scroll line in the last paint's layout.
     fn layout_rows(&mut self) {
         let l = self.layout;
-        let h = self.buf.path.as_deref().and_then(highlight::for_path);
+        let h = self.highlighter();
         let (states, buf) = (&mut self.hl_states, &self.buf);
         let span = (l.body.y, l.body.y + l.body.h);
-        self.rows = RowTable::build(&buf.lines, buf.scroll, buf.edits, l.rows, span, |ln| line_scale(states, buf, h, ln));
+        let name = h.map(|h| h.name());
+        self.rows = RowTable::build(&buf.lines, buf.scroll, buf.edits, l.rows, name, span, |ln| {
+            line_scale(states, buf, h, ln)
+        });
+    }
+
+    /// The highlighter for the buffer's file, if any.
+    fn highlighter(&self) -> Option<&'static dyn Highlighter> {
+        self.buf.path.as_deref().and_then(highlight::for_path)
     }
 
     /// The row at height `y` in the last paint's layout (wrap-, scroll- and
@@ -590,7 +598,8 @@ impl EditorView {
     /// shows from there, and its scale. A row above the text is the first;
     /// `None` below the text.
     fn visual_row(&mut self, y: f32) -> Option<(RowKind, f32)> {
-        if !self.rows.fresh(self.buf.scroll, self.buf.edits, self.layout.rows) {
+        let name = self.highlighter().map(|h| h.name());
+        if !self.rows.fresh(self.buf.scroll, self.buf.edits, self.layout.rows, name) {
             self.sync_hl_states();
             self.layout_rows();
         }
@@ -1093,16 +1102,21 @@ impl View for EditorView {
             }
         }
 
-        if cx.cfg.editor.cursor_line {
-            for r in vis.iter().filter(|r| r.ln == cursor.0) {
-                let rect = Rect { x: body.x, y: r.y, w: body.w, h: r.h };
-                cx.fill_alpha(rect, EDITOR_CURSOR_LINE, EDITOR_CURSOR_LINE_ALPHA);
+        // The last row may run past the body's bottom: everything drawn over
+        // the rows is clipped to the body, as their text is.
+        cx.with_clip(body, |cx| {
+            if cx.cfg.editor.cursor_line {
+                for r in vis.iter().filter(|r| r.ln == cursor.0) {
+                    let rect = Rect { x: body.x, y: r.y, w: body.w, h: r.h };
+                    cx.fill_alpha(rect, EDITOR_CURSOR_LINE, EDITOR_CURSOR_LINE_ALPHA);
+                }
             }
-        }
+        });
         // Selection, intersected with each row and clipped to the text area so it
         // never paints the gutter or a neighbouring pane.
         if let Some(((sr, sc), (er, ec))) = sel {
-            for r in &vis {
+            let text_area = Rect { x: text_x, w: body.x + body.w - text_x, ..body };
+            cx.with_clip(text_area, |cx| for r in &vis {
                 if r.ln < sr || r.ln > er {
                     continue;
                 }
@@ -1116,33 +1130,13 @@ impl View for EditorView {
                         cx.fill_alpha(rect, cx.chrome.accent, 0.35);
                     }
                 }
-            }
-        }
-        // Line numbers, on each logical line's first visual row, at the base
-        // size whatever the row's: on a heading's baseline, so the number
-        // reads as that line's, as it does beside body text.
-        if gutter_w > 0.0 {
-            let gutter = Rect { x: body.x, y: body.y, w: gutter_w, h: body.h };
-            let mut baseline = None;
-            for r in vis.iter().filter(|r| r.start == 0) {
-                let top = match r.scale == 1.0 {
-                    true => r.y,
-                    false => r.y + *baseline.get_or_insert_with(|| cx.mono_baseline()) * (r.scale - 1.0),
-                };
-                let is_cur = r.ln == cursor.0;
-                let num = match cx.cfg.editor.line_numbers {
-                    LineNumbers::Relative if !is_cur => (cursor.0 as isize - r.ln as isize).unsigned_abs(),
-                    _ => r.ln + 1,
-                };
-                let s = num.to_string();
-                let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
-                let left = text_x - cw - s.chars().count() as f32 * cw;
-                cx.row(&[(s, color)], left, top, gutter_w, gutter, color);
-            }
+            });
         }
         // Text, one cache-keyed row per visual row (wrapped sub-rows stay
         // cache-friendly), shaped within the frame's budget.
         let text_clip = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
+        // Each row's key in the row cache, for its line number's baseline.
+        let mut keys = Vec::with_capacity(vis.len());
         for (i, r) in vis.iter().enumerate() {
             let line = &e.lines[r.ln];
             let (spans, styles) = match highlighter {
@@ -1164,12 +1158,38 @@ impl View for EditorView {
             let shape_w = (r.len as f32 * cw).max(text_w);
             let left = text_x - hscroll_px(r);
             cx.budgeted_row_styled(key, || spans, styles, left, r.y, shape_w, text_clip, EDITOR_FG);
+            keys.push(key);
+        }
+        // Line numbers, on each logical line's first visual row, at the base
+        // size whatever the row's: on a heading's baseline (read from its own
+        // shaped row, whose faces set it), so the number reads as that line's.
+        if gutter_w > 0.0 {
+            let gutter = Rect { x: body.x, y: body.y, w: gutter_w, h: body.h };
+            let mut digits = None;
+            for (r, key) in vis.iter().zip(&keys).filter(|(r, _)| r.start == 0) {
+                let top = match r.scale == 1.0 {
+                    true => r.y,
+                    false => {
+                        let b = *digits.get_or_insert_with(|| cx.mono_baseline());
+                        r.y + cx.row_baseline(*key).unwrap_or(b) * r.scale - b
+                    }
+                };
+                let is_cur = r.ln == cursor.0;
+                let num = match cx.cfg.editor.line_numbers {
+                    LineNumbers::Relative if !is_cur => (cursor.0 as isize - r.ln as isize).unsigned_abs(),
+                    _ => r.ln + 1,
+                };
+                let s = num.to_string();
+                let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
+                let left = text_x - cw - s.chars().count() as f32 * cw;
+                cx.row(&[(s, color)], left, top, gutter_w, gutter, color);
+            }
         }
         // Cursor bar on the cursor line's last visual row that its column reaches.
         if let Some(r) = vis.iter().rev().find(|r| r.ln == cursor.0 && r.start <= cursor.1) {
             let x = text_x + (cursor.1 - r.start) as f32 * col_w(r) - hscroll_px(r);
             if x >= text_x && x < body.x + body.w {
-                cx.fill_top(Rect { x, y: r.y, w: 2.0 * scale, h: r.h }, cx.chrome.accent, 0.9);
+                cx.with_clip(body, |cx| cx.fill_top(Rect { x, y: r.y, w: 2.0 * scale, h: r.h }, cx.chrome.accent, 0.9));
             }
         }
         if !cx.hovered(body) {
@@ -1198,7 +1218,8 @@ impl View for EditorView {
                     let x0 = (text_x + (a - r.start) as f32 * col_w(r) - hscroll_px(r)).max(text_x);
                     let x1 = (text_x + (b - r.start) as f32 * col_w(r) - hscroll_px(r)).min(body.x + body.w);
                     if x1 > x0 {
-                        cx.fill_top(Rect { x: x0, y: r.bottom() - thick, w: x1 - x0, h: thick }, color, 0.9);
+                        let under = Rect { x: x0, y: r.bottom() - thick, w: x1 - x0, h: thick };
+                        cx.with_clip(body, |cx| cx.fill_top(under, color, 0.9));
                     }
                 }
             }
@@ -1316,13 +1337,13 @@ impl View for EditorView {
     fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), dx: f32, dy: f32) {
         let (cw, ch) = (cx.ui.cell_w, cx.ui.cell_h);
         self.scroll_accum += dy;
-        let lines = (self.scroll_accum / ch).trunc() as i32;
+        let lines = (self.scroll_accum / ch).trunc() as isize;
         self.scroll_accum -= lines as f32 * ch;
         let e = &mut self.buf;
         let mut changed = false;
         if lines != 0 {
             let max = e.lines.len().saturating_sub(1);
-            let next = ((e.scroll as isize - lines as isize).max(0) as usize).min(max);
+            let next = ((e.scroll as isize - lines).max(0) as usize).min(max);
             changed |= next != e.scroll;
             e.scroll = next;
         }
@@ -2912,17 +2933,20 @@ mod tests {
 
     const H1: f32 = 1.8;
     const H2: f32 = 1.5;
+    /// The rows' heights at H1, H2 and H3: whole pixels.
+    const R1: f32 = 29.0;
+    const R2: f32 = 24.0;
+    const R3: f32 = 20.0;
 
     #[test]
     fn heading_rows_draw_larger_and_push_the_rows_below_down() {
         let mut h = Harness::new();
         let mut v = markdown_view("editor-md-sized", "# Title\n## Sub\nbody\n### Three\n##### Five");
         paint_plain(&mut h, &mut v);
-        let ch = UI.cell_h;
-        let y2 = ch * (H1 + H2);
+        let y2 = R1 + R2;
         assert_eq!(
             text_rows(&h),
-            vec![(0.0, H1), (ch * H1, H2), (y2, 1.0), (y2 + ch, 1.25), (y2 + ch * 2.25, 1.0)],
+            vec![(0.0, H1), (R1, H2), (y2, 1.0), (y2 + UI.cell_h, 1.25), (y2 + UI.cell_h + R3, 1.0)],
             "H5 stays at body size"
         );
     }
@@ -2933,13 +2957,20 @@ mod tests {
         let mut v = markdown_view("editor-md-gutter", "# Title\nbody");
         paint_plain(&mut h, &mut v);
         let text_x = 4.0 * UI.cell_w;
-        let nums: Vec<(f32, f32)> = h.frame.text.iter().filter(|t| t.left < text_x).map(|t| (t.top, t.scale)).collect();
-        assert_eq!(nums.len(), 2, "{nums:?}");
-        let (top, scale) = nums[0];
-        assert_eq!(scale, 1.0);
-        // Its baseline (b below its top) meets the heading's (H1 * b below the row's).
-        assert!(top > 0.0 && top + UI.cell_h < UI.cell_h * H1, "inside the row, low: {top}");
-        assert_eq!(nums[1], (UI.cell_h * H1, 1.0), "a body row's number at its top");
+        let nums: Vec<&crate::plugin::TextItem> = h.frame.text.iter().filter(|t| t.left < text_x).collect();
+        assert_eq!(nums.len(), 2);
+        let heading = h.frame.text.iter().find(|t| t.left == text_x).unwrap();
+        let baseline = |src| match src {
+            TextSrc::Row(key) => h.text.row_cache.buffer(key).unwrap().layout_runs().next().unwrap().line_y,
+            TextSrc::Scratch(_) => panic!("a cached row"),
+        };
+        let (b_num, b_head) = (baseline(nums[0].src), baseline(heading.src));
+        assert_eq!(nums[0].scale, 1.0);
+        // The number's baseline meets the heading's, drawn H1 times as far down.
+        let top = nums[0].top;
+        assert!((top + b_num - b_head * H1).abs() < 0.5, "top {top}, baselines {b_num} {b_head}");
+        assert!((top - b_num * (H1 - 1.0)).abs() < 0.5, "row.y + baseline * (scale - 1): {top}");
+        assert_eq!((nums[1].top, nums[1].scale), (R1, 1.0), "a body row's number at its top");
     }
 
     #[test]
@@ -2955,8 +2986,7 @@ mod tests {
         };
         assert_eq!(down(&mut h, &mut v, (text_x + 4.0 * cw + 1.0, 20.0)), (0, 4));
         // Below the heading the columns are base size again.
-        let body_y = UI.cell_h * H1 + 2.0;
-        assert_eq!(down(&mut h, &mut v, (text_x + 4.0 * UI.cell_w + 1.0, body_y)), (1, 4));
+        assert_eq!(down(&mut h, &mut v, (text_x + 4.0 * UI.cell_w + 1.0, R1 + 2.0)), (1, 4));
         // A double-click picks the word under the pointer at the heading's size.
         let pos = (text_x + 9.5 * cw, 5.0);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2, button: MouseButton::Left });
@@ -2973,15 +3003,38 @@ mod tests {
         v.buf.anchor = Some((0, 2));
         v.buf.cursor = (0, 5);
         paint_plain(&mut h, &mut v);
-        let (text_x, cw, row_h) = (4.0 * UI.cell_w, UI.cell_w * H1, UI.cell_h * H1);
-        let sel = (text_x + 2.0 * cw, 0.0, 3.0 * cw, row_h);
+        let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
+        let sel = (text_x + 2.0 * cw, 0.0, 3.0 * cw, R1);
         assert!(rects(&h, &h.frame.bg).iter().any(|r| near(*r, sel)), "selection {sel:?}");
         let top = rects(&h, &h.frame.top);
-        let caret = (text_x + 5.0 * cw, 0.0, 2.0, row_h);
+        let caret = (text_x + 5.0 * cw, 0.0, 2.0, R1);
         assert!(top.iter().any(|r| near(*r, caret)), "caret {caret:?} in {top:?}");
         let thick = 1.5;
-        let under = (text_x + 5.0 * cw, row_h - thick, 3.0 * cw, thick);
+        let under = (text_x + 5.0 * cw, R1 - thick, 3.0 * cw, thick);
         assert!(top.iter().any(|r| near(*r, under)), "underline {under:?} in {top:?}");
+    }
+
+    #[test]
+    fn a_partial_heading_row_at_the_bottom_draws_nothing_below_the_body() {
+        let mut h = Harness::new();
+        // Eleven body rows (176px), then an H1 row running 5px past the 200px body.
+        let text = format!("{}# ok bad", "x\n".repeat(11));
+        let mut v = markdown_view("editor-md-clip", &text);
+        v.attach(Client::in_process(Flags, None), "markdown");
+        settle(&mut v);
+        v.buf.anchor = Some((11, 2));
+        v.buf.cursor = (11, 5);
+        paint_plain(&mut h, &mut v);
+        // Following the cursor scrolled it whole; put the row back half shown.
+        v.buf.scroll = 0;
+        paint_plain(&mut h, &mut v);
+        let all: Vec<_> = rects(&h, &h.frame.bg).into_iter().chain(rects(&h, &h.frame.top)).collect();
+        assert!(all.iter().all(|r| r.1 + r.3 <= RECT.h + 0.01), "past the body: {all:?}");
+        let (text_x, cw, y) = (4.0 * UI.cell_w, UI.cell_w * H1, 11.0 * UI.cell_h);
+        let caret = (text_x + 5.0 * cw, y, 2.0, RECT.h - y);
+        assert!(all.iter().any(|r| near(*r, caret)), "the caret, cut: {caret:?}");
+        let sel = (text_x + 2.0 * cw, y, 3.0 * cw, RECT.h - y);
+        assert!(all.iter().any(|r| near(*r, sel)), "the selection, cut: {sel:?}");
     }
 
     #[test]
@@ -2992,30 +3045,50 @@ mod tests {
         paint_plain(&mut h, &mut v);
         v.buf.cursor = (10, 0);
         paint_plain(&mut h, &mut v);
-        // Six H1 rows (172.8px) fit the 200px body, seven don't.
+        // Six H1 rows (174px) fit the 200px body, seven don't.
         assert_eq!(v.buffer().scroll, 5);
-        let row_h = UI.cell_h * H1;
         let caret = rects(&h, &h.frame.top).into_iter().find(|r| r.2 == 2.0).expect("a caret");
-        assert!(caret.1 + caret.3 <= RECT.h, "the caret shows whole: {caret:?}");
-        assert!((caret.1 - 5.0 * row_h).abs() < 0.01, "on the last whole row: {caret:?}");
+        assert_eq!((caret.1, caret.3), (5.0 * R1, R1), "whole, on the last whole row");
     }
 
     #[test]
     fn a_long_heading_wraps_at_its_scaled_column_count() {
         let mut h = Harness::new();
-        // 62 chars: 2 rows at 46 base columns, 3 at H1's 25.
+        // 62 chars: 2 rows at 46 base columns, 3 at H1's 25 (breaking after a space).
         let line = format!("# {}", "word ".repeat(12));
         let mut v = markdown_view("editor-md-wrap", &format!("{line}\nx"));
         v.soft_wrap = Some(true);
         paint_plain(&mut h, &mut v);
-        let row_h = UI.cell_h * H1;
-        assert_eq!(text_rows(&h), vec![(0.0, H1), (row_h, H1), (2.0 * row_h, H1), (3.0 * row_h, 1.0)]);
-        // A click on the second row lands in it: past the first row's 25 columns.
-        let pos = (4.0 * UI.cell_w + 1.0, row_h + 2.0);
+        assert_eq!(v.layout.rows.cols(H1), 25);
+        let rows: Vec<(usize, usize, usize)> = v.rows.text_rows().map(|r| (r.ln, r.start, r.len)).collect();
+        assert_eq!(rows, [(0, 0, 22), (0, 22, 25), (0, 47, 15), (1, 0, 1)]);
+        assert_eq!(text_rows(&h), vec![(0.0, H1), (R1, H1), (2.0 * R1, H1), (3.0 * R1, 1.0)]);
+        // A click at the second row's left edge lands on its first column.
+        let pos = (4.0 * UI.cell_w + 1.0, R1 + 2.0);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
-        let (ln, col) = v.buffer().cursor;
-        assert_eq!(ln, 0);
-        assert!((20..=25).contains(&col), "the second row starts its own columns: {col}");
+        assert_eq!(v.buffer().cursor, (0, 22));
+    }
+
+    #[test]
+    fn a_scaled_row_scrolled_sideways_measures_scaled_columns() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-hscroll", "# heading long line\nplain");
+        v.soft_wrap = Some(false);
+        v.buf.hscroll = 2;
+        v.buf.anchor = Some((0, 4));
+        v.buf.cursor = (0, 6);
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buffer().hscroll, 2, "the caret was in view");
+        let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
+        let heading = h.frame.text.iter().find(|t| t.scale == H1).unwrap();
+        assert!((heading.left - (text_x - 2.0 * cw)).abs() < 0.01, "shifted by two scaled columns");
+        let caret = (text_x + 4.0 * cw, 0.0, 2.0, R1);
+        assert!(rects(&h, &h.frame.top).iter().any(|r| near(*r, caret)), "caret {caret:?}");
+        let sel = (text_x + 2.0 * cw, 0.0, 2.0 * cw, R1);
+        assert!(rects(&h, &h.frame.bg).iter().any(|r| near(*r, sel)), "selection {sel:?}");
+        let pos = (text_x + 3.0 * cw + 1.0, 5.0);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+        assert_eq!(v.buffer().cursor, (0, 5));
     }
 
     #[test]
@@ -3024,24 +3097,23 @@ mod tests {
         let mut v = markdown_view("editor-md-boxes", "# Head\ntext `x`\n```\ncode\n```");
         paint_plain(&mut h, &mut v);
         let (ch, line) = (UI.cell_h, theme::hairline(UI));
-        let prose = ch * H1;
-        let fence = prose + ch;
+        let fence = R1 + ch;
         let boxes = code_boxes(&h);
         assert_eq!(boxes.len(), 2, "{boxes:?}");
         // The inline box on the prose row, the block over the three fence rows.
         let inline = boxes.iter().find(|b| b.3 < ch).expect("inline box");
-        assert_eq!((inline.1, inline.3), ((prose + line).round(), ch - 2.0 * line));
+        assert_eq!((inline.1, inline.3), (R1 + line, ch - 2.0 * line));
         let block = boxes.iter().find(|b| b.3 > ch).expect("block box");
-        assert_eq!((block.1, block.3), ((fence + line).round(), (fence + 3.0 * ch - line).round() - (fence + line).round()));
+        assert_eq!((block.1, block.3), (fence + line, 3.0 * ch - 2.0 * line));
     }
 
     #[test]
     fn toml_tables_draw_by_their_level() {
         let mut h = Harness::new();
-        let mut v = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]");
+        let mut v = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]\n  [1, 2],");
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
-        assert_eq!(scales, vec![H1, 1.0, H2, H2, 1.25]);
+        assert_eq!(scales, vec![H1, 1.0, H2, H2, 1.25, 1.0]);
     }
 
     #[test]

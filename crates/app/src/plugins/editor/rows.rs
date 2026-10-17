@@ -61,9 +61,15 @@ impl RowLayout {
         ((self.text_w / (self.cell.0 * scale)).floor() as usize).max(1)
     }
 
-    /// A row's height at `scale`.
+    /// A row's height at `scale`: whole pixels for a scaled row, so the
+    /// rows below it stay on the base rows' pixel grid (its columns keep the
+    /// exact scale).
     pub fn row_h(&self, scale: f32) -> f32 {
-        self.cell.1 * scale
+        if scale == 1.0 {
+            self.cell.1
+        } else {
+            (self.cell.1 * scale).round()
+        }
     }
 
     /// `line`'s rows at `scale`, as `(start, len)` in chars.
@@ -81,22 +87,24 @@ impl RowLayout {
 #[derive(Clone, Debug, Default)]
 pub struct RowTable {
     pub rows: Vec<VisualRow>,
-    /// The buffer's scroll line and edit count, and the layout, they were
-    /// built for.
+    /// The buffer's scroll line and edit count, the layout, and the
+    /// highlighter (which sizes the headings) they were built for.
     pub scroll: usize,
     pub edits: u64,
     pub layout: Option<RowLayout>,
+    pub highlighter: Option<&'static str>,
 }
 
 impl RowTable {
     /// Lay out `lines` from line `scroll`, the first row's top at `top`,
     /// until a row starts at or past `bottom`. `scale_of(ln)` is line `ln`'s
-    /// scale.
-    pub fn build(
+    /// scale under the highlighter named `highlighter`.
+        pub fn build(
         lines: &[String],
         scroll: usize,
         edits: u64,
         layout: RowLayout,
+        highlighter: Option<&'static str>,
         (top, bottom): (f32, f32),
         mut scale_of: impl FnMut(usize) -> f32,
     ) -> RowTable {
@@ -113,12 +121,13 @@ impl RowTable {
                 y += h;
             }
         }
-        RowTable { rows, scroll, edits, layout: Some(layout) }
+        RowTable { rows, scroll, edits, layout: Some(layout), highlighter }
     }
 
-    /// Whether this table was built for this scroll line, edit count and layout.
-    pub fn fresh(&self, scroll: usize, edits: u64, layout: RowLayout) -> bool {
-        self.scroll == scroll && self.edits == edits && self.layout == Some(layout)
+    /// Whether this table was built for this scroll line, edit count, layout
+    /// and highlighter.
+    pub fn fresh(&self, scroll: usize, edits: u64, layout: RowLayout, highlighter: Option<&'static str>) -> bool {
+        self.scroll == scroll && self.edits == edits && self.layout == Some(layout) && self.highlighter == highlighter
     }
 
     /// The text rows, top to bottom.
@@ -150,7 +159,7 @@ mod tests {
     #[test]
     fn rows_stack_by_their_heights_and_wrap_at_their_scaled_columns() {
         let lines = lines(&["# a heading line", "plain", "x"]);
-        let t = RowTable::build(&lines, 0, 0, LAYOUT, (0.0, 1000.0), |ln| if ln == 0 { 2.0 } else { 1.0 });
+        let t = RowTable::build(&lines, 0, 0, LAYOUT, None, (0.0, 1000.0), |ln| if ln == 0 { 2.0 } else { 1.0 });
         let rows: Vec<(usize, usize, usize, f32, f32)> =
             t.text_rows().map(|r| (r.ln, r.start, r.len, r.y, r.h)).collect();
         // 10 base columns; 5 at scale 2.
@@ -173,13 +182,26 @@ mod tests {
     }
 
     #[test]
+    fn a_scaled_row_is_whole_pixels_tall_and_keeps_exact_columns() {
+        let layout = RowLayout { text_w: 100.0, cell: (8.0, 16.0), wrap: true };
+        assert_eq!(layout.row_h(1.8), 29.0);
+        assert_eq!(layout.row_h(1.1), 18.0);
+        assert_eq!(layout.row_h(1.0), 16.0);
+        assert_eq!(layout.cols(1.8), 6, "100 / 14.4");
+        let lines = lines(&["# h", "x"]);
+        let t = RowTable::build(&lines, 0, 0, layout, None, (0.0, 100.0), |ln| if ln == 0 { 1.8 } else { 1.0 });
+        assert_eq!(t.text_rows().map(|r| r.y).collect::<Vec<_>>(), [0.0, 29.0]);
+    }
+
+    #[test]
     fn layout_stops_at_the_first_row_starting_past_the_bottom() {
         let lines = lines(&["a", "b", "c", "d"]);
-        let t = RowTable::build(&lines, 1, 0, LAYOUT, (10.0, 40.0), |_| 1.0);
+        let t = RowTable::build(&lines, 1, 0, LAYOUT, Some("md"), (10.0, 40.0), |_| 1.0);
         let shown: Vec<(usize, f32)> = t.text_rows().map(|r| (r.ln, r.y)).collect();
         assert_eq!(shown, vec![(1, 10.0), (2, 26.0)], "the second row ends past the bottom but starts above it");
-        assert!(t.fresh(1, 0, LAYOUT));
-        assert!(!t.fresh(2, 0, LAYOUT) && !t.fresh(1, 1, LAYOUT));
-        assert!(!t.fresh(1, 0, RowLayout { wrap: false, ..LAYOUT }));
+        assert!(t.fresh(1, 0, LAYOUT, Some("md")));
+        assert!(!t.fresh(2, 0, LAYOUT, Some("md")) && !t.fresh(1, 1, LAYOUT, Some("md")));
+        assert!(!t.fresh(1, 0, RowLayout { wrap: false, ..LAYOUT }, Some("md")));
+        assert!(!t.fresh(1, 0, LAYOUT, None), "another highlighter sizes other headings");
     }
 }
