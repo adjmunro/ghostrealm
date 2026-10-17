@@ -19,6 +19,9 @@ pub enum Kind {
     Path,
     /// One of these strings, each with a description.
     Enum(&'static [(&'static str, &'static str)]),
+    /// An ordered list of these strings, each at most once. An unknown or
+    /// repeated entry is dropped; the rest apply.
+    EnumList(&'static [(&'static str, &'static str)]),
     /// `[r, g, b]`, each component `0..=255`.
     Rgb,
     /// A key chord such as `"cmd+shift+d"`: modifiers in any order or alias
@@ -35,15 +38,17 @@ impl Kind {
             Kind::Float { min, max } => format!("number {min}–{max}"),
             Kind::Str => "string".into(),
             Kind::Path => "path (`~` expands)".into(),
-            Kind::Enum(variants) => variants
-                .iter()
-                .map(|(v, _)| format!("\"{v}\""))
-                .collect::<Vec<_>>()
-                .join(" | "),
+            Kind::Enum(variants) => alternatives(variants),
+            Kind::EnumList(variants) => format!("list of {}", alternatives(variants)),
             Kind::Rgb => "[r, g, b], each 0–255".into(),
             Kind::Chord => "chord, e.g. \"cmd+shift+d\"".into(),
         }
     }
+}
+
+/// `"a" | "b" | ...`
+fn alternatives(variants: &[(&str, &str)]) -> String {
+    variants.iter().map(|(v, _)| format!("\"{v}\"")).collect::<Vec<_>>().join(" | ")
 }
 
 /// One option in a section.
@@ -138,7 +143,7 @@ impl OptionSpec {
     /// default.
     pub fn hover(&self, section: &str) -> String {
         let mut s = format!("[{section}] {}: {}\n{}", self.key, self.kind.describe(), self.doc);
-        if let Kind::Enum(variants) = self.kind {
+        if let Kind::Enum(variants) | Kind::EnumList(variants) = self.kind {
             s.push('\n');
             for (v, doc) in variants {
                 s.push_str(&format!("\n\"{v}\": {doc}"));

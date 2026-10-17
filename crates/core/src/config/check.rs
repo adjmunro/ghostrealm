@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use serde::de::{Deserialize, IntoDeserializer};
-use toml::de::{DeTable, DeValue};
+use toml::de::{DeArray, DeTable, DeValue};
 use toml::Value;
 
 use super::catalogue::{Catalogue, Entries, Kind};
@@ -129,10 +129,20 @@ pub fn check(text: &str, cat: &Catalogue) -> Checked {
                     *value
                 }
             };
-            let verdict = match values.get(key) {
+            let mut verdict = match values.get(key) {
                 Some(found) if !broken(&v.span()) => check_value(key, kind, found),
                 _ => Verdict::Ok,
             };
+            // A list's entries are checked one by one, each finding at its entry.
+            if let (Verdict::Ok, Kind::EnumList(variants), DeValue::Array(items)) = (&verdict, kind, v.get_ref()) {
+                if !broken(&v.span()) {
+                    let (kept, dropped) = check_list(key, variants, items);
+                    if !dropped.is_empty() {
+                        findings.extend(dropped);
+                        verdict = Verdict::Replace(Value::Array(kept), None);
+                    }
+                }
+            }
             match verdict {
                 Verdict::Ok => {}
                 Verdict::Replace(new, message) => {
@@ -234,6 +244,10 @@ fn check_value(key: &str, kind: Kind, found: &Value) -> Verdict {
             )),
             _ => mismatch(),
         },
+        Kind::EnumList(_) => match found {
+            Value::Array(_) => Verdict::Ok,
+            _ => mismatch(),
+        },
         Kind::Rgb => {
             let Value::Array(items) = found else {
                 return mismatch();
@@ -263,6 +277,31 @@ fn check_value(key: &str, kind: Kind, found: &Value) -> Verdict {
             _ => mismatch(),
         },
     }
+}
+
+/// The entries of list `key` that are `variants`, in order and each once,
+/// and a warning at every other entry (it is dropped; the rest apply).
+fn check_list(key: &str, variants: &'static [(&'static str, &'static str)], items: &DeArray) -> (Vec<Value>, Vec<Finding>) {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut findings = Vec::new();
+    for item in items {
+        let message = match item.get_ref() {
+            DeValue::String(s) if kept.iter().any(|k| k.as_str() == Some(s)) => {
+                format!("\"{s}\" is already listed; this entry is ignored")
+            }
+            DeValue::String(s) if variants.iter().any(|(v, _)| v == s) => {
+                kept.push(Value::String(s.to_string()));
+                continue;
+            }
+            DeValue::String(s) => format!(
+                "unknown entry \"{s}\" in `{key}`: expects {}; this entry is ignored",
+                Kind::Enum(variants).describe()
+            ),
+            _ => format!("`{key}` holds strings; this entry is ignored"),
+        };
+        findings.push(Finding::warning(item.span(), message));
+    }
+    (kept, findings)
 }
 
 /// Docs for whatever sits at byte `offset` of `text`: a section header, an
@@ -414,6 +453,37 @@ mod tests {
             assert_eq!(found[0].0, Severity::Error);
             assert_eq!(found[0].1, literal);
         }
+    }
+
+    #[test]
+    fn a_list_keeps_its_known_entries_in_order_and_flags_the_rest() {
+        use crate::config::catalogue::{OptionSpec, SectionSpec};
+        const PARTS: &[(&str, &str)] = &[("a", ""), ("b", ""), ("c", "")];
+        let mut sections = core_sections(&[]);
+        sections.push(SectionSpec::options(
+            "list",
+            "",
+            vec![OptionSpec::new("parts", Kind::EnumList(PARTS), Some("[\"a\"]"), "")],
+        ));
+        let cat = Catalogue::new(sections);
+        let text = "[list]\nparts = [\"c\", \"x\", \"a\", \"c\", 3]\n";
+        let checked = check(text, &cat);
+        let found: Vec<_> = checked.findings.iter().map(|f| (f.severity, &text[f.span.clone()])).collect();
+        assert_eq!(
+            found,
+            vec![(Severity::Warning, "\"x\""), (Severity::Warning, "\"c\""), (Severity::Warning, "3")],
+            "{:?}",
+            checked.findings
+        );
+        assert!(checked.findings[0].message.contains("\"a\" | \"b\" | \"c\""), "{}", checked.findings[0].message);
+        let parts = &checked.table.unwrap()["list"]["parts"];
+        assert_eq!(parts, &Value::Array(vec![Value::String("c".into()), Value::String("a".into())]));
+
+        assert_eq!(check("[list]\nparts = []\n", &cat).findings, vec![], "empty is a list");
+        let found = check("[list]\nparts = \"a\"\n", &cat);
+        assert_eq!(found.findings[0].severity, Severity::Error, "not a list: the default applies");
+        assert!(found.table.unwrap()["list"].get("parts").is_none());
+        assert_eq!(Kind::EnumList(PARTS).describe(), "list of \"a\" | \"b\" | \"c\"");
     }
 
     #[test]
