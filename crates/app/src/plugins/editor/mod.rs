@@ -26,7 +26,7 @@ use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::syntax;
 use crate::plugin::icons::Icon;
-use crate::plugin::text_edit::{edit_for, Edit};
+use crate::plugin::text_edit::{edit_for, Edit, Motion};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MenuAlign, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
     Request, RowStyles, View, Waker,
@@ -585,6 +585,30 @@ impl EditorView {
         self.rows = RowTable::build(&buf.lines, buf.scroll, buf.edits, l.rows, name, span, |ln| {
             line_scale(states, buf, h, ln)
         });
+    }
+
+    /// The scale of the cursor's line.
+    fn cursor_scale(&mut self) -> f32 {
+        let h = self.highlighter();
+        self.sync_hl_states();
+        line_scale(&mut self.hl_states, &self.buf, h, self.buf.cursor.0)
+    }
+
+    /// After a move up or down from `(line, col)` (drawn at scale `from`),
+    /// put the caret at the column nearest where it was on screen: the
+    /// buffer moves by column, and a column's width differs between rows of
+    /// different scales.
+    fn keep_caret_x(&mut self, ((line, col), from): (Pos, f32)) {
+        let ln = self.buf.cursor.0;
+        let to = self.cursor_scale();
+        if ln == line || to == from {
+            return;
+        }
+        // Columns from the viewport's left edge: the horizontal scroll counts
+        // columns at each row's own scale.
+        let hs = self.buf.hscroll;
+        let shown = col.saturating_sub(hs) as f32 * from / to;
+        self.buf.cursor.1 = (hs + shown.round() as usize).min(self.buf.line_len(ln));
     }
 
     /// The highlighter for the buffer's file, if any.
@@ -1262,6 +1286,12 @@ impl View for EditorView {
                 true
             }
             _ => match edit_for(k) {
+                Some(edit @ Edit::Move { to: Motion::Up | Motion::Down, .. }) => {
+                    let from = (self.buf.cursor, self.cursor_scale());
+                    let used = self.buf.apply(edit, cx).used();
+                    self.keep_caret_x(from);
+                    used
+                }
                 Some(edit) => self.buf.apply(edit, cx).used(),
                 None => false,
             },
@@ -3104,6 +3134,23 @@ mod tests {
         assert!(rects(&h, &h.frame.bg).iter().any(|r| near(*r, sel)), "selection {sel:?}");
         let pos = (text_x + 3.0 * cw + 1.0, 5.0);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+        assert_eq!(v.buffer().cursor, (0, 5));
+    }
+
+    #[test]
+    fn up_and_down_keep_the_carets_x_across_row_sizes() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-updown", "# Title here\nbody text that runs on\nmore text here");
+        paint_plain(&mut h, &mut v);
+        v.buf.cursor = (0, 5);
+        // Column 5 at H1 is 72px in: column 9 of a body row.
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (1, 9));
+        // Between rows of one size the column carries over.
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.buffer().cursor, (2, 9));
+        h.key(&mut v, press(Key::Up));
+        h.key(&mut v, press(Key::Up));
         assert_eq!(v.buffer().cursor, (0, 5));
     }
 
