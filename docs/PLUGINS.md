@@ -29,14 +29,17 @@ browser, image viewer, ...) should be too. The API lives in
     `files` claims images and audio (`MediaView`).
   - The sidebar's filter box filters names; a query starting with `?`
     is search mode (`file_browser::search`): `core::search::Searcher`
-    searches the contents of the files the sidebar lists (its hidden and
-    git-ignored toggles), on a worker woken through `OpenCx::waker`, once
-    typing pauses (the view's `deadline`/`tick`). Smart case unless match
-    case is on; whole word and regex toggle in the box. Its results replace
-    the tree. Opening a matching line requests `OpenFile` and leaves the
-    match for the host: the Files surface takes it
+    searches the contents of the files the sidebar lists (its hidden,
+    git-ignored, and git filter toggles; text files only), on a worker woken
+    through `OpenCx::waker`, once typing pauses (the view's
+    `deadline`/`tick`). Smart case unless match case is on; whole word and
+    regex toggle in the box. Its results replace the tree. Opening a
+    matching line requests `OpenFile` and leaves the match
+    (`file_browser::MatchAt`) for the host: the Files surface takes it
     (`FileBrowserView::take_match`) once the file shows and selects it
-    (`EditorView::reveal`, which also centres the line).
+    (`EditorView::reveal`, which also centres the line), found again on
+    its line when the document has unsaved edits. A document saving in the
+    surface searches again (`FileBrowserView::rerun_search`).
   - `pickable`: listed in the "nothing open" picker (number keys follow order).
     A plugin whose views are only documents (`editor`) or parts of another
     surface (`file_browser`) isn't.
@@ -140,7 +143,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   budget; past it the position redraws last frame's row and the frame is
   re-requested). Use `budgeted_row` for bulk
   content (terminal grid, editor text) and build the key with `row_key` from your
-  cells so a cache hit costs no allocation.
+  cells so a cache hit costs no allocation. `row_x(key, byte)` is where a
+  shaped row's glyph for a byte starts: place marks over a row's text with
+  it, not `col * cell_w`, so wide and combining chars line up.
 - Styled rows: `budgeted_row_styled` takes `RowStyles { runs, cell_w, scale }`
   (`RowStyles::new(runs, cell_w)`, `.scaled(s)`), one
   `RunStyle` (`BOLD`, `ITALIC`, `UNDERLINE`, `BOX`, combined with `|`) per span,
