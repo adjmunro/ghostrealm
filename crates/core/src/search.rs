@@ -1,12 +1,13 @@
 //! Searching file contents under a folder: the Files sidebar's `?` mode.
 //!
 //! A [`SearchQuery`] compiles to one regex (a plain query is escaped). The
-//! [`Searcher`] runs it on a worker thread over the files a walk lists
-//! (respecting `.gitignore`, the hidden/ignored toggles, and optionally a
-//! set of files such as the git filter's), skipping binary, non-UTF-8, and
-//! large files, and streams one [`FileHits`] per file with a match. Each
-//! search has a generation: starting another stops the walk of the one
-//! before, and its late results are dropped.
+//! [`Searcher`] runs it on a worker thread over the files a sidebar lists:
+//! a walk of the root that respects the ignore files and the hidden and
+//! ignored toggles, or (for the git filter) a set of files checked against
+//! the same toggles. It skips binary, non-UTF-8, and large files, and
+//! streams one [`FileHits`] per file with a match. Each search has a
+//! generation: starting another stops the one before, and its late results
+//! are dropped.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -16,6 +17,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use regex::{Regex, RegexBuilder};
 use regex_syntax::ast::{Ast, ClassSet, ClassSetItem};
 
@@ -44,13 +47,11 @@ const WAKE_EVERY: Duration = Duration::from_millis(30);
 /// How many lines of a file go by between checks that the search is still
 /// wanted.
 const LINES_PER_CHECK: usize = 256;
-/// How many bytes one line's rejected whole-word matches may span before
-/// the rest of the line is given up: the search starts again after each,
-/// so a greedy regex rejected over and over would rescan the line each time.
-pub const REJECT_SCAN_BUDGET: usize = 4 * 1024 * 1024;
-/// How many rejections go by between checks that the search is still
-/// wanted.
-const REJECTS_PER_CHECK: usize = 64;
+/// How long matching one line may take before the rest of it is given up:
+/// a regex that scans to the line's end from each start (`x.*Q|x`, or a
+/// greedy whole-word match rejected over and over) is quadratic in it. Far
+/// above what a linear scan of a 1 MB line takes, even unoptimised.
+pub const LINE_TIME_BUDGET: Duration = Duration::from_secs(1);
 
 /// How letter case counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,7 +98,7 @@ impl SearchQuery {
             .case_insensitive(!self.case_sensitive())
             .build()
             .map_err(|e| regex_error(&e))?;
-        Ok(Matcher { re, whole_word: self.whole_word })
+        Ok(Matcher { re, whole_word: self.whole_word, line_budget: LINE_TIME_BUDGET })
     }
 }
 
@@ -144,16 +145,20 @@ fn regex_error(e: &regex::Error) -> String {
 pub struct Matcher {
     re: Regex,
     whole_word: bool,
+    /// How long one line's matching may take ([`LINE_TIME_BUDGET`]).
+    line_budget: Duration,
 }
 
 impl Matcher {
     /// The matches in `line`, as byte ranges: see [`Matches`].
     pub fn matches<'a>(&'a self, line: &'a str) -> Matches<'a> {
-        Matches { matcher: self, line, at: 0, rejected: 0, scanned: 0, partial: false, current: None }
+        Matches { matcher: self, line, at: 0, finds: 0, since: None, partial: false, current: None }
     }
 
     /// [`Self::matches`], giving up once `current` says the search is no
-    /// longer wanted (asked every few rejections).
+    /// longer wanted (asked before each find after the first: one find can
+    /// scan the rest of a long line, so a newer search isn't kept waiting
+    /// for a batch of them).
     pub fn matches_while<'a>(&'a self, line: &'a str, current: &'a dyn Fn() -> bool) -> Matches<'a> {
         Matches { current: Some(current), ..self.matches(line) }
     }
@@ -167,16 +172,17 @@ impl Matcher {
 /// A line's matches as byte ranges, left to right, none empty and none
 /// overlapping. A whole-word match a word character touches is skipped,
 /// and the search goes on past the word it starts in (any match starting
-/// inside that word fails the same way). Once the rejected matches span
-/// [`REJECT_SCAN_BUDGET`] bytes, or the search is no longer wanted, the
-/// line has no more matches and is [`partial`](Self::partial).
+/// inside that word fails the same way). Once matching the line has taken
+/// [`LINE_TIME_BUDGET`], or the search is no longer wanted, the line has no
+/// more matches and is [`partial`](Self::partial).
 pub struct Matches<'a> {
     matcher: &'a Matcher,
     line: &'a str,
     at: usize,
-    rejected: usize,
-    /// Bytes searched again for rejected matches.
-    scanned: usize,
+    /// Regex searches run, kept or not.
+    finds: usize,
+    /// When the first ran.
+    since: Option<Instant>,
     partial: bool,
     current: Option<&'a dyn Fn() -> bool>,
 }
@@ -200,19 +206,23 @@ impl Iterator for Matches<'_> {
 
     fn next(&mut self) -> Option<Range<usize>> {
         let line = self.line;
+        let since = *self.since.get_or_insert_with(Instant::now);
         while self.at <= line.len() {
+            // Every find counts, kept or not: one can scan the rest of the
+            // line.
+            if self.finds > 0 {
+                let unwanted = self.current.is_some_and(|c| !c());
+                if unwanted || since.elapsed() > self.matcher.line_budget {
+                    return self.give_up();
+                }
+            }
+            self.finds += 1;
             let m = self.matcher.re.find_at(line, self.at)?;
             if m.is_empty() {
                 self.at = next_char(line, m.start());
                 continue;
             }
             if self.matcher.whole_word && !whole_word(line, m.range()) {
-                self.rejected += 1;
-                self.scanned += m.end() - self.at;
-                let unwanted = self.rejected.is_multiple_of(REJECTS_PER_CHECK) && self.current.is_some_and(|c| !c());
-                if self.scanned > REJECT_SCAN_BUDGET || unwanted {
-                    return self.give_up();
-                }
                 self.at = past_word(line, m.start());
                 continue;
             }
@@ -319,6 +329,9 @@ pub struct SearchResults {
     /// In walk order: a folder's files before its subfolders, each by name.
     pub files: Vec<FileHits>,
     pub matches: usize,
+    /// A file's matching stopped early ([`FileHits::partial`]): `matches`
+    /// is a floor.
+    pub partial: bool,
     /// The walk finished (or stopped at a cap).
     pub done: bool,
     pub stopped: Stop,
@@ -353,20 +366,24 @@ pub struct Searcher {
     /// What [`Self::results`] shows while a [`Self::refresh`] runs: the
     /// results it replaces, until it is done.
     stale: Option<SearchResults>,
+    /// How long one line's matching may take ([`LINE_TIME_BUDGET`]).
+    line_budget: Duration,
 }
 
 impl Searcher {
     /// A searcher that calls `waker` (from its worker) when results arrive.
     pub fn new(waker: Option<Waker>) -> Self {
         let live = Arc::new(AtomicU64::new(0));
-        Searcher { waker, worker: None, live, results: SearchResults::default(), stale: None }
+        let (results, stale, line_budget) = (SearchResults::default(), None, LINE_TIME_BUDGET);
+        Searcher { waker, worker: None, live, results, stale, line_budget }
     }
 
     /// Search the files under `root` for `query`, dropping the last search's
     /// results. An invalid regex starts nothing and says why.
     pub fn start(&mut self, root: &Path, query: &SearchQuery, walk: WalkOptions) -> Result<(), String> {
         self.cancel();
-        let matcher = query.matcher()?;
+        let mut matcher = query.matcher()?;
+        matcher.line_budget = self.line_budget;
         let generation = self.live.load(Ordering::SeqCst);
         let job = Job { generation, root: root.to_path_buf(), matcher, walk };
         let sent = match &self.worker {
@@ -412,6 +429,7 @@ impl Searcher {
             match event {
                 Event::Hits(hits) => {
                     self.results.matches += hits.total;
+                    self.results.partial |= hits.partial;
                     self.results.files.push(hits);
                 }
                 Event::Done(stopped) => {
@@ -628,9 +646,11 @@ fn search_set(run: &mut Run, only: &BTreeSet<PathBuf>) -> Result<Option<Stop>, (
         let rel = p.strip_prefix(&root).unwrap_or(p);
         rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
     };
+    let mut ignores = IgnoreFiles::default();
     let mut files: Vec<&PathBuf> = only
         .iter()
         .filter(|p| p.starts_with(&root) && (run.job.walk.show_hidden || !hidden(p)))
+        .filter(|p| run.job.walk.show_gitignored || !ignores.ignored(p))
         .collect();
     files.sort_by(|a, b| walk_order(a, b));
     for path in files {
@@ -647,6 +667,51 @@ fn search_set(run: &mut Run, only: &BTreeSet<PathBuf>) -> Result<Option<Stop>, (
         }
     }
     Ok(Some(Stop::No))
+}
+
+/// The ignore files a walk honours, read once per folder: whether a file
+/// is ignored, as the walk would decide, for files found without one.
+/// Global git excludes aren't read.
+#[derive(Default)]
+struct IgnoreFiles {
+    /// Per folder, its matchers in precedence order: `.ignore`, `.gitignore`,
+    /// and in a repo's top folder `.git/info/exclude`.
+    dirs: HashMap<PathBuf, Vec<Gitignore>>,
+}
+
+impl IgnoreFiles {
+    /// Whether `path` (a file) is ignored: the nearest folder whose files
+    /// say anything about it decides, up to its repo's top folder.
+    fn ignored(&mut self, path: &Path) -> bool {
+        for dir in path.ancestors().skip(1) {
+            let matchers = self.dirs.entry(dir.to_path_buf()).or_insert_with(|| Self::read(dir));
+            for m in matchers.iter() {
+                match m.matched_path_or_any_parents(path, false) {
+                    Match::Ignore(_) => return true,
+                    Match::Whitelist(_) => return false,
+                    Match::None => {}
+                }
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
+        }
+        false
+    }
+
+    fn read(dir: &Path) -> Vec<Gitignore> {
+        let one = |file: PathBuf| {
+            file.is_file().then(|| {
+                let mut b = GitignoreBuilder::new(dir);
+                b.add(file);
+                b.build().ok()
+            })?
+        };
+        [dir.join(".ignore"), dir.join(".gitignore"), dir.join(".git").join("info").join("exclude")]
+            .into_iter()
+            .filter_map(one)
+            .collect()
+    }
 }
 
 fn lower_name(p: &Path) -> String {
@@ -721,9 +786,10 @@ fn search_file(path: &Path, matcher: &Matcher, current: &dyn Fn() -> bool) -> Se
             hits.partial = true;
         }
     }
-    match hits.total {
-        0 => Searched::Nothing,
-        _ => Searched::Hits(hits),
+    // A file given up on is kept, matches or not: it may have more.
+    match hits.total > 0 || hits.partial {
+        true => Searched::Hits(hits),
+        false => Searched::Nothing,
     }
 }
 
@@ -866,46 +932,65 @@ mod tests {
     }
 
     #[test]
-    fn rejections_that_rescan_the_line_stop_at_the_budget() {
+    fn a_line_that_rescans_itself_stops_at_the_time_budget() {
         // Each `x.*y` runs to the line's end and is rejected (an `a` before
-        // its `x`): without a budget, a rescan of the line per `x`.
+        // its `x`); each `x.*Q|x` runs to the line's end before taking `x`.
+        // Unbounded, both rescan the line per `x`.
         let line = format!("{}y", "ax ".repeat(300_000));
-        let q = SearchQuery { whole_word: true, regex: true, ..query("x.*y") };
-        let m = q.matcher().unwrap();
-        let at = Instant::now();
-        let mut it = m.matches(&line);
-        assert_eq!(it.next(), None);
-        assert!(it.partial(), "given up, not finished");
-        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
-        // A search no longer wanted gives up within a few rejections.
+        for (text, whole_word) in [("x.*y", true), ("x.*Q|x", false)] {
+            let q = SearchQuery { whole_word, regex: true, ..query(text) };
+            let m = q.matcher().unwrap();
+            let at = Instant::now();
+            let mut it = m.matches(&line);
+            let n = it.by_ref().count();
+            assert!(it.partial(), "{text}: given up after {n}, not finished");
+            assert!(at.elapsed() < Duration::from_secs(5), "{text}: {:?}", at.elapsed());
+        }
+        // A search no longer wanted gives up before its next find.
         let asked = std::cell::Cell::new(0);
         let current = || {
             asked.set(asked.get() + 1);
             false
         };
-        let q = SearchQuery { whole_word: true, ..query("a") };
-        let m = q.matcher().unwrap();
-        let line = "xa ".repeat(100_000);
-        let mut it = m.matches_while(&line, &current);
-        assert_eq!(it.next(), None);
-        assert!(it.partial());
-        assert_eq!((asked.get(), it.rejected), (1, REJECTS_PER_CHECK));
+        // A rejected find, and a kept one: either way the next find asks.
+        for (line, kept) in [("xa ".repeat(100_000), 0), ("a ".repeat(100_000), 1)] {
+            asked.set(0);
+            let q = SearchQuery { whole_word: true, ..query("a") };
+            let m = q.matcher().unwrap();
+            let mut it = m.matches_while(&line, &current);
+            let n = it.by_ref().count();
+            assert!(it.partial());
+            assert_eq!((asked.get(), it.finds, n), (1, 1, kept), "{line:.6}…");
+        }
     }
 
     #[test]
-    fn a_file_with_a_line_given_up_is_partial_and_a_newer_search_isnt_held_up() {
+    fn a_file_given_up_on_is_kept_as_partial() {
         let d = tmpdir();
-        let line = format!("{}y\nxy\n", "ax ".repeat(300_000));
-        fs::write(d.join("p.txt"), &line).unwrap();
+        fs::write(d.join("p.txt"), format!("{}y\nxy\n", "ax ".repeat(300_000))).unwrap();
         let q = SearchQuery { whole_word: true, regex: true, ..query("x.*y") };
         let r = search(&d, &q, WalkOptions::default());
         let f = &r.files[0];
-        assert!(f.partial);
+        assert!(f.partial && r.partial);
         assert_eq!((f.total, f.lines[0].line), (1, 1));
+        // With no match before it gave up, it is still listed.
+        fs::write(d.join("p.txt"), format!("{}y\n", "ax ".repeat(300_000))).unwrap();
+        let r = search(&d, &q, WalkOptions::default());
+        assert_eq!((r.files.len(), r.files[0].total, r.files[0].partial), (1, 0, true));
+    }
+
+    #[test]
+    fn a_newer_search_stops_a_line_that_would_not_finish_on_its_own() {
+        let d = tmpdir();
+        fs::write(d.join("p.txt"), "ax ".repeat(300_000)).unwrap();
         let small = tmpdir();
         fs::write(small.join("s.txt"), "a").unwrap();
+        // No time budget: the line alone would take far longer than the test.
         let mut s = Searcher::new(None);
+        s.line_budget = Duration::from_secs(3600);
+        let q = SearchQuery { regex: true, ..query("x.*Q|x") };
         s.start(&d, &q, WalkOptions::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
         let at = Instant::now();
         s.start(&small, &query("a"), WalkOptions::default()).unwrap();
         assert_eq!(wait(&mut s).files.len(), 1);
@@ -1022,6 +1107,12 @@ mod tests {
         let only = Some(Arc::new(BTreeSet::new()));
         let r = search(&d, &query("hit"), WalkOptions { only, ..WalkOptions::default() });
         assert!(r.files.is_empty() && r.done);
+        // The set is held to the ignore files as the walk is.
+        let only = Some(Arc::new(BTreeSet::from([d.join("ignored.txt"), d.join("b.txt")])));
+        let r = search(&d, &query("hit"), WalkOptions { only: only.clone(), ..WalkOptions::default() });
+        assert_eq!(names(&r, &d), ["b.txt"]);
+        let r = search(&d, &query("hit"), WalkOptions { only, show_gitignored: true, ..WalkOptions::default() });
+        assert_eq!(names(&r, &d), ["b.txt", "ignored.txt"]);
     }
 
     #[test]
