@@ -1812,7 +1812,7 @@ impl State {
     /// a redraw (`false` when there is no such view).
     fn view_event(&mut self, sid: SurfaceId, f: impl FnOnce(&mut dyn View, &mut EventCx)) -> bool {
         let ui = self.ui();
-        let mut cx = EventCx::new(&self.cfg, ui, self.mods, self.clipboard.as_mut());
+        let mut cx = EventCx::new(&self.cfg, ui, self.mods, Some(&mut self.clipboard));
         if !call_view(&mut self.app, sid, &mut cx, f) {
             return false;
         }

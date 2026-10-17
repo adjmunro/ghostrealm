@@ -1,6 +1,8 @@
 //! A headless host for exercising views in tests: paints into a [`Frame`] and
 //! delivers input through real [`PaintCx`]/[`EventCx`]s, with no window or GPU.
 
+use std::cell::RefCell;
+
 use ghostrealm_core::{Chrome, Config, Rect, SurfaceId};
 use ghostrealm_terminal::{Key, KeyPress, Mods};
 use glyphon::FontSystem;
@@ -21,6 +23,8 @@ pub struct Harness {
     pub cursor: (f32, f32),
     /// Paint as if a modal overlay covers the panes.
     pub modal: bool,
+    /// The clipboard events read and write, in place of the system's.
+    pub clipboard: RefCell<Option<String>>,
 }
 
 impl Default for Harness {
@@ -52,6 +56,7 @@ impl Harness {
             frame: Frame::new((800.0, 600.0)),
             cursor: (-1.0, -1.0),
             modal: false,
+            clipboard: RefCell::new(None),
         }
     }
 
@@ -97,7 +102,8 @@ impl Harness {
     }
 
     fn event(&self, mods: Mods, f: impl FnOnce(&mut EventCx)) -> Outcome {
-        let mut cx = EventCx::new(&self.cfg, UI, mods, None);
+        let mut clipboard = self.clipboard.borrow_mut();
+        let mut cx = EventCx::new(&self.cfg, UI, mods, Some(&mut *clipboard));
         f(&mut cx);
         cx.finish()
     }

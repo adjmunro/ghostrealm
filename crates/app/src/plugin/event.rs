@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Mods};
 
+use super::text_edit::Clipboard;
 use super::UiMetrics;
 
 /// A mouse button a press is made with.
@@ -185,7 +186,7 @@ pub struct EventCx<'a> {
     pub ui: UiMetrics,
     /// Modifier keys held right now (also on the key itself for key events).
     pub mods: Mods,
-    clipboard: Option<&'a mut arboard::Clipboard>,
+    clipboard: Option<&'a mut dyn Clipboard>,
     out: Outcome,
 }
 
@@ -194,7 +195,7 @@ impl<'a> EventCx<'a> {
         cfg: &'a Config,
         ui: UiMetrics,
         mods: Mods,
-        clipboard: Option<&'a mut arboard::Clipboard>,
+        clipboard: Option<&'a mut dyn Clipboard>,
     ) -> Self {
         EventCx {
             cfg,
@@ -224,13 +225,13 @@ impl<'a> EventCx<'a> {
 
     /// The system clipboard's text, if any.
     pub fn clipboard_text(&mut self) -> Option<String> {
-        self.clipboard.as_mut()?.get_text().ok()
+        self.clipboard.as_mut()?.text()
     }
 
     /// Put `text` on the system clipboard.
     pub fn set_clipboard_text(&mut self, text: String) {
         if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
+            cb.set_text(text);
         }
     }
 
