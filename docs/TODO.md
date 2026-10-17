@@ -442,21 +442,21 @@
 
 - Requires: NO BLOCKERS
 - Detail: DONE: **mixed** mode. Strong/headings bold, emphasis italic, link text
-  underlined, inline code in a tinted box, fenced blocks on a full-width tint
-  with the body highlighted in the fence's language (a line-local highlighter
-  such as `toml`); the markers stay visible, editable, and dimmed. The style
-  rides in `RunStyle`s per span through the row cache and `PaintCx`
-  (PLUGINS.md); rows with no styled span carry none. Remaining:
+  underlined, inline code in a rounded, outlined box, fenced blocks in one
+  such box the text area's width with a copy button, the body highlighted in
+  the fence's language (a line-local highlighter such as `toml`); the markers
+  stay visible, editable, and dimmed. The style rides in `RunStyle`s per span
+  through the row cache and `PaintCx` (PLUGINS.md); rows with no styled span
+  carry none. Remaining:
   - A toggle button switches mixed <-> fully-formatted (markers hidden; needs
     cursor-column mapping over hidden text).
   - A Markdown feature checks whether a link/image target exists (a local file
     on disk; a reachable URL needs a network decision) and flags broken ones
     with inline error markers.
-  - Code blocks: a copy button and, for shell-flavoured blocks, a run button in
-    the left gutter for each runnable command; an LSP for the fence's language;
-    highlighting a fence in a stateful language (Markdown in Markdown) needs
-    the inner state carried too; see "DISCUSSION: syntax highlighting
-    direction".
+  - Code blocks: for shell-flavoured blocks, a run button in the left gutter
+    for each runnable command; an LSP for the fence's language; highlighting
+    a fence in a stateful language (Markdown in Markdown) needs the inner
+    state carried too; see "DISCUSSION: syntax highlighting direction".
   - Links: look and feel (colours) of internal and external links, to discuss.
   - Nesting: the highlighter gives each char one token, so emphasis inside
     strong (or a link or heading) loses the outer style; needs a token set per
@@ -465,9 +465,6 @@
   - Bold has no synthetic fallback: a monospace family without a bold face
     shows the nearest weight (italic is skewed by the shaper).
   - From GitHub issue #1 (2026-10-16@ad13ff26):
-    - Code look: inline code and fenced blocks want a rounded box with a
-      defined border and a calmer colour scheme; the tint (`RunStyle::BOX`,
-      `theme::CODE_BG`) reads as a warning. Compare GitHub and Android Studio.
     - Headings differ only in weight; they should differ in size. Needs a font
       size per span, so variable row heights: an architectural change to the
       row cache, `PaintCx` rows, and every view's row-to-y mapping.

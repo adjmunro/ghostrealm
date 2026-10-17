@@ -46,8 +46,8 @@ pub fn row_spans(line: &str, spans: &[Span], start: usize, len: usize, plain: [u
 
 /// [`row_spans`] plus per-span [`RunStyle`]s (runs coalesce on colour and
 /// style). The styles are empty when no span in the row is styled, so a plain
-/// row carries nothing extra. In a `block` row (a fenced code block, drawn on
-/// a tinted background of its own) code is not boxed.
+/// row carries nothing extra. In a `block` row (a fenced code block, drawn in
+/// a box of its own) code is not boxed.
 pub fn styled_row_spans(
     line: &str,
     spans: &[Span],
@@ -213,7 +213,7 @@ mod tests {
         let line = "let x = 1;";
         let fenced = styled_row_spans(line, &Markdown.line(line, inside).0, 0, 99, FG, true);
         assert_eq!(fenced.0, vec![(line.to_string(), color(Token::Code, FG))]);
-        assert!(fenced.1.is_empty(), "the block's background replaces the box");
+        assert!(fenced.1.is_empty(), "the block's own box replaces the inline one");
     }
 
     #[test]

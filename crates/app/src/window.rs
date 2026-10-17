@@ -6119,6 +6119,18 @@ mod tests {
         assert_ne!(draw_row(text, RunStyle::BOLD), draw_row(text, RunStyle::ITALIC));
     }
 
+    /// A code box draws its hairline border brighter than its fill, and the
+    /// fill brighter than the background around it.
+    #[test]
+    fn a_code_box_draws_its_border_over_its_fill() {
+        use crate::row_cache::RunStyle;
+        let px = draw_row("Hello world, mix", RunStyle::BOX);
+        let at = |x: usize, y: usize| px[(y * 192 + x) * 4];
+        // The row is drawn at (8, 8); x 52 is inside the space after "Hello".
+        let (bg, border, fill) = (at(52, 4), at(52, 9), at(52, 16));
+        assert!(border > fill && fill > bg, "border {border}, fill {fill}, background {bg}");
+    }
+
     /// Render `quads` over `clear` on a `dim`x`dim` offscreen texture; RGBA8 pixels.
     async fn render_quads(quads: &[QuadInstance], dim: u32, clear: wgpu::Color) -> Vec<u8> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());

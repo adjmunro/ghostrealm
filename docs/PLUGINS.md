@@ -308,7 +308,11 @@ them to colours (`syntax::color`) and slices them to a visual row, ready for
 `PaintCx::row`/`budgeted_row`; `syntax::styled_row_spans` also maps them to
 `RunStyle`s (Strong/Heading bold, Emphasis italic, Link underline, Code boxed).
 `Highlighter::block_row` places a row in a block drawn as a unit (a fenced code
-block's opening fence, body, or closing fence), which the editor tints; Markdown carries a fence's language in its state and highlights the
+block's opening fence, body, or closing fence): the editor draws each block,
+fences included, as one rounded, outlined box the text area's width (open at
+an edge where the block runs past the viewport), with a copy button at its top
+right that copies the body without the fences, its container's `>` prefix, or
+its common indent; Markdown carries a fence's language in its state and highlights the
 body with that language's line-local highlighter. A view that edits text keeps a `StateCache` (only
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a
