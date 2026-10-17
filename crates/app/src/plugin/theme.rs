@@ -59,6 +59,9 @@ pub const CODE_BOX_BORDER: [u8; 3] = [255, 255, 255];
 pub const CODE_BOX_BORDER_ALPHA: f32 = 0.12;
 /// A text field's border while it has keyboard focus.
 pub const FIELD_FOCUS_BORDER: [u8; 3] = [110, 140, 210];
+/// A search match's pill behind its text: this colour at [`MATCH_ALPHA`].
+pub const MATCH_BG: [u8; 3] = [110, 140, 210];
+pub const MATCH_ALPHA: f32 = 0.38;
 
 /// Corner radius of a pill: a tab, a list row's hover or selection.
 pub fn pill_radius(ui: UiMetrics) -> f32 {

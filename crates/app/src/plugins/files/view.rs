@@ -193,6 +193,7 @@ impl FilesView {
         }
         self.active = at;
         self.opened(before, clicked.is_some());
+        self.select_match();
         id
     }
 
@@ -209,6 +210,7 @@ impl FilesView {
         let before = self.keys();
         self.set_active(i);
         self.opened(before, clicked.is_some());
+        self.select_match();
         true
     }
 
@@ -272,6 +274,18 @@ impl FilesView {
         let path = self.docs.get(self.active).and_then(|t| t.view.path());
         if let Some(p) = path.filter(|p| self.sidebar.chosen() != Some(p.as_path())) {
             self.sidebar.reveal(&p);
+        }
+    }
+
+    /// After an open: when the sidebar's search opened the shown file at a
+    /// match, select the match there. Spent either way.
+    fn select_match(&mut self) {
+        let Some((path, line, cols)) = self.sidebar.take_match() else { return };
+        let Some(t) = self.docs.get_mut(self.active) else { return };
+        if t.view.path().is_some_and(|p| same_file(&p, &path)) {
+            if let Some(editor) = t.view.downcast_mut::<EditorView>() {
+                editor.reveal(line, cols);
+            }
         }
     }
 
@@ -1322,6 +1336,41 @@ mod tests {
         h.mouse(&mut v, down(sidebar_row(1)));
         assert!(v.show_path(&d.join("b.txt")));
         assert_eq!(v.docs(), [b, a], "nothing replaced");
+    }
+
+    #[test]
+    fn a_click_on_a_search_match_opens_the_preview_tab_with_the_match_selected() {
+        let (d, mut v) = fixture(&Session::default());
+        let mut h = Harness::new();
+        for c in "?line".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            h.tick(&mut v, Instant::now() + std::time::Duration::from_secs(1));
+            v.refresh();
+            if !v.text().unwrap().contains("Searching") {
+                break;
+            }
+            assert!(Instant::now() < until, "the search finishes");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        h.paint(&mut v, RECT);
+        // Row 0 is a.md's header; row 1 its line "body line".
+        let out = h.mouse(&mut v, down(sidebar_row(1)));
+        assert_eq!(out.requests, [Request::OpenFile(d.join("a.md"))]);
+        let a = v.show_doc(editor(&d.join("a.md")));
+        assert!(v.is_preview(a));
+        assert!(v.sidebar_has_keys(), "the keys stay in the results");
+        let buffer = |v: &FilesView| v.doc_view().and_then(|d| d.downcast_ref::<EditorView>()).unwrap().buffer().selection();
+        assert_eq!(buffer(&v), Some(((1, 5), (1, 9))));
+        assert!(v.sidebar_mut().text().unwrap().starts_with("?line"), "the search stays");
+        // A double click keeps the tab, the match selected again.
+        v.doc_mut(a).and_then(|d| d.downcast_mut::<EditorView>()).unwrap().buffer_mut().clear_selection();
+        h.mouse(&mut v, MouseEvent::Down { pos: sidebar_row(1), clicks: 2, button: MouseButton::Left });
+        assert!(v.show_path(&d.join("a.md")));
+        assert!(!v.is_preview(a));
+        assert_eq!(buffer(&v), Some(((1, 5), (1, 9))));
     }
 
     #[test]

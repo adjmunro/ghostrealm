@@ -6,19 +6,23 @@
 //! config section, and opens a Files surface.
 //!
 //! Typing filters (fuzzy across the tree) or, when the input looks like a path,
-//! completes it; Up/Down move the single highlight, which the mouse also takes
+//! completes it; in the sidebar, a `?` first searches the files' contents
+//! instead (see [`search`]); Up/Down move the single highlight, which the mouse also takes
 //! over on hover. A click also *selects* the row: a separate, sticky highlight
 //! that hover and arrows leave alone. In the picker, the selected entry is the
 //! one confirming chooses.
 
+mod search;
+
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::fs_tree::{FileRow, FsTree, FsView, GitFilter};
-use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
+use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Config, Rect, Registry};
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::app_state::AppState;
@@ -207,6 +211,8 @@ pub struct FileBrowserView {
     opens: u64,
     /// The `⋯` button as last painted, which its menu opens under.
     more_hit: Option<Rect>,
+    /// Search mode ([`Mode::Sidebar`] only).
+    search: search::Search,
 }
 
 impl FileBrowserView {
@@ -231,12 +237,14 @@ impl FileBrowserView {
             more_hit: None,
             field: FieldMouse::default(),
             name_field: FieldMouse::default(),
+            search: search::Search::new(None),
         }
     }
 
     /// Wake the UI with `waker` when background work (the git filter's
     /// status) finishes.
     pub fn with_waker(mut self, waker: Option<Waker>) -> Self {
+        self.search = search::Search::new(waker.clone());
         self.tree.set_waker(waker);
         self
     }
@@ -262,8 +270,13 @@ impl FileBrowserView {
 
     /// Show `path` selected: expand the folders down to it when it is under
     /// the root (or the folder the browser opened on), else make its folder
-    /// the root.
+    /// the root. Search mode keeps its results: the tree shows it selected
+    /// once the search is cleared, if it lists it.
     pub fn reveal(&mut self, path: &Path) {
+        if self.searching() {
+            self.chosen = Some(path.to_path_buf());
+            return;
+        }
         self.tree.set_query("");
         // Back to the folder the browser opened on when it holds the path,
         // before re-rooting elsewhere.
@@ -294,9 +307,9 @@ impl FileBrowserView {
     }
 
     /// Take the tree's query into the input when the tree changed it (navigation
-    /// clears it).
+    /// clears it). A search isn't the tree's query, so it stays.
     fn sync_input(&mut self) {
-        if self.input.text() != self.tree.query() {
+        if !self.searching() && self.input.text() != self.tree.query() {
             self.input.set_text(self.tree.query());
         }
     }
@@ -677,6 +690,9 @@ impl FileBrowserView {
             icon_button(cx, clear, BTN_CLEAR, Icon::Close, "Clear", theme::GLYPH);
             text_right = clear.x;
         }
+        if self.searching() {
+            text_right = self.paint_toggles(cx, field, text_right);
+        }
         let text_x = icon.x + icon.w + pad * 0.5;
         let text = Rect { x: text_x, w: (text_right - text_x).max(1.0), ..field };
         let hint = self.hint();
@@ -689,12 +705,13 @@ impl FileBrowserView {
         header_h
     }
 
-    /// The filter box's hint: where the list is once that isn't where the
-    /// browser opened. A picker, which goes where a typed path leads, always
-    /// says.
+    /// The filter box's hint: its two modes, or where the list is once that
+    /// isn't where the browser opened (only the box says so; the modes work
+    /// the same there). A picker, which goes where a typed path leads, always
+    /// says where.
     fn hint(&self) -> String {
         match self.mode {
-            Mode::Sidebar if self.tree.root() == self.start => "Filter files".to_string(),
+            Mode::Sidebar if self.tree.root() == self.start => "Filter, or ? to search in files".to_string(),
             _ => tilde(self.tree.root()),
         }
     }
@@ -833,6 +850,10 @@ impl View for FileBrowserView {
         self.row_h = row_h;
         self.suggest_hits.clear();
 
+        if self.searching() {
+            self.paint_search(cx, list);
+            return;
+        }
         if is_path {
             // Path mode: the body is the completion list.
             cx.with_clip(list, |cx| {
@@ -899,6 +920,11 @@ impl View for FileBrowserView {
         if self.mode == Mode::Save {
             return self.save_key(cx, k);
         }
+        if self.searching() {
+            if let Some(used) = self.search_key(cx, k) {
+                return used;
+            }
+        }
         self.sync_input();
         let m = k.mods;
         let plain = !(m.shift || m.alt || m.super_ || m.ctrl);
@@ -908,10 +934,7 @@ impl View for FileBrowserView {
         let pick_dir = self.mode == Mode::PickDir;
         let browsing = !path_mode && self.input.is_empty();
         match k.key {
-            Key::Escape if plain => {
-                self.tree.set_query("");
-                self.clear_highlight();
-            }
+            Key::Escape if plain => self.clear_input(),
             Key::Enter if pick_dir => self.pick_dir(cx, path_mode),
             Key::Right if pick_dir && plain && browsing => self.enter_highlighted_dir(),
             Key::Tab if pick_dir && plain && !path_mode => self.enter_highlighted_dir(),
@@ -972,10 +995,7 @@ impl View for FileBrowserView {
             _ => match self.input.key(k, cx) {
                 Applied::Ignored => return false,
                 Applied::Moved => {}
-                Applied::Changed => {
-                    self.tree.set_query(self.input.text());
-                    self.clear_highlight();
-                }
+                Applied::Changed => self.input_changed(),
             },
         }
         self.sync_input();
@@ -990,6 +1010,9 @@ impl View for FileBrowserView {
         let extend = cx.mods.shift;
         if self.field.event(&mut self.input, event, extend) || self.name_field.event(&mut self.name, event, extend) {
             cx.redraw();
+            return;
+        }
+        if self.searching() && self.search_mouse(cx, event) {
             return;
         }
         match *event {
@@ -1081,6 +1104,13 @@ impl View for FileBrowserView {
         if self.mode != Mode::Sidebar || !rect_contains(self.list, pos.0, pos.1) {
             return;
         }
+        if self.searching() {
+            if let Some(path) = self.hit_path_at(pos.0, pos.1) {
+                let target = FileTarget { path, kind: TargetKind::File, origin: Origin::Browser };
+                cx.request(Request::FileMenu { target, at: pos, align: MenuAlign::Left });
+            }
+            return;
+        }
         let target = match self.row_at(pos.0, pos.1) {
             Some((_, row)) if row.is_category => return,
             Some((idx, row)) => {
@@ -1114,9 +1144,14 @@ impl View for FileBrowserView {
             self.chosen = Some(chosen);
         }
         self.tree.refresh();
+        self.rerun_search();
     }
 
     fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), _dx: f32, dy: f32) {
+        if self.searching() {
+            self.search_scroll(cx, dy);
+            return;
+        }
         // Pixel-precise; the upper bound is clamped to the content at paint.
         let next = (self.scroll - dy).max(0.0);
         if next != self.scroll {
@@ -1137,9 +1172,12 @@ impl View for FileBrowserView {
                 return;
             }
             BTN_CLEAR => {
-                self.tree.set_query("");
-                self.clear_highlight();
-                self.sync_input();
+                self.clear_input();
+                cx.redraw();
+                return;
+            }
+            search::BTN_MATCH_CASE | search::BTN_WHOLE_WORD | search::BTN_REGEX => {
+                self.toggle_search_option(id);
                 cx.redraw();
                 return;
             }
@@ -1168,14 +1206,32 @@ impl View for FileBrowserView {
             _ => return,
         }
         self.reselect(sel);
+        // The root or which files are listed may have changed.
+        self.run_search();
         cx.redraw();
     }
 
     fn refresh(&mut self) -> bool {
-        self.tree.poll()
+        let tree = self.tree.poll();
+        self.poll_search() || tree
+    }
+
+    /// When typing has paused long enough for the search to run.
+    fn deadline(&self, _cfg: &Config) -> Option<Instant> {
+        self.search.due()
+    }
+
+    fn tick(&mut self, cx: &mut EventCx, now: Instant) {
+        if self.search.due().is_some_and(|due| due <= now) {
+            self.run_search();
+            cx.redraw();
+        }
     }
 
     fn text(&mut self) -> Option<String> {
+        if self.searching() {
+            return Some(self.search_text());
+        }
         let mut out = format!("{}\n", self.tree.root().display());
         for r in self.tree.rows() {
             let marker = match (r.is_dir, r.expanded) {
@@ -2374,7 +2430,7 @@ mod tests {
         let (d, _) = fixture();
         let mut v = FileBrowserView::new(d.join("adir"));
         let mut h = Harness::new();
-        assert_eq!(v.hint(), "Filter files");
+        assert_eq!(v.hint(), "Filter, or ? to search in files");
         h.button(&mut v, BTN_PARENT);
         let parent = d.as_path();
         assert_eq!(v.hint(), tilde(parent));
