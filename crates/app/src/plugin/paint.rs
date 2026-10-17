@@ -941,6 +941,15 @@ impl<'a> PaintCx<'a> {
         self.text.shape_scratch(&spans, font.into(), width, true)
     }
 
+    /// How far below a monospace row's top its baseline sits, at the frame's
+    /// metrics: what lines up text of two sizes (a row drawn at a scale `s`
+    /// has its baseline `s` times as far down).
+    pub fn mono_baseline(&mut self) -> f32 {
+        let s = self.shape("0", Font::MONO, self.ui.cell_w * 4.0);
+        let run = self.text.buffer(TextSrc::Scratch(s.idx)).and_then(|b| b.layout_runs().next().map(|r| r.line_y));
+        run.unwrap_or(self.text.line_h * 0.8)
+    }
+
     /// `text` as it fits in `avail` (physical px) in `font`: whole, else cut
     /// at a cluster boundary with an ellipsis after it (just the ellipsis
     /// when nothing else fits). Measured from one shaping of the whole text.

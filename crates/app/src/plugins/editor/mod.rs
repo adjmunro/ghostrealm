@@ -718,10 +718,12 @@ impl EditorView {
     }
 }
 
-/// How much larger than the base cell line `ln` draws: every line at the
-/// base size.
-fn line_scale(_states: &mut StateCache, _buf: &EditorBuffer, _h: Option<&dyn Highlighter>, _ln: usize) -> f32 {
-    1.0
+/// How much larger than the base cell line `ln` draws: its heading level's
+/// size under highlighter `h`, else 1.
+fn line_scale(states: &mut StateCache, buf: &EditorBuffer, h: Option<&dyn Highlighter>, ln: usize) -> f32 {
+    let (Some(h), Some(line)) = (h, buf.lines.get(ln)) else { return 1.0 };
+    let state = if h.carries_state() { states.state_in(h, &buf.lines, buf.edits, ln) } else { 0 };
+    syntax::heading_scale(h.heading_level(line, state))
 }
 
 /// Where line `ln` sits in a fenced block ([`Highlighter::block_row`]);
@@ -1117,10 +1119,16 @@ impl View for EditorView {
             }
         }
         // Line numbers, on each logical line's first visual row, at the base
-        // size whatever the row's.
+        // size whatever the row's: on a heading's baseline, so the number
+        // reads as that line's, as it does beside body text.
         if gutter_w > 0.0 {
             let gutter = Rect { x: body.x, y: body.y, w: gutter_w, h: body.h };
+            let mut baseline = None;
             for r in vis.iter().filter(|r| r.start == 0) {
+                let top = match r.scale == 1.0 {
+                    true => r.y,
+                    false => r.y + *baseline.get_or_insert_with(|| cx.mono_baseline()) * (r.scale - 1.0),
+                };
                 let is_cur = r.ln == cursor.0;
                 let num = match cx.cfg.editor.line_numbers {
                     LineNumbers::Relative if !is_cur => (cursor.0 as isize - r.ln as isize).unsigned_abs(),
@@ -1129,7 +1137,7 @@ impl View for EditorView {
                 let s = num.to_string();
                 let color = if is_cur { EDITOR_GUTTER_CUR } else { EDITOR_GUTTER };
                 let left = text_x - cw - s.chars().count() as f32 * cw;
-                cx.row(&[(s, color)], left, r.y, gutter_w, gutter, color);
+                cx.row(&[(s, color)], left, top, gutter_w, gutter, color);
             }
         }
         // Text, one cache-keyed row per visual row (wrapped sub-rows stay
@@ -2874,5 +2882,174 @@ mod tests {
         let before = v.wrap_on(&h.cfg);
         h.button(&mut v, BTN_WRAP);
         assert_eq!(v.wrap_on(&h.cfg), !before);
+    }
+
+    /// A view of `text` saved as `name` (its extension picks the highlighter).
+    fn file_view(tag: &str, name: &str, text: &str) -> EditorView {
+        let path = tmpdir(tag).join(name);
+        std::fs::write(&path, text).unwrap();
+        EditorView::new(EditorBuffer::open(path).unwrap())
+    }
+
+    /// The text column's items as `(top, scale)`, top to bottom.
+    fn text_rows(h: &Harness) -> Vec<(f32, f32)> {
+        let text_x = 4.0 * UI.cell_w;
+        h.frame.text.iter().filter(|t| t.left == text_x).map(|t| (t.top, t.scale)).collect()
+    }
+
+    /// Quads as unrounded pixel rects `(x, y, w, h)`.
+    fn rects(h: &Harness, quads: &[crate::plugin::paint::QuadInstance]) -> Vec<(f32, f32, f32, f32)> {
+        let (sw, sh) = h.frame.screen;
+        quads
+            .iter()
+            .map(|q| ((q.pos[0] + 1.0) / 2.0 * sw, (1.0 - q.pos[1]) / 2.0 * sh, q.size[0] / 2.0 * sw, -q.size[1] / 2.0 * sh))
+            .collect()
+    }
+
+    fn near(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+        [a.0 - b.0, a.1 - b.1, a.2 - b.2, a.3 - b.3].iter().all(|d| d.abs() < 0.01)
+    }
+
+    const H1: f32 = 1.8;
+    const H2: f32 = 1.5;
+
+    #[test]
+    fn heading_rows_draw_larger_and_push_the_rows_below_down() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-sized", "# Title\n## Sub\nbody\n### Three\n##### Five");
+        paint_plain(&mut h, &mut v);
+        let ch = UI.cell_h;
+        let y2 = ch * (H1 + H2);
+        assert_eq!(
+            text_rows(&h),
+            vec![(0.0, H1), (ch * H1, H2), (y2, 1.0), (y2 + ch, 1.25), (y2 + ch * 2.25, 1.0)],
+            "H5 stays at body size"
+        );
+    }
+
+    #[test]
+    fn a_line_number_beside_a_heading_is_base_size_on_its_baseline() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-gutter", "# Title\nbody");
+        paint_plain(&mut h, &mut v);
+        let text_x = 4.0 * UI.cell_w;
+        let nums: Vec<(f32, f32)> = h.frame.text.iter().filter(|t| t.left < text_x).map(|t| (t.top, t.scale)).collect();
+        assert_eq!(nums.len(), 2, "{nums:?}");
+        let (top, scale) = nums[0];
+        assert_eq!(scale, 1.0);
+        // Its baseline (b below its top) meets the heading's (H1 * b below the row's).
+        assert!(top > 0.0 && top + UI.cell_h < UI.cell_h * H1, "inside the row, low: {top}");
+        assert_eq!(nums[1], (UI.cell_h * H1, 1.0), "a body row's number at its top");
+    }
+
+    #[test]
+    fn a_click_on_a_heading_row_maps_through_its_scaled_columns() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-click", "# Title here\nbody text");
+        paint_plain(&mut h, &mut v);
+        let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
+        let down = |h: &mut Harness, v: &mut EditorView, pos| {
+            h.mouse(v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+            h.mouse(v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
+            v.buffer().cursor
+        };
+        assert_eq!(down(&mut h, &mut v, (text_x + 4.0 * cw + 1.0, 20.0)), (0, 4));
+        // Below the heading the columns are base size again.
+        let body_y = UI.cell_h * H1 + 2.0;
+        assert_eq!(down(&mut h, &mut v, (text_x + 4.0 * UI.cell_w + 1.0, body_y)), (1, 4));
+        // A double-click picks the word under the pointer at the heading's size.
+        let pos = (text_x + 9.5 * cw, 5.0);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 2, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("here"));
+    }
+
+    #[test]
+    fn caret_selection_and_diagnostics_on_a_heading_measure_its_cells() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-caret", "# ok bad\nbody");
+        v.attach(Client::in_process(Flags, None), "markdown");
+        settle(&mut v);
+        v.buf.anchor = Some((0, 2));
+        v.buf.cursor = (0, 5);
+        paint_plain(&mut h, &mut v);
+        let (text_x, cw, row_h) = (4.0 * UI.cell_w, UI.cell_w * H1, UI.cell_h * H1);
+        let sel = (text_x + 2.0 * cw, 0.0, 3.0 * cw, row_h);
+        assert!(rects(&h, &h.frame.bg).iter().any(|r| near(*r, sel)), "selection {sel:?}");
+        let top = rects(&h, &h.frame.top);
+        let caret = (text_x + 5.0 * cw, 0.0, 2.0, row_h);
+        assert!(top.iter().any(|r| near(*r, caret)), "caret {caret:?} in {top:?}");
+        let thick = 1.5;
+        let under = (text_x + 5.0 * cw, row_h - thick, 3.0 * cw, thick);
+        assert!(top.iter().any(|r| near(*r, under)), "underline {under:?} in {top:?}");
+    }
+
+    #[test]
+    fn following_the_cursor_fits_tall_rows() {
+        let mut h = Harness::new();
+        let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
+        let mut v = markdown_view("editor-md-follow", &text);
+        paint_plain(&mut h, &mut v);
+        v.buf.cursor = (10, 0);
+        paint_plain(&mut h, &mut v);
+        // Six H1 rows (172.8px) fit the 200px body, seven don't.
+        assert_eq!(v.buffer().scroll, 5);
+        let row_h = UI.cell_h * H1;
+        let caret = rects(&h, &h.frame.top).into_iter().find(|r| r.2 == 2.0).expect("a caret");
+        assert!(caret.1 + caret.3 <= RECT.h, "the caret shows whole: {caret:?}");
+        assert!((caret.1 - 5.0 * row_h).abs() < 0.01, "on the last whole row: {caret:?}");
+    }
+
+    #[test]
+    fn a_long_heading_wraps_at_its_scaled_column_count() {
+        let mut h = Harness::new();
+        // 62 chars: 2 rows at 46 base columns, 3 at H1's 25.
+        let line = format!("# {}", "word ".repeat(12));
+        let mut v = markdown_view("editor-md-wrap", &format!("{line}\nx"));
+        v.soft_wrap = Some(true);
+        paint_plain(&mut h, &mut v);
+        let row_h = UI.cell_h * H1;
+        assert_eq!(text_rows(&h), vec![(0.0, H1), (row_h, H1), (2.0 * row_h, H1), (3.0 * row_h, 1.0)]);
+        // A click on the second row lands in it: past the first row's 25 columns.
+        let pos = (4.0 * UI.cell_w + 1.0, row_h + 2.0);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+        let (ln, col) = v.buffer().cursor;
+        assert_eq!(ln, 0);
+        assert!((20..=25).contains(&col), "the second row starts its own columns: {col}");
+    }
+
+    #[test]
+    fn code_boxes_sit_on_their_rows_below_a_heading() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-boxes", "# Head\ntext `x`\n```\ncode\n```");
+        paint_plain(&mut h, &mut v);
+        let (ch, line) = (UI.cell_h, theme::hairline(UI));
+        let prose = ch * H1;
+        let fence = prose + ch;
+        let boxes = code_boxes(&h);
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        // The inline box on the prose row, the block over the three fence rows.
+        let inline = boxes.iter().find(|b| b.3 < ch).expect("inline box");
+        assert_eq!((inline.1, inline.3), ((prose + line).round(), ch - 2.0 * line));
+        let block = boxes.iter().find(|b| b.3 > ch).expect("block box");
+        assert_eq!((block.1, block.3), ((fence + line).round(), (fence + 3.0 * ch - line).round() - (fence + line).round()));
+    }
+
+    #[test]
+    fn toml_tables_draw_by_their_level() {
+        let mut h = Harness::new();
+        let mut v = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]");
+        paint_plain(&mut h, &mut v);
+        let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
+        assert_eq!(scales, vec![H1, 1.0, H2, H2, 1.25]);
+    }
+
+    #[test]
+    fn hashes_in_a_fence_quote_or_list_are_not_headings() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-nested", "```\n# code\n```\n> # quoted\n- # item\n# real");
+        paint_plain(&mut h, &mut v);
+        let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
+        assert_eq!(scales, vec![1.0, 1.0, 1.0, 1.0, 1.0, H1]);
     }
 }

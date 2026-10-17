@@ -37,6 +37,19 @@ pub fn style(token: Token) -> RunStyle {
     }
 }
 
+/// How much larger than body text a heading of `level` (from
+/// `Highlighter::heading_level`) draws; 1 for no heading. H5 and H6 stay at
+/// body size, set apart by their bold alone.
+pub fn heading_scale(level: Option<u8>) -> f32 {
+    match level {
+        Some(1) => 1.8,
+        Some(2) => 1.5,
+        Some(3) => 1.25,
+        Some(4) => 1.1,
+        _ => 1.0,
+    }
+}
+
 /// Coloured spans for the chars `start..start + len` of `line`, whose
 /// highlight is `spans`; runs of one colour are coalesced. An empty range
 /// yields one empty span, so a blank row still has something to shape.
@@ -223,6 +236,13 @@ mod tests {
         let (text, styles) = styled_row_spans(line, &spans, 8, 4, FG, false);
         assert_eq!(text[0].0, "bold");
         assert_eq!(styles[0], RunStyle::BOLD);
+    }
+
+    #[test]
+    fn headings_shrink_with_depth_to_body_size() {
+        let scales: Vec<f32> = (1..=6).map(|l| heading_scale(Some(l))).collect();
+        assert_eq!(scales, [1.8, 1.5, 1.25, 1.1, 1.0, 1.0]);
+        assert_eq!(heading_scale(None), 1.0);
     }
 
     #[test]

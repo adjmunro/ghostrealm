@@ -329,7 +329,21 @@ an edge where the block runs past the viewport). While the pointer is over a
 block, a copy button floats over the text at its top right; it copies the body
 without the fences, the opening fence's quote markers, or its container's
 indent, and shows a check mark for a moment after; Markdown carries a fence's language in its state and highlights the
-body with that language's line-local highlighter. A view that edits text keeps a `StateCache` (only
+body with that language's line-local highlighter. `Highlighter::heading_level`
+gives a line's outline level when it heads a section (Markdown: an ATX
+heading's `#` count, where the highlighter marks a heading; TOML: `[a]` 1,
+`[a.b]` and `[[a]]` 2, deeper 3); `syntax::heading_scale` maps it to the
+size the editor draws the row at (H1 1.8, H2 1.5, H3 1.25, H4 1.1, else 1).
+The editor keeps the monospace grid: each paint lays out a `RowTable` of
+`VisualRow { kind: Text { ln, start, len } | Widget { after_ln, id }, y, h,
+scale }` from the scroll line, and every mapping between screen y and text
+(clicks, selection, caret, diagnostics, popup anchor, code boxes, line
+numbers) reads it. A row's columns are `cell_w * scale` wide (so a soft-wrapped
+heading wraps at fewer columns) and it is `cell_h * scale` tall; line numbers
+stay base size on the row's baseline. Scrolling stays a top line;
+`EditorBuffer::follow_cursor` fits lines by their heights. `Widget` rows
+(nothing places one yet) are where a view's own rows between lines go.
+A view that edits text keeps a `StateCache` (only
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a
 `SpanCache` so lines still on screen aren't re-highlighted each frame. A view that
