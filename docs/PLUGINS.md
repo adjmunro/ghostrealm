@@ -313,9 +313,10 @@ them to colours (`syntax::color`) and slices them to a visual row, ready for
 `Highlighter::block_row` places a row in a block drawn as a unit (a fenced code
 block's opening fence, body, or closing fence): the editor draws each block,
 fences included, as one rounded, outlined box the text area's width (open at
-an edge where the block runs past the viewport), with a copy button at its top
-right that copies the body without the fences, its container's `>` prefix, or
-its common indent; Markdown carries a fence's language in its state and highlights the
+an edge where the block runs past the viewport). While the pointer is over a
+block, a copy button floats over the text at its top right; it copies the body
+without the fences, the opening fence's quote markers, or its container's
+indent, and shows a check mark for a moment after; Markdown carries a fence's language in its state and highlights the
 body with that language's line-local highlighter. A view that edits text keeps a `StateCache` (only
 for a highlighter whose `carries_state` is true; report edits with `dirty_from`)
 so a scrolled row knows its start state without re-highlighting the file, and a

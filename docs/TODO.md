@@ -453,10 +453,12 @@
   - A Markdown feature checks whether a link/image target exists (a local file
     on disk; a reachable URL needs a network decision) and flags broken ones
     with inline error markers.
-  - Code blocks: for shell-flavoured blocks, a run button in the left gutter
-    for each runnable command; an LSP for the fence's language; highlighting
-    a fence in a stateful language (Markdown in Markdown) needs the inner
-    state carried too; see "DISCUSSION: syntax highlighting direction".
+  - Code blocks: horizontal scroll inside a block (without soft wrap, a long
+    line runs out of its box); for shell-flavoured blocks, a run button in
+    the left gutter for each runnable command; an LSP for the fence's
+    language; highlighting a fence in a stateful language (Markdown in
+    Markdown) needs the inner state carried too; see "DISCUSSION: syntax
+    highlighting direction".
   - Links: look and feel (colours) of internal and external links, to discuss.
   - Nesting: the highlighter gives each char one token, so emphasis inside
     strong (or a link or heading) loses the outer style; needs a token set per
