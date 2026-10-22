@@ -1080,35 +1080,6 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Web — pop-ups: floating window for humans, hidden for agents
-
-- Requires: NO BLOCKERS
-- Detail: Decided (DECISION.md, UX principle / agent-operated surfaces).
-  Pop-ups currently load in place and lose `window.opener`, which breaks OAuth
-  and payment flows (`on_before_popup`, `crates/web-host/src/browser.rs`;
-  [stack-review-findings-2.md](stack-review-findings-2.md) item 31).
-  - Human-triggered: open as a floating pop-up window on top of the whole app,
-    with the original tab kept alive. Fallback if that is not feasible: a new
-    tab.
-  - Agent-triggered: open in the background, hidden; never steal focus.
-- Detail: General principle: agent-operated browser or emulator activity runs in
-  the background and does not refocus or distract the human.
-- Owner, verbatim:
-  > Your recommendation about pop-ups makes sense. Could we keep that as like a
-  > pop-up window and still keep the original tab alive? If not, a new tab is
-  > fine, but I like the idea of a pop-up being a pop-up window that kind of
-  > sits on top of our entire application. Oh, but only if it's human
-  > controlled. If it's agent controlled and the agent is the one filling out
-  > the auth or whatever, prefer to hide it away. Like, it's really distracting
-  > when the agent keeps on refocusing on a browser to do things or an emulator
-  > to do things while I'm trying to do things as a human. So if you can do
-  > things in the background, then that's definitely a preference for agent
-  > operated stuff.
-- Reason: OAuth and payment pop-ups need `window.opener`; the human must not be
-  interrupted by agent work.
-
----
-
 [2026-10-13T20:45+1300@6bc650f] GitHub permalinks
 
 - Requires: NO BLOCKERS (future idea; not now)
@@ -1282,3 +1253,19 @@
   and navigations on it stall. How dialogs are answered (shown to a human,
   auto-dismissed and reported to an agent) waits on that decision.
 - Reason: a page must not be able to freeze its pane or the agent driving it.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — check floating pop-ups on a display
+
+- Requires: a human on a desktop session
+- Detail: A pop-up a person opens floats over its opener's page (DECISION.md,
+  Web surface / pop-ups). Tests cover its routing, focus, and closing
+  headlessly; check how it looks (border, shadow, header, close button
+  hover) and that clicks, typing, and scrolling in it reach it.
+- Detail: It floats over the opener's page only. Floating over the whole
+  window, as the owner first asked, needs the window to route the pointer
+  (presses, hover, wheel) to a view outside its pane while over the
+  pop-up, and keep chrome buttons, dividers, and tab strips under it from
+  taking them.
+- Reason: no display in the agent sandbox.

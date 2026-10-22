@@ -1,6 +1,12 @@
 //! The web plugin: one web page per view (the pane system provides tabs), with
 //! a back / forward / reload toolbar and an editable URL bar.
 //!
+//! A pop-up is a page of its own, so it keeps `window.opener`. One a person
+//! opened (a press or key reached the page) floats over its opener's page
+//! with a close button, the opener still live beside it. One an agent opened
+//! (an eval) stays hidden: the app keeps it as a hidden surface the agent
+//! drives ([`WebView::take_spawned`]). Either goes when it closes itself.
+//!
 //! Pages render in the out-of-process CEF host (`ghostrealm-web-host`, see
 //! [`ghostrealm_web`]): one host serves every web view and is spawned on first
 //! use. The view shows the host's latest frame with [`PaintCx::image`] and
@@ -24,13 +30,14 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 use ghostrealm_web::protocol::mods;
 use ghostrealm_web::{
-    Cursor, EditAction, MouseAction, MouseButton as PageButton, Request as HostRequest, SharedFrame, ViewState,
-    WebHost,
+    Cursor, EditAction, MouseAction, MouseButton as PageButton, PopupInfo, Request as HostRequest, SharedFrame,
+    ViewState, WebHost,
 };
 use glyphon::Family;
 use winit::window::CursorIcon;
 
 use crate::app_state::AppState;
+use crate::plugin::icons::Icon;
 use crate::plugin::text_edit::{Edit, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, ImageSource, MouseButton, MouseEvent, OpenCx, PaintCx,
@@ -46,6 +53,13 @@ pub const ID: &str = "web";
 const BTN_BACK: u32 = 0;
 const BTN_FORWARD: u32 = 1;
 const BTN_RELOAD: u32 = 2;
+/// A pop-up's close button.
+const BTN_CLOSE: u32 = 3;
+/// Id base of the floating pop-up's buttons and image.
+const POPUP_BASE: u32 = 1000;
+/// Space kept between a floating pop-up and its opener's page edges, in
+/// logical pixels.
+const POPUP_MARGIN: f32 = 24.0;
 
 /// Size a page is created at before it is painted (and stays at without a window).
 const DEFAULT_SIZE: (u32, u32) = (1024, 768);
@@ -147,8 +161,8 @@ impl HostSlot {
 
     fn find_host(&self) -> Option<std::path::PathBuf> {
         #[cfg(test)]
-        if let Some(exe) = &self.exe {
-            return Some(exe.clone());
+        if let Some(exe) = self.exe.clone().or_else(|| tests::TEST_HOST.with_borrow(Clone::clone)) {
+            return Some(exe);
         }
         let explicit = self
             .cfg
@@ -442,6 +456,28 @@ pub struct WebView {
     /// click count.
     pressed: Option<(PageButton, u32)>,
     hovering: bool,
+    /// This is a pop-up's page, made by the host: it is never created again
+    /// (it goes with the host), and its header has a close button instead of
+    /// navigation.
+    popup: bool,
+    /// The size a pop-up asked for (physical pixels), for floating it.
+    popup_size: (u32, u32),
+    /// Its close button was pressed.
+    dismissed: bool,
+    /// Pop-ups a person opened, floating over the page; the last shows.
+    floating: Vec<WebView>,
+    /// Where the shown floating pop-up was painted.
+    float_rect: Rect,
+    /// The floating pop-up has the keyboard (else the page has it).
+    float_keys: bool,
+    /// The press held is the floating pop-up's.
+    float_press: bool,
+    /// The pointer is over the floating pop-up.
+    float_hover: bool,
+    /// Whether the view has the keyboard, as last told.
+    focused: bool,
+    /// Pop-ups an agent opened, until the app takes them as hidden surfaces.
+    spawned: Vec<WebView>,
 }
 
 impl WebView {
@@ -469,7 +505,84 @@ impl WebView {
             body: zero,
             pressed: None,
             hovering: false,
+            popup: false,
+            popup_size: DEFAULT_SIZE,
+            dismissed: false,
+            floating: Vec::new(),
+            float_rect: zero,
+            float_keys: false,
+            float_press: false,
+            float_hover: false,
+            focused: false,
+            spawned: Vec::new(),
         }
+    }
+
+    /// A view of pop-up `p`, which the host made (and keeps hidden) in the
+    /// running host.
+    fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo) -> Self {
+        let generation = slot.borrow().generation;
+        let mut v = WebView::new(slot, p.id);
+        v.created_in = generation;
+        v.sent_visible = false;
+        v.last_url.clone_from(&p.url);
+        v.popup = true;
+        v.popup_size = (p.width, p.height);
+        v
+    }
+
+    /// The page is gone: a pop-up closed (by itself, its close button, or
+    /// its host exiting). A page the app creates is never gone: it is made
+    /// again.
+    pub fn is_closed(&self) -> bool {
+        if !self.popup {
+            return false;
+        }
+        if self.dismissed {
+            return true;
+        }
+        let slot = self.slot.borrow();
+        slot.generation != self.created_in || slot.host.as_ref().is_none_or(|h| h.is_closed(self.page))
+    }
+
+    /// Take the pop-ups the page opened from the host: a person's float over
+    /// it (and take the keyboard), an agent's wait in `spawned`. Drop
+    /// floating ones that closed. Returns whether the floating ones changed.
+    fn pull_popups(&mut self) -> bool {
+        let popups = match self.slot.borrow().host.as_ref() {
+            Some(h) if self.created_in != 0 => h.take_popups(self.page),
+            _ => Vec::new(),
+        };
+        let mut changed = false;
+        for p in &popups {
+            let v = WebView::for_popup(self.slot.clone(), p);
+            if p.from_input {
+                self.floating.push(v);
+                self.float_keys = true;
+                changed = true;
+            } else {
+                self.spawned.push(v);
+            }
+        }
+        for f in &mut self.floating {
+            changed |= f.pull_popups();
+            self.spawned.append(&mut f.spawned);
+        }
+        if self.drop_closed_floating() {
+            return true;
+        }
+        if changed {
+            let focused = self.focused;
+            self.sync_focus(focused);
+        }
+        changed
+    }
+
+    /// The pop-ups an agent opened from this page (or a pop-up floating over
+    /// it) since last asked, for the app to keep as hidden surfaces.
+    pub fn take_spawned(&mut self) -> Vec<WebView> {
+        self.pull_popups();
+        std::mem::take(&mut self.spawned)
     }
 
     /// Make sure the page exists in a running host (creating it at `size`, or
@@ -488,6 +601,10 @@ impl WebView {
         let Some(host) = slot.host.as_mut() else {
             return false;
         };
+        if self.created_in != generation && self.popup {
+            // It went with the host that made it.
+            return false;
+        }
         if self.created_in != generation {
             let url = match self.start.take() {
                 Some(input) => normalize_url(&input, &search),
@@ -606,6 +723,9 @@ impl WebView {
     /// Start editing the URL bar with the address selected; while already
     /// editing, select what has been typed.
     pub fn edit_url(&mut self) {
+        if self.popup {
+            return;
+        }
         let e = self
             .url_edit
             .get_or_insert_with(|| LineEdit::new(self.state.url.clone()).with_plain_brackets());
@@ -654,7 +774,13 @@ impl WebView {
     /// Tell the host whether the page has keyboard focus (not while the URL bar
     /// is being edited).
     fn sync_focus(&mut self, view_focused: bool) {
-        let want = view_focused && self.url_edit.is_none();
+        self.focused = view_focused;
+        let to_float = self.float_keys && !self.floating.is_empty();
+        let top = self.floating.len().saturating_sub(1);
+        for (i, f) in self.floating.iter_mut().enumerate() {
+            f.sync_focus(view_focused && to_float && i == top);
+        }
+        let want = view_focused && self.url_edit.is_none() && !to_float;
         if want != self.sent_focus
             && self.send(Some(HostRequest::Focus {
                 id: self.page,
@@ -726,6 +852,134 @@ impl WebView {
             id: self.page,
             action,
         }))
+    }
+}
+
+impl WebView {
+    /// Float the newest pop-up a person opened over the page, centred in
+    /// `body`; the ones under it stop rendering.
+    fn paint_floating(&mut self, cx: &mut PaintCx, body: Rect) {
+        let n = self.floating.len();
+        for f in self.floating.iter_mut().take(n.saturating_sub(1)) {
+            f.shown(false);
+        }
+        let Some(top) = self.floating.last_mut() else {
+            self.float_rect = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+            return;
+        };
+        let header_h = cx.ui.cell_h + 10.0 * cx.ui.scale;
+        let r = float_rect(body, top.popup_size, header_h, POPUP_MARGIN * cx.ui.scale);
+        self.float_rect = r;
+        let keys = cx.focused && self.float_keys;
+        cx.above(|cx| {
+            let edge = theme::hairline(cx.ui);
+            let shadow = 6.0 * cx.ui.scale;
+            cx.fill_alpha(
+                Rect { x: r.x - shadow, y: r.y - shadow * 0.5, w: r.w + shadow * 2.0, h: r.h + shadow * 2.0 },
+                [0, 0, 0],
+                0.3,
+            );
+            cx.fill(Rect { x: r.x - edge, y: r.y - edge, w: r.w + edge * 2.0, h: r.h + edge * 2.0 }, theme::INPUT_BORDER);
+            let focused = std::mem::replace(&mut cx.focused, keys);
+            cx.with_id_base(POPUP_BASE, |cx| top.paint(cx, r));
+            cx.focused = focused;
+        });
+    }
+
+    /// Route `event` to the floating pop-up when it is over it or holds the
+    /// press. A press on it gives it the keyboard; a press on the page takes
+    /// the keyboard back. Returns whether the pop-up took the event.
+    fn float_mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) -> bool {
+        if self.floating.is_empty() {
+            return false;
+        }
+        let flags = keys::modifier_flags(cx.mods);
+        let to_float = match *event {
+            MouseEvent::Down { pos, .. } => {
+                let on = self.float_at(pos);
+                self.float_press = on;
+                self.keys_to_float(on);
+                if on && std::mem::take(&mut self.hovering) {
+                    self.mouse_to_page(pos, 0, flags, MouseAction::Leave);
+                }
+                on
+            }
+            MouseEvent::Drag { .. } => self.float_press,
+            MouseEvent::Up { .. } => std::mem::take(&mut self.float_press),
+            MouseEvent::Move { pos } => {
+                let on = self.float_at(pos);
+                if on && std::mem::take(&mut self.hovering) {
+                    self.mouse_to_page(pos, 0, flags, MouseAction::Leave);
+                }
+                if !on && std::mem::take(&mut self.float_hover) {
+                    if let Some(f) = self.floating.last_mut() {
+                        f.mouse(cx, &MouseEvent::Leave { pos });
+                    }
+                }
+                self.float_hover = on;
+                on
+            }
+            MouseEvent::Leave { .. } => {
+                let held = std::mem::take(&mut self.float_hover);
+                if held {
+                    if let Some(f) = self.floating.last_mut() {
+                        f.mouse(cx, event);
+                    }
+                }
+                // The page hears it too.
+                false
+            }
+        };
+        if to_float {
+            if let Some(f) = self.floating.last_mut() {
+                f.mouse(cx, event);
+            }
+            cx.redraw();
+        }
+        to_float
+    }
+
+    /// The floating pop-up shown, if `pos` is over it.
+    fn float_at(&self, pos: (f32, f32)) -> bool {
+        !self.floating.is_empty() && rect_contains(self.float_rect, pos.0, pos.1)
+    }
+
+    /// Give the keyboard to the floating pop-up (`true`) or the page.
+    fn keys_to_float(&mut self, to_float: bool) {
+        if self.float_keys != to_float {
+            self.float_keys = to_float;
+            let focused = self.focused;
+            self.sync_focus(focused);
+        }
+    }
+
+    /// Drop floating pop-ups that were dismissed or closed; the page gets
+    /// the keyboard back.
+    fn drop_closed_floating(&mut self) -> bool {
+        let before = self.floating.len();
+        self.floating.retain(|f| !f.is_closed());
+        if self.floating.len() == before {
+            return false;
+        }
+        self.float_keys = false;
+        self.float_press = false;
+        self.float_hover = false;
+        let focused = self.focused;
+        self.sync_focus(focused);
+        true
+    }
+}
+
+/// Where a pop-up of page size `want` (physical pixels) with a header
+/// `header_h` tall floats: centred in `body`, at most `margin` from its edges.
+fn float_rect(body: Rect, want: (u32, u32), header_h: f32, margin: f32) -> Rect {
+    let w = (want.0 as f32).min(body.w - margin * 2.0).max(1.0).round();
+    let h = (want.1 as f32 + header_h).min(body.h - margin * 2.0).max(1.0).round();
+    Rect {
+        x: (body.x + (body.w - w) * 0.5).round(),
+        y: (body.y + (body.h - h) * 0.5).round(),
+        w,
+        h,
     }
 }
 
@@ -842,45 +1096,71 @@ impl View for WebView {
         // Reload also retries a host that couldn't start.
         let reloadable = alive || self.slot.borrow().error.is_some();
         self.refresh_state();
+        self.pull_popups();
         self.sync_focus(cx.focused);
 
-        // Back / forward / reload.
         let hy = rect.y + (header_h - ch) * 0.5;
         let btn_w = cx.ui.cell_w * 3.0;
         let mut x = rect.x + pad * 0.5;
-        for (glyph, enabled, id, tip) in [
-            ("\u{2190}", self.state.can_back, BTN_BACK, "Back"),
-            ("\u{2192}", self.state.can_forward, BTN_FORWARD, "Forward"),
-            ("\u{21bb}", reloadable, BTN_RELOAD, "Reload"),
-        ] {
+        let mut right = rect.x + rect.w - pad;
+        if self.popup {
+            // A pop-up closes; it doesn't navigate.
             let hit = Rect {
-                x,
+                x: rect.x + rect.w - btn_w,
                 y: rect.y,
                 w: btn_w,
                 h: header_h,
             };
-            let hov = enabled && cx.button(hit, id);
+            let hov = cx.button(hit, BTN_CLOSE);
             if hov {
                 cx.highlight(hit);
             }
-            cx.tooltip(hit, tip);
-            let color = match (enabled, hov) {
-                (false, _) => theme::DIM,
-                (true, true) => theme::GLYPH_HOVER,
-                (true, false) => theme::GLYPH,
+            cx.tooltip(hit, "Close");
+            let icon = Rect {
+                x: hit.x + (btn_w - ch) * 0.5,
+                y: hy,
+                w: ch,
+                h: ch,
             };
-            let shaped = cx.shape(glyph, Family::Monospace, btn_w);
-            cx.place(shaped, x + (btn_w - shaped.width) * 0.5, hy, hit, color);
-            x += btn_w;
+            Icon::Close.paint(cx, icon, if hov { theme::GLYPH_HOVER } else { theme::GLYPH });
+            right = hit.x;
+        } else {
+            // Back / forward / reload.
+            for (glyph, enabled, id, tip) in [
+                ("\u{2190}", self.state.can_back, BTN_BACK, "Back"),
+                ("\u{2192}", self.state.can_forward, BTN_FORWARD, "Forward"),
+                ("\u{21bb}", reloadable, BTN_RELOAD, "Reload"),
+            ] {
+                let hit = Rect {
+                    x,
+                    y: rect.y,
+                    w: btn_w,
+                    h: header_h,
+                };
+                let hov = enabled && cx.button(hit, id);
+                if hov {
+                    cx.highlight(hit);
+                }
+                cx.tooltip(hit, tip);
+                let color = match (enabled, hov) {
+                    (false, _) => theme::DIM,
+                    (true, true) => theme::GLYPH_HOVER,
+                    (true, false) => theme::GLYPH,
+                };
+                let shaped = cx.shape(glyph, Family::Monospace, btn_w);
+                cx.place(shaped, x + (btn_w - shaped.width) * 0.5, hy, hit, color);
+                x += btn_w;
+            }
+            x += pad * 0.5;
         }
 
-        // URL bar: the address, or the text being edited.
+        // URL bar: the address, or the text being edited (a pop-up's only
+        // shows where it is).
         let inset = 4.0 * scale;
-        let box_x = x + pad * 0.5;
         let url_box = Rect {
-            x: box_x,
+            x,
             y: rect.y + inset,
-            w: (rect.x + rect.w - pad - box_x).max(1.0),
+            w: (right - x).max(1.0),
             h: header_h - inset * 2.0,
         };
         self.url_box = url_box;
@@ -888,6 +1168,11 @@ impl View for WebView {
             Some(e) => {
                 let geom = widgets::text_field(cx, url_box, e, "", cx.focused);
                 self.url_field.painted(cx, geom);
+            }
+            None if self.popup => {
+                let shown = LineEdit::new(self.state.url.clone());
+                widgets::text_field(cx, url_box, &shown, "", false);
+                self.url_field.clear();
             }
             None => {
                 let shown = LineEdit::new(self.state.url.clone());
@@ -940,9 +1225,15 @@ impl View for WebView {
                 cx.cursor(body, cursor_icon(self.state.cursor));
             }
         }
+        self.paint_floating(cx, body);
     }
 
     fn raw_key(&mut self, cx: &mut EventCx, key: &RawKey) -> bool {
+        if self.float_keys {
+            if let Some(f) = self.floating.last_mut() {
+                return cx.with_id_base(POPUP_BASE, |cx| f.raw_key(cx, key));
+            }
+        }
         let pressed = key.event.state == winit::event::ElementState::Pressed;
         if self.url_edit.is_some() {
             return match (&key.press, pressed) {
@@ -975,10 +1266,18 @@ impl View for WebView {
     }
 
     fn key(&mut self, cx: &mut EventCx, press: &KeyPress) -> bool {
+        if self.float_keys {
+            if let Some(f) = self.floating.last_mut() {
+                return cx.with_id_base(POPUP_BASE, |cx| f.key(cx, press));
+            }
+        }
         self.url_key(cx, press)
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        if self.float_mouse(cx, event) {
+            return;
+        }
         if let Some(edit) = self.url_edit.as_mut() {
             if self.url_field.event(edit, event, cx.mods.shift) {
                 cx.redraw();
@@ -989,7 +1288,7 @@ impl View for WebView {
         match *event {
             MouseEvent::Down { pos, clicks, button } => {
                 if rect_contains(self.url_box, pos.0, pos.1) {
-                    if button != MouseButton::Left {
+                    if button != MouseButton::Left || self.popup {
                         return;
                     }
                     if self.url_edit.is_none() {
@@ -1039,6 +1338,12 @@ impl View for WebView {
     }
 
     fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), dx: f32, dy: f32) {
+        if self.float_at(pos) {
+            if let Some(f) = self.floating.last_mut() {
+                f.scroll(cx, pos, dx, dy);
+            }
+            return;
+        }
         if !rect_contains(self.body, pos.0, pos.1) {
             return;
         }
@@ -1050,10 +1355,22 @@ impl View for WebView {
     }
 
     fn button(&mut self, cx: &mut EventCx, id: u32) {
+        if id >= POPUP_BASE {
+            if let Some(f) = self.floating.last_mut() {
+                cx.with_id_base(POPUP_BASE, |cx| f.button(cx, id - POPUP_BASE));
+            }
+            self.drop_closed_floating();
+            cx.redraw();
+            return;
+        }
         let _ = match id {
             BTN_BACK => self.back(),
             BTN_FORWARD => self.forward(),
             BTN_RELOAD => self.reload(),
+            BTN_CLOSE => {
+                self.dismissed = true;
+                Ok(())
+            }
             _ => Ok(()),
         };
         cx.redraw();
@@ -1062,6 +1379,9 @@ impl View for WebView {
     fn focus_changed(&mut self, _cx: &mut EventCx, focused: bool) {
         if !focused {
             self.url_edit = None;
+            for f in &mut self.floating {
+                f.url_edit = None;
+            }
         }
         self.sync_focus(focused);
     }
@@ -1069,10 +1389,16 @@ impl View for WebView {
     fn shown(&mut self, visible: bool) {
         self.on_screen = visible;
         self.sync_visible();
+        if !visible {
+            for f in &mut self.floating {
+                f.shown(false);
+            }
+        }
     }
 
     fn refresh(&mut self) -> bool {
-        self.refresh_state()
+        let floating = self.floating.iter_mut().fold(false, |c, f| f.refresh_state() | c);
+        self.refresh_state() | self.pull_popups() | floating
     }
 
     /// While the host is backing off after an exit: when to try again.
@@ -1125,10 +1451,17 @@ impl View for WebView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::plugin::testing::{cmd, press, Harness};
-    use ghostrealm_web::protocol::PROTOCOL_VERSION;
+    use ghostrealm_core::Value;
+    use ghostrealm_web::protocol::{POPUP_IDS, PROTOCOL_VERSION};
+
+    thread_local! {
+        /// The host a test's web views run (on its own thread) when no view
+        /// names one: for views an `AppState` opens.
+        pub(in crate::plugins::web) static TEST_HOST: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    }
 
     /// A view whose host can't be found (tests don't bundle one).
     fn hostless() -> WebView {
@@ -1356,6 +1689,275 @@ mod tests {
             Some("the web host exited while starting")
         );
         assert!(h.frame.images.is_empty());
+    }
+
+
+    /// The host's `popup` event for page `id`, opened by page `opener`.
+    fn popup_event(id: u64, opener: u64, from_input: bool) -> String {
+        format!(
+            r#"{{"ev":"popup","id":{id},"opener":{opener},"url":"https://pop.test/","from_input":{from_input},"width":200,"height":100}}"#
+        )
+    }
+
+    /// The host requests in `log`.
+    fn host_requests(log: &str) -> Vec<HostRequest> {
+        log.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    fn focus(id: u64, focused: bool) -> HostRequest {
+        HostRequest::Focus { id, focused }
+    }
+
+    #[test]
+    fn a_popup_a_person_opened_floats_over_the_page_with_the_keyboard() {
+        let script = format!(
+            "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\ncat > \"$0.requests\"",
+            popup_event(POPUP_IDS, 1, true)
+        );
+        let (mut v, runs) = stub_host("web-float", &script);
+        let log = runs.with_file_name("host.sh.requests");
+        let mut h = Harness::new();
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.floating.is_empty() {
+            assert!(Instant::now() < until, "the pop-up never floated");
+            h.paint(&mut v, RECT);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        h.paint(&mut v, RECT);
+        let r = v.float_rect;
+        assert_eq!(r.w, 200.0, "as wide as it asked");
+        assert!(r.h > 100.0, "its page and a header");
+        let mid = |a: f32, b: f32| (a - b).abs() <= 1.0;
+        assert!(mid(r.x + r.w * 0.5, v.body.x + v.body.w * 0.5) && mid(r.y + r.h * 0.5, v.body.y + v.body.h * 0.5));
+        let close = POPUP_BASE + BTN_CLOSE;
+        assert!(h.frame.view_buttons.iter().any(|(_, _, id)| *id == close), "a close button");
+        requests(&log, |s| {
+            let got = host_requests(s);
+            got.contains(&focus(POPUP_IDS, true)) && got.contains(&focus(1, false))
+        });
+
+        // A press on the page takes the keyboard; one on the pop-up gives it back.
+        let page = (v.body.x + 2.0, v.body.y + 2.0);
+        let popup = (r.x + r.w * 0.5, r.y + r.h - 4.0);
+        let left = MouseButton::Left;
+        for pos in [page, popup] {
+            h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: left });
+            h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: left });
+        }
+        let got = requests(&log, |s| host_requests(s).iter().filter(|r| **r == focus(POPUP_IDS, true)).count() == 2);
+        let got = host_requests(&got);
+        let pressed = |id| got.iter().any(|r| matches!(r, HostRequest::Mouse { id: i, action: MouseAction::Down { .. }, .. } if *i == id));
+        assert!(pressed(1) && pressed(POPUP_IDS), "each press reached its own page: {got:?}");
+        assert!(got.contains(&focus(1, true)));
+
+        // Its close button closes it and gives the page the keyboard back.
+        h.button(&mut v, close);
+        assert!(v.floating.is_empty());
+        requests(&log, |s| {
+            let got = host_requests(s);
+            let last_focus = got.iter().rev().find(|r| matches!(r, HostRequest::Focus { id: 1, .. }));
+            got.contains(&HostRequest::Close { id: POPUP_IDS }) && last_focus == Some(&focus(1, true))
+        });
+    }
+
+    #[test]
+    fn a_popup_an_agent_opened_is_a_hidden_surface_it_can_drive() {
+        let dir = crate::plugin::testing::tmpdir("web-hidden-popup");
+        let exe = dir.join("host.sh");
+        let log = dir.join("requests");
+        // The pop-up closes itself when told to navigate.
+        let script = format!(
+            "#!/bin/sh\necho '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\n\
+             while read l; do echo \"$l\" >> '{}'; case \"$l\" in *'\"op\":\"navigate\"'*) \
+             echo '{{\"ev\":\"closed\",\"id\":{POPUP_IDS}}}';; esac; done\n",
+            popup_event(POPUP_IDS, 1, false),
+            log.display()
+        );
+        std::fs::write(&exe, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        let hidden = loop {
+            s.pump_all();
+            let tree = s.describe();
+            if let Some(line) = tree.lines().find(|l| l.starts_with("hidden surface ")) {
+                assert!(line.ends_with(&format!("(pop-up of surface {})", opener.0)), "{line}");
+                break SurfaceId(line.split(' ').nth(2).unwrap().parse().unwrap());
+            }
+            assert!(Instant::now() < until, "no hidden surface: {tree}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(s.focused_surface(), Some(opener), "it took no focus");
+        assert!(!s.describe().contains(&format!("    surface {}", hidden.0)), "it is in no pane");
+        let text = s.surface_text(opener).unwrap();
+        assert!(text.contains(&format!("pop-up: surface {} (hidden)\n", hidden.0)), "{text}");
+
+        // `web.*` commands reach it.
+        let args = Args::new().with("url", Value::Str("example.com".into())).with("id", Value::Int(hidden.0 as i64));
+        registry.execute("web.navigate", &args, &mut s).unwrap();
+        requests(&log, |l| host_requests(l).iter().any(|r| matches!(r, HostRequest::Navigate { id: POPUP_IDS, .. })));
+
+        // It closed itself: it goes.
+        let until = Instant::now() + Duration::from_secs(10);
+        while s.describe().contains("hidden surface") {
+            assert!(Instant::now() < until, "the closed pop-up stayed");
+            s.pump_all();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.view(hidden).is_none());
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+
+    /// The bundled host (`mise run web`) beside the test binary's profile
+    /// directory, if built.
+    fn real_host() -> Option<std::path::PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.parent()?.to_path_buf();
+        let name = ghostrealm_web::client::HOST_NAME;
+        let mac = dir.join(format!("{name}.app/Contents/MacOS/{name}"));
+        let linux = dir.join(name).join(name);
+        [mac, linux].into_iter().find(|p| p.is_file())
+    }
+
+    /// A local HTTP server: `/opener` opens `/popup` on a click and logs the
+    /// messages it gets in `data-got`; `/popup` posts to its opener and closes
+    /// itself a second later; `/stay` is a page.
+    fn serve() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let body = match line.split(' ').nth(1).unwrap_or("/") {
+                    "/opener" => "<title>Opener</title><body style='margin:0'><button \
+                        style='position:fixed;inset:0;border:0;background:rgb(255,0,0)' \
+                        onclick=\"window.open('/popup', 'p', 'width=200,height=100')\">open</button>\
+                        <script>addEventListener('message', e => document.body.dataset.got = \
+                        (document.body.dataset.got || '') + e.data + ';')</script>",
+                    "/popup" => "<title>Popup</title><script>window.opener.postMessage('from the popup', '*'); \
+                        setTimeout(() => window.close(), 1000)</script>",
+                    "/stay" => "<title>Stay</title><p>stay text</p>",
+                    _ => "",
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    fn wait(what: &str, mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < until, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// End to end with the real host (skipped when it isn't built): a click's
+    /// pop-up floats and goes when it closes itself; an eval's is a hidden
+    /// surface the agent drives. Both talk to their opener.
+    #[test]
+    fn popups_with_the_real_host() {
+        let Some(exe) = real_host() else {
+            eprintln!("skipping: web host not built (run `mise run web`)");
+            return;
+        };
+        let base = serve();
+        let profile = crate::plugin::testing::tmpdir("web-popups-profile");
+        // No other test here spawns a real host, which reads this at spawn.
+        std::env::set_var("GHOSTREALM_WEB_CACHE", profile.join("person"));
+
+        // A person's click.
+        let plugin = WebPlugin::new();
+        plugin.slot.borrow_mut().exe = Some(exe.clone());
+        let view = plugin.open(&OpenCx::default()).unwrap();
+        let mut v = *(view as Box<dyn Any>).downcast::<WebView>().unwrap();
+        v.start = Some(format!("{base}/opener"));
+        v.start().unwrap();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        wait("the opener paints", || {
+            v.with_host(|h, id| h.frame(id).and_then(|f| f.read()).is_some_and(|px| px[..3] == [0, 0, 255]))
+                .unwrap_or(false)
+        });
+        let at = (v.body.x + 10.0, v.body.y + 10.0);
+        h.mouse(&mut v, MouseEvent::Move { pos: at });
+        h.mouse(&mut v, MouseEvent::Down { pos: at, clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: at, dragged: false, button: MouseButton::Left });
+        wait("the pop-up floats", || {
+            h.paint(&mut v, RECT);
+            !v.floating.is_empty()
+        });
+        assert!(v.float_keys, "it has the keyboard");
+        assert!(v.take_spawned().is_empty(), "it isn't hidden");
+        wait("the pop-up closes itself", || {
+            v.refresh();
+            v.floating.is_empty()
+        });
+        assert!(!v.float_keys);
+        assert_eq!(v.eval("document.body.dataset.got"), Ok("\"from the popup;\"".into()));
+        drop(v);
+        drop(plugin);
+
+        // An agent's eval.
+        std::env::set_var("GHOSTREALM_WEB_CACHE", profile.join("agent"));
+        TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        let mut run = |s: &mut AppState, id: &str, args: Vec<(&str, Value)>| {
+            let a = args.into_iter().fold(Args::new(), |a, (k, v)| a.with(k, v));
+            registry.execute(id, &a, s).map(|o| o.message.unwrap_or_default())
+        };
+        let eval = |id: u64, js: &str| vec![("id", Value::Int(id as i64)), ("js", Value::Str(js.into()))];
+        run(&mut s, "web.new", vec![("url", Value::Str(format!("{base}/opener")))]).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let opened = run(&mut s, "web.eval", eval(opener.0, "window.open('/stay') !== null"));
+        assert_eq!(opened, Ok("true".into()));
+        s.pump_all();
+        let tree = s.describe();
+        let line = tree.lines().find(|l| l.starts_with("hidden surface ")).unwrap_or_else(|| panic!("{tree}"));
+        let hidden: u64 = line.split(' ').nth(2).unwrap().parse().unwrap();
+        assert_eq!(s.focused_surface(), Some(opener), "it took no focus");
+        assert_eq!(run(&mut s, "web.eval", eval(hidden, "document.title")), Ok("\"Stay\"".into()));
+        let text = s.surface_text(SurfaceId(hidden)).unwrap();
+        assert!(text.contains("stay text") && text.starts_with(&format!("pop-up of surface {}", opener.0)), "{text}");
+        let posted = run(&mut s, "web.eval", eval(hidden, "window.opener.postMessage('from the agent', '*'); 1"));
+        assert_eq!(posted, Ok("1".into()));
+        wait("the opener hears it", || {
+            run(&mut s, "web.eval", eval(opener.0, "document.body.dataset.got || ''")) == Ok("\"from the agent;\"".into())
+        });
+        let _ = run(&mut s, "web.eval", eval(hidden, "window.close()"));
+        wait("the hidden pop-up goes", || {
+            s.pump_all();
+            s.view(SurfaceId(hidden)).is_none()
+        });
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn a_floating_popup_fits_the_page_centred() {
+        let body = Rect { x: 10.0, y: 20.0, w: 400.0, h: 300.0 };
+        assert_eq!(float_rect(body, (200, 100), 20.0, 10.0), Rect { x: 110.0, y: 110.0, w: 200.0, h: 120.0 });
+        assert_eq!(float_rect(body, (1000, 1000), 20.0, 10.0), Rect { x: 20.0, y: 30.0, w: 380.0, h: 280.0 });
     }
 
     const RECT: Rect = Rect {

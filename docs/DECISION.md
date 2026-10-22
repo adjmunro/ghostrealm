@@ -208,3 +208,14 @@
 - Detail: `web.eval` runs the agent's script in an isolated JavaScript world (as Chrome extension content scripts do), made per document through the browser's DevTools session (`Page.createIsolatedWorld`, then `Runtime.evaluate` addressed by the world's `uniqueContextId`). The world shares the page's DOM but not its scripts' globals or prototypes, so the page cannot change how the script runs or how its value is encoded.
 - Detail: Consequence: an eval sees the DOM, not page JavaScript globals (a page's `window.app` state is out of reach). Its own globals persist for the document. What it reads from the DOM is still page content. A main-world eval is not offered (TODO.md "Web — opt-in main-world eval").
 - Reason: agents drive the browser over arbitrary pages (docs, GitHub, search results), so a page must not be able to lie to the agent about what it finds. Owner, verbatim: "Okay, it sounds like we need to put this isolated world thing on the to-do as a fairly high priority for the sake of security. High priority in terms of web stuff, although maybe some quality of life stuff will try and come before that. Mainly because agents can control the browsers and therefore there is clearly a prompt injection risk or a malicious use case risk. Having said that, we are most likely going to be running localhost stuff when we're doing stuff in the browser, right? Most of the time? Maybe not. I'm not sure, actually."
+
+---
+
+[2026-10-23T09:43+1300@5a747143]
+
+- Category: Web surface / pop-ups
+- Detail: A pop-up (`window.open`, a link to a new window) is a page of its own in the host, so it keeps `window.opener`. Who opened it decides where it shows: a person's pop-up floats over its opener's page (centred, at the size it asked for, a close button in its header; the opener stays live and takes the keyboard back on a press or when the pop-up goes); an agent's is a hidden surface (in no pane, never painted or focused) that `web.*` commands and `get surface` reach by id and `get tree` lists. A pop-up goes when it closes itself (`window.close()`) or its opener closes.
+- Detail: Rule: a pop-up is a person's when a mouse press or key from the pane reached its opener within the last 5 s (Chromium's user-activation lifespan); otherwise an eval opened it, and it is an agent's. Evals run as a user gesture so an agent can open one. When a person and an agent act on one page within 5 s, the pop-up shows (the visible failure).
+- Detail: The floating pop-up is bounded by its opener's page, not the whole window: a view receives input only inside its own rect, and floating over other panes would need the window to route the pointer to a view outside its pane.
+- Reason: OAuth and payment pop-ups need `window.opener`; agent-operated browser activity runs in the background (UX principle / agent-operated surfaces).
+

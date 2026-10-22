@@ -443,6 +443,12 @@ impl Tree {
         id
     }
 
+    /// An id for a surface kept outside every pane (a hidden pop-up), unique
+    /// among the tree's ids.
+    pub fn detached_surface_id(&mut self) -> SurfaceId {
+        SurfaceId(self.fresh())
+    }
+
     /// Create a new vtab containing one pane with one surface. Returns the ids so
     /// the app can attach a terminal to the new surface. The new vtab becomes
     /// active.

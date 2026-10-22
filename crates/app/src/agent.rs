@@ -5,9 +5,10 @@
 //! - `{"op":"search","query":"split"}`       → matching command ids + scores
 //! - `{"op":"set","id":"...","args":{...}}`  → run a command (a file command
 //!   replies once its copy, move, or git check is done)
-//! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces
+//! - `{"op":"get","what":"tree"}`            → text dump of vtabs/panes/surfaces,
+//!   then hidden surfaces (pop-ups an agent's eval opened)
 //! - `{"op":"get","what":"surface","id":N}`  → a surface's content as text (a web
-//!   page: its address, title, and text once loaded)
+//!   page: its address, title, its hidden pop-ups, and text once loaded)
 //! - `{"op":"input","text":"ls\r","id":N}`   → type into a surface (id optional,
 //!   defaulting to the focused surface)
 //! - `{"op":"pump"}`                         → drain background output

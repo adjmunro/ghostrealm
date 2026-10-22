@@ -57,6 +57,13 @@ should be too. The API lives in
   every other hook defaults to "not interested". Views live in
   `AppState::views` (headless-safe: the agent channel and tests drive them with no
   window).
+- **Hidden surfaces**: a surface in `AppState::views` but in no pane: never
+  painted, shown, or focused, still reached by commands and `get surface`
+  by id, listed last by `get tree`. A web pop-up an agent's eval opened is
+  one (`AppState::adopt_popups` takes them from `WebView::take_spawned`
+  each pump); it goes when its page closes or its opener's surface does.
+  A pop-up a person opened floats over its opener's page instead
+  (`WebView` draws it `above` and routes the input over it to it).
 - **Documents**: a view may host several files, each a `View` of its own
   (file tabs inside one surface). `docs()` lists their `DocId`s (default
   `[DocId::SELF]`: the view is its one document), `active_doc()` is the one

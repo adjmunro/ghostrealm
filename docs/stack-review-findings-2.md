@@ -54,13 +54,6 @@ against `f59386c`.
     ([`plugins/file_browser/preview.rs:73`](../crates/app/src/plugins/file_browser/preview.rs))
     blocks the loader on a dead network mount. Decision needed: a thread or
     timeout per request?
-31. **Popups load in place and lose `window.opener`** (`on_before_popup`,
-    [`browser.rs:626`](../crates/web-host/src/browser.rs)), which breaks OAuth and
-    payment popup flows. Decision needed: open them as a new tab in the pane?
-    **Decided:** a human-triggered popup opens as a floating pop-up window above
-    the app with the original tab kept alive (fallback: a new tab); an
-    agent-triggered popup opens hidden in the background. See DECISION.md
-    (UX principle / agent-operated surfaces); work tracked in TODO.md.
 
 ## Terminal input
 

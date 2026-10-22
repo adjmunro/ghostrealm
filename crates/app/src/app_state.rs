@@ -28,6 +28,7 @@ use crate::plugins::editor;
 use crate::plugins::files::{self as files_plugin, FilesView};
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
+use crate::plugins::web;
 
 mod files;
 mod open;
@@ -221,6 +222,9 @@ pub struct AppState {
     /// a file opens in the latest when none is focused.
     files_seen: HashMap<SurfaceId, u64>,
     focus_stamp: u64,
+    /// Hidden surfaces (pop-ups an agent opened), in `views` but in no pane,
+    /// by the surface that opened each.
+    hidden: HashMap<SurfaceId, SurfaceId>,
 }
 
 impl AppState {
@@ -252,6 +256,7 @@ impl AppState {
             files_session: files_plugin::Session::default(),
             files_seen: HashMap::new(),
             focus_stamp: 0,
+            hidden: HashMap::new(),
         }
     }
 
@@ -1386,6 +1391,7 @@ impl AppState {
         if let Some((picker, _)) = &mut self.picker {
             changed |= picker.refresh();
         }
+        changed |= self.adopt_popups();
         // A terminal whose shell exited closes the way Close would.
         for sid in finished {
             self.close_surface_id(sid);
@@ -1500,12 +1506,64 @@ impl AppState {
         if out.is_empty() {
             out.push_str("(no vtabs)\n");
         }
+        let mut hidden: Vec<(&SurfaceId, &SurfaceId)> = self.hidden.iter().collect();
+        hidden.sort();
+        for (p, opener) in hidden {
+            let title = self.views.get(p).and_then(|v| v.title()).unwrap_or_default();
+            let _ = writeln!(out, "hidden surface {} {:?} (pop-up of surface {})", p.0, title, opener.0);
+        }
         out
     }
 
     /// A text rendering of one surface's content (a terminal is pumped first).
+    /// A web page's header lists its hidden pop-ups.
     pub fn surface_text(&mut self, id: SurfaceId) -> Option<String> {
-        self.views.get_mut(&id)?.text()
+        self.adopt_popups();
+        let mut text = self.views.get_mut(&id)?.text()?;
+        let mut popups: Vec<SurfaceId> = self.hidden.iter().filter(|(_, o)| **o == id).map(|(p, _)| *p).collect();
+        popups.sort();
+        if !popups.is_empty() {
+            let lines: String = popups.iter().map(|p| format!("pop-up: surface {} (hidden)\n", p.0)).collect();
+            let at = text.find("\n\n").map_or(text.len(), |i| i + 1);
+            text.insert_str(at, &lines);
+        }
+        if let Some(opener) = self.hidden.get(&id) {
+            text.insert_str(0, &format!("pop-up of surface {} (hidden)\n", opener.0));
+        }
+        Some(text)
+    }
+
+    /// Keep the pop-ups agents opened in web pages as hidden surfaces (in no
+    /// pane, never focused, still driven by `web.*` and read by `get
+    /// surface`), and drop those that closed or whose opener went. Returns
+    /// whether any came or went.
+    pub fn adopt_popups(&mut self) -> bool {
+        let mut new = Vec::new();
+        for (sid, view) in self.views.iter_mut() {
+            if let Some(w) = view.downcast_mut::<web::WebView>() {
+                new.extend(w.take_spawned().into_iter().map(|p| (*sid, p)));
+            }
+        }
+        let gone: Vec<SurfaceId> = self
+            .hidden
+            .iter()
+            .filter(|(p, o)| {
+                !self.views.contains_key(o)
+                    || self.views.get(p).and_then(|v| v.downcast_ref::<web::WebView>()).is_none_or(|w| w.is_closed())
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        let changed = !new.is_empty() || !gone.is_empty();
+        for p in gone {
+            self.hidden.remove(&p);
+            self.views.remove(&p);
+        }
+        for (opener, popup) in new {
+            let sid = self.tree.detached_surface_id();
+            self.views.insert(sid, Box::new(popup));
+            self.hidden.insert(sid, opener);
+        }
+        changed
     }
 
     /// A terminal surface's child state.
