@@ -66,6 +66,9 @@ pub struct ViewState {
     pub frame: Option<FrameInfo>,
     /// The last failed load, cleared when a new load starts.
     pub error: Option<String>,
+    /// Why the page's renderer ended, cleared when a new load (a reload)
+    /// starts. Until then the frame is the dead page's last.
+    pub gone: Option<String>,
     /// Bumped on every event for this page, so a caller can tell it changed.
     pub version: u64,
 }
@@ -493,6 +496,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             let v = s.views.entry(id).or_default();
             if loading && !v.loading {
                 v.error = None;
+                v.gone = None;
             }
             v.loading = loading;
             v.loaded |= !loading;
@@ -503,6 +507,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         Event::LoadError { id, url, error } => {
             s.views.entry(id).or_default().error = Some(format!("{error} ({url})"));
         }
+        Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
         Event::Closed { id } => {
             s.views.remove(&id);
         }
@@ -527,7 +532,8 @@ fn page_of(ev: &Event) -> Option<u64> {
         | Event::Title { id, .. }
         | Event::Loading { id, .. }
         | Event::Cursor { id, .. }
-        | Event::LoadError { id, .. } => Some(*id),
+        | Event::LoadError { id, .. }
+        | Event::RendererGone { id, .. } => Some(*id),
         _ => None,
     }
 }
@@ -629,6 +635,19 @@ mod tests {
         apply_event(&shared, Event::Ready { protocol: PROTOCOL_VERSION });
         let s = shared.0.lock().unwrap();
         assert!(s.ready && s.failure.is_none());
+    }
+
+    #[test]
+    fn a_dead_renderer_is_reported_until_the_next_load() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        let gone = |s: &(Mutex<Shared>, Condvar)| s.0.lock().unwrap().views[&1].gone.clone();
+        let loading = |loading| Event::Loading { id: 1, loading, can_back: false, can_forward: false };
+        apply_event(&shared, loading(true));
+        apply_event(&shared, loading(false));
+        apply_event(&shared, Event::RendererGone { id: 1, error: "the page's renderer crashed".into() });
+        assert_eq!(gone(&shared).as_deref(), Some("the page's renderer crashed"));
+        apply_event(&shared, loading(true));
+        assert_eq!(gone(&shared), None, "a reload clears it");
     }
 
     #[test]

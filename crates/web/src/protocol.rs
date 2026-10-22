@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
 /// passes them through unchanged.
@@ -234,6 +234,13 @@ pub enum Event {
     LoadError {
         id: u64,
         url: String,
+        error: String,
+    },
+    /// The page's renderer process ended (crashed, killed, out of memory): the
+    /// page stays on its last frame until it is reloaded.
+    RendererGone {
+        id: u64,
+        /// What happened, e.g. "the page's renderer crashed".
         error: String,
     },
     Closed {

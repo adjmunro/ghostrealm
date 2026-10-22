@@ -240,6 +240,29 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
     }
 }
 
+/// Page `id`'s renderer ended: fail its evals (their world went with it) and
+/// tell the app.
+fn renderer_gone(id: u64, status: TerminationStatus, code: c_int) {
+    let what = match status {
+        TerminationStatus::PROCESS_WAS_KILLED => "was killed".to_string(),
+        TerminationStatus::PROCESS_CRASHED => "crashed".to_string(),
+        TerminationStatus::PROCESS_OOM => "ran out of memory".to_string(),
+        TerminationStatus::LAUNCH_FAILED => "failed to start".to_string(),
+        TerminationStatus::INTEGRITY_FAILURE => "failed a code integrity check".to_string(),
+        _ => format!("exited (code {code})"),
+    };
+    let error = format!("the page's renderer {what}");
+    with_eval_state(id, |s| *s = EvalState::default());
+    let evals: Vec<PendingEval> = EVALS.with_borrow_mut(|m| {
+        let msgs: Vec<i32> = m.iter().filter(|(_, e)| e.id == id).map(|(k, _)| *k).collect();
+        msgs.into_iter().filter_map(|k| m.remove(&k)).collect()
+    });
+    for e in &evals {
+        finish(e, false, error.clone());
+    }
+    emit(&Event::RendererGone { id, error });
+}
+
 /// A DevTools event on page `id`: track the eval world's context.
 fn devtools_event(id: u64, method: &str, params: &[u8]) {
     let context_event = matches!(
@@ -416,6 +439,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
         HostLoad::new(id),
         HostLifeSpan::new(id),
         HostContextMenu::new(),
+        HostRequests::new(id),
     );
     let window_info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -810,6 +834,26 @@ wrap_context_menu_handler! {
     }
 }
 
+wrap_request_handler! {
+    struct HostRequests {
+        id: u64,
+    }
+
+    impl RequestHandler {
+        /// The page keeps its last frame, so say it is dead; a reload starts a
+        /// new renderer.
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            renderer_gone(self.id, status, error_code);
+        }
+    }
+}
+
 wrap_client! {
     struct HostClient {
         render: RenderHandler,
@@ -817,6 +861,7 @@ wrap_client! {
         load: LoadHandler,
         life_span: LifeSpanHandler,
         context_menu: ContextMenuHandler,
+        request: RequestHandler,
     }
 
     impl Client {
@@ -838,6 +883,10 @@ wrap_client! {
 
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.context_menu.clone())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request.clone())
         }
     }
 }

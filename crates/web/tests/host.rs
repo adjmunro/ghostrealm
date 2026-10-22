@@ -251,3 +251,43 @@ fn a_hostile_page_cannot_shape_eval_results() {
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
 }
+
+#[test]
+fn a_dead_renderer_is_reported_and_reload_revives_it() {
+    let Some((host, cache)) = spawn("crash") else {
+        return;
+    };
+    let page = "data:text/html,<title>Alive</title>";
+    assert!(host.send(&Request::Create {
+        id: 1,
+        url: page.into(),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    assert_eq!(host.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
+
+    assert!(host.send(&Request::Navigate {
+        id: 1,
+        url: "chrome://crash".into()
+    }));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let gone = loop {
+        if let Some(gone) = host.view(1).and_then(|v| v.gone) {
+            break gone;
+        }
+        assert!(Instant::now() < deadline, "the renderer's death was never reported");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(gone.starts_with("the page's renderer "), "{gone}");
+
+    host.expect_load(1);
+    assert!(host.send(&Request::Reload { id: 1 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "reload never loaded");
+    assert_eq!(host.view(1).and_then(|v| v.gone), None, "the reload clears it");
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Alive\"".into()));
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}

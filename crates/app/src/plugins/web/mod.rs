@@ -909,7 +909,9 @@ impl View for WebView {
         }
 
         // The page.
-        let error = self.slot.borrow().error.clone();
+        let error = self.slot.borrow().error.clone().or_else(|| {
+            self.state.gone.as_ref().map(|gone| format!("{gone}. Reload to restart it."))
+        });
         match error {
             Some(err) => {
                 cx.fill(body, cx.chrome.background);
@@ -1102,6 +1104,9 @@ impl View for WebView {
         );
         if let Some(err) = &v.error {
             out.push_str(&format!("error: {err}\n"));
+        }
+        if let Some(gone) = &v.gone {
+            out.push_str(&format!("error: {gone}; reload to restart it\n"));
         }
         out.push('\n');
         out.push_str(&text);
