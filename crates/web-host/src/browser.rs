@@ -57,13 +57,18 @@ struct Entry {
 /// How a browser's DevTools session stands for evals.
 #[derive(Default)]
 struct EvalState {
-    /// `Runtime.enable` succeeded, so context events arrive.
-    runtime: bool,
-    /// The `uniqueId` of the eval world in the current document.
+    /// The `uniqueId` of the eval world, if one was made for this page. It
+    /// goes stale when the document goes; an eval then finds no context and
+    /// makes a new one.
     world: Option<String>,
-    /// Eval worlds announced by `Runtime.executionContextCreated`, newest last:
-    /// `(executionContextId, uniqueId)`.
+    /// An eval is making the world; others wait for it in `waiting`.
+    creating: bool,
+    waiting: Vec<PendingEval>,
+    /// Eval worlds announced by `Runtime.executionContextCreated` while
+    /// `Runtime` is enabled, newest last: `(executionContextId, uniqueId)`.
     created: Vec<(i64, String)>,
+    /// Why the renderer ended, until the next load starts: evals fail at once.
+    gone: Option<String>,
 }
 
 thread_local! {
@@ -79,6 +84,12 @@ thread_local! {
 /// it shares the page's DOM but none of its scripts' globals or prototypes.
 const EVAL_WORLD: &str = "ghostrealm-eval";
 
+/// The errors `Runtime.evaluate` gives for a `uniqueContextId` that names no
+/// live context: unknown to the renderer, or its context already destroyed.
+/// V8 checks the context before compiling, so the script never ran and it is
+/// safe to run it again. Anything else may come after the script started.
+const NO_CONTEXT: [&str; 2] = ["uniqueContextId not found", "Cannot find context with specified id"];
+
 /// An eval in flight: its DevTools steps run in order, each answered through
 /// [`HostDevTools`].
 struct PendingEval {
@@ -87,18 +98,23 @@ struct PendingEval {
     js: String,
     started: Instant,
     step: Step,
-    /// The cached world was gone (the page navigated); it was recreated once.
+    /// The world this eval made (before `Disable`) or runs in (`Evaluate`).
+    world: Option<String>,
+    /// It found its world stale and was started again once.
     retried: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
-    /// `Runtime.enable`, so the world's context (and its `uniqueId`) is reported.
+    /// `Runtime.enable`, so the new world's `uniqueId` is reported.
     Enable,
     /// `Page.getFrameTree`, for the main frame's DevTools id.
     FrameTree,
     /// `Page.createIsolatedWorld`.
     World,
+    /// `Runtime.disable`: with `Runtime` on, every console call and exception
+    /// on the page is serialised to the host and its arguments kept alive.
+    Disable,
     /// `Runtime.evaluate` in the world.
     Evaluate,
 }
@@ -121,53 +137,107 @@ fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T>
 /// after a navigation, so the script never lands in the page's own world.
 fn start_eval(id: u64, req: u64, js: String) {
     EVALS.with_borrow_mut(|m| m.retain(|_, e| e.started.elapsed() < EVAL_TTL));
-    let Some((runtime, world)) = with_eval_state(id, |s| (s.runtime, s.world.clone())) else {
-        emit(&Event::EvalResult { id, req, ok: false, value: format!("unknown browser {id}") });
-        return;
+    let e = PendingEval {
+        id,
+        req,
+        js,
+        started: Instant::now(),
+        step: Step::Enable,
+        world: None,
+        retried: false,
     };
-    let e = PendingEval { id, req, js, started: Instant::now(), step: Step::Enable, retried: false };
-    match (runtime, world) {
-        (_, Some(world)) => evaluate(e, &world),
-        (true, None) => frame_tree(e),
-        (false, None) => devtools(e, Step::Enable, "Runtime.enable", json!({})),
+    run(e);
+}
+
+/// Evaluate `e` in the page's world, making one first if there is none.
+fn run(e: PendingEval) {
+    enum Next {
+        Fail(String),
+        Evaluate(String),
+        Wait,
+        Create,
+    }
+    let next = with_eval_state(e.id, |s| {
+        if let Some(gone) = &s.gone {
+            Next::Fail(format!("{gone}; reload to restart it"))
+        } else if let Some(world) = &s.world {
+            Next::Evaluate(world.clone())
+        } else if s.creating {
+            Next::Wait
+        } else {
+            s.creating = true;
+            s.created.clear();
+            Next::Create
+        }
+    });
+    match next {
+        None => {
+            let value = format!("unknown browser {}", e.id);
+            emit(&Event::EvalResult { id: e.id, req: e.req, ok: false, value });
+        }
+        Some(Next::Fail(error)) => finish(&e, false, error),
+        Some(Next::Evaluate(world)) => evaluate(e, world),
+        Some(Next::Wait) => with_eval_state(e.id, |s| s.waiting.push(e)).unwrap_or_default(),
+        Some(Next::Create) => devtools(e, Step::Enable, "Runtime.enable", json!({})),
     }
 }
 
-fn frame_tree(e: PendingEval) {
-    devtools(e, Step::FrameTree, "Page.getFrameTree", json!({}));
+fn evaluate(mut e: PendingEval, world: String) {
+    let expression = eval_wrapper(&e.js);
+    let params = json!({
+        "expression": expression,
+        "uniqueContextId": world,
+        "awaitPromise": true,
+        "returnByValue": true,
+        "silent": true,
+    });
+    e.world = Some(world);
+    devtools(e, Step::Evaluate, "Runtime.evaluate", params);
 }
 
-fn evaluate(e: PendingEval, world: &str) {
-    let expression = eval_wrapper(&e.js);
-    devtools(
-        e,
-        Step::Evaluate,
-        "Runtime.evaluate",
-        json!({
-            "expression": expression,
-            "uniqueContextId": world,
-            "awaitPromise": true,
-            "returnByValue": true,
-            "silent": true,
-        }),
-    );
+/// Send DevTools method `method` to page `id`, answered to message `msg`.
+fn send(id: u64, msg: i32, method: &str, params: Value) -> bool {
+    let Some(host) = browser(id).and_then(|b| b.host()) else {
+        return false;
+    };
+    let line = json!({ "id": msg, "method": method, "params": params }).to_string();
+    host.send_dev_tools_message(Some(line.as_bytes())) != 0
+}
+
+fn next_message() -> i32 {
+    let msg = NEXT_MESSAGE.get();
+    NEXT_MESSAGE.set(msg.checked_add(1).unwrap_or(1));
+    msg
 }
 
 /// Send one DevTools method for `e`'s next step.
 fn devtools(mut e: PendingEval, step: Step, method: &str, params: Value) {
-    let Some(host) = browser(e.id).and_then(|b| b.host()) else {
-        return finish(&e, false, "the page closed".into());
-    };
-    let msg = NEXT_MESSAGE.get();
-    NEXT_MESSAGE.set(msg.checked_add(1).unwrap_or(1));
-    let line = json!({ "id": msg, "method": method, "params": params }).to_string();
+    let msg = next_message();
     e.step = step;
-    let (id, req) = (e.id, e.req);
+    let id = e.id;
     EVALS.with_borrow_mut(|m| m.insert(msg, e));
-    if host.send_dev_tools_message(Some(line.as_bytes())) == 0 {
-        EVALS.with_borrow_mut(|m| m.remove(&msg));
-        emit(&Event::EvalResult { id, req, ok: false, value: "DevTools refused the eval".into() });
+    if !send(id, msg, method, params) {
+        if let Some(e) = EVALS.with_borrow_mut(|m| m.remove(&msg)) {
+            fail(e, "DevTools refused the eval".into());
+        }
     }
+}
+
+/// Fail `e`; if it was making the world, fail the evals waiting for it too.
+fn fail(e: PendingEval, error: String) {
+    if e.step != Step::Evaluate {
+        if e.step != Step::Enable {
+            send(e.id, next_message(), "Runtime.disable", json!({}));
+        }
+        let waiting = with_eval_state(e.id, |s| {
+            s.creating = false;
+            std::mem::take(&mut s.waiting)
+        });
+        for w in waiting.into_iter().flatten() {
+            finish(&w, false, error.clone());
+        }
+    }
+    finish(&e, false, error);
 }
 
 fn finish(e: &PendingEval, ok: bool, value: String) {
@@ -187,45 +257,53 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
     });
     let Some(mut e) = pending else { return };
     let v: Value = serde_json::from_slice(result).unwrap_or(Value::Null);
-    if !success {
-        if e.step == Step::Evaluate && !e.retried {
-            // The world went with its document: make a new one.
-            e.retried = true;
-            with_eval_state(id, |s| s.world = None);
-            return frame_tree(e);
-        }
-        let message = v["message"].as_str().unwrap_or("DevTools call failed");
-        return finish(&e, false, message.to_string());
-    }
+    let message = v["message"].as_str().unwrap_or("DevTools call failed").to_string();
     match e.step {
-        Step::Enable => {
-            with_eval_state(id, |s| s.runtime = true);
-            frame_tree(e);
+        // Runtime is off, or will be; the world is what matters.
+        Step::Disable => {
+            let waiting = with_eval_state(id, |s| {
+                s.creating = false;
+                s.world.clone_from(&e.world);
+                std::mem::take(&mut s.waiting)
+            })
+            .unwrap_or_default();
+            let world = e.world.take();
+            for w in std::iter::once(e).chain(waiting) {
+                match &world {
+                    Some(world) => evaluate(w, world.clone()),
+                    None => finish(&w, false, "the isolated world did not start".into()),
+                }
+            }
         }
+        _ if !success => {
+            if e.step == Step::Evaluate && !e.retried && NO_CONTEXT.contains(&message.as_str()) {
+                // The world went with its document before the script ran.
+                e.retried = true;
+                let stale = e.world.take();
+                with_eval_state(id, |s| {
+                    if s.world == stale {
+                        s.world = None;
+                    }
+                });
+                return run(e);
+            }
+            fail(e, message);
+        }
+        Step::Enable => devtools(e, Step::FrameTree, "Page.getFrameTree", json!({})),
         Step::FrameTree => match v["frameTree"]["frame"]["id"].as_str() {
             Some(frame) => {
                 let params = json!({ "frameId": frame, "worldName": EVAL_WORLD });
                 devtools(e, Step::World, "Page.createIsolatedWorld", params);
             }
-            None => finish(&e, false, "the page has no main frame".into()),
+            None => fail(e, "the page has no main frame".into()),
         },
         Step::World => {
             let context = v["executionContextId"].as_i64();
-            let world = with_eval_state(id, |s| {
-                let unique = s
-                    .created
-                    .iter()
-                    .rev()
-                    .find(|(c, _)| Some(*c) == context)
-                    .map(|(_, u)| u.clone());
-                s.world.clone_from(&unique);
-                unique
+            e.world = with_eval_state(id, |s| {
+                s.created.iter().rev().find(|(c, _)| Some(*c) == context).map(|(_, u)| u.clone())
             })
             .flatten();
-            match world {
-                Some(world) => evaluate(e, &world),
-                None => finish(&e, false, "the isolated world did not start".into()),
-            }
+            devtools(e, Step::Disable, "Runtime.disable", json!({}));
         }
         Step::Evaluate => {
             if let Some(ex) = v.get("exceptionDetails") {
@@ -240,8 +318,25 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
     }
 }
 
-/// Page `id`'s renderer ended: fail its evals (their world went with it) and
-/// tell the app.
+/// Fail every eval of page `id` with `error` and forget its world.
+fn fail_evals(id: u64, error: &str) {
+    let mut evals: Vec<PendingEval> = EVALS.with_borrow_mut(|m| {
+        let msgs: Vec<i32> = m.iter().filter(|(_, e)| e.id == id).map(|(k, _)| *k).collect();
+        msgs.into_iter().filter_map(|k| m.remove(&k)).collect()
+    });
+    with_eval_state(id, |s| {
+        evals.append(&mut s.waiting);
+        s.world = None;
+        s.creating = false;
+        s.created.clear();
+    });
+    for e in &evals {
+        finish(e, false, error.to_string());
+    }
+}
+
+/// Page `id`'s renderer ended: fail its evals (their world went with it), and
+/// any until the next load, and tell the app.
 fn renderer_gone(id: u64, status: TerminationStatus, code: c_int) {
     let what = match status {
         TerminationStatus::PROCESS_WAS_KILLED => "was killed".to_string(),
@@ -252,53 +347,28 @@ fn renderer_gone(id: u64, status: TerminationStatus, code: c_int) {
         _ => format!("exited (code {code})"),
     };
     let error = format!("the page's renderer {what}");
-    with_eval_state(id, |s| *s = EvalState::default());
-    let evals: Vec<PendingEval> = EVALS.with_borrow_mut(|m| {
-        let msgs: Vec<i32> = m.iter().filter(|(_, e)| e.id == id).map(|(k, _)| *k).collect();
-        msgs.into_iter().filter_map(|k| m.remove(&k)).collect()
-    });
-    for e in &evals {
-        finish(e, false, error.clone());
-    }
+    fail_evals(id, &format!("{error}; reload to restart it"));
+    with_eval_state(id, |s| s.gone = Some(error.clone()));
     emit(&Event::RendererGone { id, error });
 }
 
-/// A DevTools event on page `id`: track the eval world's context.
+/// A DevTools event on page `id`: note eval worlds as they are made.
 fn devtools_event(id: u64, method: &str, params: &[u8]) {
-    let context_event = matches!(
-        method,
-        "Runtime.executionContextCreated"
-            | "Runtime.executionContextDestroyed"
-            | "Runtime.executionContextsCleared"
-    );
-    if !context_event {
+    if method != "Runtime.executionContextCreated" {
         return;
     }
     let v: Value = serde_json::from_slice(params).unwrap_or(Value::Null);
-    with_eval_state(id, |s| match method {
-        "Runtime.executionContextCreated" => {
-            let c = &v["context"];
-            if let (Some(EVAL_WORLD), Some(ctx), Some(unique)) =
-                (c["name"].as_str(), c["id"].as_i64(), c["uniqueId"].as_str())
-            {
-                if s.created.len() == CREATED_MAX {
-                    s.created.remove(0);
-                }
-                s.created.push((ctx, unique.to_string()));
+    let c = &v["context"];
+    if let (Some(EVAL_WORLD), Some(ctx), Some(unique)) =
+        (c["name"].as_str(), c["id"].as_i64(), c["uniqueId"].as_str())
+    {
+        with_eval_state(id, |s| {
+            if s.created.len() == CREATED_MAX {
+                s.created.remove(0);
             }
-        }
-        "Runtime.executionContextDestroyed" => {
-            let gone = v["executionContextUniqueId"].as_str();
-            if gone.is_some() && s.world.as_deref() == gone {
-                s.world = None;
-            }
-            s.created.retain(|(_, u)| Some(u.as_str()) != gone);
-        }
-        _ => {
-            s.world = None;
-            s.created.clear();
-        }
-    });
+            s.created.push((ctx, unique.to_string()));
+        });
+    }
 }
 
 /// Run one request (or, for `None`, the app's hang-up) on the UI thread.
@@ -746,6 +816,9 @@ wrap_load_handler! {
             can_go_back: c_int,
             can_go_forward: c_int,
         ) {
+            if is_loading != 0 {
+                with_eval_state(self.id, |s| s.gone = None);
+            }
             emit(&Event::Loading {
                 id: self.id,
                 loading: is_loading != 0,
@@ -802,7 +875,7 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            EVALS.with_borrow_mut(|m| m.retain(|_, e| e.id != self.id));
+            fail_evals(self.id, "the page closed");
             let empty = BROWSERS.with_borrow_mut(|m| {
                 m.remove(&self.id);
                 m.is_empty()
@@ -909,6 +982,11 @@ wrap_dev_tools_message_observer! {
 
         fn on_dev_tools_event(&self, _browser: Option<&mut Browser>, method: Option<&CefString>, params: Option<&[u8]>) {
             devtools_event(self.id, &string(method), params.unwrap_or_default());
+        }
+
+        /// Replies pending at a detach never arrive.
+        fn on_dev_tools_agent_detached(&self, _browser: Option<&mut Browser>) {
+            fail_evals(self.id, "the page closed or its renderer ended");
         }
     }
 }

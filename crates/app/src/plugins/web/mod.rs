@@ -324,7 +324,8 @@ impl Plugin for WebPlugin {
                 "Web: Evaluate JavaScript",
                 "Run JavaScript in a web page (after it loads) and return its JSON-encoded \
                  result. It runs in an isolated world: it sees the page's DOM but not its \
-                 scripts' globals, and the page can't change the result",
+                 scripts' globals, and the page's scripts can't tamper with how it runs or how \
+                 its value is encoded. What it reads from the DOM is still page content",
             )
             .arg(ArgSpec::required(
                 "js",

@@ -257,20 +257,26 @@ pub const MAX_EVAL_RESULT: usize = 1 << 20;
 
 /// The expression the host evaluates for `js`. It settles to `[ok, payload]`:
 /// `[true, <JSON of the awaited value>]` (`null` for a value JSON can't
-/// encode as text), or `[false, <error message>]`.
+/// encode as text), or `[false, <error message>]`. A payload over
+/// [`MAX_EVAL_RESULT`] UTF-16 units is replaced by an error in the page, so a
+/// huge value is never sent to the host.
 ///
 /// The host runs it in an isolated JavaScript world: it shares the page's DOM
-/// but not its globals or prototypes, so the page can't replace what it calls
-/// (`eval`, `JSON.stringify`, `Promise`, ...) or how the value encodes.
+/// but not its globals or prototypes, so the page's scripts can't replace what
+/// it calls (`eval`, `JSON.stringify`, `Promise`, ...) or how the value
+/// encodes. What it reads from the DOM is still page content.
 pub fn eval_wrapper(js: &str) -> String {
     // The source is embedded as a JSON string and run through indirect eval so
     // both expressions and statement lists work.
     let src = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".into());
+    let max = MAX_EVAL_RESULT;
     format!(
-        "(async () => {{ try {{ const v = await (0, eval)({src}); \
+        "(async () => {{ const out = (ok, s) => s.length > {max} \
+         ? [false, 'result too large (over {max} bytes)'] : [ok, s]; \
+         try {{ const v = await (0, eval)({src}); \
          let s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = String(v); }} \
-         return [true, s === undefined ? 'null' : s]; }} \
-         catch (e) {{ return [false, String(e && e.stack || e)]; }} }})()"
+         return out(true, s === undefined ? 'null' : s); }} \
+         catch (e) {{ return out(false, String(e && e.stack || e)); }} }})()"
     )
 }
 
@@ -320,5 +326,6 @@ mod tests {
     fn eval_wrapper_embeds_source_as_a_string_literal() {
         let w = eval_wrapper("document.title = \"x\"; 1 + 1");
         assert!(w.contains(r#"(0, eval)("document.title = \"x\"; 1 + 1")"#), "{w}");
+        assert!(w.contains(&format!("s.length > {MAX_EVAL_RESULT}")), "{w}");
     }
 }

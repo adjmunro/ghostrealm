@@ -87,6 +87,24 @@ fn page_paints_and_answers_text_and_eval() {
         "{:?}",
         big.map(|v| v.len())
     );
+    // The cap applies in the page, before a huge value is sent anywhere.
+    let start = Instant::now();
+    let huge = host.eval(1, "'x'.repeat(200 * 1024 * 1024)", Duration::from_secs(10));
+    assert!(huge.as_ref().is_err_and(|e| e.contains("too large")), "{:?}", huge.map(|v| v.len()));
+    assert!(start.elapsed() < Duration::from_secs(4), "took {:?}", start.elapsed());
+
+    // An eval still pending when its page closes fails at once.
+    std::thread::scope(|scope| {
+        let pending = scope.spawn(|| {
+            let start = Instant::now();
+            (host.eval(1, "new Promise(() => {})", Duration::from_secs(10)), start.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(host.send(&Request::Close { id: 1 }));
+        let (result, took) = pending.join().unwrap();
+        assert!(result.as_ref().is_err_and(|e| e.contains("closed")), "{result:?}");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    });
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
@@ -282,11 +300,89 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
     };
     assert!(gone.starts_with("the page's renderer "), "{gone}");
 
+    // Evals fail at once until it is reloaded.
+    let start = Instant::now();
+    let dead = host.eval(1, "1 + 1", Duration::from_secs(10));
+    assert!(dead.as_ref().is_err_and(|e| e.contains("renderer")), "{dead:?}");
+    assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+
     host.expect_load(1);
     assert!(host.send(&Request::Reload { id: 1 }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "reload never loaded");
     assert_eq!(host.view(1).and_then(|v| v.gone), None, "the reload clears it");
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Alive\"".into()));
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// A local HTTP server: `/a` and `/b` are pages (each links to the other);
+/// `/hit...` paths are recorded in the returned list. Anything else is empty.
+fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+            let body = match path.as_str() {
+                "/a" => "<title>A</title><a id=\"l\" href=\"/b\">to b</a>".to_string(),
+                "/b" => "<title>B</title><a id=\"l\" href=\"/a\">to a</a>".to_string(),
+                _ => {
+                    if path.starts_with("/hit") {
+                        seen.lock().unwrap().push(path);
+                    }
+                    String::new()
+                }
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base, hits)
+}
+
+#[test]
+fn an_eval_whose_page_navigates_away_runs_once() {
+    let Some((host, cache)) = spawn("navigate") else {
+        return;
+    };
+    let (base, hits) = serve();
+    assert!(host.send(&Request::Create {
+        id: 1,
+        url: format!("{base}/a"),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"A\"".into()));
+
+    // The script leaves its document while it waits: it must not be run again
+    // in the next one, nor answer from it.
+    host.expect_load(1);
+    let js = "(async () => { await fetch('/hit?' + document.title); \
+              document.getElementById('l').click(); \
+              await new Promise(r => setTimeout(r, 1500)); return document.title; })()";
+    let result = host.eval(1, js, Duration::from_secs(10));
+    assert!(result.is_err(), "{result:?}");
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page B never loaded");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(*hits.lock().unwrap(), ["/hit?A"]);
+
+    // The stale world is replaced on the next eval.
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"B\"".into()));
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
