@@ -1257,3 +1257,16 @@
     flow). It would be a `ViewMode::Preview` for that language, read-only
     like Markdown's.
 - Reason: GitHub issue #1.
+
+---
+
+[2026-10-23@290d752] Web — opt-in main-world eval
+
+- Requires: owner decision
+- Detail: Decision needed: offer an explicit opt-in eval in the page's own
+  JavaScript world, e.g. for reading a localhost dev server's app state while
+  debugging? `web.eval` runs isolated (DECISION.md, Web surface / security), so
+  it can't see page globals. A main-world result is page-controlled, so it
+  would have to be requested per call and marked as such.
+- Reason: isolation is the safe default, but app-state debugging needs page
+  globals.

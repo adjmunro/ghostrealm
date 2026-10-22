@@ -199,3 +199,12 @@
 - Detail: A document header's `⋯` menu lists every option of its document. `[editor] header_icons`, an ordered list of option ids (`statistic`, `autosave`, `soft_wrap`, `view_mode`, `autoplay`), picks which also show as icons left of `⋯`, in that order; a document shows the icons of the listed options it has. Default: `["statistic", "autosave", "soft_wrap", "view_mode"]`.
 - Detail: Named for the document header (GLOSSARY.md), not "ribbon". An unknown or repeated id is a config warning at that entry and is dropped; the rest apply.
 - Reason: owner, verbatim (GitHub issue #1): "I like the three dots menu … Perhaps we can use the three dots to show all the options (including softwrap and autosave) and then the config toml can specify which ones we want to actually show as icons in the ribbon as well, outside of the triple dot submenu."
+
+---
+
+[2026-10-23T07:51+1300@290d752]
+
+- Category: Web surface / security
+- Detail: `web.eval` runs the agent's script in an isolated JavaScript world (as Chrome extension content scripts do), made per document through the browser's DevTools session (`Page.createIsolatedWorld`, then `Runtime.evaluate` addressed by the world's `uniqueContextId`). The world shares the page's DOM but not its scripts' globals or prototypes, so the page cannot change how the script runs or how its value is encoded.
+- Detail: Consequence: an eval sees the DOM, not page JavaScript globals (a page's `window.app` state is out of reach). Its own globals persist for the document. What it reads from the DOM is still page content. A main-world eval is not offered (TODO.md "Web — opt-in main-world eval").
+- Reason: agents drive the browser over arbitrary pages (docs, GitHub, search results), so a page must not be able to lie to the agent about what it finds. Owner, verbatim: "Okay, it sounds like we need to put this isolated world thing on the to-do as a fairly high priority for the sake of security. High priority in terms of web stuff, although maybe some quality of life stuff will try and come before that. Mainly because agents can control the browsers and therefore there is clearly a prompt injection risk or a malicious use case risk. Having said that, we are most likely going to be running localhost stuff when we're doing stuff in the browser, right? Most of the time? Maybe not. I'm not sure, actually."
