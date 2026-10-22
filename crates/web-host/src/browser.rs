@@ -119,9 +119,21 @@ enum Step {
     Evaluate,
 }
 
-/// An eval whose promise hasn't settled by now is forgotten (the app gave up
-/// long before).
+/// An eval still unanswered after this fails (the app gave up long before).
 const EVAL_TTL: Duration = Duration::from_secs(60);
+
+/// Overrides [`EVAL_TTL`], in milliseconds, so tests can expire evals quickly.
+const EVAL_TTL_ENV: &str = "GHOSTREALM_WEB_EVAL_TTL_MS";
+
+fn eval_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var(EVAL_TTL_ENV)
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map_or(EVAL_TTL, Duration::from_millis)
+    })
+}
 
 /// Eval worlds remembered from context events, per browser.
 const CREATED_MAX: usize = 8;
@@ -136,7 +148,7 @@ fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T>
 /// `executionContextId`) can't name a context in another renderer process
 /// after a navigation, so the script never lands in the page's own world.
 fn start_eval(id: u64, req: u64, js: String) {
-    EVALS.with_borrow_mut(|m| m.retain(|_, e| e.started.elapsed() < EVAL_TTL));
+    expire_evals();
     let e = PendingEval {
         id,
         req,
@@ -147,6 +159,35 @@ fn start_eval(id: u64, req: u64, js: String) {
         retried: false,
     };
     run(e);
+}
+
+/// Fail evals older than [`eval_ttl`]. An expired eval that was making a
+/// world goes through [`fail`], so its page can make another and the evals
+/// waiting for it fail too.
+fn expire_evals() {
+    let ttl = eval_ttl();
+    let expired: Vec<PendingEval> = EVALS.with_borrow_mut(|m| {
+        let msgs: Vec<i32> =
+            m.iter().filter(|(_, e)| e.started.elapsed() >= ttl).map(|(k, _)| *k).collect();
+        msgs.into_iter().filter_map(|k| m.remove(&k)).collect()
+    });
+    for e in expired {
+        fail(e, "the eval timed out".into());
+    }
+    let waited: Vec<PendingEval> = BROWSERS.with_borrow_mut(|m| {
+        let mut out = Vec::new();
+        for entry in m.values_mut() {
+            let (old, keep) = std::mem::take(&mut entry.eval.waiting)
+                .into_iter()
+                .partition(|w| w.started.elapsed() >= ttl);
+            entry.eval.waiting = keep;
+            out.extend::<Vec<PendingEval>>(old);
+        }
+        out
+    });
+    for w in &waited {
+        finish(w, false, "the eval timed out waiting for its world".into());
+    }
 }
 
 /// Evaluate `e` in the page's world, making one first if there is none.
@@ -226,9 +267,9 @@ fn devtools(mut e: PendingEval, step: Step, method: &str, params: Value) {
 /// Fail `e`; if it was making the world, fail the evals waiting for it too.
 fn fail(e: PendingEval, error: String) {
     if e.step != Step::Evaluate {
-        if e.step != Step::Enable {
-            send(e.id, next_message(), "Runtime.disable", json!({}));
-        }
+        // `Runtime` may be on, or turn on when a late `Runtime.enable` lands
+        // (the session runs methods in order, so this comes after it).
+        send(e.id, next_message(), "Runtime.disable", json!({}));
         let waiting = with_eval_state(e.id, |s| {
             s.creating = false;
             std::mem::take(&mut s.waiting)

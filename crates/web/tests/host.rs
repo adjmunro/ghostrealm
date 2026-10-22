@@ -17,6 +17,11 @@ use ghostrealm_web::{MouseAction, MouseButton, Request, WebHost};
 /// A ready host on its own profile `ghostrealm-web-<tag>-<pid>` (removed by the
 /// caller), or `None` when the host isn't built.
 fn spawn(tag: &str) -> Option<(WebHost, PathBuf)> {
+    spawn_with(tag, &[])
+}
+
+/// [`spawn`], with extra environment variables for the host.
+fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
     // The host reads its profile from the environment at spawn; tests run in
     // parallel, so each sets and spawns in turn.
     static SPAWN: Mutex<()> = Mutex::new(());
@@ -28,7 +33,14 @@ fn spawn(tag: &str) -> Option<(WebHost, PathBuf)> {
     let host = {
         let _turn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("GHOSTREALM_WEB_CACHE", &cache);
-        WebHost::spawn(&exe, None).expect("spawn host")
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+        let host = WebHost::spawn(&exe, None).expect("spawn host");
+        for (k, _) in env {
+            std::env::remove_var(k);
+        }
+        host
     };
     assert!(
         host.wait_ready(Duration::from_secs(20)),
@@ -383,6 +395,34 @@ fn an_eval_whose_page_navigates_away_runs_once() {
 
     // The stale world is replaced on the next eval.
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"B\"".into()));
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn an_expired_eval_making_the_world_does_not_block_later_ones() {
+    let Some((host, cache)) = spawn_with("ttl", &[("GHOSTREALM_WEB_EVAL_TTL_MS", "1000")]) else {
+        return;
+    };
+    // Blocks its main thread for 3s, starting 300ms after loading.
+    let page = "data:text/html,<title>Busy</title><script>setTimeout(() => \
+                { const t = Date.now(); while (Date.now() - t < 3000); }, 300)</script>";
+    assert!(host.send(&Request::Create {
+        id: 1,
+        url: page.into(),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    std::thread::sleep(Duration::from_millis(600));
+    // Starts making the world, which the busy page doesn't answer in time.
+    assert!(host.eval(1, "1", Duration::from_millis(300)).is_err());
+    std::thread::sleep(Duration::from_millis(1200));
+    // Past the TTL: the first eval is expired, and this one makes the world
+    // once the page is free.
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(10)), Ok("\"Busy\"".into()));
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
