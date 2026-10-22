@@ -306,6 +306,11 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
     match e.step {
         // Runtime is off, or will be; the world is what matters.
         Step::Disable => {
+            if !success {
+                // Cut off by a navigation, the session may carry `Runtime`
+                // into the new renderer: turn it off there.
+                send(id, next_message(), "Runtime.disable", json!({}));
+            }
             if e.world.is_none() && !e.remade {
                 return remake(e);
             }
