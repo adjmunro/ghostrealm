@@ -122,11 +122,15 @@ enum Step {
     Evaluate,
 }
 
-/// An eval still unanswered after this fails (the app gave up long before).
+/// An eval still unanswered after this fails when the next eval on any page
+/// starts (the app gave up long before).
 const EVAL_TTL: Duration = Duration::from_secs(60);
 
 /// Overrides [`EVAL_TTL`], in milliseconds, so tests can expire evals quickly.
 const EVAL_TTL_ENV: &str = "GHOSTREALM_WEB_EVAL_TTL_MS";
+
+/// Floor for the override: shorter would fail healthy evals on other pages.
+const EVAL_TTL_MIN: Duration = Duration::from_millis(500);
 
 fn eval_ttl() -> Duration {
     static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -134,7 +138,7 @@ fn eval_ttl() -> Duration {
         std::env::var(EVAL_TTL_ENV)
             .ok()
             .and_then(|ms| ms.parse().ok())
-            .map_or(EVAL_TTL, Duration::from_millis)
+            .map_or(EVAL_TTL, |ms| Duration::from_millis(ms).max(EVAL_TTL_MIN))
     })
 }
 

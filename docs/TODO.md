@@ -1275,8 +1275,8 @@
 
 [2026-10-23@e32ebd4] Web — JS dialogs hang the page
 
-- Requires: decisions-pending.md item 5 ("Web downloads, uploads, and JS
-  dialogs")
+- Requires: an owner decision on how web downloads, uploads, and JS dialogs
+  are handled
 - Detail: The host has no `JsDialogHandler`, so a page calling `alert()`,
   `confirm()` or `prompt()` waits forever for an answer nothing gives: evals
   and navigations on it stall. How dialogs are answered (shown to a human,
