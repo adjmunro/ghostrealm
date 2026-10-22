@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Ids at or above this are pages the host made for pop-ups ([`Event::Popup`]);
+/// the app numbers the pages it creates below it.
+pub const POPUP_IDS: u64 = 1 << 40;
 
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
 /// passes them through unchanged.
@@ -152,6 +156,8 @@ pub enum Request {
     /// Evaluate JavaScript in the main frame, in a world isolated from the
     /// page's scripts (see [`eval_wrapper`]); answered by [`Event::EvalResult`].
     /// The expression may return a promise; its settled value is reported.
+    /// It runs as a user gesture, so it can do what a click can (open a
+    /// pop-up).
     Eval {
         id: u64,
         req: u64,
@@ -243,6 +249,23 @@ pub enum Event {
         /// What happened, e.g. "the page's renderer crashed".
         error: String,
     },
+    /// Page `opener` opened a pop-up (`window.open`, a link to a new window):
+    /// page `id` (from [`POPUP_IDS`] up), made by the host and hidden until
+    /// shown. It keeps `window.opener`. Its requests are served at once.
+    Popup {
+        id: u64,
+        opener: u64,
+        url: String,
+        /// A `Mouse` press or a `Key` reached the opener within the last 5 s
+        /// (as long as Chromium's user activation lasts), so it answers that
+        /// input; otherwise an eval opened it.
+        from_input: bool,
+        /// Its initial physical size: what the page asked for, else the opener's.
+        width: u32,
+        height: u32,
+    },
+    /// The page closed: by a `Close` request, `window.close()`, its opener
+    /// closing (a pop-up), or a pop-up that was never made.
     Closed {
         id: u64,
     },

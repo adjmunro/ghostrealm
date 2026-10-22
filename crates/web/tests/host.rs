@@ -329,7 +329,10 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
 }
 
 /// A local HTTP server: `/a` and `/b` are pages (each links to the other);
-/// `/hit...` paths are recorded in the returned list. Anything else is empty.
+/// `/opener` opens `/popup` on a click (red while it waits for one) and logs
+/// messages it gets in `data-got`; `/popup` posts to its opener and closes
+/// itself; `/stay` is a page. `/hit...` paths are recorded in the returned
+/// list. Anything else is empty.
 fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -347,6 +350,11 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
             let body = match path.as_str() {
                 "/a" => "<title>A</title><a id=\"l\" href=\"/b\">to b</a>".to_string(),
                 "/b" => "<title>B</title><a id=\"l\" href=\"/a\">to a</a>".to_string(),
+                "/opener" => OPENER.to_string(),
+                "/popup" => "<title>Popup</title><script>window.opener.postMessage('from ' + \
+                             location.pathname, '*'); window.close();</script>"
+                    .to_string(),
+                "/stay" => "<title>Stay</title><p>stay text</p>".to_string(),
                 _ => {
                     if path.starts_with("/hit") {
                         seen.lock().unwrap().push(path);
@@ -363,6 +371,124 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
         }
     });
     (base, hits)
+}
+
+const OPENER: &str = "<title>Opener</title><body style='margin:0'>\
+<button style='position:fixed;inset:0;border:0;background:rgb(255,0,0)' \
+onclick=\"window.open('/popup', 'p', 'width=300,height=200')\">open</button><script>\
+addEventListener('message', e => { document.body.dataset.got = \
+(document.body.dataset.got || '') + e.data + (e.source ? '' : ' (no source)') + ';'; });</script>";
+
+/// Wait for page `id`'s first painted frame whose top-left pixel is `bgr`.
+fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host.frame(id).and_then(|f| f.read()).is_some_and(|px| px[..3] == bgr) {
+        assert!(Instant::now() < deadline, "page {id} never painted");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The pop-ups page `opener` opened, once there are `n`.
+fn wait_popups(host: &WebHost, opener: u64, n: usize) -> Vec<ghostrealm_web::PopupInfo> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got = Vec::new();
+    while got.len() < n {
+        got.extend(host.take_popups(opener));
+        assert!(Instant::now() < deadline, "pop-ups so far: {got:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    got
+}
+
+fn wait_closed(host: &WebHost, id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host.is_closed(id) {
+        assert!(Instant::now() < deadline, "page {id} never closed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `data-got` of page `id` once it holds `want`.
+fn wait_got(host: &WebHost, id: u64, want: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = host.eval(id, "document.body.dataset.got || ''", Duration::from_secs(5)).unwrap();
+        if got.contains(want) || Instant::now() > deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
+    let Some((mut host, cache)) = spawn("popup") else {
+        return;
+    };
+    let (base, _) = serve();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 2.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+
+    let click = |action| assert!(host.send(&Request::Mouse { id: 1, x: 20, y: 20, mods: 0, action }));
+    click(MouseAction::Move);
+    click(MouseAction::Down { button: MouseButton::Left, count: 1 });
+    click(MouseAction::Up { button: MouseButton::Left, count: 1 });
+    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert!(p.id >= ghostrealm_web::protocol::POPUP_IDS, "{p:?}");
+    assert!(p.from_input, "a click opened it");
+    assert!(p.url.ends_with("/popup"), "{p:?}");
+    assert_eq!((p.width, p.height), (600, 400), "the size it asked for, in physical pixels");
+
+    // It posts to its opener, then closes itself.
+    wait_closed(&host, p.id);
+    let got = wait_got(&host, 1, "from /popup");
+    assert_eq!(got, "\"from /popup;\"");
+    assert!(!host.is_closed(1), "the opener stays");
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
+    let Some((host, cache)) = spawn("popup-agent") else {
+        return;
+    };
+    let (base, _) = serve();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+
+    // An eval opens it.
+    let opened = host.eval(1, "window.open('/stay') !== null", Duration::from_secs(5));
+    assert_eq!(opened, Ok("true".into()));
+    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert!(!p.from_input, "{p:?}");
+    assert_eq!((p.width, p.height), (200, 150), "the opener's size");
+
+    assert!(host.wait_loaded(p.id, Duration::from_secs(20)), "pop-up never loaded");
+    assert_eq!(host.eval(p.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert!(host.text(p.id, Duration::from_secs(5)).unwrap().contains("stay text"));
+    assert_eq!(host.view(p.id).unwrap().url, format!("{base}/stay"));
+    assert_eq!(
+        host.eval(p.id, "window.opener.postMessage('from the agent', '*'); 1", Duration::from_secs(5)),
+        Ok("1".into())
+    );
+    assert_eq!(wait_got(&host, 1, "agent"), "\"from the agent;\"");
+
+    // `window.close()` from an eval closes it.
+    host.eval(p.id, "window.close()", Duration::from_secs(5)).ok();
+    wait_closed(&host, p.id);
+
+    // Closing the opener closes the pop-ups it still has.
+    assert_eq!(host.eval(1, "window.open('/stay') !== null", Duration::from_secs(5)), Ok("true".into()));
+    let [q] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, 1);
+    wait_closed(&host, q.id);
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[test]

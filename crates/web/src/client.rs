@@ -73,6 +73,17 @@ pub struct ViewState {
     pub version: u64,
 }
 
+/// A pop-up the host made ([`Event::Popup`]), until the app takes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PopupInfo {
+    pub id: u64,
+    pub opener: u64,
+    pub url: String,
+    pub from_input: bool,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A page frame the app can hold onto: its shared mapping plus where in it the
 /// pixels are. The host may overwrite the slot two frames later; reading then
 /// fails rather than returning a torn frame (a newer one is on its way).
@@ -120,6 +131,10 @@ struct Shared {
     pending: HashMap<u64, u64>,
     /// Answers to pending requests, keyed by request id.
     replies: HashMap<u64, Event>,
+    /// Pop-ups not yet taken by their opener's view.
+    popups: Vec<PopupInfo>,
+    /// Pages the host closed and the app hasn't forgotten.
+    closed: std::collections::HashSet<u64>,
 }
 
 /// Requests waiting for the writer thread, so a host that stops reading never
@@ -276,8 +291,26 @@ impl WebHost {
 
     /// Drop local state for a closed browser.
     pub fn forget(&mut self, id: u64) {
-        self.shared.0.lock().unwrap().views.remove(&id);
+        let mut s = self.shared.0.lock().unwrap();
+        s.views.remove(&id);
+        s.closed.remove(&id);
+        s.popups.retain(|p| p.id != id && p.opener != id);
+        drop(s);
         self.readers.remove(&id);
+    }
+
+    /// Whether the host closed page `id` (see [`Event::Closed`]).
+    pub fn is_closed(&self, id: u64) -> bool {
+        self.shared.0.lock().unwrap().closed.contains(&id)
+    }
+
+    /// The pop-ups page `opener` opened since last asked, oldest first (some
+    /// may have closed since: see [`is_closed`](Self::is_closed)).
+    pub fn take_popups(&self, opener: u64) -> Vec<PopupInfo> {
+        let mut s = self.shared.0.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut s.popups).into_iter().partition(|p| p.opener == opener);
+        s.popups = rest;
+        mine
     }
 
     /// The latest frame of `id`.
@@ -508,8 +541,13 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             s.views.entry(id).or_default().error = Some(format!("{error} ({url})"));
         }
         Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
+        Event::Popup { id, opener, url, from_input, width, height } => {
+            s.views.entry(id).or_default().url.clone_from(&url);
+            s.popups.push(PopupInfo { id, opener, url, from_input, width, height });
+        }
         Event::Closed { id } => {
             s.views.remove(&id);
+            s.closed.insert(id);
         }
         Event::Failed { error } => s.failure = Some(error),
         reply @ (Event::Text { id, req, .. } | Event::EvalResult { id, req, .. }) => {
@@ -533,7 +571,8 @@ fn page_of(ev: &Event) -> Option<u64> {
         | Event::Loading { id, .. }
         | Event::Cursor { id, .. }
         | Event::LoadError { id, .. }
-        | Event::RendererGone { id, .. } => Some(*id),
+        | Event::RendererGone { id, .. }
+        | Event::Popup { id, .. } => Some(*id),
         _ => None,
     }
 }

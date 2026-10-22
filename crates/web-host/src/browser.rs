@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
-    eval_wrapper, Cursor, EditAction, Event, KeyKind, MouseAction, MouseButton, Request,
-    MAX_EVAL_RESULT,
+    eval_wrapper, Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, Request,
+    MAX_EVAL_RESULT, POPUP_IDS,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +52,24 @@ struct Entry {
     /// Keeps the DevTools observer that answers evals attached.
     _devtools: Option<Registration>,
     eval: EvalState,
+    /// The page that opened this one (a pop-up): it closes with it.
+    opener: Option<u64>,
+    /// When a `Mouse` press or a `Key` last reached the page.
+    input_at: Option<Instant>,
+}
+
+/// A pop-up opened within this of input reaching its opener answers that
+/// input (Chromium's user activation lasts as long), not an eval.
+const INPUT_ACTIVATION: Duration = Duration::from_secs(5);
+
+/// A pop-up between `on_before_popup` and `on_after_created`: its browser
+/// doesn't exist yet, so its requests wait here.
+struct PendingPopup {
+    view: SharedView,
+    opener: u64,
+    /// CEF's id for it, which `on_before_popup_aborted` names.
+    cef_id: c_int,
+    queued: Vec<Request>,
 }
 
 /// How a browser's DevTools session stands for evals.
@@ -78,6 +96,8 @@ thread_local! {
     /// Evals awaiting a DevTools reply, by message id.
     static EVALS: RefCell<HashMap<i32, PendingEval>> = RefCell::new(HashMap::new());
     static NEXT_MESSAGE: Cell<i32> = const { Cell::new(1) };
+    static PENDING: RefCell<HashMap<u64, PendingPopup>> = RefCell::new(HashMap::new());
+    static NEXT_POPUP: Cell<u64> = const { Cell::new(POPUP_IDS) };
 }
 
 /// The isolated world evals run in. One per document, created on first use:
@@ -237,6 +257,8 @@ fn evaluate(mut e: PendingEval, world: String) {
         "expression": expression,
         "uniqueContextId": world,
         "awaitPromise": true,
+        // Lets the script do what a click could (open a pop-up, ...).
+        "userGesture": true,
         "returnByValue": true,
         "silent": true,
     });
@@ -446,6 +468,21 @@ pub fn handle(req: Option<Request>) {
         shut_down();
         return;
     };
+    let req = match PENDING.with_borrow_mut(|m| match m.get_mut(&req_page(&req)) {
+        Some(p) => {
+            p.queued.push(req);
+            None
+        }
+        None => Some(req),
+    }) {
+        Some(req) => req,
+        None => return,
+    };
+    if let Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. }
+    | Request::Key { id, key: Key { kind: KeyKind::Down | KeyKind::Char, .. } } = &req
+    {
+        BROWSERS.with_borrow_mut(|m| m.get_mut(id).map(|e| e.input_at = Some(Instant::now())));
+    }
     match req {
         Request::Create {
             id,
@@ -549,6 +586,31 @@ pub fn handle(req: Option<Request>) {
     }
 }
 
+/// The page a request is for.
+fn req_page(req: &Request) -> u64 {
+    if let Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. }
+    | Request::Key { id, key: Key { kind: KeyKind::Down | KeyKind::Char, .. } } = &req
+    {
+        BROWSERS.with_borrow_mut(|m| m.get_mut(id).map(|e| e.input_at = Some(Instant::now())));
+    }
+    match req {
+        Request::Create { id, .. }
+        | Request::Close { id }
+        | Request::Navigate { id, .. }
+        | Request::Back { id }
+        | Request::Forward { id }
+        | Request::Reload { id }
+        | Request::Resize { id, .. }
+        | Request::Focus { id, .. }
+        | Request::Visible { id, .. }
+        | Request::Mouse { id, .. }
+        | Request::Key { id, .. }
+        | Request::Edit { id, .. }
+        | Request::Text { id, .. }
+        | Request::Eval { id, .. } => *id,
+    }
+}
+
 fn browser(id: u64) -> Option<Browser> {
     BROWSERS.with_borrow(|m| m.get(&id).map(|e| e.browser.clone()))
 }
@@ -579,7 +641,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
             let devtools = browser
                 .host()
                 .and_then(|h| h.add_dev_tools_message_observer(Some(&mut HostDevTools::new(id))));
-            let entry = Entry { browser, view, _devtools: devtools, eval: EvalState::default() };
+            let entry = Entry { browser, view, _devtools: devtools, eval: EvalState::default(), opener: None, input_at: None };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
         None => emit(&Event::LoadError {
@@ -628,6 +690,107 @@ fn browser_settings() -> BrowserSettings {
         // Opaque white, so pages without a background don't composite transparent.
         background_color: 0xFFFF_FFFF,
         ..Default::default()
+    }
+}
+
+/// Page `opener` is opening a pop-up: let CEF make it as an off-screen page
+/// of its own (so it keeps `window.opener`), announced as [`Event::Popup`].
+#[allow(clippy::too_many_arguments)]
+fn open_popup(
+    opener: u64,
+    cef_id: c_int,
+    url: String,
+    features: Option<&PopupFeatures>,
+    window_info: Option<&mut WindowInfo>,
+    client: Option<&mut Option<Client>>,
+    settings: Option<&mut BrowserSettings>,
+) -> bool {
+    let (Some(window_info), Some(client), Some(settings), Some(parent)) =
+        (window_info, client, settings, view(opener))
+    else {
+        return false;
+    };
+    let id = NEXT_POPUP.get();
+    NEXT_POPUP.set(id + 1);
+    let from_input = BROWSERS.with_borrow(|m| {
+        m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
+    });
+    let (width, height, scale) = {
+        let p = parent.borrow();
+        let size = |set: c_int, dip: c_int, own: u32| {
+            if set != 0 && dip > 0 {
+                (dip as f32 * p.scale).round() as u32
+            } else {
+                own
+            }
+        };
+        match features {
+            Some(f) => (size(f.width_set, f.width, p.width), size(f.height_set, f.height, p.height), p.scale),
+            None => (p.width, p.height, p.scale),
+        }
+    };
+    let view = new_view(id, width, height, scale);
+    *window_info = self::window_info();
+    *client = Some(new_client(id, &view));
+    *settings = browser_settings();
+    PENDING.with_borrow_mut(|m| {
+        m.insert(id, PendingPopup { view, opener, cef_id, queued: Vec::new() })
+    });
+    emit(&Event::Popup { id, opener, url, from_input, width: width.max(1), height: height.max(1) });
+    true
+}
+
+/// Pop-up `id`'s browser exists: serve it, hidden until the app shows it,
+/// and run the requests that waited for it.
+fn popup_created(id: u64, b: &Browser) {
+    let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&id)) else {
+        return;
+    };
+    let host = b.host();
+    if let Some(h) = &host {
+        h.was_hidden(1);
+    }
+    let devtools = host.as_ref().and_then(|h| h.add_dev_tools_message_observer(Some(&mut HostDevTools::new(id))));
+    let entry = Entry {
+        browser: b.clone(),
+        view: p.view,
+        _devtools: devtools,
+        eval: EvalState::default(),
+        opener: Some(p.opener),
+        input_at: None,
+    };
+    BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
+    // Its opener closed meanwhile, or the host is quitting.
+    if browser(p.opener).is_none() || QUITTING.get() {
+        if let Some(h) = &host {
+            h.close_browser(1);
+        }
+        return;
+    }
+    for req in p.queued {
+        handle(Some(req));
+    }
+}
+
+/// CEF dropped pop-up `cef_id` of page `opener` before making it.
+fn popup_aborted(opener: u64, cef_id: c_int) {
+    let id = PENDING.with_borrow_mut(|m| {
+        let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == cef_id).map(|(id, _)| *id)?;
+        m.remove(&id);
+        Some(id)
+    });
+    if let Some(id) = id {
+        emit(&Event::Closed { id });
+    }
+}
+
+/// Close the pop-ups page `id` opened (it is closing).
+fn close_popups(id: u64) {
+    let hosts: Vec<BrowserHost> = BROWSERS.with_borrow(|m| {
+        m.values().filter(|e| e.opener == Some(id)).filter_map(|e| e.browser.host()).collect()
+    });
+    for h in hosts {
+        h.close_browser(1);
     }
 }
 
@@ -935,31 +1098,41 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        /// A pop-up or new-window link opens as a page of its own, so it keeps
+        /// `window.opener`; the app decides where it shows.
         fn on_before_popup(
             &self,
-            browser: Option<&mut Browser>,
+            _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
-            _popup_id: c_int,
+            popup_id: c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
             _user_gesture: c_int,
-            _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>,
+            popup_features: Option<&PopupFeatures>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut c_int>,
         ) -> c_int {
-            // One page per surface (the pane system provides tabs): open popups and
-            // new-window links in place.
-            if let (Some(frame), Some(url)) = (browser.and_then(|b| b.main_frame()), target_url) {
-                frame.load_url(Some(url));
+            let url = string(target_url);
+            let made = open_popup(self.id, popup_id, url, popup_features, window_info, client, settings);
+            (!made) as c_int
+        }
+
+        fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: c_int) {
+            popup_aborted(self.id, popup_id);
+        }
+
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            if let Some(b) = browser {
+                popup_created(self.id, b);
             }
-            1
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            close_popups(self.id);
             fail_evals(self.id, "the page closed");
             let empty = BROWSERS.with_borrow_mut(|m| {
                 m.remove(&self.id);
