@@ -2,6 +2,16 @@
 //! bundle, where each runs from a helper app inside `Contents/Frameworks`.
 
 fn main() -> std::process::ExitCode {
+    let args = cef::args::Args::new();
+    // The sandbox must be entered before the CEF framework loads. It reads the
+    // process type from the command line and seals renderer and utility
+    // processes; it outlives `execute_process`.
+    #[cfg(target_os = "macos")]
+    let _sandbox = {
+        let mut sandbox = cef::sandbox::Sandbox::new();
+        sandbox.initialize(args.as_main_args());
+        sandbox
+    };
     #[cfg(target_os = "macos")]
     let _loader = {
         let exe = std::env::current_exe().expect("current exe");
@@ -12,7 +22,6 @@ fn main() -> std::process::ExitCode {
         loader
     };
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
-    let args = cef::args::Args::new();
     let code = cef::execute_process(
         Some(args.as_main_args()),
         None::<&mut cef::App>,

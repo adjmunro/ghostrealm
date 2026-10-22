@@ -125,7 +125,6 @@ fn main() -> ExitCode {
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
     let settings = Settings {
-        no_sandbox: 1,
         windowless_rendering_enabled: 1,
         root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
         cache_path: CefString::from(cache.join("profile").to_string_lossy().as_ref()),
