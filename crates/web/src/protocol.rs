@@ -258,8 +258,9 @@ pub const MAX_EVAL_RESULT: usize = 1 << 20;
 /// The expression the host evaluates for `js`. It settles to `[ok, payload]`:
 /// `[true, <JSON of the awaited value>]` (`null` for a value JSON can't
 /// encode as text), or `[false, <error message>]`. A payload over
-/// [`MAX_EVAL_RESULT`] UTF-16 units is replaced by an error in the page, so a
-/// huge value is never sent to the host.
+/// [`MAX_EVAL_RESULT`] UTF-16 code units is replaced by an error in the page,
+/// so a huge value is never sent to the host (which also caps the result at
+/// [`MAX_EVAL_RESULT`] bytes).
 ///
 /// The host runs it in an isolated JavaScript world: it shares the page's DOM
 /// but not its globals or prototypes, so the page's scripts can't replace what
@@ -272,7 +273,7 @@ pub fn eval_wrapper(js: &str) -> String {
     let max = MAX_EVAL_RESULT;
     format!(
         "(async () => {{ const out = (ok, s) => s.length > {max} \
-         ? [false, 'result too large (over {max} bytes)'] : [ok, s]; \
+         ? [false, 'result too large (over {max} UTF-16 code units)'] : [ok, s]; \
          try {{ const v = await (0, eval)({src}); \
          let s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = String(v); }} \
          return out(true, s === undefined ? 'null' : s); }} \
