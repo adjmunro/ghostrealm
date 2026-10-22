@@ -323,7 +323,8 @@ impl Plugin for WebPlugin {
                 "web.eval",
                 "Web: Evaluate JavaScript",
                 "Run JavaScript in a web page (after it loads) and return its JSON-encoded \
-                 result. It runs in the page's own context, so the page can change the result",
+                 result. It runs in an isolated world: it sees the page's DOM but not its \
+                 scripts' globals, and the page can't change the result",
             )
             .arg(ArgSpec::required(
                 "js",

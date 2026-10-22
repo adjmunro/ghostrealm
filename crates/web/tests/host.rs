@@ -1,6 +1,6 @@
 //! End-to-end against the real CEF host: a page loads, paints the expected
-//! pixels into the shared frame, answers text/eval requests, and hears each
-//! mouse button.
+//! pixels into the shared frame, answers text/eval requests (which a hostile
+//! page can't tamper with), and hears each mouse button.
 //!
 //! Needs the bundled host (`mise run web`); skipped when it isn't built.
 
@@ -81,20 +81,6 @@ fn page_paints_and_answers_text_and_eval() {
     );
     assert!(host.eval(1, "nope(", Duration::from_secs(5)).is_err());
 
-    // A second page floods the console with forged eval results; neither its
-    // own evals nor the first page's take them.
-    let forger = "data:text/html,<script>setInterval(() => { for (let i = 1; i < 50; i++) \
-                  console.log('\\u0001ghostrealm-eval\\u0001' + i + ' 1 \"pwned\"'); }, 1)</script>";
-    assert!(host.send(&Request::Create {
-        id: 2,
-        url: forger.into(),
-        width: 64,
-        height: 48,
-        scale: 1.0
-    }));
-    assert!(host.wait_loaded(2, Duration::from_secs(20)));
-    assert_eq!(host.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
-    assert_eq!(host.eval(2, "2 + 2", Duration::from_secs(5)), Ok("4".into()));
     let big = host.eval(1, "'x'.repeat(2 * 1024 * 1024)", Duration::from_secs(10));
     assert!(
         big.as_ref().is_err_and(|e| e.contains("too large")),
@@ -112,11 +98,12 @@ fn right_and_middle_presses_reach_the_page() {
         return;
     };
     // Logs each press event as `type:button:buttons` (moves only while a
-    // button is held).
+    // button is held) into the DOM, where evals (in their own world) read it.
     let url = "data:text/html,<body style='margin:0;height:100vh;background:rgb(255,0,0)'><script>window.log = [];\
                for (const t of ['mousedown', 'mouseup', 'mousemove', 'click', 'auxclick', 'contextmenu'])\
-               addEventListener(t, e => { if (t != 'mousemove' || e.buttons) \
-               log.push(t + ':' + e.button + ':' + e.buttons); }, true);</script>";
+               addEventListener(t, e => { if (t != 'mousemove' || e.buttons) { \
+               log.push(t + ':' + e.button + ':' + e.buttons); \
+               document.body.dataset.log = log.join(' '); } }, true);</script>";
     assert!(host.send(&Request::Create {
         id: 1,
         url: url.into(),
@@ -150,7 +137,7 @@ fn right_and_middle_presses_reach_the_page() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let log = loop {
-        let log = host.eval(1, "log.join(' ')", Duration::from_secs(5)).expect("read the log");
+        let log = host.eval(1, "document.body.dataset.log || ''", Duration::from_secs(5)).expect("read the log");
         if log.matches("auxclick").count() == 2 || Instant::now() > deadline {
             break log;
         }
@@ -179,6 +166,87 @@ fn right_and_middle_presses_reach_the_page() {
         ],
         "{log}"
     );
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// `html` as a `data:` URL.
+fn data_url(html: &str) -> String {
+    format!("data:text/html,{}", html.replace('%', "%25").replace('#', "%23"))
+}
+
+/// A page that replaces the globals and prototypes an eval would use, forbids
+/// `eval` by CSP, and records in the DOM whether it can see an eval's globals.
+const HOSTILE: &str = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'unsafe-inline'">
+<title>Hostile</title><p id="p">dom text</p><script>
+window.secret = 'page global';
+setInterval(() => { document.body.dataset.seen = typeof window.agentVar; }, 5);
+const lie = () => '"lie"';
+JSON.stringify = lie;
+JSON.parse = lie;
+console.log = lie;
+window.eval = lie;
+window.String = lie;
+Object.prototype.toJSON = function () { return 'lie'; };
+Array.prototype.map = function () { return ['lie']; };
+Array.prototype.join = lie;
+Promise.prototype.then = function () { return Promise.resolve('lie'); };
+Object.defineProperty(Error.prototype, 'stack', { get: lie });
+Error.prototype.toString = lie;
+Function.prototype.toString = lie;
+document.body.dataset.tampered = 'yes';
+</script>"#;
+
+#[test]
+fn a_hostile_page_cannot_shape_eval_results() {
+    let Some((host, cache)) = spawn("hostile") else {
+        return;
+    };
+    assert!(host.send(&Request::Create {
+        id: 1,
+        url: data_url(HOSTILE),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let eval = |js: &str| host.eval(1, js, Duration::from_secs(5));
+
+    // The page's own world really is tampered with.
+    assert_eq!(eval("document.body.dataset.tampered"), Ok("\"yes\"".into()));
+    assert_eq!(eval("document.body.dataset.seen"), Ok("\"undefined\"".into()));
+
+    // The DOM is shared.
+    assert_eq!(eval("document.title"), Ok("\"Hostile\"".into()));
+    assert_eq!(eval("document.querySelector('#p').textContent"), Ok("\"dom text\"".into()));
+    // Globals, prototypes and the encoding are not.
+    assert_eq!(eval("({ a: [1, 2].map(x => x * 2), s: String(3) })"), Ok(r#"{"a":[2,4],"s":"3"}"#.into()));
+    assert_eq!(eval("[1, 2].join('-')"), Ok("\"1-2\"".into()));
+    assert_eq!(eval("Promise.resolve(5).then(x => x + 1)"), Ok("6".into()));
+    assert_eq!(eval("JSON.parse('[1]')"), Ok("[1]".into()));
+    assert_eq!(eval("typeof secret"), Ok("\"undefined\"".into()));
+    assert_eq!(eval("let a = 1; a + 1"), Ok("2".into()), "statement lists still run");
+    let err = eval("throw new Error('boom')").unwrap_err();
+    assert!(err.contains("Error: boom"), "{err}");
+    assert!(eval("nope(").unwrap_err().contains("SyntaxError"));
+
+    // An eval's globals persist for the document, unseen by the page.
+    assert_eq!(eval("window.agentVar = 7"), Ok("7".into()));
+    assert_eq!(eval("agentVar"), Ok("7".into()));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(eval("document.body.dataset.seen"), Ok("\"undefined\"".into()));
+
+    // A new document gets a new world.
+    host.expect_load(1);
+    assert!(host.send(&Request::Navigate {
+        id: 1,
+        url: data_url(&HOSTILE.replace("Hostile", "Second")),
+    }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "second page never loaded");
+    assert_eq!(eval("document.title"), Ok("\"Second\"".into()));
+    assert_eq!(eval("typeof agentVar"), Ok("\"undefined\"".into()));
+    assert_eq!(eval("[3].map(x => x + 1)"), Ok("[4]".into()));
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);

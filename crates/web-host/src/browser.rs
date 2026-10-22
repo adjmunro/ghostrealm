@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
-    eval_wrapper, parse_eval_message, Cursor, EditAction, Event, KeyKind, MouseAction, MouseButton,
-    Request, MAX_EVAL_RESULT,
+    eval_wrapper, Cursor, EditAction, Event, KeyKind, MouseAction, MouseButton, Request,
+    MAX_EVAL_RESULT,
 };
+use serde_json::{json, Value};
 
 use crate::emit;
 
@@ -48,89 +49,233 @@ type SharedView = std::rc::Rc<RefCell<View>>;
 struct Entry {
     browser: Browser,
     view: SharedView,
+    /// Keeps the DevTools observer that answers evals attached.
+    _devtools: Option<Registration>,
+    eval: EvalState,
+}
+
+/// How a browser's DevTools session stands for evals.
+#[derive(Default)]
+struct EvalState {
+    /// `Runtime.enable` succeeded, so context events arrive.
+    runtime: bool,
+    /// The `uniqueId` of the eval world in the current document.
+    world: Option<String>,
+    /// Eval worlds announced by `Runtime.executionContextCreated`, newest last:
+    /// `(executionContextId, uniqueId)`.
+    created: Vec<(i64, String)>,
 }
 
 thread_local! {
     static BROWSERS: RefCell<HashMap<u64, Entry>> = RefCell::new(HashMap::new());
     /// Set once the app hung up: quit the message loop when the last browser closes.
     static QUITTING: Cell<bool> = const { Cell::new(false) };
-    /// Evals awaiting their result, by nonce.
-    static EVALS: RefCell<HashMap<String, PendingEval>> = RefCell::new(HashMap::new());
+    /// Evals awaiting a DevTools reply, by message id.
+    static EVALS: RefCell<HashMap<i32, PendingEval>> = RefCell::new(HashMap::new());
+    static NEXT_MESSAGE: Cell<i32> = const { Cell::new(1) };
 }
 
-/// An eval the host started: only a result carrying its nonce, from its page,
-/// answers it.
+/// The isolated world evals run in. One per document, created on first use:
+/// it shares the page's DOM but none of its scripts' globals or prototypes.
+const EVAL_WORLD: &str = "ghostrealm-eval";
+
+/// An eval in flight: its DevTools steps run in order, each answered through
+/// [`HostDevTools`].
 struct PendingEval {
     id: u64,
     req: u64,
+    js: String,
     started: Instant,
+    step: Step,
+    /// The cached world was gone (the page navigated); it was recreated once.
+    retried: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// `Runtime.enable`, so the world's context (and its `uniqueId`) is reported.
+    Enable,
+    /// `Page.getFrameTree`, for the main frame's DevTools id.
+    FrameTree,
+    /// `Page.createIsolatedWorld`.
+    World,
+    /// `Runtime.evaluate` in the world.
+    Evaluate,
 }
 
 /// An eval whose promise hasn't settled by now is forgotten (the app gave up
 /// long before).
 const EVAL_TTL: Duration = Duration::from_secs(60);
 
-/// 128 random bits as hex, from the std hasher's per-process random keys.
-fn nonce() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let half = |salt: u64| {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(n);
-        h.write_u64(salt);
-        h.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default(),
-        );
-        h.finish()
-    };
-    format!("{:016x}{:016x}", half(0), half(1))
+/// Eval worlds remembered from context events, per browser.
+const CREATED_MAX: usize = 8;
+
+fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T> {
+    BROWSERS.with_borrow_mut(|m| m.get_mut(&id).map(|e| f(&mut e.eval)))
 }
 
-/// Start evaluating `js` in `frame` for request `req` of page `id`.
-fn start_eval(id: u64, req: u64, js: &str, frame: &Frame) {
-    let nonce = nonce();
-    EVALS.with_borrow_mut(|m| {
-        m.retain(|_, e| e.started.elapsed() < EVAL_TTL);
-        m.insert(
-            nonce.clone(),
-            PendingEval {
-                id,
-                req,
-                started: Instant::now(),
-            },
-        );
-    });
-    frame.execute_java_script(
-        Some(&CefString::from(eval_wrapper(&nonce, js).as_str())),
-        Some(&CefString::from("ghostrealm://eval")),
-        1,
+/// Start evaluating `js` in page `id` for request `req`.
+///
+/// It runs in an isolated world addressed by its `uniqueId`, which (unlike an
+/// `executionContextId`) can't name a context in another renderer process
+/// after a navigation, so the script never lands in the page's own world.
+fn start_eval(id: u64, req: u64, js: String) {
+    EVALS.with_borrow_mut(|m| m.retain(|_, e| e.started.elapsed() < EVAL_TTL));
+    let Some((runtime, world)) = with_eval_state(id, |s| (s.runtime, s.world.clone())) else {
+        emit(&Event::EvalResult { id, req, ok: false, value: format!("unknown browser {id}") });
+        return;
+    };
+    let e = PendingEval { id, req, js, started: Instant::now(), step: Step::Enable, retried: false };
+    match (runtime, world) {
+        (_, Some(world)) => evaluate(e, &world),
+        (true, None) => frame_tree(e),
+        (false, None) => devtools(e, Step::Enable, "Runtime.enable", json!({})),
+    }
+}
+
+fn frame_tree(e: PendingEval) {
+    devtools(e, Step::FrameTree, "Page.getFrameTree", json!({}));
+}
+
+fn evaluate(e: PendingEval, world: &str) {
+    let expression = eval_wrapper(&e.js);
+    devtools(
+        e,
+        Step::Evaluate,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "uniqueContextId": world,
+            "awaitPromise": true,
+            "returnByValue": true,
+            "silent": true,
+        }),
     );
 }
 
-/// A console message from page `id`: report it if it is the result of one of
-/// our evals on that page. Returns whether it was an eval result (forged or
-/// not), so it is kept out of the page's console.
-fn eval_result(id: u64, message: &str) -> bool {
-    let Some((nonce, ok, payload)) = parse_eval_message(message) else {
-        return false;
+/// Send one DevTools method for `e`'s next step.
+fn devtools(mut e: PendingEval, step: Step, method: &str, params: Value) {
+    let Some(host) = browser(e.id).and_then(|b| b.host()) else {
+        return finish(&e, false, "the page closed".into());
     };
-    let pending = EVALS.with_borrow_mut(|m| match m.get(nonce) {
-        Some(e) if e.id == id => m.remove(nonce),
+    let msg = NEXT_MESSAGE.get();
+    NEXT_MESSAGE.set(msg.checked_add(1).unwrap_or(1));
+    let line = json!({ "id": msg, "method": method, "params": params }).to_string();
+    e.step = step;
+    let (id, req) = (e.id, e.req);
+    EVALS.with_borrow_mut(|m| m.insert(msg, e));
+    if host.send_dev_tools_message(Some(line.as_bytes())) == 0 {
+        EVALS.with_borrow_mut(|m| m.remove(&msg));
+        emit(&Event::EvalResult { id, req, ok: false, value: "DevTools refused the eval".into() });
+    }
+}
+
+fn finish(e: &PendingEval, ok: bool, value: String) {
+    let (ok, value) = if value.len() > MAX_EVAL_RESULT {
+        (false, format!("result too large ({} bytes, max {MAX_EVAL_RESULT})", value.len()))
+    } else {
+        (ok, value)
+    };
+    emit(&Event::EvalResult { id: e.id, req: e.req, ok, value });
+}
+
+/// The reply to DevTools message `msg` on page `id`: advance its eval.
+fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
+    let pending = EVALS.with_borrow_mut(|m| match m.get(&msg) {
+        Some(e) if e.id == id => m.remove(&msg),
         _ => None,
     });
-    if let Some(e) = pending {
-        let (ok, value) = if payload.len() > MAX_EVAL_RESULT {
-            (false, format!("result too large ({} bytes, max {MAX_EVAL_RESULT})", payload.len()))
-        } else {
-            (ok, payload.to_string())
-        };
-        emit(&Event::EvalResult { id, req: e.req, ok, value });
+    let Some(mut e) = pending else { return };
+    let v: Value = serde_json::from_slice(result).unwrap_or(Value::Null);
+    if !success {
+        if e.step == Step::Evaluate && !e.retried {
+            // The world went with its document: make a new one.
+            e.retried = true;
+            with_eval_state(id, |s| s.world = None);
+            return frame_tree(e);
+        }
+        let message = v["message"].as_str().unwrap_or("DevTools call failed");
+        return finish(&e, false, message.to_string());
     }
-    true
+    match e.step {
+        Step::Enable => {
+            with_eval_state(id, |s| s.runtime = true);
+            frame_tree(e);
+        }
+        Step::FrameTree => match v["frameTree"]["frame"]["id"].as_str() {
+            Some(frame) => {
+                let params = json!({ "frameId": frame, "worldName": EVAL_WORLD });
+                devtools(e, Step::World, "Page.createIsolatedWorld", params);
+            }
+            None => finish(&e, false, "the page has no main frame".into()),
+        },
+        Step::World => {
+            let context = v["executionContextId"].as_i64();
+            let world = with_eval_state(id, |s| {
+                let unique = s
+                    .created
+                    .iter()
+                    .rev()
+                    .find(|(c, _)| Some(*c) == context)
+                    .map(|(_, u)| u.clone());
+                s.world.clone_from(&unique);
+                unique
+            })
+            .flatten();
+            match world {
+                Some(world) => evaluate(e, &world),
+                None => finish(&e, false, "the isolated world did not start".into()),
+            }
+        }
+        Step::Evaluate => {
+            if let Some(ex) = v.get("exceptionDetails") {
+                let message = ex["exception"]["description"].as_str().or(ex["text"].as_str());
+                return finish(&e, false, message.unwrap_or("eval failed").to_string());
+            }
+            match v["result"]["value"].as_array().map(Vec::as_slice) {
+                Some([Value::Bool(ok), Value::String(payload)]) => finish(&e, *ok, payload.clone()),
+                _ => finish(&e, false, "eval returned no result".into()),
+            }
+        }
+    }
+}
+
+/// A DevTools event on page `id`: track the eval world's context.
+fn devtools_event(id: u64, method: &str, params: &[u8]) {
+    let context_event = matches!(
+        method,
+        "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared"
+    );
+    if !context_event {
+        return;
+    }
+    let v: Value = serde_json::from_slice(params).unwrap_or(Value::Null);
+    with_eval_state(id, |s| match method {
+        "Runtime.executionContextCreated" => {
+            let c = &v["context"];
+            if let (Some(EVAL_WORLD), Some(ctx), Some(unique)) =
+                (c["name"].as_str(), c["id"].as_i64(), c["uniqueId"].as_str())
+            {
+                if s.created.len() == CREATED_MAX {
+                    s.created.remove(0);
+                }
+                s.created.push((ctx, unique.to_string()));
+            }
+        }
+        "Runtime.executionContextDestroyed" => {
+            let gone = v["executionContextUniqueId"].as_str();
+            if gone.is_some() && s.world.as_deref() == gone {
+                s.world = None;
+            }
+            s.created.retain(|(_, u)| Some(u.as_str()) != gone);
+        }
+        _ => {
+            s.world = None;
+            s.created.clear();
+        }
+    });
 }
 
 /// Run one request (or, for `None`, the app's hang-up) on the UI thread.
@@ -238,15 +383,7 @@ pub fn handle(req: Option<Request>) {
                 text: String::new(),
             }),
         },
-        Request::Eval { id, req, js } => match browser(id).and_then(|b| b.main_frame()) {
-            Some(frame) => start_eval(id, req, &js, &frame),
-            None => emit(&Event::EvalResult {
-                id,
-                req,
-                ok: false,
-                value: format!("unknown browser {id}"),
-            }),
-        },
+        Request::Eval { id, req, js } => start_eval(id, req, js),
     }
 }
 
@@ -301,7 +438,11 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
     );
     match created {
         Some(browser) => {
-            BROWSERS.with_borrow_mut(|m| m.insert(id, Entry { browser, view }));
+            let devtools = browser
+                .host()
+                .and_then(|h| h.add_dev_tools_message_observer(Some(&mut HostDevTools::new(id))));
+            let entry = Entry { browser, view, _devtools: devtools, eval: EvalState::default() };
+            BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
         None => emit(&Event::LoadError {
             id,
@@ -565,17 +706,6 @@ wrap_display_handler! {
             emit(&Event::Cursor { id: self.id, cursor: cursor_kind(type_) });
             1
         }
-
-        fn on_console_message(
-            &self,
-            _browser: Option<&mut Browser>,
-            _level: LogSeverity,
-            message: Option<&CefString>,
-            _source: Option<&CefString>,
-            _line: c_int,
-        ) -> c_int {
-            eval_result(self.id, &string(message)) as c_int
-        }
     }
 }
 
@@ -712,6 +842,28 @@ wrap_client! {
     }
 }
 
+wrap_dev_tools_message_observer! {
+    struct HostDevTools {
+        id: u64,
+    }
+
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_id: c_int,
+            success: c_int,
+            result: Option<&[u8]>,
+        ) {
+            devtools_result(self.id, message_id, success != 0, result.unwrap_or_default());
+        }
+
+        fn on_dev_tools_event(&self, _browser: Option<&mut Browser>, method: Option<&CefString>, params: Option<&[u8]>) {
+            devtools_event(self.id, &string(method), params.unwrap_or_default());
+        }
+    }
+}
+
 wrap_string_visitor! {
     struct TextVisitor {
         id: u64,
@@ -727,14 +879,7 @@ wrap_string_visitor! {
 
 #[cfg(test)]
 mod tests {
-    use super::{blit, nonce};
-
-    #[test]
-    fn nonces_are_long_and_distinct() {
-        let (a, b) = (nonce(), nonce());
-        assert_eq!(a.len(), 32);
-        assert_ne!(a, b);
-    }
+    use super::blit;
 
     #[test]
     fn blit_clips_to_the_destination() {

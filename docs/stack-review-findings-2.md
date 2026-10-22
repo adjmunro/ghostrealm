@@ -40,13 +40,6 @@ against `f59386c`.
 
 ### Low
 
-18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
-    its result (by replacing `console.log`, `eval` or `JSON.stringify`); the
-    command's description says so. Decision needed: evaluate in an isolated
-    world instead?
-    **Decided:** yes, an isolated world (HIGH priority within the web work; an
-    agent-driven browser is a prompt-injection and misuse risk). Tracked in
-    TODO.md.
 19. **Every ghostrealm process shares one web profile**
     (`~/Library/Caches/ghostrealm/web`), so a second process (another GUI, or
     `ghostrealm agent` running `web.new`) can't start its host; the pane (and the

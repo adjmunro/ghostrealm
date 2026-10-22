@@ -1080,32 +1080,6 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] PRIORITY (web): isolated-world `web.eval`
-
-- Requires: NO BLOCKERS (a CEF render-process handler)
-- Detail: `web.eval` runs in the page's main JavaScript world, so a page can
-  redefine functions (`console.log`, `eval`, `JSON.stringify`) and lie to the
-  agent about what it finds. Run it in an isolated world, as Chrome extension
-  content scripts do; in CEF that needs a render-process handler. Priority:
-  high within the web work, after some quality-of-life items. See
-  [stack-review-findings-2.md](stack-review-findings-2.md) item 18.
-- Context: an agent-driven browser is a prompt-injection and malicious-use risk.
-  The owner asked whether agents mostly browse localhost. They will often open
-  localhost dev servers, but also docs, GitHub, and search results, which are
-  arbitrary content, so the risk stands.
-- Owner, verbatim:
-  > Okay, it sounds like we need to put this isolated world thing on the to-do
-  > as a fairly high priority for the sake of security. High priority in terms
-  > of web stuff, although maybe some quality of life stuff will try and come
-  > before that. Mainly because agents can control the browsers and therefore
-  > there is clearly a prompt injection risk or a malicious use case risk.
-  > Having said that, we are most likely going to be running localhost stuff
-  > when we're doing stuff in the browser, right? Most of the time? Maybe not.
-  > I'm not sure, actually.
-- Reason: the agent must be able to trust what it reads back from a page.
-
----
-
 [2026-10-13T20:45+1300@6bc650f] Web — pop-ups: floating window for humans, hidden for agents
 
 - Requires: NO BLOCKERS

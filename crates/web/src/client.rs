@@ -330,8 +330,8 @@ impl WebHost {
         }
     }
 
-    /// Evaluate `js` in the main frame. `Ok` carries the JSON-encoded value,
-    /// which the page can shape (see [`eval_wrapper`]).
+    /// Evaluate `js` in the main frame, isolated from the page's scripts (see
+    /// [`eval_wrapper`]). `Ok` carries the JSON-encoded value.
     ///
     /// [`eval_wrapper`]: crate::protocol::eval_wrapper
     pub fn eval(&self, id: u64, js: &str, timeout: Duration) -> Result<String, String> {

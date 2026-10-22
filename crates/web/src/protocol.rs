@@ -149,7 +149,8 @@ pub enum Request {
         id: u64,
         req: u64,
     },
-    /// Evaluate JavaScript in the main frame; answered by [`Event::EvalResult`].
+    /// Evaluate JavaScript in the main frame, in a world isolated from the
+    /// page's scripts (see [`eval_wrapper`]); answered by [`Event::EvalResult`].
     /// The expression may return a promise; its settled value is reported.
     Eval {
         id: u64,
@@ -244,41 +245,26 @@ pub enum Event {
     },
 }
 
-/// The console-message prefix the host's eval wrapper logs results under,
-/// followed by the request's nonce. The host swallows these; pages never see them
-/// in their console.
-pub const EVAL_MARKER: &str = "\u{1}ghostrealm-eval\u{1}";
-
 /// The longest eval result the host passes on; longer ones fail.
 pub const MAX_EVAL_RESULT: usize = 1 << 20;
 
-/// Wrap `js` so its (awaited) value is reported back as a console message:
-/// `EVAL_MARKER <nonce> <ok:0|1> <payload>`. `nonce` must be unguessable and
-/// used once: it is what tells the host's own result from a page's log line.
+/// The expression the host evaluates for `js`. It settles to `[ok, payload]`:
+/// `[true, <JSON of the awaited value>]` (`null` for a value JSON can't
+/// encode as text), or `[false, <error message>]`.
 ///
-/// The wrapper runs in the page's own JavaScript world, so the page can shape
-/// the result (by replacing `console.log`, `eval` or `JSON.stringify`): treat it
-/// as page-controlled data.
-pub fn eval_wrapper(nonce: &str, js: &str) -> String {
+/// The host runs it in an isolated JavaScript world: it shares the page's DOM
+/// but not its globals or prototypes, so the page can't replace what it calls
+/// (`eval`, `JSON.stringify`, `Promise`, ...) or how the value encodes.
+pub fn eval_wrapper(js: &str) -> String {
     // The source is embedded as a JSON string and run through indirect eval so
     // both expressions and statement lists work.
     let src = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".into());
-    let marker = serde_json::to_string(&format!("{EVAL_MARKER}{nonce}")).unwrap_or_default();
     format!(
-        "(async () => {{ const m = {marker}; try {{ const v = await (0, eval)({src}); \
+        "(async () => {{ try {{ const v = await (0, eval)({src}); \
          let s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = String(v); }} \
-         console.log(m + ' 1 ' + (s === undefined ? 'null' : s)); }} \
-         catch (e) {{ console.log(m + ' 0 ' + String(e && e.stack || e)); }} }})();"
+         return [true, s === undefined ? 'null' : s]; }} \
+         catch (e) {{ return [false, String(e && e.stack || e)]; }} }})()"
     )
-}
-
-/// Parse a console message produced by [`eval_wrapper`] into
-/// `(nonce, ok, payload)`. `None` for anything else.
-pub fn parse_eval_message(msg: &str) -> Option<(&str, bool, &str)> {
-    let rest = msg.strip_prefix(EVAL_MARKER)?;
-    let (nonce, rest) = rest.split_once(' ')?;
-    let (ok, payload) = rest.split_once(' ').unwrap_or((rest, ""));
-    Some((nonce, ok == "1", payload))
 }
 
 #[cfg(test)]
@@ -324,21 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn eval_message_parses_and_rejects_page_logs() {
-        let msg = format!("{EVAL_MARKER}n0nce 1 {{\"a\":1}}");
-        assert_eq!(parse_eval_message(&msg), Some(("n0nce", true, "{\"a\":1}")));
-        assert_eq!(parse_eval_message("n0nce 1 hello"), None);
-        let err = format!("{EVAL_MARKER}abc 0 ReferenceError: x");
-        assert_eq!(
-            parse_eval_message(&err),
-            Some(("abc", false, "ReferenceError: x"))
-        );
-    }
-
-    #[test]
-    fn eval_wrapper_embeds_source_and_nonce_as_string_literals() {
-        let w = eval_wrapper("f00d", "document.title = \"x\"; 1 + 1");
-        assert!(w.contains(r#""document.title = \"x\"; 1 + 1""#), "{w}");
-        assert!(w.contains("ghostrealm-eval\\u0001f00d\""), "{w}");
+    fn eval_wrapper_embeds_source_as_a_string_literal() {
+        let w = eval_wrapper("document.title = \"x\"; 1 + 1");
+        assert!(w.contains(r#"(0, eval)("document.title = \"x\"; 1 + 1")"#), "{w}");
     }
 }
