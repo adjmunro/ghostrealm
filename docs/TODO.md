@@ -1020,24 +1020,17 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Web — enable the Chromium sandbox
+[2026-10-13T20:45+1300@6bc650f] Web — verify the Chromium sandbox on Linux
 
-- Requires: NO BLOCKERS
-- Detail: Decided (DECISION.md, Web surface / security): enable the sandbox, with
-  no runtime flag to turn it off (add one only if debugging ever needs it).
-  Work: link `cef_sandbox` into the macOS helper bundles (the host passes
-  `no_sandbox: 1`, `crates/web-host/src/main.rs`); on Linux use Chromium's
-  setuid or namespace sandbox. Verify pages still load and the helpers still
-  launch with the bundle layout. See
-  [stack-review-findings-2.md](stack-review-findings-2.md) item 21.
-- Owner, verbatim:
-  > Definitely, I think, turn on the Chromium sandbox. I'm not even sure if we
-  > should have the ability to turn it off. If we need to turn it off in the
-  > future, maybe we can just program it to be able to turn off then. I don't
-  > think we need to have a flag or anything for this. No real advantage to
-  > turning it off, except for maybe debugging.
-- Reason: a renderer exploit otherwise runs with the user's rights; the browser
-  loads arbitrary pages and agents drive it.
+- Requires: a Linux machine
+- Detail: The host no longer passes `no_sandbox` (DECISION.md, Web surface /
+  security), so on Linux Chromium needs unprivileged user namespaces or a
+  setuid-root `chrome-sandbox` in the bundle directory; without either it
+  refuses to start. The bundler copies `chrome-sandbox` but does not make it
+  setuid. Check that the host starts and pages load (`cargo test -p
+  ghostrealm-web --test host`), and decide how the setuid helper is installed
+  where user namespaces are restricted (e.g. Ubuntu's AppArmor policy).
+- Reason: only the macOS sandbox has been verified.
 
 ---
 

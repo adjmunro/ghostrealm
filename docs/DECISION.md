@@ -126,7 +126,7 @@
 
 - Category: Web surface / security
 - Detail: Chromium's sandbox is enabled for every web-host process. There is no runtime flag to turn it off; add one only if debugging ever needs it.
-- Detail: Needs `cef_sandbox` linked into the macOS helper bundles, and Chromium's setuid or namespace sandbox on Linux. Work tracked in TODO.md ("Web — enable the Chromium sandbox").
+- Detail: On macOS each helper process enters the sandbox (`libcef_sandbox.dylib`, `cef::sandbox::Sandbox`) before loading the CEF framework. On Linux Chromium uses its own namespace sandbox, or the setuid `chrome-sandbox` beside the host when user namespaces are unavailable; TODO.md tracks verifying it ("Web — verify the Chromium sandbox on Linux").
 - Reason: a renderer exploit otherwise runs with the user's rights (files, SSH keys, the app's shells), and the agent-driven browser loads arbitrary pages. Owner, verbatim: "Definitely, I think, turn on the Chromium sandbox. I'm not even sure if we should have the ability to turn it off. If we need to turn it off in the future, maybe we can just program it to be able to turn off then. I don't think we need to have a flag or anything for this. No real advantage to turning it off, except for maybe debugging."
 
 ---

@@ -38,19 +38,6 @@ Found reviewing `8a77896..d34d7fa` (the web browser `0c67045`/`35e68b9`/`04794e1
 and the file-browser preview `3f58197`/`b6e3944`/`d34d7fa`). Line numbers are
 against `f59386c`.
 
-### High
-
-#### 21. Chromium runs without its sandbox
-
-- Where: `no_sandbox: 1` ([`web-host/src/main.rs:113`](../crates/web-host/src/main.rs)),
-  for every process. Recorded in DECISION.md as an open risk.
-- Effect: a renderer exploit runs with the user's full rights (files, SSH keys,
-  and the app's shells).
-- Decision needed: ship before sandboxing, or enable it (`cef_sandbox` in the
-  macOS helpers, the setuid/namespace sandbox on Linux)?
-- **Decided:** enable it, with no runtime flag to turn it off. See DECISION.md
-  (Web surface / security); work tracked in TODO.md.
-
 ### Low
 
 18. **`web.eval` runs in the page's JavaScript world**, so the page can shape
