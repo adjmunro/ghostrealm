@@ -562,35 +562,10 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
         resize(id, width, height, scale);
         return;
     }
-    let view: SharedView = std::rc::Rc::new(RefCell::new(View {
-        width: width.max(1),
-        height: height.max(1),
-        scale: if scale > 0.0 { scale } else { 1.0 },
-        frames: FrameWriter::for_page(crate::frame_dir(), id),
-        page: Vec::new(),
-        page_w: 0,
-        page_h: 0,
-        popup: None,
-    }));
-    let mut client = HostClient::new(
-        HostRender::new(view.clone(), id),
-        HostDisplay::new(id),
-        HostLoad::new(id),
-        HostLifeSpan::new(id),
-        HostContextMenu::new(),
-        HostRequests::new(id),
-    );
-    let window_info = WindowInfo {
-        windowless_rendering_enabled: 1,
-        runtime_style: RuntimeStyle::ALLOY,
-        ..Default::default()
-    };
-    let settings = BrowserSettings {
-        windowless_frame_rate: 60,
-        // Opaque white, so pages without a background don't composite transparent.
-        background_color: 0xFFFF_FFFF,
-        ..Default::default()
-    };
+    let view = new_view(id, width, height, scale);
+    let mut client = new_client(id, &view);
+    let window_info = window_info();
+    let settings = browser_settings();
     let created = browser_host_create_browser_sync(
         Some(&window_info),
         Some(&mut client),
@@ -612,6 +587,47 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
             url: url.to_string(),
             error: "failed to create browser".into(),
         }),
+    }
+}
+
+fn new_view(id: u64, width: u32, height: u32, scale: f32) -> SharedView {
+    std::rc::Rc::new(RefCell::new(View {
+        width: width.max(1),
+        height: height.max(1),
+        scale: if scale > 0.0 { scale } else { 1.0 },
+        frames: FrameWriter::for_page(crate::frame_dir(), id),
+        page: Vec::new(),
+        page_w: 0,
+        page_h: 0,
+        popup: None,
+    }))
+}
+
+fn new_client(id: u64, view: &SharedView) -> Client {
+    HostClient::new(
+        HostRender::new(view.clone(), id),
+        HostDisplay::new(id),
+        HostLoad::new(id),
+        HostLifeSpan::new(id),
+        HostContextMenu::new(),
+        HostRequests::new(id),
+    )
+}
+
+fn window_info() -> WindowInfo {
+    WindowInfo {
+        windowless_rendering_enabled: 1,
+        runtime_style: RuntimeStyle::ALLOY,
+        ..Default::default()
+    }
+}
+
+fn browser_settings() -> BrowserSettings {
+    BrowserSettings {
+        windowless_frame_rate: 60,
+        // Opaque white, so pages without a background don't composite transparent.
+        background_color: 0xFFFF_FFFF,
+        ..Default::default()
     }
 }
 
