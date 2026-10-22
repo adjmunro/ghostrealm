@@ -102,6 +102,9 @@ struct PendingEval {
     world: Option<String>,
     /// It found its world stale and was started again once.
     retried: bool,
+    /// Making its world failed (a navigation can cut it off) and was started
+    /// again once. No script has run, so that is safe.
+    remade: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,6 +160,7 @@ fn start_eval(id: u64, req: u64, js: String) {
         step: Step::Enable,
         world: None,
         retried: false,
+        remade: false,
     };
     run(e);
 }
@@ -302,6 +306,9 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
     match e.step {
         // Runtime is off, or will be; the world is what matters.
         Step::Disable => {
+            if e.world.is_none() && !e.remade {
+                return remake(e);
+            }
             let waiting = with_eval_state(id, |s| {
                 s.creating = false;
                 s.world.clone_from(&e.world);
@@ -327,6 +334,9 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
                     }
                 });
                 return run(e);
+            }
+            if e.step != Step::Evaluate && !e.remade {
+                return remake(e);
             }
             fail(e, message);
         }
@@ -357,6 +367,15 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
             }
         }
     }
+}
+
+/// Make the world again for `e`, which was making it; the evals waiting for
+/// it keep waiting.
+fn remake(mut e: PendingEval) {
+    e.remade = true;
+    e.world = None;
+    with_eval_state(e.id, |s| s.created.clear());
+    devtools(e, Step::Enable, "Runtime.enable", json!({}));
 }
 
 /// Fail every eval of page `id` with `error` and forget its world.
