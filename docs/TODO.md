@@ -1270,3 +1270,15 @@
   would have to be requested per call and marked as such.
 - Reason: isolation is the safe default, but app-state debugging needs page
   globals.
+
+---
+
+[2026-10-23@e32ebd4] Web — JS dialogs hang the page
+
+- Requires: decisions-pending.md item 5 ("Web downloads, uploads, and JS
+  dialogs")
+- Detail: The host has no `JsDialogHandler`, so a page calling `alert()`,
+  `confirm()` or `prompt()` waits forever for an answer nothing gives: evals
+  and navigations on it stall. How dialogs are answered (shown to a human,
+  auto-dismissed and reported to an agent) waits on that decision.
+- Reason: a page must not be able to freeze its pane or the agent driving it.
