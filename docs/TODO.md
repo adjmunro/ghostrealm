@@ -1020,16 +1020,19 @@
 
 ---
 
-[2026-10-13T20:45+1300@6bc650f] Web — verify the Chromium sandbox on Linux
+[2026-10-23@b179105] Web — verify the Chromium sandbox on Linux
 
 - Requires: a Linux machine
-- Detail: The host no longer passes `no_sandbox` (DECISION.md, Web surface /
+- Detail: The host leaves Chromium's sandbox on (DECISION.md, Web surface /
   security), so on Linux Chromium needs unprivileged user namespaces or a
   setuid-root `chrome-sandbox` in the bundle directory; without either it
   refuses to start. The bundler copies `chrome-sandbox` but does not make it
   setuid. Check that the host starts and pages load (`cargo test -p
   ghostrealm-web --test host`), and decide how the setuid helper is installed
   where user namespaces are restricted (e.g. Ubuntu's AppArmor policy).
+- Detail: When the sandbox is unusable the host dies before Ready without a
+  `Failed` event; the reason reaches only `host.log` and stderr, which the
+  client discards. Surface it in the pane.
 - Reason: only the macOS sandbox has been verified.
 
 ---
@@ -1280,3 +1283,14 @@
     flow). It would be a `ViewMode::Preview` for that language, read-only
     like Markdown's.
 - Reason: GitHub issue #1.
+
+---
+
+[2026-10-23@b179105] Web — report a renderer that dies
+
+- Requires: NO BLOCKERS
+- Detail: The host has no `on_render_process_terminated` handler, so a
+  renderer that crashes or is killed (including by a sandbox violation) leaves
+  the pane frozen on its last frame with no message. Report it to the pane and
+  offer a reload.
+- Reason: a dead page must say so, not look alive.

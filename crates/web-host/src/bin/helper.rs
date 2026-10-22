@@ -3,9 +3,9 @@
 
 fn main() -> std::process::ExitCode {
     let args = cef::args::Args::new();
-    // The sandbox must be entered before the CEF framework loads. It reads the
-    // process type from the command line and seals renderer and utility
-    // processes; it outlives `execute_process`.
+    // The sandbox must be entered before the CEF framework loads. It applies
+    // the seatbelt profile the browser process passes on the command line
+    // (renderer, GPU and utility processes); it outlives `execute_process`.
     #[cfg(target_os = "macos")]
     let _sandbox = {
         let mut sandbox = cef::sandbox::Sandbox::new();
