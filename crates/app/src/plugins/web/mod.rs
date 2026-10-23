@@ -2397,18 +2397,22 @@ pub(super) mod tests {
         }
     }
 
-    /// End to end with the real host (skipped when it isn't built).
+    /// End to end with the real host (skipped when it isn't built), in the
+    /// order it runs.
     /// Given a page that opens a pop-up window on a click;
-    /// when a person clicks it, and an agent's gesture eval opens a page;
-    /// then the click's pop-up floats with the keyboard and goes when it
-    /// closes itself, and the eval's is a hidden surface the agent drives and
-    /// closes; both talk to their opener.
+    /// when a person clicks it;
+    /// then the pop-up floats with the keyboard, talks to its opener, and
+    /// goes when it closes itself.
     /// Given a page covered by a link;
     /// when a person clicks it with Cmd (Ctrl off macOS), the middle button,
     /// or Shift;
     /// then each opens the link as a tab for the app to place beside the
     /// page (in the background, the background, and shown), and the page
     /// stays where it was.
+    /// Given that pop-up page again;
+    /// when an agent's gesture eval opens a page from it;
+    /// then that is a hidden surface the agent drives, which talks to its
+    /// opener, and `window.close()` or `web.close` closes it.
     #[test]
     fn popups_with_the_real_host() {
         let Some(exe) = real_host() else {
