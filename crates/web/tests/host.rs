@@ -1045,6 +1045,61 @@ fn a_modified_click_after_a_navigation_opens_a_tab() {
     shut_down(host, &cache);
 }
 
+/// Given a host that runs a modified click's eval 3 s late (at 1.5 s it
+/// failed by itself here, its DevTools session detaching), and a `data:`
+/// page (an opaque origin) covered by a link to a site;
+/// when a person Cmd-clicks (Ctrl off macOS) it, and the page then fails to
+/// load an address (an error page, of its own opaque origin) before the
+/// eval runs;
+/// then nothing opens.
+#[test]
+fn a_modified_click_does_not_open_from_an_error_page() {
+    let Some((mut host, cache)) = spawn_with("modified-click-error", &[("GHOSTREALM_WEB_LINK_DELAY_MS", "3000")]) else {
+        return;
+    };
+    let (a, _, hits) = serve_sites();
+    let page = data_url(&format!(
+        "<body style='margin:0'><a href='{a}/hit-error' style='position:fixed;inset:0;background:rgb(255,0,0)' \
+         onclick=\"document.title = 'clicked'\">x</a>"
+    ));
+    assert!(host.send(&Request::Create { id: 1, url: page, width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+    // No eval reaches the page before the link's, so its world is made
+    // late; the page's title says it heard the click.
+    let heard = || host.view(1).is_some_and(|v| v.title == "clicked");
+    for _ in 0..5 {
+        if heard() {
+            break;
+        }
+        for (flags, action) in [
+            (NEW_TAB, MouseAction::Move),
+            (NEW_TAB | mods::LEFT_MOUSE, MouseAction::Down { button: MouseButton::Left, count: 1 }),
+            (NEW_TAB, MouseAction::Up { button: MouseButton::Left, count: 1 }),
+        ] {
+            assert!(host.send(&Request::Mouse { id: 1, x: 20, y: 20, mods: flags, action }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !heard() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(heard(), "the page never heard a click");
+    // A port nothing listens on.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    assert!(host.send(&Request::Navigate { id: 1, url: format!("http://{closed}/") }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.view(1).unwrap().error.is_none() {
+        assert!(Instant::now() < deadline, "the load never failed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(host.take_popups(1).is_empty());
+    assert!(!hits.lock().unwrap().iter().any(|h| h.path == "/hit-error"), "{:?}", hits.lock().unwrap());
+
+    shut_down(host, &cache);
+}
+
 /// Given a page sandboxed by CSP (`allow-scripts allow-popups`) covered by
 /// a link to another site;
 /// when a person Cmd-clicks (Ctrl off macOS) it;
