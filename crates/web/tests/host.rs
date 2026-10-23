@@ -505,10 +505,13 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
     wait_closed(&host, p.id);
     // A click still on its way when the page was asked for its count can
     // make a second pop-up (or load the first again): each posts the same
-    // message, from a source.
+    // message, from a source. Each post needs a click the page heard, so a
+    // message delivered twice still fails.
     let got = wait_got(&host, 1, "from /popup");
     let posts: Vec<&str> = got.trim_matches('"').split_terminator(';').collect();
     assert!(!posts.is_empty() && posts.iter().all(|m| *m == "from /popup"), "{got}");
+    let clicks = host.eval(1, "+(document.body.dataset.clicks || 0)", Duration::from_secs(5)).unwrap();
+    assert!(posts.len() <= clicks.parse::<usize>().unwrap(), "{got} from {clicks} clicks");
     assert!(!host.is_closed(1), "the opener stays");
 
     drop(host);
