@@ -332,9 +332,9 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
 /// `/opener` opens `/popup` on a click (red while it waits for one) and logs
 /// messages it gets in `data-got`; `/popup` posts to its opener and closes
 /// itself; `/stay` is a page; `/opentab` opens `/stay` in a new tab on a
-/// click, then sets `data-opened`. `/opener` and the link pages count
-/// their clicks in `data-clicks`. `/hit...` paths are recorded in the
-/// returned list. Anything else is empty.
+/// click, then sets `data-opened`. `/opener` and the link pages count their
+/// clicks (the link pages' middle clicks too) in `data-clicks`. `/hit...`
+/// paths are recorded in the returned list. Anything else is empty.
 fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -388,7 +388,7 @@ addEventListener('message', e => { document.body.dataset.got = \
 
 /// A red link over the whole page.
 const LINK: &str = "<body style='margin:0'><a LINK style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a>\
-<script>addEventListener('click', () => document.body.dataset.clicks = \
+<script>for (const t of ['click', 'auxclick']) addEventListener(t, () => document.body.dataset.clicks = \
 +(document.body.dataset.clicks || 0) + 1, true)</script>";
 
 /// Wait for page `id`'s first painted frame whose top-left pixel is `bgr`.
@@ -406,7 +406,17 @@ fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
 /// (`data-clicks`): a click it heard opens its pop-up, however slowly, and
 /// a second would open or reload another.
 fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
-    let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
+    click_for_popup_with(host, id, 0, MouseButton::Left)
+}
+
+/// [`click_for_popup`] with `button`, the modifiers `flags` held.
+fn click_for_popup_with(host: &WebHost, id: u64, flags: u32, button: MouseButton) -> ghostrealm_web::PopupInfo {
+    let held = match button {
+        MouseButton::Left => mods::LEFT_MOUSE,
+        MouseButton::Middle => mods::MIDDLE_MOUSE,
+        MouseButton::Right => mods::RIGHT_MOUSE,
+    };
+    let click = |mods, action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods, action }));
     // A page that closed itself after the click answers with an error: heard.
     let unheard = || host.eval(id, "+(document.body.dataset.clicks || 0)", Duration::from_secs(5)) == Ok("0".into());
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -422,9 +432,9 @@ fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
         }
         assert!(Instant::now() < deadline, "no click on page {id} opened a pop-up");
         if clicked.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) && unheard() {
-            click(MouseAction::Move);
-            click(MouseAction::Down { button: MouseButton::Left, count: 1 });
-            click(MouseAction::Up { button: MouseButton::Left, count: 1 });
+            click(flags, MouseAction::Move);
+            click(flags | held, MouseAction::Down { button, count: 1 });
+            click(flags, MouseAction::Up { button, count: 1 });
             clicked = Some(Instant::now());
         }
         std::thread::sleep(Duration::from_millis(20));

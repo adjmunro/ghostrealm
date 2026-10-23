@@ -708,11 +708,31 @@ fn open_popup(
     client: Option<&mut Option<Client>>,
     settings: Option<&mut BrowserSettings>,
 ) -> bool {
-    let (Some(window_info), Some(client), Some(settings), Some(parent)) =
-        (window_info, client, settings, view(opener))
-    else {
+    let (Some(window_info), Some(client), Some(settings)) = (window_info, client, settings) else {
         return false;
     };
+    let Some((id, view)) = admit_popup(opener, cef_id, url, kind, features) else {
+        return false;
+    };
+    *window_info = self::window_info();
+    *client = Some(new_client(id, &view));
+    *settings = browser_settings();
+    true
+}
+
+/// Admit a pop-up page `opener` is opening to `url`: it is a person's when
+/// their input reached the opener within [`INPUT_ACTIVATION`], else an
+/// agent's, refused past [`MAX_POPUPS`]. Announces it as [`Event::Popup`] and
+/// returns its id and view, waiting in `PENDING` until its browser exists;
+/// `None` when refused or the opener is gone.
+fn admit_popup(
+    opener: u64,
+    cef_id: c_int,
+    url: String,
+    kind: PopupKind,
+    features: Option<&PopupFeatures>,
+) -> Option<(u64, SharedView)> {
+    let parent = view(opener)?;
     let from_input = BROWSERS.with_borrow(|m| {
         m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
     });
@@ -723,7 +743,7 @@ fn open_popup(
         + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener && !p.tab).count());
     if !tab && open >= MAX_POPUPS {
         emit(&Event::PopupRefused { opener, url });
-        return false;
+        return None;
     }
     let id = NEXT_POPUP.get();
     NEXT_POPUP.set(id + 1);
@@ -744,14 +764,11 @@ fn open_popup(
         }
     };
     let view = new_view(id, width, height, scale);
-    *window_info = self::window_info();
-    *client = Some(new_client(id, &view));
-    *settings = browser_settings();
     PENDING.with_borrow_mut(|m| {
-        m.insert(id, PendingPopup { view, opener, cef_id, queued: Vec::new(), tab })
+        m.insert(id, PendingPopup { view: view.clone(), opener, cef_id, queued: Vec::new(), tab })
     });
     emit(&Event::Popup { id, opener, url, from_input, kind, width: width.max(1), height: height.max(1) });
-    true
+    Some((id, view))
 }
 
 /// Pop-up `id`'s browser exists: serve it, hidden until the app shows it,
