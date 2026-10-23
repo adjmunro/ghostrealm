@@ -751,6 +751,8 @@ impl WebView {
         if self.popup {
             return;
         }
+        // Typing goes to the bar, not a floating pop-up.
+        self.keys_to_float(false);
         let e = self
             .url_edit
             .get_or_insert_with(|| LineEdit::new(self.state.url.clone()).with_plain_brackets());
@@ -968,6 +970,19 @@ impl WebView {
     /// The floating pop-up shown, if `pos` is over it.
     fn float_at(&self, pos: (f32, f32)) -> bool {
         !self.floating.is_empty() && rect_contains(self.float_rect, pos.0, pos.1)
+    }
+
+    /// Close the floating pop-up shown if it has the keyboard (Close, Cmd+W,
+    /// acts on it rather than the tab). Returns whether it did.
+    pub fn dismiss_floating(&mut self) -> bool {
+        if !self.float_keys {
+            return false;
+        }
+        let Some(top) = self.floating.last_mut() else {
+            return false;
+        };
+        top.dismissed = true;
+        self.drop_closed_floating()
     }
 
     /// Give the keyboard to the floating pop-up (`true`) or the page.
@@ -1788,6 +1803,54 @@ pub(super) mod tests {
             let last_focus = got.iter().rev().find(|r| matches!(r, HostRequest::Focus { id: 1, .. }));
             got.contains(&HostRequest::Close { id: POPUP_IDS }) && last_focus == Some(&focus(1, true))
         });
+    }
+
+    /// A stub host at `dir/host.sh` running `script` after reporting ready
+    /// and `events`; the host for views an `AppState` opens on this thread.
+    fn stub_app_host(dir: &std::path::Path, events: &[String], script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("host.sh");
+        let echo: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();
+        let ready = format!("echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\n");
+        std::fs::write(&exe, format!("#!/bin/sh\n{ready}{echo}{script}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+    }
+
+    #[test]
+    fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
+        let dir = crate::plugin::testing::tmpdir("web-float-close");
+        let log = dir.join("requests");
+        stub_app_host(&dir, &[popup_event(POPUP_IDS, 1, true)], &format!("cat > '{}'", log.display()));
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let sid = s.focused_surface().unwrap();
+        fn web(s: &mut AppState, sid: SurfaceId) -> &mut WebView {
+            s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap()
+        }
+        wait("the pop-up floats", || {
+            s.pump_all();
+            !web(&mut s, sid).floating.is_empty()
+        });
+        assert!(web(&mut s, sid).float_keys);
+
+        // Editing the URL takes the keyboard back to the page's bar.
+        registry.execute("web.focus_url", &Args::new(), &mut s).unwrap();
+        let v = web(&mut s, sid);
+        assert!(!v.float_keys && v.url_edit.is_some());
+        assert!(!v.dismiss_floating(), "Close is the tab's while the page has the keyboard");
+        v.url_edit = None;
+        v.keys_to_float(true);
+
+        // Close (Cmd+W) closes the pop-up, not the tab.
+        registry.execute("pane.close", &Args::new(), &mut s).unwrap();
+        assert_eq!(s.focused_surface(), Some(sid), "the tab stays");
+        let v = web(&mut s, sid);
+        assert!(v.floating.is_empty() && !v.float_keys);
+        requests(&log, |l| host_requests(l).contains(&HostRequest::Close { id: POPUP_IDS }));
+        TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
     #[test]

@@ -1011,6 +1011,10 @@ impl AppState {
             return;
         };
         if let Some(sid) = self.focused_surface() {
+            // A pop-up floating over a web page with the keyboard closes first.
+            if self.views.get_mut(&sid).and_then(|v| v.downcast_mut::<web::WebView>()).is_some_and(|w| w.dismiss_floating()) {
+                return;
+            }
             self.leave(match self.active_doc(sid) {
                 Some((_, doc)) => Leave::Doc(vt, pane, sid, doc),
                 None => Leave::Surface(vt, pane, sid),
