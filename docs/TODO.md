@@ -1341,20 +1341,31 @@
 
 ---
 
-[2026-10-24T01:51+1300@906c409b] Web — modified clicks in frames and on posting forms
+[2026-10-23T22:46+1300@0fd87271] Web — a host test's host can fail to start
+
+- Requires: NO BLOCKERS
+- Detail: `right_and_middle_presses_reach_the_page` and
+  `a_modified_click_loads_as_its_page_asked` (crates/web/tests/host.rs) each
+  failed once with "host never became ready", well inside its 20 s wait, so
+  the host reported a failure or exited: 2 of about 30 suite runs on
+  `feat/web-modified-link-clicks`, which grew the suite from 12 hosts at
+  once to 21. The assertion now prints the host's failure; run with
+  `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
+- Reason: a flaky test hides real failures.
+
+---
+
+[2026-10-24T02:09+1300@08234dd1] Web — modified clicks: frames, posting forms, hidden links
 
 - Requires: NO BLOCKERS
 - Detail: A link in a frame clicked with Shift, Cmd/Ctrl, or the middle
   button opens nothing: the host reopens these links through
   `window.open` in an eval, and evals reach only the main frame (DECISION.md,
-  Web surface / pop-ups, 2026-10-24T01:51). Run the eval in the link's own
+  Web surface / pop-ups, 2026-10-24T02:09). Run the eval in the link's own
   frame, so its sandbox flags apply (CEF's frame id is not known to match
   the DevTools one the eval needs).
-- Detail: One in a document with an opaque origin (`about:blank`, `data:`,
-  a CSP-sandboxed page) opens nothing either: the eval can't tell that
-  document from another at its address. A link the eval can't find (in a
-  closed shadow root, removed) and a form submitted so open without a
-  referrer.
+- Detail: A link the eval can't find (in a closed shadow root, removed)
+  and a form submitted so open without a referrer.
 - Detail: A form that posts, submitted with a modifier, is submitted again
   in place (its submit handlers run twice) instead of posting in a new tab,
   and one submitted with the focus elsewhere (by script) opens its URL in a
@@ -1366,15 +1377,3 @@
   handlers `submit()` skips.
 - Reason: browsers open all of these in a new tab, with the referrer the
   link allows.
-
----
-
-[2026-10-23T22:46+1300@0fd87271] Web — a host test's host can fail to start
-
-- Requires: NO BLOCKERS
-- Detail: `right_and_middle_presses_reach_the_page` (crates/web/tests/host.rs)
-  failed once in ten runs of the suite with "host never became ready": its
-  host gave no `ready` within 20 s while the other 14 hosts started and the
-  run took 6 s. Seen on `feat/web-modified-link-clicks`, which grew the
-  suite from 12 hosts to 15. Run with `GHOSTREALM_WEB_DEBUG=1` to see why.
-- Reason: a flaky test hides real failures.

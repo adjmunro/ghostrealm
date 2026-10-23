@@ -62,6 +62,9 @@ struct Entry {
     /// Links it asked to open in a new tab ([`open_link`]), until their
     /// `window.open` reaches `on_before_popup`.
     links: Vec<Link>,
+    /// Main-frame documents committed: a link eval runs only in the one its
+    /// click was in.
+    document: u64,
 }
 
 /// A link a page asked to open in a new tab, opened through `window.open`.
@@ -72,6 +75,8 @@ struct Link {
     kind: PopupKind,
     /// Decided at the click, not when `window.open` runs.
     from_input: bool,
+    /// Its page's [`Entry::document`] at the click.
+    document: u64,
     at: Instant,
 }
 
@@ -178,6 +183,10 @@ const EVAL_TTL: Duration = Duration::from_secs(60);
 /// Overrides [`EVAL_TTL`], in milliseconds, so tests can expire evals quickly.
 const EVAL_TTL_ENV: &str = "GHOSTREALM_WEB_EVAL_TTL_MS";
 
+/// Delays [`open_link`]'s eval, in milliseconds, so tests can move the page
+/// on before it runs.
+const LINK_DELAY_ENV: &str = "GHOSTREALM_WEB_LINK_DELAY_MS";
+
 /// Floor for the override: shorter would fail healthy evals on other pages.
 const EVAL_TTL_MIN: Duration = Duration::from_millis(500);
 
@@ -254,8 +263,21 @@ fn expire_evals() {
     }
 }
 
+/// Whether `e` is a link eval whose page has committed another document
+/// since the click: it must not run there, where the document's own sandbox
+/// flags, referrer, and form would apply, nor hand that document a gesture.
+fn moved_on(e: &PendingEval) -> bool {
+    let Some(link) = e.link else { return false };
+    BROWSERS.with_borrow(|m| {
+        m.get(&e.id).is_none_or(|o| o.links.iter().find(|l| l.id == link).is_none_or(|l| l.document != o.document))
+    })
+}
+
 /// Evaluate `e` in the page's world, making one first if there is none.
 fn run(e: PendingEval) {
+    if moved_on(&e) {
+        return finish(&e, false, "the page moved on".into());
+    }
     enum Next {
         Fail(String),
         Evaluate(String),
@@ -285,6 +307,9 @@ fn run(e: PendingEval) {
 }
 
 fn evaluate(mut e: PendingEval, world: String) {
+    if moved_on(&e) {
+        return finish(&e, false, "the page moved on".into());
+    }
     let expression = eval_wrapper(&e.js);
     let params = json!({
         "expression": expression,
@@ -404,7 +429,7 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
                         s.world = None;
                     }
                 });
-                // A link's script checks it is in the document that asked.
+                // A link's eval runs again only in the document that asked.
                 return run(e);
             }
             if e.step != Step::Evaluate && !e.remade {
@@ -708,6 +733,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
                 input_at: None,
                 enter_last: false,
                 links: Vec::new(),
+                document: 0,
             };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
@@ -777,8 +803,9 @@ fn open_popup(
         return false;
     };
     // A link `open_link` opens through `window.open` keeps the kind and
-    // owner its click had. Its evals run in order, so the first to the URL
-    // is this one's.
+    // owner its click had: the oldest to the URL, as a page's link evals run
+    // in order (one that didn't open, still awaiting its result, may be
+    // taken instead).
     let link = BROWSERS.with_borrow_mut(|m| {
         let e = m.get_mut(&opener)?;
         e.links.retain(|l| l.at.elapsed() < INPUT_ACTIVATION);
@@ -832,9 +859,18 @@ fn open_link(opener: u64, main: bool, from: &str, url: String, kind: PopupKind, 
     let id = NEXT_LINK.get();
     NEXT_LINK.set(id + 1);
     let script = link_script(from, &url, enter);
-    let link = Link { id, url, kind, from_input, at: Instant::now() };
-    BROWSERS.with_borrow_mut(|m| m.get_mut(&opener).map(|e| e.links.push(link)));
-    eval_as(opener, 0, script, true, Some(id));
+    BROWSERS.with_borrow_mut(|m| {
+        if let Some(e) = m.get_mut(&opener) {
+            let document = e.document;
+            e.links.push(Link { id, url, kind, from_input, document, at: Instant::now() });
+        }
+    });
+    match std::env::var(LINK_DELAY_ENV).ok().and_then(|ms| ms.parse().ok()) {
+        Some(ms) => {
+            post_delayed_task(ThreadId::UI, Some(&mut LinkEval::new(opener, script, id)), ms);
+        }
+        None => eval_as(opener, 0, script, true, Some(id)),
+    }
     true
 }
 
@@ -920,6 +956,7 @@ fn popup_created(id: u64, b: &Browser) {
         input_at: None,
         enter_last: false,
         links: Vec::new(),
+        document: 0,
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
     // Its opener closed meanwhile, or the host is quitting.
@@ -1237,6 +1274,12 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            if frame.is_some_and(|f| f.is_main() != 0) {
+                BROWSERS.with_borrow_mut(|m| m.get_mut(&self.id).map(|e| e.document += 1));
+            }
+        }
+
         fn on_loading_state_change(
             &self,
             _browser: Option<&mut Browser>,
@@ -1456,6 +1499,21 @@ wrap_dev_tools_message_observer! {
         /// Replies pending at a detach never arrive.
         fn on_dev_tools_agent_detached(&self, _browser: Option<&mut Browser>) {
             fail_evals(self.id, "the page closed or its renderer ended");
+        }
+    }
+}
+
+// `open_link`'s eval, run late (`LINK_DELAY_ENV`).
+wrap_task! {
+    struct LinkEval {
+        opener: u64,
+        js: String,
+        link: u64,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            eval_as(self.opener, 0, self.js.clone(), true, Some(self.link));
         }
     }
 }

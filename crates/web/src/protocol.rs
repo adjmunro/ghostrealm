@@ -348,9 +348,9 @@ pub fn eval_wrapper(js: &str) -> String {
 /// gesture, for a link to `url` that the document at `from` asked to open in
 /// a new tab or window (clicked with a modifier or the middle button, which
 /// CEF would load in place). It settles to:
-/// - `"moved"`, doing nothing, in a document whose origin isn't `from`'s
-///   (the page moved on before it ran), or is opaque (`about:blank`, `data:`,
-///   a sandboxed document), which can't be told apart;
+/// - `"moved"`, doing nothing, in a document at an address of another origin
+///   than `from` (the page moved on before it ran; the host also refuses to
+///   run it once the page has committed another document);
 /// - `"posted"` after submitting again, in place, a form that posts to
 ///   `url`: the one whose submit button has the focus, or when `enter` (Enter
 ///   was the last key) the one whose field has it, with its first submit
@@ -366,7 +366,7 @@ pub fn link_script(from: &str, url: &str, enter: bool) -> String {
     let (from, url) = (json(from), json(url));
     format!(
         "(() => {{ const url = {url}; \
-         const origin = new URL({from}).origin; if (origin === 'null' || self.origin !== origin) return 'moved'; \
+         if (new URL({from}).origin !== new URL(location.href).origin) return 'moved'; \
          const el = document.activeElement; const form = el && el.form; \
          const submits = e => e.type === 'submit' || e.type === 'image'; \
          const by = !form ? undefined : submits(el) ? el : {enter} ? [...form.elements].find(submits) || null : undefined; \

@@ -42,10 +42,7 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
         }
         host
     };
-    assert!(
-        host.wait_ready(Duration::from_secs(20)),
-        "host never became ready"
-    );
+    assert!(host.wait_ready(Duration::from_secs(20)), "host never became ready: {:?}", host.failure());
     Some((host, cache))
 }
 
@@ -777,7 +774,8 @@ struct Hit {
 /// `/link?<url>` is a link to `<url>` over the page (`/nrlink?<url>` one with
 /// `rel=NoReferrer`, `/nplink?<url>` one with `referrerpolicy=no-referrer`,
 /// `/closedlink?<url>` one in a closed shadow root, `/sandboxedlink?<url>`
-/// one in a document sandboxed by CSP (`allow-scripts allow-popups`),
+/// one in a document sandboxed by CSP (`allow-scripts allow-popups`;
+/// `/sealedlink?<url>` without `allow-popups`),
 /// `/beacon?<url>` one that requests `/hitclick` on each click);
 /// `/hostile?<url>` is a button over the page that answers a click by
 /// sending three Cmd-clicks (Ctrl off macOS) to a hidden link to `<url>`;
@@ -835,8 +833,9 @@ fn serve_sites() -> (String, String, std::sync::Arc<Mutex<Vec<Hit>>>) {
                     "<body style='margin:0'><div id=h></div><script>h.attachShadow({{ mode: 'closed' }}).innerHTML = \
                      \"<a href='{arg}' style='{FULL}'>x</a>\"</script>{COUNT}"
                 ),
-                "/sandboxedlink" => {
-                    extra = "Content-Security-Policy: sandbox allow-scripts allow-popups\r\n".into();
+                "/sandboxedlink" | "/sealedlink" => {
+                    let popups = if route == "/sandboxedlink" { " allow-popups" } else { "" };
+                    extra = format!("Content-Security-Policy: sandbox allow-scripts{popups}\r\n");
                     format!("<body style='margin:0'><a href='{arg}' style='{FULL}'>x</a>{COUNT}")
                 }
                 "/nplink" => format!("<body style='margin:0'><a referrerpolicy=no-referrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
@@ -1046,26 +1045,94 @@ fn a_modified_click_after_a_navigation_opens_a_tab() {
     shut_down(host, &cache);
 }
 
-/// Given a page sandboxed by CSP (`allow-scripts allow-popups`: an opaque
-/// origin) covered by a link to another site;
+/// Given a page sandboxed by CSP (`allow-scripts allow-popups`) covered by
+/// a link to another site;
 /// when a person Cmd-clicks (Ctrl off macOS) it;
-/// then nothing opens, as the host can't tell its document from another
-/// at its address, and the page stays.
+/// then the link opens in a tab sandboxed too (an opaque origin), as the
+/// page's sandbox flags apply.
+/// Given one sandboxed without `allow-popups`;
+/// when a person Cmd-clicks its link;
+/// then nothing opens and the page stays.
 #[test]
-fn a_modified_click_in_an_opaque_document_opens_nothing() {
-    let Some((mut host, cache)) = spawn("modified-click-opaque") else {
+fn a_modified_click_in_a_sandboxed_document_keeps_its_sandbox() {
+    let Some((mut host, cache)) = spawn("modified-click-sandboxed") else {
         return;
     };
     let (a, b, hits) = serve_sites();
-    let url = format!("{b}/sandboxedlink?{a}/hit-opaque");
+    let open = |host: &mut WebHost, id, url: &str| {
+        assert!(host.send(&Request::Create { id, url: url.into(), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+    };
+
+    open(&mut host, 1, &format!("{b}/sandboxedlink?{a}/hit-sandboxed"));
+    let tab = click_for_popup_with(&host, 1, NEW_TAB, MouseButton::Left);
+    assert!(tab.from_input && tab.is_tab(), "{tab:?}");
+    assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "the tab never loaded");
+    assert_eq!(host.eval(tab.id, "self.origin", Duration::from_secs(5)), Ok("\"null\"".into()));
+
+    let url = format!("{b}/sealedlink?{a}/hit-sealed");
+    open(&mut host, 2, &url);
+    click_at_until(&host, 2, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(host.take_popups(2).is_empty());
+    assert!(!hits.lock().unwrap().iter().any(|h| h.path == "/hit-sealed"), "{:?}", hits.lock().unwrap());
+    assert_eq!(host.view(2).unwrap().url, url);
+
+    shut_down(host, &cache);
+}
+
+/// Given a local file (`file:`, an opaque origin) covered by a link to a
+/// site;
+/// when a person Cmd-clicks (Ctrl off macOS) it;
+/// then the link opens in a tab, requested once.
+#[test]
+fn a_modified_click_in_a_local_file_opens_a_tab() {
+    let Some((mut host, cache)) = spawn("modified-click-file") else {
+        return;
+    };
+    let (a, _, hits) = serve_sites();
+    let file = cache.with_extension("html");
+    std::fs::write(&file, LINK.replace("LINK", &format!("href={a}/hit-file"))).unwrap();
+    let url = format!("file://{}", file.display());
+    assert!(host.send(&Request::Create { id: 1, url, width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+    let tab = click_for_popup_with(&host, 1, NEW_TAB, MouseButton::Left);
+    assert!(tab.from_input && tab.kind == PopupKind::BackgroundTab, "{tab:?}");
+    assert_eq!(tab.url, format!("{a}/hit-file"));
+    wait_hits(&hits, "/hit-file", 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(wait_hits(&hits, "/hit-file", 1).len(), 1);
+
+    shut_down(host, &cache);
+    let _ = std::fs::remove_file(&file);
+}
+
+/// Given a host that runs a modified click's eval 1.5 s late, and a page
+/// covered by a link to another site;
+/// when a person Cmd-clicks (Ctrl off macOS) it, and the page then loads
+/// its address again (a new document of the same origin, with the same
+/// link) before the eval runs;
+/// then nothing opens: the eval doesn't run in a document the click wasn't
+/// in.
+#[test]
+fn a_modified_click_does_not_open_from_the_next_document() {
+    let Some((mut host, cache)) = spawn_with("modified-click-gate", &[("GHOSTREALM_WEB_LINK_DELAY_MS", "1500")]) else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    let url = format!("{b}/link?{a}/hit-gated");
     assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0 }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     click_at_until(&host, 1, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
-    std::thread::sleep(Duration::from_millis(1000));
+    host.expect_load(1);
+    assert!(host.send(&Request::Navigate { id: 1, url }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "the page never loaded again");
+    std::thread::sleep(Duration::from_millis(2500));
     assert!(host.take_popups(1).is_empty());
     assert!(hits.lock().unwrap().is_empty(), "{:?}", hits.lock().unwrap());
-    assert_eq!(host.view(1).unwrap().url, url);
 
     shut_down(host, &cache);
 }
