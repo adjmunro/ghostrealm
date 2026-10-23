@@ -108,31 +108,7 @@ impl HostSlot {
     /// The running host, spawning it if needed (but not while backing off
     /// after an exit).
     fn host(&mut self) -> Option<&mut WebHost> {
-        if let Some(h) = &self.host {
-            let ready = h.is_ready();
-            // A host that failed is exiting, or can't be spoken to (another
-            // protocol version): drop it, which asks it to exit.
-            if !h.is_alive() || h.failure().is_some() {
-                let mismatch = h.protocol_mismatch();
-                let error = match h.failure() {
-                    Some(e) => e,
-                    None if ready => "the web host exited".into(),
-                    None => "the web host exited while starting".into(),
-                };
-                self.host = None;
-                if mismatch {
-                    // Another spawn of the same bundle would be refused again.
-                    self.error = Some(error);
-                    self.retry_at = None;
-                    self.refused = Some(self.find_host().and_then(|p| bundle_stamp(&p)));
-                } else {
-                    self.failed(error);
-                }
-            } else if ready {
-                self.failures = 0;
-                self.error = None;
-            }
-        }
+        self.notice_exit();
         if let Some(stamp) = self.refused {
             if self.find_host().and_then(|p| bundle_stamp(&p)) != stamp {
                 self.refused = None;
@@ -160,6 +136,36 @@ impl HostSlot {
             }
         }
         self.host.as_mut()
+    }
+
+    /// Let go of a host that exited or failed (recording why, and backing
+    /// off), or note that a running one is ready.
+    fn notice_exit(&mut self) {
+        if let Some(h) = &self.host {
+            let ready = h.is_ready();
+            // A host that failed is exiting, or can't be spoken to (another
+            // protocol version): drop it, which asks it to exit.
+            if !h.is_alive() || h.failure().is_some() {
+                let mismatch = h.protocol_mismatch();
+                let error = match h.failure() {
+                    Some(e) => e,
+                    None if ready => "the web host exited".into(),
+                    None => "the web host exited while starting".into(),
+                };
+                self.host = None;
+                if mismatch {
+                    // Another spawn of the same bundle would be refused again.
+                    self.error = Some(error);
+                    self.retry_at = None;
+                    self.refused = Some(self.find_host().and_then(|p| bundle_stamp(&p)));
+                } else {
+                    self.failed(error);
+                }
+            } else if ready {
+                self.failures = 0;
+                self.error = None;
+            }
+        }
     }
 
     fn find_host(&self) -> Option<std::path::PathBuf> {
