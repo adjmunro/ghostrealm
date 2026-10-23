@@ -1034,8 +1034,13 @@ impl AppState {
     }
 
     /// Close surface `sid` wherever it is, whole: every document in it,
-    /// asking first about any with unsaved changes.
+    /// asking first about any with unsaved changes. A hidden surface just
+    /// goes.
     pub fn close_surface_id(&mut self, sid: SurfaceId) {
+        if self.hidden.remove(&sid).is_some() {
+            self.views.remove(&sid);
+            return;
+        }
         if let Some((vt, pane)) = self.pane_of(sid) {
             self.leave(Leave::Surface(vt, pane, sid));
         }

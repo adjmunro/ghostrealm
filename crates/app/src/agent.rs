@@ -373,7 +373,7 @@ mod tests {
             .iter()
             .map(|c| c["id"].as_str().unwrap())
             .collect();
-        for id in ["web.new", "web.navigate", "web.back", "web.forward", "web.reload", "web.eval"] {
+        for id in ["web.new", "web.navigate", "web.back", "web.forward", "web.reload", "web.eval", "web.close"] {
             assert!(ids.contains(&id), "help should list {id}");
         }
         assert_eq!(resps[1]["ok"], json!(false));

@@ -323,6 +323,23 @@ impl Plugin for WebPlugin {
         }
         r.register(
             CommandMeta::new(
+                "web.close",
+                "Web: Close",
+                "Close a web surface: a hidden pop-up (see `get tree`), or a tab",
+            )
+            .arg(id_arg()),
+            Box::new(|s: &mut AppState, a| {
+                target(s, a)?;
+                let sid = match a.get_int("id") {
+                    Ok(id) => SurfaceId(id as u64),
+                    Err(_) => s.focused_surface().ok_or_else(|| CmdError::Failed("no web surface focused".into()))?,
+                };
+                s.close_surface_id(sid);
+                Ok(CmdOutcome::ok())
+            }),
+        );
+        r.register(
+            CommandMeta::new(
                 "web.focus_url",
                 "Web: Edit URL",
                 "Focus the focused web page's URL bar",
@@ -1968,6 +1985,17 @@ pub(super) mod tests {
             s.pump_all();
             s.view(SurfaceId(hidden)).is_none()
         });
+
+        // `web.close` closes one.
+        assert_eq!(run(&mut s, "web.eval", gesture(opener.0, "window.open('/stay') !== null")), Ok("true".into()));
+        s.pump_all();
+        let tree = s.describe();
+        let line = tree.lines().find(|l| l.starts_with("hidden surface ")).unwrap_or_else(|| panic!("{tree}"));
+        let hidden: u64 = line.split(' ').nth(2).unwrap().parse().unwrap();
+        run(&mut s, "web.close", vec![("id", Value::Int(hidden as i64))]).unwrap();
+        assert!(s.view(SurfaceId(hidden)).is_none());
+        assert!(!s.describe().contains("hidden surface"));
+        assert_eq!(s.view(opener).map(|v| v.plugin()), Some(ID), "the opener stays");
         TEST_HOST.with_borrow_mut(|h| *h = None);
         drop(s);
         let _ = std::fs::remove_dir_all(&profile);
