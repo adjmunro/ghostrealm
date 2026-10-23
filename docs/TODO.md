@@ -1259,13 +1259,55 @@
 [2026-10-23T09:43+1300@5a747143] Web — check floating pop-ups on a display
 
 - Requires: a human on a desktop session
-- Detail: A pop-up a person opens floats over its opener's page (DECISION.md,
-  Web surface / pop-ups). Tests cover its routing, focus, and closing
-  headlessly; check how it looks (border, shadow, header, close button
-  hover) and that clicks, typing, and scrolling in it reach it.
-- Detail: It floats over the opener's page only. Floating over the whole
-  window, as the owner first asked, needs the window to route the pointer
-  (presses, hover, wheel) to a view outside its pane while over the
-  pop-up, and keep chrome buttons, dividers, and tab strips under it from
-  taking them.
+- Detail: A pop-up window a person opens floats over its opener's page
+  (DECISION.md, Web surface / pop-ups). Tests cover its routing, focus,
+  and closing headlessly; check how it looks (border, shadow, header, close
+  button hover and its tooltip) and that clicks, typing, and scrolling in
+  it reach it. Also check a person's `target=_blank` tab opens beside its
+  opener.
 - Reason: no display in the agent sandbox.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — float pop-ups over the whole window
+
+- Requires: NO BLOCKERS
+- Detail: A floating pop-up is bounded by its opener's page. Over the
+  whole window, the window must route the pointer (presses, hover, wheel)
+  to a view outside its pane while it is over the pop-up, and keep chrome
+  buttons, dividers, and tab strips under it from taking them.
+- Reason: the owner pictured a pop-up over the entire app.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — stacked floating pop-ups
+
+- Requires: NO BLOCKERS
+- Detail: Of several pop-up windows floating over one page, only the
+  newest shows and takes input; the others wait under it until it closes.
+  A pop-up a floating pop-up opens floats inside it, and draws its shadow,
+  border, and header under the outer pop-up's page image (overlay quads
+  draw before overlay images).
+- Reason: OAuth flows rarely stack pop-ups; showing them all needs a way to
+  switch between them and a layer per pop-up.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — pop-ups across a host restart
+
+- Requires: NO BLOCKERS
+- Detail: A pop-up's page belongs to the host that made it: when the host
+  exits, floating and hidden pop-ups go and tabs opened from pop-ups close.
+  They could reopen at their last address (without `window.opener`).
+- Reason: a host crash loses them silently.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — Shift- and Cmd-clicked links
+
+- Requires: NO BLOCKERS
+- Detail: A link clicked with Shift (new window) or Cmd/Ctrl (background
+  tab) loads in place: CEF sends it to `OnOpenURLFromTab`, not
+  `OnBeforePopup` (checked in the host). Open it as a tab beside its
+  opener like a `target=_blank` link (background for Cmd/Ctrl).
+- Reason: browsers open these in a new tab or window.
