@@ -1308,14 +1308,14 @@
 - Requires: NO BLOCKERS
 - Detail: A link clicked with Shift (new window), Cmd/Ctrl, or the middle
   button (background tab) loads in place: CEF sends it to
-  `OnOpenURLFromTab`, not `OnBeforePopup` (Shift and Cmd checked in the
+  `OnOpenURLFromTab`, not `OnBeforePopup` (all three checked in the
   host). Open it as a tab beside its opener like a `target=_blank` link
   (in the background for Cmd/Ctrl and middle).
 - Reason: browsers open these in a new tab or window.
 
 ---
 
-[2026-10-23T09:43+1300@5a747143] Web — say when a pop-up is refused
+[2026-10-23T18:52+1300@cfbb8bc1] Web — say when a pop-up is refused
 
 - Requires: NO BLOCKERS
 - Detail: Past four open pop-ups a page's next is refused (DECISION.md, Web
@@ -1323,3 +1323,18 @@
   sees nothing happen. Show a brief note in the pane; nothing in the app
   shows transient messages yet.
 - Reason: a click that does nothing looks broken.
+
+---
+
+[2026-10-23T18:52+1300@cfbb8bc1] Web — revisit the person/agent pop-up rule if agents drive the GUI
+
+- Requires: the agent channel moving into the running app (agent.rs; TODO.md
+  "Agent channel → the running app")
+- Detail: A pop-up is a person's when a press or key reached its opener in
+  the last 5 s (DECISION.md, Web surface / pop-ups). Today agents drive only
+  the headless `ghostrealm agent`, where no person input arrives. Once they
+  drive the GUI, a gesture eval within 5 s of a person's click would count
+  as the person's: a visible, focused tab that the pop-up cap doesn't count.
+  Tell the two apart by the source of the activation, not by timing.
+- Reason: agent activity must stay in the background.
+

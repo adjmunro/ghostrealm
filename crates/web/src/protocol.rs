@@ -17,7 +17,8 @@ pub const PROTOCOL_VERSION: u32 = 4;
 pub const POPUP_IDS: u64 = 1 << 40;
 
 /// Pop-ups one page may have open (made or being made); the host refuses
-/// more ([`Event::PopupRefused`]).
+/// more ([`Event::PopupRefused`]). A person's new tab or window doesn't
+/// count: it is a page of its own.
 pub const MAX_POPUPS: usize = 4;
 
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
