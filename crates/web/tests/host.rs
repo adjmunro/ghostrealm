@@ -42,7 +42,21 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
         }
         host
     };
-    assert!(host.wait_ready(Duration::from_secs(20)), "host never became ready: {:?}", host.failure());
+    if !host.wait_ready(Duration::from_secs(20)) {
+        // Its stdout ends a moment before it can be reaped.
+        let mut host = host;
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut status = host.exit_status();
+        while status.is_none() && !host.is_alive() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            status = host.exit_status();
+        }
+        panic!(
+            "host never became ready: failure {:?}, exited {}, status {status:?}",
+            host.failure(),
+            !host.is_alive()
+        );
+    }
     Some((host, cache))
 }
 

@@ -1349,8 +1349,10 @@
   failed once with "host never became ready", well inside its 20 s wait, so
   the host reported a failure or exited: 2 of about 30 suite runs on
   `feat/web-modified-link-clicks`, which grew the suite from 12 hosts at
-  once to 21. The assertion now prints the host's failure; run with
-  `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
+  once to 21. A third, with two suites running at once, said `failure:
+  None` about 9.6 s in: the host exited without reporting a failure. The
+  assertion now says whether it exited and its exit status (a signal
+  shows there); run with `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
 - Reason: a flaky test hides real failures.
 
 ---
@@ -1377,3 +1379,15 @@
   handlers `submit()` skips.
 - Reason: browsers open all of these in a new tab, with the referrer the
   link allows.
+
+---
+
+[2026-10-24T02:29+1300@610a0bd1] App — web tests leave their profiles behind
+
+- Requires: NO BLOCKERS
+- Detail: The app's `plugins::web` tests (stub and real host) leave about 20
+  `$TMPDIR/ghostrealm-web-<tag>-<pid>-<n>` profile directories per run
+  (2,189 had built up). The host tests had the same leak: they removed the
+  profile before the host had exited (crates/web/tests/common/mod.rs
+  `shut_down` now waits for it). Do the same in the app's tests.
+- Reason: test runs shouldn't fill the temp directory.

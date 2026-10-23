@@ -255,6 +255,11 @@ impl WebHost {
         !self.shared.0.lock().unwrap().exited
     }
 
+    /// How the host process ended, once it has (`None` while it runs).
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut().and_then(|c| c.try_wait().ok().flatten())
+    }
+
     /// The host's process id.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
