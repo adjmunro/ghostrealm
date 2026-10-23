@@ -2177,6 +2177,39 @@ pub(super) mod tests {
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
+    /// Given a web tab (page 1) that opened a person's tab (A) and an agent's
+    /// pop-up (B), both of which closed themselves before the app placed
+    /// them;
+    /// when the app pumps once;
+    /// then only page 1's tab is left, still focused, and no hidden surface.
+    #[test]
+    fn a_popup_that_closed_before_it_was_placed_goes_in_the_same_pass() {
+        let dir = crate::plugin::testing::tmpdir("web-popup-closed-unplaced");
+        let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
+        let events = [
+            popup_event_of(a, 1, true, "tab"),
+            popup_event_of(b, 1, false, "tab"),
+            format!(r#"{{"ev":"closed","id":{a}}}"#),
+            format!(r#"{{"ev":"closed","id":{b}}}"#),
+        ];
+        stub_app_host(&dir, &events, "cat > /dev/null");
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        wait("both close in the host", || {
+            let v = s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap();
+            let slot = v.slot.borrow();
+            slot.host.as_ref().is_some_and(|h| h.is_closed(a) && h.is_closed(b))
+        });
+        s.pump_all();
+        assert_eq!(pages(&mut s), [1], "{}", s.describe());
+        assert_eq!(s.focused_surface(), Some(opener));
+        assert!(!s.describe().contains("hidden surface"), "{}", s.describe());
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
     #[test]
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
         let dir = crate::plugin::testing::tmpdir("web-float-close");

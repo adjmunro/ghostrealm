@@ -1593,9 +1593,36 @@ impl AppState {
         // pop-ups before reporting it closed, so every pop-up of a page
         // found closed here is placed below (a tab beside it) before the
         // page goes.
-        let gone = self.closed_popups();
-        // Each placed page may have opened pop-ups of its own.
-        let mut placed = false;
+        let (mut gone, mut closed_tabs) = self.closed_popups();
+        let mut placed = std::collections::HashSet::new();
+        loop {
+            self.place_all_popups(&mut placed);
+            // A page placed in this pass that has closed goes in it too
+            // (nothing may wake the app for another), after one more
+            // placing for the pop-ups it opened.
+            let (hidden, tabs) = self.closed_popups();
+            let late: Vec<SurfaceId> = hidden
+                .into_iter()
+                .chain(tabs)
+                .filter(|sid| placed.contains(sid) && !gone.contains(sid) && !closed_tabs.contains(sid))
+                .collect();
+            if late.is_empty() {
+                break;
+            }
+            for sid in late {
+                match self.hidden.contains_key(&sid) {
+                    true => gone.push(sid),
+                    false => closed_tabs.push(sid),
+                }
+            }
+        }
+        self.drop_closed_popups((gone, closed_tabs)) || !placed.is_empty()
+    }
+
+    /// Place what the web views and [`web::OrphanTabs`] hand over, until
+    /// none is left (each placed page may have opened pop-ups of its own),
+    /// adding the surfaces placed to `placed`.
+    fn place_all_popups(&mut self, placed: &mut std::collections::HashSet<SurfaceId>) {
         loop {
             let mut new = Vec::new();
             for (sid, view) in self.views.iter_mut() {
@@ -1607,11 +1634,9 @@ impl AppState {
             if new.is_empty() && orphans.is_empty() {
                 break;
             }
-            placed = true;
-            self.place_popups(new);
-            self.place_orphan_tabs(orphans);
+            placed.extend(self.place_popups(new));
+            placed.extend(self.place_orphan_tabs(orphans));
         }
-        self.drop_closed_popups(gone) || placed
     }
 
     /// Place a person's tabs whose opener (a tab, or a pop-up floating over
@@ -1619,8 +1644,9 @@ impl AppState {
     /// active surface. That is the opener's pane when Close (Cmd+W) closed
     /// it, but not when a tab's close button, the sidebar, or an agent did:
     /// the opener's pane isn't kept, as the gap is a few milliseconds. With
-    /// no workspace to hold them they close.
-    fn place_orphan_tabs(&mut self, tabs: Vec<(web::WebView, bool)>) {
+    /// no workspace to hold them they close. Returns the surfaces placed.
+    fn place_orphan_tabs(&mut self, tabs: Vec<(web::WebView, bool)>) -> Vec<SurfaceId> {
+        let mut placed = Vec::new();
         for (view, focus) in tabs {
             let Some((vt, pane)) = self.focused_pane() else {
                 continue;
@@ -1631,13 +1657,16 @@ impl AppState {
             };
             if let Some(sid) = tab {
                 self.insert_view(sid, Box::new(view));
+                placed.push(sid);
             }
         }
+        placed
     }
 
     /// Place pop-ups taken from their openers' views (see
-    /// [`adopt_popups`](Self::adopt_popups)).
-    fn place_popups(&mut self, new: Vec<(SurfaceId, web::Opened)>) {
+    /// [`adopt_popups`](Self::adopt_popups)); returns their surfaces.
+    fn place_popups(&mut self, new: Vec<(SurfaceId, web::Opened)>) -> Vec<SurfaceId> {
+        let mut placed = Vec::new();
         for (opener, o) in new {
             let tab = match (o.place, self.pane_of(opener)) {
                 (web::Place::Tab { focus }, Some((vt, pane))) => {
@@ -1645,15 +1674,21 @@ impl AppState {
                 }
                 _ => None,
             };
-            match tab {
-                Some(sid) => self.insert_view(sid, Box::new(o.view)),
+            let sid = match tab {
+                Some(sid) => {
+                    self.insert_view(sid, Box::new(o.view));
+                    sid
+                }
                 None => {
                     let sid = self.tree.detached_surface_id();
                     self.views.insert(sid, Box::new(o.view));
                     self.hidden.insert(sid, HiddenOf { opener, from_floating: o.from_floating });
+                    sid
                 }
-            }
+            };
+            placed.push(sid);
         }
+        placed
     }
 
     /// Hidden pop-ups that closed or whose opener went, and web tabs whose
