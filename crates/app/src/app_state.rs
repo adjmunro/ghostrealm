@@ -1579,15 +1579,52 @@ impl AppState {
     /// Place the pop-ups web pages opened: a person's tab beside its
     /// opener's (shown if it asked to be), an agent's as a hidden surface (in
     /// no pane, never focused, still driven by `web.*` and read by `get
-    /// surface`). Drop hidden ones that closed or whose opener went, and close
-    /// tabs whose pop-up page closed. Returns whether any came or went.
+    /// surface`). Then drop hidden ones that closed or whose opener went, and
+    /// close tabs whose pop-up page closed. Returns whether any came or went.
     pub fn adopt_popups(&mut self) -> bool {
-        let mut new = Vec::new();
-        for (sid, view) in self.views.iter_mut() {
-            if let Some(w) = view.downcast_mut::<web::WebView>() {
-                new.extend(w.take_opened().into_iter().map(|o| (*sid, o)));
+        // Place them first: a tab whose opener closed itself still goes
+        // beside it. Each placed page may have opened pop-ups of its own.
+        let mut placed = false;
+        loop {
+            let mut new = Vec::new();
+            for (sid, view) in self.views.iter_mut() {
+                if let Some(w) = view.downcast_mut::<web::WebView>() {
+                    new.extend(w.take_opened().into_iter().map(|o| (*sid, o)));
+                }
+            }
+            if new.is_empty() {
+                break;
+            }
+            placed = true;
+            self.place_popups(new);
+        }
+        self.drop_closed_popups() || placed
+    }
+
+    /// Place pop-ups taken from their openers' views (see
+    /// [`adopt_popups`](Self::adopt_popups)).
+    fn place_popups(&mut self, new: Vec<(SurfaceId, web::Opened)>) {
+        for (opener, o) in new {
+            let tab = match (o.place, self.pane_of(opener)) {
+                (web::Place::Tab { focus }, Some((vt, pane))) => {
+                    self.tree.insert_surface_after(vt, pane, opener, focus)
+                }
+                _ => None,
+            };
+            match tab {
+                Some(sid) => self.insert_view(sid, Box::new(o.view)),
+                None => {
+                    let sid = self.tree.detached_surface_id();
+                    self.views.insert(sid, Box::new(o.view));
+                    self.hidden.insert(sid, HiddenOf { opener, from_floating: o.from_floating });
+                }
             }
         }
+    }
+
+    /// Drop hidden pop-ups that closed or whose opener went, and close tabs
+    /// whose pop-up page closed. Returns whether any went.
+    fn drop_closed_popups(&mut self) -> bool {
         let gone: Vec<SurfaceId> = self
             .hidden
             .iter()
@@ -1605,29 +1642,13 @@ impl AppState {
             })
             .map(|(sid, _)| *sid)
             .collect();
-        let changed = !new.is_empty() || !gone.is_empty() || !closed_tabs.is_empty();
+        let changed = !gone.is_empty() || !closed_tabs.is_empty();
         for p in gone {
             self.hidden.remove(&p);
             self.views.remove(&p);
         }
         for sid in closed_tabs {
             self.close_surface_id(sid);
-        }
-        for (opener, o) in new {
-            let tab = match (o.place, self.pane_of(opener)) {
-                (web::Place::Tab { focus }, Some((vt, pane))) => {
-                    self.tree.insert_surface_after(vt, pane, opener, focus)
-                }
-                _ => None,
-            };
-            match tab {
-                Some(sid) => self.insert_view(sid, Box::new(o.view)),
-                None => {
-                    let sid = self.tree.detached_surface_id();
-                    self.views.insert(sid, Box::new(o.view));
-                    self.hidden.insert(sid, HiddenOf { opener, from_floating: o.from_floating });
-                }
-            }
         }
         changed
     }

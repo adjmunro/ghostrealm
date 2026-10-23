@@ -1937,6 +1937,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_tab_opened_by_a_tab_that_closed_itself_still_opens() {
+        let dir = crate::plugin::testing::tmpdir("web-popup-tab-chain");
+        let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
+        let events = [
+            popup_event_of(a, 1, true, "tab"),
+            popup_event_of(b, a, true, "tab"),
+            format!(r#"{{"ev":"closed","id":{a}}}"#),
+        ];
+        stub_app_host(&dir, &events, "cat > /dev/null");
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let pages = |s: &mut AppState| -> Vec<u64> {
+            let ids: Vec<SurfaceId> = s
+                .describe()
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("surface ")?.split(' ').next()?.parse().ok())
+                .map(SurfaceId)
+                .collect();
+            ids.into_iter().filter_map(|sid| Some(s.view_mut(sid)?.downcast_mut::<WebView>()?.page)).collect()
+        };
+        wait("the second tab opens and the first closes", || {
+            s.pump_all();
+            pages(&mut s) == [1, b]
+        });
+        assert!(s.view(opener).is_some());
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    #[test]
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
         let dir = crate::plugin::testing::tmpdir("web-float-close");
         let log = dir.join("requests");
