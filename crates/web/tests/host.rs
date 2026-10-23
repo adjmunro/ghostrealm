@@ -332,7 +332,8 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
 /// `/opener` opens `/popup` on a click (red while it waits for one) and logs
 /// messages it gets in `data-got`; `/popup` posts to its opener and closes
 /// itself; `/stay` is a page; `/opentab` opens `/stay` in a new tab on a
-/// click, then sets `data-opened`. `/hit...` paths are recorded in the
+/// click, then sets `data-opened`. `/opener` and the link pages count
+/// their clicks in `data-clicks`. `/hit...` paths are recorded in the
 /// returned list. Anything else is empty.
 fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Write};
@@ -381,10 +382,14 @@ const OPENER: &str = "<title>Opener</title><body style='margin:0'>\
 <button style='position:fixed;inset:0;border:0;background:rgb(255,0,0)' \
 onclick=\"window.open('/popup', 'p', 'width=300,height=200')\">open</button><script>\
 addEventListener('message', e => { document.body.dataset.got = \
-(document.body.dataset.got || '') + e.data + (e.source ? '' : ' (no source)') + ';'; });</script>";
+(document.body.dataset.got || '') + e.data + (e.source ? '' : ' (no source)') + ';'; });</script>\
+<script>addEventListener('click', () => document.body.dataset.clicks = \
++(document.body.dataset.clicks || 0) + 1, true)</script>";
 
 /// A red link over the whole page.
-const LINK: &str = "<body style='margin:0'><a LINK style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a>";
+const LINK: &str = "<body style='margin:0'><a LINK style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a>\
+<script>addEventListener('click', () => document.body.dataset.clicks = \
++(document.body.dataset.clicks || 0) + 1, true)</script>";
 
 /// Wait for page `id`'s first painted frame whose top-left pixel is `bgr`.
 fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
@@ -395,34 +400,35 @@ fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
     }
 }
 
-/// Click page `id` near its top-left until it opens a pop-up. A page that
-/// has just painted may not hit-test input yet, so a click can go unheard;
-/// if an earlier click was only slow, the extra pop-up it opens is closed.
+/// Click page `id` near its top-left until it opens a pop-up, and return
+/// it. A page that has just painted may not hit-test input yet, so a click
+/// can go unheard. It clicks again only while the page counts no click
+/// (`data-clicks`): a click it heard opens its pop-up, however slowly, and
+/// a second would open or reload another.
 fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
     let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
-    for clicks in 1..=5 {
-        click(MouseAction::Move);
-        click(MouseAction::Down { button: MouseButton::Left, count: 1 });
-        click(MouseAction::Up { button: MouseButton::Left, count: 1 });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let mut got = host.take_popups(id);
-            if got.is_empty() {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            let first = got.remove(0);
-            if clicks > 1 {
-                std::thread::sleep(Duration::from_millis(500));
-                got.extend(host.take_popups(id));
-            }
-            for extra in got {
+    // A page that closed itself after the click answers with an error: heard.
+    let unheard = || host.eval(id, "+(document.body.dataset.clicks || 0)", Duration::from_secs(5)) == Ok("0".into());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut clicked: Option<Instant> = None;
+    loop {
+        let mut got = host.take_popups(id);
+        if !got.is_empty() {
+            // Only a click the page hadn't counted when asked can open more.
+            for extra in got.drain(1..) {
                 host.send(&Request::Close { id: extra.id });
             }
-            return first;
+            return got.remove(0);
         }
+        assert!(Instant::now() < deadline, "no click on page {id} opened a pop-up");
+        if clicked.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) && unheard() {
+            click(MouseAction::Move);
+            click(MouseAction::Down { button: MouseButton::Left, count: 1 });
+            click(MouseAction::Up { button: MouseButton::Left, count: 1 });
+            clicked = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("no click on page {id} opened a pop-up");
 }
 
 /// Click page `id` near its top-left until `js` (evaluated in it) is truthy:

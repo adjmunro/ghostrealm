@@ -1337,20 +1337,3 @@
   as the person's: a visible, focused tab that the pop-up cap doesn't count.
   Tell the two apart by the source of the activation, not by timing.
 - Reason: agent activity must stay in the background.
-
----
-
-[2026-10-23T20:50+1300@ebebcfd4] Web — host test can hear its pop-up twice
-
-- Requires: NO BLOCKERS
-- Detail: `click_for_popup` (`crates/web/tests/host.rs`) clicks again after
-  2 s with no pop-up. A slow first click then calls `window.open('/popup',
-  'p')` twice: the second opens another pop-up or reloads the named one,
-  either posting to the opener again, so
-  `a_clicked_popup_keeps_its_opener_and_closes_itself` can see
-  `"from /popup;from /popup;"`. Closing the extra pop-up comes too late.
-  Click again only while the page heard no click, as `click_until` and
-  `popups_with_the_real_host` do.
-- Reason: found while fixing the app's real-host test; not verified, as the
-  host can't start in the agent sandbox (Chromium's profile lock binds a
-  Unix socket).
