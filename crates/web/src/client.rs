@@ -299,7 +299,8 @@ impl WebHost {
         let mut s = self.shared.0.lock().unwrap();
         s.views.remove(&id);
         s.closed.remove(&id);
-        s.popups.retain(|p| p.id != id && p.opener != id);
+        s.popups.retain(|p| p.id != id);
+        drop_popups_of(&mut s, id);
         drop(s);
         self.readers.remove(&id);
     }
@@ -559,8 +560,12 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         }
         Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
         Event::Closed { id } => {
-            s.views.remove(&id);
-            s.closed.insert(id);
+            // Only pages the app may still ask about: one it forgot stays so.
+            let known = s.views.remove(&id).is_some() || s.popups.iter().any(|p| p.id == id);
+            if known {
+                s.closed.insert(id);
+            }
+            drop_popups_of(&mut s, id);
         }
         Event::Failed { error } => s.failure = Some(error),
         reply @ (Event::Text { id, req, .. } | Event::EvalResult { id, req, .. }) => {
@@ -573,6 +578,17 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         }
     }
     cv.notify_all();
+}
+
+/// Forget the pop-ups page `opener` opened that no view took: none will now.
+fn drop_popups_of(s: &mut Shared, opener: u64) {
+    let (gone, keep): (Vec<PopupInfo>, Vec<PopupInfo>) =
+        std::mem::take(&mut s.popups).into_iter().partition(|p| p.opener == opener);
+    s.popups = keep;
+    for p in gone {
+        s.views.remove(&p.id);
+        s.closed.remove(&p.id);
+    }
 }
 
 /// The page an event updates the state of (not replies, which answer requests).
@@ -702,6 +718,34 @@ mod tests {
         assert_eq!(gone(&shared).as_deref(), Some("the page's renderer crashed"));
         apply_event(&shared, loading(true));
         assert_eq!(gone(&shared), None, "a reload clears it");
+    }
+
+    #[test]
+    fn closed_pages_and_untaken_popups_are_not_kept_forever() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        let popup = |id| Event::Popup {
+            id,
+            opener: 1,
+            url: String::new(),
+            from_input: false,
+            kind: Default::default(),
+            width: 1,
+            height: 1,
+        };
+        apply_event(&shared, Event::Title { id: 1, title: "t".into() });
+        apply_event(&shared, popup(10));
+        apply_event(&shared, Event::Closed { id: 10 });
+        apply_event(&shared, Event::Closed { id: 99 });
+        {
+            let s = shared.0.lock().unwrap();
+            assert!(s.closed.contains(&10), "a pop-up not yet taken");
+            assert!(!s.closed.contains(&99), "a page the app forgot");
+        }
+        apply_event(&shared, popup(11));
+        apply_event(&shared, Event::Closed { id: 1 });
+        let s = shared.0.lock().unwrap();
+        assert!(s.popups.is_empty(), "nobody takes its opener's pop-ups now");
+        assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1]);
     }
 
     #[test]

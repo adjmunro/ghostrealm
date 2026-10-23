@@ -599,9 +599,13 @@ impl WebView {
     /// agent's pop-up wait in `opened`. Drop floating ones that closed.
     /// Returns whether the floating ones changed.
     fn pull_popups(&mut self) -> bool {
-        let popups = match self.slot.borrow().host.as_ref() {
-            Some(h) if self.created_in != 0 => h.take_popups(self.page),
-            _ => Vec::new(),
+        let popups = {
+            let slot = self.slot.borrow();
+            match slot.host.as_ref() {
+                // A page made in an older host is not this host's page.
+                Some(h) if self.created_in == slot.generation => h.take_popups(self.page),
+                _ => Vec::new(),
+            }
         };
         let mut changed = false;
         for p in &popups {
@@ -1948,20 +1952,19 @@ pub(super) mod tests {
     #[test]
     fn a_popup_an_agent_opened_is_a_hidden_surface_it_can_drive() {
         let dir = crate::plugin::testing::tmpdir("web-hidden-popup");
-        let exe = dir.join("host.sh");
         let log = dir.join("requests");
-        // The pop-up closes itself when told to navigate.
+        let loaded = |id: u64| format!(r#"{{"ev":"loading","id":{id},"loading":false,"can_back":false,"can_forward":false}}"#);
+        let events = [popup_event(POPUP_IDS, 1, false), loaded(1), loaded(POPUP_IDS)];
+        // It answers text requests, and the pop-up closes itself when told
+        // to navigate.
         let script = format!(
-            "#!/bin/sh\necho '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\n\
-             while read l; do echo \"$l\" >> '{}'; case \"$l\" in *'\"op\":\"navigate\"'*) \
-             echo '{{\"ev\":\"closed\",\"id\":{POPUP_IDS}}}';; esac; done\n",
-            popup_event(POPUP_IDS, 1, false),
+            "while read l; do echo \"$l\" >> '{}'; case \"$l\" in \
+             *'\"op\":\"navigate\"'*) echo '{{\"ev\":\"closed\",\"id\":{POPUP_IDS}}}';; \
+             *'\"op\":\"text\"'*) echo \"$l\" | sed 's/.*\"op\":\"text\",\"id\":\\([0-9]*\\),\"req\":\\([0-9]*\\).*/{{\"ev\":\"text\",\"id\":\\1,\"req\":\\2,\"text\":\"\"}}/';; \
+             esac; done",
             log.display()
         );
-        std::fs::write(&exe, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+        stub_app_host(&dir, &events, &script);
 
         let mut s = AppState::new().with_shell_line("sleep 1");
         s.new_empty_vtab();

@@ -481,6 +481,7 @@ pub fn handle(req: Option<Request>) {
         Some(req) => req,
         None => return,
     };
+    // Person input: a pop-up opened soon after answers it.
     if let Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. }
     | Request::Key { id, key: Key { kind: KeyKind::Down | KeyKind::Char, .. } } = &req
     {
@@ -594,11 +595,6 @@ pub fn handle(req: Option<Request>) {
 
 /// The page a request is for.
 fn req_page(req: &Request) -> u64 {
-    if let Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. }
-    | Request::Key { id, key: Key { kind: KeyKind::Down | KeyKind::Char, .. } } = &req
-    {
-        BROWSERS.with_borrow_mut(|m| m.get_mut(id).map(|e| e.input_at = Some(Instant::now())));
-    }
     match req {
         Request::Create { id, .. }
         | Request::Close { id }
