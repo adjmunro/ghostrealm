@@ -3031,8 +3031,10 @@ impl State {
     /// Draw the hovered tooltip once its anchor has been hovered for
     /// [`TOOLTIP_DELAY`] (until then, schedule the wake that shows it): a small
     /// panel below the anchor (above, near the bottom edge). A pane's tooltip is
-    /// suppressed while a modal overlay is open.
-    fn build_tooltip(&mut self, frame: &mut Frame) {
+    /// suppressed while a modal overlay is open. It goes into a frame of its
+    /// own, drawn in the menu's pass (after overlay images, which would cover
+    /// its panel but not its text): never with a menu, which suppresses it.
+    fn build_tooltip(&mut self, frame: &mut Frame) -> Option<Frame> {
         let modal = self.palette.is_some()
             || self.menu.is_some()
             || self.app.picker_open()
@@ -3045,7 +3047,7 @@ impl State {
         let Some((anchor, text, _)) = tip else {
             self.tooltip_hover = None;
             self.tooltip_due = None;
-            return;
+            return None;
         };
         let now = Instant::now();
         let since = match self.tooltip_hover {
@@ -3055,11 +3057,12 @@ impl State {
         self.tooltip_hover = Some((anchor, since));
         if now < since + TOOLTIP_DELAY {
             self.tooltip_due = Some(since + TOOLTIP_DELAY);
-            return;
+            return None;
         }
         self.tooltip_due = None;
 
         let (sw, sh) = frame.screen;
+        let mut tip = Frame::new(frame.screen);
         let (scale, ch) = (self.scale, self.cell_h);
         let pad = 6.0 * scale;
         let ui = self.ui();
@@ -3069,7 +3072,7 @@ impl State {
             ui,
             self.cursor,
             &mut self.text,
-            frame,
+            &mut tip,
             Layer::Overlay,
             PICKER_SID,
         );
@@ -3086,6 +3089,7 @@ impl State {
         for (i, line) in lines.into_iter().enumerate() {
             cx.place(line, x + pad, y + pad + i as f32 * ch, panel, theme::TEXT);
         }
+        Some(tip)
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -4469,14 +4473,22 @@ impl State {
         // overlay pass.
         self.build_picker(&mut frame);
         self.build_confirm(&mut frame);
-        self.build_tooltip(&mut frame);
-        // The menu draws after every other overlay, quads and text, so one
-        // opened from the picker's view shows above the picker.
+        let tooltip = self.build_tooltip(&mut frame);
+        // The menu (or else the tooltip) draws after every other overlay,
+        // quads and text, so one opened from the picker's view shows above
+        // the picker, and neither loses its panel under an overlay image.
         let mut menu_quads = Vec::new();
         let menu_placements = if self.menu.is_some() {
             self.build_menu(sw, sh, &mut menu_quads)
         } else {
             Vec::new()
+        };
+        let tooltip_text = match tooltip {
+            Some(tip) if menu_placements.is_empty() => {
+                menu_quads.extend_from_slice(&tip.top);
+                tip.overlay_text
+            }
+            _ => Vec::new(),
         };
 
         self.images.prepare(
@@ -4657,8 +4669,22 @@ impl State {
                 )
                 .context("overlay prepare")?;
         }
-        // The menu's text, in a pass of its own after its quads.
-        if !menu_placements.is_empty() {
+        // The menu's (or tooltip's) text, in a pass of its own after its quads.
+        let has_menu_text = !menu_placements.is_empty() || !tooltip_text.is_empty();
+        if !tooltip_text.is_empty() {
+            let areas: Vec<TextArea> = tooltip_text.iter().filter_map(area).collect();
+            self.menu_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .context("tooltip prepare")?;
+        } else if !menu_placements.is_empty() {
             let areas = menu_placements.iter().map(|p| TextArea {
                 buffer: &self.menu_buffers[p.idx],
                 left: p.left,
@@ -4767,7 +4793,7 @@ impl State {
             }
             // Only what was prepared this frame: a renderer replays its last
             // prepared text otherwise.
-            if !menu_placements.is_empty() {
+            if has_menu_text {
                 self.menu_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .context("menu render")?;
