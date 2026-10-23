@@ -1914,6 +1914,33 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_hidden_popup_outlives_other_surfaces_closing_but_not_its_opener() {
+        let dir = crate::plugin::testing::tmpdir("web-hidden-keep");
+        stub_app_host(&dir, &[popup_event(POPUP_IDS, 1, false)], "cat > /dev/null");
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let hidden = |s: &AppState| s.describe().lines().any(|l| l.starts_with("hidden surface "));
+        wait("the hidden pop-up", || {
+            s.pump_all();
+            hidden(&s)
+        });
+        // Another surface opens and closes.
+        registry.execute("surface.new", &Args::new(), &mut s).unwrap();
+        assert_ne!(s.focused_surface(), Some(opener));
+        registry.execute("pane.close", &Args::new(), &mut s).unwrap();
+        s.pump_all();
+        assert!(hidden(&s), "closing another surface keeps it: {}", s.describe());
+        // Its opener closes: it goes.
+        s.close_surface_id(opener);
+        s.pump_all();
+        assert!(!hidden(&s), "{}", s.describe());
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    #[test]
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
         let dir = crate::plugin::testing::tmpdir("web-float-close");
         let log = dir.join("requests");

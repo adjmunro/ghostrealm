@@ -1201,16 +1201,31 @@ impl AppState {
         });
     }
 
-    /// Run a tree mutation, then drop terminals whose surfaces no longer exist.
+    /// Run a tree mutation, then drop views whose surfaces no longer exist:
+    /// those in no pane, except hidden surfaces whose opener (through any
+    /// chain of hidden openers) is still in one.
     fn prune_orphan_surfaces_after(&mut self, f: impl FnOnce(&mut Self) -> bool) {
         f(self);
-        let live: std::collections::HashSet<SurfaceId> = self
+        let mut live: std::collections::HashSet<SurfaceId> = self
             .tree
             .vtabs()
             .iter()
             .flat_map(|v| v.panes())
             .flat_map(|p| p.surfaces.iter().map(|s| s.id))
             .collect();
+        loop {
+            let more: Vec<SurfaceId> = self
+                .hidden
+                .iter()
+                .filter(|(p, of)| !live.contains(p) && live.contains(&of.opener))
+                .map(|(p, _)| *p)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            live.extend(more);
+        }
+        self.hidden.retain(|p, _| live.contains(p));
         self.views.retain(|id, _| live.contains(id));
     }
 
