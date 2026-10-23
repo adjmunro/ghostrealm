@@ -10,7 +10,7 @@ use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
     eval_wrapper, Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, Request,
-    MAX_EVAL_RESULT, POPUP_IDS,
+    MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS,
 };
 use serde_json::{json, Value};
 
@@ -713,6 +713,12 @@ fn open_popup(
     else {
         return false;
     };
+    let open = BROWSERS.with_borrow(|m| m.values().filter(|e| e.opener == Some(opener)).count())
+        + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener).count());
+    if open >= MAX_POPUPS {
+        emit(&Event::PopupRefused { opener, url });
+        return false;
+    }
     let id = NEXT_POPUP.get();
     NEXT_POPUP.set(id + 1);
     let from_input = BROWSERS.with_borrow(|m| {

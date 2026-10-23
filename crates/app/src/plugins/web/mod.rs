@@ -1444,6 +1444,10 @@ impl View for WebView {
         if let Some(gone) = &v.gone {
             out.push_str(&format!("error: {gone}; reload to restart it\n"));
         }
+        if v.popups_refused > 0 {
+            let max = ghostrealm_web::protocol::MAX_POPUPS;
+            out.push_str(&format!("pop-ups refused: {} (a page keeps at most {max} open)\n", v.popups_refused));
+        }
         out.push('\n');
         out.push_str(&text);
         out.push('\n');

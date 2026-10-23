@@ -484,12 +484,20 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     host.eval(p.id, "window.close()", Duration::from_secs(5)).ok();
     wait_closed(&host, p.id);
 
-    // Closing the opener closes the pop-ups it still has.
-    assert_eq!(host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)), Ok("true".into()));
-    let [q] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    // A page keeps at most `MAX_POPUPS` open; closing it closes them.
+    let max = ghostrealm_web::protocol::MAX_POPUPS;
+    let open = |n| host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)) == Ok(n);
+    for _ in 0..max {
+        assert!(open("true".into()));
+    }
+    assert!(open("false".into()), "one too many");
+    assert_eq!(host.view(1).unwrap().popups_refused, 1);
+    let open = wait_popups(&host, 1, max);
     assert!(host.send(&Request::Close { id: 1 }));
     wait_closed(&host, 1);
-    wait_closed(&host, q.id);
+    for q in open {
+        wait_closed(&host, q.id);
+    }
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);

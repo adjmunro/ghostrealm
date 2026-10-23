@@ -69,6 +69,10 @@ pub struct ViewState {
     /// Why the page's renderer ended, cleared when a new load (a reload)
     /// starts. Until then the frame is the dead page's last.
     pub gone: Option<String>,
+    /// Pop-ups the host refused this page (it had [`MAX_POPUPS`] open).
+    ///
+    /// [`MAX_POPUPS`]: crate::protocol::MAX_POPUPS
+    pub popups_refused: u32,
     /// Bumped on every event for this page, so a caller can tell it changed.
     pub version: u64,
 }
@@ -552,6 +556,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             s.views.entry(id).or_default().url.clone_from(&url);
             s.popups.push(PopupInfo { id, opener, url, from_input, width, height });
         }
+        Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
         Event::Closed { id } => {
             s.views.remove(&id);
             s.closed.insert(id);
@@ -579,7 +584,8 @@ fn page_of(ev: &Event) -> Option<u64> {
         | Event::Cursor { id, .. }
         | Event::LoadError { id, .. }
         | Event::RendererGone { id, .. }
-        | Event::Popup { id, .. } => Some(*id),
+        | Event::Popup { id, .. }
+        | Event::PopupRefused { opener: id, .. } => Some(*id),
         _ => None,
     }
 }

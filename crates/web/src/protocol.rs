@@ -16,6 +16,10 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// the app numbers the pages it creates below it.
 pub const POPUP_IDS: u64 = 1 << 40;
 
+/// Pop-ups one page may have open (made or being made); the host refuses
+/// more ([`Event::PopupRefused`]).
+pub const MAX_POPUPS: usize = 4;
+
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
 /// passes them through unchanged.
 pub mod mods {
@@ -269,6 +273,12 @@ pub enum Event {
         /// Its initial physical size: what the page asked for, else the opener's.
         width: u32,
         height: u32,
+    },
+    /// Page `opener` already has [`MAX_POPUPS`] pop-ups open, so the one to
+    /// `url` was not made (`window.open` returned `null`).
+    PopupRefused {
+        opener: u64,
+        url: String,
     },
     /// The page closed: by a `Close` request, `window.close()`, its opener
     /// closing (a pop-up), or a pop-up that was never made.
