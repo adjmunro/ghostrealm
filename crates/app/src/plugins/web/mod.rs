@@ -11,9 +11,10 @@
 //! [`WebView::take_opened`]. Each goes when it closes itself.
 //!
 //! Pages render in the out-of-process CEF host (`ghostrealm-web-host`, see
-//! [`ghostrealm_web`]): one host serves every web view and is spawned on first
-//! use. The view shows the host's latest frame with [`PaintCx::image`] and
-//! forwards mouse and raw key events. Without a window (the agent channel) a
+//! [`ghostrealm_web`]): one host serves every web view. It is spawned on first
+//! use and hung up on once no web view has been left for `IDLE_EXIT`. The
+//! view shows the host's latest frame with [`PaintCx::image`] and forwards
+//! mouse and raw key events. Without a window (the agent channel) a
 //! page is created at a default size the first time it is used.
 
 mod keys;
@@ -33,8 +34,8 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 use ghostrealm_web::protocol::mods;
 use ghostrealm_web::{
-    Cursor, EditAction, MouseAction, MouseButton as PageButton, PopupInfo, PopupKind, Request as HostRequest,
-    SharedFrame, ViewState, WebHost,
+    Cursor, EditAction, Exiting, MouseAction, MouseButton as PageButton, PopupInfo, PopupKind,
+    Request as HostRequest, SharedFrame, ViewState, WebHost,
 };
 use glyphon::Family;
 use winit::window::CursorIcon;
@@ -76,6 +77,13 @@ const PAGE_BG: [u8; 3] = [255, 255, 255];
 /// exit in a row up to [`RETRY_MAX`] (Reload retries at once).
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// With no web view left, the host is hung up on after this long: an idle
+/// Chromium browser and GPU process hold a few hundred MB. Long enough that
+/// closing the last tab and opening another doesn't restart it.
+const IDLE_EXIT: Duration = Duration::from_secs(30);
+/// Without a window, a new host waits this long for the one hung up on to go
+/// (its reaper kills it after 5 s).
+const EXIT_WAIT: Duration = Duration::from_secs(10);
 
 /// The host process, shared by every web view.
 #[derive(Default)]
@@ -102,6 +110,16 @@ struct HostSlot {
     cfg: ghostrealm_core::Web,
     waker: Option<Waker>,
     next_page: u64,
+    /// One clone per live web view, so the slot knows when none is left.
+    views: Rc<()>,
+    /// Since when no web view has been left, while a host runs.
+    idle_since: Option<Instant>,
+    /// The host hung up on for being idle, until its process has gone: it may
+    /// still hold the profile, so no host is spawned before then.
+    exiting: Option<Exiting>,
+    /// [`IDLE_EXIT`] instead.
+    #[cfg(test)]
+    idle_exit: Option<Duration>,
 }
 
 impl HostSlot {
@@ -112,6 +130,17 @@ impl HostSlot {
         if let Some(stamp) = self.refused {
             if self.find_host().and_then(|p| bundle_stamp(&p)) != stamp {
                 self.refused = None;
+            }
+        }
+        if self.host.is_none() {
+            if let Some(old) = &self.exiting {
+                // The GUI doesn't wait: the old host's reaper wakes it once
+                // it has gone, and the view's timer spawns then.
+                if !old.is_gone() && self.waker.is_some() {
+                    return None;
+                }
+                old.wait(EXIT_WAIT);
+                self.exiting = None;
             }
         }
         if self.host.is_none()
@@ -168,6 +197,39 @@ impl HostSlot {
         }
     }
 
+    /// Hang up on the host once no web view, and no person's tab waiting to
+    /// be placed, has been left for [`IDLE_EXIT`]. A host that exited by
+    /// itself meanwhile is let go as an exit (its reason kept, backing off),
+    /// not as idle.
+    fn idle_tick(&mut self, now: Instant) {
+        let unused = Rc::strong_count(&self.views) == 1 && !self.host.as_ref().is_some_and(WebHost::has_orphan_tabs);
+        if unused {
+            self.notice_exit();
+        }
+        if !unused || self.host.is_none() {
+            self.idle_since = None;
+            return;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= self.idle_exit() {
+            self.idle_since = None;
+            self.exiting = self.host.take().map(WebHost::hang_up);
+        }
+    }
+
+    /// When [`idle_tick`](Self::idle_tick) next hangs up, while it is counting.
+    fn idle_deadline(&self) -> Option<Instant> {
+        self.idle_since.map(|t| t + self.idle_exit())
+    }
+
+    fn idle_exit(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.idle_exit.or_else(|| tests::TEST_IDLE_EXIT.get()) {
+            return d;
+        }
+        IDLE_EXIT
+    }
+
     fn find_host(&self) -> Option<std::path::PathBuf> {
         #[cfg(test)]
         if let Some(exe) = self.exe.clone().or_else(|| tests::TEST_HOST.with_borrow(Clone::clone)) {
@@ -195,9 +257,17 @@ impl HostSlot {
         self.refused = None;
     }
 
-    /// When a host can next be spawned, while there is none.
+    /// When a host can next be spawned, while there is none: after the
+    /// back-off, or once the host hung up on has gone (its reaper wakes the
+    /// loop then).
     fn retry_at(&self) -> Option<Instant> {
-        self.retry_at.filter(|_| self.host.is_none())
+        if self.host.is_some() {
+            return None;
+        }
+        match &self.exiting {
+            Some(old) => old.gone_at(),
+            None => self.retry_at,
+        }
     }
 }
 
@@ -221,6 +291,34 @@ impl WebPlugin {
     /// the app placed them: no view is left to hand them over.
     pub fn orphan_tabs(&self) -> OrphanTabs {
         OrphanTabs(self.slot.clone())
+    }
+
+    /// What hangs up on the host once no web surface is left (see
+    /// [`IdleExit`]): no view is left to do it.
+    pub fn idle_exit(&self) -> IdleExit {
+        IdleExit(self.slot.clone())
+    }
+}
+
+/// See [`WebPlugin::idle_exit`].
+pub struct IdleExit(Rc<RefCell<HostSlot>>);
+
+impl IdleExit {
+    /// Hang up on the host once no web surface (a web view anywhere: a tab
+    /// in any workspace, a hidden or floating pop-up, a pop-up not yet
+    /// placed) and no person's tab waiting to be placed has been left for
+    /// `IDLE_EXIT` (30 s); it respawns on demand. Call on every pass of the event
+    /// loop, and between agent requests.
+    pub fn tick(&self, now: Instant) {
+        if let Ok(mut slot) = self.0.try_borrow_mut() {
+            slot.idle_tick(now);
+        }
+    }
+
+    /// When [`tick`](Self::tick) next has something to do, so the event loop
+    /// wakes for it.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.0.try_borrow().ok()?.idle_deadline()
     }
 }
 
@@ -485,6 +583,8 @@ impl ImageSource for PageImage {
 
 pub struct WebView {
     slot: Rc<RefCell<HostSlot>>,
+    /// Counts this view in the slot's `views`.
+    _counted: Rc<()>,
     /// This page's id in the host.
     page: u64,
     /// Host generation the page was created in (0 = not yet).
@@ -564,8 +664,10 @@ impl WebView {
             w: 0.0,
             h: 0.0,
         };
+        let counted = slot.borrow().views.clone();
         WebView {
             slot,
+            _counted: counted,
             page,
             created_in: 0,
             start: None,
@@ -748,10 +850,15 @@ impl WebView {
     /// be ready and return why it isn't; with one (the GUI) return at once and
     /// let the pane show it.
     fn start(&mut self) -> Result<(), String> {
+        let gui = self.slot.borrow().waker.is_some();
         if !self.send(None) {
+            // The page is created once the host hung up on has gone.
+            if gui && self.slot.borrow().exiting.is_some() {
+                return Ok(());
+            }
             return Err(self.no_host());
         }
-        if self.slot.borrow().waker.is_some() {
+        if gui {
             return Ok(());
         }
         if self.with_host(|h, _| h.wait_ready(LOAD_WAIT)) == Some(true) {
@@ -774,18 +881,25 @@ impl WebView {
     }
 
     fn no_host(&self) -> String {
-        self.slot
-            .borrow()
-            .error
-            .clone()
-            .unwrap_or_else(|| "web host not running".into())
+        let slot = self.slot.borrow();
+        match (&slot.error, &slot.exiting) {
+            (Some(e), _) => e.clone(),
+            (None, Some(_)) => "the web host is restarting".into(),
+            (None, None) => "web host not running".into(),
+        }
     }
 
-    /// Load an address or search terms.
+    /// Load an address or search terms. Typed into a page not yet made while
+    /// the host hung up on is still going, it is the page's first address.
     pub fn navigate(&mut self, input: &str) -> Result<(), String> {
         let search = self.slot.borrow().cfg.search.clone();
         let url = normalize_url(input, &search);
-        self.navigation(HostRequest::Navigate { id: self.page, url })
+        let sent = self.navigation(HostRequest::Navigate { id: self.page, url });
+        if sent.is_err() && self.created_in == 0 && !self.host_made && self.slot.borrow().exiting.is_some() {
+            self.start = Some(input.to_string());
+            return Ok(());
+        }
+        sent
     }
 
     pub fn back(&mut self) -> Result<(), String> {
@@ -1529,7 +1643,8 @@ impl View for WebView {
         self.refresh_state() | self.pull_popups() | floating
     }
 
-    /// While the host is backing off after an exit: when to try again.
+    /// While the host is backing off after an exit, or being hung up on:
+    /// when to try again.
     fn deadline(&self, _cfg: &ghostrealm_core::Config) -> Option<Instant> {
         self.slot.borrow().retry_at()
     }
@@ -1583,7 +1698,7 @@ impl View for WebView {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plugin::testing::{cmd, press, Harness};
     use ghostrealm_core::Value;
@@ -1592,7 +1707,9 @@ pub(super) mod tests {
     thread_local! {
         /// The host a test's web views run (on its own thread) when no view
         /// names one: for views an `AppState` opens.
-        pub(in crate::plugins::web) static TEST_HOST: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+        pub(crate) static TEST_HOST: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+        /// [`IDLE_EXIT`] for the views an `AppState` opens on this thread.
+        pub(crate) static TEST_IDLE_EXIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     }
 
     /// A view whose host can't be found (tests don't bundle one).
@@ -1905,7 +2022,7 @@ pub(super) mod tests {
 
     /// A stub host at `dir/host.sh` running `script` after reporting ready
     /// and `events`; the host for views an `AppState` opens on this thread.
-    fn stub_app_host(dir: &std::path::Path, events: &[String], script: &str) {
+    pub(crate) fn stub_app_host(dir: &std::path::Path, events: &[String], script: &str) {
         use std::os::unix::fs::PermissionsExt;
         let exe = dir.join("host.sh");
         let echo: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();
@@ -2343,6 +2460,157 @@ pub(super) mod tests {
     }
 
 
+    /// Given web tabs in two workspaces, and a host that notes when it starts
+    /// and when its stdin closes;
+    /// when one tab closes and well past the idle exit passes;
+    /// then the host keeps running: the other workspace's tab is a web surface;
+    /// when the other closes too;
+    /// then the host is hung up on once the idle exit has passed since then,
+    /// not before;
+    /// when a web surface opens again at once;
+    /// then a new host starts (no back-off, as after a failure) once the old
+    /// one has gone, and the page is made in it.
+    #[test]
+    fn the_host_is_hung_up_on_once_no_web_surface_is_left_for_a_while() {
+        let dir = crate::plugin::testing::tmpdir("web-idle-exit");
+        let log = dir.join("log");
+        // It takes a moment to exit once its stdin closes.
+        let script = format!("echo run >> '{0}'; cat > /dev/null; sleep 0.5; echo eof >> '{0}'", log.display());
+        stub_app_host(&dir, &[], &script);
+        let read = || std::fs::read_to_string(&log).unwrap_or_default();
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        let mut registry = crate::app_state::build_registry();
+        s.new_empty_vtab();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let first = s.focused_surface().unwrap();
+        s.new_empty_vtab();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let second = s.focused_surface().unwrap();
+
+        s.close_surface_id(first);
+        let t0 = Instant::now();
+        s.tick_web(t0);
+        s.tick_web(t0 + IDLE_EXIT * 2);
+        assert_eq!(s.next_web_deadline(), None, "a web surface is left");
+        wait("one host runs", || read() == "run\n");
+
+        s.close_surface_id(second);
+        let t1 = t0 + IDLE_EXIT * 3;
+        s.tick_web(t1);
+        assert_eq!(s.next_web_deadline(), Some(t1 + IDLE_EXIT));
+        s.tick_web(t1 + IDLE_EXIT - Duration::from_millis(1));
+        assert_eq!(s.next_web_deadline(), Some(t1 + IDLE_EXIT), "still counting");
+        s.tick_web(t1 + IDLE_EXIT);
+        assert_eq!(s.next_web_deadline(), None);
+
+        s.new_empty_vtab();
+        registry.execute("web.new", &Args::new(), &mut s).expect("respawns at once");
+        wait("a second host starts after the first went", || read() == "run\neof\nrun\n");
+        let sid = s.focused_surface().unwrap();
+        let v = s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap();
+        let generation = v.slot.borrow().generation;
+        assert_eq!((v.created_in, generation), (2, 2), "made in the new host");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// Given a running host with no web view left but a person's tab whose
+    /// opener went, waiting to be placed;
+    /// when well past the idle exit passes;
+    /// then the host keeps running; and while the view the tab is placed in
+    /// lives, still; once that goes, the idle exit counts from then.
+    #[test]
+    fn a_tab_waiting_to_be_placed_keeps_the_host() {
+        let (mut v, _) = stub_host("web-idle-orphan", "cat > /dev/null");
+        assert!(v.send(None));
+        let slot = v.slot.clone();
+        let tab = PopupInfo { id: POPUP_IDS, opener: 1, url: String::new(), from_input: true, kind: PopupKind::Tab, width: 1, height: 1 };
+        slot.borrow().host.as_ref().unwrap().orphan_tab(tab);
+        drop(v);
+        let idle = IdleExit(slot.clone());
+        let t0 = Instant::now();
+        idle.tick(t0);
+        idle.tick(t0 + IDLE_EXIT * 2);
+        assert!(slot.borrow().host.is_some(), "the waiting tab keeps it");
+        assert_eq!(idle.deadline(), None);
+
+        let placed = OrphanTabs(slot.clone()).take();
+        assert_eq!(placed.len(), 1);
+        idle.tick(t0 + IDLE_EXIT * 3);
+        assert!(slot.borrow().host.is_some(), "its view keeps it");
+        drop(placed);
+        let t1 = t0 + IDLE_EXIT * 4;
+        idle.tick(t1);
+        assert_eq!(idle.deadline(), Some(t1 + IDLE_EXIT));
+        idle.tick(t1 + IDLE_EXIT);
+        assert!(slot.borrow().host.is_none() && slot.borrow().exiting.is_some(), "hung up on");
+    }
+
+    /// Given a host that exits by itself (a failure) after the last web view
+    /// went;
+    /// when the idle tick runs;
+    /// then it is let go as an exit, its reason kept and the next spawn
+    /// backed off, not as an idle hang-up.
+    #[test]
+    fn a_host_that_fails_with_no_web_view_left_is_not_an_idle_exit() {
+        let (mut v, _) = stub_host("web-idle-crash", r#"echo '{"ev":"failed","error":"boom"}'; exit 1"#);
+        assert!(v.send(None));
+        wait_exit(&v);
+        let slot = v.slot.clone();
+        drop(v);
+        IdleExit(slot.clone()).tick(Instant::now() + IDLE_EXIT * 2);
+        let slot = slot.borrow();
+        assert!(slot.host.is_none() && slot.exiting.is_none(), "not hung up on");
+        assert_eq!(slot.error.as_deref(), Some("boom"));
+        assert!(slot.retry_at.is_some(), "backs off");
+    }
+
+    /// Given the GUI (a waker), and a host that takes a second to exit once
+    /// its stdin closes;
+    /// when it is hung up on for being idle, and a web surface opens, is
+    /// started (as `web.new` does), and is typed an address before the old
+    /// host has gone;
+    /// then no host is spawned and no error shown meanwhile, starting and
+    /// the address succeed, and the view has no timer; once the old host
+    /// has gone, the view's timer is due and spawns a new host, which makes
+    /// the page at that address.
+    #[test]
+    fn a_surface_opened_while_the_host_exits_waits_for_it_to_go() {
+        let script = "if [ -e \"$0.once\" ]; then cat > \"$0.requests\"; else touch \"$0.once\"; cat > /dev/null; sleep 1; fi";
+        let (mut v, runs_file) = stub_host("web-idle-wait", script);
+        let log = runs_file.with_file_name("host.sh.requests");
+        v.slot.borrow_mut().waker = Some(Arc::new(|| {}));
+        assert!(v.send(None));
+        wait("the first host starts", || runs(&runs_file) == 1);
+        let plugin = WebPlugin { slot: v.slot.clone() };
+        let slot = v.slot.clone();
+        drop(v);
+        let idle = plugin.idle_exit();
+        let t = Instant::now();
+        idle.tick(t);
+        idle.tick(t + IDLE_EXIT);
+        assert!(slot.borrow().exiting.is_some(), "hung up on");
+
+        let view = plugin.open(&OpenCx::default()).unwrap();
+        let mut v = *(view as Box<dyn Any>).downcast::<WebView>().unwrap();
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        assert_eq!(v.start(), Ok(()));
+        assert_eq!(v.navigate("example.com"), Ok(()));
+        h.paint(&mut v, RECT);
+        assert_eq!(runs(&runs_file), 1, "not spawned while the old host exits");
+        assert_eq!(slot.borrow().error, None);
+        assert_eq!(v.deadline(&Default::default()), None, "its reaper wakes the loop");
+
+        wait("the old host goes", || slot.borrow().exiting.as_ref().is_some_and(Exiting::is_gone));
+        let due = v.deadline(&Default::default()).expect("due once it has gone");
+        assert!(due <= Instant::now());
+        h.tick(&mut v, Instant::now());
+        assert!(slot.borrow().host.is_some(), "spawned");
+        wait("the new host starts", || runs(&runs_file) == 2);
+        let got = requests(&log, |l| l.contains(r#""op":"create""#));
+        assert!(got.contains("example.com"), "{got}");
+    }
+
     /// The bundled host (`mise run web`) beside the test binary's profile
     /// directory, if built.
     fn real_host() -> Option<std::path::PathBuf> {
@@ -2351,6 +2619,71 @@ pub(super) mod tests {
         let mac = dir.join(format!("{name}.app/Contents/MacOS/{name}"));
         let linux = dir.join(name).join(name);
         [mac, linux].into_iter().find(|p| p.is_file())
+    }
+
+    /// Taken by each test here that runs the real host: each points
+    /// `GHOSTREALM_WEB_CACHE`, which a host reads at spawn, at a profile of
+    /// its own.
+    static REAL_HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn running(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// The process id of the host behind surface `sid`'s web view.
+    fn host_pid(s: &mut AppState, sid: SurfaceId) -> Option<u32> {
+        let v = s.view_mut(sid)?.downcast_mut::<WebView>()?;
+        let slot = v.slot.borrow();
+        slot.host.as_ref()?.pid()
+    }
+
+    /// Given the real host (skipped when it isn't built) serving a web
+    /// surface, without a window (as the agent channel runs);
+    /// when the surface closes, the idle exit passes, and a web surface opens
+    /// again at once on the same profile;
+    /// then the first host's process has gone, and a new host serves the new
+    /// surface rather than finding the profile still in use.
+    #[test]
+    fn the_real_host_exits_when_idle_and_a_new_surface_respawns_it() {
+        let Some(exe) = real_host() else {
+            eprintln!("skipping: web host not built (run `mise run web`)");
+            return;
+        };
+        let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
+        let profile = crate::plugin::testing::tmpdir("web-idle-profile");
+        std::env::set_var("GHOSTREALM_WEB_CACHE", &profile);
+        TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        let page = || Args::new().with("url", Value::Str("data:text/html,<title>idle</title>".into()));
+        registry.execute("web.new", &page(), &mut s).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let pid = host_pid(&mut s, sid).expect("a host");
+
+        s.close_surface_id(sid);
+        let t = Instant::now();
+        s.tick_web(t);
+        s.tick_web(t + IDLE_EXIT);
+        registry.execute("web.new", &page(), &mut s).expect("a new host on the same profile");
+        assert!(!running(pid), "the first host has gone");
+        let sid = s.focused_surface().unwrap();
+        let again = host_pid(&mut s, sid).expect("a host");
+        assert_ne!(again, pid);
+        let eval = Args::new().with("id", Value::Int(sid.0 as i64)).with("js", Value::Str("document.title".into()));
+        assert_eq!(registry.execute("web.eval", &eval, &mut s).map(|o| o.message).map_err(|e| e.to_string()), Ok(Some("\"idle\"".into())));
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+        drop(s);
+        let until = Instant::now() + Duration::from_secs(10);
+        while running(again) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&profile);
     }
 
     /// A local HTTP server: `/opener` opens `/popup` on a click, counting its
@@ -2425,9 +2758,9 @@ pub(super) mod tests {
             eprintln!("skipping: web host not built (run `mise run web`)");
             return;
         };
+        let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
         let base = serve();
         let profile = crate::plugin::testing::tmpdir("web-popups-profile");
-        // No other test here spawns a real host, which reads this at spawn.
         std::env::set_var("GHOSTREALM_WEB_CACHE", profile.join("person"));
 
         // A person's click.

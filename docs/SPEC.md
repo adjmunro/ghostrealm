@@ -31,8 +31,9 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
   per line, `crates/web/src/protocol.rs`). Page pixels go through a memory-mapped,
   double-buffered BGRA file per page (`frame.rs`); the `web` plugin shows the
   newest frame with `PaintCx::image`, a texture in the same wgpu scene. Input (mouse, keys, edit
-  commands) is forwarded as requests. One host serves every web surface and is
-  spawned on first use. Build it with `mise run web` (needs CMake + Ninja, pinned
+  commands) is forwarded as requests. One host serves every web surface. It is
+  spawned on first use and asked to exit once no web surface has been left for
+  30 s; the next web surface spawns another. Build it with `mise run web` (needs CMake + Ninja, pinned
   in `mise.toml`; CEF's binary distribution is downloaded by `cef-dll-sys`). The
   app finds it beside its own binary, at `[web] host`, or `$GHOSTREALM_WEB_HOST`.
 

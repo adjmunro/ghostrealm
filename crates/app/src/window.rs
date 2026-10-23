@@ -309,9 +309,15 @@ impl ApplicationHandler<UserEvent> for App {
         if state.fire_view_timers() {
             state.window.request_redraw();
         }
+        // Hang up on an idle web host; its clock starts here, after the event
+        // that closed the last web surface.
+        state.app.tick_web(Instant::now());
         // Wake for whichever comes first: the next paced PTY frame, a pending inbox
-        // auto-read deadline, or a view's timer.
+        // auto-read deadline, a view's timer, or the web host's idle exit.
         let mut wake: Option<Instant> = state.frame_pending.then_some(state.next_frame);
+        if let Some(d) = state.app.next_web_deadline() {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
         if let Some(d) = state.app.next_inbox_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }

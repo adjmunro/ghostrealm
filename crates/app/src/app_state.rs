@@ -246,12 +246,15 @@ pub struct AppState {
     hidden: HashMap<SurfaceId, HiddenOf>,
     /// A person's web tabs whose opener went before they were placed.
     orphan_tabs: web::OrphanTabs,
+    /// Hangs up on the web host once no web surface is left.
+    web_idle: web::IdleExit,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let web = web::WebPlugin::new();
         let orphan_tabs = web.orphan_tabs();
+        let web_idle = web.idle_exit();
         AppState {
             tree: Tree::new(),
             views: HashMap::new(),
@@ -281,6 +284,7 @@ impl AppState {
             focus_stamp: 0,
             hidden: HashMap::new(),
             orphan_tabs,
+            web_idle,
         }
     }
 
@@ -1298,6 +1302,19 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    /// Hang up on the web host once no web surface has been left for a
+    /// while (see [`web::IdleExit::tick`]). Call on every pass of the event
+    /// loop and between agent requests.
+    pub fn tick_web(&mut self, now: Instant) {
+        self.web_idle.tick(now);
+    }
+
+    /// When [`tick_web`](Self::tick_web) next has something to do, so the
+    /// event loop wakes for it.
+    pub fn next_web_deadline(&self) -> Option<Instant> {
+        self.web_idle.deadline()
     }
 
     /// The next time an inbox timer should fire (a pending auto-read dwell), so the

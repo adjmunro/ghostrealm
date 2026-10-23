@@ -27,6 +27,9 @@ use crate::app_state::{build_registry, AppState};
 
 /// Run the REPL until the input reaches EOF.
 ///
+/// The web host's idle exit is checked around each request: nothing wakes
+/// this loop while it waits for the next one.
+///
 /// Exited terminals stay in the tree whatever the config says: the agent has to
 /// read a finished command's output with `get surface`, which a closed surface
 /// no longer answers.
@@ -47,7 +50,9 @@ pub fn run<R: BufRead, W: Write>(
         if trimmed.is_empty() {
             continue;
         }
+        state.tick_web(std::time::Instant::now());
         let response = handle(trimmed, &mut state, &mut registry);
+        state.tick_web(std::time::Instant::now());
         serde_json::to_writer(&mut output, &response)?;
         output.write_all(b"\n")?;
         output.flush()?;
@@ -198,6 +203,37 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    /// Given the agent channel and a web host whose idle exit is immediate,
+    /// which takes a moment to exit once its stdin closes, noting each start
+    /// and that exit;
+    /// when the agent opens a web surface, closes it, and opens another;
+    /// then the first host is hung up on once the surface closed, the
+    /// second starts only once the first has gone, and both opens succeed.
+    #[cfg(unix)]
+    #[test]
+    fn the_web_host_is_hung_up_on_between_requests_once_idle() {
+        use crate::plugins::web::tests::{stub_app_host, TEST_HOST, TEST_IDLE_EXIT};
+        let dir = crate::plugin::testing::tmpdir("agent-web-idle");
+        let log = dir.join("log");
+        stub_app_host(&dir, &[], &format!("echo run >> '{0}'; cat > /dev/null; sleep 0.5; echo eof >> '{0}'", log.display()));
+        TEST_IDLE_EXIT.set(Some(std::time::Duration::ZERO));
+        let lines = [
+            r#"{"op":"set","id":"web.new","args":{}}"#,
+            r#"{"op":"set","id":"web.close","args":{}}"#,
+            r#"{"op":"set","id":"web.new","args":{}}"#,
+        ];
+        let mut state = AppState::new().with_shell_line("sleep 1");
+        state.new_empty_vtab();
+        state.new_empty_vtab();
+        let mut out: Vec<u8> = Vec::new();
+        run(Cursor::new(lines.join("\n").into_bytes()), &mut out, state).unwrap();
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+        TEST_IDLE_EXIT.set(None);
+        let replies: Vec<Json> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(replies.iter().all(|r| r["ok"] == json!(true)), "{replies:?}");
+        assert!(std::fs::read_to_string(&log).unwrap().starts_with("run\neof\nrun\n"));
     }
 
     #[test]

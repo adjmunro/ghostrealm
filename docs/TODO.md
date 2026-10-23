@@ -672,15 +672,6 @@
 
 ---
 
-[2026-10-05@93248d9] Web — exit the host when no web surfaces remain
-
-- Requires: NO BLOCKERS
-- Detail: The host is spawned on first use and lives until the app quits. Close it
-  (stdin EOF) a little after the last web surface closes; it respawns on demand.
-- Reason: an idle Chromium browser + GPU process hold a few hundred MB.
-
----
-
 [2026-10-13T19:46+1300@d292715] PRIORITY: User-visible error surface
 
 - Requires: a design (prompt the user about it)
@@ -1396,3 +1387,16 @@
   profile before the host had exited (crates/web/tests/common/mod.rs
   `shut_down` now waits for it). Do the same in the app's tests.
 - Reason: test runs shouldn't fill the temp directory.
+
+---
+
+[2026-10-24T03:20+1300@8b75dfd] Web — idle host exit while `ghostrealm agent` waits on stdin
+
+- Requires: NO BLOCKERS
+- Detail: The agent channel checks the web host's idle exit only around each
+  request (DECISION.md, Web surface / host lifecycle): blocked on `read_line`,
+  nothing wakes it, so an idle host there lives until the agent's next request or
+  the session's end. Read requests on a thread (or poll stdin with a timeout) and
+  tick at `AppState::next_web_deadline`.
+- Reason: that host holds a few hundred MB, and the web profile's lock, which
+  keeps the GUI's web surfaces from starting on the same profile.
