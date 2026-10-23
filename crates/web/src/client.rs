@@ -69,7 +69,8 @@ pub struct ViewState {
     /// Why the page's renderer ended, cleared when a new load (a reload)
     /// starts. Until then the frame is the dead page's last.
     pub gone: Option<String>,
-    /// Pop-ups the host refused this page (it had [`MAX_POPUPS`] open).
+    /// Pop-ups the host refused this page (it had [`MAX_POPUPS`] open),
+    /// cleared when a new load starts.
     ///
     /// [`MAX_POPUPS`]: crate::protocol::MAX_POPUPS
     pub popups_refused: u32,
@@ -559,6 +560,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             if loading && !v.loading {
                 v.error = None;
                 v.gone = None;
+                v.popups_refused = 0;
             }
             v.loading = loading;
             v.loaded |= !loading;
@@ -762,6 +764,18 @@ mod tests {
         let s = shared.0.lock().unwrap();
         assert!(s.popups.is_empty(), "nobody takes its opener's pop-ups now");
         assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn refused_popups_are_counted_until_the_next_load() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        let refused = || Event::PopupRefused { opener: 1, url: String::new() };
+        let loading = |loading| Event::Loading { id: 1, loading, can_back: false, can_forward: false };
+        apply_event(&shared, refused());
+        apply_event(&shared, refused());
+        assert_eq!(shared.0.lock().unwrap().views[&1].popups_refused, 2);
+        apply_event(&shared, loading(true));
+        assert_eq!(shared.0.lock().unwrap().views[&1].popups_refused, 0);
     }
 
     #[test]
