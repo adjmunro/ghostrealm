@@ -356,6 +356,7 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
                     .to_string(),
                 "/stay" => "<title>Stay</title><p>stay text</p>".to_string(),
                 "/blank" => LINK.replace("LINK", "target=_blank href=/stay"),
+                "/selfclose" => LINK.replace("LINK", "target=_blank href=/stay onclick='setTimeout(() => window.close(), 0)'"),
                 _ => {
                     if path.starts_with("/hit") {
                         seen.lock().unwrap().push(path);
@@ -501,6 +502,52 @@ fn a_popup_says_how_the_page_asked_for_it() {
     assert!(!host.is_closed(tab.id));
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)));
     assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn a_persons_tab_outlives_an_opener_that_closes_itself_until_the_app_forgets_it() {
+    let Some((mut host, cache)) = spawn("popup-orphan") else {
+        return;
+    };
+    let (base, _) = serve();
+    let open = |host: &mut WebHost, id, path: &str| {
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+    };
+
+    // The opener closes itself as its link opens a tab: the app still holds
+    // the opener, so the tab waits for its view to take it.
+    open(&mut host, 1, "/selfclose");
+    let tab = click_for_popup(&host, 1);
+    wait_closed(&host, 1);
+    assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "the tab lives on");
+    assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    host.forget(tab.id);
+
+    // An opener the app forgets before its view takes the tab: the tab closes.
+    open(&mut host, 2, "/blank");
+    let id = ghostrealm_web::protocol::POPUP_IDS + 1;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.view(id).is_none() {
+        if Instant::now() > deadline {
+            panic!("no tab");
+        }
+        for action in [MouseAction::Move, MouseAction::Down { button: MouseButton::Left, count: 1 }, MouseAction::Up { button: MouseButton::Left, count: 1 }] {
+            host.send(&Request::Mouse { id: 2, x: 20, y: 20, mods: 0, action });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(host.send(&Request::Close { id: 2 }));
+    host.forget(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.eval(id, "1", Duration::from_secs(2)).is_ok() {
+        assert!(Instant::now() < deadline, "the untaken tab still runs");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);

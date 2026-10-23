@@ -191,6 +191,7 @@ impl WebHost {
         let shared: Arc<(Mutex<Shared>, Condvar)> = Arc::default();
         let reader_shared = shared.clone();
         let outbox: Arc<(Mutex<Outbox>, Condvar)> = Arc::default();
+        let reader_outbox = outbox.clone();
         std::thread::Builder::new()
             .name("web-host-events".into())
             .spawn(move || {
@@ -199,7 +200,10 @@ impl WebHost {
                     let Ok(ev) = serde_json::from_str::<Event>(&line) else {
                         continue;
                     };
-                    apply_event(&reader_shared, ev);
+                    // Pop-ups no view will take are closed, not left running.
+                    for id in apply_event(&reader_shared, ev) {
+                        enqueue(&reader_outbox, &Request::Close { id });
+                    }
                     if let Some(w) = &waker {
                         w();
                     }
@@ -281,8 +285,11 @@ impl WebHost {
             s.forgotten.insert(id);
         }
         s.popups.retain(|p| p.id != id);
-        drop_popups_of(&mut s, id);
+        let orphans = drop_popups_of(&mut s, id);
         drop(s);
+        for id in orphans {
+            self.send(&Request::Close { id });
+        }
         self.readers.remove(&id);
     }
 
@@ -511,19 +518,21 @@ fn write_requests(mut stdin: ChildStdin, outbox: &(Mutex<Outbox>, Condvar)) {
     }
 }
 
-fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
+/// Apply `ev`; returns the pop-ups to close because no view will take them
+/// (their opener was forgotten).
+fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
     let (lock, cv) = shared;
     let mut s = lock.lock().unwrap();
     let late = match &ev {
-        Event::Closed { id } if s.forgotten.remove(id) => {
-            drop_popups_of(&mut s, *id);
-            true
+        Event::Closed { id } if s.forgotten.remove(id) => Some(drop_popups_of(&mut s, *id)),
+        Event::Popup { id, opener, .. } if s.forgotten.contains(opener) => {
+            s.forgotten.insert(*id);
+            Some(vec![*id])
         }
-        Event::Popup { opener, .. } => s.forgotten.contains(opener),
-        ev => page_of(ev).is_some_and(|id| s.forgotten.contains(&id)),
+        ev => page_of(ev).is_some_and(|id| s.forgotten.contains(&id)).then(Vec::new),
     };
-    if late {
-        return;
+    if let Some(orphans) = late {
+        return orphans;
     }
     if let Some(id) = page_of(&ev) {
         s.views.entry(id).or_default().version += 1;
@@ -582,13 +591,13 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             s.popups.push(PopupInfo { id, opener, url, from_input, kind, width, height });
         }
         Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
+        // The app still holds the page (it closed itself): its view takes
+        // the pop-ups it opened (a tab can outlive it).
         Event::Closed { id } => {
-            // Only pages the app may still ask about: one it forgot stays so.
             let known = s.views.remove(&id).is_some() || s.popups.iter().any(|p| p.id == id);
             if known {
                 s.closed.insert(id);
             }
-            drop_popups_of(&mut s, id);
         }
         Event::Failed { error } => s.failure = Some(error),
         reply @ (Event::Text { id, req, .. } | Event::EvalResult { id, req, .. }) => {
@@ -601,17 +610,24 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
         }
     }
     cv.notify_all();
+    Vec::new()
 }
 
-/// Forget the pop-ups page `opener` opened that no view took: none will now.
-fn drop_popups_of(s: &mut Shared, opener: u64) {
+/// Forget the pop-ups the forgotten page `opener` opened that no view took
+/// (none will now); returns those still open, to close.
+fn drop_popups_of(s: &mut Shared, opener: u64) -> Vec<u64> {
     let (gone, keep): (Vec<PopupInfo>, Vec<PopupInfo>) =
         std::mem::take(&mut s.popups).into_iter().partition(|p| p.opener == opener);
     s.popups = keep;
+    let mut open = Vec::new();
     for p in gone {
         s.views.remove(&p.id);
-        s.closed.remove(&p.id);
+        if !s.closed.remove(&p.id) {
+            s.forgotten.insert(p.id);
+            open.push(p.id);
+        }
     }
+    open
 }
 
 /// The page an event updates the state of (not replies, which answer requests).
@@ -744,31 +760,48 @@ mod tests {
     }
 
     #[test]
-    fn closed_pages_and_untaken_popups_are_not_kept_forever() {
-        let shared: (Mutex<Shared>, Condvar) = Default::default();
-        let popup = |id| Event::Popup {
+    fn untaken_popups_wait_for_their_opener_or_close_with_it() {
+        let mut host = WebHost {
+            child: None,
+            outbox: Arc::default(),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+        };
+        let popup = |id, opener| Event::Popup {
             id,
-            opener: 1,
+            opener,
             url: String::new(),
-            from_input: false,
-            kind: Default::default(),
+            from_input: true,
+            kind: PopupKind::Tab,
             width: 1,
             height: 1,
         };
+        let shared = host.shared.clone();
         apply_event(&shared, Event::Title { id: 1, title: "t".into() });
-        apply_event(&shared, popup(10));
-        apply_event(&shared, Event::Closed { id: 10 });
+        assert!(apply_event(&shared, popup(10, 1)).is_empty());
         apply_event(&shared, Event::Closed { id: 99 });
-        {
-            let s = shared.0.lock().unwrap();
-            assert!(s.closed.contains(&10), "a pop-up not yet taken");
-            assert!(!s.closed.contains(&99), "a page the app forgot");
-        }
-        apply_event(&shared, popup(11));
+        assert!(!shared.0.lock().unwrap().closed.contains(&99), "a page the app never had");
+
+        // The opener closed itself: its view still takes the pop-up.
         apply_event(&shared, Event::Closed { id: 1 });
+        assert_eq!(host.take_popups(1).len(), 1);
+
+        // A forgotten opener's untaken pop-ups close, late ones too.
+        apply_event(&shared, Event::Title { id: 2, title: "t".into() });
+        apply_event(&shared, popup(11, 2));
+        host.forget(2);
+        assert_eq!(apply_event(&shared, popup(12, 2)), [12]);
+        let queued: Vec<Request> = host.outbox.0.lock().unwrap().queue.iter().cloned().collect();
+        assert_eq!(queued, [Request::Close { id: 11 }]);
+        assert!(apply_event(&shared, Event::Title { id: 11, title: "late".into() }).is_empty());
+        assert!(host.view(11).is_none(), "its late events are dropped");
+        for id in [2, 11, 12] {
+            apply_event(&shared, Event::Closed { id });
+        }
         let s = shared.0.lock().unwrap();
-        assert!(s.popups.is_empty(), "nobody takes its opener's pop-ups now");
-        assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1]);
+        assert!(s.popups.is_empty() && s.forgotten.is_empty(), "nothing kept");
+        assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1], "the opener the app still holds");
     }
 
     #[test]
