@@ -67,8 +67,9 @@ const INPUT_ACTIVATION: Duration = Duration::from_secs(5);
 struct PendingPopup {
     view: SharedView,
     opener: u64,
-    /// CEF's id for it, which `on_before_popup_aborted` names.
-    cef_id: c_int,
+    /// CEF's id for it, which `on_before_popup_aborted` names; none for a
+    /// page the host creates itself ([`open_link`]).
+    cef_id: Option<c_int>,
     queued: Vec<Request>,
     /// A person's new tab or window: it outlives its opener and doesn't
     /// count toward its pop-ups.
@@ -711,12 +712,45 @@ fn open_popup(
     let (Some(window_info), Some(client), Some(settings)) = (window_info, client, settings) else {
         return false;
     };
-    let Some((id, view)) = admit_popup(opener, cef_id, url, kind, features) else {
+    let Some((id, view)) = admit_popup(opener, Some(cef_id), url, kind, features) else {
         return false;
     };
     *window_info = self::window_info();
     *client = Some(new_client(id, &view));
     *settings = browser_settings();
+    true
+}
+
+/// Page `opener` asked for `url` in a new tab or window from a link clicked
+/// with a modifier or the middle button (CEF's `OnOpenURLFromTab`, which
+/// would load it in place). Open it as a pop-up of `kind`: a page of its own,
+/// with no `window.opener`. Returns whether the opener's own load of it is
+/// cancelled.
+fn open_link(opener: u64, url: String, kind: PopupKind, gesture: bool) -> bool {
+    // The new page loads `url` as if typed, which skips the checks Chromium
+    // makes on a page's own navigations to other schemes; a plain click's
+    // load keeps them.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    // Chromium blocks a new window opened without user activation.
+    if !gesture {
+        return true;
+    }
+    let Some((id, view)) = admit_popup(opener, None, url.clone(), kind, None) else {
+        return true;
+    };
+    let made = browser_host_create_browser(
+        Some(&window_info()),
+        Some(&mut new_client(id, &view)),
+        Some(&CefString::from(url.as_str())),
+        Some(&browser_settings()),
+        None,
+        None,
+    );
+    if made == 0 && PENDING.with_borrow_mut(|m| m.remove(&id)).is_some() {
+        emit(&Event::Closed { id });
+    }
     true
 }
 
@@ -727,7 +761,7 @@ fn open_popup(
 /// `None` when refused or the opener is gone.
 fn admit_popup(
     opener: u64,
-    cef_id: c_int,
+    cef_id: Option<c_int>,
     url: String,
     kind: PopupKind,
     features: Option<&PopupFeatures>,
@@ -812,7 +846,7 @@ fn popup_created(id: u64, b: &Browser) {
 /// CEF dropped pop-up `cef_id` of page `opener` before making it.
 fn popup_aborted(opener: u64, cef_id: c_int) {
     let id = PENDING.with_borrow_mut(|m| {
-        let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == cef_id).map(|(id, _)| *id)?;
+        let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == Some(cef_id)).map(|(id, _)| *id)?;
         m.remove(&id);
         Some(id)
     });
@@ -1242,6 +1276,27 @@ wrap_request_handler! {
             _error_string: Option<&CefString>,
         ) {
             renderer_gone(self.id, status, error_code);
+        }
+
+        /// A link clicked with Shift (a new window), Cmd/Ctrl (a background
+        /// tab, foreground with Shift), or the middle button (likewise), even
+        /// one with `target=_blank`, comes here rather than to
+        /// `on_before_popup`.
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: c_int,
+        ) -> c_int {
+            let kind = match target_disposition {
+                WindowOpenDisposition::NEW_FOREGROUND_TAB => PopupKind::Tab,
+                WindowOpenDisposition::NEW_BACKGROUND_TAB => PopupKind::BackgroundTab,
+                WindowOpenDisposition::NEW_WINDOW => PopupKind::Window,
+                _ => return 0,
+            };
+            open_link(self.id, string(target_url), kind, user_gesture != 0) as c_int
         }
     }
 }

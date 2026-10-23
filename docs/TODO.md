@@ -1303,18 +1303,6 @@
 
 ---
 
-[2026-10-24@48bff23e] Web — Shift-, Cmd-, and middle-clicked links
-
-- Requires: NO BLOCKERS
-- Detail: A link clicked with Shift (new window), Cmd/Ctrl, or the middle
-  button (background tab) loads in place: CEF sends it to
-  `OnOpenURLFromTab`, not `OnBeforePopup` (all three checked in the
-  host). Open it as a tab beside its opener like a `target=_blank` link
-  (in the background for Cmd/Ctrl and middle).
-- Reason: browsers open these in a new tab or window.
-
----
-
 [2026-10-23T18:52+1300@cfbb8bc1] Web — say when a pop-up is refused
 
 - Requires: NO BLOCKERS
@@ -1350,3 +1338,18 @@
   the underline can be missing when asserted. Settle until the diagnostics
   arrive.
 - Reason: a flaky test hides real failures.
+
+---
+
+[2026-10-23T22:14+1300@b1975bea] Web — forms submitted with a modifier
+
+- Requires: NO BLOCKERS
+- Detail: A form submitted with Shift or Cmd/Ctrl held (checked on a
+  clicked submit button; Shift+Enter in a field is likely the same) opens
+  its action URL in a new tab as a GET, without the form data: CEF's
+  `OnOpenURLFromTab` doesn't say the request is a POST (DECISION.md, Web surface / pop-ups, 2026-10-23T22:14). Browsers
+  post it in the new tab. Options: tell a POST apart before the opener's
+  `beforeunload` runs, or post it in the new page once it has loaded its
+  origin (CEF's `LoadRequest` needs that first).
+- Reason: a modifier held while submitting a login form sends the person
+  to an empty request instead of signing in.

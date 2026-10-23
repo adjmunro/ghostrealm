@@ -231,3 +231,14 @@
 - Detail: A person's new tab whose opener (a tab, or a pop-up floating over one) goes before the app places the tab still outlives it: it opens in the focused pane, after its active surface, shown unless it is a background tab. The window is a few milliseconds after the click.
 - Detail: Any web tab, one the app created included, goes when its page closes itself (`window.close()`), once the tabs that page opened are placed.
 - Reason: a person who opens a tab and closes its opener at once still asked for the tab; a page that closed itself leaves nothing to show or drive.
+
+---
+
+[2026-10-23T22:14+1300@b1975bea]
+
+- Category: Web surface / pop-ups
+- Detail: A link clicked with Cmd (Ctrl off macOS) or the middle button opens as a background tab, with Shift too as a foreground tab, and with Shift alone (a new window) as a foreground tab, as a person's new-window pop-up already does; a `target=_blank` link clicked so does the same. Chromium sends these to `OnOpenURLFromTab`, not `OnBeforePopup`: the host cancels the in-place load, makes the page itself, and announces it as a pop-up of the matching kind, so the pop-up rules place it. A person's (their input within 5 s) is a tab beside its opener that outlives it and isn't counted toward the four-pop-up cap; an agent's (a gesture eval dispatching a modified click) is a hidden surface that counts, is refused past the cap (the opener stays put), and closes with its opener.
+- Detail: The page has no `window.opener` and loads its URL as a typed address does: no referrer, and not as the opener's request (`Sec-Fetch-Site: none`; `SameSite=Strict` cookies go with it). A form submitted with a modifier opens its URL without the form data, as a GET (TODO.md "Web — forms submitted with a modifier").
+- Detail: Only `http` and `https` URLs open so. Any other that arrives (`about:blank`, `blob:`, `mailto:`) loads in place, as a plain click on it would, keeping Chromium's checks on a page's own navigations; Chromium refuses `file:`, `data:` and `chrome:` links and runs `javascript:` ones before this. A same-document link (`#frag`) opens its page in the new tab, as browsers do.
+- Detail: A modified click without user activation (a page's script unprompted, an eval without `gesture`) opens nothing and loads nothing, as Chromium blocks a new window without activation. Alt-click (a download in browsers) and, on macOS, Ctrl-click (a context menu) reach neither callback and do nothing.
+- Reason: browsers open these in a new tab or window, and the app shows pages in its own tabs rather than windows. The host makes the page without the opener because CEF gives `OnOpenURLFromTab` no way to hand the opener to a new browser, nor the request's method or body. Deciding in `OnBeforeBrowse` (which sees the method) would mean letting the in-place load start, which runs the opener's `beforeunload`; a page that asks there (an unsaved draft) then cancels the load, so the click would open nothing.

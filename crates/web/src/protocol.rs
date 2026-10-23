@@ -182,12 +182,13 @@ pub enum PopupKind {
     #[default]
     Popup,
     /// A new foreground tab: a `target=_blank` link, `window.open` with no
-    /// features.
+    /// features, a link clicked with Cmd+Shift (Ctrl+Shift off macOS) or
+    /// Shift and the middle button.
     Tab,
-    /// A new background tab. Modifier- and middle-clicked links never come
-    /// here: CEF loads them in place (`OnOpenURLFromTab`).
+    /// A new background tab, such as a link clicked with Cmd (Ctrl off
+    /// macOS) or the middle button.
     BackgroundTab,
-    /// A new window (as for `BackgroundTab`, not from a Shift-click).
+    /// A new window, such as a link clicked with Shift.
     Window,
 }
 
@@ -275,9 +276,11 @@ pub enum Event {
         /// What happened, e.g. "the page's renderer crashed".
         error: String,
     },
-    /// Page `opener` opened a pop-up (`window.open`, a link to a new window):
-    /// page `id` (from [`POPUP_IDS`] up), made by the host and hidden until
-    /// shown. It keeps `window.opener`. Its requests are served at once.
+    /// Page `opener` opened a pop-up (`window.open`, a link to a new window,
+    /// a link clicked to open in one): page `id` (from [`POPUP_IDS`] up),
+    /// made by the host and hidden until shown. It keeps `window.opener`,
+    /// unless a click with a modifier or the middle button opened it. Its
+    /// requests are served at once.
     Popup {
         id: u64,
         opener: u64,

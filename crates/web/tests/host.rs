@@ -332,7 +332,8 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
 /// `/opener` opens `/popup` on a click (red while it waits for one) and logs
 /// messages it gets in `data-got`; `/popup` posts to its opener and closes
 /// itself; `/stay` is a page; `/opentab` opens `/stay` in a new tab on a
-/// click, then sets `data-opened`. `/opener` and the link pages count their
+/// click, then sets `data-opened`; `/link` links to `/stay` with no target,
+/// `/aboutlink` to `about:blank`. `/opener` and the link pages count their
 /// clicks (the link pages' middle clicks too) in `data-clicks`. `/hit...`
 /// paths are recorded in the returned list. Anything else is empty.
 fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
@@ -360,6 +361,8 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
                 "/blank" => LINK.replace("LINK", "target=_blank href=/stay"),
                 "/selfclose" => LINK.replace("LINK", "target=_blank href=/stay onclick='setTimeout(() => window.close(), 0)'"),
                 "/opentab" => LINK.replace("LINK", "onclick=\"window.open('/stay'); document.body.dataset.opened = 1\""),
+                "/link" => format!("<title>Link</title>{}", LINK.replace("LINK", "href=/stay")),
+                "/aboutlink" => LINK.replace("LINK", "href=about:blank"),
                 _ => {
                     if path.starts_with("/hit") {
                         seen.lock().unwrap().push(path);
@@ -390,6 +393,13 @@ addEventListener('message', e => { document.body.dataset.got = \
 const LINK: &str = "<body style='margin:0'><a LINK style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a>\
 <script>for (const t of ['click', 'auxclick']) addEventListener(t, () => document.body.dataset.clicks = \
 +(document.body.dataset.clicks || 0) + 1, true)</script>";
+
+/// The modifier that makes a clicked link a new background tab: Cmd on
+/// macOS, Ctrl elsewhere.
+const NEW_TAB: u32 = if cfg!(target_os = "macos") { mods::COMMAND } else { mods::CONTROL };
+
+/// [`NEW_TAB`] as a `MouseEvent` init property.
+const NEW_TAB_KEY: &str = if cfg!(target_os = "macos") { "metaKey" } else { "ctrlKey" };
 
 /// Wait for page `id`'s first painted frame whose top-left pixel is `bgr`.
 fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
@@ -614,6 +624,127 @@ fn a_persons_tab_outlives_its_opener() {
     for t in tabs {
         host.send(&Request::Close { id: t.id });
         host.forget(t.id);
+    }
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Given a page covered by a link to `/stay` (no target);
+/// when a person clicks it with Cmd (Ctrl off macOS), Shift, Cmd+Shift, the
+/// middle button, or Shift+middle;
+/// then each click opens `/stay` as a person's new tab (a background tab, a
+/// window, a foreground tab, a background tab, a foreground tab), and the
+/// page stays where it was.
+/// Given a page covered by a link to `about:blank`;
+/// when a person Cmd-clicks it;
+/// then no tab opens and the link loads in place, as a plain click's would.
+#[test]
+fn a_modified_or_middle_clicked_link_opens_a_tab() {
+    let Some((mut host, cache)) = spawn("modified-click") else {
+        return;
+    };
+    let (base, _) = serve();
+    let (left, middle) = (MouseButton::Left, MouseButton::Middle);
+    let cases = [
+        (NEW_TAB, left, PopupKind::BackgroundTab),
+        (mods::SHIFT, left, PopupKind::Window),
+        (NEW_TAB | mods::SHIFT, left, PopupKind::Tab),
+        (0, middle, PopupKind::BackgroundTab),
+        (mods::SHIFT, middle, PopupKind::Tab),
+    ];
+    let open = |host: &mut WebHost, id, path: &str| {
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+    };
+    for (id, (flags, button, kind)) in (1..).zip(cases) {
+        open(&mut host, id, "/link");
+        let tab = click_for_popup_with(&host, id, flags, button);
+        let case = format!("mods {flags:#x}, {button:?}: {tab:?}");
+        assert!(tab.from_input && tab.is_tab(), "{case}");
+        assert_eq!(tab.kind, kind, "{case}");
+        assert_eq!(tab.url, format!("{base}/stay"), "{case}");
+        assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "{case}");
+        assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()), "{case}");
+        assert_eq!(host.eval(id, "document.title", Duration::from_secs(5)), Ok("\"Link\"".into()), "{case}");
+        assert_eq!(host.view(id).unwrap().url, format!("{base}/link"), "{case}");
+        assert!(host.take_popups(id).is_empty(), "one click, one tab: {case}");
+    }
+
+    // A link that isn't http(s) loads in place. A page that has just painted
+    // may not hit-test input yet, so it clicks until the page leaves.
+    let id = cases.len() as u64 + 1;
+    open(&mut host, id, "/aboutlink");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while host.view(id).unwrap().url != "about:blank" {
+        assert!(Instant::now() < deadline, "the link never loaded in place");
+        for (flags, action) in [
+            (NEW_TAB, MouseAction::Move),
+            (NEW_TAB | mods::LEFT_MOUSE, MouseAction::Down { button: left, count: 1 }),
+            (NEW_TAB, MouseAction::Up { button: left, count: 1 }),
+        ] {
+            assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: flags, action }));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(host.take_popups(id).is_empty());
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Given a page covered by a link to `/stay` that no person has touched;
+/// when an eval without a gesture dispatches a Cmd-click (Ctrl off macOS) on
+/// it, then gesture evals dispatch one more than the pop-up cap;
+/// then the gestureless click opens nothing, each gesture click up to the
+/// cap opens `/stay` as an agent's background pop-up (hidden, drivable), the
+/// one past the cap is refused, the page never leaves, and closing it closes
+/// them.
+#[test]
+fn an_agents_modified_click_opens_a_hidden_popup() {
+    let Some((host, cache)) = spawn("modified-click-agent") else {
+        return;
+    };
+    let (base, _) = serve();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/link"), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let click = format!(
+        "document.querySelector('a').dispatchEvent(new MouseEvent('click', \
+         {{ bubbles: true, cancelable: true, {NEW_TAB_KEY}: true }})); 1"
+    );
+    let click = |gesture| host.eval_as(1, &click, gesture, Duration::from_secs(5)) == Ok("1".into());
+
+    // The host hears the clicks in order: the gestureless one came first.
+    assert!(click(false));
+    assert!(click(true));
+    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert!(!p.from_input && !p.is_tab(), "{p:?}");
+    assert_eq!(p.kind, PopupKind::BackgroundTab, "{p:?}");
+    assert_eq!(p.url, format!("{base}/stay"));
+    assert!(host.wait_loaded(p.id, Duration::from_secs(20)), "pop-up never loaded");
+    assert_eq!(host.eval(p.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+
+    let max = ghostrealm_web::protocol::MAX_POPUPS;
+    for _ in 1..=max {
+        assert!(click(true));
+    }
+    let mut open = wait_popups(&host, 1, max - 1);
+    open.push(p);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.view(1).unwrap().popups_refused == 0 {
+        assert!(Instant::now() < deadline, "the click past the cap was never refused");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(host.view(1).unwrap().popups_refused, 1);
+    assert!(host.take_popups(1).is_empty());
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Link\"".into()));
+    assert_eq!(host.view(1).unwrap().url, format!("{base}/link"));
+
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, 1);
+    for q in open {
+        wait_closed(&host, q.id);
     }
 
     drop(host);

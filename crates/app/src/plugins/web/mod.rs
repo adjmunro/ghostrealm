@@ -2350,7 +2350,8 @@ pub(super) mod tests {
     /// A local HTTP server: `/opener` opens `/popup` on a click, counting its
     /// clicks in `data-clicks`, and logs the messages it gets in `data-got`;
     /// `/popup` posts to its opener and closes itself a second later; `/stay`
-    /// is a page.
+    /// is a page; `/link` is a link to `/stay` over the whole page, counting
+    /// its clicks (middle ones too) in `data-clicks`.
     fn serve() -> String {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2372,6 +2373,10 @@ pub(super) mod tests {
                     "/popup" => "<title>Popup</title><script>window.opener.postMessage('from the popup', '*'); \
                         setTimeout(() => window.close(), 1000)</script>",
                     "/stay" => "<title>Stay</title><p>stay text</p>",
+                    "/link" => "<title>Link</title><body style='margin:0'><a href='/stay' \
+                        style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a><script>\
+                        for (const t of ['click', 'auxclick']) addEventListener(t, () => \
+                        document.body.dataset.clicks = +(document.body.dataset.clicks || 0) + 1, true)</script>",
                     _ => "",
                 };
                 let _ = write!(
@@ -2398,6 +2403,12 @@ pub(super) mod tests {
     /// then the click's pop-up floats with the keyboard and goes when it
     /// closes itself, and the eval's is a hidden surface the agent drives and
     /// closes; both talk to their opener.
+    /// Given a page covered by a link;
+    /// when a person clicks it with Cmd (Ctrl off macOS), the middle button,
+    /// or Shift;
+    /// then each opens the link as a tab for the app to place beside the
+    /// page (in the background, the background, and shown), and the page
+    /// stays where it was.
     #[test]
     fn popups_with_the_real_host() {
         let Some(exe) = real_host() else {
@@ -2455,6 +2466,55 @@ pub(super) mod tests {
         let got = v.eval("document.body.dataset.got", false).unwrap();
         let posts: Vec<&str> = got.trim_matches('"').split_terminator(';').collect();
         assert!(!posts.is_empty() && posts.iter().all(|m| *m == "from the popup"), "{got}");
+        drop(v);
+
+        // A person's modified clicks on a link.
+        let view = plugin.open(&OpenCx::default()).unwrap();
+        let mut v = *(view as Box<dyn Any>).downcast::<WebView>().unwrap();
+        v.start = Some(format!("{base}/link"));
+        v.start().unwrap();
+        h.paint(&mut v, RECT);
+        wait("the link paints", || {
+            v.with_host(|h, id| h.frame(id).and_then(|f| f.read()).is_some_and(|px| px[..3] == [0, 0, 255]))
+                .unwrap_or(false)
+        });
+        use ghostrealm_terminal::Mods;
+        let new_tab = Mods { super_: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Mods::default() };
+        let shift = Mods { shift: true, ..Mods::default() };
+        let cases = [
+            (new_tab, MouseButton::Left, false),
+            (Mods::default(), MouseButton::Middle, false),
+            (shift, MouseButton::Left, true),
+        ];
+        for (n, (mods, button, focus)) in (1..).zip(cases) {
+            // As above: click again only while the page heard no click.
+            let mut clicks = 0;
+            let mut clicked = Instant::now() - Duration::from_secs(2);
+            let mut opened = Vec::new();
+            wait("the link opens a tab", || {
+                if clicked.elapsed() >= Duration::from_secs(2)
+                    && clicks < 5
+                    && v.eval("+(document.body.dataset.clicks || 0)", false) == Ok((n - 1).to_string())
+                {
+                    clicks += 1;
+                    clicked = Instant::now();
+                    h.mouse_with(&mut v, mods, MouseEvent::Move { pos: at });
+                    h.mouse_with(&mut v, mods, MouseEvent::Down { pos: at, clicks: 1, button });
+                    h.mouse_with(&mut v, mods, MouseEvent::Up { pos: at, dragged: false, button });
+                }
+                h.paint(&mut v, RECT);
+                opened.extend(v.take_opened());
+                !opened.is_empty()
+            });
+            let case = format!("{mods:?} {button:?}");
+            assert_eq!(opened.len(), 1, "{case}");
+            assert_eq!(opened[0].place, Place::Tab { focus }, "{case}");
+            assert!(v.floating.is_empty(), "{case}");
+            let tab = opened[0].view.page;
+            let title = v.with_host(|h, _| h.eval(tab, "document.title", Duration::from_secs(5)));
+            assert_eq!(title, Some(Ok("\"Stay\"".into())), "{case}");
+            assert_eq!(v.eval("document.title", false), Ok("\"Link\"".into()), "{case}");
+        }
         drop(v);
         drop(plugin);
 
