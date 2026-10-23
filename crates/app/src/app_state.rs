@@ -1601,20 +1601,14 @@ impl AppState {
             // (nothing may wake the app for another), after one more
             // placing for the pop-ups it opened.
             let (hidden, tabs) = self.closed_popups();
-            let late: Vec<SurfaceId> = hidden
-                .into_iter()
-                .chain(tabs)
-                .filter(|sid| placed.contains(sid) && !gone.contains(sid) && !closed_tabs.contains(sid))
-                .collect();
-            if late.is_empty() {
+            let late = |sid: &SurfaceId| placed.contains(sid) && !gone.contains(sid) && !closed_tabs.contains(sid);
+            let (hidden, tabs): (Vec<SurfaceId>, Vec<SurfaceId>) =
+                (hidden.into_iter().filter(late).collect(), tabs.into_iter().filter(late).collect());
+            if hidden.is_empty() && tabs.is_empty() {
                 break;
             }
-            for sid in late {
-                match self.hidden.contains_key(&sid) {
-                    true => gone.push(sid),
-                    false => closed_tabs.push(sid),
-                }
-            }
+            gone.extend(hidden);
+            closed_tabs.extend(tabs);
         }
         self.drop_closed_popups((gone, closed_tabs)) || !placed.is_empty()
     }
@@ -1718,11 +1712,15 @@ impl AppState {
     /// Returns whether any went.
     ///
     /// [`closed_popups`]: Self::closed_popups
-    fn drop_closed_popups(&mut self, (gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
+    fn drop_closed_popups(&mut self, (mut gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
         let changed = !gone.is_empty() || !closed_tabs.is_empty();
-        for p in gone {
-            self.hidden.remove(&p);
-            self.views.remove(&p);
+        // A hidden pop-up goes with its opener, which may have gone just now.
+        while !gone.is_empty() {
+            for p in gone {
+                self.hidden.remove(&p);
+                self.views.remove(&p);
+            }
+            gone = self.hidden.iter().filter(|(_, o)| !self.views.contains_key(&o.opener)).map(|(p, _)| *p).collect();
         }
         for sid in closed_tabs {
             self.close_surface_id(sid);

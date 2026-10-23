@@ -2210,6 +2210,37 @@ pub(super) mod tests {
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
+    /// Given a web tab (page 1) whose agent's pop-up (B) opened an agent's
+    /// pop-up of its own (C) and then closed itself, before the app placed
+    /// either;
+    /// when the app pumps once;
+    /// then neither is left as a hidden surface.
+    #[test]
+    fn a_hidden_popup_of_a_popup_that_closed_before_it_was_placed_goes_with_it() {
+        let dir = crate::plugin::testing::tmpdir("web-popup-chain-closed-unplaced");
+        let (b, c) = (POPUP_IDS, POPUP_IDS + 1);
+        let events = [
+            popup_event_of(b, 1, false, "tab"),
+            popup_event_of(c, b, false, "tab"),
+            format!(r#"{{"ev":"closed","id":{b}}}"#),
+        ];
+        stub_app_host(&dir, &events, "cat > /dev/null");
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        wait("B closes in the host", || {
+            let v = s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap();
+            let slot = v.slot.borrow();
+            slot.host.as_ref().is_some_and(|h| h.is_closed(b) && h.view(c).is_some())
+        });
+        s.pump_all();
+        assert!(!s.describe().contains("hidden surface"), "{}", s.describe());
+        assert_eq!(pages(&mut s), [1]);
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
     #[test]
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
         let dir = crate::plugin::testing::tmpdir("web-float-close");
