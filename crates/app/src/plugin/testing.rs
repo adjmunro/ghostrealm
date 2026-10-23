@@ -267,7 +267,8 @@ pub fn tmpdir(tag: &str) -> std::path::PathBuf {
 
 /// A [`tmpdir`] removed when dropped, so a test that fails cleans up too.
 /// Declare it before anything that writes into it (a host, a view): locals
-/// drop in reverse order, so those stop first.
+/// drop in reverse order, so those are dropped first. A dropped host is only
+/// asked to exit and may still be running when the directory goes.
 pub struct TmpDir(std::path::PathBuf);
 
 impl TmpDir {
@@ -295,6 +296,9 @@ impl Drop for TmpDir {
             && std::time::Instant::now() < until
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if self.0.exists() {
+            eprintln!("left behind: {} (still being written to)", self.0.display());
         }
     }
 }

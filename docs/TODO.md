@@ -1391,3 +1391,29 @@
   reap time and ignore the back-off; GUI `start()` would report a failure as a
   restart; headless `host()` would block in the exit wait during the back-off.
 - Reason: a failure shouldn't cost a second, spurious "profile in use" failure.
+
+---
+
+[2026-10-24T06:23+1300@83f8fe8d] Web — the real host leaves CEF temp dirs outside its profile
+
+- Requires: NO BLOCKERS
+- Detail: Each `plugins::web` run with the real host leaves a
+  `$TMPDIR/dev.ghostrealm.web-host.chromium_chrome_url_fetcher_.*` dir
+  (14 KB; 2,457 had built up), plus `…Unpacker_BeginUnzipping` ones. They sit
+  outside the profile, so removing the profile doesn't reach them. Find what
+  creates them and point it at the profile, or remove them once the host exits.
+- Reason: test runs shouldn't fill the temp directory.
+
+---
+
+[2026-10-24T06:23+1300@83f8fe8d] App — tests outside the web plugin leave their temp dirs behind
+
+- Requires: NO BLOCKERS
+- Detail: One full workspace run leaves about 410 `$TMPDIR/ghostrealm-*` dirs
+  from plain `testing::tmpdir()` (about 25,600 had built up): editor 72
+  (mostly `editor-md-*`), files/file browser/file manager about 147, pv 23,
+  toc 21, ops 21, open 15, media 18, fstree 11, jobs 10, agent 2.
+- Detail: Making `tmpdir()` return the `TmpDir` guard would fix most at once;
+  a caller that lets it drop early (e.g. one that only keeps a path) needs to
+  hold it instead.
+- Reason: test runs shouldn't fill the temp directory.

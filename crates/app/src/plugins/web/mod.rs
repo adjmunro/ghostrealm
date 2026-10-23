@@ -2658,7 +2658,9 @@ pub(crate) mod tests {
 
     /// Hang up on the host behind `v` and wait for it to go: a real host
     /// writes to its profile until it has, so removing the profile sooner
-    /// leaves some of it behind.
+    /// leaves some of it behind. A test that panics never gets here, so its
+    /// profile's guard removes it while the host may still be writing: best
+    /// effort, on failure only.
     fn hang_up(v: &WebView) {
         let host = v.slot.borrow_mut().host.take();
         if let Some(host) = host {
