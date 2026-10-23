@@ -1341,19 +1341,24 @@
 
 ---
 
-[2026-10-23T22:46+1300@0fd87271] Web — modified clicks in frames and on posting forms
+[2026-10-24T01:36+1300@8a1d68b0] Web — modified clicks in frames and on posting forms
 
 - Requires: NO BLOCKERS
 - Detail: A link in a frame clicked with Shift, Cmd/Ctrl, or the middle
   button opens nothing: the host reopens these links through
   `window.open` in an eval, and evals reach only the main frame (DECISION.md,
-  Web surface / pop-ups, 2026-10-23T22:46). Run the eval in the link's own
+  Web surface / pop-ups, 2026-10-24T01:36). Run the eval in the link's own
   frame, so its sandbox flags apply (CEF's frame id is not known to match
   the DevTools one the eval needs).
 - Detail: A form that posts, submitted with a modifier, is submitted again
   in place (its submit handlers run twice) instead of posting in a new tab,
   and one submitted with the focus elsewhere (by script) opens its URL in a
-  new tab as a GET, without its data.
+  new tab as a GET, without its data. A disabled submit button (a guard
+  against a second submit) submits nothing. After Enter, a page's own
+  `form.submit()` (Cmd+Enter in an editor, say) is taken for an implicit
+  submission: the form is submitted with its first submit button, adding
+  that button's name and value and running the validation and submit
+  handlers `submit()` skips.
 - Reason: browsers open both in a new tab.
 
 ---

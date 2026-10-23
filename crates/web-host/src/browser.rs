@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
-    eval_wrapper, Cursor, EditAction, Event, Key, KeyKind, PopupKind, MouseAction, MouseButton, Request,
+    eval_wrapper, link_script, Cursor, EditAction, Event, Key, KeyKind, PopupKind, MouseAction, MouseButton, Request,
     MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS,
 };
 use serde_json::{json, Value};
@@ -59,9 +59,6 @@ struct Entry {
     /// The last press or key down to reach the page was Enter, which
     /// submits a form (Shift+Enter in a new window).
     enter_last: bool,
-    /// A press, key, or gesture eval reached the page since it last opened a
-    /// link in a new tab: each opens at most one.
-    link_armed: bool,
     /// Links it asked to open in a new tab ([`open_link`]), until their
     /// `window.open` reaches `on_before_popup`.
     links: Vec<Link>,
@@ -142,8 +139,9 @@ struct PendingEval {
     js: String,
     /// Run it as a user gesture.
     gesture: bool,
-    /// The host's own: its result goes nowhere.
-    silent: bool,
+    /// The host's own, for [`open_link`]'s link to this URL: its result goes
+    /// nowhere.
+    link: Option<String>,
     started: Instant,
     step: Step,
     /// The world this eval made (before `Disable`) or runs in (`Evaluate`).
@@ -203,18 +201,18 @@ fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T>
 /// `executionContextId`) can't name a context in another renderer process
 /// after a navigation, so the script never lands in the page's own world.
 fn start_eval(id: u64, req: u64, js: String, gesture: bool) {
-    eval_as(id, req, js, gesture, false);
+    eval_as(id, req, js, gesture, None);
 }
 
-/// [`start_eval`], answered to the app unless `silent`.
-fn eval_as(id: u64, req: u64, js: String, gesture: bool, silent: bool) {
+/// [`start_eval`]; `link` makes it [`open_link`]'s, answered to no one.
+fn eval_as(id: u64, req: u64, js: String, gesture: bool, link: Option<String>) {
     expire_evals();
     let e = PendingEval {
         id,
         req,
         js,
         gesture,
-        silent,
+        link,
         started: Instant::now(),
         step: Step::Enable,
         world: None,
@@ -344,7 +342,12 @@ fn fail(e: PendingEval, error: String) {
 }
 
 fn finish(e: &PendingEval, ok: bool, value: String) {
-    if e.silent {
+    if let Some(url) = &e.link {
+        // Its `window.open` didn't run: a later pop-up to the URL mustn't
+        // take the link's kind.
+        if !(ok && value == "\"opened\"") {
+            BROWSERS.with_borrow_mut(|m| m.get_mut(&e.id).map(|o| o.links.retain(|l| l.url != *url)));
+        }
         return;
     }
     let (ok, value) = if value.len() > MAX_EVAL_RESULT {
@@ -399,7 +402,10 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
                         s.world = None;
                     }
                 });
-                return run(e);
+                // A link's eval is for the document that asked.
+                if e.link.is_none() {
+                    return run(e);
+                }
             }
             if e.step != Step::Evaluate && !e.remade {
                 return remake(e);
@@ -529,7 +535,6 @@ pub fn handle(req: Option<Request>) {
                 e.input_at = Some(Instant::now());
                 if let Some(enter) = enter {
                     e.enter_last = enter;
-                    e.link_armed = true;
                 }
             }
         });
@@ -538,7 +543,6 @@ pub fn handle(req: Option<Request>) {
         BROWSERS.with_borrow_mut(|m| {
             if let Some(e) = m.get_mut(id) {
                 e.enter_last = false;
-                e.link_armed = true;
             }
         });
     }
@@ -703,7 +707,6 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
                 opener: None,
                 input_at: None,
                 enter_last: false,
-                link_armed: false,
                 links: Vec::new(),
             };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
@@ -796,18 +799,17 @@ fn open_popup(
 
 /// Page `opener` asked for `url` in a new tab or window from a link clicked
 /// with a modifier or the middle button (CEF's `OnOpenURLFromTab`, which
-/// would load it in place); `main` is whether the link is in its main
-/// frame. Returns whether the opener's own load of it is cancelled.
+/// would load it in place); `main` is whether the link is in its main frame,
+/// `from` the address of the link's document. Returns whether the opener's
+/// own load of it is cancelled.
 ///
-/// It reopens the link with `window.open(url, '_blank', 'noopener')` from a
-/// gesture eval in the opener's isolated world, so the page loads as one the
-/// opener asked for (its referrer and cookie rules, its sandbox flags), and
-/// `on_before_popup` places it as a pop-up of `kind`: a page of its own, with
-/// no `window.opener`. A form that posts to `url` is submitted again in place
-/// instead (a new page can't be made to post it, and CEF's in-place load
-/// drops the body): the one whose submit button has the focus, or after
-/// Enter, the one whose field has it.
-fn open_link(opener: u64, main: bool, url: String, kind: PopupKind, gesture: bool) -> bool {
+/// It reopens the link with [`link_script`] in a gesture eval, so the page
+/// loads as one the opener asked for (its referrer and cookie rules, its
+/// sandbox flags), and `on_before_popup` places it as a pop-up of `kind`: a
+/// page of its own, with no `window.opener`. A form that posts to `url` is
+/// submitted again in place instead: a new page can't be made to post it,
+/// and CEF's in-place load drops the body.
+fn open_link(opener: u64, main: bool, from: &str, url: String, kind: PopupKind, gesture: bool) -> bool {
     // The eval reaches only the main frame, whose sandbox flags may be
     // laxer than the link's frame's.
     if !main {
@@ -818,41 +820,18 @@ fn open_link(opener: u64, main: bool, url: String, kind: PopupKind, gesture: boo
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return false;
     }
-    let Some((enter, armed)) = BROWSERS.with_borrow(|m| m.get(&opener).map(|e| (e.enter_last, e.link_armed))) else {
+    let Some(enter) = BROWSERS.with_borrow(|m| m.get(&opener).map(|e| e.enter_last)) else {
         return false;
     };
-    // Chromium blocks a new window opened without user activation; a page
-    // can't spend one press on several.
-    if !gesture || !armed {
+    // Chromium blocks a new window opened without user activation.
+    if !gesture {
         return true;
     }
     let from_input = from_input(opener);
     let link = Link { url: url.clone(), kind, from_input, at: Instant::now() };
-    BROWSERS.with_borrow_mut(|m| {
-        if let Some(e) = m.get_mut(&opener) {
-            e.link_armed = false;
-            e.links.push(link);
-        }
-    });
-    eval_as(opener, 0, link_script(&url, enter), true, true);
+    BROWSERS.with_borrow_mut(|m| m.get_mut(&opener).map(|e| e.links.push(link)));
+    eval_as(opener, 0, link_script(from, &url, enter), true, Some(url));
     true
-}
-
-/// The eval [`open_link`] runs for `url`; `enter` when Enter was the last
-/// key, so a focused field's form may be what asked (with its first submit
-/// button, as Enter submits).
-fn link_script(url: &str, enter: bool) -> String {
-    let url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        "(() => {{ const url = {url}; const el = document.activeElement; const form = el && el.form; \
-         const submits = e => e.type === 'submit' || e.type === 'image'; \
-         const by = !form ? undefined : submits(el) ? el : {enter} ? [...form.elements].find(submits) || null : undefined; \
-         if (by !== undefined) {{ \
-         const method = by && by.hasAttribute('formmethod') ? by.formMethod : form.method; \
-         const action = by && by.hasAttribute('formaction') ? by.formAction : form.action; \
-         if (method === 'post' && action === url) {{ form.requestSubmit(by); return 'posted'; }} }} \
-         window.open(url, '_blank', 'noopener'); return 'opened'; }})()"
-    )
 }
 
 /// Whether a person's input reached page `opener` within
@@ -936,7 +915,6 @@ fn popup_created(id: u64, b: &Browser) {
         opener: (!p.tab).then_some(p.opener),
         input_at: None,
         enter_last: false,
-        link_armed: false,
         links: Vec::new(),
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
@@ -1405,8 +1383,11 @@ wrap_request_handler! {
                 WindowOpenDisposition::NEW_WINDOW => PopupKind::Window,
                 _ => return 0,
             };
-            let main = frame.is_some_and(|f| f.is_main() != 0);
-            open_link(self.id, main, string(target_url), kind, user_gesture != 0) as c_int
+            // The frame is the document the link was in, even once its page
+            // has moved on.
+            let main = frame.as_ref().is_some_and(|f| f.is_main() != 0);
+            let from = frame.map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
+            open_link(self.id, main, &from, string(target_url), kind, user_gesture != 0) as c_int
         }
     }
 }

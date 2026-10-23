@@ -344,6 +344,42 @@ pub fn eval_wrapper(js: &str) -> String {
     )
 }
 
+/// The script the host evaluates, in the page's isolated world as a user
+/// gesture, for a link to `url` that the document at `from` asked to open in
+/// a new tab or window (clicked with a modifier or the middle button, which
+/// CEF would load in place). It settles to:
+/// - `"moved"`, doing nothing, in a document of another origin than `from`'s
+///   (the page moved on before it ran);
+/// - `"posted"` after submitting again, in place, a form that posts to
+///   `url`: the one whose submit button has the focus, or when `enter` (Enter
+///   was the last key) the one whose field has it, with its first submit
+///   button, as Enter submits; `"disabled"`, doing nothing, when that button
+///   is disabled;
+/// - `"opened"` after `window.open(url, '_blank', 'noopener')`, so the page
+///   loads as one the document asked for; with `noreferrer` too when a link
+///   to `url` withholds the referrer (`rel=noreferrer`, or a policy stricter
+///   than `unsafe-url`), as `window.open` sends the document's.
+pub fn link_script(from: &str, url: &str, enter: bool) -> String {
+    let json = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    let (from, url) = (json(from), json(url));
+    format!(
+        "(() => {{ const url = {url}; \
+         if (new URL({from}).origin !== new URL(location.href).origin) return 'moved'; \
+         const el = document.activeElement; const form = el && el.form; \
+         const submits = e => e.type === 'submit' || e.type === 'image'; \
+         const by = !form ? undefined : submits(el) ? el : {enter} ? [...form.elements].find(submits) || null : undefined; \
+         if (by !== undefined) {{ \
+         const method = by && by.hasAttribute('formmethod') ? by.formMethod : form.method; \
+         const action = by && by.hasAttribute('formaction') ? by.formAction : form.action; \
+         if (method === 'post' && action === url) {{ \
+         if (by && by.disabled) return 'disabled'; form.requestSubmit(by); return 'posted'; }} }} \
+         const keeps = ['', 'unsafe-url', 'no-referrer-when-downgrade']; \
+         const bare = [...document.querySelectorAll('a[href], area[href]')].some(a => a.href === url \
+         && (a.relList.contains('noreferrer') || !keeps.includes(a.referrerPolicy))); \
+         window.open(url, '_blank', bare ? 'noopener,noreferrer' : 'noopener'); return 'opened'; }})()"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use common::host_exe;
-use ghostrealm_web::protocol::{mods, Key, KeyKind};
+use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
 /// A ready host on its own profile `ghostrealm-web-<tag>-<pid>` (removed by the
@@ -783,9 +783,11 @@ struct Hit {
 /// A local HTTP server as two sites: `http://127.0.0.1:<port>` and
 /// `http://localhost:<port>`, returned with the `/hit...` requests it got.
 /// `/cookies` sets a `SameSite=Strict` cookie `s` and a `Lax` one `l`;
-/// `/link?<url>` is a link to `<url>` over the page; `/hostile?<url>` is a
-/// button over the page that answers a click by sending three Cmd-clicks
-/// (Ctrl off macOS) to a hidden link to `<url>`; `/sandboxed?<url>` is a
+/// `/link?<url>` is a link to `<url>` over the page (`/nrlink?<url>` one with
+/// `rel=noreferrer`, `/nplink?<url>` one with `referrerpolicy=no-referrer`);
+/// `/hostile?<url>` is a button over the page that answers a click by
+/// sending three Cmd-clicks (Ctrl off macOS) to a hidden link to `<url>`;
+/// `/sandboxed?<url>` is a
 /// `sandbox=allow-scripts` frame over the page holding `/link?<url>`, which
 /// tells its parent of each click; `/post` is a form posting to
 /// `/hitpost`, its submit button over the top half, its text field `q`
@@ -830,6 +832,8 @@ fn serve_sites() -> (String, String, std::sync::Arc<Mutex<Vec<Hit>>>) {
                     "<title>Cookies</title>".to_string()
                 }
                 "/link" => format!("<title>Link</title><body style='margin:0'><a href='{arg}' style='{FULL}'>x</a>{COUNT}"),
+                "/nrlink" => format!("<body style='margin:0'><a rel=noreferrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
+                "/nplink" => format!("<body style='margin:0'><a referrerpolicy=no-referrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
                 "/hostile" => format!(
                     "<title>Hostile</title><body style='margin:0'><a id=l href='{arg}' style='display:none'>x</a>\
                      <button style='{FULL}' onclick=\"for (let i = 0; i < 3; i++) l.dispatchEvent(new MouseEvent('click', \
@@ -926,6 +930,57 @@ fn a_modified_click_loads_as_its_page_asked() {
     let got = wait_hits(&hits, "/hit-hostile", 1);
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!((got[0].site.as_str(), got[0].cookie.as_str()), ("cross-site", "l=1"), "{got:?}");
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Given pages on one site whose links to another site withhold the referrer
+/// (`rel=noreferrer`, `referrerpolicy=no-referrer`);
+/// when a person Cmd-clicks (Ctrl off macOS) each;
+/// then each tab's request has no referrer, as a plain click's wouldn't.
+#[test]
+fn a_modified_click_keeps_a_links_referrer_policy() {
+    let Some((mut host, cache)) = spawn("modified-click-referrer") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    for (id, route) in [(1, "nrlink"), (2, "nplink")] {
+        assert!(host.send(&Request::Create { id, url: format!("{b}/{route}?{a}/hit-{route}"), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(&mut host, id, [0, 0, 255]);
+        let tab = click_for_popup_with(&host, id, NEW_TAB, MouseButton::Left);
+        assert!(tab.from_input && tab.is_tab(), "{tab:?}");
+        let [hit] = <[_; 1]>::try_from(wait_hits(&hits, &format!("/hit-{route}"), 1)).unwrap();
+        assert_eq!((hit.site.as_str(), hit.referer.as_str()), ("cross-site", ""), "{hit:?}");
+    }
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Given a page on one site covered by a link to another;
+/// when the host's script for that link runs in it as a gesture eval, first
+/// as asked by a document of another origin, then as asked by the page;
+/// then the first does nothing (`"moved"`), and the second opens the link
+/// in a new tab, requested once.
+#[test]
+fn the_link_script_runs_only_in_the_document_that_asked() {
+    let Some((host, cache)) = spawn("link-script") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    let page = format!("{b}/link?{a}/hit-guard");
+    assert!(host.send(&Request::Create { id: 1, url: page.clone(), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let url = format!("{a}/hit-guard");
+    let run = |from: &str| host.eval_as(1, &link_script(from, &url, false), true, Duration::from_secs(5));
+    assert_eq!(run("http://elsewhere.test/page"), Ok("\"moved\"".into()));
+    assert_eq!(run(&page), Ok("\"opened\"".into()));
+    // The host hears pop-ups in order: the first eval opened none.
+    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert_eq!(p.url, url);
+    assert_eq!(wait_hits(&hits, "/hit-guard", 1).len(), 1);
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);
