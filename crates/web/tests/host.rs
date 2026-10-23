@@ -62,9 +62,8 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
 
 /// Given a ready host on a profile;
 /// when the app hangs up on it;
-/// then it is reported gone once its process has gone, and a new host on the
-/// same profile then becomes ready and serves a page (rather than finding
-/// the profile in use).
+/// then it is reported gone, by then its process has gone, and a new host
+/// on the same profile afterwards becomes ready and serves a page.
 #[test]
 fn a_host_hung_up_on_frees_its_profile_once_gone() {
     let Some((host, _)) = spawn("hang-up") else { return };

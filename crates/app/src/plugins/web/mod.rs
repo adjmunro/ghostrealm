@@ -117,9 +117,6 @@ struct HostSlot {
     /// The host hung up on for being idle, until its process has gone: it may
     /// still hold the profile, so no host is spawned before then.
     exiting: Option<Exiting>,
-    /// [`IDLE_EXIT`] instead.
-    #[cfg(test)]
-    idle_exit: Option<Duration>,
 }
 
 impl HostSlot {
@@ -224,7 +221,7 @@ impl HostSlot {
 
     fn idle_exit(&self) -> Duration {
         #[cfg(test)]
-        if let Some(d) = self.idle_exit.or_else(|| tests::TEST_IDLE_EXIT.get()) {
+        if let Some(d) = tests::TEST_IDLE_EXIT.get() {
             return d;
         }
         IDLE_EXIT
@@ -307,7 +304,7 @@ impl IdleExit {
     /// Hang up on the host once no web surface (a web view anywhere: a tab
     /// in any workspace, a hidden or floating pop-up, a pop-up not yet
     /// placed) and no person's tab waiting to be placed has been left for
-    /// `IDLE_EXIT` (30 s); it respawns on demand. Call on every pass of the event
+    /// `IDLE_EXIT`; it respawns on demand. Call on every pass of the event
     /// loop, and between agent requests.
     pub fn tick(&self, now: Instant) {
         if let Ok(mut slot) = self.0.try_borrow_mut() {
@@ -2468,8 +2465,8 @@ pub(crate) mod tests {
     /// then the host is hung up on once the idle exit has passed since then,
     /// not before;
     /// when a web surface opens again at once;
-    /// then a new host starts (no back-off, as after a failure) once the old
-    /// one has gone, and the page is made in it.
+    /// then a new host starts once the old one has gone, and the page is
+    /// made in it.
     #[test]
     fn the_host_is_hung_up_on_once_no_web_surface_is_left_for_a_while() {
         let dir = crate::plugin::testing::tmpdir("web-idle-exit");
@@ -2517,7 +2514,9 @@ pub(crate) mod tests {
     /// opener went, waiting to be placed;
     /// when well past the idle exit passes;
     /// then the host keeps running; and while the view the tab is placed in
-    /// lives, still; once that goes, the idle exit counts from then.
+    /// lives, still; once that goes, the idle exit counts from then;
+    /// when a web view opens 20 s into that count and goes 5 s later;
+    /// then the count starts again from when it went.
     #[test]
     fn a_tab_waiting_to_be_placed_keeps_the_host() {
         let (mut v, _) = stub_host("web-idle-orphan", "cat > /dev/null");
@@ -2541,7 +2540,17 @@ pub(crate) mod tests {
         let t1 = t0 + IDLE_EXIT * 4;
         idle.tick(t1);
         assert_eq!(idle.deadline(), Some(t1 + IDLE_EXIT));
+
+        let view = WebView::new(slot.clone(), 99);
+        idle.tick(t1 + Duration::from_secs(20));
+        assert_eq!(idle.deadline(), None, "a view opening stops the count");
+        drop(view);
+        let t2 = t1 + Duration::from_secs(25);
+        idle.tick(t2);
+        assert_eq!(idle.deadline(), Some(t2 + IDLE_EXIT), "it counts afresh");
         idle.tick(t1 + IDLE_EXIT);
+        assert!(slot.borrow().host.is_some(), "not hung up on from the first count");
+        idle.tick(t2 + IDLE_EXIT);
         assert!(slot.borrow().host.is_none() && slot.borrow().exiting.is_some(), "hung up on");
     }
 
