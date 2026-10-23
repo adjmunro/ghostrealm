@@ -1697,7 +1697,7 @@ impl View for WebView {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::plugin::testing::{cmd, press, Harness};
+    use crate::plugin::testing::{cmd, press, Harness, TmpDir};
     use ghostrealm_core::Value;
     use ghostrealm_web::protocol::{POPUP_IDS, PROTOCOL_VERSION};
 
@@ -1721,10 +1721,10 @@ pub(crate) mod tests {
     }
 
     /// A view whose host is `script` (a shell script standing in for the real
-    /// one), and the file the script appends a line to each time it starts.
-    fn stub_host(tag: &str, script: &str) -> (WebView, std::path::PathBuf) {
+    /// one) in `dir`, and the file the script appends a line to each time it
+    /// starts.
+    fn stub_host(dir: &std::path::Path, script: &str) -> (WebView, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::plugin::testing::tmpdir(tag);
         let exe = dir.join("host.sh");
         let runs = dir.join("runs");
         std::fs::write(
@@ -1754,8 +1754,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_host_that_dies_is_not_respawned_until_reload_or_the_backoff() {
+        let dir = TmpDir::new("web-respawn");
         let (mut v, runs_file) = stub_host(
-            "web-respawn",
+            &dir,
             r#"echo '{"ev":"failed","error":"the web profile is in use"}'; exit 1"#,
         );
         let mut h = Harness::new();
@@ -1799,20 +1800,23 @@ pub(crate) mod tests {
 
     #[test]
     fn starting_from_the_agent_reports_a_host_that_fails_after_spawning() {
+        let dir = TmpDir::new("web-start-fail");
         let (mut v, _) = stub_host(
-            "web-start-fail",
+            &dir,
             r#"echo '{"ev":"failed","error":"the web profile is in use"}'; exit 1"#,
         );
         assert_eq!(v.start(), Err("the web profile is in use".into()));
 
         let ready = format!(r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'; cat > /dev/null"#);
-        let (mut v, _) = stub_host("web-start-ok", &ready);
+        let dir = TmpDir::new("web-start-ok");
+        let (mut v, _) = stub_host(&dir, &ready);
         assert_eq!(v.start(), Ok(()));
     }
 
     #[test]
     fn a_host_bundle_from_another_protocol_version_is_reported() {
-        let (mut v, _) = stub_host("web-old-host", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+        let dir = TmpDir::new("web-old-host");
+        let (mut v, _) = stub_host(&dir, r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
         let err = v.start().unwrap_err();
         assert!(err.contains("out of date") && err.contains("mise run web"), "{err}");
         let mut h = Harness::new();
@@ -1823,8 +1827,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_protocol_mismatch_is_not_retried_until_reload_or_a_new_bundle() {
+        let dir = TmpDir::new("web-mismatch");
         let (mut v, runs_file) =
-            stub_host("web-mismatch", r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
+            stub_host(&dir, r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
         let mut h = Harness::new();
         // Painting spawns the host, which reports the wrong protocol; poll
         // until the slot has let go of it.
@@ -1858,7 +1863,8 @@ pub(crate) mod tests {
 
     #[test]
     fn starting_from_the_gui_does_not_wait_for_the_host() {
-        let (mut v, _) = stub_host("web-start-gui", "cat > /dev/null");
+        let dir = TmpDir::new("web-start-gui");
+        let (mut v, _) = stub_host(&dir, "cat > /dev/null");
         v.slot.borrow_mut().waker = Some(Arc::new(|| {}));
         let t = Instant::now();
         assert_eq!(v.start(), Ok(()));
@@ -1867,7 +1873,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_page_starts_hidden_until_painted() {
-        let (mut v, runs) = stub_host("web-hidden", "cat > \"$0.requests\"");
+        let dir = TmpDir::new("web-hidden");
+        let (mut v, runs) = stub_host(&dir, "cat > \"$0.requests\"");
         let log = runs.with_file_name("host.sh.requests");
         // Created without being painted (as `web.new` from the agent does).
         assert!(v.send(None));
@@ -1894,7 +1901,8 @@ pub(crate) mod tests {
 
     #[test]
     fn right_and_middle_presses_reach_the_page_with_their_button_held() {
-        let (mut v, runs) = stub_host("web-buttons", "cat > \"$0.requests\"");
+        let dir = TmpDir::new("web-buttons");
+        let (mut v, runs) = stub_host(&dir, "cat > \"$0.requests\"");
         let log = runs.with_file_name("host.sh.requests");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -1926,7 +1934,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_host_that_exits_before_ready_keeps_its_error_shown() {
-        let (mut v, _) = stub_host("web-early-exit", "exit 0");
+        let dir = TmpDir::new("web-early-exit");
+        let (mut v, _) = stub_host(&dir, "exit 0");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         wait_exit(&v);
@@ -1966,7 +1975,8 @@ pub(crate) mod tests {
             "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\ncat > \"$0.requests\"",
             popup_event(POPUP_IDS, 1, true)
         );
-        let (mut v, runs) = stub_host("web-float", &script);
+        let dir = TmpDir::new("web-float");
+        let (mut v, runs) = stub_host(&dir, &script);
         let log = runs.with_file_name("host.sh.requests");
         let mut h = Harness::new();
         let until = Instant::now() + Duration::from_secs(10);
@@ -2031,7 +2041,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tab_a_person_opened_opens_beside_its_opener() {
-        let dir = crate::plugin::testing::tmpdir("web-popup-tab");
+        let dir = TmpDir::new("web-popup-tab");
         let log = dir.join("requests");
         let events = [
             popup_event_of(POPUP_IDS, 1, true, "background_tab"),
@@ -2083,7 +2093,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_hidden_popup_outlives_other_surfaces_closing_but_not_its_opener() {
-        let dir = crate::plugin::testing::tmpdir("web-hidden-keep");
+        let dir = TmpDir::new("web-hidden-keep");
         stub_app_host(&dir, &[popup_event(POPUP_IDS, 1, false)], "cat > /dev/null");
         let mut s = AppState::new().with_shell_line("sleep 1");
         s.new_empty_vtab();
@@ -2110,7 +2120,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tab_opened_by_a_tab_that_closed_itself_still_opens() {
-        let dir = crate::plugin::testing::tmpdir("web-popup-tab-chain");
+        let dir = TmpDir::new("web-popup-tab-chain");
         let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
         let events = [
             popup_event_of(a, 1, true, "tab"),
@@ -2185,7 +2195,7 @@ pub(crate) mod tests {
     /// Page 1 opens tab A, then is closed before the app places A, with A
     /// taken by page 1's view first when `taken`; B arrives after the close.
     fn opener_closes_before_its_tabs_are_placed(tag: &str, taken: bool) {
-        let dir = crate::plugin::testing::tmpdir(tag);
+        let dir = TmpDir::new(tag);
         let log = dir.join("requests");
         let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
         let script = format!(
@@ -2229,7 +2239,7 @@ pub(crate) mod tests {
     /// neither is closed.
     #[test]
     fn a_tab_opened_from_a_floating_popup_outlives_its_close_button() {
-        let dir = crate::plugin::testing::tmpdir("web-float-tab-orphan");
+        let dir = TmpDir::new("web-float-tab-orphan");
         let log = dir.join("requests");
         let (p, a, b) = (POPUP_IDS, POPUP_IDS + 1, POPUP_IDS + 2);
         // A comes once page 1 is told to navigate (after P floats), and no
@@ -2274,7 +2284,7 @@ pub(crate) mod tests {
     /// then A opens as a tab and page 1's tab closes.
     #[test]
     fn a_tab_whose_page_closes_itself_closes_once_its_tabs_are_placed() {
-        let dir = crate::plugin::testing::tmpdir("web-app-page-closes");
+        let dir = TmpDir::new("web-app-page-closes");
         let a = POPUP_IDS;
         let script = format!(
             "while read l; do case \"$l\" in *'\"op\":\"navigate\"'*) \
@@ -2304,7 +2314,7 @@ pub(crate) mod tests {
     /// then only page 1's tab is left, still focused, and no hidden surface.
     #[test]
     fn a_popup_that_closed_before_it_was_placed_goes_in_the_same_pass() {
-        let dir = crate::plugin::testing::tmpdir("web-popup-closed-unplaced");
+        let dir = TmpDir::new("web-popup-closed-unplaced");
         let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
         let events = [
             popup_event_of(a, 1, true, "tab"),
@@ -2337,7 +2347,7 @@ pub(crate) mod tests {
     /// then neither is left as a hidden surface.
     #[test]
     fn a_hidden_popup_of_a_popup_that_closed_before_it_was_placed_goes_with_it() {
-        let dir = crate::plugin::testing::tmpdir("web-popup-chain-closed-unplaced");
+        let dir = TmpDir::new("web-popup-chain-closed-unplaced");
         let (b, c) = (POPUP_IDS, POPUP_IDS + 1);
         let events = [
             popup_event_of(b, 1, false, "tab"),
@@ -2363,7 +2373,7 @@ pub(crate) mod tests {
 
     #[test]
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
-        let dir = crate::plugin::testing::tmpdir("web-float-close");
+        let dir = TmpDir::new("web-float-close");
         let log = dir.join("requests");
         let events = [popup_event(POPUP_IDS, 1, true), popup_event(POPUP_IDS + 1, 1, true)];
         stub_app_host(&dir, &events, &format!("cat > '{}'", log.display()));
@@ -2404,7 +2414,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_popup_an_agent_opened_is_a_hidden_surface_it_can_drive() {
-        let dir = crate::plugin::testing::tmpdir("web-hidden-popup");
+        let dir = TmpDir::new("web-hidden-popup");
         let log = dir.join("requests");
         let loaded = |id: u64| format!(r#"{{"ev":"loading","id":{id},"loading":false,"can_back":false,"can_forward":false}}"#);
         let events = [popup_event(POPUP_IDS, 1, false), loaded(1), loaded(POPUP_IDS)];
@@ -2469,7 +2479,7 @@ pub(crate) mod tests {
     /// made in it.
     #[test]
     fn the_host_is_hung_up_on_once_no_web_surface_is_left_for_a_while() {
-        let dir = crate::plugin::testing::tmpdir("web-idle-exit");
+        let dir = TmpDir::new("web-idle-exit");
         let log = dir.join("log");
         // It takes a moment to exit once its stdin closes.
         let script = format!("echo run >> '{0}'; cat > /dev/null; sleep 0.5; echo eof >> '{0}'", log.display());
@@ -2519,7 +2529,8 @@ pub(crate) mod tests {
     /// then the count starts again from when it went.
     #[test]
     fn a_tab_waiting_to_be_placed_keeps_the_host() {
-        let (mut v, _) = stub_host("web-idle-orphan", "cat > /dev/null");
+        let dir = TmpDir::new("web-idle-orphan");
+        let (mut v, _) = stub_host(&dir, "cat > /dev/null");
         assert!(v.send(None));
         let slot = v.slot.clone();
         let tab = PopupInfo { id: POPUP_IDS, opener: 1, url: String::new(), from_input: true, kind: PopupKind::Tab, width: 1, height: 1 };
@@ -2561,7 +2572,8 @@ pub(crate) mod tests {
     /// backed off, not as an idle hang-up.
     #[test]
     fn a_host_that_fails_with_no_web_view_left_is_not_an_idle_exit() {
-        let (mut v, _) = stub_host("web-idle-crash", r#"echo '{"ev":"failed","error":"boom"}'; exit 1"#);
+        let dir = TmpDir::new("web-idle-crash");
+        let (mut v, _) = stub_host(&dir, r#"echo '{"ev":"failed","error":"boom"}'; exit 1"#);
         assert!(v.send(None));
         wait_exit(&v);
         let slot = v.slot.clone();
@@ -2585,7 +2597,8 @@ pub(crate) mod tests {
     #[test]
     fn a_surface_opened_while_the_host_exits_waits_for_it_to_go() {
         let script = "if [ -e \"$0.once\" ]; then cat > \"$0.requests\"; else touch \"$0.once\"; cat > /dev/null; sleep 1; fi";
-        let (mut v, runs_file) = stub_host("web-idle-wait", script);
+        let dir = TmpDir::new("web-idle-wait");
+        let (mut v, runs_file) = stub_host(&dir, script);
         let log = runs_file.with_file_name("host.sh.requests");
         v.slot.borrow_mut().waker = Some(Arc::new(|| {}));
         assert!(v.send(None));
@@ -2643,6 +2656,16 @@ pub(crate) mod tests {
             .is_ok_and(|s| s.success())
     }
 
+    /// Hang up on the host behind `v` and wait for it to go: a real host
+    /// writes to its profile until it has, so removing the profile sooner
+    /// leaves some of it behind.
+    fn hang_up(v: &WebView) {
+        let host = v.slot.borrow_mut().host.take();
+        if let Some(host) = host {
+            host.hang_up().wait(Duration::from_secs(10));
+        }
+    }
+
     /// The process id of the host behind surface `sid`'s web view.
     fn host_pid(s: &mut AppState, sid: SurfaceId) -> Option<u32> {
         let v = s.view_mut(sid)?.downcast_mut::<WebView>()?;
@@ -2663,8 +2686,8 @@ pub(crate) mod tests {
             return;
         };
         let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
-        let profile = crate::plugin::testing::tmpdir("web-idle-profile");
-        std::env::set_var("GHOSTREALM_WEB_CACHE", &profile);
+        let profile = TmpDir::new("web-idle-profile");
+        std::env::set_var("GHOSTREALM_WEB_CACHE", &*profile);
         TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
         let mut s = AppState::new().with_shell_line("sleep 1");
         s.new_empty_vtab();
@@ -2687,12 +2710,7 @@ pub(crate) mod tests {
         let eval = Args::new().with("id", Value::Int(sid.0 as i64)).with("js", Value::Str("document.title".into()));
         assert_eq!(registry.execute("web.eval", &eval, &mut s).map(|o| o.message).map_err(|e| e.to_string()), Ok(Some("\"idle\"".into())));
         TEST_HOST.with_borrow_mut(|h| *h = None);
-        drop(s);
-        let until = Instant::now() + Duration::from_secs(10);
-        while running(again) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = std::fs::remove_dir_all(&profile);
+        hang_up(s.view(sid).unwrap().downcast_ref::<WebView>().unwrap());
     }
 
     /// A local HTTP server: `/opener` opens `/popup` on a click, counting its
@@ -2769,7 +2787,7 @@ pub(crate) mod tests {
         };
         let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
         let base = serve();
-        let profile = crate::plugin::testing::tmpdir("web-popups-profile");
+        let profile = TmpDir::new("web-popups-profile");
         std::env::set_var("GHOSTREALM_WEB_CACHE", profile.join("person"));
 
         // A person's click.
@@ -2867,6 +2885,7 @@ pub(crate) mod tests {
             assert_eq!(title, Some(Ok("\"Stay\"".into())), "{case}");
             assert_eq!(v.eval("document.title", false), Ok("\"Link\"".into()), "{case}");
         }
+        hang_up(&v);
         drop(v);
         drop(plugin);
 
@@ -2922,8 +2941,7 @@ pub(crate) mod tests {
         assert!(!s.describe().contains("hidden surface"));
         assert_eq!(s.view(opener).map(|v| v.plugin()), Some(ID), "the opener stays");
         TEST_HOST.with_borrow_mut(|h| *h = None);
-        drop(s);
-        let _ = std::fs::remove_dir_all(&profile);
+        hang_up(s.view(opener).unwrap().downcast_ref::<WebView>().unwrap());
     }
 
     #[test]

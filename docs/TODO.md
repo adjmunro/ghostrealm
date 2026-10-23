@@ -1365,18 +1365,6 @@
 
 ---
 
-[2026-10-24T02:29+1300@610a0bd1] App — web tests leave their profiles behind
-
-- Requires: NO BLOCKERS
-- Detail: The app's `plugins::web` tests (stub and real host) leave about 20
-  `$TMPDIR/ghostrealm-web-<tag>-<pid>-<n>` profile directories per run
-  (2,189 had built up). The host tests had the same leak: they removed the
-  profile before the host had exited (crates/web/tests/common/mod.rs
-  `shut_down` now waits for it). Do the same in the app's tests.
-- Reason: test runs shouldn't fill the temp directory.
-
----
-
 [2026-10-24T03:20+1300@8b75dfd] Web — idle host exit while `ghostrealm agent` waits on stdin
 
 - Requires: NO BLOCKERS

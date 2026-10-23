@@ -264,3 +264,37 @@ pub fn tmpdir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// A [`tmpdir`] removed when dropped, so a test that fails cleans up too.
+/// Declare it before anything that writes into it (a host, a view): locals
+/// drop in reverse order, so those stop first.
+pub struct TmpDir(std::path::PathBuf);
+
+impl TmpDir {
+    pub fn new(tag: &str) -> Self {
+        TmpDir(tmpdir(tag))
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TmpDir {
+    /// Retried for a while: a stub host told to exit may still be writing
+    /// its log, and a file it creates mid-removal leaves the directory
+    /// non-empty. Once the directory has gone its writes fail instead.
+    fn drop(&mut self) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::remove_dir_all(&self.0).is_err()
+            && self.0.exists()
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}

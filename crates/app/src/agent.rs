@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn the_web_host_is_hung_up_on_between_requests_once_idle() {
         use crate::plugins::web::tests::{stub_app_host, TEST_HOST, TEST_IDLE_EXIT};
-        let dir = crate::plugin::testing::tmpdir("agent-web-idle");
+        let dir = crate::plugin::testing::TmpDir::new("agent-web-idle");
         let log = dir.join("log");
         stub_app_host(&dir, &[], &format!("echo run >> '{0}'; cat > /dev/null; sleep 0.5; echo eof >> '{0}'", log.display()));
         TEST_IDLE_EXIT.set(Some(std::time::Duration::ZERO));
