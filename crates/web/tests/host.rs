@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use common::host_exe;
+use common::{host_exe, shut_down};
 use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
@@ -118,8 +118,7 @@ fn page_paints_and_answers_text_and_eval() {
         assert!(took < Duration::from_secs(5), "took {took:?}");
     });
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -197,8 +196,7 @@ fn right_and_middle_presses_reach_the_page() {
         "{log}"
     );
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// `html` as a `data:` URL.
@@ -278,8 +276,7 @@ fn a_hostile_page_cannot_shape_eval_results() {
     assert_eq!(eval("typeof agentVar"), Ok("\"undefined\"".into()));
     assert_eq!(eval("[3].map(x => x + 1)"), Ok("[4]".into()));
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -324,8 +321,7 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
     assert_eq!(host.view(1).and_then(|v| v.gone), None, "the reload clears it");
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Alive\"".into()));
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// A local HTTP server: `/a` and `/b` are pages (each links to the other);
@@ -543,8 +539,7 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
     assert!(posts.len() <= clicks.parse::<usize>().unwrap(), "{got} from {clicks} clicks");
     assert!(!host.is_closed(1), "the opener stays");
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -579,8 +574,7 @@ fn a_popup_says_how_the_page_asked_for_it() {
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)));
     assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given a page that opens a person's tab (A) on a click and then closes
@@ -635,8 +629,7 @@ fn a_persons_tab_outlives_its_opener() {
         host.forget(t.id);
     }
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given a page covered by a link to `/stay` (no target);
@@ -709,8 +702,7 @@ fn a_modified_or_middle_clicked_link_opens_a_tab() {
     }
     assert!(host.take_popups(id).is_empty());
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given a page covered by a link to `/stay` that no person has touched;
@@ -766,8 +758,7 @@ fn an_agents_modified_click_opens_a_hidden_popup() {
         wait_closed(&host, q.id);
     }
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// One request [`serve_sites`] recorded.
@@ -931,8 +922,7 @@ fn a_modified_click_loads_as_its_page_asked() {
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!((got[0].site.as_str(), got[0].cookie.as_str()), ("cross-site", "l=1"), "{got:?}");
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given pages on one site whose links to another site withhold the referrer
@@ -955,8 +945,7 @@ fn a_modified_click_keeps_a_links_referrer_policy() {
         assert_eq!((hit.site.as_str(), hit.referer.as_str()), ("cross-site", ""), "{hit:?}");
     }
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given a page on one site covered by a link to another;
@@ -982,8 +971,7 @@ fn the_link_script_runs_only_in_the_document_that_asked() {
     assert_eq!(p.url, url);
     assert_eq!(wait_hits(&hits, "/hit-guard", 1).len(), 1);
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// Given a page filled by a `sandbox=allow-scripts` frame (no
@@ -1006,8 +994,7 @@ fn a_modified_click_in_a_frame_opens_nothing() {
     assert!(hits.lock().unwrap().is_empty(), "{:?}", hits.lock().unwrap());
     assert_eq!(host.view(1).unwrap().url, url);
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 /// A key press `kind` of Enter with `flags` held.
@@ -1059,8 +1046,7 @@ fn a_form_submitted_with_a_modifier_posts_in_place() {
     assert!(host.take_popups(1).is_empty() && host.take_popups(2).is_empty());
     assert_eq!(hits.lock().unwrap().len(), 2, "{:?}", hits.lock().unwrap());
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -1112,8 +1098,7 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
         wait_closed(&host, q.id);
     }
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -1147,8 +1132,7 @@ fn an_eval_whose_page_navigates_away_runs_once() {
     // The stale world is replaced on the next eval.
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"B\"".into()));
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }
 
 #[test]
@@ -1175,6 +1159,5 @@ fn an_expired_eval_making_the_world_does_not_block_later_ones() {
     // once the page is free.
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(10)), Ok("\"Busy\"".into()));
 
-    drop(host);
-    let _ = std::fs::remove_dir_all(&cache);
+    shut_down(host, &cache);
 }

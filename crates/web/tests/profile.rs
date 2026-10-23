@@ -8,16 +8,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::host_exe;
+use common::{host_exe, running};
 use ghostrealm_web::{Request, WebHost};
-
-fn running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
 
 #[test]
 fn a_second_host_on_one_profile_reports_it_in_use() {
