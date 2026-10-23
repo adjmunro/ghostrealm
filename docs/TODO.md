@@ -1408,9 +1408,10 @@
 - Requires: a design
 - Detail: `HostSlot::notice_exit` drops a host that failed but is still running
   (a `failed` event, or a protocol mismatch) through `failed()`, with no
-  `Exiting` guard. If the process is still exiting when the 1 s back-off ends,
-  the respawn can find the profile still locked: it reports the profile in use
-  and backs off again.
+  `Exiting` guard. The respawn follows the back-off (1 s), or for a mismatch
+  the next Reload, `web.new` or bundle change, which can come at once. If the
+  process is still exiting then, the respawn can find the profile still locked:
+  it reports the profile in use and backs off again.
 - Detail: Setting `exiting` there needs a design. `retry_at()` would return the
   reap time and ignore the back-off; GUI `start()` would report a failure as a
   restart; headless `host()` would block in the exit wait during the back-off.
