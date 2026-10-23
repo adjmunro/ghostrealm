@@ -175,12 +175,65 @@ const OUTBOX_MAX: usize = 1024;
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// Whether the host process has been reaped, set by the reaper [`WebHost`]'s
+/// drop starts.
+#[derive(Default)]
+struct Reaped {
+    /// When it was reaped.
+    gone: Mutex<Option<Instant>>,
+    cv: Condvar,
+    /// Told once it has gone, so the GUI can act on it.
+    waker: Option<Waker>,
+}
+
+impl Reaped {
+    fn done(&self) {
+        *self.gone.lock().unwrap() = Some(Instant::now());
+        self.cv.notify_all();
+        if let Some(w) = &self.waker {
+            w();
+        }
+    }
+}
+
+/// A host the app hung up on ([`WebHost::hang_up`]), until its process has
+/// gone. Until then it may hold the profile, which another host would then
+/// report in use.
+pub struct Exiting(Arc<Reaped>);
+
+impl Exiting {
+    /// Whether the process has gone (exited, or killed for taking too long).
+    pub fn is_gone(&self) -> bool {
+        self.gone_at().is_some()
+    }
+
+    /// When the process went, once it has.
+    pub fn gone_at(&self) -> Option<Instant> {
+        *self.0.gone.lock().unwrap()
+    }
+
+    /// Block until the process has gone (or `timeout`); returns whether it has.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut gone = self.0.gone.lock().unwrap();
+        while gone.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            gone = self.0.cv.wait_timeout(gone, left).unwrap().0;
+        }
+        gone.is_some()
+    }
+}
+
 pub struct WebHost {
     child: Option<Child>,
     outbox: Arc<(Mutex<Outbox>, Condvar)>,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     next_req: AtomicU64,
     readers: HashMap<u64, Arc<FrameReader>>,
+    reaped: Arc<Reaped>,
 }
 
 impl WebHost {
@@ -200,6 +253,7 @@ impl WebHost {
             .with_context(|| format!("spawn web host {}", exe.display()))?;
         let stdin = child.stdin.take().context("web host stdin")?;
         let stdout = child.stdout.take().context("web host stdout")?;
+        let reaped = Arc::new(Reaped { waker: waker.clone(), ..Reaped::default() });
         let shared: Arc<(Mutex<Shared>, Condvar)> = Arc::default();
         let reader_shared = shared.clone();
         let outbox: Arc<(Mutex<Outbox>, Condvar)> = Arc::default();
@@ -239,7 +293,14 @@ impl WebHost {
             shared,
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
+            reaped,
         })
+    }
+
+    /// Ask the host to exit, as dropping it does, and keep track of when its
+    /// process has gone.
+    pub fn hang_up(self) -> Exiting {
+        Exiting(self.reaped.clone())
     }
 
     /// Queue a request for the host; never blocks on the pipe. A mouse move
@@ -309,6 +370,12 @@ impl WebHost {
             self.send(&Request::Close { id });
         }
         self.readers.remove(&id);
+    }
+
+    /// Whether a person's tab whose opener the app forgot waits to be placed
+    /// (see [`take_orphan_tabs`](Self::take_orphan_tabs)).
+    pub fn has_orphan_tabs(&self) -> bool {
+        !self.shared.0.lock().unwrap().orphans.is_empty()
     }
 
     /// The tabs a person opened whose opener the app forgot before its view
@@ -471,22 +538,31 @@ impl Drop for WebHost {
         let (lock, cv) = &*self.outbox;
         lock.lock().unwrap().closed = true;
         cv.notify_one();
+        let reaped = self.reaped.clone();
         let Some(mut child) = self.child.take() else {
+            reaped.done();
             return;
         };
-        let _ = std::thread::Builder::new()
+        let reaper = reaped.clone();
+        let spawned = std::thread::Builder::new()
             .name("web-host-reap".into())
             .spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while Instant::now() < deadline {
                     if let Ok(Some(_)) = child.try_wait() {
+                        reaper.done();
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 let _ = child.kill();
                 let _ = child.wait();
+                reaper.done();
             });
+        // Nothing would report it gone: don't leave a waiter waiting forever.
+        if spawned.is_err() {
+            reaped.done();
+        }
     }
 }
 
@@ -751,6 +827,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Given a host that closed its stdout at once and, once its stdin
+    /// closes, takes a moment to exit;
+    /// when the app hangs up on it;
+    /// then it is not gone at once, and once its process has gone it is
+    /// reported gone, a waiter returns, and the waker is told.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_hung_up_on_is_reported_gone_once_its_process_has_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ghostrealm-web-hang-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("slow-exit.sh");
+        std::fs::write(&exe, "#!/bin/sh\nexec 1>&-\ncat > /dev/null\nsleep 0.5\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let w = woken.clone();
+        let host = WebHost::spawn(&exe, Some(Arc::new(move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        })))
+        .unwrap();
+        let pid = host.pid().unwrap();
+        // Its stdout's end wakes too: let that pass first.
+        let until = Instant::now() + Duration::from_secs(2);
+        while host.is_alive() {
+            assert!(Instant::now() < until, "its stdout never closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let woken_before = woken.load(Ordering::Relaxed);
+        let exiting = host.hang_up();
+        assert!(!exiting.is_gone(), "it is still exiting");
+        assert!(exiting.wait(Duration::from_secs(4)), "it went before the reaper's kill");
+        assert!(exiting.is_gone());
+        let alive = Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status();
+        assert!(!alive.is_ok_and(|s| s.success()), "its process has gone");
+        let until = Instant::now() + Duration::from_secs(2);
+        while woken.load(Ordering::Relaxed) == woken_before {
+            assert!(Instant::now() < until, "the waker was not told");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_queued_mouse_move_is_replaced_by_the_next() {
         let outbox: (Mutex<Outbox>, Condvar) = Default::default();
@@ -760,6 +880,7 @@ mod tests {
             shared: Arc::default(),
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
+            reaped: Arc::default(),
         };
         let mv = |id, x| Request::Mouse {
             id,
@@ -834,6 +955,7 @@ mod tests {
             shared: Arc::default(),
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
+            reaped: Arc::default(),
         };
         let shared = host.shared.clone();
         apply_event(&shared, Event::Title { id: 1, title: "t".into() });
@@ -878,6 +1000,7 @@ mod tests {
             shared: Arc::default(),
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
+            reaped: Arc::default(),
         };
         let shared = host.shared.clone();
         apply_event(&shared, Event::Title { id: 2, title: "t".into() });
@@ -926,6 +1049,7 @@ mod tests {
             shared: Arc::default(),
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
+            reaped: Arc::default(),
         };
         apply_event(&host.shared, Event::Title { id: 1, title: "t".into() });
         host.forget(1);

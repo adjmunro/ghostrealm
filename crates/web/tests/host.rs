@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use common::{host_exe, shut_down};
+use common::{host_exe, running, shut_down};
 use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
@@ -58,6 +58,31 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
         );
     }
     Some((host, cache))
+}
+
+/// Given a ready host on a profile;
+/// when the app hangs up on it;
+/// then it is reported gone once its process has gone, and a new host on the
+/// same profile then becomes ready and serves a page (rather than finding
+/// the profile in use).
+#[test]
+fn a_host_hung_up_on_frees_its_profile_once_gone() {
+    let Some((host, _)) = spawn("hang-up") else { return };
+    let pid = host.pid().expect("host pid");
+    let exiting = host.hang_up();
+    assert!(exiting.wait(Duration::from_secs(10)), "never reported gone");
+    assert!(!running(pid), "its process is still running");
+    let (again, cache) = spawn("hang-up").expect("built");
+    assert!(again.send(&Request::Create {
+        id: 1,
+        url: data_url("<p>again"),
+        width: 64,
+        height: 48,
+        scale: 1.0
+    }));
+    assert!(again.wait_loaded(1, Duration::from_secs(20)));
+    assert_eq!(again.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
+    shut_down(again, &cache);
 }
 
 #[test]
