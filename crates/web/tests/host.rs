@@ -392,6 +392,25 @@ fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
     }
 }
 
+/// Click page `id` near its top-left until it opens a pop-up. A page that
+/// has just painted may not hit-test input yet, so a click can go unheard.
+fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
+    let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
+    for _ in 0..5 {
+        click(MouseAction::Move);
+        click(MouseAction::Down { button: MouseButton::Left, count: 1 });
+        click(MouseAction::Up { button: MouseButton::Left, count: 1 });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(p) = host.take_popups(id).pop() {
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("no click on page {id} opened a pop-up");
+}
+
 /// The pop-ups page `opener` opened, once there are `n`.
 fn wait_popups(host: &WebHost, opener: u64, n: usize) -> Vec<ghostrealm_web::PopupInfo> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -434,11 +453,7 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
 
-    let click = |action| assert!(host.send(&Request::Mouse { id: 1, x: 20, y: 20, mods: 0, action }));
-    click(MouseAction::Move);
-    click(MouseAction::Down { button: MouseButton::Left, count: 1 });
-    click(MouseAction::Up { button: MouseButton::Left, count: 1 });
-    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    let p = click_for_popup(&host, 1);
     assert!(p.id >= ghostrealm_web::protocol::POPUP_IDS, "{p:?}");
     assert!(p.from_input, "a click opened it");
     assert_eq!(p.kind, PopupKind::Popup, "window.open with a size");
@@ -467,11 +482,7 @@ fn a_popup_says_how_the_page_asked_for_it() {
         assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0 }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
-        let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
-        click(MouseAction::Move);
-        click(MouseAction::Down { button: MouseButton::Left, count: 1 });
-        click(MouseAction::Up { button: MouseButton::Left, count: 1 });
-        wait_popups(host, id, 1).remove(0)
+        click_for_popup(host, id)
     };
     let tab = click_on(&mut host, "/blank");
     assert_eq!(tab.kind, PopupKind::Tab, "target=_blank");
