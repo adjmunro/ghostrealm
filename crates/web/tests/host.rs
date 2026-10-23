@@ -544,8 +544,7 @@ fn a_popup_says_how_the_page_asked_for_it() {
 /// Given a page that opens a person's tab (A) on a click and then closes
 /// itself, and a page that opens a person's tab (B) on a click;
 /// when A's opener closes itself, and B's opener is closed and forgotten
-/// by the app before its view takes B (B reaching the client before or
-/// after the forget);
+/// by the app after B reached the client but before its view took B;
 /// then A waits for the opener's view to take it and still runs, and B is
 /// handed to the app as a tab of the forgotten opener and still runs.
 #[test]
@@ -570,8 +569,9 @@ fn a_persons_tab_outlives_its_opener() {
     host.forget(tab.id);
 
     // An opener the app closes and forgets before its view takes the tab.
-    // `window.open` returns once the host has reported the tab, so it is
-    // reported before the close is read.
+    // `window.open` returns once the host has reported the tab, so the
+    // client has it before the eval that sees `data-opened` answers. (A tab
+    // reported after the forget is the client tests'.)
     open(&mut host, 2, "/opentab");
     click_until(&host, 2, "document.body.dataset.opened");
     assert!(host.send(&Request::Close { id: 2 }));

@@ -1584,8 +1584,10 @@ impl AppState {
     /// Place the pop-ups web pages opened: a person's tab beside its
     /// opener's (shown if it asked to be), an agent's as a hidden surface (in
     /// no pane, never focused, still driven by `web.*` and read by `get
-    /// surface`). Then drop hidden ones that closed or whose opener went, and
-    /// close tabs whose pop-up page closed. Returns whether any came or went.
+    /// surface`), and a person's tab whose opener went before it was placed
+    /// in the focused pane. Then drop hidden ones that closed or whose opener
+    /// went, and close web tabs whose page closed. Returns whether any came
+    /// or went.
     pub fn adopt_popups(&mut self) -> bool {
         // What went is found before placing: the host reports a page's
         // pop-ups before reporting it closed, so every pop-up of a page
@@ -1614,9 +1616,10 @@ impl AppState {
 
     /// Place a person's tabs whose opener (a tab, or a pop-up floating over
     /// one) went before they were placed: in the focused pane, after its
-    /// active surface. Close and a floating pop-up's close button act in the
-    /// focused pane, so that is the opener's. With no workspace to hold them
-    /// they close.
+    /// active surface. That is the opener's pane when Close (Cmd+W) closed
+    /// it, but not when a tab's close button, the sidebar, or an agent did:
+    /// the opener's pane isn't kept, as the gap is a few milliseconds. With
+    /// no workspace to hold them they close.
     fn place_orphan_tabs(&mut self, tabs: Vec<(web::WebView, bool)>) {
         for (view, focus) in tabs {
             let Some((vt, pane)) = self.focused_pane() else {
