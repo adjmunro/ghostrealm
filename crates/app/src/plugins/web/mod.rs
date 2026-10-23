@@ -1029,14 +1029,15 @@ impl WebView {
     }
 
     /// Drop floating pop-ups that were dismissed or closed; the page gets
-    /// the keyboard back.
+    /// the keyboard back once none floats.
     fn drop_closed_floating(&mut self) -> bool {
         let before = self.floating.len();
         self.floating.retain(|f| !f.is_closed());
         if self.floating.len() == before {
             return false;
         }
-        self.float_keys = false;
+        // The keyboard stays with the floating pop-ups while one is left.
+        self.float_keys &= !self.floating.is_empty();
         self.float_press = false;
         self.float_hover = false;
         let focused = self.focused;
@@ -1939,7 +1940,8 @@ pub(super) mod tests {
     fn close_and_edit_url_act_on_a_floating_popup_with_the_keyboard() {
         let dir = crate::plugin::testing::tmpdir("web-float-close");
         let log = dir.join("requests");
-        stub_app_host(&dir, &[popup_event(POPUP_IDS, 1, true)], &format!("cat > '{}'", log.display()));
+        let events = [popup_event(POPUP_IDS, 1, true), popup_event(POPUP_IDS + 1, 1, true)];
+        stub_app_host(&dir, &events, &format!("cat > '{}'", log.display()));
         let mut s = AppState::new().with_shell_line("sleep 1");
         s.new_empty_vtab();
         let mut registry = crate::app_state::build_registry();
@@ -1948,9 +1950,9 @@ pub(super) mod tests {
         fn web(s: &mut AppState, sid: SurfaceId) -> &mut WebView {
             s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap()
         }
-        wait("the pop-up floats", || {
+        wait("the pop-ups float", || {
             s.pump_all();
-            !web(&mut s, sid).floating.is_empty()
+            web(&mut s, sid).floating.len() == 2
         });
         assert!(web(&mut s, sid).float_keys);
 
@@ -1962,7 +1964,11 @@ pub(super) mod tests {
         v.url_edit = None;
         v.keys_to_float(true);
 
-        // Close (Cmd+W) closes the pop-up, not the tab.
+        // Close (Cmd+W) closes the top pop-up, not the tab; the keyboard
+        // goes to the next one, then to the page.
+        registry.execute("pane.close", &Args::new(), &mut s).unwrap();
+        let v = web(&mut s, sid);
+        assert!(v.floating.len() == 1 && v.float_keys);
         registry.execute("pane.close", &Args::new(), &mut s).unwrap();
         assert_eq!(s.focused_surface(), Some(sid), "the tab stays");
         let v = web(&mut s, sid);
