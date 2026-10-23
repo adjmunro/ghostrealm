@@ -1400,3 +1400,18 @@
   tick at `AppState::next_web_deadline`.
 - Reason: that host holds a few hundred MB, and the web profile's lock, which
   keeps the GUI's web surfaces from starting on the same profile.
+
+---
+
+[2026-10-24T03:27+1300@eee9ed39] Web — guard the respawn after a host that failed while still alive
+
+- Requires: a design
+- Detail: `HostSlot::notice_exit` drops a host that failed but is still running
+  (a `failed` event, or a protocol mismatch) through `failed()`, with no
+  `Exiting` guard. If the process is still exiting when the 1 s back-off ends,
+  the respawn can find the profile still locked: it reports the profile in use
+  and backs off again.
+- Detail: Setting `exiting` there needs a design. `retry_at()` would return the
+  reap time and ignore the back-off; GUI `start()` would report a failure as a
+  restart; headless `host()` would block in the exit wait during the back-off.
+- Reason: a failure shouldn't cost a second, spurious "profile in use" failure.
