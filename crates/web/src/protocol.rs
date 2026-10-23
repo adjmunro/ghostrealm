@@ -292,7 +292,8 @@ pub enum Event {
         /// with that eval's activation.
         from_input: bool,
         kind: PopupKind,
-        /// Its initial physical size: what the page asked for, else the opener's.
+        /// Its initial physical size: what the page asked for, at most the
+        /// opener's.
         width: u32,
         height: u32,
     },

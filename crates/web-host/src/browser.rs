@@ -731,9 +731,11 @@ fn open_popup(
     });
     let (width, height, scale) = {
         let p = parent.borrow();
+        // What the page asked for, no larger than its opener: a huge size
+        // would make a page that never paints.
         let size = |set: c_int, dip: c_int, own: u32| {
             if set != 0 && dip > 0 {
-                (dip as f32 * p.scale).round() as u32
+                ((dip as f32 * p.scale).round() as u32).min(own)
             } else {
                 own
             }

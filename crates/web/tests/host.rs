@@ -430,7 +430,7 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
         return;
     };
     let (base, _) = serve();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 2.0 }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 800, height: 600, scale: 2.0 }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
 
@@ -478,6 +478,10 @@ fn a_popup_says_how_the_page_asked_for_it() {
     assert_eq!(host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)), Ok("true".into()));
     let p = wait_popups(&host, 1, 1);
     assert_eq!(p[0].kind, PopupKind::Tab, "window.open with no features");
+    let huge = "window.open('/stay', '', 'width=40000,height=40000') !== null";
+    assert_eq!(host.eval_as(1, huge, true, Duration::from_secs(5)), Ok("true".into()));
+    let q = wait_popups(&host, 1, 1).remove(0);
+    assert_eq!((q.kind, q.width, q.height), (PopupKind::Popup, 100, 100), "no larger than its opener");
 
     // A detached pop-up outlives its opener; the others close with it.
     assert!(host.send(&Request::Detach { id: tab.id }));
