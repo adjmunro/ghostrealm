@@ -1708,8 +1708,9 @@ impl AppState {
         (gone, closed_tabs)
     }
 
-    /// Drop the hidden pop-ups and close the tabs [`closed_popups`] found.
-    /// Returns whether any went.
+    /// Drop the hidden pop-ups and close the tabs [`closed_popups`] found,
+    /// with the hidden pop-ups hanging off what went. Returns whether any
+    /// went.
     ///
     /// [`closed_popups`]: Self::closed_popups
     fn drop_closed_popups(&mut self, (mut gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
