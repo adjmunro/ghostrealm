@@ -312,6 +312,14 @@ impl WebHost {
         std::mem::take(&mut self.shared.0.lock().unwrap().orphans)
     }
 
+    /// Hand back person's tab `p`, taken by its opener's view, which went
+    /// before the app placed the tab: [`take_orphan_tabs`] returns it.
+    ///
+    /// [`take_orphan_tabs`]: Self::take_orphan_tabs
+    pub fn orphan_tab(&self, p: PopupInfo) {
+        self.shared.0.lock().unwrap().orphans.push(p);
+    }
+
     /// Whether the host closed page `id` (see [`Event::Closed`]).
     pub fn is_closed(&self, id: u64) -> bool {
         self.shared.0.lock().unwrap().closed.contains(&id)

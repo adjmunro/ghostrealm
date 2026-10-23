@@ -615,6 +615,21 @@ impl WebView {
         self.dismissed || !current || slot.host.as_ref().is_none_or(|h| h.is_closed(self.page))
     }
 
+    /// This pop-up tab's page, as opened by `opener`, for another view to
+    /// show: this view no longer closes it.
+    fn release(mut self, opener: u64, focus: bool) -> PopupInfo {
+        self.created_in = 0;
+        PopupInfo {
+            id: self.page,
+            opener,
+            url: self.last_url.clone(),
+            from_input: true,
+            kind: if focus { PopupKind::Tab } else { PopupKind::BackgroundTab },
+            width: self.popup_size.0,
+            height: self.popup_size.1,
+        }
+    }
+
     /// Take the pop-ups the page opened from the host: a person's pop-up
     /// window floats over it (and takes the keyboard); a person's tab and an
     /// agent's pop-up wait in `opened`. Drop floating ones that closed.
@@ -1088,6 +1103,16 @@ impl Drop for WebView {
         if let Ok(mut slot) = self.slot.try_borrow_mut() {
             if slot.generation == self.created_in {
                 if let Some(h) = slot.host.as_mut() {
+                    // A person's tab taken but not yet placed outlives this
+                    // page: the app places it. The rest close with it, once
+                    // the slot is free.
+                    let (tabs, rest): (Vec<Opened>, Vec<Opened>) =
+                        std::mem::take(&mut self.opened).into_iter().partition(|o| matches!(o.place, Place::Tab { .. }));
+                    self.opened = rest;
+                    for o in tabs {
+                        let Place::Tab { focus } = o.place else { continue };
+                        h.orphan_tab(o.view.release(self.page, focus));
+                    }
                     h.send(&HostRequest::Close { id: self.page });
                     h.forget(self.page);
                 }
@@ -2023,7 +2048,24 @@ pub(super) mod tests {
     /// then A and B open as tabs in that pane, A shown, and neither is closed.
     #[test]
     fn a_tab_a_person_opened_outlives_its_opener_closing_before_it_is_placed() {
-        let dir = crate::plugin::testing::tmpdir("web-popup-tab-orphan");
+        opener_closes_before_its_tabs_are_placed("web-popup-tab-orphan", false);
+    }
+
+    /// Given a web tab (page 1) whose view has taken a person's tab (A) from
+    /// the host (as painting does) but the app has not placed it yet, and a
+    /// host that reports a second person's tab (B, in the background) from
+    /// page 1 only once told to close page 1;
+    /// when the person closes page 1's tab (Close, Cmd+W);
+    /// then A and B open as tabs in that pane, A shown, and neither is closed.
+    #[test]
+    fn a_tab_its_opener_took_outlives_the_opener_closing_before_it_is_placed() {
+        opener_closes_before_its_tabs_are_placed("web-popup-tab-taken-orphan", true);
+    }
+
+    /// Page 1 opens tab A, then is closed before the app places A, with A
+    /// taken by page 1's view first when `taken`; B arrives after the close.
+    fn opener_closes_before_its_tabs_are_placed(tag: &str, taken: bool) {
+        let dir = crate::plugin::testing::tmpdir(tag);
         let log = dir.join("requests");
         let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
         let script = format!(
@@ -2040,6 +2082,11 @@ pub(super) mod tests {
         let opener = s.focused_surface().unwrap();
         // Nothing pumps the app until the close, so A stays unplaced.
         wait("A reaches the app", || host_knows(&mut s, opener, a));
+        if taken {
+            let v = s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap();
+            v.pull_popups();
+            assert_eq!(v.opened.len(), 1, "the view holds A");
+        }
         registry.execute("pane.close", &Args::new(), &mut s).unwrap();
         assert!(s.view(opener).is_none(), "the opener closed");
 
