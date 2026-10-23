@@ -90,6 +90,14 @@ pub struct PopupInfo {
     pub height: u32,
 }
 
+impl PopupInfo {
+    /// A person's new tab or window: it outlives its opener (the host keeps
+    /// it when the opener closes).
+    pub fn is_tab(&self) -> bool {
+        is_tab(self.from_input, self.kind)
+    }
+}
+
 /// A page frame the app can hold onto: its shared mapping plus where in it the
 /// pixels are. The host may overwrite the slot two frames later; reading then
 /// fails rather than returning a torn frame (a newer one is on its way).
@@ -139,6 +147,9 @@ struct Shared {
     replies: HashMap<u64, Event>,
     /// Pop-ups not yet taken by their opener's view.
     popups: Vec<PopupInfo>,
+    /// A person's tabs whose opener the app forgot before its view took
+    /// them, until the app places them.
+    orphans: Vec<PopupInfo>,
     /// Pages the host closed and the app hasn't forgotten.
     closed: std::collections::HashSet<u64>,
     /// Pages the app forgot, and untaken pop-ups the client closed, until the
@@ -286,12 +297,19 @@ impl WebHost {
             s.forgotten.insert(id);
         }
         s.popups.retain(|p| p.id != id);
-        let orphans = drop_popups_of(&mut s, id);
+        s.orphans.retain(|p| p.id != id);
+        let untaken = drop_popups_of(&mut s, id);
         drop(s);
-        for id in orphans {
+        for id in untaken {
             self.send(&Request::Close { id });
         }
         self.readers.remove(&id);
+    }
+
+    /// The tabs a person opened whose opener the app forgot before its view
+    /// took them, oldest first: they outlive it, so the app places them.
+    pub fn take_orphan_tabs(&self) -> Vec<PopupInfo> {
+        std::mem::take(&mut self.shared.0.lock().unwrap().orphans)
     }
 
     /// Whether the host closed page `id` (see [`Event::Closed`]).
@@ -526,7 +544,9 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
     let mut s = lock.lock().unwrap();
     let late = match &ev {
         Event::Closed { id } if s.forgotten.remove(id) => Some(drop_popups_of(&mut s, *id)),
-        Event::Popup { id, opener, .. } if s.forgotten.contains(opener) => {
+        Event::Popup { id, opener, from_input, kind, .. }
+            if s.forgotten.contains(opener) && !is_tab(*from_input, *kind) =>
+        {
             s.forgotten.insert(*id);
             Some(vec![*id])
         }
@@ -589,9 +609,21 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
         Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
         Event::Popup { id, opener, url, from_input, kind, width, height } => {
             s.views.entry(id).or_default().url.clone_from(&url);
-            s.popups.push(PopupInfo { id, opener, url, from_input, kind, width, height });
+            let p = PopupInfo { id, opener, url, from_input, kind, width, height };
+            // A person's tab whose opener was forgotten (any other pop-up of
+            // it was closed above).
+            if s.forgotten.contains(&opener) {
+                s.orphans.push(p);
+            } else {
+                s.popups.push(p);
+            }
         }
         Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
+        // A person's tab no view took yet closed: none will now.
+        Event::Closed { id } if s.orphans.iter().any(|p| p.id == id) => {
+            s.orphans.retain(|p| p.id != id);
+            s.views.remove(&id);
+        }
         // A page that closed itself may still have a view: that view takes
         // the pop-ups it opened (a tab can outlive it).
         Event::Closed { id } => {
@@ -615,20 +647,30 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
 }
 
 /// Forget the pop-ups the forgotten page `opener` opened that no view took
-/// (none will now); returns those still open, to close.
+/// (none will now): a person's tabs still open are kept for the app to
+/// place; the other pop-ups still open are returned, to close.
 fn drop_popups_of(s: &mut Shared, opener: u64) -> Vec<u64> {
     let (gone, keep): (Vec<PopupInfo>, Vec<PopupInfo>) =
         std::mem::take(&mut s.popups).into_iter().partition(|p| p.opener == opener);
     s.popups = keep;
     let mut open = Vec::new();
     for p in gone {
-        s.views.remove(&p.id);
-        if !s.closed.remove(&p.id) {
+        if s.closed.remove(&p.id) {
+            s.views.remove(&p.id);
+        } else if p.is_tab() {
+            s.orphans.push(p);
+        } else {
+            s.views.remove(&p.id);
             s.forgotten.insert(p.id);
             open.push(p.id);
         }
     }
     open
+}
+
+/// Whether a pop-up is a person's new tab or window (see [`PopupInfo::is_tab`]).
+fn is_tab(from_input: bool, kind: PopupKind) -> bool {
+    from_input && kind != PopupKind::Popup
 }
 
 /// The page an event updates the state of (not replies, which answer requests).
@@ -760,6 +802,17 @@ mod tests {
         assert_eq!(gone(&shared), None, "a reload clears it");
     }
 
+    fn popup(id: u64, opener: u64, from_input: bool, kind: PopupKind) -> Event {
+        Event::Popup { id, opener, url: String::new(), from_input, kind, width: 1, height: 1 }
+    }
+
+    /// Given page 1 opened a person's tab and page 2 an agent's pop-up (11),
+    /// neither taken by a view;
+    /// when page 1 closes itself, and the app forgets page 2, after which
+    /// page 2's second agent's pop-up (12) arrives;
+    /// then page 1's view still takes its tab, while 11 and 12 are closed,
+    /// their late events are dropped, and nothing is kept for them once the
+    /// host reports them closed.
     #[test]
     fn untaken_popups_wait_for_their_opener_or_close_with_it() {
         let mut host = WebHost {
@@ -769,18 +822,9 @@ mod tests {
             next_req: AtomicU64::new(1),
             readers: HashMap::new(),
         };
-        let popup = |id, opener| Event::Popup {
-            id,
-            opener,
-            url: String::new(),
-            from_input: true,
-            kind: PopupKind::Tab,
-            width: 1,
-            height: 1,
-        };
         let shared = host.shared.clone();
         apply_event(&shared, Event::Title { id: 1, title: "t".into() });
-        assert!(apply_event(&shared, popup(10, 1)).is_empty());
+        assert!(apply_event(&shared, popup(10, 1, true, PopupKind::Tab)).is_empty());
         apply_event(&shared, Event::Closed { id: 99 });
         assert!(!shared.0.lock().unwrap().closed.contains(&99), "a page the app never had");
 
@@ -790,9 +834,9 @@ mod tests {
 
         // A forgotten opener's untaken pop-ups close, late ones too.
         apply_event(&shared, Event::Title { id: 2, title: "t".into() });
-        apply_event(&shared, popup(11, 2));
+        apply_event(&shared, popup(11, 2, false, PopupKind::Tab));
         host.forget(2);
-        assert_eq!(apply_event(&shared, popup(12, 2)), [12]);
+        assert_eq!(apply_event(&shared, popup(12, 2, false, PopupKind::Tab)), [12]);
         let queued: Vec<Request> = host.outbox.0.lock().unwrap().queue.iter().cloned().collect();
         assert_eq!(queued, [Request::Close { id: 11 }]);
         assert!(apply_event(&shared, Event::Title { id: 11, title: "late".into() }).is_empty());
@@ -803,6 +847,50 @@ mod tests {
         let s = shared.0.lock().unwrap();
         assert!(s.popups.is_empty() && s.forgotten.is_empty(), "nothing kept");
         assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1], "the opener the app still holds");
+    }
+
+    /// Given page 2 opened, untaken by a view: a person's tab (11), an
+    /// agent's pop-up (13), a person's pop-up window (14), and a person's tab
+    /// that has since closed (16);
+    /// when the app forgets page 2, after which page 2's person's new window
+    /// (12) and background tab (15) arrive, and 15 closes;
+    /// then 13 and 14 are closed while 11 and 12 keep running, with their
+    /// late events, and are handed to the app once, oldest first; 15 and 16
+    /// are not handed over, and nothing is kept for any of them.
+    #[test]
+    fn a_persons_tab_outlives_a_forgotten_opener_for_the_app_to_place() {
+        let mut host = WebHost {
+            child: None,
+            outbox: Arc::default(),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+        };
+        let shared = host.shared.clone();
+        apply_event(&shared, Event::Title { id: 2, title: "t".into() });
+        apply_event(&shared, popup(11, 2, true, PopupKind::Tab));
+        apply_event(&shared, popup(13, 2, false, PopupKind::Tab));
+        apply_event(&shared, popup(14, 2, true, PopupKind::Popup));
+        apply_event(&shared, popup(16, 2, true, PopupKind::Tab));
+        apply_event(&shared, Event::Closed { id: 16 });
+        host.forget(2);
+        assert!(apply_event(&shared, popup(12, 2, true, PopupKind::Window)).is_empty(), "a late tab isn't closed");
+        assert!(apply_event(&shared, popup(15, 2, true, PopupKind::BackgroundTab)).is_empty());
+        apply_event(&shared, Event::Title { id: 12, title: "late".into() });
+        apply_event(&shared, Event::Closed { id: 15 });
+        let queued: Vec<Request> = host.outbox.0.lock().unwrap().queue.iter().cloned().collect();
+        assert_eq!(queued, [Request::Close { id: 13 }, Request::Close { id: 14 }]);
+
+        let tabs = host.take_orphan_tabs();
+        assert_eq!(tabs.iter().map(|p| (p.id, p.kind)).collect::<Vec<_>>(), [(11, PopupKind::Tab), (12, PopupKind::Window)]);
+        assert_eq!(host.view(12).map(|v| v.title).as_deref(), Some("late"), "its events are kept");
+        assert!(host.take_orphan_tabs().is_empty(), "handed over once");
+        for id in [2, 13, 14] {
+            apply_event(&shared, Event::Closed { id });
+        }
+        let s = shared.0.lock().unwrap();
+        assert!(s.popups.is_empty() && s.forgotten.is_empty() && s.closed.is_empty(), "nothing kept");
+        assert!(!s.views.contains_key(&15) && !s.views.contains_key(&16));
     }
 
     #[test]

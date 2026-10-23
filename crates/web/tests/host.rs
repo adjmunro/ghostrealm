@@ -331,8 +331,9 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
 /// A local HTTP server: `/a` and `/b` are pages (each links to the other);
 /// `/opener` opens `/popup` on a click (red while it waits for one) and logs
 /// messages it gets in `data-got`; `/popup` posts to its opener and closes
-/// itself; `/stay` is a page. `/hit...` paths are recorded in the returned
-/// list. Anything else is empty.
+/// itself; `/stay` is a page; `/opentab` opens `/stay` in a new tab on a
+/// click, then sets `data-opened`. `/hit...` paths are recorded in the
+/// returned list. Anything else is empty.
 fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -357,6 +358,7 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
                 "/stay" => "<title>Stay</title><p>stay text</p>".to_string(),
                 "/blank" => LINK.replace("LINK", "target=_blank href=/stay"),
                 "/selfclose" => LINK.replace("LINK", "target=_blank href=/stay onclick='setTimeout(() => window.close(), 0)'"),
+                "/opentab" => LINK.replace("LINK", "onclick=\"window.open('/stay'); document.body.dataset.opened = 1\""),
                 _ => {
                     if path.starts_with("/hit") {
                         seen.lock().unwrap().push(path);
@@ -421,6 +423,27 @@ fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
         }
     }
     panic!("no click on page {id} opened a pop-up");
+}
+
+/// Click page `id` near its top-left until `js` (evaluated in it) is truthy:
+/// a page that has just painted may not hit-test input yet, so a click can
+/// go unheard. It clicks again only while `js` is falsy, so a click the
+/// page heard is never repeated.
+fn click_until(host: &WebHost, id: u64, js: &str) {
+    let heard = || host.eval(id, &format!("!!({js})"), Duration::from_secs(5)) == Ok("true".into());
+    for _ in 0..5 {
+        for action in [MouseAction::Move, MouseAction::Down { button: MouseButton::Left, count: 1 }, MouseAction::Up { button: MouseButton::Left, count: 1 }] {
+            assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if heard() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!("page {id} never heard a click");
 }
 
 /// The pop-ups page `opener` opened, once there are `n`.
@@ -518,8 +541,15 @@ fn a_popup_says_how_the_page_asked_for_it() {
     let _ = std::fs::remove_dir_all(&cache);
 }
 
+/// Given a page that opens a person's tab (A) on a click and then closes
+/// itself, and a page that opens a person's tab (B) on a click;
+/// when A's opener closes itself, and B's opener is closed and forgotten
+/// by the app before its view takes B (B reaching the client before or
+/// after the forget);
+/// then A waits for the opener's view to take it and still runs, and B is
+/// handed to the app as a tab of the forgotten opener and still runs.
 #[test]
-fn a_persons_tab_outlives_an_opener_that_closes_itself_until_the_app_forgets_it() {
+fn a_persons_tab_outlives_its_opener() {
     let Some((mut host, cache)) = spawn("popup-orphan") else {
         return;
     };
@@ -539,25 +569,28 @@ fn a_persons_tab_outlives_an_opener_that_closes_itself_until_the_app_forgets_it(
     assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
     host.forget(tab.id);
 
-    // An opener the app forgets before its view takes the tab: the tab closes.
-    open(&mut host, 2, "/blank");
-    let id = ghostrealm_web::protocol::POPUP_IDS + 1;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while host.view(id).is_none() {
-        if Instant::now() > deadline {
-            panic!("no tab");
-        }
-        for action in [MouseAction::Move, MouseAction::Down { button: MouseButton::Left, count: 1 }, MouseAction::Up { button: MouseButton::Left, count: 1 }] {
-            host.send(&Request::Mouse { id: 2, x: 20, y: 20, mods: 0, action });
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // An opener the app closes and forgets before its view takes the tab.
+    // `window.open` returns once the host has reported the tab, so it is
+    // reported before the close is read.
+    open(&mut host, 2, "/opentab");
+    click_until(&host, 2, "document.body.dataset.opened");
     assert!(host.send(&Request::Close { id: 2 }));
     host.forget(2);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while host.eval(id, "1", Duration::from_secs(2)).is_ok() {
-        assert!(Instant::now() < deadline, "the untaken tab still runs");
-        std::thread::sleep(Duration::from_millis(50));
+    let tabs = loop {
+        let tabs = host.take_orphan_tabs();
+        if !tabs.is_empty() {
+            break tabs;
+        }
+        assert!(Instant::now() < deadline, "the tab was never handed over");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(tabs.iter().all(|t| t.opener == 2 && t.is_tab()), "{tabs:?}");
+    assert!(host.wait_loaded(tabs[0].id, Duration::from_secs(20)), "the tab lives on");
+    assert_eq!(host.eval(tabs[0].id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    for t in tabs {
+        host.send(&Request::Close { id: t.id });
+        host.forget(t.id);
     }
 
     drop(host);

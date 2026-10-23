@@ -210,6 +210,29 @@ impl WebPlugin {
             slot: Rc::default(),
         }
     }
+
+    /// What hands the app the tabs a person opened whose opener went before
+    /// the app placed them: no view is left to hand them over.
+    pub fn orphan_tabs(&self) -> OrphanTabs {
+        OrphanTabs(self.slot.clone())
+    }
+}
+
+/// See [`WebPlugin::orphan_tabs`].
+pub struct OrphanTabs(Rc<RefCell<HostSlot>>);
+
+impl OrphanTabs {
+    /// Views of those tabs since last asked, oldest first, each with whether
+    /// it asked to be shown.
+    pub fn take(&self) -> Vec<(WebView, bool)> {
+        let tabs = match self.0.borrow().host.as_ref() {
+            Some(h) => h.take_orphan_tabs(),
+            None => return Vec::new(),
+        };
+        tabs.iter()
+            .map(|p| (WebView::for_popup(self.0.clone(), p, false), p.kind != PopupKind::BackgroundTab))
+            .collect()
+    }
 }
 
 impl Default for WebPlugin {
@@ -1957,20 +1980,126 @@ pub(super) mod tests {
         let mut registry = crate::app_state::build_registry();
         registry.execute("web.new", &Args::new(), &mut s).unwrap();
         let opener = s.focused_surface().unwrap();
-        let pages = |s: &mut AppState| -> Vec<u64> {
-            let ids: Vec<SurfaceId> = s
-                .describe()
-                .lines()
-                .filter_map(|l| l.trim().strip_prefix("surface ")?.split(' ').next()?.parse().ok())
-                .map(SurfaceId)
-                .collect();
-            ids.into_iter().filter_map(|sid| Some(s.view_mut(sid)?.downcast_mut::<WebView>()?.page)).collect()
-        };
         wait("the second tab opens and the first closes", || {
             s.pump_all();
             pages(&mut s) == [1, b]
         });
         assert!(s.view(opener).is_some());
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// The pages of the web tabs in the workspaces, in tree order.
+    fn pages(s: &mut AppState) -> Vec<u64> {
+        let ids: Vec<SurfaceId> = s
+            .describe()
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("surface ")?.split(' ').next()?.parse().ok())
+            .map(SurfaceId)
+            .collect();
+        ids.into_iter().filter_map(|sid| Some(s.view_mut(sid)?.downcast_mut::<WebView>()?.page)).collect()
+    }
+
+    /// Page `page`'s tab (the surface whose view shows it).
+    fn tab_of(s: &mut AppState, page: u64) -> Option<SurfaceId> {
+        let ids: Vec<SurfaceId> = s
+            .describe()
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("surface ")?.split(' ').next()?.parse().ok())
+            .map(SurfaceId)
+            .collect();
+        ids.into_iter().find(|sid| s.view_mut(*sid).and_then(|v| v.downcast_mut::<WebView>()).is_some_and(|w| w.page == page))
+    }
+
+    /// Whether the host client behind surface `sid`'s web view has heard of
+    /// page `page` (without the app taking anything from it).
+    fn host_knows(s: &mut AppState, sid: SurfaceId, page: u64) -> bool {
+        let v = s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap();
+        let slot = v.slot.borrow();
+        slot.host.as_ref().is_some_and(|h| h.view(page).is_some())
+    }
+
+    /// Given a web tab (page 1) whose person's click opened a tab (A) the app
+    /// has not placed yet, and a host that reports a second person's tab (B,
+    /// in the background) from page 1 only once told to close page 1;
+    /// when the person closes page 1's tab (Close, Cmd+W);
+    /// then A and B open as tabs in that pane, A shown, and neither is closed.
+    #[test]
+    fn a_tab_a_person_opened_outlives_its_opener_closing_before_it_is_placed() {
+        let dir = crate::plugin::testing::tmpdir("web-popup-tab-orphan");
+        let log = dir.join("requests");
+        let (a, b) = (POPUP_IDS, POPUP_IDS + 1);
+        let script = format!(
+            "while read l; do echo \"$l\" >> '{}'; case \"$l\" in *'\"op\":\"close\",\"id\":1}}'*) \
+             echo '{}'; echo '{{\"ev\":\"closed\",\"id\":1}}';; esac; done",
+            log.display(),
+            popup_event_of(b, 1, true, "background_tab"),
+        );
+        stub_app_host(&dir, &[popup_event_of(a, 1, true, "tab")], &script);
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        // Nothing pumps the app until the close, so A stays unplaced.
+        wait("A reaches the app", || host_knows(&mut s, opener, a));
+        registry.execute("pane.close", &Args::new(), &mut s).unwrap();
+        assert!(s.view(opener).is_none(), "the opener closed");
+
+        wait("both tabs open", || {
+            s.pump_all();
+            pages(&mut s) == [a, b]
+        });
+        assert_eq!(s.focused_surface(), tab_of(&mut s, a), "A shows");
+        let got = requests(&log, |l| host_requests(l).contains(&HostRequest::Close { id: 1 }));
+        let got = host_requests(&got);
+        assert!(!got.iter().any(|r| matches!(r, HostRequest::Close { id } if *id != 1)), "{got:?}");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// Given a page (1) with a person's pop-up window (P) floating over it, a
+    /// person's tab (A) from P the app has not placed yet, and a host that
+    /// reports a second person's tab (B) from P only once told to close P;
+    /// when the person presses P's close button;
+    /// then A opens as a tab right after page 1's and B right after A, and
+    /// neither is closed.
+    #[test]
+    fn a_tab_opened_from_a_floating_popup_outlives_its_close_button() {
+        let dir = crate::plugin::testing::tmpdir("web-float-tab-orphan");
+        let log = dir.join("requests");
+        let (p, a, b) = (POPUP_IDS, POPUP_IDS + 1, POPUP_IDS + 2);
+        // A comes once page 1 is told to navigate (after P floats), and no
+        // pump follows to take it.
+        let script = format!(
+            "while read l; do echo \"$l\" >> '{}'; case \"$l\" in \
+             *'\"op\":\"navigate\",\"id\":1,'*) echo '{}';; \
+             *'\"op\":\"close\",\"id\":{p}}}'*) echo '{}'; echo '{{\"ev\":\"closed\",\"id\":{p}}}';; esac; done",
+            log.display(),
+            popup_event_of(a, p, true, "tab"),
+            popup_event_of(b, p, true, "tab"),
+        );
+        stub_app_host(&dir, &[popup_event(p, 1, true)], &script);
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let sid = s.focused_surface().unwrap();
+        wait("P floats", || {
+            s.pump_all();
+            !s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap().floating.is_empty()
+        });
+        registry.execute("web.navigate", &Args::new().with("url", Value::Str("example.com".into())), &mut s).unwrap();
+        wait("A reaches the app", || host_knows(&mut s, sid, a));
+        let h = Harness::new();
+        h.button(s.view_mut(sid).unwrap(), POPUP_BASE + BTN_CLOSE);
+        assert!(s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap().floating.is_empty());
+
+        wait("both tabs open", || {
+            s.pump_all();
+            pages(&mut s) == [1, a, b]
+        });
+        let got = requests(&log, |l| host_requests(l).contains(&HostRequest::Close { id: p }));
+        let got = host_requests(&got);
+        assert!(!got.iter().any(|r| matches!(r, HostRequest::Close { id } if *id != p)), "{got:?}");
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 

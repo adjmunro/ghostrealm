@@ -244,14 +244,18 @@ pub struct AppState {
     /// Hidden surfaces (pop-ups an agent opened), in `views` but in no pane,
     /// by the surface that opened each.
     hidden: HashMap<SurfaceId, HiddenOf>,
+    /// A person's web tabs whose opener went before they were placed.
+    orphan_tabs: web::OrphanTabs,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let web = web::WebPlugin::new();
+        let orphan_tabs = web.orphan_tabs();
         AppState {
             tree: Tree::new(),
             views: HashMap::new(),
-            plugins: crate::plugins::builtin(),
+            plugins: crate::plugins::builtin_with(web),
             picker: None,
             confirm: None,
             guard_unsaved: false,
@@ -276,6 +280,7 @@ impl AppState {
             files_seen: HashMap::new(),
             focus_stamp: 0,
             hidden: HashMap::new(),
+            orphan_tabs,
         }
     }
 
@@ -1592,13 +1597,35 @@ impl AppState {
                     new.extend(w.take_opened().into_iter().map(|o| (*sid, o)));
                 }
             }
-            if new.is_empty() {
+            let orphans = self.orphan_tabs.take();
+            if new.is_empty() && orphans.is_empty() {
                 break;
             }
             placed = true;
             self.place_popups(new);
+            self.place_orphan_tabs(orphans);
         }
         self.drop_closed_popups() || placed
+    }
+
+    /// Place a person's tabs whose opener (a tab, or a pop-up floating over
+    /// one) went before they were placed: in the focused pane, after its
+    /// active surface. Close and a floating pop-up's close button act in the
+    /// focused pane, so that is the opener's. With no workspace to hold them
+    /// they close.
+    fn place_orphan_tabs(&mut self, tabs: Vec<(web::WebView, bool)>) {
+        for (view, focus) in tabs {
+            let Some((vt, pane)) = self.focused_pane() else {
+                continue;
+            };
+            let tab = match self.focused_surface() {
+                Some(after) => self.tree.insert_surface_after(vt, pane, after, focus),
+                None => self.tree.add_surface(vt, pane),
+            };
+            if let Some(sid) = tab {
+                self.insert_view(sid, Box::new(view));
+            }
+        }
     }
 
     /// Place pop-ups taken from their openers' views (see
