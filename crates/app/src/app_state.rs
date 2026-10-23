@@ -1587,8 +1587,12 @@ impl AppState {
     /// surface`). Then drop hidden ones that closed or whose opener went, and
     /// close tabs whose pop-up page closed. Returns whether any came or went.
     pub fn adopt_popups(&mut self) -> bool {
-        // Place them first: a tab whose opener closed itself still goes
-        // beside it. Each placed page may have opened pop-ups of its own.
+        // What went is found before placing: the host reports a page's
+        // pop-ups before reporting it closed, so every pop-up of a page
+        // found closed here is placed below (a tab beside it) before the
+        // page goes.
+        let gone = self.closed_popups();
+        // Each placed page may have opened pop-ups of its own.
         let mut placed = false;
         loop {
             let mut new = Vec::new();
@@ -1605,7 +1609,7 @@ impl AppState {
             self.place_popups(new);
             self.place_orphan_tabs(orphans);
         }
-        self.drop_closed_popups() || placed
+        self.drop_closed_popups(gone) || placed
     }
 
     /// Place a person's tabs whose opener (a tab, or a pop-up floating over
@@ -1649,9 +1653,9 @@ impl AppState {
         }
     }
 
-    /// Drop hidden pop-ups that closed or whose opener went, and close tabs
-    /// whose pop-up page closed. Returns whether any went.
-    fn drop_closed_popups(&mut self) -> bool {
+    /// Hidden pop-ups that closed or whose opener went, and web tabs whose
+    /// page closed.
+    fn closed_popups(&self) -> (Vec<SurfaceId>, Vec<SurfaceId>) {
         let gone: Vec<SurfaceId> = self
             .hidden
             .iter()
@@ -1669,6 +1673,14 @@ impl AppState {
             })
             .map(|(sid, _)| *sid)
             .collect();
+        (gone, closed_tabs)
+    }
+
+    /// Drop the hidden pop-ups and close the tabs [`closed_popups`] found.
+    /// Returns whether any went.
+    ///
+    /// [`closed_popups`]: Self::closed_popups
+    fn drop_closed_popups(&mut self, (gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
         let changed = !gone.is_empty() || !closed_tabs.is_empty();
         for p in gone {
             self.hidden.remove(&p);

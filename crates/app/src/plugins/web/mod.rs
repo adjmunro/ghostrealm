@@ -507,8 +507,8 @@ pub struct WebView {
     /// click count.
     pressed: Option<(PageButton, u32)>,
     hovering: bool,
-    /// The page was made by the host (a pop-up): it is never created again
-    /// (it goes with the host), and it goes when the host closes it.
+    /// The page was made by the host (a pop-up): it is never created again,
+    /// so it goes with the host.
     host_made: bool,
     /// Its header has a close button instead of navigation (a floating or
     /// hidden pop-up).
@@ -603,18 +603,16 @@ impl WebView {
         v
     }
 
-    /// The page is gone: a pop-up closed (by itself, its close button, or
-    /// its host exiting). A page the app creates is never gone: it is made
-    /// again.
+    /// The page is gone: it closed itself, or a pop-up closed (by its close
+    /// button or its host exiting). A page the app creates outlives its
+    /// host: it is made again in the next.
     pub fn is_closed(&self) -> bool {
-        if !self.host_made {
-            return false;
-        }
-        if self.dismissed {
-            return true;
-        }
         let slot = self.slot.borrow();
-        slot.generation != self.created_in || slot.host.as_ref().is_none_or(|h| h.is_closed(self.page))
+        let current = slot.generation == self.created_in;
+        if !self.host_made {
+            return current && slot.host.as_ref().is_some_and(|h| h.is_closed(self.page));
+        }
+        self.dismissed || !current || slot.host.as_ref().is_none_or(|h| h.is_closed(self.page))
     }
 
     /// Take the pop-ups the page opened from the host: a person's pop-up
@@ -2100,6 +2098,35 @@ pub(super) mod tests {
         let got = requests(&log, |l| host_requests(l).contains(&HostRequest::Close { id: p }));
         let got = host_requests(&got);
         assert!(!got.iter().any(|r| matches!(r, HostRequest::Close { id } if *id != p)), "{got:?}");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// Given a web tab the app created (page 1) and a host where, told to
+    /// navigate, page 1 opens a person's tab (A) and then closes itself;
+    /// when the page is navigated;
+    /// then A opens as a tab and page 1's tab closes.
+    #[test]
+    fn a_tab_whose_page_closes_itself_closes_once_its_tabs_are_placed() {
+        let dir = crate::plugin::testing::tmpdir("web-app-page-closes");
+        let a = POPUP_IDS;
+        let script = format!(
+            "while read l; do case \"$l\" in *'\"op\":\"navigate\"'*) \
+             echo '{}'; echo '{{\"ev\":\"closed\",\"id\":1}}';; esac; done",
+            popup_event_of(a, 1, true, "tab"),
+        );
+        let title = r#"{"ev":"title","id":1,"title":"Page"}"#.to_string();
+        stub_app_host(&dir, &[title], &script);
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        registry.execute("web.navigate", &Args::new().with("url", Value::Str("example.com".into())), &mut s).unwrap();
+        wait("A opens and page 1's tab closes", || {
+            s.pump_all();
+            pages(&mut s) == [a]
+        });
+        assert!(s.view(opener).is_none());
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
