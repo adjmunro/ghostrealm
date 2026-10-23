@@ -1319,19 +1319,6 @@
 
 ---
 
-[2026-10-23T21:57+1300@d61f281a] Editor — heading caret test can race its diagnostics
-
-- Requires: NO BLOCKERS
-- Detail: `plugins::editor::tests::caret_selection_and_diagnostics_on_a_heading_measure_its_cells`
-  failed once in a full run (underline assert), never in 40+ reruns on
-  `fix/web-popup-edge-cases` or `ebebcfd`. Its `settle` returns on the first
-  `refresh()` that reports a change, which need not be the diagnostics, so
-  the underline can be missing when asserted. Settle until the diagnostics
-  arrive.
-- Reason: a flaky test hides real failures.
-
----
-
 [2026-10-23T22:46+1300@0fd87271] Web — a host test's host can fail to start
 
 - Requires: NO BLOCKERS

@@ -2167,10 +2167,14 @@ mod tests {
         v
     }
 
-    /// Wait for the language service to post something.
+    /// Wait for the language service's next post: after attaching, the
+    /// diagnostics; after a dwell, the docs. Only the service is polled,
+    /// because the view's other background work (a file's `HEAD` fetch) can
+    /// land first and would end the wait with the service's answer still out.
     fn settle(v: &mut EditorView) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !v.refresh() {
+        let lang = v.lang.as_mut().expect("a language service is attached");
+        while !lang.refresh(&v.buf.lines) {
             assert!(Instant::now() < deadline, "the language service never answered");
             std::thread::sleep(Duration::from_millis(2));
         }
