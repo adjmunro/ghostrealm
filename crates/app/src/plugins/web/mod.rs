@@ -2236,9 +2236,10 @@ pub(super) mod tests {
         [mac, linux].into_iter().find(|p| p.is_file())
     }
 
-    /// A local HTTP server: `/opener` opens `/popup` on a click and logs the
-    /// messages it gets in `data-got`; `/popup` posts to its opener and closes
-    /// itself a second later; `/stay` is a page.
+    /// A local HTTP server: `/opener` opens `/popup` on a click, counting its
+    /// clicks in `data-clicks`, and logs the messages it gets in `data-got`;
+    /// `/popup` posts to its opener and closes itself a second later; `/stay`
+    /// is a page.
     fn serve() -> String {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2253,7 +2254,8 @@ pub(super) mod tests {
                 let body = match line.split(' ').nth(1).unwrap_or("/") {
                     "/opener" => "<title>Opener</title><body style='margin:0'><button \
                         style='position:fixed;inset:0;border:0;background:rgb(255,0,0)' \
-                        onclick=\"window.open('/popup', 'p', 'width=200,height=100')\">open</button>\
+                        onclick=\"document.body.dataset.clicks = +(document.body.dataset.clicks || 0) + 1; \
+                        window.open('/popup', 'p', 'width=200,height=100')\">open</button>\
                         <script>addEventListener('message', e => document.body.dataset.got = \
                         (document.body.dataset.got || '') + e.data + ';')</script>",
                     "/popup" => "<title>Popup</title><script>window.opener.postMessage('from the popup', '*'); \
@@ -2279,9 +2281,12 @@ pub(super) mod tests {
         }
     }
 
-    /// End to end with the real host (skipped when it isn't built): a click's
-    /// pop-up floats and goes when it closes itself; an eval's is a hidden
-    /// surface the agent drives. Both talk to their opener.
+    /// End to end with the real host (skipped when it isn't built).
+    /// Given a page that opens a pop-up window on a click;
+    /// when a person clicks it, and an agent's gesture eval opens a page;
+    /// then the click's pop-up floats with the keyboard and goes when it
+    /// closes itself, and the eval's is a hidden surface the agent drives and
+    /// closes; both talk to their opener.
     #[test]
     fn popups_with_the_real_host() {
         let Some(exe) = real_host() else {
@@ -2307,12 +2312,17 @@ pub(super) mod tests {
                 .unwrap_or(false)
         });
         // A page that has just painted may not hit-test input yet: click
-        // again if nothing opens within 2 s.
+        // again if the page heard no click within 2 s. A click it heard
+        // opens a pop-up, however slowly, so it is not repeated.
         let at = (v.body.x + 10.0, v.body.y + 10.0);
         let mut clicks = 0;
         let mut clicked = Instant::now() - Duration::from_secs(2);
         wait("the pop-up floats", || {
-            if v.floating.is_empty() && clicked.elapsed() >= Duration::from_secs(2) && clicks < 5 {
+            if v.floating.is_empty()
+                && clicked.elapsed() >= Duration::from_secs(2)
+                && clicks < 5
+                && v.eval("document.body.dataset.clicks || ''", false) == Ok("\"\"".into())
+            {
                 clicks += 1;
                 clicked = Instant::now();
                 h.mouse(&mut v, MouseEvent::Move { pos: at });
@@ -2329,7 +2339,11 @@ pub(super) mod tests {
             v.floating.is_empty()
         });
         assert!(!v.float_keys);
-        assert_eq!(v.eval("document.body.dataset.got", false), Ok("\"from the popup;\"".into()));
+        // A click still on its way when the page was asked can make a second
+        // pop-up (or load the first again): each posts the same message.
+        let got = v.eval("document.body.dataset.got", false).unwrap();
+        let posts: Vec<&str> = got.trim_matches('"').split_terminator(';').collect();
+        assert!(!posts.is_empty() && posts.iter().all(|m| *m == "from the popup"), "{got}");
         drop(v);
         drop(plugin);
 
