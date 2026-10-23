@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Ids at or above this are pages the host made for pop-ups ([`Event::Popup`]);
 /// the app numbers the pages it creates below it.
