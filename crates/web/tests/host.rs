@@ -394,19 +394,30 @@ fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
 }
 
 /// Click page `id` near its top-left until it opens a pop-up. A page that
-/// has just painted may not hit-test input yet, so a click can go unheard.
+/// has just painted may not hit-test input yet, so a click can go unheard;
+/// if an earlier click was only slow, the extra pop-up it opens is closed.
 fn click_for_popup(host: &WebHost, id: u64) -> ghostrealm_web::PopupInfo {
     let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
-    for _ in 0..5 {
+    for clicks in 1..=5 {
         click(MouseAction::Move);
         click(MouseAction::Down { button: MouseButton::Left, count: 1 });
         click(MouseAction::Up { button: MouseButton::Left, count: 1 });
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if let Some(p) = host.take_popups(id).pop() {
-                return p;
+            let mut got = host.take_popups(id);
+            if got.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let first = got.remove(0);
+            if clicks > 1 {
+                std::thread::sleep(Duration::from_millis(500));
+                got.extend(host.take_popups(id));
+            }
+            for extra in got {
+                host.send(&Request::Close { id: extra.id });
+            }
+            return first;
         }
     }
     panic!("no click on page {id} opened a pop-up");

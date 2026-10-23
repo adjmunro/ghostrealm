@@ -1829,10 +1829,15 @@ pub(super) mod tests {
             h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: left });
             h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: left });
         }
-        let got = requests(&log, |s| host_requests(s).iter().filter(|r| **r == focus(POPUP_IDS, true)).count() == 2);
+        // A press sends its focus change before its mouse down: wait for the
+        // pop-up's down, the last request.
+        let pressed = |got: &[HostRequest], id| {
+            got.iter().any(|r| matches!(r, HostRequest::Mouse { id: i, action: MouseAction::Down { .. }, .. } if *i == id))
+        };
+        let got = requests(&log, |s| pressed(&host_requests(s), POPUP_IDS));
         let got = host_requests(&got);
-        let pressed = |id| got.iter().any(|r| matches!(r, HostRequest::Mouse { id: i, action: MouseAction::Down { .. }, .. } if *i == id));
-        assert!(pressed(1) && pressed(POPUP_IDS), "each press reached its own page: {got:?}");
+        assert!(pressed(&got, 1), "each press reached its own page: {got:?}");
+        assert_eq!(got.iter().filter(|r| **r == focus(POPUP_IDS, true)).count(), 2, "{got:?}");
         assert!(got.contains(&focus(1, true)));
 
         // Its close button closes it and gives the page the keyboard back.
@@ -2144,11 +2149,19 @@ pub(super) mod tests {
             v.with_host(|h, id| h.frame(id).and_then(|f| f.read()).is_some_and(|px| px[..3] == [0, 0, 255]))
                 .unwrap_or(false)
         });
+        // A page that has just painted may not hit-test input yet: click
+        // again if nothing opens within 2 s.
         let at = (v.body.x + 10.0, v.body.y + 10.0);
-        h.mouse(&mut v, MouseEvent::Move { pos: at });
-        h.mouse(&mut v, MouseEvent::Down { pos: at, clicks: 1, button: MouseButton::Left });
-        h.mouse(&mut v, MouseEvent::Up { pos: at, dragged: false, button: MouseButton::Left });
+        let mut clicks = 0;
+        let mut clicked = Instant::now() - Duration::from_secs(2);
         wait("the pop-up floats", || {
+            if v.floating.is_empty() && clicked.elapsed() >= Duration::from_secs(2) && clicks < 5 {
+                clicks += 1;
+                clicked = Instant::now();
+                h.mouse(&mut v, MouseEvent::Move { pos: at });
+                h.mouse(&mut v, MouseEvent::Down { pos: at, clicks: 1, button: MouseButton::Left });
+                h.mouse(&mut v, MouseEvent::Up { pos: at, dragged: false, button: MouseButton::Left });
+            }
             h.paint(&mut v, RECT);
             !v.floating.is_empty()
         });
