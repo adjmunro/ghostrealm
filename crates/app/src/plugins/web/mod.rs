@@ -637,11 +637,6 @@ impl WebView {
         changed
     }
 
-    /// Keep this pop-up's page when its opener closes: it is a tab now.
-    pub fn detach(&mut self) {
-        self.send(Some(HostRequest::Detach { id: self.page }));
-    }
-
     /// The pop-ups this page (or a pop-up floating over it) opened as tabs or
     /// hidden surfaces since last asked, for the app to place.
     pub fn take_opened(&mut self) -> Vec<Opened> {

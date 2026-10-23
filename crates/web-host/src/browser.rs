@@ -70,6 +70,9 @@ struct PendingPopup {
     /// CEF's id for it, which `on_before_popup_aborted` names.
     cef_id: c_int,
     queued: Vec<Request>,
+    /// A person's new tab or window: it outlives its opener and doesn't
+    /// count toward its pop-ups.
+    tab: bool,
 }
 
 /// How a browser's DevTools session stands for evals.
@@ -587,9 +590,6 @@ pub fn handle(req: Option<Request>) {
             }),
         },
         Request::Eval { id, req, js, gesture } => start_eval(id, req, js, gesture),
-        Request::Detach { id } => {
-            BROWSERS.with_borrow_mut(|m| m.get_mut(&id).map(|e| e.opener = None));
-        }
     }
 }
 
@@ -609,7 +609,6 @@ fn req_page(req: &Request) -> u64 {
         | Request::Key { id, .. }
         | Request::Edit { id, .. }
         | Request::Text { id, .. }
-        | Request::Detach { id }
         | Request::Eval { id, .. } => *id,
     }
 }
@@ -714,17 +713,20 @@ fn open_popup(
     else {
         return false;
     };
+    let from_input = BROWSERS.with_borrow(|m| {
+        m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
+    });
+    // The app shows a person's new tab or window as a tab of its own, as a
+    // browser does: it outlives its opener.
+    let tab = from_input && kind != PopupKind::Popup;
     let open = BROWSERS.with_borrow(|m| m.values().filter(|e| e.opener == Some(opener)).count())
-        + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener).count());
-    if open >= MAX_POPUPS {
+        + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener && !p.tab).count());
+    if !tab && open >= MAX_POPUPS {
         emit(&Event::PopupRefused { opener, url });
         return false;
     }
     let id = NEXT_POPUP.get();
     NEXT_POPUP.set(id + 1);
-    let from_input = BROWSERS.with_borrow(|m| {
-        m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
-    });
     let (width, height, scale) = {
         let p = parent.borrow();
         // What the page asked for, no larger than its opener: a huge size
@@ -746,7 +748,7 @@ fn open_popup(
     *client = Some(new_client(id, &view));
     *settings = browser_settings();
     PENDING.with_borrow_mut(|m| {
-        m.insert(id, PendingPopup { view, opener, cef_id, queued: Vec::new() })
+        m.insert(id, PendingPopup { view, opener, cef_id, queued: Vec::new(), tab })
     });
     emit(&Event::Popup { id, opener, url, from_input, kind, width: width.max(1), height: height.max(1) });
     true
@@ -774,12 +776,12 @@ fn popup_created(id: u64, b: &Browser) {
         view: p.view,
         _devtools: devtools,
         eval: EvalState::default(),
-        opener: Some(p.opener),
+        opener: (!p.tab).then_some(p.opener),
         input_at: None,
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
     // Its opener closed meanwhile, or the host is quitting.
-    if browser(p.opener).is_none() || QUITTING.get() {
+    if (!p.tab && browser(p.opener).is_none()) || QUITTING.get() {
         if let Some(h) = &host {
             h.close_browser(1);
         }
@@ -813,7 +815,7 @@ fn close_popups(id: u64) {
         h.close_browser(1);
     }
     let pending: Vec<(u64, PendingPopup)> = PENDING.with_borrow_mut(|m| {
-        let ids: Vec<u64> = m.iter().filter(|(_, p)| p.opener == id).map(|(k, _)| *k).collect();
+        let ids: Vec<u64> = m.iter().filter(|(_, p)| p.opener == id && !p.tab).map(|(k, _)| *k).collect();
         ids.into_iter().filter_map(|k| m.remove(&k).map(|p| (k, p))).collect()
     });
     for (popup, p) in pending {

@@ -152,11 +152,6 @@ pub enum Request {
         id: u64,
         action: EditAction,
     },
-    /// Pop-up `id` no longer closes with its opener (the app shows it as a
-    /// tab of its own).
-    Detach {
-        id: u64,
-    },
     /// Ask for the main frame's visible text; answered by [`Event::Text`].
     Text {
         id: u64,
@@ -287,7 +282,8 @@ pub enum Event {
         url: String,
         /// A `Mouse` press or a `Key` reached the opener within the last 5 s
         /// (as long as Chromium's user activation lasts), so it answers that
-        /// input. Otherwise the activation that opened it came from a
+        /// input (and a pop-up of any `kind` but `Popup` then outlives its
+        /// opener, as a tab does). Otherwise the activation that opened it came from a
         /// gesture eval: the eval opened it, or the page's own script did
         /// with that eval's activation.
         from_input: bool,

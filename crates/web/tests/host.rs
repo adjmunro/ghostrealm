@@ -494,10 +494,9 @@ fn a_popup_says_how_the_page_asked_for_it() {
     let q = wait_popups(&host, 1, 1).remove(0);
     assert_eq!((q.kind, q.width, q.height), (PopupKind::Popup, 100, 100), "no larger than its opener");
 
-    // A detached pop-up outlives its opener; the others close with it.
-    assert!(host.send(&Request::Detach { id: tab.id }));
+    // A tab a person opened outlives its opener; a pop-up window closes with it.
     assert!(host.send(&Request::Close { id: 1 }));
-    wait_closed(&host, p[0].id);
+    wait_closed(&host, q.id);
     std::thread::sleep(Duration::from_millis(300));
     assert!(!host.is_closed(tab.id));
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)));

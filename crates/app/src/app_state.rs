@@ -1621,11 +1621,7 @@ impl AppState {
                 _ => None,
             };
             match tab {
-                Some(sid) => {
-                    let mut view = o.view;
-                    view.detach();
-                    self.insert_view(sid, Box::new(view));
-                }
+                Some(sid) => self.insert_view(sid, Box::new(o.view)),
                 None => {
                     let sid = self.tree.detached_surface_id();
                     self.views.insert(sid, Box::new(o.view));
