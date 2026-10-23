@@ -1303,11 +1303,23 @@
 
 ---
 
-[2026-10-23T09:43+1300@5a747143] Web — Shift- and Cmd-clicked links
+[2026-10-23T09:43+1300@5a747143] Web — Shift-, Cmd-, and middle-clicked links
 
 - Requires: NO BLOCKERS
-- Detail: A link clicked with Shift (new window) or Cmd/Ctrl (background
-  tab) loads in place: CEF sends it to `OnOpenURLFromTab`, not
-  `OnBeforePopup` (checked in the host). Open it as a tab beside its
-  opener like a `target=_blank` link (background for Cmd/Ctrl).
+- Detail: A link clicked with Shift (new window), Cmd/Ctrl, or the middle
+  button (background tab) loads in place: CEF sends it to
+  `OnOpenURLFromTab`, not `OnBeforePopup` (Shift and Cmd checked in the
+  host). Open it as a tab beside its opener like a `target=_blank` link
+  (in the background for Cmd/Ctrl and middle).
 - Reason: browsers open these in a new tab or window.
+
+---
+
+[2026-10-23T09:43+1300@5a747143] Web — say when a pop-up is refused
+
+- Requires: NO BLOCKERS
+- Detail: Past four open pop-ups a page's next is refused (DECISION.md, Web
+  surface / pop-ups). An agent reads the count in `get surface`; a person
+  sees nothing happen. Show a brief note in the pane; nothing in the app
+  shows transient messages yet.
+- Reason: a click that does nothing looks broken.

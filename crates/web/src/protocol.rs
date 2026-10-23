@@ -183,9 +183,10 @@ pub enum PopupKind {
     /// A new foreground tab: a `target=_blank` link, `window.open` with no
     /// features.
     Tab,
-    /// A new background tab (a Cmd- or middle-click on a link).
+    /// A new background tab. Modifier- and middle-clicked links never come
+    /// here: CEF loads them in place (`OnOpenURLFromTab`).
     BackgroundTab,
-    /// A new window (a Shift-click on a link).
+    /// A new window (as for `BackgroundTab`, not from a Shift-click).
     Window,
 }
 
