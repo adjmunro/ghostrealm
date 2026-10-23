@@ -190,6 +190,7 @@ impl WebHost {
         let stdout = child.stdout.take().context("web host stdout")?;
         let shared: Arc<(Mutex<Shared>, Condvar)> = Arc::default();
         let reader_shared = shared.clone();
+        let outbox: Arc<(Mutex<Outbox>, Condvar)> = Arc::default();
         std::thread::Builder::new()
             .name("web-host-events".into())
             .spawn(move || {
@@ -211,7 +212,6 @@ impl WebHost {
                 }
             })
             .context("spawn web host reader")?;
-        let outbox: Arc<(Mutex<Outbox>, Condvar)> = Arc::default();
         let writer_outbox = outbox.clone();
         std::thread::Builder::new()
             .name("web-host-requests".into())
@@ -231,32 +231,7 @@ impl WebHost {
     /// has gone away, or isn't reading and the queue is full (a dropped mouse
     /// move or wheel step still returns true).
     pub fn send(&self, req: &Request) -> bool {
-        let (lock, cv) = &*self.outbox;
-        let mut o = lock.lock().unwrap();
-        if o.broken || o.closed {
-            return false;
-        }
-        let (moving, lossy) = match req {
-            Request::Mouse { id, action, .. } => (
-                (*action == MouseAction::Move).then_some(*id),
-                matches!(action, MouseAction::Move | MouseAction::Wheel { .. }),
-            ),
-            _ => (None, false),
-        };
-        if let (Some(id), Some(Request::Mouse { id: last, action: MouseAction::Move, .. })) =
-            (moving, o.queue.back())
-        {
-            if *last == id {
-                *o.queue.back_mut().expect("checked") = req.clone();
-                return true;
-            }
-        }
-        if o.queue.len() >= OUTBOX_MAX {
-            return lossy;
-        }
-        o.queue.push_back(req.clone());
-        cv.notify_one();
-        true
+        enqueue(&self.outbox, req)
     }
 
     /// Whether the host process is still running.
@@ -474,6 +449,36 @@ impl Drop for WebHost {
                 let _ = child.wait();
             });
     }
+}
+
+/// Queue `req` for the writer thread (see [`WebHost::send`]).
+fn enqueue(outbox: &(Mutex<Outbox>, Condvar), req: &Request) -> bool {
+    let (lock, cv) = outbox;
+    let mut o = lock.lock().unwrap();
+    if o.broken || o.closed {
+        return false;
+    }
+    let (moving, lossy) = match req {
+        Request::Mouse { id, action, .. } => (
+            (*action == MouseAction::Move).then_some(*id),
+            matches!(action, MouseAction::Move | MouseAction::Wheel { .. }),
+        ),
+        _ => (None, false),
+    };
+    if let (Some(id), Some(Request::Mouse { id: last, action: MouseAction::Move, .. })) =
+        (moving, o.queue.back())
+    {
+        if *last == id {
+            *o.queue.back_mut().expect("checked") = req.clone();
+            return true;
+        }
+    }
+    if o.queue.len() >= OUTBOX_MAX {
+        return lossy;
+    }
+    o.queue.push_back(req.clone());
+    cv.notify_one();
+    true
 }
 
 /// The writer thread: write queued requests to the host's stdin until the app
