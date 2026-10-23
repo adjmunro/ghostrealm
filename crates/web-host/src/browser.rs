@@ -760,6 +760,12 @@ fn open_popup(
 /// and run the requests that waited for it.
 fn popup_created(id: u64, b: &Browser) {
     let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&id)) else {
+        // Its opener closed before it was made (and it was reported closed).
+        if id >= POPUP_IDS && browser(id).is_none() {
+            if let Some(h) = b.host() {
+                h.close_browser(1);
+            }
+        }
         return;
     };
     let host = b.host();
@@ -801,12 +807,30 @@ fn popup_aborted(opener: u64, cef_id: c_int) {
 }
 
 /// Close the pop-ups page `id` opened (it is closing).
+/// Pop-ups not yet made are dropped here, as CEF may not report them
+/// aborted: they are reported closed and the requests waiting on them fail.
 fn close_popups(id: u64) {
     let hosts: Vec<BrowserHost> = BROWSERS.with_borrow(|m| {
         m.values().filter(|e| e.opener == Some(id)).filter_map(|e| e.browser.host()).collect()
     });
     for h in hosts {
         h.close_browser(1);
+    }
+    let pending: Vec<(u64, PendingPopup)> = PENDING.with_borrow_mut(|m| {
+        let ids: Vec<u64> = m.iter().filter(|(_, p)| p.opener == id).map(|(k, _)| *k).collect();
+        ids.into_iter().filter_map(|k| m.remove(&k).map(|p| (k, p))).collect()
+    });
+    for (popup, p) in pending {
+        for req in p.queued {
+            match req {
+                Request::Eval { req, .. } => {
+                    emit(&Event::EvalResult { id: popup, req, ok: false, value: "the page closed".into() })
+                }
+                Request::Text { req, .. } => emit(&Event::Text { id: popup, req, text: String::new() }),
+                _ => {}
+            }
+        }
+        emit(&Event::Closed { id: popup });
     }
 }
 
