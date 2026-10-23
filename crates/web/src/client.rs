@@ -140,6 +140,9 @@ struct Shared {
     popups: Vec<PopupInfo>,
     /// Pages the host closed and the app hasn't forgotten.
     closed: std::collections::HashSet<u64>,
+    /// Pages the app forgot, until the host reports them closed: their late
+    /// events are dropped rather than bring their state back.
+    forgotten: std::collections::HashSet<u64>,
 }
 
 /// Requests waiting for the writer thread, so a host that stops reading never
@@ -298,7 +301,9 @@ impl WebHost {
     pub fn forget(&mut self, id: u64) {
         let mut s = self.shared.0.lock().unwrap();
         s.views.remove(&id);
-        s.closed.remove(&id);
+        if !s.closed.remove(&id) {
+            s.forgotten.insert(id);
+        }
         s.popups.retain(|p| p.id != id);
         drop_popups_of(&mut s, id);
         drop(s);
@@ -503,6 +508,17 @@ fn write_requests(mut stdin: ChildStdin, outbox: &(Mutex<Outbox>, Condvar)) {
 fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
     let (lock, cv) = shared;
     let mut s = lock.lock().unwrap();
+    let late = match &ev {
+        Event::Closed { id } if s.forgotten.remove(id) => {
+            drop_popups_of(&mut s, *id);
+            true
+        }
+        Event::Popup { opener, .. } => s.forgotten.contains(opener),
+        ev => page_of(ev).is_some_and(|id| s.forgotten.contains(&id)),
+    };
+    if late {
+        return;
+    }
     if let Some(id) = page_of(&ev) {
         s.views.entry(id).or_default().version += 1;
     }
@@ -746,6 +762,24 @@ mod tests {
         let s = shared.0.lock().unwrap();
         assert!(s.popups.is_empty(), "nobody takes its opener's pop-ups now");
         assert_eq!(s.closed.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn a_forgotten_page_stays_forgotten() {
+        let mut host = WebHost {
+            child: None,
+            outbox: Arc::default(),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+        };
+        apply_event(&host.shared, Event::Title { id: 1, title: "t".into() });
+        host.forget(1);
+        apply_event(&host.shared, Event::Title { id: 1, title: "late".into() });
+        assert!(host.view(1).is_none(), "late events don't bring it back");
+        apply_event(&host.shared, Event::Closed { id: 1 });
+        let s = host.shared.0.lock().unwrap();
+        assert!(s.closed.is_empty() && s.forgotten.is_empty(), "nothing kept for it");
     }
 
     #[test]
