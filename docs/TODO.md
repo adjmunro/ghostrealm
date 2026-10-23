@@ -1303,7 +1303,7 @@
 
 ---
 
-[2026-10-23T09:43+1300@5a747143] Web — Shift-, Cmd-, and middle-clicked links
+[2026-10-24@48bff23e] Web — Shift-, Cmd-, and middle-clicked links
 
 - Requires: NO BLOCKERS
 - Detail: A link clicked with Shift (new window), Cmd/Ctrl, or the middle
@@ -1338,3 +1338,22 @@
   Tell the two apart by the source of the activation, not by timing.
 - Reason: agent activity must stay in the background.
 
+---
+
+[2026-10-24@48bff23e] Web — pop-up edge cases left open
+
+- Requires: NO BLOCKERS
+- Detail: A person's new tab is closed, not kept, when its opener is closed
+  (Cmd+W, or a floating pop-up's close button) before the app adopts the tab
+  or before its `Popup` event arrives (a few ms). DECISION.md says such a tab
+  outlives its opener. Adopt it as a tab instead (`client.rs` `forget` and
+  the late-`Popup` branch; `web/mod.rs` `drop_closed_floating`).
+- Detail: A page the app created that closes itself stays as a dead tab
+  (empty title; evals answer "unknown browser"): `WebView::is_closed` is
+  false while `!host_made`. Remove the tab once its pop-ups are placed.
+- Detail: Tests: `popups_with_the_real_host` re-clicks after 2 s without
+  closing an extra pop-up, so a slow first click fails its `dataset.got`
+  assertion; `crates/web/tests/host.rs` hard-codes `POPUP_IDS + 1` for its
+  second case, which can wait on an extra pop-up's id and pass without
+  testing the forgotten-opener close.
+- Reason: found in review; none leaves a host browser running.

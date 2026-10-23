@@ -141,8 +141,9 @@ struct Shared {
     popups: Vec<PopupInfo>,
     /// Pages the host closed and the app hasn't forgotten.
     closed: std::collections::HashSet<u64>,
-    /// Pages the app forgot, until the host reports them closed: their late
-    /// events are dropped rather than bring their state back.
+    /// Pages the app forgot, and untaken pop-ups the client closed, until the
+    /// host reports them closed: their late events are dropped rather than
+    /// bring their state back.
     forgotten: std::collections::HashSet<u64>,
 }
 
@@ -591,7 +592,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
             s.popups.push(PopupInfo { id, opener, url, from_input, kind, width, height });
         }
         Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
-        // The app still holds the page (it closed itself): its view takes
+        // A page that closed itself may still have a view: that view takes
         // the pop-ups it opened (a tab can outlive it).
         Event::Closed { id } => {
             let known = s.views.remove(&id).is_some() || s.popups.iter().any(|p| p.id == id);
