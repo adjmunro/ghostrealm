@@ -59,10 +59,11 @@ should be too. The API lives in
   window).
 - **Hidden surfaces**: a surface in `AppState::views` but in no pane: never
   painted, shown, or focused, still reached by commands and `get surface`
-  by id, listed last by `get tree`. A web pop-up an agent's eval opened is
-  one (`AppState::adopt_popups` takes them from `WebView::take_spawned`
-  each pump); it goes when its page closes or its opener's surface does.
-  A pop-up a person opened floats over its opener's page instead
+  by id, listed last by `get tree`. A web pop-up an agent opened is one;
+  it goes when its page closes or its opener's surface does. Each pump
+  `AppState::adopt_popups` places what `WebView::take_opened` returns:
+  hidden surfaces, and a person's new tabs (right after the opener's tab).
+  A pop-up window a person opened floats over its opener's page instead
   (`WebView` draws it `above` and routes the input over it to it).
 - **Documents**: a view may host several files, each a `View` of its own
   (file tabs inside one surface). `docs()` lists their `DocId`s (default

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::host_exe;
 use ghostrealm_web::protocol::mods;
-use ghostrealm_web::{MouseAction, MouseButton, Request, WebHost};
+use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
 /// A ready host on its own profile `ghostrealm-web-<tag>-<pid>` (removed by the
 /// caller), or `None` when the host isn't built.
@@ -355,6 +355,7 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
                              location.pathname, '*'); window.close();</script>"
                     .to_string(),
                 "/stay" => "<title>Stay</title><p>stay text</p>".to_string(),
+                "/blank" => LINK.replace("LINK", "target=_blank href=/stay"),
                 _ => {
                     if path.starts_with("/hit") {
                         seen.lock().unwrap().push(path);
@@ -378,6 +379,9 @@ const OPENER: &str = "<title>Opener</title><body style='margin:0'>\
 onclick=\"window.open('/popup', 'p', 'width=300,height=200')\">open</button><script>\
 addEventListener('message', e => { document.body.dataset.got = \
 (document.body.dataset.got || '') + e.data + (e.source ? '' : ' (no source)') + ';'; });</script>";
+
+/// A red link over the whole page.
+const LINK: &str = "<body style='margin:0'><a LINK style='position:fixed;inset:0;background:rgb(255,0,0)'>x</a>";
 
 /// Wait for page `id`'s first painted frame whose top-left pixel is `bgr`.
 fn wait_painted(host: &mut WebHost, id: u64, bgr: [u8; 3]) {
@@ -437,6 +441,7 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
     let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
     assert!(p.id >= ghostrealm_web::protocol::POPUP_IDS, "{p:?}");
     assert!(p.from_input, "a click opened it");
+    assert_eq!(p.kind, PopupKind::Popup, "window.open with a size");
     assert!(p.url.ends_with("/popup"), "{p:?}");
     assert_eq!((p.width, p.height), (600, 400), "the size it asked for, in physical pixels");
 
@@ -445,6 +450,43 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
     let got = wait_got(&host, 1, "from /popup");
     assert_eq!(got, "\"from /popup;\"");
     assert!(!host.is_closed(1), "the opener stays");
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn a_popup_says_how_the_page_asked_for_it() {
+    let Some((mut host, cache)) = spawn("popup-kind") else {
+        return;
+    };
+    let (base, _) = serve();
+    let mut id = 0;
+    let mut click_on = |host: &mut WebHost, path: &str| {
+        id += 1;
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+        let click = |action| assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
+        click(MouseAction::Move);
+        click(MouseAction::Down { button: MouseButton::Left, count: 1 });
+        click(MouseAction::Up { button: MouseButton::Left, count: 1 });
+        wait_popups(host, id, 1).remove(0)
+    };
+    let tab = click_on(&mut host, "/blank");
+    assert_eq!(tab.kind, PopupKind::Tab, "target=_blank");
+    assert_eq!(host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)), Ok("true".into()));
+    let p = wait_popups(&host, 1, 1);
+    assert_eq!(p[0].kind, PopupKind::Tab, "window.open with no features");
+
+    // A detached pop-up outlives its opener; the others close with it.
+    assert!(host.send(&Request::Detach { id: tab.id }));
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, p[0].id);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!host.is_closed(tab.id));
+    assert!(host.wait_loaded(tab.id, Duration::from_secs(20)));
+    assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
-    eval_wrapper, Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, Request,
+    eval_wrapper, Cursor, EditAction, Event, Key, KeyKind, PopupKind, MouseAction, MouseButton, Request,
     MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS,
 };
 use serde_json::{json, Value};
@@ -586,6 +586,9 @@ pub fn handle(req: Option<Request>) {
             }),
         },
         Request::Eval { id, req, js, gesture } => start_eval(id, req, js, gesture),
+        Request::Detach { id } => {
+            BROWSERS.with_borrow_mut(|m| m.get_mut(&id).map(|e| e.opener = None));
+        }
     }
 }
 
@@ -610,6 +613,7 @@ fn req_page(req: &Request) -> u64 {
         | Request::Key { id, .. }
         | Request::Edit { id, .. }
         | Request::Text { id, .. }
+        | Request::Detach { id }
         | Request::Eval { id, .. } => *id,
     }
 }
@@ -703,6 +707,7 @@ fn open_popup(
     opener: u64,
     cef_id: c_int,
     url: String,
+    kind: PopupKind,
     features: Option<&PopupFeatures>,
     window_info: Option<&mut WindowInfo>,
     client: Option<&mut Option<Client>>,
@@ -745,7 +750,7 @@ fn open_popup(
     PENDING.with_borrow_mut(|m| {
         m.insert(id, PendingPopup { view, opener, cef_id, queued: Vec::new() })
     });
-    emit(&Event::Popup { id, opener, url, from_input, width: width.max(1), height: height.max(1) });
+    emit(&Event::Popup { id, opener, url, from_input, kind, width: width.max(1), height: height.max(1) });
     true
 }
 
@@ -1116,7 +1121,7 @@ wrap_life_span_handler! {
             popup_id: c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
-            _target_disposition: WindowOpenDisposition,
+            target_disposition: WindowOpenDisposition,
             _user_gesture: c_int,
             popup_features: Option<&PopupFeatures>,
             window_info: Option<&mut WindowInfo>,
@@ -1126,7 +1131,13 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut c_int>,
         ) -> c_int {
             let url = string(target_url);
-            let made = open_popup(self.id, popup_id, url, popup_features, window_info, client, settings);
+            let kind = match target_disposition {
+                WindowOpenDisposition::NEW_POPUP => PopupKind::Popup,
+                WindowOpenDisposition::NEW_BACKGROUND_TAB => PopupKind::BackgroundTab,
+                WindowOpenDisposition::NEW_WINDOW => PopupKind::Window,
+                _ => PopupKind::Tab,
+            };
+            let made = open_popup(self.id, popup_id, url, kind, popup_features, window_info, client, settings);
             (!made) as c_int
         }
 

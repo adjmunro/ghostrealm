@@ -608,6 +608,27 @@ impl Tree {
         Some(sid)
     }
 
+    /// Add a surface to `pane` right after surface `after` (last if `after`
+    /// isn't there), making it the pane's active one when `activate`.
+    pub fn insert_surface_after(
+        &mut self,
+        vtab: VtabId,
+        pane: PaneId,
+        after: SurfaceId,
+        activate: bool,
+    ) -> Option<SurfaceId> {
+        let sid = SurfaceId(self.fresh());
+        let p = self.vtab_mut(vtab)?.pane_mut(pane)?;
+        let at = p.surfaces.iter().position(|s| s.id == after).map_or(p.surfaces.len(), |i| i + 1);
+        p.surfaces.insert(at, Surface { id: sid, title: String::new(), user_named: false });
+        if activate {
+            p.active = at;
+        } else if p.active >= at && p.surfaces.len() > 1 {
+            p.active += 1;
+        }
+        Some(sid)
+    }
+
     /// Close a surface. If it was the pane's last surface and other panes remain,
     /// the pane closes and the split collapses. If it was the *sole* pane's last
     /// surface, the pane stays as the workspace's empty ("nothing open") state
@@ -755,6 +776,22 @@ mod tests {
         assert_eq!(v.panes().len(), 1);
         assert_eq!(v.focused_pane, pane);
         assert_eq!(v.panes()[0].surfaces[0].id, surf);
+    }
+
+    #[test]
+    fn a_surface_inserted_after_another_goes_beside_it() {
+        let mut t = Tree::new();
+        let (vt, pane, a) = t.add_vtab("a");
+        let c = t.add_surface(vt, pane).unwrap();
+        t.vtab_mut(vt).unwrap().pane_mut(pane).unwrap().active = 0;
+        let b = t.insert_surface_after(vt, pane, a, false).unwrap();
+        let ids = |t: &Tree| t.vtab(vt).unwrap().panes()[0].surfaces.iter().map(|s| s.id).collect::<Vec<_>>();
+        let active = |t: &Tree| t.vtab(vt).unwrap().panes()[0].active;
+        assert_eq!(ids(&t), [a, b, c]);
+        assert_eq!(active(&t), 0, "in the background");
+        let d = t.insert_surface_after(vt, pane, b, true).unwrap();
+        assert_eq!(ids(&t), [a, b, d, c]);
+        assert_eq!(active(&t), 2, "shown");
     }
 
     #[test]

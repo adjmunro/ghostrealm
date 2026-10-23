@@ -2,10 +2,13 @@
 //! a back / forward / reload toolbar and an editable URL bar.
 //!
 //! A pop-up is a page of its own, so it keeps `window.opener`. One a person
-//! opened (a press or key reached the page) floats over its opener's page
-//! with a close button, the opener still live beside it. One an agent opened
-//! (through a gesture eval's activation) stays hidden: the app keeps it as a hidden surface the agent
-//! drives ([`WebView::take_spawned`]). Either goes when it closes itself.
+//! opened (a press or key reached the page) as a pop-up window
+//! (`window.open` with a size) floats over its opener's page with a close
+//! button, the opener still live beside it; as a tab (`target=_blank`) it
+//! opens as a tab beside its opener. One an agent opened (through a gesture
+//! eval's activation) stays hidden: the app keeps it as a hidden surface the
+//! agent drives. The app takes tabs and hidden ones from
+//! [`WebView::take_opened`]. Each goes when it closes itself.
 //!
 //! Pages render in the out-of-process CEF host (`ghostrealm-web-host`, see
 //! [`ghostrealm_web`]): one host serves every web view and is spawned on first
@@ -30,8 +33,8 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 use ghostrealm_web::protocol::mods;
 use ghostrealm_web::{
-    Cursor, EditAction, MouseAction, MouseButton as PageButton, PopupInfo, Request as HostRequest, SharedFrame,
-    ViewState, WebHost,
+    Cursor, EditAction, MouseAction, MouseButton as PageButton, PopupInfo, PopupKind, Request as HostRequest,
+    SharedFrame, ViewState, WebHost,
 };
 use glyphon::Family;
 use winit::window::CursorIcon;
@@ -481,9 +484,11 @@ pub struct WebView {
     /// click count.
     pressed: Option<(PageButton, u32)>,
     hovering: bool,
-    /// This is a pop-up's page, made by the host: it is never created again
-    /// (it goes with the host), and its header has a close button instead of
-    /// navigation.
+    /// The page was made by the host (a pop-up): it is never created again
+    /// (it goes with the host), and it goes when the host closes it.
+    host_made: bool,
+    /// Its header has a close button instead of navigation (a floating or
+    /// hidden pop-up).
     popup: bool,
     /// The size a pop-up asked for (physical pixels), for floating it.
     popup_size: (u32, u32),
@@ -501,8 +506,25 @@ pub struct WebView {
     float_hover: bool,
     /// Whether the view has the keyboard, as last told.
     focused: bool,
-    /// Pop-ups an agent opened, until the app takes them as hidden surfaces.
-    spawned: Vec<WebView>,
+    /// Pop-ups to open as tabs or hidden surfaces, until the app takes them.
+    opened: Vec<Opened>,
+}
+
+/// A pop-up the app opens as a surface of its own.
+pub struct Opened {
+    pub view: WebView,
+    pub place: Place,
+    /// A pop-up floating over the page opened it, not the page itself.
+    pub from_floating: bool,
+}
+
+/// Where an [`Opened`] pop-up goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// A hidden surface: an agent opened it.
+    Hidden,
+    /// A tab beside its opener's, shown when `focus`: a person opened it.
+    Tab { focus: bool },
 }
 
 impl WebView {
@@ -530,6 +552,7 @@ impl WebView {
             body: zero,
             pressed: None,
             hovering: false,
+            host_made: false,
             popup: false,
             popup_size: DEFAULT_SIZE,
             dismissed: false,
@@ -539,19 +562,20 @@ impl WebView {
             float_press: false,
             float_hover: false,
             focused: false,
-            spawned: Vec::new(),
+            opened: Vec::new(),
         }
     }
 
     /// A view of pop-up `p`, which the host made (and keeps hidden) in the
-    /// running host.
-    fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo) -> Self {
+    /// running host. A `popup` one has a close button for a header.
+    fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo, popup: bool) -> Self {
         let generation = slot.borrow().generation;
         let mut v = WebView::new(slot, p.id);
         v.created_in = generation;
         v.sent_visible = false;
         v.last_url.clone_from(&p.url);
-        v.popup = true;
+        v.host_made = true;
+        v.popup = popup;
         v.popup_size = (p.width, p.height);
         v
     }
@@ -560,7 +584,7 @@ impl WebView {
     /// its host exiting). A page the app creates is never gone: it is made
     /// again.
     pub fn is_closed(&self) -> bool {
-        if !self.popup {
+        if !self.host_made {
             return false;
         }
         if self.dismissed {
@@ -570,9 +594,10 @@ impl WebView {
         slot.generation != self.created_in || slot.host.as_ref().is_none_or(|h| h.is_closed(self.page))
     }
 
-    /// Take the pop-ups the page opened from the host: a person's float over
-    /// it (and take the keyboard), an agent's wait in `spawned`. Drop
-    /// floating ones that closed. Returns whether the floating ones changed.
+    /// Take the pop-ups the page opened from the host: a person's pop-up
+    /// window floats over it (and takes the keyboard); a person's tab and an
+    /// agent's pop-up wait in `opened`. Drop floating ones that closed.
+    /// Returns whether the floating ones changed.
     fn pull_popups(&mut self) -> bool {
         let popups = match self.slot.borrow().host.as_ref() {
             Some(h) if self.created_in != 0 => h.take_popups(self.page),
@@ -580,18 +605,23 @@ impl WebView {
         };
         let mut changed = false;
         for p in &popups {
-            let v = WebView::for_popup(self.slot.clone(), p);
-            if p.from_input {
-                self.floating.push(v);
-                self.float_keys = true;
-                changed = true;
-            } else {
-                self.spawned.push(v);
-            }
+            let place = match (p.from_input, p.kind) {
+                (false, _) => Place::Hidden,
+                (true, PopupKind::Popup) => {
+                    self.floating.push(WebView::for_popup(self.slot.clone(), p, true));
+                    self.float_keys = true;
+                    changed = true;
+                    continue;
+                }
+                (true, PopupKind::BackgroundTab) => Place::Tab { focus: false },
+                (true, PopupKind::Tab | PopupKind::Window) => Place::Tab { focus: true },
+            };
+            let view = WebView::for_popup(self.slot.clone(), p, place == Place::Hidden);
+            self.opened.push(Opened { view, place, from_floating: false });
         }
         for f in &mut self.floating {
             changed |= f.pull_popups();
-            self.spawned.append(&mut f.spawned);
+            self.opened.extend(f.opened.drain(..).map(|o| Opened { from_floating: true, ..o }));
         }
         if self.drop_closed_floating() {
             return true;
@@ -603,11 +633,16 @@ impl WebView {
         changed
     }
 
-    /// The pop-ups an agent opened from this page (or a pop-up floating over
-    /// it) since last asked, for the app to keep as hidden surfaces.
-    pub fn take_spawned(&mut self) -> Vec<WebView> {
+    /// Keep this pop-up's page when its opener closes: it is a tab now.
+    pub fn detach(&mut self) {
+        self.send(Some(HostRequest::Detach { id: self.page }));
+    }
+
+    /// The pop-ups this page (or a pop-up floating over it) opened as tabs or
+    /// hidden surfaces since last asked, for the app to place.
+    pub fn take_opened(&mut self) -> Vec<Opened> {
         self.pull_popups();
-        std::mem::take(&mut self.spawned)
+        std::mem::take(&mut self.opened)
     }
 
     /// Make sure the page exists in a running host (creating it at `size`, or
@@ -626,7 +661,7 @@ impl WebView {
         let Some(host) = slot.host.as_mut() else {
             return false;
         };
-        if self.created_in != generation && self.popup {
+        if self.created_in != generation && self.host_made {
             // It went with the host that made it.
             return false;
         }
@@ -1737,10 +1772,15 @@ pub(super) mod tests {
     }
 
 
-    /// The host's `popup` event for page `id`, opened by page `opener`.
+    /// The host's `popup` event for pop-up window `id`, opened by page `opener`.
     fn popup_event(id: u64, opener: u64, from_input: bool) -> String {
+        popup_event_of(id, opener, from_input, "popup")
+    }
+
+    /// [`popup_event`] of `kind`.
+    fn popup_event_of(id: u64, opener: u64, from_input: bool, kind: &str) -> String {
         format!(
-            r#"{{"ev":"popup","id":{id},"opener":{opener},"url":"https://pop.test/","from_input":{from_input},"width":200,"height":100}}"#
+            r#"{{"ev":"popup","id":{id},"opener":{opener},"url":"https://pop.test/","from_input":{from_input},"kind":"{kind}","width":200,"height":100}}"#
         )
     }
 
@@ -1815,6 +1855,58 @@ pub(super) mod tests {
         std::fs::write(&exe, format!("#!/bin/sh\n{ready}{echo}{script}\n")).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         TEST_HOST.with_borrow_mut(|h| *h = Some(exe));
+    }
+
+    #[test]
+    fn a_tab_a_person_opened_opens_beside_its_opener() {
+        let dir = crate::plugin::testing::tmpdir("web-popup-tab");
+        let log = dir.join("requests");
+        let events = [
+            popup_event_of(POPUP_IDS, 1, true, "background_tab"),
+            popup_event_of(POPUP_IDS + 1, 1, true, "tab"),
+            popup_event_of(POPUP_IDS + 2, 1, false, "tab"),
+        ];
+        // The foreground tab's page closes itself when told to navigate.
+        let script = format!(
+            "while read l; do echo \"$l\" >> '{}'; case \"$l\" in *'\"op\":\"navigate\"'*) \
+             echo '{{\"ev\":\"closed\",\"id\":{}}}';; esac; done",
+            log.display(),
+            POPUP_IDS + 1
+        );
+        stub_app_host(&dir, &events, &script);
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let surfaces = |s: &AppState| -> Vec<String> {
+            s.describe().lines().filter(|l| l.contains("surface ")).map(|l| l.trim().to_string()).collect()
+        };
+        wait("the pop-ups are placed", || {
+            s.pump_all();
+            surfaces(&s).len() == 4
+        });
+        let got = surfaces(&s);
+        // The opener, the foreground tab (shown), the background tab, and the
+        // agent's hidden one.
+        let id = |i: usize| got[i].split(' ').nth(1).unwrap().parse::<u64>().unwrap();
+        assert!(got[0].starts_with(&format!("surface {} ", opener.0)), "{got:?}");
+        assert!(got[1].ends_with("(active)"), "the foreground tab shows: {got:?}");
+        assert!(!got[2].ends_with("(active)"), "{got:?}");
+        assert!(got[3].starts_with("hidden surface"), "{got:?}");
+        let foreground = SurfaceId(id(1));
+        assert_eq!(s.focused_surface(), Some(foreground));
+        let page = |s: &mut AppState, sid| s.view_mut(sid).unwrap().downcast_mut::<WebView>().unwrap().page;
+        assert_eq!(page(&mut s, foreground), POPUP_IDS + 1);
+        assert_eq!(page(&mut s, SurfaceId(id(2))), POPUP_IDS);
+
+        // A tab whose page closes itself closes.
+        registry.execute("web.navigate", &Args::new().with("url", Value::Str("example.com".into())), &mut s).unwrap();
+        wait("the tab closes", || {
+            s.pump_all();
+            s.view(foreground).is_none()
+        });
+        TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
     #[test]
@@ -1998,7 +2090,7 @@ pub(super) mod tests {
             !v.floating.is_empty()
         });
         assert!(v.float_keys, "it has the keyboard");
-        assert!(v.take_spawned().is_empty(), "it isn't hidden");
+        assert!(v.take_opened().is_empty(), "it isn't hidden");
         wait("the pop-up closes itself", || {
             v.refresh();
             v.floating.is_empty()

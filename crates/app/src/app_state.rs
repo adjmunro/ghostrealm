@@ -162,6 +162,25 @@ enum Leave {
     Vtab(VtabId),
 }
 
+/// What opened a hidden surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HiddenOf {
+    /// The surface it belongs to, closing with it.
+    opener: SurfaceId,
+    /// A pop-up floating over that surface's page opened it.
+    from_floating: bool,
+}
+
+impl HiddenOf {
+    /// "surface 4", or "the pop-up floating over surface 4".
+    fn describe(&self) -> String {
+        match self.from_floating {
+            true => format!("the pop-up floating over surface {}", self.opener.0),
+            false => format!("surface {}", self.opener.0),
+        }
+    }
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// Each surface's content. A surface without a view is "empty" — it shows
@@ -224,7 +243,7 @@ pub struct AppState {
     focus_stamp: u64,
     /// Hidden surfaces (pop-ups an agent opened), in `views` but in no pane,
     /// by the surface that opened each.
-    hidden: HashMap<SurfaceId, SurfaceId>,
+    hidden: HashMap<SurfaceId, HiddenOf>,
 }
 
 impl AppState {
@@ -1515,11 +1534,11 @@ impl AppState {
         if out.is_empty() {
             out.push_str("(no vtabs)\n");
         }
-        let mut hidden: Vec<(&SurfaceId, &SurfaceId)> = self.hidden.iter().collect();
+        let mut hidden: Vec<(&SurfaceId, &HiddenOf)> = self.hidden.iter().collect();
         hidden.sort();
-        for (p, opener) in hidden {
+        for (p, of) in hidden {
             let title = self.views.get(p).and_then(|v| v.title()).unwrap_or_default();
-            let _ = writeln!(out, "hidden surface {} {:?} (pop-up of surface {})", p.0, title, opener.0);
+            let _ = writeln!(out, "hidden surface {} {:?} (pop-up of {})", p.0, title, of.describe());
         }
         out
     }
@@ -1529,48 +1548,75 @@ impl AppState {
     pub fn surface_text(&mut self, id: SurfaceId) -> Option<String> {
         self.adopt_popups();
         let mut text = self.views.get_mut(&id)?.text()?;
-        let mut popups: Vec<SurfaceId> = self.hidden.iter().filter(|(_, o)| **o == id).map(|(p, _)| *p).collect();
+        let mut popups: Vec<SurfaceId> = self.hidden.iter().filter(|(_, o)| o.opener == id).map(|(p, _)| *p).collect();
         popups.sort();
         if !popups.is_empty() {
             let lines: String = popups.iter().map(|p| format!("pop-up: surface {} (hidden)\n", p.0)).collect();
             let at = text.find("\n\n").map_or(text.len(), |i| i + 1);
             text.insert_str(at, &lines);
         }
-        if let Some(opener) = self.hidden.get(&id) {
-            text.insert_str(0, &format!("pop-up of surface {} (hidden)\n", opener.0));
+        if let Some(of) = self.hidden.get(&id) {
+            text.insert_str(0, &format!("pop-up of {} (hidden)\n", of.describe()));
         }
         Some(text)
     }
 
-    /// Keep the pop-ups agents opened in web pages as hidden surfaces (in no
-    /// pane, never focused, still driven by `web.*` and read by `get
-    /// surface`), and drop those that closed or whose opener went. Returns
-    /// whether any came or went.
+    /// Place the pop-ups web pages opened: a person's tab beside its
+    /// opener's (shown if it asked to be), an agent's as a hidden surface (in
+    /// no pane, never focused, still driven by `web.*` and read by `get
+    /// surface`). Drop hidden ones that closed or whose opener went, and close
+    /// tabs whose pop-up page closed. Returns whether any came or went.
     pub fn adopt_popups(&mut self) -> bool {
         let mut new = Vec::new();
         for (sid, view) in self.views.iter_mut() {
             if let Some(w) = view.downcast_mut::<web::WebView>() {
-                new.extend(w.take_spawned().into_iter().map(|p| (*sid, p)));
+                new.extend(w.take_opened().into_iter().map(|o| (*sid, o)));
             }
         }
         let gone: Vec<SurfaceId> = self
             .hidden
             .iter()
             .filter(|(p, o)| {
-                !self.views.contains_key(o)
+                !self.views.contains_key(&o.opener)
                     || self.views.get(p).and_then(|v| v.downcast_ref::<web::WebView>()).is_none_or(|w| w.is_closed())
             })
             .map(|(p, _)| *p)
             .collect();
-        let changed = !new.is_empty() || !gone.is_empty();
+        let closed_tabs: Vec<SurfaceId> = self
+            .views
+            .iter()
+            .filter(|(sid, v)| {
+                !self.hidden.contains_key(sid) && v.downcast_ref::<web::WebView>().is_some_and(|w| w.is_closed())
+            })
+            .map(|(sid, _)| *sid)
+            .collect();
+        let changed = !new.is_empty() || !gone.is_empty() || !closed_tabs.is_empty();
         for p in gone {
             self.hidden.remove(&p);
             self.views.remove(&p);
         }
-        for (opener, popup) in new {
-            let sid = self.tree.detached_surface_id();
-            self.views.insert(sid, Box::new(popup));
-            self.hidden.insert(sid, opener);
+        for sid in closed_tabs {
+            self.close_surface_id(sid);
+        }
+        for (opener, o) in new {
+            let tab = match (o.place, self.pane_of(opener)) {
+                (web::Place::Tab { focus }, Some((vt, pane))) => {
+                    self.tree.insert_surface_after(vt, pane, opener, focus)
+                }
+                _ => None,
+            };
+            match tab {
+                Some(sid) => {
+                    let mut view = o.view;
+                    view.detach();
+                    self.insert_view(sid, Box::new(view));
+                }
+                None => {
+                    let sid = self.tree.detached_surface_id();
+                    self.views.insert(sid, Box::new(o.view));
+                    self.hidden.insert(sid, HiddenOf { opener, from_floating: o.from_floating });
+                }
+            }
         }
         changed
     }

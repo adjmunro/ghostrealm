@@ -152,6 +152,11 @@ pub enum Request {
         id: u64,
         action: EditAction,
     },
+    /// Pop-up `id` no longer closes with its opener (the app shows it as a
+    /// tab of its own).
+    Detach {
+        id: u64,
+    },
     /// Ask for the main frame's visible text; answered by [`Event::Text`].
     Text {
         id: u64,
@@ -171,6 +176,22 @@ pub enum Request {
         #[serde(default)]
         gesture: bool,
     },
+}
+
+/// How the page asked for a pop-up to open (Chromium's window disposition).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupKind {
+    /// A pop-up window: `window.open` with a size or position.
+    #[default]
+    Popup,
+    /// A new foreground tab: a `target=_blank` link, `window.open` with no
+    /// features.
+    Tab,
+    /// A new background tab (a Cmd- or middle-click on a link).
+    BackgroundTab,
+    /// A new window (a Shift-click on a link).
+    Window,
 }
 
 /// Mouse cursor shapes the page asks for (the subset we map to the OS cursor).
@@ -270,6 +291,7 @@ pub enum Event {
         /// gesture eval: the eval opened it, or the page's own script did
         /// with that eval's activation.
         from_input: bool,
+        kind: PopupKind,
         /// Its initial physical size: what the page asked for, else the opener's.
         width: u32,
         height: u32,

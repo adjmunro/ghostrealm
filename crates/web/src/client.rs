@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::frame::FrameReader;
-use crate::protocol::{Cursor, Event, MouseAction, Request, PROTOCOL_VERSION};
+use crate::protocol::{Cursor, Event, MouseAction, PopupKind, Request, PROTOCOL_VERSION};
 
 /// Executable name of the host (and of its macOS bundle, `<name>.app`).
 pub const HOST_NAME: &str = "ghostrealm-web-host";
@@ -84,6 +84,7 @@ pub struct PopupInfo {
     pub opener: u64,
     pub url: String,
     pub from_input: bool,
+    pub kind: PopupKind,
     pub width: u32,
     pub height: u32,
 }
@@ -552,9 +553,9 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) {
             s.views.entry(id).or_default().error = Some(format!("{error} ({url})"));
         }
         Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
-        Event::Popup { id, opener, url, from_input, width, height } => {
+        Event::Popup { id, opener, url, from_input, kind, width, height } => {
             s.views.entry(id).or_default().url.clone_from(&url);
-            s.popups.push(PopupInfo { id, opener, url, from_input, width, height });
+            s.popups.push(PopupInfo { id, opener, url, from_input, kind, width, height });
         }
         Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
         Event::Closed { id } => {
