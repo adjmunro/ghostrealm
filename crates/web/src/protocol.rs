@@ -348,23 +348,25 @@ pub fn eval_wrapper(js: &str) -> String {
 /// gesture, for a link to `url` that the document at `from` asked to open in
 /// a new tab or window (clicked with a modifier or the middle button, which
 /// CEF would load in place). It settles to:
-/// - `"moved"`, doing nothing, in a document of another origin than `from`'s
-///   (the page moved on before it ran);
+/// - `"moved"`, doing nothing, in a document whose origin isn't `from`'s
+///   (the page moved on before it ran), or is opaque (`about:blank`, `data:`,
+///   a sandboxed document), which can't be told apart;
 /// - `"posted"` after submitting again, in place, a form that posts to
 ///   `url`: the one whose submit button has the focus, or when `enter` (Enter
 ///   was the last key) the one whose field has it, with its first submit
 ///   button, as Enter submits; `"disabled"`, doing nothing, when that button
 ///   is disabled;
 /// - `"opened"` after `window.open(url, '_blank', 'noopener')`, so the page
-///   loads as one the document asked for; with `noreferrer` too when a link
-///   to `url` withholds the referrer (`rel=noreferrer`, or a policy stricter
-///   than `unsafe-url`), as `window.open` sends the document's.
+///   loads as one the document asked for; with `noreferrer` too unless a
+///   link to `url` is found (open shadow roots included) and none withholds
+///   the referrer (`rel=noreferrer`, or a policy other than the document's or
+///   `unsafe-url`), as `window.open` sends the document's.
 pub fn link_script(from: &str, url: &str, enter: bool) -> String {
     let json = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let (from, url) = (json(from), json(url));
     format!(
         "(() => {{ const url = {url}; \
-         if (new URL({from}).origin !== new URL(location.href).origin) return 'moved'; \
+         const origin = new URL({from}).origin; if (origin === 'null' || self.origin !== origin) return 'moved'; \
          const el = document.activeElement; const form = el && el.form; \
          const submits = e => e.type === 'submit' || e.type === 'image'; \
          const by = !form ? undefined : submits(el) ? el : {enter} ? [...form.elements].find(submits) || null : undefined; \
@@ -373,9 +375,11 @@ pub fn link_script(from: &str, url: &str, enter: bool) -> String {
          const action = by && by.hasAttribute('formaction') ? by.formAction : form.action; \
          if (method === 'post' && action === url) {{ \
          if (by && by.disabled) return 'disabled'; form.requestSubmit(by); return 'posted'; }} }} \
-         const keeps = ['', 'unsafe-url', 'no-referrer-when-downgrade']; \
-         const bare = [...document.querySelectorAll('a[href], area[href]')].some(a => a.href === url \
-         && (a.relList.contains('noreferrer') || !keeps.includes(a.referrerPolicy))); \
+         const links = []; const walk = root => {{ for (const e of root.querySelectorAll('*')) {{ \
+         if ((e.localName === 'a' || e.localName === 'area') && e.href === url) links.push(e); \
+         if (e.shadowRoot) walk(e.shadowRoot); }} }}; walk(document); \
+         const bare = !links.length || links.some(a => a.rel.toLowerCase().split(/\\s+/).includes('noreferrer') \
+         || !['', 'unsafe-url'].includes(a.referrerPolicy)); \
          window.open(url, '_blank', bare ? 'noopener,noreferrer' : 'noopener'); return 'opened'; }})()"
     )
 }

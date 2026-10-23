@@ -775,7 +775,10 @@ struct Hit {
 /// `http://localhost:<port>`, returned with the `/hit...` requests it got.
 /// `/cookies` sets a `SameSite=Strict` cookie `s` and a `Lax` one `l`;
 /// `/link?<url>` is a link to `<url>` over the page (`/nrlink?<url>` one with
-/// `rel=noreferrer`, `/nplink?<url>` one with `referrerpolicy=no-referrer`);
+/// `rel=NoReferrer`, `/nplink?<url>` one with `referrerpolicy=no-referrer`,
+/// `/closedlink?<url>` one in a closed shadow root, `/sandboxedlink?<url>`
+/// one in a document sandboxed by CSP (`allow-scripts allow-popups`),
+/// `/beacon?<url>` one that requests `/hitclick` on each click);
 /// `/hostile?<url>` is a button over the page that answers a click by
 /// sending three Cmd-clicks (Ctrl off macOS) to a hidden link to `<url>`;
 /// `/sandboxed?<url>` is a
@@ -823,7 +826,19 @@ fn serve_sites() -> (String, String, std::sync::Arc<Mutex<Vec<Hit>>>) {
                     "<title>Cookies</title>".to_string()
                 }
                 "/link" => format!("<title>Link</title><body style='margin:0'><a href='{arg}' style='{FULL}'>x</a>{COUNT}"),
-                "/nrlink" => format!("<body style='margin:0'><a rel=noreferrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
+                "/beacon" => format!(
+                    "<body style='margin:0'><a href='{arg}' style='{FULL}' \
+                     onclick=\"fetch('/hitclick', {{ keepalive: true }})\">x</a>"
+                ),
+                "/nrlink" => format!("<body style='margin:0'><a rel=NoReferrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
+                "/closedlink" => format!(
+                    "<body style='margin:0'><div id=h></div><script>h.attachShadow({{ mode: 'closed' }}).innerHTML = \
+                     \"<a href='{arg}' style='{FULL}'>x</a>\"</script>{COUNT}"
+                ),
+                "/sandboxedlink" => {
+                    extra = "Content-Security-Policy: sandbox allow-scripts allow-popups\r\n".into();
+                    format!("<body style='margin:0'><a href='{arg}' style='{FULL}'>x</a>{COUNT}")
+                }
                 "/nplink" => format!("<body style='margin:0'><a referrerpolicy=no-referrer href='{arg}' style='{FULL}'>x</a>{COUNT}"),
                 "/hostile" => format!(
                     "<title>Hostile</title><body style='margin:0'><a id=l href='{arg}' style='display:none'>x</a>\
@@ -926,16 +941,18 @@ fn a_modified_click_loads_as_its_page_asked() {
 }
 
 /// Given pages on one site whose links to another site withhold the referrer
-/// (`rel=noreferrer`, `referrerpolicy=no-referrer`);
+/// (`rel=NoReferrer`, `referrerpolicy=no-referrer`), and one whose link is
+/// in a closed shadow root, out of the host's sight;
 /// when a person Cmd-clicks (Ctrl off macOS) each;
-/// then each tab's request has no referrer, as a plain click's wouldn't.
+/// then each tab's request has no referrer, as a plain click's wouldn't for
+/// the first two.
 #[test]
 fn a_modified_click_keeps_a_links_referrer_policy() {
     let Some((mut host, cache)) = spawn("modified-click-referrer") else {
         return;
     };
     let (a, b, hits) = serve_sites();
-    for (id, route) in [(1, "nrlink"), (2, "nplink")] {
+    for (id, route) in [(1, "nrlink"), (2, "nplink"), (3, "closedlink")] {
         assert!(host.send(&Request::Create { id, url: format!("{b}/{route}?{a}/hit-{route}"), width: 100, height: 100, scale: 1.0 }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(&mut host, id, [0, 0, 255]);
@@ -969,7 +986,86 @@ fn the_link_script_runs_only_in_the_document_that_asked() {
     // The host hears pop-ups in order: the first eval opened none.
     let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
     assert_eq!(p.url, url);
+    wait_hits(&hits, "/hit-guard", 1);
+    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(wait_hits(&hits, "/hit-guard", 1).len(), 1);
+
+    shut_down(host, &cache);
+}
+
+/// Send page `id` Cmd-clicks (Ctrl off macOS) near its top-left, with no
+/// eval between them, until the server has `n` `/hitclick` requests: a page
+/// that has just painted may not hit-test input yet. A click the page heard
+/// is never repeated.
+fn raw_click_until_heard(host: &WebHost, id: u64, hits: &Mutex<Vec<Hit>>, n: usize) {
+    let heard = || hits.lock().unwrap().iter().filter(|h| h.path == "/hitclick").count() >= n;
+    for _ in 0..5 {
+        for (flags, action) in [
+            (NEW_TAB, MouseAction::Move),
+            (NEW_TAB | mods::LEFT_MOUSE, MouseAction::Down { button: MouseButton::Left, count: 1 }),
+            (NEW_TAB, MouseAction::Up { button: MouseButton::Left, count: 1 }),
+        ] {
+            assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: flags, action }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if heard() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("page {id} never heard a click");
+}
+
+/// Given a page whose link (to another site) has opened a tab from a
+/// person's Cmd-click (Ctrl off macOS);
+/// when the page goes to another such page, and the person Cmd-clicks its
+/// link, with no eval between the clicks (as from the app);
+/// then that click opens a tab too.
+#[test]
+fn a_modified_click_after_a_navigation_opens_a_tab() {
+    let Some((mut host, cache)) = spawn("modified-click-navigate") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{b}/beacon?{a}/hit-first"), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+    raw_click_until_heard(&host, 1, &hits, 1);
+    let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert_eq!(p.url, format!("{a}/hit-first"));
+
+    host.expect_load(1);
+    assert!(host.send(&Request::Navigate { id: 1, url: format!("{b}/beacon?{a}/hit-second") }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "second page never loaded");
+    raw_click_until_heard(&host, 1, &hits, 2);
+    let [q] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert_eq!(q.url, format!("{a}/hit-second"));
+
+    shut_down(host, &cache);
+}
+
+/// Given a page sandboxed by CSP (`allow-scripts allow-popups`: an opaque
+/// origin) covered by a link to another site;
+/// when a person Cmd-clicks (Ctrl off macOS) it;
+/// then nothing opens, as the host can't tell its document from another
+/// at its address, and the page stays.
+#[test]
+fn a_modified_click_in_an_opaque_document_opens_nothing() {
+    let Some((mut host, cache)) = spawn("modified-click-opaque") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    let url = format!("{b}/sandboxedlink?{a}/hit-opaque");
+    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+    click_at_until(&host, 1, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(host.take_popups(1).is_empty());
+    assert!(hits.lock().unwrap().is_empty(), "{:?}", hits.lock().unwrap());
+    assert_eq!(host.view(1).unwrap().url, url);
 
     shut_down(host, &cache);
 }

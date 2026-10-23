@@ -66,6 +66,8 @@ struct Entry {
 
 /// A link a page asked to open in a new tab, opened through `window.open`.
 struct Link {
+    /// The [`PendingEval::link`] of the eval that opens it.
+    id: u64,
     url: String,
     kind: PopupKind,
     /// Decided at the click, not when `window.open` runs.
@@ -119,6 +121,7 @@ thread_local! {
     static NEXT_MESSAGE: Cell<i32> = const { Cell::new(1) };
     static PENDING: RefCell<HashMap<u64, PendingPopup>> = RefCell::new(HashMap::new());
     static NEXT_POPUP: Cell<u64> = const { Cell::new(POPUP_IDS) };
+    static NEXT_LINK: Cell<u64> = const { Cell::new(1) };
 }
 
 /// The isolated world evals run in. One per document, created on first use:
@@ -139,9 +142,9 @@ struct PendingEval {
     js: String,
     /// Run it as a user gesture.
     gesture: bool,
-    /// The host's own, for [`open_link`]'s link to this URL: its result goes
-    /// nowhere.
-    link: Option<String>,
+    /// The host's own, for [`open_link`]'s [`Link`] of this id: its result
+    /// goes nowhere.
+    link: Option<u64>,
     started: Instant,
     step: Step,
     /// The world this eval made (before `Disable`) or runs in (`Evaluate`).
@@ -205,7 +208,7 @@ fn start_eval(id: u64, req: u64, js: String, gesture: bool) {
 }
 
 /// [`start_eval`]; `link` makes it [`open_link`]'s, answered to no one.
-fn eval_as(id: u64, req: u64, js: String, gesture: bool, link: Option<String>) {
+fn eval_as(id: u64, req: u64, js: String, gesture: bool, link: Option<u64>) {
     expire_evals();
     let e = PendingEval {
         id,
@@ -342,12 +345,11 @@ fn fail(e: PendingEval, error: String) {
 }
 
 fn finish(e: &PendingEval, ok: bool, value: String) {
-    if let Some(url) = &e.link {
-        // Its `window.open` didn't run: a later pop-up to the URL mustn't
-        // take the link's kind.
-        if !(ok && value == "\"opened\"") {
-            BROWSERS.with_borrow_mut(|m| m.get_mut(&e.id).map(|o| o.links.retain(|l| l.url != *url)));
-        }
+    if let Some(link) = e.link {
+        // `window.open` reaches `on_before_popup` before it returns, so a
+        // link still here was never opened: a later pop-up to its URL
+        // mustn't take its kind.
+        BROWSERS.with_borrow_mut(|m| m.get_mut(&e.id).map(|o| o.links.retain(|l| l.id != link)));
         return;
     }
     let (ok, value) = if value.len() > MAX_EVAL_RESULT {
@@ -402,10 +404,8 @@ fn devtools_result(id: u64, msg: i32, success: bool, result: &[u8]) {
                         s.world = None;
                     }
                 });
-                // A link's eval is for the document that asked.
-                if e.link.is_none() {
-                    return run(e);
-                }
+                // A link's script checks it is in the document that asked.
+                return run(e);
             }
             if e.step != Step::Evaluate && !e.remade {
                 return remake(e);
@@ -777,7 +777,8 @@ fn open_popup(
         return false;
     };
     // A link `open_link` opens through `window.open` keeps the kind and
-    // owner its click had.
+    // owner its click had. Its evals run in order, so the first to the URL
+    // is this one's.
     let link = BROWSERS.with_borrow_mut(|m| {
         let e = m.get_mut(&opener)?;
         e.links.retain(|l| l.at.elapsed() < INPUT_ACTIVATION);
@@ -828,9 +829,12 @@ fn open_link(opener: u64, main: bool, from: &str, url: String, kind: PopupKind, 
         return true;
     }
     let from_input = from_input(opener);
-    let link = Link { url: url.clone(), kind, from_input, at: Instant::now() };
+    let id = NEXT_LINK.get();
+    NEXT_LINK.set(id + 1);
+    let script = link_script(from, &url, enter);
+    let link = Link { id, url, kind, from_input, at: Instant::now() };
     BROWSERS.with_borrow_mut(|m| m.get_mut(&opener).map(|e| e.links.push(link)));
-    eval_as(opener, 0, link_script(from, &url, enter), true, Some(url));
+    eval_as(opener, 0, script, true, Some(id));
     true
 }
 
