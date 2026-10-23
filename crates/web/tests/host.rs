@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use common::host_exe;
-use ghostrealm_web::protocol::mods;
+use ghostrealm_web::protocol::{mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
 /// A ready host on its own profile `ghostrealm-web-<tag>-<pid>` (removed by the
@@ -456,10 +456,19 @@ fn click_for_popup_with(host: &WebHost, id: u64, flags: u32, button: MouseButton
 /// go unheard. It clicks again only while `js` is falsy, so a click the
 /// page heard is never repeated.
 fn click_until(host: &WebHost, id: u64, js: &str) {
+    click_at_until(host, id, (20, 20), 0, js);
+}
+
+/// [`click_until`] at `(x, y)`, the modifiers `flags` held.
+fn click_at_until(host: &WebHost, id: u64, (x, y): (i32, i32), flags: u32, js: &str) {
     let heard = || host.eval(id, &format!("!!({js})"), Duration::from_secs(5)) == Ok("true".into());
     for _ in 0..5 {
-        for action in [MouseAction::Move, MouseAction::Down { button: MouseButton::Left, count: 1 }, MouseAction::Up { button: MouseButton::Left, count: 1 }] {
-            assert!(host.send(&Request::Mouse { id, x: 20, y: 20, mods: 0, action }));
+        for (mods, action) in [
+            (flags, MouseAction::Move),
+            (flags | mods::LEFT_MOUSE, MouseAction::Down { button: MouseButton::Left, count: 1 }),
+            (flags, MouseAction::Up { button: MouseButton::Left, count: 1 }),
+        ] {
+            assert!(host.send(&Request::Mouse { id, x, y, mods, action }));
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -636,6 +645,9 @@ fn a_persons_tab_outlives_its_opener() {
 /// then each click opens `/stay` as a person's new tab (a background tab, a
 /// window, a foreground tab, a background tab, a foreground tab), and the
 /// page stays where it was.
+/// Given a page covered by a `target=_blank` link;
+/// when a person Cmd-clicks it;
+/// then it opens as a person's background tab.
 /// Given a page covered by a link to `about:blank`;
 /// when a person Cmd-clicks it;
 /// then no tab opens and the link loads in place, as a plain click's would.
@@ -672,9 +684,16 @@ fn a_modified_or_middle_clicked_link_opens_a_tab() {
         assert!(host.take_popups(id).is_empty(), "one click, one tab: {case}");
     }
 
+    // A `target=_blank` link clicked so is the same.
+    let id = cases.len() as u64 + 1;
+    open(&mut host, id, "/blank");
+    let tab = click_for_popup_with(&host, id, NEW_TAB, left);
+    assert!(tab.from_input && tab.kind == PopupKind::BackgroundTab, "{tab:?}");
+    assert_eq!(tab.url, format!("{base}/stay"));
+
     // A link that isn't http(s) loads in place. A page that has just painted
     // may not hit-test input yet, so it clicks until the page leaves.
-    let id = cases.len() as u64 + 1;
+    let id = cases.len() as u64 + 2;
     open(&mut host, id, "/aboutlink");
     let deadline = Instant::now() + Duration::from_secs(20);
     while host.view(id).unwrap().url != "about:blank" {
@@ -746,6 +765,244 @@ fn an_agents_modified_click_opens_a_hidden_popup() {
     for q in open {
         wait_closed(&host, q.id);
     }
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// One request [`serve_sites`] recorded.
+#[derive(Debug, Clone)]
+struct Hit {
+    method: String,
+    path: String,
+    cookie: String,
+    site: String,
+    referer: String,
+}
+
+/// A local HTTP server as two sites: `http://127.0.0.1:<port>` and
+/// `http://localhost:<port>`, returned with the `/hit...` requests it got.
+/// `/cookies` sets a `SameSite=Strict` cookie `s` and a `Lax` one `l`;
+/// `/link?<url>` is a link to `<url>` over the page; `/hostile?<url>` is a
+/// button over the page that answers a click by sending three Cmd-clicks
+/// (Ctrl off macOS) to a hidden link to `<url>`; `/sandboxed?<url>` is a
+/// `sandbox=allow-scripts` frame over the page holding `/link?<url>`, which
+/// tells its parent of each click; `/post` is a form posting to
+/// `/hitpost`, its submit button over the top half, its text field `q`
+/// below. Pages count their clicks in `data-clicks`.
+fn serve_sites() -> (String, String, std::sync::Arc<Mutex<Vec<Hit>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = hits.clone();
+    const COUNT: &str = "<script>for (const t of ['click', 'auxclick']) addEventListener(t, () => \
+        document.body.dataset.clicks = +(document.body.dataset.clicks || 0) + 1, true); \
+        addEventListener('message', () => document.body.dataset.clicks = +(document.body.dataset.clicks || 0) + 1)</script>";
+    const FULL: &str = "position:fixed;inset:0;border:0;background:rgb(255,0,0)";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let seen = seen.clone();
+            // A connection per thread: Chromium opens some it sends nothing on.
+            std::thread::spawn(move || {
+            let mut reader = BufReader::new(&stream);
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                lines.push(line.trim_end().to_string());
+            }
+            let Some(first) = lines.first() else { return };
+            let mut parts = first.split(' ');
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or("/").to_string();
+            let header = |name: &str| {
+                lines.iter().find_map(|l| l.split_once(": ").filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_string()))
+            };
+            let (route, arg) = path.split_once('?').unwrap_or((&path, ""));
+            let mut extra = String::new();
+            let body = match route {
+                "/cookies" => {
+                    extra = "Set-Cookie: s=1; SameSite=Strict\r\nSet-Cookie: l=1; SameSite=Lax\r\n".into();
+                    "<title>Cookies</title>".to_string()
+                }
+                "/link" => format!("<title>Link</title><body style='margin:0'><a href='{arg}' style='{FULL}'>x</a>{COUNT}"),
+                "/hostile" => format!(
+                    "<title>Hostile</title><body style='margin:0'><a id=l href='{arg}' style='display:none'>x</a>\
+                     <button style='{FULL}' onclick=\"for (let i = 0; i < 3; i++) l.dispatchEvent(new MouseEvent('click', \
+                     {{ bubbles: true, cancelable: true, {NEW_TAB_KEY}: true }}))\">go</button>{COUNT}"
+                ),
+                "/sandboxed" => format!(
+                    "<title>Sandboxed</title><body style='margin:0'><iframe sandbox=allow-scripts \
+                     src='/framed?{arg}' style='{FULL}'></iframe>{COUNT}"
+                ),
+                "/framed" => format!(
+                    "<body style='margin:0'><a href='{arg}' style='{FULL}'>x</a><script>addEventListener('click', \
+                     () => parent.postMessage('click', '*'), true)</script>"
+                ),
+                "/post" => format!(
+                    "<title>Post</title><body style='margin:0'><form method=post action=/hitpost>\
+                     <button style='position:fixed;left:0;top:0;right:0;height:50%;border:0;background:rgb(255,0,0)'>go</button>\
+                     <input name=q style='position:fixed;left:0;bottom:0;width:100%;height:40%'></form>{COUNT}"
+                ),
+                _ => {
+                    if route.starts_with("/hit") {
+                        seen.lock().unwrap().push(Hit {
+                            method,
+                            path: path.clone(),
+                            cookie: header("Cookie").unwrap_or_default(),
+                            site: header("Sec-Fetch-Site").unwrap_or_default(),
+                            referer: header("Referer").unwrap_or_default(),
+                        });
+                    }
+                    format!("<title>{route}</title>")
+                }
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}"), hits)
+}
+
+/// The requests for `path` among `hits`, once there are `n`.
+fn wait_hits(hits: &Mutex<Vec<Hit>>, path: &str, n: usize) -> Vec<Hit> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got: Vec<Hit> = hits.lock().unwrap().iter().filter(|h| h.path == path).cloned().collect();
+        if got.len() >= n {
+            return got;
+        }
+        assert!(Instant::now() < deadline, "requests for {path}: {got:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Given a page on one site linking to a page on another, which holds a
+/// `SameSite=Strict` and a `Lax` cookie;
+/// when a person Cmd-clicks (Ctrl off macOS) the link;
+/// then its tab's request is the page's own: cross-site, with the `Lax`
+/// cookie only and the page's origin as referrer, as for a plain click.
+/// Given a page whose button answers a click by sending three Cmd-clicks to
+/// a hidden link to that other site;
+/// when a person plainly clicks the button;
+/// then one tab opens, its request cross-site without the `Strict` cookie.
+#[test]
+fn a_modified_click_loads_as_its_page_asked() {
+    let Some((mut host, cache)) = spawn("modified-click-site") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{a}/cookies"), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let open = |host: &mut WebHost, id, url: String| {
+        assert!(host.send(&Request::Create { id, url, width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+    };
+
+    open(&mut host, 2, format!("{b}/link?{a}/hit-link"));
+    let tab = click_for_popup_with(&host, 2, NEW_TAB, MouseButton::Left);
+    assert!(tab.from_input && tab.kind == PopupKind::BackgroundTab, "{tab:?}");
+    let [hit] = <[_; 1]>::try_from(wait_hits(&hits, "/hit-link", 1)).unwrap();
+    assert_eq!((hit.method.as_str(), hit.site.as_str(), hit.cookie.as_str()), ("GET", "cross-site", "l=1"), "{hit:?}");
+    assert_eq!(hit.referer, format!("{b}/"), "{hit:?}");
+
+    open(&mut host, 3, format!("{b}/hostile?{a}/hit-hostile"));
+    // Chromium makes a script's background tab a foreground one.
+    let tab = click_for_popup(&host, 3);
+    assert!(tab.from_input && tab.is_tab(), "{tab:?}");
+    wait_hits(&hits, "/hit-hostile", 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(host.take_popups(3).is_empty(), "one press, one tab");
+    let got = wait_hits(&hits, "/hit-hostile", 1);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].site.as_str(), got[0].cookie.as_str()), ("cross-site", "l=1"), "{got:?}");
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Given a page filled by a `sandbox=allow-scripts` frame (no
+/// `allow-popups`) holding a link;
+/// when a person Cmd-clicks (Ctrl off macOS) the link;
+/// then nothing opens and the page stays where it was.
+#[test]
+fn a_modified_click_in_a_frame_opens_nothing() {
+    let Some((mut host, cache)) = spawn("modified-click-frame") else {
+        return;
+    };
+    let (a, b, hits) = serve_sites();
+    let url = format!("{b}/sandboxed?{a}/hit-framed");
+    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0 }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+    click_at_until(&host, 1, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(host.take_popups(1).is_empty());
+    assert!(hits.lock().unwrap().is_empty(), "{:?}", hits.lock().unwrap());
+    assert_eq!(host.view(1).unwrap().url, url);
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// A key press `kind` of Enter with `flags` held.
+fn enter(kind: KeyKind, flags: u32) -> Key {
+    // macOS's virtual key code for Return; Chromium elsewhere reads
+    // `windows_key_code`.
+    let native_key_code = if cfg!(target_os = "macos") { 0x24 } else { 0 };
+    Key { kind, windows_key_code: 0x0D, native_key_code, character: 13, unmodified_character: 13, mods: flags }
+}
+
+/// Given a page with a form that posts;
+/// when a person types in its field and presses Shift+Enter, and (on a
+/// fresh copy) Shift-clicks its submit button;
+/// then each posts the form in place, as on a plain submit, and no tab
+/// opens.
+#[test]
+fn a_form_submitted_with_a_modifier_posts_in_place() {
+    let Some((mut host, cache)) = spawn("modified-submit") else {
+        return;
+    };
+    let (a, _, hits) = serve_sites();
+    let open = |host: &mut WebHost, id| {
+        assert!(host.send(&Request::Create { id, url: format!("{a}/post"), width: 100, height: 100, scale: 1.0 }));
+        assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
+        wait_painted(host, id, [0, 0, 255]);
+    };
+
+    open(&mut host, 1);
+    click_at_until(&host, 1, (20, 80), 0, "document.activeElement.name == 'q'");
+    for kind in [KeyKind::Down, KeyKind::Char, KeyKind::Up] {
+        assert!(host.send(&Request::Key { id: 1, key: enter(kind, mods::SHIFT) }));
+    }
+    let [hit] = <[_; 1]>::try_from(wait_hits(&hits, "/hitpost", 1)).unwrap();
+    assert_eq!(hit.method, "POST", "{hit:?}");
+    assert!(host.wait_loaded(1, Duration::from_secs(20)));
+    assert_eq!(host.view(1).unwrap().url, format!("{a}/hitpost"));
+
+    open(&mut host, 2);
+    let js = "+(document.body.dataset.clicks || 0) > 0 || location.pathname == '/hitpost'";
+    click_at_until(&host, 2, (20, 20), mods::SHIFT, js);
+    let got = wait_hits(&hits, "/hitpost", 2);
+    assert_eq!(got[1].method, "POST", "{got:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.view(2).unwrap().url != format!("{a}/hitpost") {
+        assert!(Instant::now() < deadline, "the form never posted in place");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(host.take_popups(1).is_empty() && host.take_popups(2).is_empty());
+    assert_eq!(hits.lock().unwrap().len(), 2, "{:?}", hits.lock().unwrap());
 
     drop(host);
     let _ = std::fs::remove_dir_all(&cache);

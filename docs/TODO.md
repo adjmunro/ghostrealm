@@ -1341,15 +1341,29 @@
 
 ---
 
-[2026-10-23T22:14+1300@b1975bea] Web — forms submitted with a modifier
+[2026-10-23T22:46+1300@0fd87271] Web — modified clicks in frames and on posting forms
 
 - Requires: NO BLOCKERS
-- Detail: A form submitted with Shift or Cmd/Ctrl held (checked on a
-  clicked submit button; Shift+Enter in a field is likely the same) opens
-  its action URL in a new tab as a GET, without the form data: CEF's
-  `OnOpenURLFromTab` doesn't say the request is a POST (DECISION.md, Web surface / pop-ups, 2026-10-23T22:14). Browsers
-  post it in the new tab. Options: tell a POST apart before the opener's
-  `beforeunload` runs, or post it in the new page once it has loaded its
-  origin (CEF's `LoadRequest` needs that first).
-- Reason: a modifier held while submitting a login form sends the person
-  to an empty request instead of signing in.
+- Detail: A link in a frame clicked with Shift, Cmd/Ctrl, or the middle
+  button opens nothing: the host reopens these links through
+  `window.open` in an eval, and evals reach only the main frame (DECISION.md,
+  Web surface / pop-ups, 2026-10-23T22:46). Run the eval in the link's own
+  frame, so its sandbox flags apply (CEF's frame id is not known to match
+  the DevTools one the eval needs).
+- Detail: A form that posts, submitted with a modifier, is submitted again
+  in place (its submit handlers run twice) instead of posting in a new tab,
+  and one submitted with the focus elsewhere (by script) opens its URL in a
+  new tab as a GET, without its data.
+- Reason: browsers open both in a new tab.
+
+---
+
+[2026-10-23T22:46+1300@0fd87271] Web — a host test's host can fail to start
+
+- Requires: NO BLOCKERS
+- Detail: `right_and_middle_presses_reach_the_page` (crates/web/tests/host.rs)
+  failed once in ten runs of the suite with "host never became ready": its
+  host gave no `ready` within 20 s while the other 14 hosts started and the
+  run took 6 s. Seen on `feat/web-modified-link-clicks`, which grew the
+  suite from 12 hosts to 15. Run with `GHOSTREALM_WEB_DEBUG=1` to see why.
+- Reason: a flaky test hides real failures.

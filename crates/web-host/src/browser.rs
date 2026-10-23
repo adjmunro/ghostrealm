@@ -56,7 +56,28 @@ struct Entry {
     opener: Option<u64>,
     /// When a `Mouse` press or a `Key` last reached the page.
     input_at: Option<Instant>,
+    /// The last press or key down to reach the page was Enter, which
+    /// submits a form (Shift+Enter in a new window).
+    enter_last: bool,
+    /// A press, key, or gesture eval reached the page since it last opened a
+    /// link in a new tab: each opens at most one.
+    link_armed: bool,
+    /// Links it asked to open in a new tab ([`open_link`]), until their
+    /// `window.open` reaches `on_before_popup`.
+    links: Vec<Link>,
 }
+
+/// A link a page asked to open in a new tab, opened through `window.open`.
+struct Link {
+    url: String,
+    kind: PopupKind,
+    /// Decided at the click, not when `window.open` runs.
+    from_input: bool,
+    at: Instant,
+}
+
+/// Windows' virtual key code for Enter, as `Key::windows_key_code` carries it.
+const VK_RETURN: i32 = 0x0D;
 
 /// A pop-up opened within this of input reaching its opener answers that
 /// input (Chromium's user activation lasts as long), not an eval.
@@ -67,9 +88,8 @@ const INPUT_ACTIVATION: Duration = Duration::from_secs(5);
 struct PendingPopup {
     view: SharedView,
     opener: u64,
-    /// CEF's id for it, which `on_before_popup_aborted` names; none for a
-    /// page the host creates itself ([`open_link`]).
-    cef_id: Option<c_int>,
+    /// CEF's id for it, which `on_before_popup_aborted` names.
+    cef_id: c_int,
     queued: Vec<Request>,
     /// A person's new tab or window: it outlives its opener and doesn't
     /// count toward its pop-ups.
@@ -122,6 +142,8 @@ struct PendingEval {
     js: String,
     /// Run it as a user gesture.
     gesture: bool,
+    /// The host's own: its result goes nowhere.
+    silent: bool,
     started: Instant,
     step: Step,
     /// The world this eval made (before `Disable`) or runs in (`Evaluate`).
@@ -181,12 +203,18 @@ fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T>
 /// `executionContextId`) can't name a context in another renderer process
 /// after a navigation, so the script never lands in the page's own world.
 fn start_eval(id: u64, req: u64, js: String, gesture: bool) {
+    eval_as(id, req, js, gesture, false);
+}
+
+/// [`start_eval`], answered to the app unless `silent`.
+fn eval_as(id: u64, req: u64, js: String, gesture: bool, silent: bool) {
     expire_evals();
     let e = PendingEval {
         id,
         req,
         js,
         gesture,
+        silent,
         started: Instant::now(),
         step: Step::Enable,
         world: None,
@@ -247,10 +275,7 @@ fn run(e: PendingEval) {
         }
     });
     match next {
-        None => {
-            let value = format!("unknown browser {}", e.id);
-            emit(&Event::EvalResult { id: e.id, req: e.req, ok: false, value });
-        }
+        None => finish(&e, false, format!("unknown browser {}", e.id)),
         Some(Next::Fail(error)) => finish(&e, false, error),
         Some(Next::Evaluate(world)) => evaluate(e, world),
         Some(Next::Wait) => with_eval_state(e.id, |s| s.waiting.push(e)).unwrap_or_default(),
@@ -319,6 +344,9 @@ fn fail(e: PendingEval, error: String) {
 }
 
 fn finish(e: &PendingEval, ok: bool, value: String) {
+    if e.silent {
+        return;
+    }
     let (ok, value) = if value.len() > MAX_EVAL_RESULT {
         (false, format!("result too large ({} bytes, max {MAX_EVAL_RESULT})", value.len()))
     } else {
@@ -485,11 +513,34 @@ pub fn handle(req: Option<Request>) {
         Some(req) => req,
         None => return,
     };
-    // Person input: a pop-up opened soon after answers it.
-    if let Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. }
-    | Request::Key { id, key: Key { kind: KeyKind::Down | KeyKind::Char, .. } } = &req
-    {
-        BROWSERS.with_borrow_mut(|m| m.get_mut(id).map(|e| e.input_at = Some(Instant::now())));
+    // Person input: a pop-up opened soon after answers it. `enter` is
+    // whether it was Enter, unknown for the character a key down made.
+    let input = match &req {
+        Request::Mouse { id, action: MouseAction::Down { .. } | MouseAction::Up { .. }, .. } => Some((*id, Some(false))),
+        Request::Key { id, key: Key { kind: KeyKind::Down, windows_key_code, .. } } => {
+            Some((*id, Some(*windows_key_code == VK_RETURN)))
+        }
+        Request::Key { id, key: Key { kind: KeyKind::Char, .. } } => Some((*id, None)),
+        _ => None,
+    };
+    if let Some((id, enter)) = input {
+        BROWSERS.with_borrow_mut(|m| {
+            if let Some(e) = m.get_mut(&id) {
+                e.input_at = Some(Instant::now());
+                if let Some(enter) = enter {
+                    e.enter_last = enter;
+                    e.link_armed = true;
+                }
+            }
+        });
+    }
+    if let Request::Eval { id, gesture: true, .. } = &req {
+        BROWSERS.with_borrow_mut(|m| {
+            if let Some(e) = m.get_mut(id) {
+                e.enter_last = false;
+                e.link_armed = true;
+            }
+        });
     }
     match req {
         Request::Create {
@@ -644,7 +695,17 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
             let devtools = browser
                 .host()
                 .and_then(|h| h.add_dev_tools_message_observer(Some(&mut HostDevTools::new(id))));
-            let entry = Entry { browser, view, _devtools: devtools, eval: EvalState::default(), opener: None, input_at: None };
+            let entry = Entry {
+                browser,
+                view,
+                _devtools: devtools,
+                eval: EvalState::default(),
+                opener: None,
+                input_at: None,
+                enter_last: false,
+                link_armed: false,
+                links: Vec::new(),
+            };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
         None => emit(&Event::LoadError {
@@ -712,7 +773,19 @@ fn open_popup(
     let (Some(window_info), Some(client), Some(settings)) = (window_info, client, settings) else {
         return false;
     };
-    let Some((id, view)) = admit_popup(opener, Some(cef_id), url, kind, features) else {
+    // A link `open_link` opens through `window.open` keeps the kind and
+    // owner its click had.
+    let link = BROWSERS.with_borrow_mut(|m| {
+        let e = m.get_mut(&opener)?;
+        e.links.retain(|l| l.at.elapsed() < INPUT_ACTIVATION);
+        let i = e.links.iter().position(|l| l.url == url)?;
+        Some(e.links.remove(i))
+    });
+    let (kind, from_input) = match link {
+        Some(l) => (l.kind, l.from_input),
+        None => (kind, from_input(opener)),
+    };
+    let Some((id, view)) = admit_popup(opener, cef_id, url, kind, from_input, features) else {
         return false;
     };
     *window_info = self::window_info();
@@ -723,53 +796,86 @@ fn open_popup(
 
 /// Page `opener` asked for `url` in a new tab or window from a link clicked
 /// with a modifier or the middle button (CEF's `OnOpenURLFromTab`, which
-/// would load it in place). Open it as a pop-up of `kind`: a page of its own,
-/// with no `window.opener`. Returns whether the opener's own load of it is
-/// cancelled.
-fn open_link(opener: u64, url: String, kind: PopupKind, gesture: bool) -> bool {
-    // The new page loads `url` as if typed, which skips the checks Chromium
-    // makes on a page's own navigations to other schemes; a plain click's
-    // load keeps them.
+/// would load it in place); `main` is whether the link is in its main
+/// frame. Returns whether the opener's own load of it is cancelled.
+///
+/// It reopens the link with `window.open(url, '_blank', 'noopener')` from a
+/// gesture eval in the opener's isolated world, so the page loads as one the
+/// opener asked for (its referrer and cookie rules, its sandbox flags), and
+/// `on_before_popup` places it as a pop-up of `kind`: a page of its own, with
+/// no `window.opener`. A form that posts to `url` is submitted again in place
+/// instead (a new page can't be made to post it, and CEF's in-place load
+/// drops the body): the one whose submit button has the focus, or after
+/// Enter, the one whose field has it.
+fn open_link(opener: u64, main: bool, url: String, kind: PopupKind, gesture: bool) -> bool {
+    // The eval reaches only the main frame, whose sandbox flags may be
+    // laxer than the link's frame's.
+    if !main {
+        return true;
+    }
+    // Other schemes load as a plain click on them does (`about:blank`,
+    // `mailto:`).
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return false;
     }
-    // Chromium blocks a new window opened without user activation.
-    if !gesture {
-        return true;
-    }
-    let Some((id, view)) = admit_popup(opener, None, url.clone(), kind, None) else {
-        return true;
+    let Some((enter, armed)) = BROWSERS.with_borrow(|m| m.get(&opener).map(|e| (e.enter_last, e.link_armed))) else {
+        return false;
     };
-    let made = browser_host_create_browser(
-        Some(&window_info()),
-        Some(&mut new_client(id, &view)),
-        Some(&CefString::from(url.as_str())),
-        Some(&browser_settings()),
-        None,
-        None,
-    );
-    if made == 0 && PENDING.with_borrow_mut(|m| m.remove(&id)).is_some() {
-        emit(&Event::Closed { id });
+    // Chromium blocks a new window opened without user activation; a page
+    // can't spend one press on several.
+    if !gesture || !armed {
+        return true;
     }
+    let from_input = from_input(opener);
+    let link = Link { url: url.clone(), kind, from_input, at: Instant::now() };
+    BROWSERS.with_borrow_mut(|m| {
+        if let Some(e) = m.get_mut(&opener) {
+            e.link_armed = false;
+            e.links.push(link);
+        }
+    });
+    eval_as(opener, 0, link_script(&url, enter), true, true);
     true
 }
 
-/// Admit a pop-up page `opener` is opening to `url`: it is a person's when
-/// their input reached the opener within [`INPUT_ACTIVATION`], else an
-/// agent's, refused past [`MAX_POPUPS`]. Announces it as [`Event::Popup`] and
-/// returns its id and view, waiting in `PENDING` until its browser exists;
-/// `None` when refused or the opener is gone.
+/// The eval [`open_link`] runs for `url`; `enter` when Enter was the last
+/// key, so a focused field's form may be what asked (with its first submit
+/// button, as Enter submits).
+fn link_script(url: &str, enter: bool) -> String {
+    let url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ const url = {url}; const el = document.activeElement; const form = el && el.form; \
+         const submits = e => e.type === 'submit' || e.type === 'image'; \
+         const by = !form ? undefined : submits(el) ? el : {enter} ? [...form.elements].find(submits) || null : undefined; \
+         if (by !== undefined) {{ \
+         const method = by && by.hasAttribute('formmethod') ? by.formMethod : form.method; \
+         const action = by && by.hasAttribute('formaction') ? by.formAction : form.action; \
+         if (method === 'post' && action === url) {{ form.requestSubmit(by); return 'posted'; }} }} \
+         window.open(url, '_blank', 'noopener'); return 'opened'; }})()"
+    )
+}
+
+/// Whether a person's input reached page `opener` within
+/// [`INPUT_ACTIVATION`], so a pop-up it opens now is theirs.
+fn from_input(opener: u64) -> bool {
+    BROWSERS.with_borrow(|m| {
+        m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
+    })
+}
+
+/// Admit a pop-up page `opener` is opening to `url`, a person's when
+/// `from_input` (else an agent's, refused past [`MAX_POPUPS`]). Announces it
+/// as [`Event::Popup`] and returns its id and view, waiting in `PENDING`
+/// until its browser exists; `None` when refused or the opener is gone.
 fn admit_popup(
     opener: u64,
-    cef_id: Option<c_int>,
+    cef_id: c_int,
     url: String,
     kind: PopupKind,
+    from_input: bool,
     features: Option<&PopupFeatures>,
 ) -> Option<(u64, SharedView)> {
     let parent = view(opener)?;
-    let from_input = BROWSERS.with_borrow(|m| {
-        m.get(&opener).and_then(|e| e.input_at).is_some_and(|t| t.elapsed() < INPUT_ACTIVATION)
-    });
     // The app shows a person's new tab or window as a tab of its own, as a
     // browser does: it outlives its opener.
     let tab = from_input && kind != PopupKind::Popup;
@@ -829,6 +935,9 @@ fn popup_created(id: u64, b: &Browser) {
         eval: EvalState::default(),
         opener: (!p.tab).then_some(p.opener),
         input_at: None,
+        enter_last: false,
+        link_armed: false,
+        links: Vec::new(),
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
     // Its opener closed meanwhile, or the host is quitting.
@@ -846,7 +955,7 @@ fn popup_created(id: u64, b: &Browser) {
 /// CEF dropped pop-up `cef_id` of page `opener` before making it.
 fn popup_aborted(opener: u64, cef_id: c_int) {
     let id = PENDING.with_borrow_mut(|m| {
-        let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == Some(cef_id)).map(|(id, _)| *id)?;
+        let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == cef_id).map(|(id, _)| *id)?;
         m.remove(&id);
         Some(id)
     });
@@ -1285,7 +1394,7 @@ wrap_request_handler! {
         fn on_open_urlfrom_tab(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             target_url: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
             user_gesture: c_int,
@@ -1296,7 +1405,8 @@ wrap_request_handler! {
                 WindowOpenDisposition::NEW_WINDOW => PopupKind::Window,
                 _ => return 0,
             };
-            open_link(self.id, string(target_url), kind, user_gesture != 0) as c_int
+            let main = frame.is_some_and(|f| f.is_main() != 0);
+            open_link(self.id, main, string(target_url), kind, user_gesture != 0) as c_int
         }
     }
 }
