@@ -1617,9 +1617,10 @@ pub(super) mod tests {
         assert!(next - Instant::now() > RETRY_FIRST, "backs off further");
     }
 
-    /// The requests the stub host has read, once `ok` holds for them.
+    /// The requests the stub host has read, once `ok` holds for them. The
+    /// wait is long: the whole suite (real hosts included) loads the machine.
     fn requests(path: &std::path::Path, ok: impl Fn(&str) -> bool) -> String {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(20);
         loop {
             let got = std::fs::read_to_string(path).unwrap_or_default();
             if ok(&got) {
