@@ -156,12 +156,16 @@ pub enum Request {
     /// Evaluate JavaScript in the main frame, in a world isolated from the
     /// page's scripts (see [`eval_wrapper`]); answered by [`Event::EvalResult`].
     /// The expression may return a promise; its settled value is reported.
-    /// It runs as a user gesture, so it can do what a click can (open a
-    /// pop-up).
     Eval {
         id: u64,
         req: u64,
         js: String,
+        /// Run it as a user gesture, so it can do what a click can (open a
+        /// pop-up). The activation is the frame's: the page's own scripts
+        /// can spend it too (write the clipboard, open pop-ups) and can
+        /// tell it came.
+        #[serde(default)]
+        gesture: bool,
     },
 }
 
@@ -258,7 +262,9 @@ pub enum Event {
         url: String,
         /// A `Mouse` press or a `Key` reached the opener within the last 5 s
         /// (as long as Chromium's user activation lasts), so it answers that
-        /// input; otherwise an eval opened it.
+        /// input. Otherwise the activation that opened it came from a
+        /// gesture eval: the eval opened it, or the page's own script did
+        /// with that eval's activation.
         from_input: bool,
         /// Its initial physical size: what the page asked for, else the opener's.
         width: u32,

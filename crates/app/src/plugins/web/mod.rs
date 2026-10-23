@@ -4,7 +4,7 @@
 //! A pop-up is a page of its own, so it keeps `window.opener`. One a person
 //! opened (a press or key reached the page) floats over its opener's page
 //! with a close button, the opener still live beside it. One an agent opened
-//! (an eval) stays hidden: the app keeps it as a hidden surface the agent
+//! (through a gesture eval's activation) stays hidden: the app keeps it as a hidden surface the agent
 //! drives ([`WebView::take_spawned`]). Either goes when it closes itself.
 //!
 //! Pages render in the out-of-process CEF host (`ghostrealm-web-host`, see
@@ -346,12 +346,20 @@ impl Plugin for WebPlugin {
                 ArgKind::Str,
                 "expression or statements; a promise is awaited",
             ))
+            .arg(ArgSpec::optional(
+                "gesture",
+                ArgKind::Bool,
+                "run as a user gesture, to do what a click can (open a pop-up). It hands the \
+                 page a user activation its own scripts can use too (write the clipboard, open \
+                 pop-ups) and can see. Default false",
+            ))
             .arg(id_arg())
             .hidden(),
             Box::new(|s: &mut AppState, a| {
                 let js = a.get_str("js")?.to_string();
+                let gesture = a.get_bool("gesture").unwrap_or(false);
                 target(s, a)?
-                    .eval(&js)
+                    .eval(&js, gesture)
                     .map(CmdOutcome::msg)
                     .map_err(CmdError::Failed)
             }),
@@ -733,11 +741,12 @@ impl WebView {
         self.sync_focus(true);
     }
 
-    /// Evaluate `js` once the page has loaded; `Ok` is the JSON-encoded value.
-    pub fn eval(&mut self, js: &str) -> Result<String, String> {
+    /// Evaluate `js` once the page has loaded, as a user gesture when
+    /// `gesture`; `Ok` is the JSON-encoded value.
+    pub fn eval(&mut self, js: &str, gesture: bool) -> Result<String, String> {
         match self.with_host(|h, id| {
             h.wait_loaded(id, LOAD_WAIT);
-            h.eval(id, js, REPLY_WAIT)
+            h.eval_as(id, js, gesture, REPLY_WAIT)
         }) {
             Some(r) => r,
             None => Err(self.no_host()),
@@ -1911,7 +1920,7 @@ pub(super) mod tests {
             v.floating.is_empty()
         });
         assert!(!v.float_keys);
-        assert_eq!(v.eval("document.body.dataset.got"), Ok("\"from the popup;\"".into()));
+        assert_eq!(v.eval("document.body.dataset.got", false), Ok("\"from the popup;\"".into()));
         drop(v);
         drop(plugin);
 
@@ -1926,9 +1935,16 @@ pub(super) mod tests {
             registry.execute(id, &a, s).map(|o| o.message.unwrap_or_default())
         };
         let eval = |id: u64, js: &str| vec![("id", Value::Int(id as i64)), ("js", Value::Str(js.into()))];
+        let gesture = |id: u64, js: &str| {
+            let mut a = eval(id, js);
+            a.push(("gesture", Value::Bool(true)));
+            a
+        };
         run(&mut s, "web.new", vec![("url", Value::Str(format!("{base}/opener")))]).unwrap();
         let opener = s.focused_surface().unwrap();
-        let opened = run(&mut s, "web.eval", eval(opener.0, "window.open('/stay') !== null"));
+        let blocked = run(&mut s, "web.eval", eval(opener.0, "window.open('/stay') !== null"));
+        assert_eq!(blocked, Ok("false".into()), "an eval is no user gesture by default");
+        let opened = run(&mut s, "web.eval", gesture(opener.0, "window.open('/stay') !== null"));
         assert_eq!(opened, Ok("true".into()));
         s.pump_all();
         let tree = s.describe();

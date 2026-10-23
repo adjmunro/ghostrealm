@@ -116,6 +116,8 @@ struct PendingEval {
     id: u64,
     req: u64,
     js: String,
+    /// Run it as a user gesture.
+    gesture: bool,
     started: Instant,
     step: Step,
     /// The world this eval made (before `Disable`) or runs in (`Evaluate`).
@@ -174,12 +176,13 @@ fn with_eval_state<T>(id: u64, f: impl FnOnce(&mut EvalState) -> T) -> Option<T>
 /// It runs in an isolated world addressed by its `uniqueId`, which (unlike an
 /// `executionContextId`) can't name a context in another renderer process
 /// after a navigation, so the script never lands in the page's own world.
-fn start_eval(id: u64, req: u64, js: String) {
+fn start_eval(id: u64, req: u64, js: String, gesture: bool) {
     expire_evals();
     let e = PendingEval {
         id,
         req,
         js,
+        gesture,
         started: Instant::now(),
         step: Step::Enable,
         world: None,
@@ -257,8 +260,8 @@ fn evaluate(mut e: PendingEval, world: String) {
         "expression": expression,
         "uniqueContextId": world,
         "awaitPromise": true,
-        // Lets the script do what a click could (open a pop-up, ...).
-        "userGesture": true,
+        // Gives the frame (page scripts too) a user activation.
+        "userGesture": e.gesture,
         "returnByValue": true,
         "silent": true,
     });
@@ -582,7 +585,7 @@ pub fn handle(req: Option<Request>) {
                 text: String::new(),
             }),
         },
-        Request::Eval { id, req, js } => start_eval(id, req, js),
+        Request::Eval { id, req, js, gesture } => start_eval(id, req, js, gesture),
     }
 }
 

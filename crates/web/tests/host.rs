@@ -459,8 +459,12 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0 }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
 
-    // An eval opens it.
-    let opened = host.eval(1, "window.open('/stay') !== null", Duration::from_secs(5));
+    // An eval is no user gesture unless asked; a gesture eval opens it.
+    let blocked = host.eval(1, "window.open('/stay') !== null", Duration::from_secs(5));
+    assert_eq!(blocked, Ok("false".into()));
+    let activation = "navigator.userActivation.isActive";
+    assert_eq!(host.eval(1, activation, Duration::from_secs(5)), Ok("false".into()));
+    let opened = host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5));
     assert_eq!(opened, Ok("true".into()));
     let [p] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
     assert!(!p.from_input, "{p:?}");
@@ -481,7 +485,7 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     wait_closed(&host, p.id);
 
     // Closing the opener closes the pop-ups it still has.
-    assert_eq!(host.eval(1, "window.open('/stay') !== null", Duration::from_secs(5)), Ok("true".into()));
+    assert_eq!(host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)), Ok("true".into()));
     let [q] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
     assert!(host.send(&Request::Close { id: 1 }));
     wait_closed(&host, 1);

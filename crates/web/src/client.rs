@@ -371,11 +371,18 @@ impl WebHost {
     ///
     /// [`eval_wrapper`]: crate::protocol::eval_wrapper
     pub fn eval(&self, id: u64, js: &str, timeout: Duration) -> Result<String, String> {
+        self.eval_as(id, js, false, timeout)
+    }
+
+    /// [`eval`](Self::eval), as a user gesture when `gesture` (see
+    /// [`Request::Eval`]).
+    pub fn eval_as(&self, id: u64, js: &str, gesture: bool, timeout: Duration) -> Result<String, String> {
         let req = self.expect_reply(id);
         if !self.send(&Request::Eval {
             id,
             req,
             js: js.to_string(),
+            gesture,
         }) {
             self.forget_reply(req);
             return Err("web host is not running".into());
@@ -604,6 +611,7 @@ mod tests {
             id: 1,
             req: 0,
             js: "x".repeat(1000),
+            gesture: false,
         };
         let start = Instant::now();
         // Far more than the pipe holds.
