@@ -1310,8 +1310,10 @@ wrap_load_handler! {
             if error_code == Errorcode::ABORTED || !frame.is_some_and(|f| f.is_main() != 0) {
                 return;
             }
-            // The error page is a document of its own, which `on_load_start`
-            // isn't told of.
+            // A navigation that fails commits an error page, which
+            // `on_load_start` isn't told of. A committed document whose load
+            // fails part-way comes here too, after its `on_load_start`: the
+            // extra count only drops its pending link evals.
             BROWSERS.with_borrow_mut(|m| m.get_mut(&self.id).map(|e| e.document += 1));
             emit(&Event::LoadError { id: self.id, url: string(failed_url), error: string(error_text) });
         }

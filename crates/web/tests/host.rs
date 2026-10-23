@@ -52,7 +52,7 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
             status = host.exit_status();
         }
         panic!(
-            "host never became ready: failure {:?}, exited {}, status {status:?}",
+            "host never became ready: failure {:?}, stdout closed {}, status {status:?}",
             host.failure(),
             !host.is_alive()
         );
@@ -1099,6 +1099,7 @@ fn a_modified_click_does_not_open_from_an_error_page() {
         }
     }
     assert!(heard(), "the page never heard a click");
+    let clicked = Instant::now();
     // A port nothing listens on.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     assert!(host.send(&Request::Navigate { id: 1, url: format!("http://{closed}/") }));
@@ -1107,7 +1108,8 @@ fn a_modified_click_does_not_open_from_an_error_page() {
         assert!(Instant::now() < deadline, "the load never failed");
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(4000));
+    // The eval's delay, and as long again for a pop-up it opened to arrive.
+    std::thread::sleep((clicked + Duration::from_secs(6)).saturating_duration_since(Instant::now()));
     assert!(host.take_popups(1).is_empty());
     assert!(!hits.lock().unwrap().iter().any(|h| h.path == "/hit-error"), "{:?}", hits.lock().unwrap());
 

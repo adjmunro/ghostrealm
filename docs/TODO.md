@@ -1351,8 +1351,13 @@
   `feat/web-modified-link-clicks`, which grew the suite from 12 hosts at
   once to 21. A third, with two suites running at once, said `failure:
   None` about 9.6 s in: the host exited without reporting a failure. The
-  assertion now says whether it exited and its exit status (a signal
-  shows there); run with `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
+  assertion now prints the exit status: under heavy load it read `failure
+  None, stdout closed true, status Some(ExitStatus(unix_wait_status(9)))`,
+  so the host is SIGKILLed, with nothing in the system log. Guessed
+  senders: jetsam (memory pressure), or Chromium's ProcessSingleton killing
+  an "unresponsive" holder of a stale profile lock (thousands of leaked
+  profiles make a reused name possible). Run with `GHOSTREALM_WEB_DEBUG=1`
+  to see its stderr.
 - Reason: a flaky test hides real failures.
 
 ---
