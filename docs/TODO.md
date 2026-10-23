@@ -1340,20 +1340,17 @@
 
 ---
 
-[2026-10-24@48bff23e] Web — pop-up edge cases left open
+[2026-10-23T20:50+1300@ebebcfd4] Web — host test can hear its pop-up twice
 
 - Requires: NO BLOCKERS
-- Detail: A person's new tab is closed, not kept, when its opener is closed
-  (Cmd+W, or a floating pop-up's close button) before the app adopts the tab
-  or before its `Popup` event arrives (a few ms). DECISION.md says such a tab
-  outlives its opener. Adopt it as a tab instead (`client.rs` `forget` and
-  the late-`Popup` branch; `web/mod.rs` `drop_closed_floating`).
-- Detail: A page the app created that closes itself stays as a dead tab
-  (empty title; evals answer "unknown browser"): `WebView::is_closed` is
-  false while `!host_made`. Remove the tab once its pop-ups are placed.
-- Detail: Tests: `popups_with_the_real_host` re-clicks after 2 s without
-  closing an extra pop-up, so a slow first click fails its `dataset.got`
-  assertion; `crates/web/tests/host.rs` hard-codes `POPUP_IDS + 1` for its
-  second case, which can wait on an extra pop-up's id and pass without
-  testing the forgotten-opener close.
-- Reason: found in review; none leaves a host browser running.
+- Detail: `click_for_popup` (`crates/web/tests/host.rs`) clicks again after
+  2 s with no pop-up. A slow first click then calls `window.open('/popup',
+  'p')` twice: the second opens another pop-up or reloads the named one,
+  either posting to the opener again, so
+  `a_clicked_popup_keeps_its_opener_and_closes_itself` can see
+  `"from /popup;from /popup;"`. Closing the extra pop-up comes too late.
+  Click again only while the page heard no click, as `click_until` and
+  `popups_with_the_real_host` do.
+- Reason: found while fixing the app's real-host test; not verified, as the
+  host can't start in the agent sandbox (Chromium's profile lock binds a
+  Unix socket).
