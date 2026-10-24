@@ -1144,7 +1144,7 @@ impl State {
         // against.
         let registry = build_registry();
         let catalogue = Arc::new(crate::settings::catalogue(&registry));
-        let cfg = ghostrealm_core::config::load_or_create(&catalogue).unwrap_or_default();
+        let cfg = load_config(&catalogue).and_then(|l| l.config).unwrap_or_default();
         // Only a full DB (the synchronous load) can say a family isn't installed.
         let full_db = mono_family.is_none();
         pin_preview_serif(font_system.db_mut(), cfg.editor.preview_font.as_deref(), &serif_alias, full_db);
@@ -1338,7 +1338,7 @@ impl State {
     /// truth). A file that doesn't parse leaves the current config in place.
     fn reload_config(&mut self) {
         self.config_watch.mark_seen();
-        if let Some(cfg) = ghostrealm_core::config::load_or_create(&self.catalogue) {
+        if let Some(cfg) = load_config(&self.catalogue).and_then(|l| l.config) {
             self.apply_config(cfg);
             self.window.request_redraw();
         }
@@ -1354,7 +1354,7 @@ impl State {
         let mut changed = false;
         let loaded = self.config_watch.poll(|| {
             changed = true;
-            ghostrealm_core::config::load_or_create(&catalogue)
+            load_config(&catalogue).and_then(|l| l.config)
         });
         if let Some(cfg) = loaded {
             self.apply_config(cfg);
@@ -5210,6 +5210,16 @@ fn installed_family(db: &glyphon::cosmic_text::fontdb::Database, name: &str) -> 
         .flat_map(|face| face.families.iter().map(|(family, _)| family))
         .find(|family| family.eq_ignore_ascii_case(name) || family.eq_ignore_ascii_case(&hidden))
         .cloned()
+}
+
+/// Load the config file, printing what the load found to stderr. `None`
+/// when there is no config path.
+fn load_config(catalogue: &Catalogue) -> Option<ghostrealm_core::config::Loaded> {
+    let loaded = ghostrealm_core::config::load_or_create(catalogue)?;
+    for line in loaded.report.log_lines() {
+        eprintln!("{line}");
+    }
+    Some(loaded)
 }
 
 /// Point `Family::Serif` (the Preview's body face, `Font::SERIF`) at

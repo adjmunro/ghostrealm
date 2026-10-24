@@ -242,7 +242,10 @@ functions, so tests paint them with a bare `Frame`.
 - `core::config::load_or_create` returns `Loaded { config: Option<Config>,
   report: Report }`, where `Report { path, read_error: Option<String>,
   findings: Vec<(usize, usize, Severity, String)> }` (line, col). It prints
-  nothing.
+  nothing. As built: `load_or_create` returns `Option<Loaded>` (`None` with
+  no config path, as `ensure_file`), and `load(path, cat) -> Loaded` does the
+  reading, so tests load a temp file. `Report::log_lines()` gives the stderr
+  lines; the window's `load_config` prints them.
 - The window prints the same stderr lines as today. When the report has
   problems, it pushes one toast with key `config`:
   - not applied (unreadable, or not valid TOML: `config` is `None`): error,

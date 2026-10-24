@@ -512,28 +512,70 @@ pub fn ensure_file() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Read the config file (see [`ensure_file`]). Findings go to stderr. `None`
-/// when the file can't be read or isn't valid TOML: the caller keeps the config
-/// it has.
-pub fn load_or_create(cat: &Catalogue) -> Option<Config> {
-    let path = ensure_file()?;
+/// What loading the config file found.
+#[derive(Debug)]
+pub struct Loaded {
+    /// `None` when the file can't be read or isn't valid TOML: the caller
+    /// keeps the config it has.
+    pub config: Option<Config>,
+    pub report: Report,
+}
+
+/// The problems a load found in the config file.
+#[derive(Debug)]
+pub struct Report {
+    pub path: PathBuf,
+    /// Why the file couldn't be read.
+    pub read_error: Option<String>,
+    /// Each finding: 1-based line and column (in chars), severity, message.
+    pub findings: Vec<(usize, usize, Severity, String)>,
+}
+
+impl Report {
+    /// Whether the load found anything to tell the user.
+    pub fn has_problems(&self) -> bool {
+        self.read_error.is_some() || !self.findings.is_empty()
+    }
+
+    /// One line per problem, for stderr.
+    pub fn log_lines(&self) -> Vec<String> {
+        let path = self.path.display();
+        let read = self.read_error.iter().map(|e| format!("ghostrealm: can't read {path}: {e}"));
+        let found = self.findings.iter().map(|(line, col, severity, message)| {
+            let level = match severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+            };
+            format!("{path}:{line}:{col}: {level}: {message}")
+        });
+        read.chain(found).collect()
+    }
+}
+
+/// Read the config file (see [`ensure_file`]). `None` when there is no
+/// config path (no home directory).
+pub fn load_or_create(cat: &Catalogue) -> Option<Loaded> {
+    Some(load(ensure_file()?, cat))
+}
+
+/// Read and check the config file at `path`.
+pub fn load(path: PathBuf, cat: &Catalogue) -> Loaded {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) => {
-            eprintln!("ghostrealm: can't read {}: {e}", path.display());
-            return None;
+            let report = Report { path, read_error: Some(e.to_string()), findings: Vec::new() };
+            return Loaded { config: None, report };
         }
     };
-    let (cfg, findings) = parse(&text, cat);
-    for f in &findings {
-        let (line, col) = line_col(&text, f.span.start);
-        let level = match f.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        eprintln!("{}:{line}:{col}: {level}: {}", path.display(), f.message);
-    }
-    cfg
+    let (config, findings) = parse(&text, cat);
+    let findings = findings
+        .into_iter()
+        .map(|f| {
+            let (line, col) = line_col(&text, f.span.start);
+            (line, col, f.severity, f.message)
+        })
+        .collect();
+    Loaded { config, report: Report { path, read_error: None, findings } }
 }
 
 /// 1-based line and column (in chars) of byte `offset` in `text`.
@@ -660,6 +702,43 @@ mod tests {
         let (cfg, _) = parse("[tabs]\n", &cat());
         assert!(cfg.unwrap().keybindings.is_empty());
     }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ghostrealm-config-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_load_reports_each_findings_line_column_and_severity() {
+        let path = tmp("clamp").join("config.toml");
+        std::fs::write(&path, "[terminal]\nfont_size = 1000\n").unwrap();
+        let loaded = load(path.clone(), &cat());
+        assert_eq!(loaded.config.unwrap().terminal.font_size, 96.0, "clamped and applied");
+        let r = loaded.report;
+        assert!(r.read_error.is_none());
+        assert_eq!(r.findings.len(), 1, "{:?}", r.findings);
+        let (line, col, severity, message) = &r.findings[0];
+        assert_eq!((*line, *severity), (2, Severity::Warning));
+        assert!(*col > 1 && message.contains("clamped"), "{col} {message}");
+        assert!(r.has_problems());
+        assert_eq!(r.log_lines(), [format!("{}:2:{col}: warning: {message}", path.display())]);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_and_not_applied() {
+        let loaded = load(tmp("unreadable"), &cat());
+        assert!(loaded.config.is_none());
+        assert!(loaded.report.read_error.is_some());
+        assert!(loaded.report.log_lines()[0].starts_with("ghostrealm: can't read "));
+    }
+
+    #[test]
+    fn a_clean_load_has_no_problems() {
+        let path = tmp("clean").join("config.toml");
+        std::fs::write(&path, "[terminal]\nfont_size = 14\n").unwrap();
+        let loaded = load(path, &cat());
+        assert!(loaded.config.is_some());
+        assert!(!loaded.report.has_problems());
+    }
 }
-
-
