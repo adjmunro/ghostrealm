@@ -14,15 +14,16 @@
 - Before adding or changing a surface kind (terminal, editor, file browser, ...), read [`PLUGINS.md`](docs/PLUGINS.md).
 - Before mutating source control, read [`GIT.md`](docs/GIT.md)!
 
-## Skills
+## Roles & Skills
 
-- Conditional rules (building, toolchain pins, web host, sandbox, verifying the app) live in micro-skills under `.claude/skills/` and load when their description matches the task.
+- Sessions start as 🎬 Director. Roles live in `.claude/agents/`; the roster and how to take a role are in [`.claude/agents/README.md`](.claude/agents/README.md).
+- Conditional rules (building, toolchain pins, web host, sandbox, verifying the app, flagging decisions for the owner) live in micro-skills under `.claude/skills/` and load when their description matches the task.
 
 ## Editing Agents.md
 
 > Agents.md is a record of **mistakes**.
 
-Record each lesson in the narrowest place: a micro-skill (`.claude/skills/`) when it applies only in some situations, this file only when every task needs it.
+Record each lesson in the narrowest place: a micro-skill (`.claude/skills/`) when it applies only in some situations, a role file when it applies to one role, this file only when every task needs it.
 
 You may edit these files if:
 
