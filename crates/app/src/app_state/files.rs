@@ -58,7 +58,7 @@ impl AppState {
         if !file_ops::is_web_url(url) {
             bail!("not opening {url}: only http, https, and mailto links open outside the app");
         }
-        self.system.open_url(url)
+        self.system.open_url(url).with_context(|| format!("can't open {url}"))
     }
 
     /// The file menu for `target`.

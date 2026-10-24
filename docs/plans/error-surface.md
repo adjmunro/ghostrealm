@@ -509,6 +509,14 @@ Where the build differs from the design above:
     toasts on the focused pane until commit 17 shows it inline.
   - Command and file-job toasts read "<command title>: <error>"; a
     confirmation's toast is its error, capitalised.
+- Commit 14:
+  - The opens live on `AppState` (`open_requested_file`, `show_requested`,
+    `open_requested_url`, `open_requested_plugin`), so their toasts are
+    tested without a window.
+  - A refused open's toast is its error, capitalised: the file's error
+    already names it ("Can't edit <path>: …"). `open_url` adds "can't open
+    <url>" to a system handler's failure, so both of its errors name the
+    URL.
 
 ## Risks
 

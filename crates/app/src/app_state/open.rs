@@ -4,14 +4,60 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ghostrealm_core::{SurfaceId, VtabId};
+use ghostrealm_core::{PaneId, SurfaceId, VtabId};
 
-use super::AppState;
+use super::{capitalized, AppState};
 use crate::plugin::{OpenCx, View};
 use crate::plugins::editor;
 use crate::plugins::files::{self, FilesView};
+use crate::toasts::{Level, Scope, Toast};
 
+/// Opens a view or the user asked for. A refusal (a file that isn't text, a
+/// link that isn't the web's) goes to stderr and to an error toast on the
+/// pane it was asked from.
 impl AppState {
+    /// Open `path` as surface `from` asked ([`Self::open_file_from`]; its
+    /// error names the file).
+    pub fn open_requested_file(&mut self, from: SurfaceId, path: &Path) {
+        let scope = self.scope_of(Some(from));
+        let opened = self.open_file_from(from, path);
+        self.refused(scope, opened);
+    }
+
+    /// Show `path` in the sidebar as surface `from` asked
+    /// ([`Self::show_in_browser`]).
+    pub fn show_requested(&mut self, from: SurfaceId, path: &Path) {
+        let scope = self.scope_of(Some(from));
+        let shown = self.show_in_browser(path);
+        self.refused(scope, shown.with_context(|| format!("couldn't show {} in the sidebar", file_name(path))));
+    }
+
+    /// Open `url` as surface `from` asked ([`Self::open_url`]; its error
+    /// names the URL).
+    pub fn open_requested_url(&mut self, from: SurfaceId, url: &str) {
+        let scope = self.scope_of(Some(from));
+        let opened = self.open_url(url);
+        self.refused(scope, opened);
+    }
+
+    /// Open plugin `id` from the "nothing open" screen: in `pane` of
+    /// workspace `vt` ([`Self::open_plugin_in_pane`]), else the focused pane.
+    pub fn open_requested_plugin(&mut self, at: Option<(VtabId, PaneId)>, id: &str) {
+        let title = self.plugins.iter().find(|p| p.id() == id).map_or(id, |p| p.title());
+        let (scope, opened) = match at {
+            Some((vt, pane)) => (Scope::Pane(pane), self.open_plugin_in_pane(vt, pane, id)),
+            None => (self.scope_of(None), self.open_plugin_in_focused(id)),
+        };
+        self.refused(scope, opened.with_context(|| format!("couldn't open {title}")));
+    }
+
+    fn refused(&mut self, scope: Scope, result: Result<()>) {
+        if let Err(e) = result {
+            eprintln!("ghostrealm: {e:#}");
+            self.notify(Toast::new(Level::Error, capitalized(&format!("{e:#}"))).on(scope));
+        }
+    }
+
     /// Open `path` from outside any Files surface (the palette, a link,
     /// `file.open`, the agent): in a Files surface of the active workspace
     /// with a tab of it already (that tab shown), else the focused one, else
@@ -201,6 +247,11 @@ impl AppState {
     }
 }
 
+/// `path`'s last part, to name it in a toast.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +288,33 @@ mod tests {
 
     fn edit(s: &mut AppState, sid: SurfaceId) {
         assert!(s.views.get_mut(&sid).unwrap().write_input(b"new "));
+    }
+
+    #[test]
+    fn a_refused_sidebar_open_toasts_on_the_sidebars_pane() {
+        let (mut s, d) = app("open-refused");
+        std::fs::write(d.join("latin1.txt"), b"caf\xe9").unwrap();
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let (_, pane) = s.pane_of(sid).unwrap();
+        s.split_focused(ghostrealm_core::Axis::LeftRight).unwrap();
+        assert_ne!(s.focused_pane().map(|(_, p)| p), Some(pane));
+        s.open_requested_file(sid, &d.join("latin1.txt"));
+        let toast = &s.toasts().head().expect("a toast").toast;
+        assert_eq!((toast.level, toast.scope), (Level::Error, Scope::Pane(pane)));
+        assert!(toast.message.starts_with("Can't edit "), "{}", toast.message);
+        assert_eq!(toast.message.matches("latin1.txt").count(), 1, "{}", toast.message);
+    }
+
+    #[test]
+    fn a_link_that_isnt_the_webs_toasts_once_naming_it() {
+        let (mut s, d) = app("open-url-refused");
+        s.open_file(&d.join("a.txt")).unwrap();
+        let sid = s.focused_surface().unwrap();
+        s.open_requested_url(sid, "ftp://example.com/x");
+        let message = &s.toasts().head().expect("a toast").toast.message;
+        assert!(message.starts_with("Not opening ftp://example.com/x: "), "{message}");
+        assert_eq!(message.matches("ftp://").count(), 1, "{message}");
     }
 
     #[test]

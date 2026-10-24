@@ -1600,13 +1600,6 @@ impl State {
         Duration::from_millis(self.cfg.input.double_click_ms as u64)
     }
 
-    /// Open a file view `sid` asked for, in a Files surface.
-    fn open_requested_file(&mut self, sid: SurfaceId, path: std::path::PathBuf) {
-        if let Err(e) = self.app.open_file_from(sid, &path) {
-            eprintln!("ghostrealm: open {}: {e:#}", path.display());
-        }
-    }
-
     /// Height of the custom title-bar strip in physical pixels. macOS renders its
     /// own strip (title + sidebar toggle) over a full-size content view; other
     /// platforms keep the native title bar and reserve nothing.
@@ -1720,11 +1713,7 @@ impl State {
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
-            ButtonAction::OpenPlugin(vt, pane, id) => {
-                if let Err(e) = self.app.open_plugin_in_pane(vt, pane, id) {
-                    eprintln!("ghostrealm: open {id}: {e:#}");
-                }
-            }
+            ButtonAction::OpenPlugin(vt, pane, id) => self.app.open_requested_plugin(Some((vt, pane)), id),
             ButtonAction::View(sid, id) => {
                 self.view_event(sid, |v, cx| v.button(cx, id));
             }
@@ -1941,17 +1930,9 @@ impl State {
         }
         for req in out.requests {
             match req {
-                Request::OpenFile(path) => self.open_requested_file(sid, path),
-                Request::ShowInSidebar(path) => {
-                    if let Err(e) = self.app.show_in_browser(&path) {
-                        eprintln!("ghostrealm: show {}: {e:#}", path.display());
-                    }
-                }
-                Request::OpenUrl(url) => {
-                    if let Err(e) = self.app.open_url(&url) {
-                        eprintln!("ghostrealm: open {url}: {e:#}");
-                    }
-                }
+                Request::OpenFile(path) => self.app.open_requested_file(sid, &path),
+                Request::ShowInSidebar(path) => self.app.show_requested(sid, &path),
+                Request::OpenUrl(url) => self.app.open_requested_url(sid, &url),
                 Request::Saved(path) => self.saved(path),
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}
@@ -3846,9 +3827,7 @@ impl State {
                 if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
                     let i = if d == 0 { 9 } else { d as usize - 1 };
                     if let Some(id) = self.pickable_plugins().get(i).map(|(id, _)| *id) {
-                        if let Err(e) = self.app.open_plugin_in_focused(id) {
-                            eprintln!("ghostrealm: open {id}: {e:#}");
-                        }
+                        self.app.open_requested_plugin(None, id);
                         self.dirty = true;
                     }
                 }
