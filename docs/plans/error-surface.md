@@ -490,6 +490,14 @@ Where the build differs from the design above:
   - `open_save_dialog` stays private: `choose_toast` is on `AppState`.
   - `choose_toast_with(id, i, settings)` takes the config path, so tests
     don't touch the real one.
+- Commit 7 also gives save and reload errors their context: "can't save
+  <path>" and "can't reload <path>". Toast text built from them doesn't
+  repeat it.
+- Commit 12:
+  - `config_problems` lives on `AppState`, with `report_config(report,
+    applied)`, so the toast logic is tested without a window.
+  - Cmd+, with no config path toasts too, with the text the "Open
+    Settings" choice uses.
 
 ## Risks
 

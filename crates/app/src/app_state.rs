@@ -17,6 +17,7 @@ use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CloseOnExit, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
     TabStatus, Tree, VtabId,
 };
+use ghostrealm_core::config::Report;
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
@@ -251,6 +252,8 @@ pub struct AppState {
     web_idle: web::IdleExit,
     /// Notices for the user, the window shows the head of.
     toasts: Toasts,
+    /// The last config load had problems: a clean one then says so.
+    config_problems: bool,
 }
 
 impl AppState {
@@ -289,6 +292,7 @@ impl AppState {
             orphan_tabs,
             web_idle,
             toasts: Toasts::default(),
+            config_problems: false,
         }
     }
 
@@ -869,6 +873,42 @@ impl AppState {
         self.choose_toast_with(id, i, ghostrealm_core::config::ensure_file);
     }
 
+    /// Tell the user what a config load found: a toast keyed `config` when it
+    /// had problems, and "Settings applied" when it is clean after one that
+    /// had. `applied` says the load produced a config.
+    pub fn report_config(&mut self, report: &Report, applied: bool) {
+        let problems = report.has_problems();
+        let toast = match config_toast(report, applied) {
+            Some(toast) => toast,
+            None if self.config_problems => Toast::new(Level::Success, "Settings applied").keyed("config"),
+            None => return,
+        };
+        self.config_problems = problems;
+        self.notify(toast);
+    }
+
+    /// Warn that `[editor] preview_font` isn't installed (`message` says so).
+    pub fn warn_preview_font(&mut self, message: String) {
+        let open = ToastAction::OpenSettings { line: None };
+        self.notify(Toast::new(Level::Warning, message).keyed("preview_font").with_choice("Open Settings", open));
+    }
+
+    /// Open the settings file (Cmd+,), or toast why not.
+    pub fn open_settings_or_toast(&mut self, path: Option<std::path::PathBuf>) {
+        if let Err(why) = self.try_open_settings(path) {
+            eprintln!("ghostrealm: {why}");
+            self.notify(Toast::new(Level::Error, why));
+        }
+    }
+
+    /// Open the settings file at `path`, or say why it didn't open.
+    fn try_open_settings(&mut self, path: Option<std::path::PathBuf>) -> std::result::Result<(), String> {
+        match path {
+            Some(path) => self.open_settings(path.clone()).map_err(|e| format!("Couldn't open {}: {e:#}", path.display())),
+            None => Err("Couldn't open the settings file: there is no config path".to_string()),
+        }
+    }
+
     /// [`Self::choose_toast`], with the config file from `settings`.
     fn choose_toast_with(&mut self, id: u64, i: usize, settings: impl FnOnce() -> Option<std::path::PathBuf>) {
         let Some(entry) = self.toasts.get(id) else { return };
@@ -881,13 +921,7 @@ impl AppState {
                 self.toasts.dismiss(id);
             }
             ToastAction::OpenSettings { line } => {
-                let opened = match settings() {
-                    Some(path) => self
-                        .open_settings(path.clone())
-                        .map_err(|e| format!("Couldn't open {}: {e:#}", path.display())),
-                    None => Err("Couldn't open the settings file: there is no config path".to_string()),
-                };
-                match opened {
+                match self.try_open_settings(settings()) {
                     Ok(()) => {
                         if let Some(line) = line {
                             self.reveal_focused_line(line.saturating_sub(1));
@@ -2059,6 +2093,28 @@ fn can_t_save(path: &Path) -> String {
     format!("can't save {}", path.display())
 }
 
+/// The toast for a config load's problems, keyed `config` with an "Open
+/// Settings" choice at the first finding's line. `None` when it had none.
+fn config_toast(report: &Report, applied: bool) -> Option<Toast> {
+    let name = report.path.file_name().map_or_else(|| report.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let first = report.findings.first();
+    let message = match (&report.read_error, first, applied) {
+        (Some(e), _, _) => format!("can't read {name}: {e}"),
+        (None, Some((line, _, _, msg)), false) => format!("{name} line {line}: {msg}"),
+        (None, Some((line, _, _, msg)), true) if report.findings.len() > 1 => {
+            format!("{name}: {} problems. Line {line}: {msg}", report.findings.len())
+        }
+        (None, Some((line, _, _, msg)), true) => format!("{name} line {line}: {msg}"),
+        (None, None, _) => return None,
+    };
+    let (level, message) = match applied {
+        false => (Level::Error, format!("Settings not applied: {message}")),
+        true => (Level::Warning, message),
+    };
+    let open = ToastAction::OpenSettings { line: first.map(|f| f.0) };
+    Some(Toast::new(level, message).keyed("config").with_choice("Open Settings", open))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2582,6 +2638,78 @@ mod tests {
         let b = s.notify(Toast::new(Level::Error, "b"));
         r.execute("toast.dismiss", &ghostrealm_core::Args::new(), &mut s).unwrap();
         assert_eq!(s.toasts().head().map(|e| e.id), Some(b));
+    }
+
+    fn report(read_error: Option<&str>, findings: &[(usize, &str)]) -> Report {
+        use ghostrealm_core::config::Severity;
+        Report {
+            path: std::path::PathBuf::from("/home/u/.config/ghostrealm/config.toml"),
+            read_error: read_error.map(str::to_string),
+            findings: findings.iter().map(|&(line, m)| (line, 1, Severity::Warning, m.to_string())).collect(),
+        }
+    }
+
+    fn head(s: &AppState) -> (Level, String, Option<String>) {
+        let t = &s.toasts().head().expect("a toast").toast;
+        (t.level, t.message.clone(), t.key.clone())
+    }
+
+    #[test]
+    fn a_config_that_wont_parse_raises_an_error_toast_at_its_line() {
+        let mut s = AppState::new();
+        s.report_config(&report(None, &[(3, "expected `=`")]), false);
+        let key = Some("config".to_string());
+        assert_eq!(head(&s), (Level::Error, "Settings not applied: config.toml line 3: expected `=`".into(), key));
+        let choices = &s.toasts().head().unwrap().toast.choices;
+        assert!(matches!(choices[..], [(ref label, ToastAction::OpenSettings { line: Some(3) })] if label == "Open Settings"));
+    }
+
+    #[test]
+    fn an_unreadable_config_says_why() {
+        let mut s = AppState::new();
+        s.report_config(&report(Some("permission denied"), &[]), false);
+        assert_eq!(head(&s).1, "Settings not applied: can't read config.toml: permission denied");
+    }
+
+    #[test]
+    fn config_findings_raise_one_warning_naming_the_first() {
+        let mut s = AppState::new();
+        s.report_config(&report(None, &[(2, "unknown key `x`")]), true);
+        assert_eq!(head(&s).0, Level::Warning);
+        assert_eq!(head(&s).1, "config.toml line 2: unknown key `x`");
+        s.report_config(&report(None, &[(4, "a"), (9, "b")]), true);
+        assert_eq!(s.toasts().len(), 1, "the reload replaces the first");
+        assert_eq!(head(&s).1, "config.toml: 2 problems. Line 4: a");
+    }
+
+    #[test]
+    fn a_clean_config_after_problems_says_settings_applied_once() {
+        let mut s = AppState::new();
+        s.report_config(&report(None, &[]), true);
+        assert!(s.toasts().is_empty(), "clean from the start: nothing to say");
+        s.report_config(&report(None, &[(2, "a")]), true);
+        s.report_config(&report(None, &[]), true);
+        assert_eq!(s.toasts().len(), 1);
+        assert_eq!(head(&s), (Level::Success, "Settings applied".into(), Some("config".into())));
+        s.dismiss_head_toast();
+        s.report_config(&report(None, &[]), true);
+        assert!(s.toasts().is_empty());
+    }
+
+    #[test]
+    fn a_missing_preview_font_warns_once_per_key() {
+        let mut s = AppState::new();
+        s.warn_preview_font("a".into());
+        s.warn_preview_font("b".into());
+        assert_eq!(s.toasts().len(), 1);
+        assert_eq!(head(&s), (Level::Warning, "b".into(), Some("preview_font".into())));
+    }
+
+    #[test]
+    fn a_settings_file_that_wont_open_from_cmd_comma_raises_an_error() {
+        let mut s = AppState::new();
+        s.open_settings_or_toast(None);
+        assert_eq!(head(&s), (Level::Error, "Couldn't open the settings file: there is no config path".into(), None));
     }
 
     #[test]

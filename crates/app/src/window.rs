@@ -1188,10 +1188,16 @@ impl State {
         // against.
         let registry = build_registry();
         let catalogue = Arc::new(crate::settings::catalogue(&registry));
-        let cfg = load_config(&catalogue).and_then(|l| l.config).unwrap_or_default();
+        let (cfg, config_report) = match load_config(&catalogue) {
+            Some(l) => (l.config, Some(l.report)),
+            None => (None, None),
+        };
+        let config_applied = cfg.is_some();
+        let cfg = cfg.unwrap_or_default();
         // Only a full DB (the synchronous load) can say a family isn't installed.
         let full_db = mono_family.is_none();
-        pin_and_report_preview_serif(font_system.db_mut(), cfg.editor.preview_font.as_deref(), &serif_alias, full_db);
+        let missing_font =
+            pin_and_report_preview_serif(font_system.db_mut(), cfg.editor.preview_font.as_deref(), &serif_alias, full_db);
         let chrome = cfg.resolved_chrome();
         let double_tap_window = Duration::from_millis(cfg.input.double_tap_window_ms as u64);
         let (cell_w, cell_h) = measure_cell(
@@ -1214,6 +1220,12 @@ impl State {
         };
         let mut app = AppState::new().with_unsaved_guard();
         app.set_windowed(true);
+        if let Some(report) = &config_report {
+            app.report_config(report, config_applied);
+        }
+        if let Some(message) = missing_font {
+            app.warn_preview_font(message);
+        }
         let has_command = command_line.is_some();
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
@@ -1366,7 +1378,11 @@ impl State {
         let serif_changed = serif != self.cfg.editor.preview_font.as_deref();
         if serif_changed {
             let full_db = self.pending_fonts.is_none();
-            pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db);
+            if let Some(message) =
+                pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db)
+            {
+                self.app.warn_preview_font(message);
+            }
         }
         if serif_changed || (cw - self.cell_w).abs() > 0.01 || (ch - self.cell_h).abs() > 0.01 {
             self.cell_w = cw;
@@ -1385,10 +1401,19 @@ impl State {
     /// truth). A file that doesn't parse leaves the current config in place.
     fn reload_config(&mut self) {
         self.config_watch.mark_seen();
-        if let Some(cfg) = load_config(&self.catalogue).and_then(|l| l.config) {
-            self.apply_config(cfg);
+        if let Some(loaded) = load_config(&self.catalogue) {
+            self.apply_loaded(loaded);
             self.window.request_redraw();
         }
+    }
+
+    /// Report what a config load found, and apply the config it produced.
+    fn apply_loaded(&mut self, loaded: ghostrealm_core::config::Loaded) {
+        self.app.report_config(&loaded.report, loaded.config.is_some());
+        if let Some(cfg) = loaded.config {
+            self.apply_config(cfg);
+        }
+        self.dirty = true;
     }
 
     /// Reload the config if the file changed outside the app since it was last
@@ -1401,10 +1426,10 @@ impl State {
         let mut changed = false;
         let loaded = self.config_watch.poll(|| {
             changed = true;
-            load_config(&catalogue).and_then(|l| l.config)
+            load_config(&catalogue)
         });
-        if let Some(cfg) = loaded {
-            self.apply_config(cfg);
+        if let Some(loaded) = loaded {
+            self.apply_loaded(loaded);
         }
         if changed | self.app.check_open_files() {
             self.window.request_redraw();
@@ -1414,13 +1439,9 @@ impl State {
     /// Open the config file in an editor pane (creating it if absent). Saving it
     /// (Cmd+S) hot-reloads the config.
     fn open_config_editor(&mut self) {
-        if let Some(path) = ghostrealm_core::config::ensure_file() {
-            // Settings live in their own "settings" workspace, not the focused pane.
-            if let Err(e) = self.app.open_settings(path.clone()) {
-                eprintln!("ghostrealm: open {}: {e:#}", path.display());
-            }
-            self.dirty = true;
-        }
+        // Settings live in their own "settings" workspace, not the focused pane.
+        self.app.open_settings_or_toast(ghostrealm_core::config::ensure_file());
+        self.dirty = true;
     }
 
     /// Canonical chord string for the current modifiers + `c` (matches
@@ -1481,7 +1502,11 @@ impl State {
             db.set_monospace_family(fam.clone());
         }
         self.serif_alias = db.family_name(&Family::Serif).to_owned();
-        pin_and_report_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true);
+        if let Some(message) =
+            pin_and_report_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true)
+        {
+            self.app.warn_preview_font(message);
+        }
         self.text.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
         // Cell metrics should be unchanged (same pinned monospace); re-measure in
         // case the fuller DB resolves the family to a different face.
@@ -5370,16 +5395,17 @@ fn pin_preview_serif(
 }
 
 /// Pin the Preview's serif ([`pin_preview_serif`]), printing a configured
-/// family that isn't installed.
+/// family that isn't installed. Returns that message.
 fn pin_and_report_preview_serif(
     db: &mut glyphon::cosmic_text::fontdb::Database,
     configured: Option<&str>,
     alias: &str,
     report_missing: bool,
-) {
-    if let (family, Some(name)) = pin_preview_serif(db, configured, alias, report_missing) {
-        eprintln!("ghostrealm: {}", missing_preview_font(&name, &family));
-    }
+) -> Option<String> {
+    let (family, Some(name)) = pin_preview_serif(db, configured, alias, report_missing) else { return None };
+    let message = missing_preview_font(&name, &family);
+    eprintln!("ghostrealm: {message}");
+    Some(message)
 }
 
 /// What to tell the user when `[editor] preview_font` names a family that
