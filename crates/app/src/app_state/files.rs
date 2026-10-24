@@ -1212,7 +1212,9 @@ mod tests {
         let sid = open_editor(&mut s, &d.join("a.txt"));
         run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
         let err = s.accept_confirm().unwrap_err();
-        assert!(format!("{err:#}").contains("no Trash here"), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with(&format!("can't move {} to the Trash", d.join("a.txt").display())), "{msg}");
+        assert!(msg.contains("no Trash here"), "{msg}");
         assert!(d.join("a.txt").exists() && s.view(sid).is_some() && calls.borrow().is_empty());
     }
 

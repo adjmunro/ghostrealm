@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ghostrealm_core::{
     ArgKind, ArgSpec, Axis, CloseOnExit, CmdError, CmdOutcome, CommandMeta, Inbox, PaneId, Registry, SurfaceId,
     TabStatus, Tree, VtabId,
@@ -725,7 +725,7 @@ impl AppState {
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
                 let mut written = Vec::new();
                 if let Some(path) = view.path() {
-                    view.save_as(path.clone())?;
+                    view.save_as(path.clone()).with_context(|| can_t_save(&path))?;
                     written.push(path);
                 }
                 written.extend(self.save_views(&rest, then)?);
@@ -760,7 +760,7 @@ impl AppState {
                 self.ask_disk_conflict_then(*doc, docs[i + 1..].to_vec(), then);
                 return Ok(written);
             }
-            view.save_as(path.clone())?;
+            view.save_as(path.clone()).with_context(|| can_t_save(&path))?;
             written.push(path);
         }
         if let Some(then) = then {
@@ -812,9 +812,9 @@ impl AppState {
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
             Some(Confirm { then: Confirmed::DiskConflict { doc, .. }, .. }) => {
-                self.doc_mut(doc)
-                    .ok_or_else(|| anyhow::anyhow!("the view to reload has closed"))?
-                    .reload()?;
+                let view = self.doc_mut(doc).ok_or_else(|| anyhow::anyhow!("the view to reload has closed"))?;
+                let path = view.path().unwrap_or_default();
+                view.reload().with_context(|| format!("can't reload {}", path.display()))?;
             }
             _ => {}
         }
@@ -906,7 +906,8 @@ impl AppState {
             Pick::SaveAs(doc) => {
                 self.doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?
-                    .save_as(path.clone())?;
+                    .save_as(path.clone())
+                    .with_context(|| can_t_save(&path))?;
                 if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
                     self.tree.set_surface_title(doc.0, t, false);
                 }
@@ -916,7 +917,7 @@ impl AppState {
                 let view = self
                     .doc_mut(doc)
                     .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
-                view.save_copy(path.clone())?;
+                view.save_copy(path.clone()).with_context(|| can_t_save(&path))?;
                 self.changed(&[]);
                 return Ok(Some(path));
             }
@@ -1957,6 +1958,11 @@ pub fn build_registry() -> Registry<AppState> {
         plugin.register_commands(&mut r);
     }
     r
+}
+
+/// The context of a failed save, naming the file.
+fn can_t_save(path: &Path) -> String {
+    format!("can't save {}", path.display())
 }
 
 #[cfg(test)]
@@ -3065,7 +3071,8 @@ mod tests {
             } else {
                 s.close_focused_surface();
             }
-            assert!(s.accept_confirm().is_err());
+            let e = format!("{:#}", s.accept_confirm().unwrap_err());
+            assert!(e.starts_with(&format!("can't save {}: ", file.display())), "names the action: {e}");
             assert!(s.view(sid).is_some_and(|v| v.modified()), "still open, still unsaved");
             assert!(!s.quitting());
         }

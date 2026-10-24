@@ -1926,11 +1926,12 @@ impl State {
     }
 
     /// Follow up an answered confirmation: hot-reload a written config, report
-    /// a failed save, and exit if it was a quit.
+    /// a failure (its error names the action: a save, a Trash, a reload), and
+    /// exit if it was a quit.
     fn after_confirm(&mut self, done: Result<Vec<std::path::PathBuf>>) {
         match done {
             Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
-            Err(e) => eprintln!("ghostrealm: save: {e:#}"),
+            Err(e) => eprintln!("ghostrealm: {e:#}"),
         }
         self.dirty = true;
         self.exit_if_quitting();
