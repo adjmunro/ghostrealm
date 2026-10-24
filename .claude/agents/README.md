@@ -14,8 +14,8 @@ Each `.md` here with a `name` in its frontmatter is a role. This README has none
 | Role | Does | Edits files | Default model / effort |
 | :- | :- | :- | :- |
 | 🎬 `director` | Talks with the owner (or its parent director), decides what a goal needs, dispatches roles, reports back | Only its `decisions-pending.md` entries | inherit / inherit |
-| 🔨 `implementer` | Plans and implements one unit of work in one context | Yes | opus / high |
-| 🔍 `reviewer` | Adversarial review of a plan or a branch delta; reports, never fixes | No | opus / high |
+| 🔨 `code-implementer` | Plans and implements one unit of work in one context | Yes | opus / high |
+| 🔍 `code-reviewer` | Adversarial review of a plan or a branch delta; reports, never fixes | No | opus / high |
 | 📐 `role-architect` | Tunes the role system: creates, splits, merges and deletes roles and micro-skills | Roles, skills, `AGENTS.md` | opus / high |
 | 🩺 `role-reviewer` | Reads transcripts for where roles struggled or erred; suggests fixes | No | opus / medium |
 

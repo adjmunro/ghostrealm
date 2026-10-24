@@ -19,7 +19,7 @@ Inputs: the director's request, and 🩺 Role Reviewer findings drawn from trans
 
 - One role per way of working (stance, tools, output), not per topic. Topics belong in the brief or a skill.
 - Merge work that would share context into one role, e.g. planning and implementing the same change: separate agents re-read the same files and pay for the cache writes twice.
-- Keep roles apart when independence is the point (🔍 Reviewer vs 🔨 Implementer) or their tools must differ.
+- Keep roles apart when independence is the point (🔍 Code Reviewer vs 🔨 Code Implementer) or their tools must differ.
 - Split a role when its runs routinely approach the context budget (300,000 tokens; 100,000 on haiku), or its body branches into modes that never occur in the same run.
 - Delete a role nobody dispatches.
 - Name roles by what they act on when the bare name would be ambiguous (`role-architect`, not `architect`).
