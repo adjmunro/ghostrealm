@@ -5,6 +5,7 @@
 - COMMITTING IS PRE-AUTHORISED: commit freely, without asking, whenever the work is
   in a sensible state (follow the Commit Hygiene below). No per-commit approval is
   needed.
+- NEVER SIGN COMMITS OR TAGS: always pass `--no-gpg-sign` (`git commit --no-gpg-sign`, likewise for `merge`, `rebase`, `cherry-pick` and `revert`; `git tag --no-sign`). Signing waits for a human to unlock the key, and agents work while no human is present.
 - DO NOT PUSH WITHOUT EXPLICIT AUTHORISATION. (Push authorisation is per-request:
   prior push authorisation does not entail present or future push authorisation.)
 - NEVER PUSH TO `origin/develop`, `origin/main`, or `origin/master`. STOP. ASK YOUR HUMAN FOR FURTHER INSTRUCTIONS.
