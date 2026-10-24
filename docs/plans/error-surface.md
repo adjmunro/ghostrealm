@@ -498,6 +498,17 @@ Where the build differs from the design above:
     applied)`, so the toast logic is tested without a window.
   - Cmd+, with no config path toasts too, with the text the "Open
     Settings" choice uses.
+- Commit 13:
+  - `CmdError::Inapplicable` marks a command that doesn't apply where the
+    focus is ("no editor is focused", "no web surface focused", "no Files
+    surface is focused", "no file is focused"). Bound chords meet it
+    wherever the focus is, so it goes to stderr and never to a toast.
+  - `AppState::run_command(registry, id, args, from)` runs and reports;
+    the window passes the menu's surface (`MenuTarget::File` carries it)
+    through `begin_command_with`. A command run from the argument prompt
+    toasts on the focused pane until commit 17 shows it inline.
+  - Command and file-job toasts read "<command title>: <error>"; a
+    confirmation's toast is its error, capitalised.
 
 ## Risks
 

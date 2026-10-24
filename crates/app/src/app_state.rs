@@ -30,7 +30,7 @@ use crate::plugins::files::{self as files_plugin, FilesView};
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 use crate::plugins::web;
-use crate::toasts::{Level, Toast, ToastAction, Toasts};
+use crate::toasts::{Level, Scope, Toast, ToastAction, Toasts};
 
 mod files;
 mod open;
@@ -885,6 +885,64 @@ impl AppState {
         };
         self.config_problems = problems;
         self.notify(toast);
+    }
+
+    /// The scope of a toast about surface `sid`: its pane, else the focused
+    /// pane, else the app.
+    fn scope_of(&self, sid: Option<SurfaceId>) -> Scope {
+        sid.and_then(|sid| self.pane_of(sid))
+            .or_else(|| self.focused_pane())
+            .map_or(Scope::App, |(_, pane)| Scope::Pane(pane))
+    }
+
+    /// Run command `id` from `registry`. A failure goes to stderr and to an
+    /// error toast on the pane of `from` (the surface whose menu ran it),
+    /// else the focused pane, else the app. A command that only doesn't
+    /// apply where the focus is ([`CmdError::Inapplicable`]) goes to stderr
+    /// alone: a bound chord meets that wherever the focus is.
+    pub fn run_command(
+        &mut self,
+        registry: &mut Registry<AppState>,
+        id: &str,
+        args: &ghostrealm_core::Args,
+        from: Option<SurfaceId>,
+    ) -> std::result::Result<CmdOutcome, CmdError> {
+        // Taken first: the command may close the surface it ran from.
+        let scope = self.scope_of(from);
+        let result = registry.execute(id, args, self);
+        if let Err(e) = &result {
+            eprintln!("ghostrealm: {id}: {e}");
+            if !matches!(e, CmdError::Inapplicable(_)) {
+                let title = registry.meta(id).map_or(id, |m| m.title);
+                self.notify(Toast::new(Level::Error, format!("{title}: {e}")).on(scope));
+            }
+        }
+        result
+    }
+
+    /// Tell the user that what they confirmed failed (`e` names the action).
+    pub fn confirm_failed(&mut self, e: &anyhow::Error) {
+        eprintln!("ghostrealm: {e:#}");
+        self.notify(Toast::new(Level::Error, capitalized(&format!("{e:#}"))));
+    }
+
+    /// Tell the user about file operations that failed after their command
+    /// returned, or went ahead only in part: on stderr, and as app toasts
+    /// (the pane the command ran from may be gone). Returns whether any did.
+    pub fn toast_file_reports(&mut self) -> bool {
+        let mut any = false;
+        for report in self.take_file_reports() {
+            let title = files::job_title(report.command);
+            let (level, text) = match report.result {
+                Err(e) => (Level::Error, e),
+                Ok(m) if report.warning => (Level::Warning, m),
+                Ok(_) => continue,
+            };
+            eprintln!("ghostrealm: {}: {text}", report.command);
+            self.notify(Toast::new(level, format!("{title}: {text}")));
+            any = true;
+        }
+        any
     }
 
     /// Warn that `[editor] preview_font` isn't installed (`message` says so).
@@ -2086,6 +2144,12 @@ pub fn build_registry() -> Registry<AppState> {
         plugin.register_commands(&mut r);
     }
     r
+}
+
+/// `s` with its first letter upper case, to start a toast.
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 /// The context of a failed save, naming the file.

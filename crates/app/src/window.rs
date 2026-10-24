@@ -42,7 +42,7 @@ use crate::plugin::{
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
 use crate::pointer::{self, ButtonAction, Gate};
-use crate::toasts::{self, ToastHit};
+use crate::toasts::{self, Level, Toast, ToastHit};
 use crate::images::ImageRenderer;
 use crate::tap::{HeldKey, TapDetector};
 
@@ -282,7 +282,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = cb.set_text(text);
             }
         }
-        state.print_file_reports();
+        if state.app.toast_file_reports() {
+            state.dirty = true;
+            state.window.request_redraw();
+        }
         // The copy the quit question was about finished: quit.
         if state.app.continue_busy_quit() {
             state.exit_if_quitting();
@@ -837,8 +840,9 @@ enum MenuAction {
 enum MenuTarget {
     /// A workspace in the sidebar.
     Vtab(ghostrealm_core::VtabId),
-    /// A file, folder, or empty space in a file browser, or an editor's file.
-    File(FileTarget),
+    /// A file, folder, or empty space in a file browser, or an editor's file,
+    /// with the surface that asked for the menu.
+    File(FileTarget, SurfaceId),
     /// The view on this surface, which filed `Request::Menu`.
     View(SurfaceId),
 }
@@ -1961,7 +1965,7 @@ impl State {
                     self.app.close_surface_id(sid);
                 }
                 Request::CloseDoc(doc) => self.app.close_doc_of(sid, doc),
-                Request::FileMenu { target, at, align } => self.open_file_menu(target, at, align),
+                Request::FileMenu { target, at, align } => self.open_file_menu(sid, target, at, align),
                 Request::Menu { items, at, align } => self.open_view_menu(sid, items, at, align),
             }
         }
@@ -1996,7 +2000,7 @@ impl State {
     fn after_confirm(&mut self, done: Result<Vec<std::path::PathBuf>>) {
         match done {
             Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
-            Err(e) => eprintln!("ghostrealm: {e:#}"),
+            Err(e) => self.app.confirm_failed(&e),
         }
         self.dirty = true;
         self.exit_if_quitting();
@@ -2006,7 +2010,7 @@ impl State {
     fn discard_confirm(&mut self) {
         match self.app.discard_confirm() {
             Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
-            Err(e) => eprintln!("ghostrealm: {e:#}"),
+            Err(e) => self.app.confirm_failed(&e),
         }
         self.dirty = true;
         self.exit_if_quitting();
@@ -2335,8 +2339,8 @@ impl State {
 
     fn apply_menu_action(&mut self, action: MenuAction, target: MenuTarget) {
         let target = match (action, target) {
-            (MenuAction::File(action), MenuTarget::File(target)) => {
-                self.run_file_action(action, &target);
+            (MenuAction::File(action), MenuTarget::File(target, sid)) => {
+                self.run_file_action(action, &target, sid);
                 return;
             }
             (MenuAction::View(id), MenuTarget::View(sid)) => {
@@ -2370,8 +2374,8 @@ impl State {
         }
     }
 
-    /// Open the file menu on `target` at `at`.
-    fn open_file_menu(&mut self, target: FileTarget, at: (f32, f32), align: MenuAlign) {
+    /// Open the file menu on `target` at `at`, for surface `sid`.
+    fn open_file_menu(&mut self, sid: SurfaceId, target: FileTarget, at: (f32, f32), align: MenuAlign) {
         if self.app.picker_open() {
             return;
         }
@@ -2386,7 +2390,7 @@ impl State {
             .collect();
         self.palette = None;
         let over_picker = self.app.picker_open();
-        self.menu = Some(Menu::new(MenuTarget::File(target), at, align, items, over_picker));
+        self.menu = Some(Menu::new(MenuTarget::File(target, sid), at, align, items, over_picker));
         self.dirty = true;
     }
 
@@ -2403,13 +2407,14 @@ impl State {
         self.dirty = true;
     }
 
-    /// Run a file menu item as its command on `target`; one that needs a name
-    /// asks for it in the palette's argument prompt.
-    fn run_file_action(&mut self, action: FileAction, target: &FileTarget) {
+    /// Run a file menu item as its command on `target`, from surface `from`'s
+    /// menu; one that needs a name asks for it in the palette's argument
+    /// prompt.
+    fn run_file_action(&mut self, action: FileAction, target: &FileTarget, from: SurfaceId) {
         let prefill = (action == FileAction::Rename)
             .then(|| target.path.file_name().map(|n| n.to_string_lossy().into_owned()))
             .flatten();
-        self.begin_command_with(action.command(), action.args(target), prefill);
+        self.begin_command_with(action.command(), action.args(target), prefill, Some(from));
     }
 
     /// A click while the palette is open: start a clicked result (prompting
@@ -3611,12 +3616,13 @@ impl State {
     /// Run a command by id: execute immediately if it needs no required args, else
     /// open the palette to collect them (the argument prompt).
     fn begin_command(&mut self, id: &str) {
-        self.begin_command_with(id, Args::new(), None);
+        self.begin_command_with(id, Args::new(), None, None);
     }
 
     /// [`Self::begin_command`] with some arguments known (`preset`) and the
-    /// prompt starting with `prefill`.
-    fn begin_command_with(&mut self, id: &str, preset: Args, prefill: Option<String>) {
+    /// prompt starting with `prefill`. `from` is the surface whose menu ran
+    /// it, for where a failure shows.
+    fn begin_command_with(&mut self, id: &str, preset: Args, prefill: Option<String>, from: Option<SurfaceId>) {
         if let Entry::Prompt(specs) = command_entry(self.registry.meta(id), &preset) {
             let title = self
                 .registry
@@ -3638,16 +3644,14 @@ impl State {
                 }),
             });
         } else {
-            self.run_command(id, &preset);
+            self.run_command(id, &preset, from);
         }
         self.dirty = true;
     }
 
-    /// Run command `id`, reporting a failure.
-    fn run_command(&mut self, id: &str, args: &Args) {
-        if let Err(e) = self.registry.execute(id, args, &mut self.app) {
-            eprintln!("ghostrealm: {id}: {e}");
-        }
+    /// Run command `id`, reporting a failure ([`AppState::run_command`]).
+    fn run_command(&mut self, id: &str, args: &Args, from: Option<SurfaceId>) {
+        let _ = self.app.run_command(&mut self.registry, id, args, from);
     }
 
     /// Open the command palette (fresh query, first result selected).
@@ -3912,6 +3916,7 @@ impl State {
                     if !line.is_empty() {
                         if let Err(e) = self.app.new_vtab_running(line) {
                             eprintln!("ghostrealm: run-anything failed: {e:#}");
+                            self.app.notify(Toast::new(Level::Error, format!("Run Anything: {e:#}")));
                         }
                     }
                 }
@@ -3968,7 +3973,7 @@ impl State {
                 }
                 if let Some((id, args)) = run {
                     self.palette = None;
-                    self.run_command(&id, &args);
+                    self.run_command(&id, &args, None);
                 }
             }
             _ => {

@@ -36,6 +36,10 @@ pub enum CmdError {
     Args(ArgError),
     /// The handler ran and failed.
     Failed(String),
+    /// The command doesn't apply to what has the focus: an editor command with
+    /// no editor focused. A bound chord meets this wherever the focus is, so
+    /// callers don't show it the way they show a failure.
+    Inapplicable(String),
 }
 
 impl fmt::Display for CmdError {
@@ -43,7 +47,7 @@ impl fmt::Display for CmdError {
         match self {
             CmdError::Unknown(id) => write!(f, "unknown command `{id}`"),
             CmdError::Args(e) => write!(f, "{e}"),
-            CmdError::Failed(m) => write!(f, "{m}"),
+            CmdError::Failed(m) | CmdError::Inapplicable(m) => write!(f, "{m}"),
         }
     }
 }

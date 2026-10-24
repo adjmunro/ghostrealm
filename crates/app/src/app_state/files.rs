@@ -100,10 +100,12 @@ impl AppState {
     }
 
     /// `path` as given, else the focused view's subject.
-    fn subject_or(&self, path: Option<&str>) -> Result<PathBuf> {
+    fn subject_or(&self, path: Option<&str>) -> Result<PathBuf, CmdError> {
         match path {
-            Some(p) => self.resolve(p),
-            None => self.focused_subject().context("no file is focused; give a path"),
+            Some(p) => self.resolve(p).map_err(failed),
+            None => self
+                .focused_subject()
+                .ok_or_else(|| CmdError::Inapplicable("no file is focused; give a path".into())),
         }
     }
 
@@ -553,6 +555,15 @@ impl AppState {
     }
 }
 
+/// The title of file command `command` (`file.paste`: "Paste"), for a
+/// report of its job.
+pub(super) fn job_title(command: &'static str) -> &'static str {
+    [FileAction::Paste, FileAction::Duplicate, FileAction::Delete]
+        .into_iter()
+        .find(|a| a.command() == command)
+        .map_or(command, FileAction::title)
+}
+
 fn failed(e: anyhow::Error) -> CmdError {
     CmdError::Failed(format!("{e:#}"))
 }
@@ -578,7 +589,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         r.register(
             CommandMeta::new(action.command(), action.title(), description).arg(path_arg()),
             Box::new(move |s: &mut AppState, a| {
-                let path = s.subject_or(a.opt_str("path")).map_err(failed)?;
+                let path = s.subject_or(a.opt_str("path"))?;
                 let msg = run(s, &path).map_err(failed)?;
                 Ok(if msg.is_empty() { CmdOutcome::ok() } else { CmdOutcome::msg(msg) })
             }),
@@ -658,7 +669,7 @@ pub(super) fn register(r: &mut Registry<AppState>) {
             .arg(ArgSpec::required("name", ArgKind::Str, "the new name"))
             .arg(path_arg()),
         Box::new(|s: &mut AppState, a| {
-            let path = s.subject_or(a.opt_str("path")).map_err(failed)?;
+            let path = s.subject_or(a.opt_str("path"))?;
             let path = s.rename_path(&path, a.get_str("name")?).map_err(failed)?;
             Ok(CmdOutcome::msg(format!("renamed to {}", path.display())))
         }),
@@ -681,6 +692,7 @@ mod tests {
     use crate::file_menu::{Kind, Origin};
     use crate::plugin::testing::{tmpdir, DocsView};
     use crate::plugin::{DocId, View};
+    use crate::toasts::{Level, Scope};
 
     type Calls = Rc<RefCell<Vec<String>>>;
 
@@ -932,6 +944,7 @@ mod tests {
     fn copy_path_with_nothing_focused_fails_clearly() {
         let (mut s, _) = app();
         let err = build_registry().execute("file.copy_path", &Args::new(), &mut s).unwrap_err();
+        assert!(matches!(err, CmdError::Inapplicable(_)), "{err:?}");
         assert!(err.to_string().contains("no file is focused"), "{err}");
     }
 
@@ -1603,5 +1616,72 @@ mod tests {
         let msg = pasted_message(&left);
         assert!(msg.starts_with("pasted /to/a; the original wasn't fully removed"), "{msg}");
         assert!(msg.contains("added") && msg.contains("changed"), "both reasons are named: {msg}");
+    }
+
+    fn head(s: &AppState) -> &crate::toasts::Toast {
+        &s.toasts().head().expect("a toast").toast
+    }
+
+    fn args(pairs: &[(&str, &Path)]) -> Args {
+        let mut a = Args::new();
+        for (k, v) in pairs {
+            a.insert(k, Value::Str(v.to_string_lossy().into_owned()));
+        }
+        a
+    }
+
+    #[test]
+    fn a_failed_command_from_a_menu_toasts_on_that_menus_pane() {
+        let (mut s, _) = app();
+        let d = tmpdir("fm-toast-menu");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let sid = open_editor(&mut s, &d.join("a.txt"));
+        let (_, pane) = s.pane_of(sid).unwrap();
+        s.split_focused(ghostrealm_core::Axis::LeftRight).unwrap();
+        assert_ne!(s.focused_pane().map(|(_, p)| p), Some(pane), "the menu's pane isn't the focused one");
+        let err = s.run_command(&mut build_registry(), "file.paste", &args(&[("dir", &d)]), Some(sid)).unwrap_err();
+        assert!(err.to_string().contains("nothing to paste"), "{err}");
+        let toast = head(&s);
+        assert_eq!((toast.level, toast.scope), (Level::Error, Scope::Pane(pane)));
+        assert!(toast.message.starts_with("Paste File: nothing to paste"), "{}", toast.message);
+    }
+
+    #[test]
+    fn a_command_that_doesnt_apply_where_the_focus_is_raises_no_toast() {
+        let (mut s, _) = app();
+        let mut r = build_registry();
+        for id in ["file.copy_path", "editor.toggle_comment", "web.focus_url"] {
+            let err = s.run_command(&mut r, id, &Args::new(), None).unwrap_err();
+            assert!(matches!(err, CmdError::Inapplicable(_)), "{id}: {err:?}");
+        }
+        assert!(s.toasts().is_empty());
+    }
+
+    #[test]
+    fn a_failed_file_job_becomes_an_app_error_toast() {
+        let (mut s, _) = app_in_background();
+        let d = tmpdir("fm-toast-job");
+        std::fs::create_dir_all(d.join("dir/sub")).unwrap();
+        run(&mut s, "file.cut", &[("path", &d.join("dir"))]).unwrap();
+        start(&mut s, "file.paste", &[("dir", &d.join("dir/sub"))]).unwrap();
+        s.wait_file_jobs();
+        assert!(s.toast_file_reports());
+        let toast = head(&s);
+        assert_eq!((toast.level, toast.scope), (Level::Error, Scope::App));
+        assert!(toast.message.starts_with("Paste File: "), "{}", toast.message);
+        assert!(!s.toast_file_reports(), "each report toasts once");
+    }
+
+    #[test]
+    fn a_refused_trash_after_its_confirmation_toasts_as_a_trash() {
+        let (mut s, _) = app_with(true);
+        let d = tmpdir("fm-toast-trash");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        run(&mut s, "file.delete", &[("path", &d.join("a.txt"))]).unwrap();
+        let err = s.accept_confirm().unwrap_err();
+        s.confirm_failed(&err);
+        let message = &head(&s).message;
+        assert!(!message.starts_with("save:"), "{message}");
+        assert!(message.starts_with(&format!("Can't move {} to the Trash", d.join("a.txt").display())), "{message}");
     }
 }

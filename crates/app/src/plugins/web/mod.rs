@@ -459,7 +459,7 @@ impl Plugin for WebPlugin {
                 target(s, a)?;
                 let sid = match a.get_int("id") {
                     Ok(id) => SurfaceId(id as u64),
-                    Err(_) => s.focused_surface().ok_or_else(|| CmdError::Failed("no web surface focused".into()))?,
+                    Err(_) => s.focused_surface().ok_or_else(|| CmdError::Inapplicable("no web surface focused".into()))?,
                 };
                 s.close_surface_id(sid);
                 Ok(CmdOutcome::ok())
@@ -545,13 +545,13 @@ fn target<'a>(s: &'a mut AppState, a: &Args) -> Result<&'a mut WebView, CmdError
         Ok(id) => SurfaceId(id as u64),
         Err(_) => s
             .focused_surface()
-            .ok_or_else(|| CmdError::Failed("no web surface focused; pass `id`".into()))?,
+            .ok_or_else(|| CmdError::Inapplicable("no web surface focused; pass `id`".into()))?,
     };
     s.view_mut(sid)
         .and_then(|v| v.downcast_mut::<WebView>())
         .ok_or_else(|| match a.get_int("id") {
             Ok(id) => CmdError::Failed(format!("surface {id} is not a web surface")),
-            Err(_) => CmdError::Failed("no web surface focused; pass `id`".into()),
+            Err(_) => CmdError::Inapplicable("no web surface focused; pass `id`".into()),
         })
 }
 

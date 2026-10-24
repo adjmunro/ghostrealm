@@ -93,7 +93,7 @@ impl Plugin for FilesPlugin {
                         .focused_surface()
                         .and_then(|sid| s.view_mut(sid))
                         .and_then(|v| v.downcast_mut::<FilesView>())
-                        .ok_or_else(|| CmdError::Failed("no Files surface is focused".into()))?;
+                        .ok_or_else(|| CmdError::Inapplicable("no Files surface is focused".into()))?;
                     f(files);
                     Ok(CmdOutcome::ok())
                 }),

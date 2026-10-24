@@ -228,7 +228,7 @@ impl Plugin for EditorPlugin {
                 let editor = doc
                     .and_then(|d| s.doc_mut(d))
                     .and_then(|v| v.downcast_mut::<EditorView>())
-                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                    .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
                 editor.toggle_comment().map_err(|e| CmdError::Failed(e.into()))?;
                 Ok(CmdOutcome::ok())
             }),
@@ -244,7 +244,7 @@ impl Plugin for EditorPlugin {
                 let editor = doc
                     .and_then(|d| s.doc_mut(d))
                     .and_then(|v| v.downcast_mut::<EditorView>())
-                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                    .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
                 editor.cycle_view_mode();
                 Ok(CmdOutcome::ok())
             }),
@@ -259,7 +259,7 @@ impl Plugin for EditorPlugin {
                 let sid = s
                     .focused_surface()
                     .filter(|sid| s.active_doc(*sid).and_then(|d| s.doc(d)).is_some_and(|v| v.plugin() == ID))
-                    .ok_or_else(|| CmdError::Failed("no editor is focused".into()))?;
+                    .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
                 s.open_save_as(sid);
                 Ok(CmdOutcome::ok())
             }),
