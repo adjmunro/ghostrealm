@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ghostrealm_core::config::Catalogue;
 use ghostrealm_core::{
-    ArgKind, ArgSpec, Args, Axis, Chrome, Config, Divider, PaneId, Rect, Registry, Side,
+    ArgKind, ArgSpec, Args, Axis, Chrome, CommandMeta, Config, Divider, PaneId, Rect, Registry, Side,
     SurfaceId, TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Mods};
@@ -41,6 +41,7 @@ use crate::plugin::{
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
+use crate::pointer::{self, ButtonAction, Gate};
 use crate::images::ImageRenderer;
 use crate::tap::{HeldKey, TapDetector};
 
@@ -733,6 +734,60 @@ struct PendingArgs {
     preset: Args,
 }
 
+/// What Enter in the argument prompt does.
+#[derive(Debug, PartialEq)]
+enum ArgStep {
+    /// The value was taken; the prompt asks for the next argument.
+    Next,
+    /// Every argument is in: run this command with these arguments.
+    Run(String, Args),
+    /// The value didn't parse: the prompt keeps it to be corrected.
+    Retry,
+}
+
+impl PendingArgs {
+    /// Take `input` as the value of the argument being asked for.
+    fn enter(&mut self, input: &str) -> ArgStep {
+        let Some(spec) = self.specs.get(self.values.len()) else {
+            return ArgStep::Retry;
+        };
+        let Some(value) = parse_arg_value(&spec.kind, input) else {
+            return ArgStep::Retry;
+        };
+        self.values.push(value);
+        if self.values.len() < self.specs.len() {
+            return ArgStep::Next;
+        }
+        let mut args = self.preset.clone();
+        for (s, v) in self.specs.iter().zip(&self.values) {
+            args.insert(s.name, v.clone());
+        }
+        ArgStep::Run(self.id.clone(), args)
+    }
+}
+
+/// How a command starts.
+#[derive(Debug, PartialEq)]
+enum Entry {
+    /// It has every required argument: run it.
+    Run,
+    /// The argument prompt asks for these first.
+    Prompt(Vec<ArgSpec>),
+}
+
+/// How the command `meta` describes starts, given the arguments already
+/// known (`preset`). An unknown command runs, so the registry reports it.
+fn command_entry(meta: Option<&CommandMeta>, preset: &Args) -> Entry {
+    let specs: Vec<ArgSpec> = meta
+        .map(|m| m.args.iter().filter(|a| a.required && preset.get(a.name).is_none()).cloned().collect())
+        .unwrap_or_default();
+    if specs.is_empty() {
+        Entry::Run
+    } else {
+        Entry::Prompt(specs)
+    }
+}
+
 /// Command-palette / run-anything overlay state.
 struct Palette {
     /// The search query, run line, or argument being typed.
@@ -1033,31 +1088,6 @@ struct PaneRender {
     rect: Rect,
     focused: bool,
     surfaces: Vec<(SurfaceId, String, bool)>,
-}
-
-/// What a clickable chrome button does. All buttons share hover-highlight and
-/// arm-on-press/fire-on-release behaviour (see `arm_button`/`fire_button`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ButtonAction {
-    /// Open a new workspace (the sidebar's "+ New workspace").
-    NewVtab,
-    /// Close a workspace (vtab) from the sidebar.
-    CloseVtab(VtabId),
-    /// Close one tab (surface) in a pane's horizontal tab strip.
-    CloseSurface(VtabId, PaneId, SurfaceId),
-    /// Show/hide the workspace sidebar.
-    ToggleSidebar,
-    /// Open a plugin's content in the given pane (the "nothing open" picker).
-    OpenPlugin(VtabId, PaneId, &'static str),
-    /// A button a view registered while painting: (owning surface, view-local id).
-    View(SurfaceId, u32),
-    /// Confirm / cancel the floating picker.
-    PickerConfirm,
-    PickerCancel,
-    /// Accept / cancel the open confirmation.
-    ConfirmAccept,
-    ConfirmCancel,
-    ConfirmDiscard,
 }
 
 impl State {
@@ -1586,39 +1616,19 @@ impl State {
             .map(|(_, id)| *id)
     }
 
-    /// The chrome button under the cursor, if any. The sidebar toggle wins any
-    /// overlap (it can float over a pane's tab strip when the sidebar is hidden);
-    /// otherwise the first button in paint order takes the hit.
+    /// What covers the window for pointer decisions ([`pointer`]).
+    fn gate(&self) -> Gate {
+        Gate {
+            modal: self.palette.is_some() || self.menu.is_some(),
+            picker: self.app.picker_open(),
+            confirm: self.app.confirm().is_some(),
+            toast: None,
+        }
+    }
+
+    /// The chrome button under the cursor, if any ([`pointer::button_at`]).
     fn button_at_cursor(&self) -> Option<ButtonAction> {
-        let (x, y) = self.cursor;
-        // Overlays are modal: the palette and menu own the pointer, and while the
-        // picker is open only its own buttons are live.
-        if self.palette.is_some() || self.menu.is_some() {
-            return None;
-        }
-        let picker = self.app.picker_open();
-        let confirm = self.app.confirm().is_some();
-        let mut hit = None;
-        for &(r, action) in &self.buttons {
-            let modal = matches!(
-                action,
-                ButtonAction::PickerConfirm | ButtonAction::PickerCancel | ButtonAction::View(PICKER_SID, _)
-            );
-            let asking = matches!(
-                action,
-                ButtonAction::ConfirmAccept | ButtonAction::ConfirmCancel | ButtonAction::ConfirmDiscard
-            );
-            if (confirm && !asking) || (picker && !confirm && !modal) {
-                continue;
-            }
-            if rect_contains(r, x, y) {
-                if action == ButtonAction::ToggleSidebar {
-                    return Some(action);
-                }
-                hit.get_or_insert(action);
-            }
-        }
-        hit
+        pointer::button_at(&self.gate(), &self.buttons, self.cursor)
     }
 
     /// Mouse-down over a button arms it (fires later on release), so a press can
@@ -1664,11 +1674,7 @@ impl State {
     /// Recompute which button is under the cursor; returns whether it changed, so
     /// the caller redraws only when the hover highlight must move.
     fn update_button_hover(&mut self) -> bool {
-        let (x, y) = self.cursor;
-        let now = self
-            .buttons
-            .iter()
-            .position(|(r, _)| rect_contains(*r, x, y));
+        let now = pointer::hover_index(&self.gate(), &self.buttons, self.cursor);
         if now != self.button_hover {
             self.button_hover = now;
             self.dirty = true;
@@ -1751,13 +1757,14 @@ impl State {
     }
 
     /// The split divider under the cursor, unless something covers it: an
-    /// overlay, the sidebar, the title bar, or a button.
+    /// overlay, the toast, the sidebar, the title bar, or a button.
     fn divider_under_cursor(&self) -> Option<(VtabId, Divider)> {
         let (x, y) = self.cursor;
-        let covered = self.palette.is_some()
-            || self.menu.is_some()
-            || self.app.picker_open()
-            || self.app.confirm().is_some()
+        let gate = self.gate();
+        let covered = gate.modal
+            || gate.picker
+            || gate.confirm
+            || pointer::covered(&gate, self.cursor)
             || self.in_sidebar(x)
             || y < self.title_bar_h()
             || self.button_at_cursor().is_some();
@@ -2100,10 +2107,10 @@ impl State {
     }
 
     /// The pane under the cursor in the active workspace (not over the
-    /// sidebar).
+    /// sidebar or under the toast).
     fn pane_under_cursor(&self) -> Option<PaneHit> {
         let (x, y) = self.cursor;
-        if self.in_sidebar(x) {
+        if self.in_sidebar(x) || pointer::covered(&self.gate(), self.cursor) {
             return None;
         }
         let vt = self.app.tree.active_vtab()?;
@@ -2445,10 +2452,10 @@ impl State {
     }
 
     /// The active surface of the pane under the cursor, if the cursor is over the
-    /// workspace (not the sidebar).
+    /// workspace (not the sidebar or the toast).
     fn surface_under_cursor(&self) -> Option<SurfaceId> {
         let (x, y) = self.cursor;
-        if self.in_sidebar(x) {
+        if self.in_sidebar(x) || pointer::covered(&self.gate(), self.cursor) {
             return None;
         }
         let workspace = self.workspace_rect();
@@ -2467,7 +2474,7 @@ impl State {
     /// Returns whether the focused pane changed.
     fn focus_pane_under_cursor(&mut self) -> bool {
         let (x, y) = self.cursor;
-        if self.in_sidebar(x) {
+        if self.in_sidebar(x) || pointer::covered(&self.gate(), self.cursor) {
             return false;
         }
         let workspace = self.workspace_rect();
@@ -2609,8 +2616,7 @@ impl State {
             }
             return;
         }
-        // A view takes the wheel: the one under the cursor, else the focused one.
-        let target = self.surface_under_cursor().or_else(|| self.app.focused_surface());
+        let target = pointer::wheel_target(&self.gate(), pos, self.surface_under_cursor(), self.app.focused_surface());
         if let Some(sid) = target {
             self.view_event(sid, |v, cx| v.scroll(cx, pos, px_x, px));
         }
@@ -3498,14 +3504,7 @@ impl State {
     /// [`Self::begin_command`] with some arguments known (`preset`) and the
     /// prompt starting with `prefill`.
     fn begin_command_with(&mut self, id: &str, preset: Args, prefill: Option<String>) {
-        let specs: Vec<ArgSpec> = self
-            .registry
-            .meta(id)
-            .map(|m| m.args.iter().filter(|a| a.required && preset.get(a.name).is_none()).cloned().collect())
-            .unwrap_or_default();
-        if specs.is_empty() {
-            self.run_command(id, &preset);
-        } else {
+        if let Entry::Prompt(specs) = command_entry(self.registry.meta(id), &preset) {
             let title = self
                 .registry
                 .meta(id)
@@ -3525,6 +3524,8 @@ impl State {
                     preset,
                 }),
             });
+        } else {
+            self.run_command(id, &preset);
         }
         self.dirty = true;
     }
@@ -3846,23 +3847,10 @@ impl State {
                 let mut run: Option<(String, Args)> = None;
                 if let Some(p) = self.palette.as_mut() {
                     let query = p.input.text().to_string();
-                    if let Some(pend) = p.pending.as_mut() {
-                        let idx = pend.values.len();
-                        if let Some(spec) = pend.specs.get(idx) {
-                            if let Some(val) = parse_arg_value(&spec.kind, &query) {
-                                pend.values.push(val);
-                                if pend.values.len() == pend.specs.len() {
-                                    let mut args = pend.preset.clone();
-                                    for (s, v) in pend.specs.iter().zip(&pend.values) {
-                                        args.insert(s.name, v.clone());
-                                    }
-                                    run = Some((pend.id.clone(), args));
-                                } else {
-                                    p.input.set_text("");
-                                }
-                            }
-                            // An unparseable value keeps the query for a retry.
-                        }
+                    match p.pending.as_mut().map(|pend| pend.enter(&query)) {
+                        Some(ArgStep::Next) => p.input.set_text(""),
+                        Some(ArgStep::Run(id, args)) => run = Some((id, args)),
+                        Some(ArgStep::Retry) | None => {}
                     }
                 }
                 if let Some((id, args)) = run {
@@ -5562,6 +5550,52 @@ mod tests {
     use winit::window::CursorIcon;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
     use std::time::{Duration, Instant};
+
+    mod args {
+        use super::super::{command_entry, ArgStep, Entry, PendingArgs};
+        use crate::app_state::build_registry;
+        use ghostrealm_core::{ArgKind, ArgSpec, Args, Value};
+
+        fn pending() -> PendingArgs {
+            let mut preset = Args::new();
+            preset.insert("path", Value::Str("/tmp/a".into()));
+            PendingArgs {
+                id: "cmd".into(),
+                title: "Cmd".into(),
+                specs: vec![
+                    ArgSpec::required("name", ArgKind::Str, ""),
+                    ArgSpec::required("count", ArgKind::Int, ""),
+                ],
+                values: Vec::new(),
+                preset,
+            }
+        }
+
+        #[test]
+        fn enter_takes_each_value_then_runs_with_the_preset() {
+            let mut p = pending();
+            assert_eq!(p.enter("b.txt"), ArgStep::Next);
+            assert_eq!(p.enter("x"), ArgStep::Retry, "not a number");
+            assert_eq!(p.values.len(), 1, "the bad value isn't taken");
+            let mut args = Args::new();
+            args.insert("path", Value::Str("/tmp/a".into()));
+            args.insert("name", Value::Str("b.txt".into()));
+            args.insert("count", Value::Int(3));
+            assert_eq!(p.enter("3"), ArgStep::Run("cmd".into(), args));
+        }
+
+        #[test]
+        fn a_command_with_a_required_arg_prompts_and_one_without_runs() {
+            let reg = build_registry();
+            let rename = command_entry(reg.meta("file.rename"), &Args::new());
+            assert!(matches!(&rename, Entry::Prompt(specs) if specs.iter().any(|s| s.name == "name")), "{rename:?}");
+            let mut named = Args::new();
+            named.insert("name", Value::Str("b".into()));
+            assert_eq!(command_entry(reg.meta("file.rename"), &named), Entry::Run, "preset");
+            assert_eq!(command_entry(reg.meta("palette.toggle"), &Args::new()), Entry::Run);
+            assert_eq!(command_entry(None, &Args::new()), Entry::Run, "unknown: the registry reports it");
+        }
+    }
 
     mod menus {
         use super::super::{call_view, menu_layout, Menu, MenuAction, MenuRelease, MenuRow, MenuTarget};

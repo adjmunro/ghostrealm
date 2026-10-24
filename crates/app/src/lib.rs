@@ -21,6 +21,7 @@ mod macos_keys;
 #[cfg(target_os = "macos")]
 mod macos_quit;
 pub mod plugin;
+mod pointer;
 pub mod plugins;
 pub mod row_cache;
 pub mod settings;
