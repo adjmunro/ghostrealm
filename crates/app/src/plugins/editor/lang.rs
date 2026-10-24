@@ -16,9 +16,6 @@ use crate::plugin::{theme, Font, PaintCx};
 /// How long the pointer rests on a character before its popup shows.
 pub const HOVER_DWELL: Duration = Duration::from_millis(400);
 
-const ERROR: [u8; 3] = [240, 100, 100];
-const WARNING: [u8; 3] = [230, 180, 70];
-const INFO: [u8; 3] = [110, 160, 230];
 const POPUP_BG: [u8; 3] = [34, 34, 42];
 /// Widest a popup gets, in columns.
 const POPUP_COLS: usize = 72;
@@ -195,9 +192,9 @@ fn within((start, end): (Pos, Pos), at: Pos) -> bool {
 
 fn severity_color(s: Option<DiagnosticSeverity>) -> [u8; 3] {
     match s {
-        Some(DiagnosticSeverity::WARNING) => WARNING,
-        Some(DiagnosticSeverity::INFORMATION | DiagnosticSeverity::HINT) => INFO,
-        _ => ERROR,
+        Some(DiagnosticSeverity::WARNING) => theme::DIAG_WARNING,
+        Some(DiagnosticSeverity::INFORMATION | DiagnosticSeverity::HINT) => theme::DIAG_INFO,
+        _ => theme::DIAG_ERROR,
     }
 }
 

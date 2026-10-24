@@ -27,6 +27,11 @@ pub const GLYPH_HOVER: [u8; 3] = [235, 235, 245];
 pub const ON: [u8; 3] = [80, 180, 90];
 /// A file changed on disk under unsaved edits.
 pub const WARN: [u8; 3] = [225, 170, 70];
+/// A language service diagnostic, by severity: its underline and its
+/// paragraph in the hover popup. Info and hints share [`DIAG_INFO`].
+pub const DIAG_ERROR: [u8; 3] = [240, 100, 100];
+pub const DIAG_WARNING: [u8; 3] = [230, 180, 70];
+pub const DIAG_INFO: [u8; 3] = [110, 160, 230];
 /// Lines added and deleted (diff counts).
 pub const ADDED: [u8; 3] = [80, 180, 90];
 pub const DELETED: [u8; 3] = [210, 90, 90];
