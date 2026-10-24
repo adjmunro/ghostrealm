@@ -631,18 +631,33 @@ impl EditorView {
     /// Write a modified, file-backed buffer. Returns the file written. A file
     /// that changed on disk since the buffer loaded or wrote it is left alone,
     /// and the buffer stays modified: only an explicit save may ask to
-    /// overwrite it.
-    fn save_if_modified(&mut self) -> Option<PathBuf> {
+    /// overwrite it. A failed write leaves the buffer modified.
+    fn save_if_modified(&mut self) -> Result<Option<PathBuf>> {
         if !self.buf.modified || self.buf.path.is_none() {
-            return None;
+            return Ok(None);
         }
         if self.buf.conflicted() {
             self.buf.changed_on_disk = true;
-            return None;
+            return Ok(None);
         }
-        self.buf.save().ok().filter(|saved| *saved)?;
+        if !self.buf.save()? {
+            return Ok(None);
+        }
         self.saved();
-        self.buf.path.clone()
+        Ok(self.buf.path.clone())
+    }
+
+    /// [`Self::save_if_modified`], reporting the file written to the app and a
+    /// failure to stderr.
+    fn autosave_now(&mut self, cx: &mut EventCx) {
+        match self.save_if_modified() {
+            Ok(Some(path)) => cx.request(Request::Saved(path)),
+            Ok(None) => {}
+            Err(e) => {
+                let path = self.buf.path.as_deref().unwrap_or(Path::new("")).display();
+                eprintln!("ghostrealm: autosave {path}: {e:#}");
+            }
+        }
     }
 
     /// Note a write: disarm the idle timer, stamp the save time.
@@ -1914,9 +1929,7 @@ impl View for EditorView {
             cx.redraw();
         }
         if !focused && self.autosave_on_unfocus(cx.cfg) {
-            if let Some(path) = self.save_if_modified() {
-                cx.request(Request::Saved(path));
-            }
+            self.autosave_now(cx);
         }
     }
 
@@ -1952,9 +1965,7 @@ impl View for EditorView {
         }
         if self.autosave_deadline(cx.cfg).is_some_and(|d| now >= d) {
             self.last_edit_at = None;
-            if let Some(path) = self.save_if_modified() {
-                cx.request(Request::Saved(path));
-            }
+            self.autosave_now(cx);
             cx.redraw();
         }
     }
@@ -1965,9 +1976,9 @@ impl View for EditorView {
         stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
 
-    fn autosave(&mut self, cfg: &Config) -> Option<PathBuf> {
+    fn autosave(&mut self, cfg: &Config) -> Result<Option<PathBuf>> {
         if !self.autosave_on_unfocus(cfg) {
-            return None;
+            return Ok(None);
         }
         self.save_if_modified()
     }
@@ -2443,7 +2454,7 @@ mod tests {
         // An edit and save now keep the other program's change.
         v.buffer_mut().cursor = (0, 5);
         v.buffer_mut().insert_str("0");
-        assert_eq!(v.save_if_modified(), Some(path.clone()));
+        assert_eq!(v.save_if_modified().unwrap(), Some(path.clone()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a = 20\n");
         // Unsaved edits are not replaced.
         v.buffer_mut().insert_str("0");
@@ -2651,13 +2662,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_autosave_is_an_error_and_keeps_the_edits() {
+        let path = tmpdir("editor-autosave-readonly").join("f.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        v.buffer_mut().insert_str("x");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert!(v.save_if_modified().is_err());
+        let h = Harness::new();
+        assert!(v.autosave(&h.cfg).is_err());
+        assert!(v.modified());
+    }
+
+    #[test]
     fn autosave_skips_a_file_changed_on_disk_and_keeps_the_edits() {
         let (mut v, path) = conflicted("editor-autosave-conflict");
         let h = Harness::new();
         let out = h.focus(&mut v, false);
         assert!(out.requests.is_empty(), "no save on blur");
-        assert_eq!(v.save_if_modified(), None);
-        assert_eq!(v.autosave(&h.cfg), None, "nor on quit or app blur");
+        assert_eq!(v.save_if_modified().unwrap(), None);
+        assert_eq!(v.autosave(&h.cfg).unwrap(), None, "nor on quit or app blur");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's\n");
         assert!(v.modified() && v.buffer().changed_on_disk, "still unsaved, and marked");
     }
@@ -2675,8 +2701,8 @@ mod tests {
         assert_eq!(v.buffer().lines, ["old"]);
         assert!(v.modified() && v.buffer().changed_on_disk && v.disk_conflict());
         let h = Harness::new();
-        assert_eq!(v.save_if_modified(), None, "autosave skips it");
-        assert_eq!(v.autosave(&h.cfg), None);
+        assert_eq!(v.save_if_modified().unwrap(), None, "autosave skips it");
+        assert_eq!(v.autosave(&h.cfg).unwrap(), None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
         assert_eq!(out.requests, vec![Request::SaveConflict], "an explicit save asks");
@@ -2709,7 +2735,7 @@ mod tests {
         assert!(!v.buffer().disk_changed(), "the new version counts as seen");
         assert!(!v.changed_on_disk(&path), "and is not read again");
         v.buffer_mut().insert_str("x");
-        assert_eq!(v.save_if_modified(), None, "autosave would write over it");
+        assert_eq!(v.save_if_modified().unwrap(), None, "autosave would write over it");
         assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, 0x00]);
     }
 
@@ -3407,7 +3433,7 @@ mod tests {
         h.key(&mut v, press(Key::Char('a')));
         assert_eq!(v.deadline(&h.cfg), None, "no idle timer");
         assert!(h.focus(&mut v, false).requests.is_empty(), "no save on unfocus");
-        assert_eq!(v.autosave(&h.cfg), None, "nor on quit");
+        assert_eq!(v.autosave(&h.cfg).unwrap(), None, "nor on quit");
         assert!(v.modified());
     }
 

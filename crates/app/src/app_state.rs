@@ -986,8 +986,14 @@ impl AppState {
         let mut saved_config = false;
         for view in self.views.values_mut() {
             for doc in view.docs() {
-                if let Some(path) = view.document_mut(doc).and_then(|d| d.autosave(cfg)) {
-                    saved_config |= config_path.is_some_and(|c| same_file(c, &path));
+                let Some(d) = view.document_mut(doc) else { continue };
+                match d.autosave(cfg) {
+                    Ok(Some(path)) => saved_config |= config_path.is_some_and(|c| same_file(c, &path)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let path = d.path().unwrap_or_default();
+                        eprintln!("ghostrealm: autosave {}: {e:#}", path.display());
+                    }
                 }
             }
         }

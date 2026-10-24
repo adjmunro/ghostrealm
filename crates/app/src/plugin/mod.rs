@@ -290,8 +290,8 @@ pub trait View: Any {
 
     /// Persist unsaved state if it has a home and the view autosaves (the app is
     /// losing focus or quitting). Returns the file written, if any.
-    fn autosave(&mut self, _cfg: &Config) -> Option<PathBuf> {
-        None
+    fn autosave(&mut self, _cfg: &Config) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// The file the view shows, if any (Save As starts beside it).
