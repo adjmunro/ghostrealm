@@ -4,7 +4,7 @@ Each `.md` here with a `name` in its frontmatter is a role. This README has none
 
 ## Taking a role
 
-- A new session in this repo starts as 🎬 Director (`agent` in `.claude/settings.json`).
+- Every new session in this repo, headless `claude -p` included, starts as 🎬 Director at opus/high (`agent` in `.claude/settings.json`).
 - To start as another role, including for headless `claude -p` runs: `claude --agent <role>`, or set `agent` in your `.claude/settings.local.json`. The role's frontmatter (model, effort, tool limits) then applies to the session.
 - Told "you are the <role>" mid-session: read `.claude/agents/<role>.md` and follow its body. Its frontmatter doesn't apply; the session keeps its own model, effort and tools.
 - Dispatched with `subagent_type: "<role>"`: the body is already your system prompt.

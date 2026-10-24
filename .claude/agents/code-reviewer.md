@@ -24,7 +24,7 @@ Review the delta the brief names (base..tip), not each commit. Ignore what a lat
 
 ## Report
 
-- Verdict: approve; approve with non-blocking findings (fine to record in `docs/TODO.md` rather than fix first); or changes needed.
+- Verdict: approve; approve with non-blocking findings (each is then fixed or recorded in `docs/TODO.md`, per `docs/GIT.md`); or changes needed.
 - Findings, most severe first, each marked blocking or non-blocking. Each: `file:line`, what is wrong, a concrete failure scenario (inputs or state → wrong result), and the direction of a fix (not a patch). Mark findings you could not confirm as uncertain.
 - Out-of-scope observations last, one line each.
 

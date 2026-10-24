@@ -58,9 +58,8 @@ Except for dependency bumps, which should look like so:
 - Always make a backup branch before risky changes, for example, when modifying commit history, and then verify the backup against the new branch. Delete the backup if full and complete, and not degraded. Note that it might not be identical, such as when rebasing. However, if the sum of all changes *can* be identical (no base delta), then it *must* be identical before accepting the change & deleting the backup.
 - When rebasing, aim to preserve the *intent* behind both branches changes (unless redundant).
 - `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed and approved. Commits above `develop` are work in progress.
-- Blocking findings are fixed, and the fix reviewed, before `develop` advances. Non-blocking findings may be written down (findings docs / `TODO.md`) instead; the review then approves with findings recorded.
+- Blocking findings are fixed, and the fix reviewed, before `develop` advances. Non-blocking findings are fixed the same way when nothing is stacked on top; otherwise they are written down (findings docs / `TODO.md`) before `develop` advances.
 - Review the branch delta (tip vs base), not each commit. Ignore issues a later commit or branch already fixed.
-- With nothing stacked on top, fix findings immediately. Write findings down only when work is stacked on top or in other branches and they can't be resolved right away.
 - Fixes get an adversarial review from a fresh context.
 - Delete findings and `TODO.md` entries once done.
 - Fixes take priority over features unless the owner chooses a feature.

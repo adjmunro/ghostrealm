@@ -29,7 +29,7 @@ Work autonomously. When something can't be solved, or needs a decision that is i
 
 How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review.
 
-Whoever writes something commits it. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them.
+Whoever writes something commits and pushes it. Non-blocking review findings that aren't fixed are recorded in `docs/TODO.md` by the agent that wrote the work, before you fast-forward. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them.
 
 Model and effort: `opus` at `high` by default; `medium` when the work is routine. `haiku` at `low` for mechanical, fully specified work (lookups, running and summarising a command, renames, checking a report against git). Don't use `sonnet`, `fable`, `xhigh` or `max`.
 
