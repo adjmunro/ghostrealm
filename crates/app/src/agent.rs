@@ -90,11 +90,14 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
                 Ok(a) => a,
                 Err(e) => return json!({ "ok": false, "error": e }),
             };
+            let mark = state.file_job_mark();
             let ran = registry.execute(id, &args, state);
             // A file command's work on the file worker finishes before the
-            // reply, which carries its outcome.
+            // reply, which carries its outcome. Jobs the user started before
+            // stay queued for the window to report.
             state.wait_file_jobs();
-            let finished = state.take_file_reports().into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>();
+            let finished =
+                state.take_file_reports_since(mark).into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>();
             match (ran, finished) {
                 (Err(e), _) => json!({ "ok": false, "error": e.to_string() }),
                 (Ok(_), Err(e)) => json!({ "ok": false, "error": e }),
@@ -340,6 +343,27 @@ mod tests {
         if ghostrealm_core::git::repo_root(&d).is_none() {
             assert!(state.confirm().is_some(), "untracked: asks first");
         }
+    }
+
+    #[test]
+    fn a_user_file_job_finished_during_an_agent_command_stays_for_the_window() {
+        let d = crate::plugin::testing::tmpdir("agent-user-job");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        std::fs::write(d.join("b.txt"), "B").unwrap();
+        let mut state = AppState::new().with_file_job_wait(std::time::Duration::ZERO);
+        state.new_empty_vtab();
+        let mut registry = build_registry();
+        let path = d.to_str().unwrap();
+        // The user's duplicate, still running or unreported when the agent asks.
+        let mut args = Args::new();
+        args.insert("path", Value::Str(format!("{path}/a.txt")));
+        registry.execute("file.duplicate", &args, &mut state).unwrap();
+        let dup = format!(r#"{{"op":"set","id":"file.duplicate","args":{{"path":"{path}/b.txt"}}}}"#);
+        let resp = handle(&dup, &mut state, &mut registry);
+        assert_eq!(resp["message"], json!(format!("duplicated to {path}/b copy.txt")), "{resp:?}");
+        state.wait_file_jobs();
+        let left: Vec<_> = state.take_file_reports().into_iter().map(|r| r.result).collect();
+        assert_eq!(left, [Ok(format!("duplicated to {path}/a copy.txt"))], "the user's report stays");
     }
 
     #[test]

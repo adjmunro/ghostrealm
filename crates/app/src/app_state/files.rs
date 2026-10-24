@@ -25,6 +25,8 @@ pub(super) const INLINE_WAIT: Duration = Duration::from_millis(30);
 /// How a file job that finished after its command returned turned out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileReport {
+    /// The job's number, in submission order ([`AppState::file_job_mark`]).
+    pub job: u64,
     /// The command it did the work of (`file.paste`).
     pub command: &'static str,
     /// What the command would have said, or why it failed.
@@ -214,7 +216,7 @@ impl AppState {
                 // The command's reply goes to stderr only when it fails; a
                 // warning is reported as one that finished later is.
                 if let (true, Ok(message)) = (warning, &result) {
-                    self.file_reports.push(FileReport { command, result: Ok(message.clone()), warning });
+                    self.file_reports.push(FileReport { job: id, command, result: Ok(message.clone()), warning });
                 }
                 return result;
             }
@@ -268,8 +270,23 @@ impl AppState {
         std::mem::take(&mut self.file_reports)
     }
 
+    /// The number the next file job gets: jobs are numbered in submission
+    /// order, so the reports of jobs submitted from here on are those
+    /// [`Self::take_file_reports_since`] this mark takes.
+    pub fn file_job_mark(&self) -> u64 {
+        self.file_jobs.next_id()
+    }
+
+    /// Take the reports of the jobs submitted since `mark`
+    /// ([`Self::file_job_mark`]); earlier jobs' reports stay queued.
+    pub fn take_file_reports_since(&mut self, mark: u64) -> Vec<FileReport> {
+        let (since, before) = std::mem::take(&mut self.file_reports).into_iter().partition(|r| r.job >= mark);
+        self.file_reports = before;
+        since
+    }
+
     fn report_file_job(&mut self, done: Done) {
-        let command = done.job.command();
+        let (job, command) = (done.id, done.job.command());
         let asking = self.confirm.is_some();
         let (result, warning) = self.apply_file_job(done);
         // A question from a job that finished after its command returned
@@ -278,7 +295,7 @@ impl AppState {
             c.late = Some(Instant::now());
         }
         let result = result.map_err(|e| format!("{e:#}"));
-        self.file_reports.push(FileReport { command, result, warning });
+        self.file_reports.push(FileReport { job, command, result, warning });
     }
 
     /// Bring the views up to date with a finished job. Returns what its
@@ -1291,6 +1308,7 @@ mod tests {
         assert_eq!(
             reports,
             [FileReport {
+                job: reports[0].job,
                 command: "file.paste",
                 result: Ok(format!("pasted {}", d.join("to/src").display())),
                 warning: false,

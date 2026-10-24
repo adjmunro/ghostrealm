@@ -228,6 +228,12 @@ impl FileJobs {
         self.waker = waker;
     }
 
+    /// The id the next job [`submit`](Self::submit)ted gets. Ids rise in
+    /// submission order.
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Queue `job` behind the ones of its lane given before it: copies and
     /// moves on one, Delete's checks on another, so a check never waits
     /// behind a long copy. Returns its id.
