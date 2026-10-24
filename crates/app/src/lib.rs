@@ -22,6 +22,7 @@ mod macos_keys;
 mod macos_quit;
 pub mod plugin;
 mod pointer;
+pub mod toasts;
 pub mod plugins;
 pub mod row_cache;
 pub mod settings;

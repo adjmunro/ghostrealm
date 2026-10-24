@@ -29,6 +29,7 @@ use crate::plugins::files::{self as files_plugin, FilesView};
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 use crate::plugins::web;
+use crate::toasts::{Level, Toast, ToastAction, Toasts};
 
 mod files;
 mod open;
@@ -248,6 +249,8 @@ pub struct AppState {
     orphan_tabs: web::OrphanTabs,
     /// Hangs up on the web host once no web surface is left.
     web_idle: web::IdleExit,
+    /// Notices for the user, the window shows the head of.
+    toasts: Toasts,
 }
 
 impl AppState {
@@ -285,6 +288,7 @@ impl AppState {
             hidden: HashMap::new(),
             orphan_tabs,
             web_idle,
+            toasts: Toasts::default(),
         }
     }
 
@@ -825,6 +829,89 @@ impl AppState {
     pub fn with_unsaved_guard(mut self) -> Self {
         self.guard_unsaved = true;
         self
+    }
+
+    /// A window shows the toasts: keep each until it is dismissed (headless,
+    /// only the latest few are kept).
+    pub fn set_windowed(&mut self, on: bool) {
+        self.toasts.set_windowed(on);
+    }
+
+    /// Queue `toast` for the user. Returns its id.
+    pub fn notify(&mut self, toast: Toast) -> u64 {
+        self.toasts.push(toast)
+    }
+
+    pub fn toasts(&self) -> &Toasts {
+        &self.toasts
+    }
+
+    pub fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.dismiss(id);
+    }
+
+    /// Dismiss the toast that shows.
+    pub fn dismiss_head_toast(&mut self) {
+        if let Some(id) = self.toasts.head().map(|e| e.id) {
+            self.toasts.dismiss(id);
+        }
+    }
+
+    /// Advance the toast clock ([`Toasts::tick`]). Returns whether the
+    /// head hid.
+    pub fn tick_toasts(&mut self, now: Instant, visible: bool) -> bool {
+        self.toasts.tick(now, visible)
+    }
+
+    /// Run choice `i` of toast `id`, which then goes. Opening the settings
+    /// file can fail: the toast then says why, keeping its message.
+    pub fn choose_toast(&mut self, id: u64, i: usize) {
+        self.choose_toast_with(id, i, ghostrealm_core::config::ensure_file);
+    }
+
+    /// [`Self::choose_toast`], with the config file from `settings`.
+    fn choose_toast_with(&mut self, id: u64, i: usize, settings: impl FnOnce() -> Option<std::path::PathBuf>) {
+        let Some(entry) = self.toasts.get(id) else { return };
+        let Some((_, action)) = entry.toast.choices.get(i).cloned() else { return };
+        match action {
+            ToastAction::SaveAs(doc) => {
+                if self.doc(doc).is_some() {
+                    self.open_save_dialog(doc, Pick::SaveAs(doc));
+                }
+                self.toasts.dismiss(id);
+            }
+            ToastAction::OpenSettings { line } => {
+                let opened = match settings() {
+                    Some(path) => self
+                        .open_settings(path.clone())
+                        .map_err(|e| format!("Couldn't open {}: {e:#}", path.display())),
+                    None => Err("Couldn't open the settings file: there is no config path".to_string()),
+                };
+                match opened {
+                    Ok(()) => {
+                        if let Some(line) = line {
+                            self.reveal_focused_line(line.saturating_sub(1));
+                        }
+                        self.toasts.dismiss(id);
+                    }
+                    Err(why) => {
+                        let Some(old) = self.toasts.get(id).map(|e| e.toast.clone()) else { return };
+                        let mut toast = Toast::new(Level::Error, format!("{why}\n\n{}", old.message)).on(old.scope);
+                        toast.key = old.key;
+                        self.toasts.replace(id, toast);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put the caret at the start of line `line` (0-based) of the focused
+    /// editor document.
+    fn reveal_focused_line(&mut self, line: usize) {
+        let Some(doc) = self.focused_surface().and_then(|s| self.active_doc(s)) else { return };
+        if let Some(editor) = self.doc_mut(doc).and_then(|v| v.downcast_mut::<editor::EditorView>()) {
+            editor.reveal(line, 0..0);
+        }
     }
 
     /// Leave the app, asking first when views have unsaved changes.
@@ -1792,6 +1879,13 @@ pub fn build_registry() -> Registry<AppState> {
         }),
     );
     r.register(
+        CommandMeta::new("toast.dismiss", "Dismiss Toast", "Dismiss the notice showing across the top of a pane or the workspace"),
+        Box::new(|s: &mut AppState, _| {
+            s.dismiss_head_toast();
+            Ok(CmdOutcome::ok())
+        }),
+    );
+    r.register(
         CommandMeta::new("workspace.close", "Close Workspace", "Close the active workspace"),
         Box::new(|s: &mut AppState, _| {
             s.close_active_vtab();
@@ -2422,6 +2516,72 @@ mod tests {
         let err = s.open_file(&file).unwrap_err();
         assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
         assert_eq!(s.focused_surface(), None, "no tab bound to it");
+    }
+
+    #[test]
+    fn a_save_as_choice_opens_the_picker_for_its_document_and_goes() {
+        let dir = crate::plugin::testing::tmpdir("toast-save-as");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.open_file_in_new_surface(&file).unwrap();
+        let doc = s.active_doc(s.focused_surface().unwrap()).unwrap();
+        let id = s.notify(Toast::new(Level::Error, "Couldn't save a.txt").with_choice("Save As…", ToastAction::SaveAs(doc)));
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(doc)));
+        assert!(s.toasts().is_empty());
+    }
+
+    #[test]
+    fn an_open_settings_choice_opens_the_file_and_goes() {
+        let path = crate::plugin::testing::tmpdir("toast-settings").join("config.toml");
+        std::fs::write(&path, "a = 1\nb = 2\n").unwrap();
+        let mut s = AppState::new();
+        let id = s.notify(
+            Toast::new(Level::Warning, "config.toml line 2: unknown key")
+                .keyed("config")
+                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2) }),
+        );
+        s.choose_toast_with(id, 0, || Some(path.clone()));
+        let sid = s.focused_surface().expect("the settings file is focused");
+        assert_eq!(s.editor(sid).and_then(|e| e.path()), Some(path));
+        assert!(s.toasts().is_empty());
+    }
+
+    #[test]
+    fn a_settings_file_that_wont_open_turns_the_toast_into_why_keeping_its_message() {
+        let path = crate::plugin::testing::tmpdir("toast-settings-bad").join("config.toml");
+        std::fs::write(&path, b"caf\xe9").unwrap();
+        let mut s = AppState::new();
+        let other = s.notify(Toast::new(Level::Error, "first"));
+        let id = s.notify(
+            Toast::new(Level::Warning, "config.toml line 2: unknown key")
+                .keyed("config")
+                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2) }),
+        );
+        s.choose_toast_with(id, 0, || Some(path.clone()));
+        let ids: Vec<u64> = s.toasts().iter().map(|e| e.id).collect();
+        assert_eq!(ids, [other, id], "in place");
+        let toast = &s.toasts().get(id).unwrap().toast;
+        assert_eq!(toast.level, Level::Error);
+        assert!(toast.message.starts_with(&format!("Couldn't open {}: ", path.display())), "{}", toast.message);
+        assert!(toast.message.ends_with("\n\nconfig.toml line 2: unknown key"), "{}", toast.message);
+        assert!(toast.choices.is_empty());
+        // No config path at all.
+        let id = s.notify(Toast::new(Level::Warning, "w").with_choice("Open Settings", ToastAction::OpenSettings { line: None }));
+        s.choose_toast_with(id, 0, || None);
+        assert!(s.toasts().get(id).unwrap().toast.message.starts_with("Couldn't open the settings file"));
+    }
+
+    #[test]
+    fn toast_dismiss_dismisses_the_showing_toast() {
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        s.notify(Toast::new(Level::Error, "a"));
+        let b = s.notify(Toast::new(Level::Error, "b"));
+        r.execute("toast.dismiss", &ghostrealm_core::Args::new(), &mut s).unwrap();
+        assert_eq!(s.toasts().head().map(|e| e.id), Some(b));
     }
 
     #[test]

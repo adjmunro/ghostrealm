@@ -6,6 +6,7 @@ use ghostrealm_core::{PaneId, Rect, SurfaceId, VtabId};
 
 use crate::app_state::PICKER_SID;
 use crate::plugin::rect_contains;
+use crate::toasts::ToastHit;
 
 /// What a clickable chrome button does. All buttons share hover-highlight and
 /// arm-on-press/fire-on-release behaviour (see the window's
@@ -31,6 +32,8 @@ pub(crate) enum ButtonAction {
     ConfirmAccept,
     ConfirmCancel,
     ConfirmDiscard,
+    /// A part of the toast with this id.
+    Toast(u64, ToastHit),
 }
 
 impl ButtonAction {
@@ -38,6 +41,10 @@ impl ButtonAction {
     /// browser's).
     fn in_picker(self) -> bool {
         matches!(self, ButtonAction::PickerConfirm | ButtonAction::PickerCancel | ButtonAction::View(PICKER_SID, _))
+    }
+
+    fn in_toast(self) -> bool {
+        matches!(self, ButtonAction::Toast(..))
     }
 
     /// One of the confirmation's buttons.
@@ -65,7 +72,9 @@ pub(crate) fn covered(gate: &Gate, (x, y): (f32, f32)) -> bool {
 }
 
 /// The button at `pos`, if any. The palette and menus own the pointer; while
-/// a confirmation or the picker is open only its buttons are live. The
+/// a confirmation or the picker is open only its buttons are live, and under
+/// the toast only the toast's (view buttons under it come first in paint
+/// order). The
 /// sidebar toggle wins any overlap (it can float over a pane's tab strip when
 /// the sidebar is hidden); otherwise the first button in paint order takes
 /// the hit.
@@ -73,8 +82,12 @@ pub(crate) fn button_at(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (
     if gate.modal {
         return None;
     }
+    let toast = covered(gate, (x, y));
     let mut hit = None;
     for &(r, action) in buttons {
+        if toast && !action.in_toast() {
+            continue;
+        }
         if (gate.confirm && !action.in_confirm()) || (gate.picker && !gate.confirm && !action.in_picker()) {
             continue;
         }
@@ -88,9 +101,11 @@ pub(crate) fn button_at(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (
     hit
 }
 
-/// The index in `buttons` of the one to light up under `pos`.
-pub(crate) fn hover_index(_gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (f32, f32)) -> Option<usize> {
-    buttons.iter().position(|(r, _)| rect_contains(*r, x, y))
+/// The index in `buttons` of the one to light up under `pos`: under the
+/// toast only one of its own, so nothing beneath it lights up.
+pub(crate) fn hover_index(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (f32, f32)) -> Option<usize> {
+    let toast = covered(gate, (x, y));
+    buttons.iter().position(|(r, a)| (!toast || a.in_toast()) && rect_contains(*r, x, y))
 }
 
 /// The view the wheel scrolls: the one `under` the pointer, else the
@@ -144,6 +159,30 @@ mod tests {
         assert!(covered(&gate, IN));
         assert!(!covered(&gate, (20.0, 5.0)));
         assert!(!covered(&Gate::default(), IN));
+    }
+
+    #[test]
+    fn under_the_toast_only_its_buttons_take_the_pointer() {
+        let close = Rect { x: 6.0, y: 2.0, w: 4.0, h: 4.0 };
+        let toast = Rect { x: 0.0, y: 0.0, w: 10.0, h: 6.0 };
+        // A view button under the toast, registered (painted) first.
+        let buttons = [
+            (R, ButtonAction::View(SurfaceId(1), 0)),
+            (R, ButtonAction::ToggleSidebar),
+            (close, ButtonAction::Toast(7, ToastHit::Dismiss)),
+        ];
+        let gate = Gate { toast: Some(toast), ..Gate::default() };
+        let on_close = (8.0, 4.0);
+        assert_eq!(button_at(&gate, &buttons, on_close), Some(ButtonAction::Toast(7, ToastHit::Dismiss)));
+        assert_eq!(hover_index(&gate, &buttons, on_close), Some(2));
+        // The toast's body: nothing under it.
+        assert_eq!(button_at(&gate, &buttons, (2.0, 2.0)), None);
+        assert_eq!(hover_index(&gate, &buttons, (2.0, 2.0)), None);
+        assert!(covered(&gate, (2.0, 2.0)));
+        assert_eq!(wheel_target(&gate, (2.0, 2.0), Some(1), Some(2)), None);
+        // Below it, everything is as before.
+        assert_eq!(button_at(&gate, &buttons, (2.0, 8.0)), Some(ButtonAction::ToggleSidebar));
+        assert_eq!(hover_index(&gate, &buttons, (2.0, 8.0)), Some(0));
     }
 
     #[test]

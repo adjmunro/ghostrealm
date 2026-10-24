@@ -42,6 +42,7 @@ use crate::plugin::{
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
 use crate::pointer::{self, ButtonAction, Gate};
+use crate::toasts::{self, ToastHit};
 use crate::images::ImageRenderer;
 use crate::tap::{HeldKey, TapDetector};
 
@@ -325,6 +326,12 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(d) = state.next_view_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
+        if state.tick_toasts() {
+            state.window.request_redraw();
+        }
+        if let Some(d) = state.app.toasts().next_deadline() {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
         if let Some(d) = state.tooltip_due {
             if Instant::now() >= d {
                 state.dirty = true;
@@ -597,6 +604,12 @@ struct State {
     /// Draws the context menu's text, after its quads: a menu can stack over
     /// another overlay (the picker), whose text draws in the palette pass.
     menu_renderer: TextRenderer,
+    /// Draws the toast's text, after its quads: above every pane and view
+    /// popup, below the menu and tooltip.
+    toast_renderer: TextRenderer,
+    /// The toast as last drawn: nothing under it takes the pointer. `None`
+    /// while no toast shows.
+    toast_rect: Option<Rect>,
     palette_buffers: Vec<Buffer>,
     palette: Option<Palette>,
     /// Last-rendered palette panel rect (physical px), for click-outside dismissal.
@@ -1169,6 +1182,7 @@ impl State {
         let palette_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let menu_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let toast_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         // The registry and plugins make up the catalogue the config is checked
         // against.
@@ -1199,6 +1213,7 @@ impl State {
             })
         };
         let mut app = AppState::new().with_unsaved_guard();
+        app.set_windowed(true);
         let has_command = command_line.is_some();
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
@@ -1260,6 +1275,8 @@ impl State {
             serif_alias,
             palette_renderer,
             menu_renderer,
+            toast_renderer,
+            toast_rect: None,
             palette_buffers: Vec::new(),
             palette: None,
             palette_panel: Rect {
@@ -1622,8 +1639,29 @@ impl State {
             modal: self.palette.is_some() || self.menu.is_some(),
             picker: self.app.picker_open(),
             confirm: self.app.confirm().is_some(),
-            toast: None,
+            toast: self.toast_rect,
         }
+    }
+
+    /// The pointer as panes see it: nowhere while it is over the toast, so
+    /// nothing under the toast lights up.
+    fn pane_cursor(&self) -> (f32, f32) {
+        if pointer::covered(&self.gate(), self.cursor) {
+            (-1.0, -1.0)
+        } else {
+            self.cursor
+        }
+    }
+
+    /// Advance the toast clock: it runs while the toast is drawn, the window
+    /// focused, and the pointer off it. Returns whether the toast hid.
+    fn tick_toasts(&mut self) -> bool {
+        let visible = self
+            .toast_rect
+            .is_some_and(|r| self.window_focused && !rect_contains(r, self.cursor.0, self.cursor.1));
+        let hid = self.app.tick_toasts(Instant::now(), visible);
+        self.dirty |= hid;
+        hid
     }
 
     /// The chrome button under the cursor, if any ([`pointer::button_at`]).
@@ -1666,6 +1704,8 @@ impl State {
             ButtonAction::ConfirmAccept => self.accept_confirm(),
             ButtonAction::ConfirmCancel => self.app.cancel_confirm(),
             ButtonAction::ConfirmDiscard => self.discard_confirm(),
+            ButtonAction::Toast(id, ToastHit::Dismiss) => self.app.dismiss_toast(id),
+            ButtonAction::Toast(id, ToastHit::Choice(i)) => self.app.choose_toast(id, i),
         }
         self.dirty = true;
         true
@@ -2794,13 +2834,14 @@ impl State {
         });
         let ui = self.ui();
         let (scale, ch) = (ui.scale, ui.cell_h);
+        let cursor = self.pane_cursor();
         // The buttons here are the app's (pushed to `self.buttons`), so the
         // context's view-button owner is never used.
         let mut cx = PaintCx::new(
             &self.cfg,
             &self.chrome,
             ui,
-            self.cursor,
+            cursor,
             &mut self.text,
             frame,
             Layer::Base,
@@ -3039,6 +3080,52 @@ impl State {
             self.buttons.push((hit, action));
             right -= w + pad * 3.0;
         }
+    }
+
+    /// Draw the head of the toast queue, unless a modal (palette, picker,
+    /// confirmation, menu) is open, into a frame of its own: its quads and
+    /// text draw after every overlay but the menu and tooltip. Registers its
+    /// buttons and notes its rect; with the pointer over it, its own tooltip
+    /// (or none) replaces the frame's.
+    fn build_toast(
+        &mut self,
+        frame: &mut Frame,
+        panes: &[(PaneId, Rect, Rect)],
+        workspace: Rect,
+        modal: bool,
+    ) -> Option<Frame> {
+        self.toast_rect = None;
+        let ui = self.ui();
+        let head = self.app.toasts().head().filter(|_| !modal)?;
+        let more = self.app.toasts().len() - 1;
+        let toggle = self.buttons.iter().find(|(_, a)| *a == ButtonAction::ToggleSidebar).map(|(r, _)| *r);
+        let area = toasts::Area {
+            workspace,
+            panes,
+            toggle,
+            min_pane_w: 24.0 * self.cell_w,
+            margin: 6.0 * self.scale,
+        };
+        let at = toasts::place(head.toast.scope, &area);
+        let mut tf = Frame::new(frame.screen);
+        let mut cx = PaintCx::new(
+            &self.cfg,
+            &self.chrome,
+            ui,
+            self.cursor,
+            &mut self.text,
+            &mut tf,
+            Layer::Overlay,
+            PICKER_SID,
+        );
+        let layout = toasts::paint(&mut cx, &head.toast, at, more);
+        let id = head.id;
+        self.buttons.extend(layout.buttons.iter().map(|(r, hit)| (*r, ButtonAction::Toast(id, *hit))));
+        self.toast_rect = Some(layout.rect);
+        if rect_contains(layout.rect, self.cursor.0, self.cursor.1) {
+            frame.tooltip = tf.tooltip.take();
+        }
+        Some(tf)
     }
 
     /// Draw the hovered tooltip once its anchor has been hovered for
@@ -4211,6 +4298,7 @@ impl State {
             self.last_focused_surface = focused;
         }
         self.fire_view_timers();
+        self.tick_toasts();
         // A modal that opened (from the keyboard, say) takes hover from the
         // view under the pointer.
         let may_hover = self.may_hover();
@@ -4279,6 +4367,7 @@ impl State {
             .shape_until_scroll(&mut self.text.font_system, false);
 
         let mut painted: Vec<SurfaceId> = Vec::new();
+        let pane_cursor = self.pane_cursor();
         for (pr, strip_h, term) in &resolved {
             // Horizontal tab strip (autohidden for single-surface panes).
             if *strip_h > 0.0 {
@@ -4405,7 +4494,7 @@ impl State {
                     &self.cfg,
                     &self.chrome,
                     ui,
-                    self.cursor,
+                    pane_cursor,
                     &mut self.text,
                     &mut frame,
                     Layer::Base,
@@ -4468,6 +4557,8 @@ impl State {
         // overlay pass.
         self.build_picker(&mut frame);
         self.build_confirm(&mut frame);
+        let pane_rects: Vec<(PaneId, Rect, Rect)> = resolved.iter().map(|(pr, _, term)| (pr.id, pr.rect, *term)).collect();
+        let toast = self.build_toast(&mut frame, &pane_rects, workspace, modal);
         let tooltip = self.build_tooltip(&mut frame);
         // The menu (or else the tooltip) draws after every other overlay,
         // quads and text, so one opened from the picker's view shows above
@@ -4494,11 +4585,14 @@ impl State {
             self.config.width,
             self.config.height,
         );
-        let n_bg = frame.bg.len() as u32;
-        let n_top = frame.top.len();
-        let n_menu = menu_quads.len();
+        let (toast_quads, toast_text) = match toast {
+            Some(t) => (t.top, t.overlay_text),
+            None => (Vec::new(), Vec::new()),
+        };
+        let ranges = pass_ranges(frame.bg.len(), frame.top.len(), toast_quads.len(), menu_quads.len());
         let mut quads = std::mem::take(&mut frame.bg);
         quads.extend_from_slice(&frame.top);
+        quads.extend_from_slice(&toast_quads);
         quads.extend_from_slice(&menu_quads);
         self.upload_quads(&quads);
 
@@ -4664,6 +4758,22 @@ impl State {
                 )
                 .context("overlay prepare")?;
         }
+        // The toast's text, in a pass of its own after its quads.
+        let has_toast_text = !toast_text.is_empty();
+        if has_toast_text {
+            let areas: Vec<TextArea> = toast_text.iter().filter_map(area).collect();
+            self.toast_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .context("toast prepare")?;
+        }
         // The menu's (or tooltip's) text, in a pass of its own after its quads.
         let has_menu_text = !menu_placements.is_empty() || !tooltip_text.is_empty();
         if !tooltip_text.is_empty() {
@@ -4759,35 +4869,37 @@ impl State {
                 multiview_mask: None,
             });
 
-            if n_bg > 0 {
-                pass.set_pipeline(&self.quad_pipeline);
-                pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
-                pass.draw(0..4, 0..n_bg);
-            }
+            let [bg_quads, top_quads, toast_quads, menu_quads] = ranges;
+            let quad_pipeline = &self.quad_pipeline;
+            let quad_buffer = &self.quad_buffer;
+            let draw_quads = |pass: &mut wgpu::RenderPass, range: std::ops::Range<u32>| {
+                if !range.is_empty() {
+                    pass.set_pipeline(quad_pipeline);
+                    pass.set_vertex_buffer(0, quad_buffer.slice(..));
+                    pass.draw(0..4, range);
+                }
+            };
+            draw_quads(&mut pass, bg_quads);
             self.images.draw_base(&mut pass, self.config.width, self.config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .context("text render")?;
-            let total = (n_bg as usize + n_top) as u32;
-            if total > n_bg {
-                pass.set_pipeline(&self.quad_pipeline);
-                pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
-                pass.draw(0..4, n_bg..total);
-            }
+            draw_quads(&mut pass, top_quads);
             self.images.draw_overlay(&mut pass, self.config.width, self.config.height);
             if has_overlay_text {
                 self.palette_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .context("overlay render")?;
             }
-            if n_menu > 0 {
-                let (start, end) = ((n_bg as usize + n_top) as u32, (n_bg as usize + n_top + n_menu) as u32);
-                pass.set_pipeline(&self.quad_pipeline);
-                pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
-                pass.draw(0..4, start..end);
-            }
             // Only what was prepared this frame: a renderer replays its last
             // prepared text otherwise.
+            draw_quads(&mut pass, toast_quads);
+            if has_toast_text {
+                self.toast_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .context("toast render")?;
+            }
+            draw_quads(&mut pass, menu_quads);
             if has_menu_text {
                 self.menu_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
@@ -4847,9 +4959,22 @@ fn is_modifier_key(key: &WKey) -> bool {
     )
 }
 
+/// The instance ranges of the quad passes, in draw order, for a buffer laid
+/// out `bg ++ top ++ toast ++ menu`: the background, the top layer (after
+/// the base text), the toast (after the overlay text), and the menu or
+/// tooltip (after the toast's text).
+fn pass_ranges(n_bg: usize, n_top: usize, n_toast: usize, n_menu: usize) -> [std::ops::Range<u32>; 4] {
+    let mut start = 0u32;
+    [n_bg, n_top, n_toast, n_menu].map(|n| {
+        let r = start..start + n as u32;
+        start = r.end;
+        r
+    })
+}
+
 /// Break `text` at spaces into lines no wider than `max_w` as `width_of`
 /// measures them. A word wider than that gets a line of its own.
-fn wrap_words(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
+pub(crate) fn wrap_words(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split(' ').filter(|w| !w.is_empty()) {
@@ -5544,7 +5669,7 @@ fn close_slot(
 mod tests {
     use super::{
         build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, close_slot,
+        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, close_slot, pass_ranges,
     };
     use crate::plugin::theme;
     use ghostrealm_core::{Axis, Rect, Side, SurfaceId};
@@ -5836,6 +5961,15 @@ mod tests {
 
     /// A confirmation's message is drawn as lines that each fit the panel, so
     /// none of it (such as the warning that a buffer would be lost) is cut off.
+    #[test]
+    fn the_toast_pass_follows_the_top_layer_and_precedes_the_menu() {
+        assert_eq!(pass_ranges(3, 2, 4, 1), [0..3, 3..5, 5..9, 9..10]);
+        // Empty passes are empty ranges, which draw nothing.
+        let [bg, top, toast, menu] = pass_ranges(3, 0, 0, 2);
+        assert!(top.is_empty() && toast.is_empty());
+        assert_eq!((bg, menu), (0..3, 3..5));
+    }
+
     #[test]
     fn a_message_breaks_into_lines_that_fit() {
         let width = |s: &str| s.chars().count() as f32 * 10.0;

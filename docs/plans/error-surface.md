@@ -476,6 +476,21 @@ functions above.
   strips and beside the sidebar toggle, toast over a hover popup, the picker
   error row, and dismiss on mouse-up.
 
+## As built
+
+Where the build differs from the design above:
+
+- Commit 11:
+  - `notify` doesn't print. Each call site keeps its own stderr line, so
+    terminal launches log what they did before.
+  - `Toasts::next_deadline()` takes no `now`: the clock counts from the last
+    tick that saw the head visible.
+  - The floating sidebar toggle insets pane toasts as well as app toasts:
+    either can sit under it.
+  - `open_save_dialog` stays private: `choose_toast` is on `AppState`.
+  - `choose_toast_with(id, i, settings)` takes the config path, so tests
+    don't touch the real one.
+
 ## Risks
 
 - A pointer path that skips the `pointer.rs` gate would let a click through.

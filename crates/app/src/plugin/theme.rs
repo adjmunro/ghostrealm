@@ -32,6 +32,11 @@ pub const WARN: [u8; 3] = [225, 170, 70];
 pub const DIAG_ERROR: [u8; 3] = [240, 100, 100];
 pub const DIAG_WARNING: [u8; 3] = [230, 205, 70];
 pub const DIAG_INFO: [u8; 3] = [110, 160, 230];
+/// A toast's fill, by level. Opaque, under [`TEXT`].
+pub const TOAST_INFO: [u8; 3] = [40, 80, 140];
+pub const TOAST_SUCCESS: [u8; 3] = [40, 110, 60];
+pub const TOAST_WARNING: [u8; 3] = [160, 95, 25];
+pub const TOAST_ERROR: [u8; 3] = [155, 45, 50];
 /// Lines added and deleted (diff counts).
 pub const ADDED: [u8; 3] = [80, 180, 90];
 pub const DELETED: [u8; 3] = [210, 90, 90];
