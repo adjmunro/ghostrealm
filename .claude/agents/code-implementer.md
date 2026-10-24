@@ -21,7 +21,7 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 
 ## Implement
 
-- Branch from the base in the brief, per `docs/GIT.md`. Commit as you go. Never push and never move `develop`.
+- Branch from the base in the brief, per `docs/GIT.md`. Commit as you go and push your branch. Never move `develop`.
 - Run the tests that cover what you changed.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.

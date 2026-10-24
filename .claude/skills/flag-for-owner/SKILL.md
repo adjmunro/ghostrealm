@@ -12,4 +12,4 @@ Where it goes in `decisions-pending.md`:
 - **Needs a human at a desktop:** a line under "Needs you at a desktop".
 - **Unsolved problem:** a numbered section with what you tried and what blocked you, in place of **Options**.
 
-Before building on an item, check whether its **Your answer** block is filled in. Whoever writes the entry commits it.
+Before building on an item, check whether its **Your answer** block is filled in. Whoever writes the entry commits and pushes it: on the current goal branch, or with no goal branch on a new branch from `develop`. It reaches `develop` through the same review as any other commit.

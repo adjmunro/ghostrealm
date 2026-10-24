@@ -43,4 +43,4 @@ Each context should hold only what its task needs.
 
 ## Report
 
-What changed (files), why, and anything the director must do differently. Commit what you wrote, on a branch per `docs/GIT.md`.
+What changed (files), why, and anything the director must do differently. Commit and push what you wrote, on a branch per `docs/GIT.md`.

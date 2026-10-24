@@ -3,7 +3,7 @@ name: sandboxed-build
 description: Use when the agent command sandbox is on, or builds or PTY, GPU, local-port or CEF tests fail on sandbox restrictions.
 ---
 
-With the sandbox on, PTY, GPU, local-port and CEF-host tests fail and the build needs workarounds. Ask the owner to turn it off. If it must stay on:
+With the sandbox on, PTY, GPU, local-port and CEF-host tests fail and the build needs workarounds. Flag it for the owner to turn off (`flag-for-owner`, under "Needs you at a desktop"), and meanwhile:
 
 - Zig from ziglang.org on `PATH`.
 - `CARGO_HOME` and `ZIG_GLOBAL_CACHE_DIR` under `$TMPDIR`.
