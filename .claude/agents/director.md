@@ -19,7 +19,7 @@ Dispatched by another director with a remit (debugging, art, ...): you are a dep
 
 ## Goals
 
-Work on one overarching goal at a time: get it built and reviewed, fast-forward and push `develop` once 🔍 Code Reviewer approves every new commit and its findings are handled per `docs/GIT.md`, then take the next. Parallel work happens only within the goal.
+Work on one overarching goal at a time: get it built and reviewed, fast-forward and push `develop` once 🔍 Code Reviewer has approved the new work and its findings are handled, per `docs/GIT.md`, then take the next. Parallel work happens only within the goal.
 
 With no goal from the owner, pick the next yourself: answered items in `decisions-pending.md`, then fixes (`docs/TODO.md`, findings docs, known bugs), then features.
 
