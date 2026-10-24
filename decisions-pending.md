@@ -144,7 +144,13 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 - Add C later only if A's boundary gets in the way.
 
 **Your answer:**
+> **C, with a standing grant.** By default an agent is scoped to its own workspace (per-workspace token, enforced in the app). Reaching the rest of the app (e.g. for testing) needs human approval, given via a per-workspace toggle in the UI so it can be set once and left on for autonomous jobs.
 >
+> **Human-only things are structural, not rules.** Some things are hard-coded out of the command registry/MCP entirely, so they can only be driven through the UI. Human-only web profiles are among them.
+>
+> **Profile access lives on the profile.** Which workspaces can use a profile, and whether it's human-only or human+agent, are profile settings (see item 4).
+>
+> **Open risk / follow-up:** CEF stores cookies and logins on disk, readable by any same-user process (including an agent's shell). Check whether CEF uses Keychain-backed cookie encryption on macOS. Explore app-managed encryption at rest, one key per profile (not per workspace) held in the Keychain so only Ghost Realm can unlock it.
 
 ---
 
@@ -178,7 +184,19 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 **Recommendation:** a(i), b(i), c(i) private by default, d as described, and e(i). This ships the structural isolation first and leaves named profiles and scope editing as later work.
 
 **Your answer:**
+> **Ownership by opener.** Whoever opens a browser owns it: opened from the UI means human-only; opened over MCP means agent-owned. Agent browsers are always visible to and usable by the human (e.g. to enter login details).
 >
+> **Profiles:** One unified human profile shared across all workspaces. Each workspace's "view" of it is bookkeeping only (a record of which sites were used there), not a separate profile and no copying. Agents always use their own separate profile(s). An agent must never drive a pane on the human profile.
+>
+> **Sharing a browser with an agent:** a toggle on the pane. The pane stays in place but reloads under the agent profile (unsaved page state is lost). The first time it's enabled, show a prominent warning listing exactly what the agent gains access to. On re-enable, prompt again only if access has grown: show the new items first, with the already-granted ones greyed out underneath.
+>
+> **No session/cookie copying between human and agent profiles.** Copying risks token rotation logging the human out, and write-back would let an agent plant cookies in the human profile. Instead, agents get their own independent sessions.
+>
+> **Login handover:** the agent requests a login (command), or the human presses "take over". The pane enters human control and the app refuses every agent op aimed at it until it's handed back. Backstop: refuse agent script/eval on pages with a password field. For unattended jobs, log in to the agent profile ahead of time; if a session expires mid-job, that site pauses until a human returns.
+>
+> **Password managers, staged:** v1 is manual handover only. Later, optionally fill credentials from the 1Password CLI during a handover. Browser extensions are likely out: CEF only supports extensions in Chrome-style windows with Chrome UI. Apple Passwords is unverified (no general read access for third-party apps). A home-grown manager is a maybe for later (crypto is easy; sync, recovery and phishing-safe matching are the hard parts).
+>
+> **Follow-up (from item 3):** check CEF's on-disk cookie encryption on macOS; consider per-profile at-rest encryption with keys in the Keychain.
 
 ---
 
@@ -211,7 +229,15 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 **Recommendation:** A. It keeps agent work in the background, as you want, and confines agent file access to its workspace.
 
 **Your answer:**
+> **JS dialogs (agent-driven pages):** don't auto-dismiss blindly. Hold the dialog open and report its type and text to the agent, which can accept, dismiss, or enter text via a command (Playwright-style), so agents can test sites properly. On timeout with no response, dismiss so the page never stalls. Human-driven pages get normal in-app modals.
 >
+> **Per-site permissions system:** agent uploads and downloads are **off by default** for agent-owned and agent-shared browsers. A human grants permissions per host, granularly. Upload and download are separate permissions. Generalise to the usual browser site permissions (camera, microphone, etc.) under the same system.
+>
+> **Two layers:** a global list plus a per-workspace list. The workspace list overrides the global one in either direction (turn off something global allows, or turn on something global doesn't mention). Lists are human-controlled only.
+>
+> **Download location:** agent downloads go to `~/Downloads/Ghost Realm/<workspace>/`. Human downloads go to `~/Downloads` as normal.
+>
+> **Quarantine:** make sure downloads get the macOS `com.apple.quarantine` attribute (verify CEF does this; don't assume) so Gatekeeper checks on open. Note: an agent executing a file from its shell bypasses this, and that's governed by agent shell policy, not the download path.
 
 ---
 
@@ -243,7 +269,7 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 **Recommendation:** A. Split the `Token` vocabulary first. The heading modes and outline you want need a syntax tree, which only A provides cheaply.
 
 **Your answer:**
->
+> **A: tree-sitter** for code languages (via the official `tree-sitter` Rust crate plus per-language grammar crates). Markdown and TOML keep their hand-written highlighters. Split the `Token` vocabulary first. Accepted as a core dependency: stable, widely used (Neovim, Helix, Zed, GitHub), incremental and error-tolerant. The syntax tree should also feed the outline, Kotlin heading modes, fence highlighting, and later the indexer (item 18).
 
 ---
 
@@ -275,7 +301,15 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 **Recommendation:** B. It keeps licensing and build weight visible without stalling items 6, 9, and 11.
 
 **Your answer:**
+> **Dependency policy (roughly B, leaning C for small deps):**
+> - Unless a dependency is truly integral (graphics stack, browser engine, VT-level jobs where we're deeply coupled), it sits behind our own trait/interface so it can be swapped.
+> - Simple dependencies doing simple jobs should be replaced with our own code over time, to cut the risk surface.
+> - Large jobs (codecs, browser, tree-sitter) stay as dependencies.
+> - Watch the transitive tree (`cargo tree`). Anything pulling in C/C++ or a large transitive tree needs my OK.
 >
+> **Licence (new decision, made here):** relicense the project under the **Functional Source License (FSL)**. Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years. The current MIT licence was not a deliberate choice: replace it.
+>
+> **Hard rule: no GPL dependencies.** GPL is incompatible with FSL. Any dependency that is GPL (or would force GPL) must be flagged to me for a licence review and never just added. LGPL is acceptable only when dynamically linked and replaceable (e.g. an LGPL-only ffmpeg build: no `--enable-gpl`, no x264/x265). Playback only needs decoders, which LGPL builds include.
 
 ---
 
@@ -310,7 +344,7 @@ A `[terminal]` boolean controls it under every option.
 **Recommendation:** A. It gives word and line motion in Vim with no mappings, and stops the `^A` / `^E` / `^U` side effects. Verify it in Vim, Neovim, `less`, and `htop` before shipping.
 
 **Your answer:**
->
+> **B: turn translation off in the alternate screen.** My earlier "they should do the same thing in Vim" was wrong. Full-screen programs (Vim, less, htop, etc.) must be respected: when a program is on the alternate screen, all of our readline-style key translation comes off and keys send their normal encoding. No Vim-specific translation.
 
 ---
 
@@ -341,7 +375,14 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** A, with the autoplay button kept per document. Pick C instead if you want pins on every machine.
 
 **Your answer:**
+> **Three layers, split by who writes it and whether it syncs:**
+> 1. `config.toml`: shared, human-intent settings, synced across machines. This includes palette hide and pin, keybindings added from the app, colour-picker writes, and human-chosen defaults (e.g. a default 75/25 split ratio). The app may write here only on an explicit user action, using `toml_edit` so comments and order are preserved.
+> 2. `config.local.toml`: human settings for this machine only, never synced. Overrides `config.toml`.
+> 3. `state/` directory (platform state dir, never synced): app-generated output, one JSON file per feature (MRU, current split sizes, window size, etc.). Uses `serde_json`, which is already in the tree via the LSP crates. One file per feature avoids write contention and limits corruption to one feature.
 >
+> (Effectively option C extended: pins and hides sync; programmatic state stays local.)
+>
+> **Autoplay sub-question:** the media autoplay button sets the global default for all videos (writes `[file_browser] preview_autoplay` to `config.toml`), not a per-document override. **Follow-up:** check the provenance of the current per-document behaviour (TODO "Files surface — media follow-ups" ~line 396, and git history). Was it something I specified, or an agent choice?
 
 ---
 
@@ -367,7 +408,13 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** A. Reset with a confirmation popup is what you described, and regenerate is a case of it.
 
 **Your answer:**
+> **Parked: not a priority; revisit later.** Unsure we need these commands at all.
 >
+> **Key concern to resolve first (default drift):** if a shipped default changes in an update, users relying on that default, whether the key is absent from their file or was removed by a clean-up, get the behaviour changed underneath them. Any design here must prevent that rug pull, automatically and programmatically (no agent involved). Ideas to explore:
+> 1. On update, auto-write the old default into the user's file for any changed default (an exception to the "no implicit rewrite" rule).
+> 2. Versioned defaults: the config records a `defaults_version`. The app keeps old default sets, so users stay on their version until they opt in to upgrading, with a diff shown first.
+>
+> Also: "clean up" must not remove entries equal to the current default unless drift is handled.
 
 ---
 
@@ -397,7 +444,11 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** D until you want video, then B.
 
 **Your answer:**
->
+> **A, via a user-installed ffmpeg, optional and not bundled.**
+> - Ghost Realm does not bundle ffmpeg. It uses a system-installed copy, declared as an optional dependency in package managers (Homebrew, Pacman, etc.).
+> - Load ffmpeg dynamically at runtime, not linked at build time. If it's missing, video is disabled and the UI shows a clear "install ffmpeg to play video" message. Images and audio keep working.
+> - Licence note (see item 7): distro builds (e.g. Homebrew) are often GPL. Because we neither distribute nor statically link it, this should be acceptable, but it's a grey area. Keep it runtime-loaded and record the reasoning.
+> - Standing rule: flag any future dependency that is a notably large binary for my review.
 
 ---
 
@@ -420,7 +471,12 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** B now, C when groups come up. In both, hold re-sorting while the pointer is over the sidebar so rows don't jump under a click.
 
 **Your answer:**
->
+> **Two lists, both sorted inbox-style; no manual order.**
+> - **Pinned** (top) and **everything else** (below). Pinning only decides which list a workspace is in.
+> - Both lists sort by most recent attention request (needs input, ready to view, etc.), newest first. Viewing a workspace does not move it back; there is no "original slot".
+> - **Directory groups:** in both lists, workspaces sharing a root folder auto-group under a collapsible directory header. If any member requests attention, the whole group moves to the top.
+> - **Drag-to-reorder is dropped entirely.**
+> - **Hover freeze:** while the pointer is over the sidebar, keep rendering the previous order (status dots still update live). When the pointer leaves, re-sort once with a short animation. The order is derived from timestamps, so nothing needs queueing.
 
 ---
 
@@ -447,7 +503,7 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** B.
 
 **Your answer:**
->
+> **B: leaf zones plus workspace-edge bands.** Must include clear visual guides: once a drag starts, all drop zones (pane edges/centre and workspace edge bands) faintly highlight. Hovering a zone shows a translucent preview of exactly where and how big the resulting pane will be (VS Code style).
 
 ---
 
@@ -475,7 +531,13 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Recommendation:** A now, D next (getting a file back from the Trash is the main value), and B or C only if you want them. Add your own ideas below.
 
 **Your answer:**
->
+> 1. **Proper standard undo** (option A): an operation log, runs that break at word boundaries and pauses, and history that survives Save As and reload.
+> 2. **Undo tree per open file** (option C): branching history tied to the file, not the pane, and discarded when the file closes. **No undo across restarts** (B dropped).
+> 3. **File-operation undo** (option D) for create, rename, move, and Trash, with its own tree.
+> 4. **Embedded undo panel:** the editor (one per open file) and the file browser each get a toggleable undo panel showing their tree, where you can walk it to undo, redo, and switch branches. Embedding avoids focus ambiguity.
+> 5. **No other app-wide undo** (layout etc.) for now.
+> 6. **Simple linear undo/redo built into the standard single-line text field** (`LineEdit`), used everywhere (rename, palette, URL bar, etc.). No tree.
+> 7. **Standing note:** revisit undo coverage as new surfaces are added. Each new pane type should be assessed for whether it needs undo, e.g. web form interactions, or a future Git pane where undoing and redoing Git actions would be very valuable.
 
 ---
 
