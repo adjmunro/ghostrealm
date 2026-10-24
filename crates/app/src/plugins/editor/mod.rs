@@ -1591,8 +1591,7 @@ impl View for EditorView {
         }
         if let Some(lang) = &self.lang {
             let lines = &self.buf.lines;
-            // Diagnostics: an underline under each visual row's part of the span.
-            let thick = (1.5 * scale).max(1.0);
+            // Diagnostics: a wavy underline under each visual row's part of the span.
             for (start, end, color) in lang.underlines(lines) {
                 for (i, r) in vis.iter().enumerate() {
                     if r.ln < start.0 || r.ln > end.0 {
@@ -1612,8 +1611,7 @@ impl View for EditorView {
                     let x0 = (text_x + (a - r.start) as f32 * col_w(r) - hscroll_px(r)).max(text_x);
                     let x1 = (text_x + (b - r.start) as f32 * col_w(r) - hscroll_px(r)).min(body.x + body.w);
                     if x1 > x0 {
-                        let under = Rect { x: x0, y: r.bottom() - thick, w: x1 - x0, h: thick };
-                        cx.with_clip(body, |cx| cx.fill_top(under, color, 0.9));
+                        cx.with_clip(body, |cx| cx.squiggle(x0, x1, r.bottom(), color));
                     }
                 }
             }
@@ -2127,7 +2125,8 @@ mod tests {
         v
     }
 
-    /// A language server that flags every "bad" and documents every word.
+    /// A language server that flags every "bad" (an error) and run of "z" (a
+    /// warning), and documents every word.
     struct Flags;
 
     impl ghostrealm_lsp::LanguageServer for Flags {
@@ -2143,10 +2142,24 @@ mod tests {
         }
 
         fn diagnostics(&mut self, doc: &ghostrealm_lsp::Document) -> Vec<ghostrealm_lsp::types::Diagnostic> {
-            doc.text
-                .match_indices("bad")
-                .map(|(i, _)| ghostrealm_lsp::types::Diagnostic {
-                    range: doc.range(i..i + 3),
+            use ghostrealm_lsp::types::{Diagnostic, DiagnosticSeverity};
+            let bad = doc.text.match_indices("bad").map(|(i, _)| (i..i + 3, None));
+            // Each run of "z" is a warning.
+            let mut runs = Vec::new();
+            let mut chars = doc.text.char_indices().peekable();
+            while let Some((i, c)) = chars.next() {
+                if c == 'z' {
+                    let mut end = i + 1;
+                    while let Some((j, _)) = chars.next_if(|&(_, c)| c == 'z') {
+                        end = j + 1;
+                    }
+                    runs.push((i..end, Some(DiagnosticSeverity::WARNING)));
+                }
+            }
+            bad.chain(runs)
+                .map(|(span, severity)| Diagnostic {
+                    range: doc.range(span),
+                    severity,
                     message: "flagged".into(),
                     ..Default::default()
                 })
@@ -2196,15 +2209,50 @@ mod tests {
         Some(popup.text.iter().map(|(t, _)| t.clone()).collect())
     }
 
+    /// The wavy underlines painted over the text in `color`, one per visual
+    /// row: (left, right, bottom) of its segments, ordered by row.
+    fn squiggles(h: &Harness, color: [u8; 3]) -> Vec<(f32, f32, f32)> {
+        let rgb = color.map(|c| crate::plugin::paint::srgb_to_linear(c) as f32);
+        let segments = h.frame.top.iter().filter(|q| {
+            q.radius < 0.0 && q.color[3] == 1.0 && q.color.iter().zip(rgb).all(|(a, b)| (a - b).abs() < 1e-4)
+        });
+        let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+        for q in segments {
+            let r = rects(h, std::slice::from_ref(q))[0];
+            let (left, right, bottom) = (r.0, r.0 + r.2, r.1 + r.3);
+            // A row's segments end anywhere on the wave, rows a cell apart.
+            match rows.iter_mut().find(|row| (row.2 - bottom).abs() < UI.cell_h / 2.0) {
+                Some(row) => *row = (row.0.min(left), row.1.max(right), row.2.max(bottom)),
+                None => rows.push((left, right, bottom)),
+            }
+        }
+        rows.sort_by(|a, b| a.2.total_cmp(&b.2));
+        rows
+    }
+
+    /// Whether `row` squiggles columns `from..to` of visual row `n`: the
+    /// stroke's round ends reach half its width past them.
+    fn squiggles_cols(row: (f32, f32, f32), n: usize, from: usize, to: usize) -> bool {
+        let ((x0, _), (x1, _)) = (at(n, from), at(n, to));
+        (row.0 - (x0 - 0.5)).abs() < 0.01
+            && (row.1 - (x1 + 0.5)).abs() < 0.01
+            && (row.2 - (n + 1) as f32 * UI.cell_h).abs() < 0.01
+    }
+
     #[test]
     fn diagnostics_are_underlined_and_follow_edits() {
         let mut h = Harness::new();
-        let mut v = attached("ok bad\n");
+        let mut v = attached("ok bad zzz\n");
         paint_plain(&mut h, &mut v);
-        let plain = h.frame.top.len();
+        assert!(squiggles(&h, theme::DIAG_ERROR).is_empty(), "nothing before the service answers");
         settle(&mut v);
         paint_plain(&mut h, &mut v);
-        assert_eq!(h.frame.top.len(), plain + 1, "one underline");
+        let red = squiggles(&h, theme::DIAG_ERROR);
+        assert!(red.len() == 1 && squiggles_cols(red[0], 0, 3, 6), "red under \"bad\" only: {red:?}");
+        let yellow = squiggles(&h, theme::DIAG_WARNING);
+        assert!(yellow.len() == 1 && squiggles_cols(yellow[0], 0, 7, 10), "yellow under \"zzz\" only: {yellow:?}");
+        let segments = h.frame.top.iter().filter(|q| q.radius < 0.0).count();
+        assert!(segments > 4, "a zigzag, not a bar: {segments}");
 
         v.buffer_mut().cursor = (1, 0);
         for c in "bad".chars() {
@@ -2217,12 +2265,25 @@ mod tests {
         loop {
             v.refresh();
             paint_plain(&mut h, &mut v);
-            if h.frame.top.len() == plain + 2 {
+            let red = squiggles(&h, theme::DIAG_ERROR);
+            if red.len() == 2 && squiggles_cols(red[1], 1, 0, 3) {
                 break;
             }
             assert!(Instant::now() < deadline, "the typed word is flagged too");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn a_wrapped_diagnostic_squiggles_on_each_visual_row() {
+        let mut h = Harness::new();
+        // 46 text columns per visual row: 60 z's take two.
+        let mut v = attached(&format!("{}\n", "z".repeat(60)));
+        settle(&mut v);
+        paint_plain(&mut h, &mut v);
+        let yellow = squiggles(&h, theme::DIAG_WARNING);
+        assert_eq!(yellow.len(), 2, "{yellow:?}");
+        assert!(squiggles_cols(yellow[0], 0, 0, 46) && squiggles_cols(yellow[1], 1, 0, 14), "{yellow:?}");
     }
 
     #[test]
@@ -3587,9 +3648,12 @@ mod tests {
         let top = rects(&h, &h.frame.top);
         let caret = (text_x + 5.0 * cw, 0.0, 2.0, R1);
         assert!(top.iter().any(|r| near(*r, caret)), "caret {caret:?} in {top:?}");
-        let thick = 1.5;
-        let under = (text_x + 5.0 * cw, R1 - thick, 3.0 * cw, thick);
-        assert!(top.iter().any(|r| near(*r, under)), "underline {under:?} in {top:?}");
+        let red = squiggles(&h, theme::DIAG_ERROR);
+        let under = (text_x + 5.0 * cw - 0.5, text_x + 8.0 * cw + 0.5, R1);
+        assert!(
+            red.len() == 1 && [red[0].0 - under.0, red[0].1 - under.1, red[0].2 - under.2].iter().all(|d| d.abs() < 0.01),
+            "underline {under:?} in {red:?}"
+        );
     }
 
     #[test]

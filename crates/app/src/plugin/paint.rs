@@ -896,6 +896,28 @@ impl<'a> PaintCx<'a> {
         self.push_quad(q, false);
     }
 
+    /// A wavy underline from `x0` to `x1` over the text, its lowest edge at
+    /// `bottom` (a diagnostic): a zigzag of [`line`](Self::line) segments,
+    /// within the clip. Opaque, because a translucent stroke darkens where
+    /// its segments overlap at the joints.
+    pub fn squiggle(&mut self, x0: f32, x1: f32, bottom: f32, color: [u8; 3]) {
+        let s = self.ui.scale;
+        // Half a period, the amplitude, and the stroke width.
+        let (half, amp, width) = (2.0 * s, 1.5 * s, 1.0 * s);
+        let low = bottom - width / 2.0;
+        let y = |i: usize| if i % 2 == 0 { low } else { low - 2.0 * amp };
+        self.over_text(|cx| {
+            let (mut x, mut i) = (x0, 0);
+            while x < x1 {
+                let next = (x + half).min(x1);
+                let (ya, yb) = (y(i), y(i + 1));
+                let end = ya + (yb - ya) * (next - x) / half;
+                cx.line((x, ya), (next, end), width, color, 1.0);
+                (x, i) = (next, i + 1);
+            }
+        });
+    }
+
     /// Fill `r` over the text (cursors, carets).
     pub fn fill_top(&mut self, r: Rect, color: [u8; 3], alpha: f32) {
         let q = self.frame.quad(r, color, alpha);
