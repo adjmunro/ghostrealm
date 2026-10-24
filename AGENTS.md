@@ -14,29 +14,17 @@
 - Before adding or changing a surface kind (terminal, editor, file browser, ...), read [`PLUGINS.md`](docs/PLUGINS.md).
 - Before mutating source control, read [`GIT.md`](docs/GIT.md)!
 
-## Build & Toolchain
+## Skills
 
-- Zig is pinned in `mise.toml` and is **required** to build `libghostty-vt-sys` (it compiles Ghostty from source). Run cargo from the repo root so `mise` activates Zig, or prefix `mise exec --`. The scratchpad has no `mise.toml`, so Zig is NOT on PATH there — export it explicitly if building outside the repo.
-- Do not bump Zig blindly: its major.minor must equal the pinned Ghostty's `build.zig.zon` `minimum_zig_version`, and it must be new enough to link this host's macOS SDK. See [`docs/libghostty-findings.md`](docs/libghostty-findings.md) → "Build toolchain".
-- `libghostty-vt` comes from git (pinned `rev`), not crates.io — the published crate is stale.
-- `target/` grows without bound (Cargo keeps superseded hashed copies). `mise run clean-stale -- --dry-run` lists what it would free; drop `--dry-run` to free it. Don't run it during a build.
-- `cargo` lives in `~/.cargo/bin`, which the agent shell's `PATH` lacks: `export PATH="$HOME/.cargo/bin:$PATH"` first. There is no `timeout` binary either.
-- The web host (`crates/web-host`, CEF) is not a default workspace member: plain `cargo build/test` skip it. Build + bundle it with `mise run web` (CMake + Ninja come from `mise.toml`). Toggling its `bundle` feature rebuilds `cef`, so always build it via that task. Its integration test (`cargo test -p ghostrealm-web --test host`) skips unless the bundle exists.
-- The host runs headless (no display needed), so web behaviour is verifiable without a GUI: drive it with `ghostrealm agent` (`web.new`, `web.eval`, `get surface`) or the host test.
-- With the agent command sandbox on, PTY, GPU, local-port and CEF-host tests fail and the build needs workarounds: ask the owner to turn it off. If it must stay on: Zig from ziglang.org on `PATH`; `CARGO_HOME` and `ZIG_GLOBAL_CACHE_DIR` under `$TMPDIR`; `CARGO_NET_GIT_FETCH_WITH_CLI=true` and `GIT_CONFIG_GLOBAL=/dev/null`; `GHOSTTY_SOURCE_DIR` set to the extracted pinned Ghostty source, its Zig dependencies `zig fetch`ed, and `xcrun`/`mktemp` in its `src/build/libsystem_override.sh` kept off the per-user temp dir.
-
-## Verifying the app
-
-- The sandbox has no display: a launched `ghostrealm` window never fires winit's `resumed`, so it neither draws nor writes its config — it just idles without error. A "still alive after 2s" smoke check only proves it didn't crash at startup; it does NOT prove rendering. Don't claim the GUI works from that alone.
-- Judge performance (scroll, typing, rendering) only from `--release` builds. The default dev profile leaves font shaping (cosmic-text/swash) unoptimised, so a debug build feels slow on its own, which is not a regression.
-- On macOS, a test that spawns the debug `ghostrealm` binary waits ~2s before its `main` runs (process load, outside our code). Time from `main` before blaming a spawned server or CLI path for slowness.
-- Verify headlessly instead: `cargo test` (core logic, backend PTY/VT, agent protocol, inbox, config) + the offscreen wgpu render test. Drive behaviour through `ghostrealm agent` (JSON on stdin/stdout) or `ghostrealm dump <cmd>` (grid as text). Real visual confirmation needs a human on a desktop session.
+- Conditional rules (building, toolchain pins, web host, sandbox, verifying the app) live in micro-skills under `.claude/skills/` and load when their description matches the task.
 
 ## Editing Agents.md
 
 > Agents.md is a record of **mistakes**.
 
-You may edit these Markdown files if:
+Record each lesson in the narrowest place: a micro-skill (`.claude/skills/`) when it applies only in some situations, this file only when every task needs it.
+
+You may edit these files if:
 
 1. You encounter a recurring tooling issue that obstructs your progress.
 2. You took more than 3 turns to discover something non-obvious.
