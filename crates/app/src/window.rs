@@ -2347,8 +2347,9 @@ impl State {
         self.begin_command_with(action.command(), action.args(target), prefill);
     }
 
-    /// A click while the palette is open: run a clicked result, or dismiss when
-    /// the click lands outside the panel.
+    /// A click while the palette is open: start a clicked result (prompting
+    /// for its required arguments), or dismiss when the click lands outside
+    /// the panel.
     fn palette_click(&mut self) {
         if self.palette_press() {
             return;
@@ -2361,8 +2362,7 @@ impl State {
             .map(|(_, _, id)| id.clone())
         {
             self.palette = None;
-            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
-            self.dirty = true;
+            self.begin_command(&id);
             return;
         }
         if !rect_contains(self.palette_panel, x, y) {
@@ -3701,7 +3701,7 @@ impl State {
                         if id == "palette.toggle" {
                             self.open_palette();
                         } else {
-                            let _ = self.registry.execute(&id, &Args::new(), &mut self.app);
+                            self.begin_command(&id);
                         }
                         self.dirty = true;
                         return;
