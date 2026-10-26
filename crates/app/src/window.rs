@@ -58,8 +58,8 @@ const PALETTE_VISIBLE: usize = 10;
 /// Most rows the argument prompt's error takes; the rest is cut.
 const PROMPT_ERROR_ROWS: usize = 4;
 
-/// A tooltip's text, line width (bits), row cap and cell height (bits).
-type TooltipKey = (String, u32, usize, u32);
+/// A tooltip's text, line width (bits), row cap and metrics generation.
+type TooltipKey = (String, u32, usize, u64);
 
 /// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
 /// output wakes into at most one redraw per interval so input stays responsive.
@@ -690,8 +690,8 @@ struct State {
     tooltip_hover: Option<(Rect, Instant)>,
     /// When a pending tooltip is due to show (a wake-up).
     tooltip_due: Option<Instant>,
-    /// The shown tooltip's rows, keyed by its text, line width, row cap and
-    /// cell height: a held tooltip wraps once, not on every redraw.
+    /// The shown tooltip's rows, keyed by [`tooltip_key`]: a held tooltip
+    /// wraps once, not on every redraw.
     tooltip_rows: Option<(TooltipKey, Vec<String>)>,
     /// Notices edits to the config file made outside the app.
     config_watch: ConfigWatch,
@@ -3257,8 +3257,7 @@ impl State {
         // than the screen holds, the last then cut with an ellipsis.
         let max_w = (sw * 0.5).max(240.0 * scale).min(sw - pad * 4.0).max(1.0);
         let max_rows = (((sh - pad * 2.0) / ch).floor() as usize).max(1);
-        // The cell height stands in for the font, which sets the widths.
-        let key = (text, max_w.to_bits(), max_rows, ch.to_bits());
+        let key = tooltip_key(text, max_w, max_rows, self.metrics_gen);
         let rows = match &self.tooltip_rows {
             Some((k, rows)) if *k == key => rows,
             _ => {
@@ -5525,6 +5524,13 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
+/// What a tooltip's wrapped rows depend on: its text, line width and row
+/// cap, and the font metrics and font set (`metrics_gen`, bumped on every
+/// change to either), which set the text's widths.
+fn tooltip_key(text: String, max_w: f32, max_rows: usize, metrics_gen: u64) -> TooltipKey {
+    (text, max_w.to_bits(), max_rows, metrics_gen)
+}
+
 /// `text` split into clusters a line may break between: a base character
 /// with the zero-width characters after it (combining marks, variation
 /// selectors, joiners) and whatever a zero-width joiner joins on.
@@ -6416,6 +6422,19 @@ mod tests {
         assert_eq!(wrap(&heart.repeat(3), 4, 1), (vec![format!("{heart}\u{2026}")], true));
         // A line break in the text starts a row.
         assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
+    }
+
+    /// A held tooltip's cached rows are rewrapped when anything they depend
+    /// on changes.
+    #[test]
+    fn a_tooltip_rewraps_when_its_text_width_rows_or_metrics_change() {
+        let key = |t: &str, w: f32, rows: usize, gen: u64| super::tooltip_key(t.to_string(), w, rows, gen);
+        let base = key("tip", 300.0, 10, 1);
+        assert_eq!(base, key("tip", 300.0, 10, 1));
+        assert_ne!(base, key("tap", 300.0, 10, 1));
+        assert_ne!(base, key("tip", 301.0, 10, 1));
+        assert_ne!(base, key("tip", 300.0, 9, 1));
+        assert_ne!(base, key("tip", 300.0, 10, 2));
     }
 
     /// A tooltip breaks at its own line breaks, between words, and across a
