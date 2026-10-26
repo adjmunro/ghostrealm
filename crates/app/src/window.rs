@@ -57,6 +57,10 @@ const PALETTE_SEARCH_CAP: usize = 100;
 const PALETTE_VISIBLE: usize = 10;
 /// Most rows the argument prompt's error takes; the rest is cut.
 const PROMPT_ERROR_ROWS: usize = 4;
+
+/// A tooltip's text, line width (bits), row cap and cell height (bits).
+type TooltipKey = (String, u32, usize, u32);
+
 /// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
 /// output wakes into at most one redraw per interval so input stays responsive.
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
@@ -688,7 +692,7 @@ struct State {
     tooltip_due: Option<Instant>,
     /// The shown tooltip's rows, keyed by its text, line width, row cap and
     /// cell height: a held tooltip wraps once, not on every redraw.
-    tooltip_rows: Option<((String, u32, usize, u32), Vec<String>)>,
+    tooltip_rows: Option<(TooltipKey, Vec<String>)>,
     /// Notices edits to the config file made outside the app.
     config_watch: ConfigWatch,
     /// Whether the window has keyboard focus (the config file is polled only
