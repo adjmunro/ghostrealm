@@ -4080,10 +4080,16 @@ impl State {
         let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
         let panel_x = ((sw - panel_w) / 2.0).max(0.0);
         let panel_y = sh * 0.12;
+        // The argument prompt's error, wrapped (indented two cells) so none
+        // of it is cut off.
+        let error_lines = pending.as_ref().and_then(|p| p.6.as_deref()).map_or_else(Vec::new, |e| {
+            let cols = (((panel_w - pad * 2.0) / self.cell_w).floor() as usize).saturating_sub(2).max(1);
+            wrap_cols(e, cols)
+        });
         let body_rows = if is_search && n > 0 {
             n.min(PALETTE_VISIBLE)
-        } else if pending.as_ref().is_some_and(|p| p.6.is_some()) {
-            2 // the argument prompt's error and hint
+        } else if !error_lines.is_empty() {
+            error_lines.len() + 1 // the argument prompt's error and hint
         } else {
             1 // a hint / "no matches" / arg-prompt line
         };
@@ -4143,13 +4149,13 @@ impl State {
         self.palette_rows.clear();
         let mut lines: Vec<Vec<(String, [u8; 3])>> = Vec::new();
 
-        if let Some((title, name, desc, kind_hint, idx, total, error)) = &pending {
+        if let Some((title, name, desc, kind_hint, idx, total, _)) = &pending {
             // Argument-collection view: input the current argument, then why
             // the last Enter failed.
             let prefix = format!("\u{203a} {title} — {name}: ");
             lines.push(vec![(format!("{prefix}{query}"), [235, 235, 245])]);
-            if let Some(error) = error {
-                lines.push(vec![(format!("  {error}"), theme::TOAST_ERROR)]);
+            for line in &error_lines {
+                lines.push(vec![(format!("  {line}"), theme::TOAST_ERROR)]);
             }
             let more = if idx + 1 < *total {
                 "Enter for next"
@@ -5459,6 +5465,17 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
+/// `text` in lines of at most `cols` characters: broken between words,
+/// and a word longer than a line (a deep path) across lines.
+fn wrap_cols(text: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in wrap_words(text, cols as f32, |t| t.chars().count() as f32) {
+        let chars: Vec<char> = line.chars().collect();
+        out.extend(chars.chunks(cols.max(1)).map(|c| c.iter().collect::<String>()));
+    }
+    out
+}
+
 /// What to tell the user when `[editor] preview_font` names a family that
 /// isn't installed.
 fn missing_preview_font(name: &str, using: &str) -> String {
@@ -6203,6 +6220,15 @@ mod tests {
         };
         let (regular, bold) = (width(&mut fs, glyphon::Weight::NORMAL), width(&mut fs, glyphon::Weight::BOLD));
         assert!(bold > regular, "bold {bold} vs regular {regular}");
+    }
+
+    #[test]
+    fn a_prompt_error_wraps_between_words_and_breaks_a_long_word() {
+        assert_eq!(super::wrap_cols("Name taken", 20), ["Name taken"]);
+        assert_eq!(
+            super::wrap_cols("Can't create /a/very/deep/path: File exists", 12),
+            ["Can't create", "/a/very/deep", "/path:", "File exists"]
+        );
     }
 
     #[test]
