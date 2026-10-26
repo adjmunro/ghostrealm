@@ -1504,3 +1504,18 @@
   only, so running it from the palette does nothing visible. Consider an
   info toast for a command the user ran explicitly from the palette.
 - Reason: an explicit request that silently does nothing looks broken.
+
+---
+
+[2026-10-26T23:30+1300@fdc79620] Palette — a prompt error row may hide its last wide glyph
+
+- Requires: a desktop check with a CJK or emoji error message
+- Detail: The argument prompt's error rows are drawn in `line_h`-tall
+  buffers `text_w` wide with `Wrap::WordOrGlyph` (`build_palette` in
+  `crates/app/src/window.rs`). `wrap_cols` fits rows by cell count, a wide
+  glyph counting two. If a fallback font draws CJK or emoji glyphs wider
+  than two monospace cells, a row that fits by count overflows `text_w`
+  and its last glyph wraps onto a second line the buffer's height hides.
+  Check with a long CJK/emoji error; if it clips, draw the rows with
+  `Wrap::None` or measure them by shaped width.
+- Reason: the hidden glyph is dropped without an ellipsis.
