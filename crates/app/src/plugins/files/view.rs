@@ -1732,6 +1732,46 @@ mod tests {
         assert_eq!(out.requests, [Request::Saved(d.join("3.txt"))], "3.txt autosaved on losing the keys");
     }
 
+    fn read_only(path: &std::path::Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// The document a toast request names, so its "Save As…" saves that one.
+    fn toast_doc(out: &crate::plugin::Outcome) -> Option<DocId> {
+        match &out.requests[..] {
+            [Request::Toast { doc, .. }] => *doc,
+            other => panic!("one toast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_autosave_of_a_document_no_longer_shown_names_that_document() {
+        let (d, mut v) = fixture(&Session::default());
+        let h = Harness::new();
+        h.focus(&mut v, true);
+        let ids = tabs_of(&d, &mut v, &["1.txt", "2.txt"]);
+        assert!(v.write_input(b"edit "), "edits the shown 2.txt");
+        read_only(&d.join("2.txt"));
+        v.cycle_tab(1);
+        assert_ne!(v.active_doc(), ids[1]);
+        let due = v.deadline(&h.cfg).expect("a tick to tell 2.txt");
+        assert_eq!(toast_doc(&h.tick(&mut v, due)), Some(ids[1]));
+    }
+
+    #[test]
+    fn a_failed_cmd_s_names_the_shown_document() {
+        let (d, mut v) = fixture(&Session::default());
+        let h = Harness::new();
+        h.focus(&mut v, true);
+        let ids = tabs_of(&d, &mut v, &["1.txt", "2.txt"]);
+        assert!(v.write_input(b"edit "));
+        read_only(&d.join("2.txt"));
+        let (_, out) = h.key(&mut v, crate::plugin::testing::cmd(Key::Char('s')));
+        assert_eq!(toast_doc(&out), Some(ids[1]));
+    }
+
     #[test]
     fn switching_tabs_selects_the_file_in_the_sidebar() {
         let (d, mut v) = fixture(&Session::default());
