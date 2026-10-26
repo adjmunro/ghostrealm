@@ -55,6 +55,8 @@ const DIVIDER_SLOP: f32 = 3.0;
 const PALETTE_SEARCH_CAP: usize = 100;
 /// Max result rows shown at once in the palette (the rest scroll into view).
 const PALETTE_VISIBLE: usize = 10;
+/// Most rows the argument prompt's error takes; the rest is cut.
+const PROMPT_ERROR_ROWS: usize = 4;
 /// Minimum spacing between PTY-driven frames (~120fps). Coalesces a flood of
 /// output wakes into at most one redraw per interval so input stays responsive.
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
@@ -429,8 +431,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.pointer_in = true;
+                let before = state.cursor;
                 state.cursor = (position.x as f32, position.y as f32);
-                let mut redraw = false;
+                // The prompt's cut error shows its tooltip while hovered.
+                let mut redraw = state.palette_error_tip.as_ref().is_some_and(|(r, _)| {
+                    rect_contains(*r, before.0, before.1) != rect_contains(*r, state.cursor.0, state.cursor.1)
+                });
                 if state.palette.is_some() {
                     redraw |= if state.palette_selecting { state.palette_drag() } else { state.palette_hover() };
                 } else if state.menu.is_some() {
@@ -625,6 +631,9 @@ struct State {
     palette: Option<Palette>,
     /// Last-rendered palette panel rect (physical px), for click-outside dismissal.
     palette_panel: Rect,
+    /// The argument prompt's cut error: its rows' rect and its whole text,
+    /// the tooltip there.
+    palette_error_tip: Option<(Rect, String)>,
     /// Last-rendered palette result rows: (row rect, result index, command id),
     /// for click/hover hit-testing. Rebuilt each frame the palette is open.
     palette_rows: Vec<(Rect, usize, String)>,
@@ -1335,6 +1344,7 @@ impl State {
             toast_rect: None,
             palette_buffers: Vec::new(),
             palette: None,
+            palette_error_tip: None,
             palette_panel: Rect {
                 x: 0.0,
                 y: 0.0,
@@ -4080,11 +4090,17 @@ impl State {
         let panel_w = (sw * 0.6).clamp(240.0, 720.0 * self.scale);
         let panel_x = ((sw - panel_w) / 2.0).max(0.0);
         let panel_y = sh * 0.12;
-        // The argument prompt's error, wrapped (indented two cells) so none
-        // of it is cut off.
-        let error_lines = pending.as_ref().and_then(|p| p.6.as_deref()).map_or_else(Vec::new, |e| {
-            let cols = (((panel_w - pad * 2.0) / self.cell_w).floor() as usize).saturating_sub(2).max(1);
-            wrap_cols(e, cols)
+        // The argument prompt's error, wrapped (indented two cells) over up
+        // to `PROMPT_ERROR_ROWS`; past that, cut with its whole text as the
+        // tooltip of its rows.
+        let error = pending.as_ref().and_then(|p| p.6.as_deref());
+        let (error_lines, cut) = error.map_or_else(|| (Vec::new(), false), |e| {
+            let cols = (((panel_w - pad * 2.0) / self.cell_w).floor() as usize).saturating_sub(2);
+            wrap_cols(e, cols, PROMPT_ERROR_ROWS)
+        });
+        self.palette_error_tip = error.filter(|_| cut).map(|e| {
+            let r = Rect { x: panel_x, y: panel_y + pad + line_h, w: panel_w, h: error_lines.len() as f32 * line_h };
+            (r, e.to_string())
         });
         let body_rows = if is_search && n > 0 {
             n.min(PALETTE_VISIBLE)
@@ -4624,11 +4640,17 @@ impl State {
         self.title_place = None;
         self.build_titlebar(sw, sh, &mut frame.bg);
 
+        self.palette_error_tip = None;
         let palette_placements = if self.palette.is_some() {
             self.build_palette(sw, sh, &mut frame.top)
         } else {
             Vec::new()
         };
+        if let Some((r, text)) = &self.palette_error_tip {
+            if rect_contains(*r, self.cursor.0, self.cursor.1) {
+                frame.tooltip = Some((*r, text.clone(), Layer::Overlay));
+            }
+        }
         // Floating picker and confirmation (modal overlays). Their text joins the
         // overlay pass.
         self.build_picker(&mut frame);
@@ -5465,15 +5487,38 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
-/// `text` in lines of at most `cols` characters: broken between words,
-/// and a word longer than a line (a deep path) across lines.
-fn wrap_cols(text: &str, cols: usize) -> Vec<String> {
+/// `text` in at most `max_rows` lines of at most `cols` cells (a wide
+/// glyph takes two): broken between words, and a word longer than a line
+/// (a deep path) across lines. Returns the lines and whether the text was
+/// cut, its last line then ending in an ellipsis.
+fn wrap_cols(text: &str, cols: usize, max_rows: usize) -> (Vec<String>, bool) {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let cols = cols.max(2);
     let mut out = Vec::new();
-    for line in wrap_words(text, cols as f32, |t| t.chars().count() as f32) {
-        let chars: Vec<char> = line.chars().collect();
-        out.extend(chars.chunks(cols.max(1)).map(|c| c.iter().collect::<String>()));
+    for line in wrap_words(text, cols as f32, |t| t.width() as f32) {
+        let (mut row, mut w) = (String::new(), 0);
+        for c in line.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw > cols && !row.is_empty() {
+                out.push(std::mem::take(&mut row));
+                w = 0;
+            }
+            row.push(c);
+            w += cw;
+        }
+        out.push(row);
     }
-    out
+    let max_rows = max_rows.max(1);
+    if out.len() <= max_rows {
+        return (out, false);
+    }
+    out.truncate(max_rows);
+    let last = out.last_mut().expect("at least one row");
+    while last.width() + 1 > cols {
+        last.pop();
+    }
+    last.push('\u{2026}');
+    (out, true)
 }
 
 /// What to tell the user when `[editor] preview_font` names a family that
@@ -6224,11 +6269,18 @@ mod tests {
 
     #[test]
     fn a_prompt_error_wraps_between_words_and_breaks_a_long_word() {
-        assert_eq!(super::wrap_cols("Name taken", 20), ["Name taken"]);
-        assert_eq!(
-            super::wrap_cols("Can't create /a/very/deep/path: File exists", 12),
-            ["Can't create", "/a/very/deep", "/path:", "File exists"]
-        );
+        let wrap = |t: &str, cols: usize, rows: usize| super::wrap_cols(t, cols, rows);
+        assert_eq!(wrap("Name taken", 20, 4), (vec!["Name taken".to_string()], false));
+        let (lines, cut) = wrap("Can't create /a/very/deep/path: File exists", 12, 4);
+        assert_eq!((lines, cut), (vec!["Can't create", "/a/very/deep", "/path:", "File exists"].into_iter().map(String::from).collect(), false));
+        // Wide glyphs take two cells each.
+        let (lines, _) = wrap("名前名前名前", 6, 4);
+        assert_eq!(lines, ["名前名", "前名前"]);
+        // Past the row cap, the last row ends in an ellipsis within the width.
+        let (lines, cut) = wrap(&"word ".repeat(40), 10, 2);
+        assert!(cut);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('\u{2026}') && lines[1].chars().count() <= 10, "{lines:?}");
     }
 
     #[test]
