@@ -1031,6 +1031,7 @@ impl AppState {
                         self.toasts.dismiss(id);
                     }
                     Err(why) => {
+                        eprintln!("ghostrealm: {why}");
                         let Some(old) = self.toasts.get(id).map(|e| e.toast.clone()) else { return };
                         let mut toast = Toast::new(Level::Error, format!("{why}\n\n{}", old.message)).on(old.scope);
                         toast.key = old.key;
@@ -2806,6 +2807,24 @@ mod tests {
         let err = s.open_file(&file).unwrap_err();
         assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
         assert_eq!(s.focused_surface(), None, "no tab bound to it");
+    }
+
+    #[test]
+    fn a_save_as_choice_for_a_closed_document_just_goes() {
+        let dir = crate::plugin::testing::tmpdir("toast-save-as-gone");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.open_file_in_new_surface(&file).unwrap();
+        let sid = s.focused_surface().unwrap();
+        let doc = s.active_doc(sid).unwrap();
+        let id = s.notify(Toast::new(Level::Error, "Couldn't save a.txt").with_choice("Save As…", ToastAction::SaveAs(doc)));
+        s.close_surface_id(sid);
+        assert!(s.doc(doc).is_none());
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), None);
+        assert!(s.toasts().is_empty());
     }
 
     #[test]
