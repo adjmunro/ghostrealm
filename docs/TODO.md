@@ -1470,3 +1470,14 @@
 - Detail: `core::config`'s test helper `tmp()` (`config.rs:706`) makes a
   directory per test in the temp dir and never removes it.
 - Reason: test runs shouldn't fill the temp directory.
+
+---
+
+[2026-10-26T22:32+1300@b11e6ef3] Picker — Save As for a closed document can only be cancelled
+
+- Requires: NO BLOCKERS
+- Detail: When the document a Save As (or Save Copy As) picker saves has
+  closed, every path fails with "The view to save has closed" and only
+  Cancel exits. Close the picker instead (`act_on_pick`, `Pick::SaveAs` /
+  `Pick::SaveCopy` in `app_state.rs`).
+- Reason: an error no answer can fix should not hold the form open.
