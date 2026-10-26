@@ -505,7 +505,7 @@ Where the build differs from the design above:
   - `AppState::run_command(registry, id, args, from)` runs and reports;
     the window passes the menu's surface (`MenuTarget::File` carries it)
     through `begin_command_with`. A command run from the argument prompt
-    toasts on the focused pane until commit 17 shows it inline.
+    shows its failure inline in the prompt (commit 17).
   - Command and file-job toasts read "<command title>: <error>"; a
     confirmation's toast is its error, capitalised.
 - Commit 14:
