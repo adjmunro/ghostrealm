@@ -417,7 +417,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let left = state.hover.left_window(state.mouse_down);
                 let mut redraw = state.send_leave(left);
                 // No pane tab is hovered now: an unsaved one's dot comes back.
-                if state.htab_hover.take().is_some() {
+                // A tooltip (shown or pending) goes with the pointer.
+                if state.htab_hover.take().is_some() || state.tooltip_hover.is_some() {
                     state.dirty = true;
                     redraw = true;
                 }
@@ -3192,11 +3193,13 @@ impl State {
     }
 
     /// Draw the hovered tooltip once its anchor has been hovered for
-    /// [`TOOLTIP_DELAY`] (until then, schedule the wake that shows it): a small
-    /// panel below the anchor (above, near the bottom edge). A pane's tooltip is
-    /// suppressed while a modal overlay is open. It goes into a frame of its
-    /// own, drawn in the menu's pass (after overlay images, which would cover
-    /// its panel but not its text): never with a menu, which suppresses it.
+    /// [`TOOLTIP_DELAY`] (until then, schedule the wake that shows it): a
+    /// panel of wrapped lines below the anchor (above, near the bottom edge;
+    /// as low as fits when neither fits). A pane's tooltip is suppressed while
+    /// a modal overlay is open, and every tooltip while the pointer is outside
+    /// the window. It goes into a frame of its own, drawn in the menu's pass
+    /// (after overlay images, which would cover its panel but not its text):
+    /// never with a menu, which suppresses it.
     fn build_tooltip(&mut self, frame: &mut Frame) -> Option<Frame> {
         let modal = self.palette.is_some()
             || self.menu.is_some()
@@ -3206,7 +3209,9 @@ impl State {
         let tip = frame
             .tooltip
             .take()
-            .filter(|(_, _, layer)| self.menu.is_none() && (!modal || *layer == Layer::Overlay));
+            .filter(|(_, _, layer)| {
+                self.pointer_in && self.menu.is_none() && (!modal || *layer == Layer::Overlay)
+            });
         let Some((anchor, text, _)) = tip else {
             self.tooltip_hover = None;
             self.tooltip_due = None;
@@ -3239,12 +3244,28 @@ impl State {
             Layer::Overlay,
             PICKER_SID,
         );
-        let lines: Vec<Shaped> = text.lines().map(|l| cx.shape(l, Family::SansSerif, sw)).collect();
+        // Lines no wider than half the screen (within its edges), and no more
+        // than the screen holds, the last then cut with an ellipsis.
+        let max_w = (sw * 0.5).max(240.0 * scale).min(sw - pad * 4.0).max(1.0);
+        let mut rows = wrap_lines(&text, max_w, |t| cx.shape(t, Family::SansSerif, f32::MAX).width);
+        let max_rows = (((sh - pad * 2.0) / ch).floor() as usize).max(1);
+        if rows.len() > max_rows {
+            rows.truncate(max_rows);
+            let last = rows.pop().expect("at least one row");
+            rows.push(cx.cut_to_fit(&format!("{}\u{2026}", last.trim_end()), Family::SansSerif, max_w));
+        }
+        let lines: Vec<Shaped> = rows.iter().map(|l| cx.shape(l, Family::SansSerif, f32::MAX)).collect();
         let w = lines.iter().map(|s| s.width).fold(0.0, f32::max) + pad * 2.0;
         let h = lines.len() as f32 * ch + pad * 2.0;
         let gap = 4.0 * scale;
-        let below = anchor.y + anchor.h + gap;
-        let y = if below + h <= sh { below } else { (anchor.y - gap - h).max(0.0) };
+        let (below, above) = (anchor.y + anchor.h + gap, anchor.y - gap - h);
+        let y = if below + h <= sh {
+            below
+        } else if above >= 0.0 {
+            above
+        } else {
+            (sh - h).max(0.0)
+        };
         let x = anchor.x.clamp(0.0, (sw - w).max(0.0));
         let panel = Rect { x, y, w, h };
         cx.fill(panel, theme::TOOLTIP_BG);
