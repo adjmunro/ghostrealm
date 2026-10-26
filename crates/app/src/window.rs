@@ -411,6 +411,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::CursorLeft { .. } => {
+                state.pointer_in = false;
                 let left = state.hover.left_window(state.mouse_down);
                 let mut redraw = state.send_leave(left);
                 // No pane tab is hovered now: an unsaved one's dot comes back.
@@ -422,8 +423,12 @@ impl ApplicationHandler<UserEvent> for App {
                     state.window.request_redraw();
                 }
             }
-            WindowEvent::CursorEntered { .. } => state.hover.entered(),
+            WindowEvent::CursorEntered { .. } => {
+                state.pointer_in = true;
+                state.hover.entered();
+            }
             WindowEvent::CursorMoved { position, .. } => {
+                state.pointer_in = true;
                 state.cursor = (position.x as f32, position.y as f32);
                 let mut redraw = false;
                 if state.palette.is_some() {
@@ -676,6 +681,9 @@ struct State {
     /// Whether the window has keyboard focus (the config file is polled only
     /// then).
     window_focused: bool,
+    /// Whether the pointer is over the window. `cursor` keeps its last spot
+    /// after the pointer leaves.
+    pointer_in: bool,
     /// When the focused window next checks the config file.
     config_check_due: Instant,
     /// Presses, for counting double-clicks.
@@ -1359,6 +1367,7 @@ impl State {
             tooltip_due: None,
             config_watch: ConfigWatch::new(ghostrealm_core::config::config_path()),
             window_focused: true,
+            pointer_in: false,
             config_check_due: Instant::now() + config_watch::POLL,
             clicks: ClickCounter::default(),
             mouse_capture: None,
@@ -1712,9 +1721,8 @@ impl State {
     /// Advance the toast clock: it runs while the toast is drawn, the window
     /// focused, and the pointer off it. Returns whether the toast hid.
     fn tick_toasts(&mut self) -> bool {
-        let visible = self
-            .toast_rect
-            .is_some_and(|r| self.window_focused && !rect_contains(r, self.cursor.0, self.cursor.1));
+        let pointer = self.pointer_in.then_some(self.cursor);
+        let visible = toast_clock_runs(self.toast_rect, self.window_focused, pointer);
         let hid = self.app.tick_toasts(Instant::now(), visible);
         self.dirty |= hid;
         hid
@@ -5452,6 +5460,12 @@ fn pin_and_report_preview_serif(
     Some(message)
 }
 
+/// Whether the toast clock runs: the toast at `toast` is drawn, the window
+/// is focused, and the pointer (`None`: outside the window) is off it.
+fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f32)>) -> bool {
+    toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
+}
+
 /// What to tell the user when `[editor] preview_font` names a family that
 /// isn't installed.
 fn missing_preview_font(name: &str, using: &str) -> String {
@@ -6185,6 +6199,16 @@ mod tests {
         };
         let (regular, bold) = (width(&mut fs, glyphon::Weight::NORMAL), width(&mut fs, glyphon::Weight::BOLD));
         assert!(bold > regular, "bold {bold} vs regular {regular}");
+    }
+
+    #[test]
+    fn the_toast_clock_runs_once_the_pointer_leaves_the_window_from_over_the_toast() {
+        let toast = Some(Rect { x: 10.0, y: 10.0, w: 100.0, h: 30.0 });
+        assert!(!super::toast_clock_runs(toast, true, Some((20.0, 20.0))));
+        assert!(super::toast_clock_runs(toast, true, Some((200.0, 20.0))));
+        assert!(super::toast_clock_runs(toast, true, None));
+        assert!(!super::toast_clock_runs(toast, false, None));
+        assert!(!super::toast_clock_runs(None, true, None));
     }
 
     /// `preview_font` picks an installed family by name, case aside, and
