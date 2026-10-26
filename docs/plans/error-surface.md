@@ -517,6 +517,14 @@ Where the build differs from the design above:
     already names it ("Can't edit <path>: …"). `open_url` adds "can't open
     <url>" to a system handler's failure, so both of its errors name the
     URL.
+- Commit 15:
+  - `toast_request(sid, req)` takes the `Request` and returns the toast's
+    id (`None` for another request). `autosave_all` builds a
+    `Request::Toast` per failure and passes it through `toast_request`, so
+    both paths make the same toast.
+  - `toasts::save_failed(path, e)` gives the text, "Couldn't save <file
+    name>: <error>". The editor prints its stderr line before raising the
+    request; `toast_request` prints nothing.
 
 ## Risks
 

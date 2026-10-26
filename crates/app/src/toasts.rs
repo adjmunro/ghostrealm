@@ -7,6 +7,7 @@
 //! paints, and hit-tests the head with [`place`] and [`paint`].
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{PaneId, Rect};
@@ -113,6 +114,12 @@ impl Toast {
             None => self.scope == other.scope && self.message == other.message,
         }
     }
+}
+
+/// A toast's text for a failed write of `path`.
+pub fn save_failed(path: &Path, e: &anyhow::Error) -> String {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    format!("Couldn't save {name}: {e:#}")
 }
 
 /// A queued toast.

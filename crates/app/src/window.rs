@@ -378,6 +378,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.app.autosave_all(&state.cfg) {
                     state.reload_config();
                 }
+                // A failed autosave toasts.
+                state.dirty = true;
+                state.window.request_redraw();
                 // The release of a press held across the focus loss may never
                 // arrive; left held, hover could never be withdrawn.
                 if state.mouse_down {
@@ -1939,6 +1942,11 @@ impl State {
                 Request::SaveAs => self.app.open_save_as(sid),
                 Request::SaveConflict => self.app.ask_disk_conflict(sid),
                 Request::Busy => self.app.mark_busy(sid),
+                req @ Request::Toast { .. } => {
+                    self.app.toast_request(sid, req);
+                    self.dirty = true;
+                    self.window.request_redraw();
+                }
                 Request::Close => {
                     if let Some(key) = self.key_in_flight {
                         self.closing_key.hold(key);

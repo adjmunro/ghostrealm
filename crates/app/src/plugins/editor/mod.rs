@@ -28,11 +28,12 @@ use ghostrealm_terminal::{Key, KeyPress};
 use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::syntax;
+use crate::toasts::{self, Level};
 use crate::plugin::icons::Icon;
 use crate::plugin::text_edit::{edit_for, Edit, Motion};
 use crate::plugin::{
     hover_box, rect_contains, theme, EventCx, Font, MenuAlign, MenuItem, MouseEvent, OpenCx, PaintCx, Plugin,
-    Request, RowStyles, View, Waker,
+    Request, RowStyles, ToastChoice, View, Waker,
 };
 use crate::plugins::files::header::{text_kind, DocHeader, HeaderText};
 
@@ -648,16 +649,27 @@ impl EditorView {
     }
 
     /// [`Self::save_if_modified`], reporting the file written to the app and a
-    /// failure to stderr.
+    /// failure in a toast keyed `autosave:<path>`.
     fn autosave_now(&mut self, cx: &mut EventCx) {
         match self.save_if_modified() {
             Ok(Some(path)) => cx.request(Request::Saved(path)),
             Ok(None) => {}
-            Err(e) => {
-                let path = self.buf.path.as_deref().unwrap_or(Path::new("")).display();
-                eprintln!("ghostrealm: autosave {path}: {e:#}");
-            }
+            Err(e) => self.save_failed(cx, "autosave", &e),
         }
+    }
+
+    /// Report a failed write of the buffer's file, on stderr and in an error
+    /// toast keyed `<kind>:<path>` (so repeats replace it) offering Save As.
+    fn save_failed(&self, cx: &mut EventCx, kind: &str, e: &anyhow::Error) {
+        let path = self.buf.path.as_deref().unwrap_or(Path::new(""));
+        eprintln!("ghostrealm: {kind} {}: {e:#}", path.display());
+        cx.request(Request::Toast {
+            level: Level::Error,
+            message: toasts::save_failed(path, e),
+            key: Some(format!("{kind}:{}", path.display())),
+            choices: vec![ToastChoice::SaveAs],
+            doc: None,
+        });
     }
 
     /// Note a write: disarm the idle timer, stamp the save time.
@@ -832,9 +844,13 @@ impl EditorView {
             cx.request(Request::SaveConflict);
             return;
         }
-        if let Ok(true) = self.buf.save() {
-            self.saved();
-            cx.request(Request::Saved(path));
+        match self.buf.save() {
+            Ok(true) => {
+                self.saved();
+                cx.request(Request::Saved(path));
+            }
+            Ok(false) => {}
+            Err(e) => self.save_failed(cx, "save", &e.into()),
         }
     }
 
@@ -2735,6 +2751,35 @@ mod tests {
         let h = Harness::new();
         assert!(v.autosave(&h.cfg).is_err());
         assert!(v.modified());
+    }
+
+    #[test]
+    fn a_failed_save_or_autosave_raises_a_keyed_toast_and_keeps_the_edits() {
+        let path = tmpdir("editor-save-toast").join("f.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        v.buffer_mut().insert_str("x");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let toast = |kind: &str, out: crate::plugin::Outcome| match &out.requests[..] {
+            [Request::Toast { level, message, key, choices, doc }] => {
+                assert_eq!(*level, Level::Error);
+                assert!(message.starts_with("Couldn't save f.txt: "), "{message}");
+                assert_eq!(key.as_deref(), Some(format!("{kind}:{}", path.display()).as_str()));
+                assert_eq!(choices, &[ToastChoice::SaveAs]);
+                assert_eq!(*doc, None, "the host names the document");
+            }
+            other => panic!("one toast, got {other:?}"),
+        };
+        let h = Harness::new();
+        let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
+        assert!(used);
+        toast("save", out);
+        assert!(v.modified());
+        toast("autosave", h.focus(&mut v, false));
+        assert!(v.modified());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk\n");
     }
 
     #[test]

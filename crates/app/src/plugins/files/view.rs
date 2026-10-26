@@ -439,7 +439,7 @@ impl FilesView {
             Keys::Sidebar => cx.with_id_base(SIDEBAR_IDS, |cx| self.sidebar.focus_changed(cx, on)),
             Keys::Doc(id) => {
                 if let Some(t) = self.docs.iter_mut().find(|t| t.id == id) {
-                    cx.with_id_base(DOC_IDS, |cx| t.view.focus_changed(cx, on));
+                    cx.with_doc(t.id, |cx| cx.with_id_base(DOC_IDS, |cx| t.view.focus_changed(cx, on)));
                 }
             }
         }
@@ -451,7 +451,7 @@ impl FilesView {
             Part::Sidebar => Some(cx.with_id_base(SIDEBAR_IDS, |cx| f(&mut self.sidebar, cx))),
             Part::Doc => {
                 let t = self.docs.get_mut(self.active)?;
-                Some(cx.with_id_base(DOC_IDS, |cx| f(&mut *t.view, cx)))
+                Some(cx.with_doc(t.id, |cx| cx.with_id_base(DOC_IDS, |cx| f(&mut *t.view, cx))))
             }
         }
     }
@@ -903,7 +903,7 @@ impl View for FilesView {
         }
         cx.with_id_base(SIDEBAR_IDS, |cx| self.sidebar.tick(cx, now));
         for t in &mut self.docs {
-            cx.with_id_base(DOC_IDS, |cx| t.view.tick(cx, now));
+            cx.with_doc(t.id, |cx| cx.with_id_base(DOC_IDS, |cx| t.view.tick(cx, now)));
         }
         self.settle();
     }

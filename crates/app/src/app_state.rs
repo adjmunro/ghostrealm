@@ -24,13 +24,13 @@ use ghostrealm_terminal::{KeyPress, Lifecycle};
 use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
 use crate::languages::same_file;
-use crate::plugin::{DocId, EventCx, Plugin, Request, UiMetrics, View};
+use crate::plugin::{DocId, EventCx, Plugin, Request, ToastChoice, UiMetrics, View};
 use crate::plugins::editor;
 use crate::plugins::files::{self as files_plugin, FilesView};
 use crate::plugins::file_browser::{FileBrowserView, Mode};
 use crate::plugins::terminal::{self, TerminalView};
 use crate::plugins::web;
-use crate::toasts::{Level, Scope, Toast, ToastAction, Toasts};
+use crate::toasts::{self, Level, Scope, Toast, ToastAction, Toasts};
 
 mod files;
 mod open;
@@ -895,6 +895,23 @@ impl AppState {
             .map_or(Scope::App, |(_, pane)| Scope::Pane(pane))
     }
 
+    /// Queue the toast view `sid` asked for ([`Request::Toast`]) on its
+    /// pane. A choice acts on the document the request names (else the view
+    /// itself), whichever document shows by then. Returns its id; `None`
+    /// for any other request.
+    pub fn toast_request(&mut self, sid: SurfaceId, req: Request) -> Option<u64> {
+        let Request::Toast { level, message, key, choices, doc } = req else { return None };
+        let doc = (sid, doc.unwrap_or(DocId::SELF));
+        let mut toast = Toast::new(level, message).on(self.scope_of(Some(sid)));
+        toast.key = key;
+        for choice in choices {
+            toast = match choice {
+                ToastChoice::SaveAs => toast.with_choice("Save As\u{2026}", ToastAction::SaveAs(doc)),
+            };
+        }
+        Some(self.notify(toast))
+    }
+
     /// Run command `id` from `registry`. A failure goes to stderr and to an
     /// error toast on the pane of `from` (the surface whose menu ran it),
     /// else the focused pane, else the app. A command that only doesn't
@@ -1164,7 +1181,8 @@ impl AppState {
     /// [`Self::autosave_all`], with the config file at `config_path`.
     fn autosave_all_with_config(&mut self, cfg: &Config, config_path: Option<&Path>) -> bool {
         let mut saved_config = false;
-        for view in self.views.values_mut() {
+        let mut failed = Vec::new();
+        for (&sid, view) in self.views.iter_mut() {
             for doc in view.docs() {
                 let Some(d) = view.document_mut(doc) else { continue };
                 match d.autosave(cfg) {
@@ -1173,9 +1191,20 @@ impl AppState {
                     Err(e) => {
                         let path = d.path().unwrap_or_default();
                         eprintln!("ghostrealm: autosave {}: {e:#}", path.display());
+                        failed.push(((sid, doc), path, e));
                     }
                 }
             }
+        }
+        for ((sid, doc), path, e) in failed {
+            let req = Request::Toast {
+                level: Level::Error,
+                message: toasts::save_failed(&path, &e),
+                key: Some(format!("autosave:{}", path.display())),
+                choices: vec![ToastChoice::SaveAs],
+                doc: Some(doc),
+            };
+            self.toast_request(sid, req);
         }
         saved_config
     }
@@ -1573,6 +1602,9 @@ impl AppState {
             match req {
                 Request::Busy => self.mark_busy(sid),
                 Request::Close => self.close_surface_id(sid),
+                req @ Request::Toast { .. } => {
+                    self.toast_request(sid, req);
+                }
                 Request::OpenFile(path) => {
                     let _ = self.open_file_from(sid, &path);
                 }
@@ -3517,6 +3549,67 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    fn make_read_only(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn a_failed_autosave_on_blur_or_quit_toasts_once_on_its_pane() {
+        let dir = crate::plugin::testing::tmpdir("autosave-toast");
+        let (mut s, sid, file) = edited(&dir, "a.txt");
+        make_read_only(&file);
+        let cfg = Config::default();
+        let (_, pane) = s.pane_of(sid).unwrap();
+        let doc = s.active_doc(sid).unwrap();
+        for _ in 0..2 {
+            assert!(!s.autosave_all(&cfg));
+            assert_eq!(s.toasts().len(), 1, "a repeat replaces it");
+            let toast = &s.toasts().head().unwrap().toast;
+            assert_eq!((toast.level, toast.scope), (Level::Error, Scope::Pane(pane)));
+            assert_eq!(toast.key, Some(format!("autosave:{}", file.display())));
+            assert!(toast.message.starts_with("Couldn't save a.txt: "), "{}", toast.message);
+            assert_eq!(toast.choices, vec![("Save As\u{2026}".to_string(), ToastAction::SaveAs(doc))]);
+        }
+        assert!(s.view(sid).unwrap().modified());
+    }
+
+    #[test]
+    fn save_as_from_a_files_documents_autosave_toast_asks_for_that_document() {
+        let dir = crate::plugin::testing::tmpdir("files-autosave-toast");
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        let files = ["a.txt", "b.txt"].map(|n| dir.join(n));
+        let cx = s.open_cx(None);
+        let mut view = FilesView::new(dir.clone(), &cx);
+        let mut ids = Vec::new();
+        for f in &files {
+            std::fs::write(f, "old\n").unwrap();
+            ids.push(view.show_doc(s.view_for_path(Some(editor::ID), f).unwrap()));
+        }
+        s.open_view_in_focused(Box::new(view));
+        let sid = s.focused_surface().unwrap();
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(s.active_doc(sid), Some((sid, b)), "b.txt shows");
+        edit_doc(&mut s, (sid, a));
+        make_read_only(&files[0]);
+
+        let mut cfg = Config::default();
+        cfg.editor.autosave_after = 1;
+        let mut cx = EventCx::new(&cfg, UiMetrics::default(), Default::default(), None);
+        s.view_mut(sid).unwrap().tick(&mut cx, Instant::now() + Duration::from_secs(60));
+        let mut toasts = cx.finish().requests.into_iter().filter(|r| matches!(r, Request::Toast { .. }));
+        let req = toasts.next().expect("the idle autosave's toast");
+        assert!(toasts.next().is_none());
+        assert!(matches!(req, Request::Toast { doc: Some(d), .. } if d == a), "{req:?}");
+
+        let id = s.toast_request(sid, req).unwrap();
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, a))));
+        assert!(s.toasts().is_empty());
     }
 
     #[test]

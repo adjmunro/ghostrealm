@@ -6,7 +6,8 @@ use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Mods};
 
 use super::text_edit::Clipboard;
-use super::UiMetrics;
+use super::{DocId, UiMetrics};
+use crate::toasts::Level;
 
 /// A mouse button a press is made with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +115,25 @@ pub enum Request {
     /// The view just started work the user is waiting on (e.g. a submitted shell
     /// command): show its workspace busy now, before `is_busy` catches up.
     Busy,
+    /// Tell the user something went wrong (or right) in a toast on the view's
+    /// pane. A toast with a `key` replaces the queued one with the same key.
+    /// `doc` is the document it concerns; a host fills it in
+    /// ([`EventCx::with_doc`]), so a view leaves it `None`.
+    Toast {
+        level: Level,
+        message: String,
+        key: Option<String>,
+        choices: Vec<ToastChoice>,
+        doc: Option<DocId>,
+    },
+}
+
+/// A button on a view's toast ([`Request::Toast`]). The app runs it, so the
+/// view names no button id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastChoice {
+    /// "Save As…": ask where to save the document.
+    SaveAs,
 }
 
 /// How a menu sits against the point it opens at: its top edge is at the
@@ -254,6 +274,20 @@ impl<'a> EventCx<'a> {
                 for item in items.iter_mut().filter(|i| !i.is_rule()) {
                     item.id += base;
                 }
+            }
+        }
+        out
+    }
+
+    /// Run `f` with `doc` as the document of the toasts it requests
+    /// ([`Request::Toast`]) that name none: a host passes each call to a
+    /// hosted document through this with that document's id.
+    pub fn with_doc<T>(&mut self, doc: DocId, f: impl FnOnce(&mut Self) -> T) -> T {
+        let from = self.out.requests.len();
+        let out = f(self);
+        for r in &mut self.out.requests[from..] {
+            if let Request::Toast { doc: d @ None, .. } = r {
+                *d = Some(doc);
             }
         }
         out
