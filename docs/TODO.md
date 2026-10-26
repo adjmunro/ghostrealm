@@ -1507,7 +1507,7 @@
 
 ---
 
-[2026-10-26T23:30+1300@fdc79620] Palette — a prompt error row may hide its last wide glyph
+[2026-10-26T22:54+1300@fdc79626] Palette — a prompt error row may hide its last wide glyph
 
 - Requires: a desktop check with a CJK or emoji error message
 - Detail: The argument prompt's error rows are drawn in `line_h`-tall
@@ -1519,3 +1519,17 @@
   Check with a long CJK/emoji error; if it clips, draw the rows with
   `Wrap::None` or measure them by shaped width.
 - Reason: the hidden glyph is dropped without an ellipsis.
+
+---
+
+[2026-10-26T23:00+1300@a49a439a] Text wrapping — `clusters()` splits flags and skin tones
+
+- Requires: a new dependency (`unicode-segmentation`), which the owner's
+  dependency policy discourages
+- Detail: `clusters()` in `crates/app/src/window.rs` groups a base
+  character with the zero-width characters after it and what a ZWJ joins.
+  Regional-indicator pairs (flags such as 🇳🇿) and skin-tone modifiers
+  (👍🏽) count as separate clusters, so `wrap_lines` and `wrap_cols` can
+  break a too-long word, or cut for the ellipsis, inside one. Proper
+  grapheme segmentation fixes it.
+- Reason: a split flag or skin tone draws as two wrong glyphs.
