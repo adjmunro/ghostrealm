@@ -686,6 +686,9 @@ struct State {
     tooltip_hover: Option<(Rect, Instant)>,
     /// When a pending tooltip is due to show (a wake-up).
     tooltip_due: Option<Instant>,
+    /// The shown tooltip's rows, keyed by its text, line width, row cap and
+    /// cell height: a held tooltip wraps once, not on every redraw.
+    tooltip_rows: Option<((String, u32, usize, u32), Vec<String>)>,
     /// Notices edits to the config file made outside the app.
     config_watch: ConfigWatch,
     /// Whether the window has keyboard focus (the config file is polled only
@@ -1374,6 +1377,7 @@ impl State {
             picker_panel: None,
             tooltip_hover: None,
             tooltip_due: None,
+            tooltip_rows: None,
             config_watch: ConfigWatch::new(ghostrealm_core::config::config_path()),
             window_focused: true,
             pointer_in: false,
@@ -3215,6 +3219,7 @@ impl State {
         let Some((anchor, text, _)) = tip else {
             self.tooltip_hover = None;
             self.tooltip_due = None;
+            self.tooltip_rows = None;
             return None;
         };
         let now = Instant::now();
@@ -3247,13 +3252,21 @@ impl State {
         // Lines no wider than half the screen (within its edges), and no more
         // than the screen holds, the last then cut with an ellipsis.
         let max_w = (sw * 0.5).max(240.0 * scale).min(sw - pad * 4.0).max(1.0);
-        let mut rows = wrap_lines(&text, max_w, |t| cx.shape(t, Family::SansSerif, f32::MAX).width);
         let max_rows = (((sh - pad * 2.0) / ch).floor() as usize).max(1);
-        if rows.len() > max_rows {
-            rows.truncate(max_rows);
-            let last = rows.pop().expect("at least one row");
-            rows.push(cx.cut_to_fit(&format!("{}\u{2026}", last.trim_end()), Family::SansSerif, max_w));
-        }
+        // The cell height stands in for the font, which sets the widths.
+        let key = (text, max_w.to_bits(), max_rows, ch.to_bits());
+        let rows = match &self.tooltip_rows {
+            Some((k, rows)) if *k == key => rows,
+            _ => {
+                let mut rows = wrap_lines(&key.0, max_w, |t| cx.shape(t, Family::SansSerif, f32::MAX).width);
+                if rows.len() > max_rows {
+                    rows.truncate(max_rows);
+                    let last = rows.pop().expect("at least one row");
+                    rows.push(cx.cut_to_fit(&format!("{}\u{2026}", last.trim_end()), Family::SansSerif, max_w));
+                }
+                &self.tooltip_rows.insert((key, rows)).1
+            }
+        };
         let lines: Vec<Shaped> = rows.iter().map(|l| cx.shape(l, Family::SansSerif, f32::MAX)).collect();
         let w = lines.iter().map(|s| s.width).fold(0.0, f32::max) + pad * 2.0;
         let h = lines.len() as f32 * ch + pad * 2.0;
