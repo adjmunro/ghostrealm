@@ -41,8 +41,11 @@ pub const BORDER: f32 = 2.0;
 ///   `border_w` wide inside it, in `border_color`.
 /// - `radius` < 0: a segment `-radius` px either side of the line between two
 ///   endpoints, held in `border_color` as `[ax, ay, bx, by]` (px from the
-///   rect's top-left); `border_w` 0 gives round ends, > 0 flat ends exactly
+///   rect's top-left); `border_w` 0 gives round ends, 1 flat ends exactly
 ///   at the endpoints (an oriented box). The rect must contain the shape.
+///   `border_w` [`WAVE`] instead repeats the segment as a zigzag across the
+///   whole rect: the segment rises from a trough to the next peak, half a
+///   period, and the rect's sides cut the ends flat.
 ///
 /// Shaped quads are antialiased, and draw one pixel past their rect for it.
 /// They also draw only inside `clip`; a plain fill ignores it (clip its rect
@@ -71,6 +74,9 @@ pub struct QuadInstance {
     /// aren't drawn. [`NO_CLIP`] by default.
     pub clip: [f32; 4],
 }
+
+/// A segment [`QuadInstance::border_w`] that draws a zigzag (a wave).
+pub const WAVE: f32 = 2.0;
 
 /// A [`QuadInstance::clip`] that clips nothing.
 pub const NO_CLIP: [f32; 4] = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
@@ -146,6 +152,27 @@ pub fn line_quad(
     q.radius = -hw;
     q.border_w = if flat { 1.0 } else { 0.0 };
     q.border_color = [a.0 - x, a.1 - y, b.0 - x, b.1 - y];
+    q
+}
+
+/// A zigzag across `xs`, its lowest edge at `bottom`, with a trough at
+/// `start`: `(half, amp, width)` are half its period, its amplitude, and its
+/// stroke width ([`WAVE`]). Opaque.
+pub fn wave_quad(
+    xs: std::ops::Range<f32>,
+    start: f32,
+    bottom: f32,
+    (half, amp, width): (f32, f32, f32),
+    sw: f32,
+    sh: f32,
+    color: [u8; 3],
+) -> QuadInstance {
+    let (hw, low) = (width / 2.0, bottom - width / 2.0);
+    let r = Rect { x: xs.start, y: low - 2.0 * amp - hw, w: xs.end - xs.start, h: 2.0 * amp + width };
+    let mut q = rect_quad(r, sw, sh, color, 1.0);
+    q.radius = -hw;
+    q.border_w = WAVE;
+    q.border_color = [start - r.x, low - r.y, start + half - r.x, low - 2.0 * amp - r.y];
     q
 }
 
@@ -897,25 +924,28 @@ impl<'a> PaintCx<'a> {
     }
 
     /// A wavy underline from `x0` to `x1` over the text, its lowest edge at
-    /// `bottom` (a diagnostic): a zigzag of [`line`](Self::line) segments,
-    /// within the clip. Opaque, because a translucent stroke darkens where
-    /// its segments overlap at the joints.
+    /// `bottom` (a diagnostic), within the clip: one [`WAVE`] quad. The wave
+    /// starts at `x0` in a trough, so `x0` may lie left of the clip (a span
+    /// scrolled partly out of view) and the wave keeps its place under the
+    /// text.
     pub fn squiggle(&mut self, x0: f32, x1: f32, bottom: f32, color: [u8; 3]) {
         let s = self.ui.scale;
         // Half a period, the amplitude, and the stroke width.
         let (half, amp, width) = (2.0 * s, 1.5 * s, 1.0 * s);
-        let low = bottom - width / 2.0;
-        let y = |i: usize| if i % 2 == 0 { low } else { low - 2.0 * amp };
-        self.over_text(|cx| {
-            let (mut x, mut i) = (x0, 0);
-            while x < x1 {
-                let next = (x + half).min(x1);
-                let (ya, yb) = (y(i), y(i + 1));
-                let end = ya + (yb - ya) * (next - x) / half;
-                cx.line((x, ya), (next, end), width, color, 1.0);
-                (x, i) = (next, i + 1);
-            }
-        });
+        let (lo, hi) = match self.clip {
+            Some(c) => (x0.max(c.x), x1.min(c.x + c.w)),
+            None => (x0, x1),
+        };
+        if hi <= lo {
+            return;
+        }
+        // The trough at or before `lo`, a whole number of periods from `x0`,
+        // so the shader works with small offsets however far `x0` is.
+        let period = 2.0 * half;
+        let start = x0 + ((lo - x0) / period).floor() * period;
+        let (sw, sh) = self.frame.screen;
+        let q = wave_quad(lo..hi, start, bottom, (half, amp, width), sw, sh, color);
+        self.over_text(|cx| cx.push_quad(q, false));
     }
 
     /// Fill `r` over the text (cursors, carets).
@@ -1450,6 +1480,32 @@ mod tests {
         }
         assert!(h.text.finish_paint(), "some rows were deferred");
         assert_eq!(h.frame.bg.len(), MIN_SHAPES_PER_FRAME, "an underline for each shaped row only");
+    }
+
+    /// A squiggle is one quad per row however wide, cut to the clip, with
+    /// its wave's phase set by where it starts, in view or not.
+    #[test]
+    fn a_wide_squiggle_is_one_quad_in_phase_with_its_start() {
+        let mut h = Harness::new();
+        h.frame = crate::plugin::Frame::new((800.0, 600.0));
+        let clip = Rect { x: 100.0, y: 0.0, w: 500.0, h: 600.0 };
+        let x0 = -10_001.0;
+        {
+            let mut cx = PaintCx::new(
+                &h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1),
+            );
+            cx.with_clip(clip, |cx| cx.squiggle(x0, 50_000.0, 40.0, [200, 0, 0]));
+        }
+        let [q] = h.frame.top[..] else { panic!("one quad: {}", h.frame.top.len()) };
+        assert_eq!(q.border_w, WAVE);
+        let left = (q.pos[0] + 1.0) / 2.0 * 800.0;
+        assert!((left - 100.0).abs() < 0.01 && (q.px[0] - 500.0).abs() < 0.01, "cut to the clip");
+        // The trough the wave starts from is a whole number of periods from `x0`.
+        let period = 4.0 * UI.scale;
+        let trough = left + q.border_color[0];
+        assert!(trough <= 100.0 && trough > 100.0 - period, "{trough}");
+        let periods = (trough - x0) / period;
+        assert!((periods - periods.round()).abs() < 1e-3, "{periods}");
     }
 
     fn block_spans(text: &str) -> Vec<BlockSpan> {

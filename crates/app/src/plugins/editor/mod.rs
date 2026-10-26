@@ -1624,10 +1624,13 @@ impl View for EditorView {
                     if b <= a {
                         continue;
                     }
-                    let x0 = (text_x + (a - r.start) as f32 * col_w(r) - hscroll_px(r)).max(text_x);
+                    // The wave starts where the span does, in view or not, so
+                    // it scrolls with the text; the clip cuts it at the text's edge.
+                    let x0 = text_x + (a - r.start) as f32 * col_w(r) - hscroll_px(r);
                     let x1 = (text_x + (b - r.start) as f32 * col_w(r) - hscroll_px(r)).min(body.x + body.w);
-                    if x1 > x0 {
-                        cx.with_clip(body, |cx| cx.squiggle(x0, x1, r.bottom(), color));
+                    if x1 > x0.max(text_x) {
+                        let text = Rect { x: text_x, y: body.y, w: body.x + body.w - text_x, h: body.h };
+                        cx.with_clip(text, |cx| cx.squiggle(x0, x1, r.bottom(), color));
                     }
                 }
             }
@@ -2226,7 +2229,7 @@ mod tests {
     }
 
     /// The wavy underlines painted over the text in `color`, one per visual
-    /// row: (left, right, bottom) of its segments, ordered by row.
+    /// row: (left, right, bottom) of its quads, ordered by row.
     fn squiggles(h: &Harness, color: [u8; 3]) -> Vec<(f32, f32, f32)> {
         let rgb = color.map(|c| crate::plugin::paint::srgb_to_linear(c) as f32);
         let segments = h.frame.top.iter().filter(|q| {
@@ -2246,12 +2249,11 @@ mod tests {
         rows
     }
 
-    /// Whether `row` squiggles columns `from..to` of visual row `n`: the
-    /// stroke's round ends reach half its width past them.
+    /// Whether `row` squiggles columns `from..to` of visual row `n`.
     fn squiggles_cols(row: (f32, f32, f32), n: usize, from: usize, to: usize) -> bool {
         let ((x0, _), (x1, _)) = (at(n, from), at(n, to));
-        (row.0 - (x0 - 0.5)).abs() < 0.01
-            && (row.1 - (x1 + 0.5)).abs() < 0.01
+        (row.0 - x0).abs() < 0.01
+            && (row.1 - x1).abs() < 0.01
             && (row.2 - (n + 1) as f32 * UI.cell_h).abs() < 0.01
     }
 
@@ -2267,8 +2269,8 @@ mod tests {
         assert!(red.len() == 1 && squiggles_cols(red[0], 0, 3, 6), "red under \"bad\" only: {red:?}");
         let yellow = squiggles(&h, theme::DIAG_WARNING);
         assert!(yellow.len() == 1 && squiggles_cols(yellow[0], 0, 7, 10), "yellow under \"zzz\" only: {yellow:?}");
-        let segments = h.frame.top.iter().filter(|q| q.radius < 0.0).count();
-        assert!(segments > 4, "a zigzag, not a bar: {segments}");
+        let waves = h.frame.top.iter().filter(|q| q.radius < 0.0 && q.border_w == crate::plugin::paint::WAVE).count();
+        assert_eq!(waves, 2, "a wave, not a bar");
 
         v.buffer_mut().cursor = (1, 0);
         for c in "bad".chars() {
@@ -3678,6 +3680,35 @@ mod tests {
         assert_eq!(v.buffer().selected_text().as_deref(), Some("here"));
     }
 
+    /// A diagnostic scrolled partly out of view keeps its wave under the
+    /// text: the wave's troughs fall a whole number of periods from the
+    /// span's start, not from the text's left edge.
+    #[test]
+    fn a_squiggle_scrolled_partly_out_of_view_keeps_its_phase() {
+        let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-squiggle-scroll", &format!("# ok bad {}\nbody", "x".repeat(300)));
+        v.attach(Client::in_process(Flags, None), "markdown");
+        settle(&mut v);
+        v.soft_wrap = Some(false);
+        v.buf.cursor = (0, 8);
+        v.buf.hscroll = 6;
+        paint_plain(&mut h, &mut v);
+        assert_eq!(v.buf.hscroll, 6);
+        let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
+        let span_x = text_x + (5.0 - 6.0) * cw;
+        let rgb = theme::DIAG_ERROR.map(|c| crate::plugin::paint::srgb_to_linear(c) as f32);
+        let wave = h
+            .frame
+            .top
+            .iter()
+            .find(|q| q.border_w == crate::plugin::paint::WAVE && q.color.iter().zip(rgb).all(|(a, b)| (a - b).abs() < 1e-4))
+            .expect("the squiggle under \"bad\"");
+        let left = rects(&h, std::slice::from_ref(wave))[0].0;
+        assert!((left - text_x).abs() < 0.01, "cut at the text's edge: {left}");
+        let periods = (left + wave.border_color[0] - span_x) / (4.0 * UI.scale);
+        assert!((periods - periods.round()).abs() < 1e-3, "{periods}");
+    }
+
     #[test]
     fn caret_selection_and_diagnostics_on_a_heading_measure_its_cells() {
         let mut h = Harness::new();
@@ -3694,7 +3725,7 @@ mod tests {
         let caret = (text_x + 5.0 * cw, 0.0, 2.0, R1);
         assert!(top.iter().any(|r| near(*r, caret)), "caret {caret:?} in {top:?}");
         let red = squiggles(&h, theme::DIAG_ERROR);
-        let under = (text_x + 5.0 * cw - 0.5, text_x + 8.0 * cw + 0.5, R1);
+        let under = (text_x + 5.0 * cw, text_x + 8.0 * cw, R1);
         assert!(
             red.len() == 1 && [red[0].0 - under.0, red[0].1 - under.1, red[0].2 - under.2].iter().all(|d| d.abs() < 0.01),
             "underline {under:?} in {red:?}"

@@ -5674,7 +5674,18 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         let ba = b - a;
         let len = length(ba);
         var d: f32;
-        if (in.shape.y > 0.0) {
+        if (in.shape.y > 1.5) {
+            // A zigzag of the segment and its mirror images: fold the pixel
+            // into the rising half-period, whose nearest point is then the
+            // nearest on the wave. The rect's sides cut it flat.
+            let period = 2.0 * ba.x;
+            var t = in.local.x - a.x;
+            t = t - period * floor(t / period);
+            t = min(t, period - t);
+            let pa = vec2<f32>(t, in.local.y - a.y);
+            let k = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+            d = max(length(pa - ba * k) - hw, abs(in.local.x) - in.half.x);
+        } else if (in.shape.y > 0.0) {
             let u = select(vec2<f32>(1.0, 0.0), ba / len, len > 0.0);
             let v = vec2<f32>(-u.y, u.x);
             let m = in.local - (a + b) * 0.5;
@@ -6333,6 +6344,40 @@ mod tests {
                 assert!((got - exact).abs() / exact < 0.04, "width {w} {a:?}-{b:?}: {got} vs {exact}");
             }
         }
+    }
+
+    /// A wave quad draws the zigzag of round-ended segments it stands for,
+    /// cut flat at its sides.
+    #[test]
+    fn a_wave_draws_its_zigzag_of_segments() {
+        use crate::plugin::paint::{line_quad, wave_quad};
+        let (half, amp, w) = (4.0, 3.0, 2.0);
+        let (x0, x1, bottom) = (8.3, 56.3, 40.0);
+        let wave = render(&[wave_quad(x0..x1, x0 - 3.0 * half, bottom, (half, amp, w), D, D, [255; 3])], 0.0);
+        let low = bottom - w / 2.0;
+        let y = |i: i32| if i % 2 == 0 { low } else { low - 2.0 * amp };
+        let segments: Vec<QuadInstance> = (0..16)
+            .map(|i| {
+                let a = x0 + (i - 3) as f32 * half;
+                line_quad((a, y(i)), (a + half, y(i + 1)), w, false, D, D, [255; 3], 1.0)
+            })
+            .collect();
+        let zigzag = render(&segments, 0.0);
+        let mut worst = 0;
+        for py in 0..64 {
+            for px in 0..64 {
+                let (a, b) = (pixel(&wave, 64, px, py)[0], pixel(&zigzag, 64, px, py)[0]);
+                if (px as f32) < x0 - 1.0 || (px as f32) > x1 {
+                    assert_eq!(a, 0, "nothing past its sides at ({px}, {py})");
+                } else if (px as f32) > x0 + 1.0 && (px as f32) < x1 - 2.0 {
+                    worst = worst.max(a.abs_diff(b));
+                }
+            }
+        }
+        // Overlapping segments' antialiased ends add up a little at the
+        // joints; the wave's single distance field doesn't.
+        assert!(worst <= 64, "differs from the segments by up to {worst}");
+        assert!(ink(&wave) > 0.9 * (x1 - x0) * w, "{}", ink(&wave));
     }
 
     /// A flat-ended bar is a rotated rect: a diamond covers its area.

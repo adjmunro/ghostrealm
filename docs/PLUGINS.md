@@ -128,8 +128,10 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   with `theme::pill_radius`, `box_radius`, `hairline`, and `focus_ring_w`,
   which scale with `cx.ui`.
 - `squiggle(x0, x1, bottom, colour)` draws a wavy underline over the text
-  (a diagnostic), opaque, its lowest edge at `bottom`, within the clip. Call
-  it per visual row of a wrapped range. Colours: `theme::DIAG_ERROR`,
+  (a diagnostic), opaque, its lowest edge at `bottom`, within the clip: one
+  quad however wide. The wave's phase starts at `x0`, so pass the span's
+  unclamped start and clip at the text's edge; it then scrolls with the
+  text. Call it per visual row of a wrapped range. Colours: `theme::DIAG_ERROR`,
   `DIAG_WARNING`, `DIAG_INFO`.
 - `over_text(|cx| ...)` draws every quad painted inside it over the panes'
   text, as `fill_top` does: a control floating on text (a code block's copy
