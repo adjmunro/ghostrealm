@@ -2,7 +2,6 @@
 
 Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings files, and the "decision needed" markers in `docs/DECISION.md`, `docs/SPEC.md`, and `docs/GOAL.md`, as of `develop` at `311033e`. Each one needs a call only you can make. The Files surface work (issue #1, file tabs, the unsaved dot) is decided and left out. Fill in each **Your answer** block. Sections are ordered by what they block and what they risk.
 
-1. **User-visible error surface**: where do errors and notices show?
 2. **Web host in the normal build**: how should plain `cargo build` / `cargo run --release` produce the CEF bundle?
 3. **Agent channel into the running app**: which processes may connect, and what may each one reach?
 4. **Web profiles, concrete model**: which profiles exist by default, who creates them, what scope they default to, and who owns the host?
@@ -25,50 +24,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 21. **Web preload / prerender default**: off, connect, or prerender?
 22. **Comment mode storage**: where do comment threads live?
 23. **GIT.md "committing is pre-authorised"**: is this intended?
-
----
-
-## 1. User-visible error surface
-
-**Source:** docs/TODO.md entry "PRIORITY: User-visible error surface" (line ~757); docs/stack-review-findings.md item 5; docs/stack-review-findings-2.md item 15; TODO "File and folder context menu — remaining" (line ~924)
-
-**What's being decided:** where the app shows a failed action or a notice. Today the user sees nothing when one of these happens.
-
-**Background:**
-- These failures go only to stderr (`eprintln!`; `window.rs` alone has 13 call sites):
-  - Save As failures, reported after the picker has closed.
-  - Refused opens: a file that is not UTF-8 or can't be read.
-  - Config load findings. New clamps (`sidebar.width` min 40, `font_size` max 96, `double_tap_window_ms` max 2000) change an existing file's behaviour without a word.
-  - File-menu failures: name taken, nothing to paste, Trash refused.
-- When the app is launched from Finder, nobody sees stderr. The TODO says to prompt you about this design.
-- What the app already has to build on:
-  - The web pane shows host failures inline.
-  - A modal confirmation exists (`AppState::confirm`).
-  - The config language server shows findings as diagnostics, but only once the file is open.
-- Constraint: overlay text draws above every overlay quad, so modals can't stack yet (`Frame` needs one layer per modal). A toast that shows while a modal is open needs those layers.
-- Other apps: VS Code and Zed use bottom-right toasts plus a status bar or Problems panel. Ghostty shows config errors in a banner inside the window.
-
-**Options:**
-- **A. Toasts.** Stacked in the window's bottom-right corner. Errors stay until dismissed; info fades after a few seconds. Clicking a config toast opens `config.toml` at the first finding.
-  - Pros: covers every case; familiar.
-  - Cons: needs the per-modal overlay layers.
-  - Effort: medium.
-- **B. Status line.** One row along the window bottom: the last message plus a count, and a click shows the history.
-  - Pros: never covers content.
-  - Cons: costs a permanent row (or needs autohide); easy to miss.
-  - Effort: medium.
-- **C. Inline where it happened.** The picker keeps the Save As error under the name field; the document header or sidebar shows file errors.
-  - Pros: the error appears where you are looking.
-  - Cons: each site needs its own design; there is no site for errors at startup (config).
-  - Effort: medium, spread across sites.
-- **D. Inbox.** Errors arrive as an unread notice on the workspace.
-  - Pros: reuses the existing inbox.
-  - Cons: mixes app errors with job status; the inbox is per workspace, but config errors belong to the whole app.
-
-**Recommendation:** A for everything, plus C for Save As only: you are still in the picker there, so keep it open and show the error under the name field.
-
-**Your answer:**
-> If the error is from a form, such as the Save As interface, then it should be inline and prevent progression (but not cancellation) until resolve. For code/text in the editor, we should use a red squiggly line under the affected area (or yellow if warning). For everything else, can we add blue(info)/green(succes)/orange(warning)/red(error) toasts, in the top of the affected panel. If it's an app issue not a panel issue, then make the width of the toast full-width excluding the vtab sidebar. Less important / non-actionable toasts, then can autohide. For important ones a human should read, keep it there until they click the 'x'/'dismiss'/other choices. That probably also means FIFO queuing them to ensure all errors are read and acknowledged, showing only 1 issue at a time.
 
 ---
 
@@ -824,6 +779,8 @@ These can't be verified in the headless sandbox:
 - **Web pages:** "Web surface — follow-ups" (1) (line ~665): page drawing, HiDPI, cursors, dead keys, and clipboard in pages.
 - **GPU compositing:** "Web — GPU (accelerated) off-screen rendering" (line ~736): does GPU compositing paint on a real display?
 - **Nested `.gitignore`:** "File browser — remaining polish" (6) (line ~420): confirm it on a real repo.
+- **Error surface:** toasts (colours, placement at the top of the pane or below the top tab strips for app-wide ones, hover highlight and dismiss on mouse-up, auto-hide timing), the Save As picker's inline error and red border, the palette prompt's error rows and their tooltip, wrapped tooltips, and the wavy red/yellow underlines in the editor. Two TODO entries also need a display: a launch-time toast under a still pointer, and wide glyphs in prompt error rows.
+- **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 
 ## Parked (no decision needed yet)
 
