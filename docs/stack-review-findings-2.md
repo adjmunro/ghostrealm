@@ -25,12 +25,6 @@ test reproduced it; the rest come from reading the code. Items marked
     `[keybindings]` binds nothing, deliberately, with no fallback to built-in
     defaults: every binding is explicit in the user's file. See DECISION.md
     (Config). Recommended bindings are tracked in TODO.md.
-15. **Load-time findings go only to stderr** (`load_or_create`,
-    [`config.rs:470`](../crates/core/src/config.rs), `019dc17`). New clamps
-    (`sidebar.width` min 40, `font_size` max 96, `double_tap_window_ms` max 2000)
-    change existing files' behaviour silently when launched from Finder.
-    Decision needed: surface them how (inbox, toast, settings status)? Folded
-    into the "User-visible error surface" design in TODO.md.
 
 ## Web browser and file-browser preview
 

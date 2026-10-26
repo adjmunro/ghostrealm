@@ -672,20 +672,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] PRIORITY: User-visible error surface
-
-- Requires: a design (prompt the user about it)
-- Detail: Errors reach stderr only: a failed Save As, a refused open of an
-  unreadable or non-UTF-8 file, config load findings. (Web host failures are
-  shown in the web pane and reported by `web.new`.) Design
-  where they show (toast, status line, inbox, settings status). See
-  [stack-review-findings.md](stack-review-findings.md) item 5 (silent Save As and
-  open failures) and [stack-review-findings-2.md](stack-review-findings-2.md)
-  item 15 (load-time findings go only to stderr).
-- Reason: the user cannot see why an action did nothing.
-
----
-
 [2026-10-13T19:46+1300@d292715] Terminal: text-editing keys inside full-screen programs (decision pending)
 
 - Requires: a decision from the owner (see "Decision session")
@@ -838,8 +824,6 @@
   - **Cmd+Backspace** on the file browser's selection to delete (from the old
     "Delete files" entry).
   - New File / New Folder create the entry and do not open it.
-  - Failures (name taken, nothing to paste, Trash refused) reach stderr only;
-    see "User-visible error surface".
 - Not in the menu: **GitHub permalinks** (see "GitHub permalinks"), Open
   Markdown Preview (the document header's view-mode button shows it).
 - Reason: the first menu covers the owner's list; these are the edges.
@@ -1417,3 +1401,83 @@
   a caller that lets it drop early (e.g. one that only keeps a path) needs to
   hold it instead.
 - Reason: test runs shouldn't fill the temp directory.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] App — per-modal overlay layers
+
+- Requires: NO BLOCKERS
+- Detail: `Frame` draws overlay text above every overlay quad, so modals
+  can't stack: the picker hides while a confirmation is open, and toasts
+  don't draw (their clock stops) while the palette, picker, confirmation, or
+  a menu is open. Give each modal a layer of its own (quads, then text), so
+  one can draw over another and a toast can show over a modal.
+- Reason: a toast raised while a modal is open waits until it closes.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Errors still reaching stderr only, or dropped
+
+- Requires: NO BLOCKERS
+- Detail: Left out of the error surface:
+  - `terminal-ghostty`'s "snapshot failed" (`lib.rs:377`) stays on stderr:
+    it repeats every frame.
+  - The web view drops the `Result`s of navigate (`plugins/web/mod.rs:1032`)
+    and of back, forward, and reload (its toolbar buttons, `:1605`).
+  - `AppState::save_views` returns early on a failed save, losing the
+    paths it already wrote: a config written before the failure isn't
+    hot-reloaded.
+- Reason: the user can't see why these did nothing.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Tests — fail under full-workspace load, pass alone
+
+- Requires: NO BLOCKERS
+- Detail: The file-browser test `a_match_is_found_again_in_one_pass_over_a_long_line`
+  (`plugins/file_browser/search.rs:1051`) and `ghostrealm-web --lib`
+  `a_host_hung_up_on_is_reported_gone_once_its_process_has_gone` fail now
+  and then in a full `cargo test --workspace` and pass run alone. Find the
+  timing they depend on.
+- Reason: a flaky test hides real failures.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
+
+- Requires: investigation (environment, or a stale host bundle)
+- Detail: `ghostrealm-web --test host` and `popups_with_the_real_host` fail
+  on `develop` too, not only on branches. Find whether the environment or a
+  stale bundle is at fault, and fix it or document the setup they need.
+- Reason: the web host's integration is untested while they fail.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Agent — a reply waits for the user's own file jobs
+
+- Requires: NO BLOCKERS
+- Detail: The agent's `wait_file_jobs` (`agent.rs:98`) waits for every file
+  job before replying, including a long copy the user started; the reply
+  already carries only the agent's own jobs' reports. Wait for those jobs
+  alone.
+- Reason: an agent call shouldn't stall behind the user's copy.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Core — config tests leave their temp dirs behind
+
+- Requires: NO BLOCKERS
+- Detail: `core::config`'s test helper `tmp()` (`config.rs:706`) makes a
+  directory per test in the temp dir and never removes it.
+- Reason: test runs shouldn't fill the temp directory.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa] Toasts — a `preview_font` warning outlives the fix
+
+- Requires: NO BLOCKERS
+- Detail: The warning that `[editor] preview_font` isn't installed stays
+  queued after the font is installed or the setting changed, until
+  dismissed. Replace it with nothing (dismiss the `preview_font` key) when a
+  config reload finds the font.
+- Reason: a warning about a fixed problem misleads.

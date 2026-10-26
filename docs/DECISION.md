@@ -257,3 +257,16 @@
 - Detail: `ghostrealm agent` checks the idle exit before and after each request. Nothing wakes it while it waits for the next request, so an idle host there goes at the first request after the 30 s, or with the session (TODO.md "Web — idle host exit while `ghostrealm agent` waits on stdin").
 - Detail: An idle exit is not a failure: no error shown, no back-off, the failure count untouched. A host that exited or failed by itself is handled as before (its reason shown, back-off), also when it did so with no web surface left.
 - Reason: an idle Chromium browser and GPU process hold a few hundred MB. 30 s keeps closing the last tab and opening another from paying for a host start.
+
+---
+
+[2026-10-26T22:13+1300@462d3daa]
+
+- Category: UI / errors and notices
+- Detail: A failure in a form shows inline and blocks confirming until the input changes; Cancel always works. Forms: the floating picker (Save As, Save Copy As, Open; a failed Replace too) shows the error under its listing, the name field outlined red; the command palette's argument prompt (Rename, New File, New Folder; a value that doesn't parse) shows it under the input.
+- Detail: Language-service diagnostics are wavy underlines under the range: red errors, yellow warnings, blue info and hints.
+- Detail: Everything else is a toast: blue info, green success, orange warning, red error. One tied to a pane shows across the top of that pane below its tab strip; one about the whole app across the workspace area (window minus the sidebar) below the top row's tab strips.
+- Detail: Errors and warnings stay until dismissed (`×`, a choice, or `toast.dismiss`); info and success hide after 4 s on screen. One window-wide FIFO queue shows its head only, with "+N" for the rest. A toast with a key (`config`, `preview_font`, `save:<path>`, `autosave:<path>`) replaces the queued one with that key, so repeats don't stack.
+- Detail: Toasts don't draw, and their clock stops, while the palette, picker, confirmation, or a menu is open: those modals own the pointer, and modals can't stack until `Frame` has per-modal layers.
+- Detail: Every toast's message also goes to stderr. Failures of commands an agent runs go back to it as before; web host failures stay inline in the web pane.
+- Reason: the owner's answer: "If the error is from a form, such as the Save As interface, then it should be inline and prevent progression (but not cancellation) until resolve. For code/text in the editor, we should use a red squiggly line under the affected area (or yellow if warning). For everything else, can we add blue(info)/green(succes)/orange(warning)/red(error) toasts, in the top of the affected panel. If it's an app issue not a panel issue, then make the width of the toast full-width excluding the vtab sidebar. Less important / non-actionable toasts, then can autohide. For important ones a human should read, keep it there until they click the 'x'/'dismiss'/other choices. That probably also means FIFO queuing them to ensure all errors are read and acknowledged, showing only 1 issue at a time."

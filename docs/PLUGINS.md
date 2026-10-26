@@ -127,6 +127,10 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   translucent guides so they don't overlap. Size pills, boxes, and borders
   with `theme::pill_radius`, `box_radius`, `hairline`, and `focus_ring_w`,
   which scale with `cx.ui`.
+- `squiggle(x0, x1, bottom, colour)` draws a wavy underline over the text
+  (a diagnostic), opaque, its lowest edge at `bottom`, within the clip. Call
+  it per visual row of a wrapped range. Colours: `theme::DIAG_ERROR`,
+  `DIAG_WARNING`, `DIAG_INFO`.
 - `over_text(|cx| ...)` draws every quad painted inside it over the panes'
   text, as `fill_top` does: a control floating on text (a code block's copy
   button). Only base-layer quads move; in a popup (`above`) quads already sit
@@ -242,7 +246,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - `above(|cx| ...)` paints into the overlay pass, over every pane (a view's
   popups, such as the editor's hover docs). While `cx.modal` (a palette, menu,
   picker, or confirmation covers the panes) it paints nothing; close popups
-  then, so they don't reappear when the modal goes.
+  then, so they don't reappear when the modal goes. A toast draws over
+  popups; the tooltip draws over the toast.
 - Document header: `plugins::files::header::DocHeader` draws a document's
   details (name, kind and size, modified) in its rect, from what
   `refresh(path)` last read (call it when the document shows, saves,
@@ -354,7 +359,11 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   and triple-click (all) then edit the `LineEdit` like the editor's.
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
-into the overlay layer; it doesn't need to know.
+into the overlay layer; it doesn't need to know. The picker shows a failed
+answer's error in its browser: `FileBrowserView::set_error(message, path)`
+draws it under the listing (above the name row in Save mode, whose field
+turns red) until the answer changes, and `blocks(path)` holds back picking
+the path that failed meanwhile.
 
 ## Input (`EventCx`)
 
@@ -422,7 +431,20 @@ into the overlay layer; it doesn't need to know.
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
   explicit save found the file changed on disk: the app asks before writing),
   `FileMenu` (open the file menu on a target), `Menu` (open the view's own
-  menu), `Close` / `CloseDoc` (see Documents above).
+  menu), `Close` / `CloseDoc` (see Documents above), `Toast` (below).
+- Toasts: `Request::Toast { level, message, key, choices, doc }` queues a
+  toast on the view's pane (`toasts::Level`: info, success, warning,
+  error). A `key` replaces the queued toast with the same key, so a failure
+  that repeats (an autosave each idle tick) leaves one; without one, the
+  same pane and message replace it. `choices` are `ToastChoice`s the app
+  runs itself (`SaveAs`: the Save As picker for the document), so the view
+  names no button ids. Leave `doc` `None`: a view hosting documents passes
+  each call to one through `EventCx::with_doc(id, ...)`, which fills in that
+  document's `DocId`, so a choice acts on the document that failed whichever
+  shows by then (`FilesView` does for focus, input, and every document's
+  `tick`). A failed save's text is `toasts::save_failed(path, e)`; print
+  your own stderr line, as the app doesn't. Failures in a form the view
+  draws show inline instead.
 - View menu: `Request::Menu { items, at, align }` opens a menu of the view's
   own with its top edge at `at` (physical px) and its left or right edge
   there per `align` (`MenuAlign::Right` for a button at the view's right end,

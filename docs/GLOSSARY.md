@@ -21,3 +21,4 @@ Mutual project lexicon so we both know what we're talking about. Aim to be consi
 - Outline: a document's section headings in order, each with its line, level, and title (`core::outline`): Markdown headings and TOML tables, found by the file's highlighter.
 - Table of contents (TOC): the outline shown at a document's top-left in every view mode, unmoved by scrolling: collapsed, a column of dashes (current section in the accent colour); resting the pointer on it opens a panel of the headings' titles; a click jumps to one.
 - Block (`BlockCache`): a shaped run of word-wrapped proportional text, such as a Preview paragraph, cached by content, width, and metrics beside the monospace rows of the `RowCache`.
+- Toast: a coloured notice across the top of the pane it concerns, or of the workspace area for the whole app. Errors and warnings stay until dismissed; info and success hide on their own. One shows at a time, the rest wait in order.

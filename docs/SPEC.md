@@ -53,7 +53,11 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
 
 Per frame: every view is pumped (a terminal checks its VT worker's published
 grid); then each pane's active view paints into a `Frame`: quads under text, images,
-text items, quads over text, overlay images, overlay text. The app draws the quads
+text items, quads over text, overlay images, overlay text. The head of the toast
+queue paints into a `Frame` of its own, drawn in a pass after the overlay text
+(toast quads, then its text through a renderer of its own) and before the
+menu and tooltip; so it covers views' popups and the tooltip covers it. While
+the palette, picker, confirmation, or a menu is open no toast draws. The app draws the quads
 via an instanced quad pipeline (rounded corners and borders by an SDF in the
 shader), images via a textured-quad pipeline (a texture per view image,
 re-uploaded only when its version changes and freed once undrawn), and the text

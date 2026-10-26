@@ -2,7 +2,7 @@
 
 Branch `feat/error-surface` from `develop` (`70ac650`). Owner's decision:
 `decisions-pending.md` section 1, "Your answer" (read that section, but don't
-edit the file). The last commit of the build deletes this plan. Line numbers
+edit the file). The last fix commit after review deletes this plan. Line numbers
 are against `70ac650`.
 
 ## Rules applied
@@ -407,7 +407,6 @@ and passes `cargo test --workspace` (see the `build` skill).
     - Delete findings item 5 (and the "Medium" heading it leaves empty) from
       `stack-review-findings.md`, and item 15 from
       `stack-review-findings-2.md`.
-    - Delete this plan.
 
 ## Tests
 
@@ -548,6 +547,11 @@ Where the build differs from the design above:
     that doesn't apply (`CmdError::Inapplicable`) shows inline too.
   - The error line sits between the input and the hint, in
     `theme::TOAST_ERROR`.
+- Commit 18 leaves this plan in place: fixes for the review's findings
+  follow, and the last of them deletes it. TODO.md also takes the review's
+  out-of-scope items (flaky tests under load, the CEF host tests, the
+  agent's wait for the user's file jobs, the config tests' temp dirs, the
+  `preview_font` warning outliving the fix).
 
 ## Risks
 
