@@ -5638,6 +5638,7 @@ fn wrap_cols(text: &str, cols: usize, max_rows: usize) -> (Vec<String>, bool) {
         let keep = clusters(last).iter().rev().skip(1).map(|c| c.len()).sum();
         last.truncate(keep);
     }
+    last.truncate(last.trim_end().len());
     last.push('\u{2026}');
     (out, true)
 }
@@ -6420,6 +6421,8 @@ mod tests {
         assert_eq!(lines, [format!("a{heart}"), "a\u{2026}".to_string()]);
         // The ellipsis takes the place of a whole multi-char cluster.
         assert_eq!(wrap(&heart.repeat(3), 4, 1), (vec![format!("{heart}\u{2026}")], true));
+        // The ellipsis follows the last row's text, not its trailing spaces.
+        assert_eq!(wrap("x  \ny\nz", 20, 1), (vec!["x\u{2026}".to_string()], true));
         // A line break in the text starts a row.
         assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
     }
