@@ -5530,12 +5530,18 @@ fn clusters(text: &str) -> Vec<&str> {
 }
 
 /// `text` broken into lines no wider than `max_w` as `width_of` measures
-/// them: at its own line breaks, then between words, then a word wider
-/// than a line across lines (between [`clusters`]).
+/// them: at its own line breaks, then (a line too wide) between words,
+/// then a word wider than a line across lines (between [`clusters`]). A
+/// line that fits is kept as is, and a wrapped one keeps its spacing but
+/// the spaces it breaks at.
 fn wrap_lines(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
-        for mut row in wrap_words(line, max_w, &mut width_of) {
+        if width_of(line) <= max_w {
+            out.push(line.to_string());
+            continue;
+        }
+        for mut row in wrap_spaced(line, max_w, &mut width_of) {
             while width_of(&row) > max_w {
                 // The longest prefix of whole clusters that fits, at least one.
                 let ends: Vec<usize> = clusters(&row).iter().scan(0, |n, c| {
@@ -5561,6 +5567,35 @@ fn wrap_lines(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> 
         }
     }
     out
+}
+
+/// `line` broken between words into rows no wider than `max_w`, a word
+/// wider than that on a row of its own. Spaces within a row are kept;
+/// those at a break are dropped.
+fn wrap_spaced(line: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
+    // Pieces: a run of spaces with the word after it (the first piece's
+    // spaces lead the line).
+    let mut cuts = vec![0];
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        if c == ' ' && prev != ' ' {
+            cuts.push(i);
+        }
+        prev = c;
+    }
+    cuts.push(line.len());
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for piece in cuts.windows(2).map(|w| &line[w[0]..w[1]]) {
+        let candidate = format!("{row}{piece}");
+        if row.is_empty() || width_of(&candidate) <= max_w {
+            row = candidate;
+        } else if !piece.trim_start().is_empty() {
+            rows.push(std::mem::replace(&mut row, piece.trim_start().to_string()));
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 /// `text` in at most `max_rows` lines of at most `cols` cells (a wide
@@ -6360,6 +6395,8 @@ mod tests {
         assert!(fits(&lines, 3) && lines.iter().all(|l| l.starts_with('\u{2764}')), "{lines:?}");
         let (lines, _) = wrap(&format!("a{heart}").repeat(5), 3, 2);
         assert_eq!(lines, [format!("a{heart}"), "a\u{2026}".to_string()]);
+        // The ellipsis takes the place of a whole multi-char cluster.
+        assert_eq!(wrap(&heart.repeat(3), 4, 1), (vec![format!("{heart}\u{2026}")], true));
         // A line break in the text starts a row.
         assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
     }
@@ -6375,6 +6412,10 @@ mod tests {
         assert!(lines.iter().all(|l| width(l) <= 100.0), "{lines:?}");
         assert_eq!(lines.concat().replace(' ', ""), text.replace(['\n', ' '], ""), "every character, in order");
         assert_eq!(super::wrap_lines("", 100.0, width), Vec::<String>::new());
+        // A line that fits is kept as is; a wrapped one keeps its spacing
+        // but at its breaks.
+        assert_eq!(super::wrap_lines("  …/a  b.txt", 300.0, width), ["  …/a  b.txt"]);
+        assert_eq!(super::wrap_lines("  ab  cd  ef  gh", 80.0, width), ["  ab  cd", "ef  gh"]);
     }
 
     #[test]
