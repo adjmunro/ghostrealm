@@ -340,7 +340,13 @@ pub fn paint(cx: &mut PaintCx, toast: &Toast, area: Rect, more: usize) -> ToastL
 
     let mut lines = Vec::new();
     for para in toast.message.split('\n') {
-        lines.extend(wrap_words(para, text_w, |t| cx.shape(t, Font::SANS, f32::MAX).width));
+        // A blank line would spend one of the few lines on nothing.
+        lines.extend(
+            wrap_words(para, text_w, |t| cx.shape(t, Font::SANS, f32::MAX).width).into_iter().filter(|l| !l.is_empty()),
+        );
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
     }
     let cut = lines.len() > MAX_LINES;
     if cut {
@@ -645,6 +651,17 @@ mod tests {
         let layout = paint_at(&mut h, &Toast::new(Level::Error, "short"), 400.0, 0, (20.0, 20.0));
         assert_eq!(layout.rect.h, UI.cell_h + 12.0);
         assert!(h.frame.tooltip.is_none());
+    }
+
+    #[test]
+    fn blank_lines_take_no_line_of_the_toast() {
+        let mut h = Harness::new();
+        let toast = Toast::new(Level::Error, "Couldn't open a.txt: denied\n\nUnsaved changes");
+        let layout = paint_at(&mut h, &toast, 400.0, 0, (20.0, 20.0));
+        assert_eq!(layout.rect.h, 2.0 * UI.cell_h + 12.0);
+        // A message that is only blank still shows as one line.
+        let layout = paint_at(&mut h, &Toast::new(Level::Error, "\n"), 400.0, 0, (20.0, 20.0));
+        assert_eq!(layout.rect.h, UI.cell_h + 12.0);
     }
 
     #[test]
