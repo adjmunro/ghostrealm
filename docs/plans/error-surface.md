@@ -538,6 +538,16 @@ Where the build differs from the design above:
     different highlighted file) still picks.
   - The error text is the error capitalised ("Can't save <path>: …"); it
     also goes to stderr.
+- Commit 17:
+  - `PendingArgs` has `error` but no `failed_input`: any edit of the input
+    clears `error` (`PendingArgs::edited`), so "error set" already means
+    "input unchanged". `fail(message)` takes no input; the window keeps the
+    text.
+  - `AppState::run_command_logged` runs and prints to stderr without a
+    toast; the prompt uses it, and `run_command` builds on it. A command
+    that doesn't apply (`CmdError::Inapplicable`) shows inline too.
+  - The error line sits between the input and the hint, in
+    `theme::TOAST_ERROR`.
 
 ## Risks
 

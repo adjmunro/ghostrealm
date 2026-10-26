@@ -31,7 +31,7 @@ use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::config_watch::{self, ConfigWatch};
-use crate::app_state::{build_registry, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
+use crate::app_state::{build_registry, capitalized, AppState, Pick, PICKER_SID, SETTINGS_VTAB_NAME};
 use crate::file_menu::{FileAction, FileTarget, MenuEntry};
 use crate::plugin::paint::{line_quad, push_border, rect_quad, round_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
@@ -751,6 +751,10 @@ struct PendingArgs {
     /// Arguments already known (the file menu's target), passed along with
     /// the collected ones.
     preset: Args,
+    /// Why the last Enter failed: the value didn't parse, or the command
+    /// failed. Shown under the input until it is edited; until then Enter
+    /// does nothing.
+    error: Option<String>,
 }
 
 /// What Enter in the argument prompt does.
@@ -760,17 +764,22 @@ enum ArgStep {
     Next,
     /// Every argument is in: run this command with these arguments.
     Run(String, Args),
-    /// The value didn't parse: the prompt keeps it to be corrected.
+    /// The value didn't parse, or failed and is unchanged: the prompt keeps
+    /// it to be corrected.
     Retry,
 }
 
 impl PendingArgs {
     /// Take `input` as the value of the argument being asked for.
     fn enter(&mut self, input: &str) -> ArgStep {
+        if self.error.is_some() {
+            return ArgStep::Retry;
+        }
         let Some(spec) = self.specs.get(self.values.len()) else {
             return ArgStep::Retry;
         };
         let Some(value) = parse_arg_value(&spec.kind, input) else {
+            self.error = Some(expected(&spec.kind));
             return ArgStep::Retry;
         };
         self.values.push(value);
@@ -782,6 +791,28 @@ impl PendingArgs {
             args.insert(s.name, v.clone());
         }
         ArgStep::Run(self.id.clone(), args)
+    }
+
+    /// The command [`Self::enter`] ran failed with `message`: ask for the
+    /// last argument again, showing why.
+    fn fail(&mut self, message: String) {
+        self.values.pop();
+        self.error = Some(message);
+    }
+
+    /// The input changed: the error no longer applies.
+    fn edited(&mut self) {
+        self.error = None;
+    }
+}
+
+/// What an argument of `kind` takes, for a value that doesn't parse.
+fn expected(kind: &ArgKind) -> String {
+    match kind {
+        ArgKind::Str => "expected text".to_string(),
+        ArgKind::Int => "expected a number".to_string(),
+        ArgKind::Bool => "expected yes or no".to_string(),
+        ArgKind::Enum(vs) => format!("expected one of: {}", vs.join(", ")),
     }
 }
 
@@ -3632,6 +3663,7 @@ impl State {
                     specs,
                     values: Vec::new(),
                     preset,
+                    error: None,
                 }),
             });
         } else {
@@ -3960,13 +3992,25 @@ impl State {
                         Some(ArgStep::Retry) | None => {}
                     }
                 }
+                // Run with the prompt still open: a failure shows in it,
+                // with the value kept to correct.
                 if let Some((id, args)) = run {
-                    self.palette = None;
-                    self.run_command(&id, &args, None);
+                    match self.app.run_command_logged(&mut self.registry, &id, &args) {
+                        Ok(_) => self.palette = None,
+                        Err(e) => {
+                            if let Some(pend) = self.palette.as_mut().and_then(|p| p.pending.as_mut()) {
+                                pend.fail(capitalized(&e.to_string()));
+                            }
+                        }
+                    }
                 }
             }
             _ => {
-                self.palette_edit(event);
+                if self.palette_edit(event) == Applied::Changed {
+                    if let Some(pend) = self.palette.as_mut().and_then(|p| p.pending.as_mut()) {
+                        pend.edited();
+                    }
+                }
             }
         }
         self.dirty = true;
@@ -3991,7 +4035,7 @@ impl State {
                             (s.name.to_string(), s.description.to_string(), kh)
                         })
                         .unwrap_or_default();
-                    (pd.title.clone(), name, desc, kind_hint, idx, pd.specs.len())
+                    (pd.title.clone(), name, desc, kind_hint, idx, pd.specs.len(), pd.error.clone())
                 });
                 (p.input.clone(), p.mode, pend)
             }
@@ -4037,6 +4081,8 @@ impl State {
         let panel_y = sh * 0.12;
         let body_rows = if is_search && n > 0 {
             n.min(PALETTE_VISIBLE)
+        } else if pending.as_ref().is_some_and(|p| p.6.is_some()) {
+            2 // the argument prompt's error and hint
         } else {
             1 // a hint / "no matches" / arg-prompt line
         };
@@ -4096,10 +4142,14 @@ impl State {
         self.palette_rows.clear();
         let mut lines: Vec<Vec<(String, [u8; 3])>> = Vec::new();
 
-        if let Some((title, name, desc, kind_hint, idx, total)) = &pending {
-            // Argument-collection view: input the current argument.
+        if let Some((title, name, desc, kind_hint, idx, total, error)) = &pending {
+            // Argument-collection view: input the current argument, then why
+            // the last Enter failed.
             let prefix = format!("\u{203a} {title} — {name}: ");
             lines.push(vec![(format!("{prefix}{query}"), [235, 235, 245])]);
+            if let Some(error) = error {
+                lines.push(vec![(format!("  {error}"), theme::TOAST_ERROR)]);
+            }
             let more = if idx + 1 < *total {
                 "Enter for next"
             } else {
@@ -5714,6 +5764,7 @@ mod tests {
                 ],
                 values: Vec::new(),
                 preset,
+                error: None,
             }
         }
 
@@ -5723,11 +5774,28 @@ mod tests {
             assert_eq!(p.enter("b.txt"), ArgStep::Next);
             assert_eq!(p.enter("x"), ArgStep::Retry, "not a number");
             assert_eq!(p.values.len(), 1, "the bad value isn't taken");
+            assert_eq!(p.error.as_deref(), Some("expected a number"));
+            assert_eq!(p.enter("3"), ArgStep::Retry, "nothing runs until the input is edited");
+            p.edited();
+            assert_eq!(p.error, None);
             let mut args = Args::new();
             args.insert("path", Value::Str("/tmp/a".into()));
             args.insert("name", Value::Str("b.txt".into()));
             args.insert("count", Value::Int(3));
             assert_eq!(p.enter("3"), ArgStep::Run("cmd".into(), args));
+        }
+
+        #[test]
+        fn a_failed_run_asks_for_the_last_argument_again_with_its_error() {
+            let mut p = pending();
+            p.enter("b.txt");
+            assert!(matches!(p.enter("3"), ArgStep::Run(..)));
+            p.fail("Name taken".into());
+            assert_eq!(p.values.len(), 1, "the same argument is asked again");
+            assert_eq!(p.error.as_deref(), Some("Name taken"));
+            assert_eq!(p.enter("3"), ArgStep::Retry, "unchanged: nothing runs");
+            p.edited();
+            assert!(matches!(p.enter("4"), ArgStep::Run(..)));
         }
 
         #[test]

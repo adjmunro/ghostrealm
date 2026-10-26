@@ -926,13 +926,27 @@ impl AppState {
     ) -> std::result::Result<CmdOutcome, CmdError> {
         // Taken first: the command may close the surface it ran from.
         let scope = self.scope_of(from);
-        let result = registry.execute(id, args, self);
+        let result = self.run_command_logged(registry, id, args);
         if let Err(e) = &result {
-            eprintln!("ghostrealm: {id}: {e}");
             if !matches!(e, CmdError::Inapplicable(_)) {
                 let title = registry.meta(id).map_or(id, |m| m.title);
                 self.notify(Toast::new(Level::Error, format!("{title}: {e}")).on(scope));
             }
+        }
+        result
+    }
+
+    /// Run command `id` from `registry`, printing a failure to stderr only:
+    /// the caller shows it (the argument prompt, inline).
+    pub fn run_command_logged(
+        &mut self,
+        registry: &mut Registry<AppState>,
+        id: &str,
+        args: &ghostrealm_core::Args,
+    ) -> std::result::Result<CmdOutcome, CmdError> {
+        let result = registry.execute(id, args, self);
+        if let Err(e) = &result {
+            eprintln!("ghostrealm: {id}: {e}");
         }
         result
     }
@@ -2201,8 +2215,8 @@ pub fn build_registry() -> Registry<AppState> {
     r
 }
 
-/// `s` with its first letter upper case, to start a toast.
-fn capitalized(s: &str) -> String {
+/// `s` with its first letter upper case, to start a toast or an inline error.
+pub(crate) fn capitalized(s: &str) -> String {
     let mut chars = s.chars();
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
