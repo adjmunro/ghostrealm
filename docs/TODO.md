@@ -1481,3 +1481,26 @@
   Cancel exits. Close the picker instead (`act_on_pick`, `Pick::SaveAs` /
   `Pick::SaveCopy` in `app_state.rs`).
 - Reason: an error no answer can fix should not hold the form open.
+
+---
+
+[2026-10-26T22:50+1300@5bb2c09d] Toasts — the clock may run under a pointer already over the window at launch
+
+- Requires: a desktop check
+- Detail: `pointer_in` (`window.rs`) starts false, so a launch-time toast
+  under a pointer that is already over the window runs its clock until the
+  first `CursorEntered` or `CursorMoved`. Check whether winit sends
+  `CursorEntered` at launch in that case; if not, start from the pointer's
+  real position.
+- Reason: a toast under the pointer should wait to be read.
+
+---
+
+[2026-10-26T22:50+1300@5bb2c09d] Editor — Toggle Comment from the palette without comment syntax shows nothing
+
+- Requires: NO BLOCKERS
+- Detail: In a file whose language has no comment syntax (or an untitled
+  buffer), Toggle Comment is `CmdError::Inapplicable`, which goes to stderr
+  only, so running it from the palette does nothing visible. Consider an
+  info toast for a command the user ran explicitly from the palette.
+- Reason: an explicit request that silently does nothing looks broken.
