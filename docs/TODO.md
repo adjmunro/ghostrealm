@@ -1470,14 +1470,3 @@
 - Detail: `core::config`'s test helper `tmp()` (`config.rs:706`) makes a
   directory per test in the temp dir and never removes it.
 - Reason: test runs shouldn't fill the temp directory.
-
----
-
-[2026-10-26T22:13+1300@462d3daa] Toasts — a `preview_font` warning outlives the fix
-
-- Requires: NO BLOCKERS
-- Detail: The warning that `[editor] preview_font` isn't installed stays
-  queued after the font is installed or the setting changed, until
-  dismissed. Replace it with nothing (dismiss the `preview_font` key) when a
-  config reload finds the font.
-- Reason: a warning about a fixed problem misleads.

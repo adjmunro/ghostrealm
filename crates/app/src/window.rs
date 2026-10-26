@@ -1269,9 +1269,7 @@ impl State {
         if let Some(report) = &config_report {
             app.report_config(report, config_applied);
         }
-        if let Some(message) = missing_font {
-            app.warn_preview_font(message);
-        }
+        app.report_preview_font(missing_font);
         let has_command = command_line.is_some();
         if let Some(line) = command_line {
             app = app.with_shell_line(line);
@@ -1425,11 +1423,8 @@ impl State {
         let serif_changed = serif != self.cfg.editor.preview_font.as_deref();
         if serif_changed {
             let full_db = self.pending_fonts.is_none();
-            if let Some(message) =
-                pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db)
-            {
-                self.app.warn_preview_font(message);
-            }
+            let missing = pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db);
+            self.app.report_preview_font(missing);
         }
         if serif_changed || (cw - self.cell_w).abs() > 0.01 || (ch - self.cell_h).abs() > 0.01 {
             self.cell_w = cw;
@@ -1549,11 +1544,8 @@ impl State {
             db.set_monospace_family(fam.clone());
         }
         self.serif_alias = db.family_name(&Family::Serif).to_owned();
-        if let Some(message) =
-            pin_and_report_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true)
-        {
-            self.app.warn_preview_font(message);
-        }
+        let missing = pin_and_report_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true);
+        self.app.report_preview_font(missing);
         self.text.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
         // Cell metrics should be unchanged (same pinned monospace); re-measure in
         // case the fuller DB resolves the family to a different face.

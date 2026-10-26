@@ -197,6 +197,14 @@ impl Toasts {
         self.queue.len() != before
     }
 
+    /// Remove the toast keyed `key` ([`Toast::key`]). Returns whether one
+    /// was queued.
+    pub fn dismiss_key(&mut self, key: &str) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|e| e.toast.key.as_deref() != Some(key));
+        self.queue.len() != before
+    }
+
     /// Put `toast` in toast `id`'s place, its clock reset. Returns whether
     /// `id` was queued.
     pub fn replace(&mut self, id: u64, toast: Toast) -> bool {
@@ -449,6 +457,16 @@ mod tests {
         assert_eq!(t.len(), 2);
         t.push(Toast::new(Level::Error, "other").on(Scope::Pane(PaneId(3))));
         assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn dismissing_a_key_removes_only_its_toast() {
+        let mut t = Toasts::default();
+        t.push(Toast::new(Level::Error, "a"));
+        t.push(Toast::new(Level::Warning, "font").keyed("preview_font"));
+        assert!(t.dismiss_key("preview_font"));
+        assert_eq!(messages(&t), ["a"]);
+        assert!(!t.dismiss_key("preview_font"));
     }
 
     #[test]

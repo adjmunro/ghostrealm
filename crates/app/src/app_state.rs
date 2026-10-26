@@ -976,8 +976,13 @@ impl AppState {
         any
     }
 
-    /// Warn that `[editor] preview_font` isn't installed (`message` says so).
-    pub fn warn_preview_font(&mut self, message: String) {
+    /// Warn that `[editor] preview_font` isn't installed (`missing` says
+    /// so), or with `None`, withdraw the warning: the font now resolves.
+    pub fn report_preview_font(&mut self, missing: Option<String>) {
+        let Some(message) = missing else {
+            self.toasts.dismiss_key("preview_font");
+            return;
+        };
         let open = ToastAction::OpenSettings { line: None };
         self.notify(Toast::new(Level::Warning, message).keyed("preview_font").with_choice("Open Settings", open));
     }
@@ -2908,12 +2913,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_preview_font_warns_once_per_key() {
+    fn a_missing_preview_font_warns_once_per_key_until_it_resolves() {
         let mut s = AppState::new();
-        s.warn_preview_font("a".into());
-        s.warn_preview_font("b".into());
+        s.report_preview_font(Some("a".into()));
+        s.report_preview_font(Some("b".into()));
         assert_eq!(s.toasts().len(), 1);
         assert_eq!(head(&s), (Level::Warning, "b".into(), Some("preview_font".into())));
+        s.report_preview_font(None);
+        assert!(s.toasts().is_empty());
     }
 
     #[test]
