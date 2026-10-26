@@ -154,7 +154,9 @@ impl Toasts {
         if let Some(e) = self.queue.iter_mut().find(|e| e.toast.replaced_by(&toast)) {
             e.toast = toast;
             e.shown_for = Duration::ZERO;
-            return e.id;
+            let id = e.id;
+            self.restart_clock(id);
+            return id;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -201,7 +203,16 @@ impl Toasts {
         let Some(e) = self.queue.iter_mut().find(|e| e.id == id) else { return false };
         e.toast = toast;
         e.shown_for = Duration::ZERO;
+        self.restart_clock(id);
         true
+    }
+
+    /// Toast `id` has new content: none of the time before it counts, so
+    /// its visible stretch starts at the next tick.
+    fn restart_clock(&mut self, id: u64) {
+        if self.visible_since.is_some_and(|(v, _)| v == id) {
+            self.visible_since = None;
+        }
     }
 
     /// Advance the head's clock to `now`, counting the time since the last
@@ -442,8 +453,30 @@ mod tests {
         t.tick(now, true);
         t.tick(now + secs(3.0), true);
         t.push(Toast::new(Level::Info, "y").keyed("k"));
+        // Its clock starts at the first tick after the replacement.
         assert!(!t.tick(now + secs(4.5), true));
-        assert!(t.tick(now + secs(7.6), true));
+        assert!(!t.tick(now + secs(8.4), true));
+        assert!(t.tick(now + secs(8.6), true));
+    }
+
+    #[test]
+    fn a_replacement_of_the_visible_head_is_not_charged_for_time_before_it() {
+        let mut t = Toasts::default();
+        let now = t0();
+        let id = t.push(Toast::new(Level::Error, "bad config").keyed("config"));
+        t.tick(now, true);
+        // Long after the last tick, the head is replaced.
+        t.push(Toast::new(Level::Success, "Settings applied").keyed("config"));
+        assert!(!t.tick(now + secs(60.0), true));
+        assert!(!t.tick(now + secs(63.9), true));
+        assert!(t.tick(now + secs(64.1), true));
+        // Likewise by id.
+        let id2 = t.push(Toast::new(Level::Error, "x"));
+        assert_ne!(id, id2);
+        t.tick(now + secs(70.0), true);
+        t.replace(id2, Toast::new(Level::Info, "y"));
+        assert!(!t.tick(now + secs(130.0), true));
+        assert!(t.tick(now + secs(134.1), true));
     }
 
     #[test]
