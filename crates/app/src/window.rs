@@ -5487,27 +5487,68 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
-/// `text` in at most `max_rows` lines of at most `cols` cells (a wide
-/// glyph takes two): broken between words, and a word longer than a line
-/// (a deep path) across lines. Returns the lines and whether the text was
-/// cut, its last line then ending in an ellipsis.
-fn wrap_cols(text: &str, cols: usize, max_rows: usize) -> (Vec<String>, bool) {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let cols = cols.max(2);
-    let mut out = Vec::new();
-    for line in wrap_words(text, cols as f32, |t| t.width() as f32) {
-        let (mut row, mut w) = (String::new(), 0);
-        for c in line.chars() {
-            let cw = c.width().unwrap_or(0);
-            if w + cw > cols && !row.is_empty() {
-                out.push(std::mem::take(&mut row));
-                w = 0;
-            }
-            row.push(c);
-            w += cw;
+/// `text` split into clusters a line may break between: a base character
+/// with the zero-width characters after it (combining marks, variation
+/// selectors, joiners) and whatever a zero-width joiner joins on.
+fn clusters(text: &str) -> Vec<&str> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut prev = None;
+    for (i, c) in text.char_indices() {
+        if i > start && c.width() != Some(0) && prev != Some('\u{200D}') {
+            out.push(&text[start..i]);
+            start = i;
         }
-        out.push(row);
+        prev = Some(c);
     }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// `text` broken into lines no wider than `max_w` as `width_of` measures
+/// them: at its own line breaks, then between words, then a word wider
+/// than a line across lines (between [`clusters`]).
+fn wrap_lines(text: &str, max_w: f32, mut width_of: impl FnMut(&str) -> f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for mut row in wrap_words(line, max_w, &mut width_of) {
+            while width_of(&row) > max_w {
+                // The longest prefix of whole clusters that fits, at least one.
+                let ends: Vec<usize> = clusters(&row).iter().scan(0, |n, c| {
+                    *n += c.len();
+                    Some(*n)
+                }).collect();
+                if ends.len() < 2 {
+                    break;
+                }
+                let (mut lo, mut hi) = (1, ends.len() - 1);
+                while lo < hi {
+                    let mid = (lo + hi).div_ceil(2);
+                    if width_of(&row[..ends[mid - 1]]) <= max_w {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                let rest = row.split_off(ends[lo - 1]);
+                out.push(std::mem::replace(&mut row, rest));
+            }
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// `text` in at most `max_rows` lines of at most `cols` cells (a wide
+/// glyph takes two) as [`wrap_lines`] breaks it. Returns the lines and
+/// whether the text was cut, its last line then ending in an ellipsis.
+fn wrap_cols(text: &str, cols: usize, max_rows: usize) -> (Vec<String>, bool) {
+    use unicode_width::UnicodeWidthStr;
+    let cols = cols.max(2);
+    let mut out = wrap_lines(text, cols as f32, |t| t.width() as f32);
     let max_rows = max_rows.max(1);
     if out.len() <= max_rows {
         return (out, false);
@@ -5515,7 +5556,8 @@ fn wrap_cols(text: &str, cols: usize, max_rows: usize) -> (Vec<String>, bool) {
     out.truncate(max_rows);
     let last = out.last_mut().expect("at least one row");
     while last.width() + 1 > cols {
-        last.pop();
+        let keep = clusters(last).iter().rev().skip(1).map(|c| c.len()).sum();
+        last.truncate(keep);
     }
     last.push('\u{2026}');
     (out, true)
@@ -6269,6 +6311,7 @@ mod tests {
 
     #[test]
     fn a_prompt_error_wraps_between_words_and_breaks_a_long_word() {
+        use unicode_width::UnicodeWidthStr;
         let wrap = |t: &str, cols: usize, rows: usize| super::wrap_cols(t, cols, rows);
         assert_eq!(wrap("Name taken", 20, 4), (vec!["Name taken".to_string()], false));
         let (lines, cut) = wrap("Can't create /a/very/deep/path: File exists", 12, 4);
@@ -6277,10 +6320,40 @@ mod tests {
         let (lines, _) = wrap("名前名前名前", 6, 4);
         assert_eq!(lines, ["名前名", "前名前"]);
         // Past the row cap, the last row ends in an ellipsis within the width.
+        let fits = |lines: &[String], cols: usize| lines.iter().all(|l| l.width() <= cols);
         let (lines, cut) = wrap(&"word ".repeat(40), 10, 2);
         assert!(cut);
         assert_eq!(lines.len(), 2);
-        assert!(lines[1].ends_with('\u{2026}') && lines[1].chars().count() <= 10, "{lines:?}");
+        assert!(lines[1].ends_with('\u{2026}') && fits(&lines, 10), "{lines:?}");
+        // A last row filling the width loses its tail to make room.
+        let (lines, cut) = wrap(&"x".repeat(30), 10, 2);
+        assert!(cut);
+        assert_eq!(lines, ["x".repeat(10), format!("{}\u{2026}", "x".repeat(9))]);
+        let (lines, cut) = wrap(&format!("a{}", "名".repeat(20)), 7, 1);
+        assert!(cut);
+        assert_eq!(lines, ["a名名\u{2026}"]);
+        // A heart with its emoji selector is two cells, never split.
+        let heart = "\u{2764}\u{FE0F}";
+        let (lines, cut) = wrap(&heart.repeat(5), 3, 4);
+        assert!(cut);
+        assert!(fits(&lines, 3) && lines.iter().all(|l| l.starts_with('\u{2764}')), "{lines:?}");
+        let (lines, _) = wrap(&format!("a{heart}").repeat(5), 3, 2);
+        assert_eq!(lines, [format!("a{heart}"), "a\u{2026}".to_string()]);
+        // A line break in the text starts a row.
+        assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
+    }
+
+    /// A tooltip breaks at its own line breaks, between words, and across a
+    /// word wider than a line, so none of it runs off screen.
+    #[test]
+    fn tooltip_lines_fit_their_width() {
+        let width = |s: &str| s.chars().count() as f32 * 10.0;
+        let text = "Failed:\nno such file /a/very/long/unbroken/path/that/runs/well/past/one/line ok";
+        let lines = super::wrap_lines(text, 100.0, width);
+        assert_eq!(lines[0], "Failed:");
+        assert!(lines.iter().all(|l| width(l) <= 100.0), "{lines:?}");
+        assert_eq!(lines.concat().replace(' ', ""), text.replace(['\n', ' '], ""), "every character, in order");
+        assert_eq!(super::wrap_lines("", 100.0, width), Vec::<String>::new());
     }
 
     #[test]
