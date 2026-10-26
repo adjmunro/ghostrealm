@@ -230,7 +230,7 @@ impl Plugin for EditorPlugin {
                     .and_then(|d| s.doc_mut(d))
                     .and_then(|v| v.downcast_mut::<EditorView>())
                     .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
-                editor.toggle_comment().map_err(|e| CmdError::Failed(e.into()))?;
+                editor.toggle_comment().map_err(|e| CmdError::Inapplicable(e.into()))?;
                 Ok(CmdOutcome::ok())
             }),
         );

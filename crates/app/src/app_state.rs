@@ -2999,11 +2999,13 @@ mod tests {
         r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap();
         assert_eq!(lines(&s), ["a = 1", "b = 2"]);
 
-        // A file whose language has no comment syntax reports it and stays as it was.
+        // A file whose language has no comment syntax stays as it was, and
+        // the command doesn't apply there (no toast).
         let txt = dir.join("a.txt");
         std::fs::write(&txt, "x").unwrap();
         s.open_file_in_new_surface(&txt).unwrap();
-        assert!(r.execute("editor.toggle_comment", &Args::new(), &mut s).is_err());
+        let err = r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap_err();
+        assert!(matches!(err, CmdError::Inapplicable(_)), "{err:?}");
     }
 
     #[test]
