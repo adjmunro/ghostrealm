@@ -525,6 +525,19 @@ Where the build differs from the design above:
   - `toasts::save_failed(path, e)` gives the text, "Couldn't save <file
     name>: <error>". The editor prints its stderr line before raising the
     request; `toast_request` prints nothing.
+- Commit 16:
+  - `set_error(message, path)` records the path that failed and the
+    answer as it stood (name, selected entry, shown directory, filter).
+    The error shows while that answer is unchanged; arrow keys moving the
+    highlight clear it too, but the pointer moving it doesn't, so reaching
+    for Cancel keeps it. Once the answer changes the error is dropped for
+    good.
+  - `blocks(path)` is true while the error shows and `path` is the one
+    that failed. Enter, a double-click, the confirm button, and
+    `confirm_picker_with` do nothing for that path; another path (a
+    different highlighted file) still picks.
+  - The error text is the error capitalised ("Can't save <path>: …"); it
+    also goes to stderr.
 
 ## Risks
 

@@ -155,6 +155,25 @@ pub enum Mode {
     Save,
 }
 
+/// Why the picker's last answer failed, shown under the listing.
+struct PickError {
+    message: String,
+    /// The path that failed: picking it again does nothing while this shows.
+    path: PathBuf,
+    /// The answer as it stood: changing it clears the error.
+    at: Answer,
+}
+
+/// What the user has set in a picker: the file name, the selected entry,
+/// the shown directory, and the filter.
+#[derive(PartialEq)]
+struct Answer {
+    name: String,
+    chosen: Option<PathBuf>,
+    root: PathBuf,
+    query: String,
+}
+
 /// A row's click target: a real entry (path) or a synthetic category (key).
 #[derive(Clone)]
 struct RowRef {
@@ -215,6 +234,8 @@ pub struct FileBrowserView {
     more_hit: Option<Rect>,
     /// Search mode ([`Mode::Sidebar`] only).
     search: search::Search,
+    /// The picker's failed answer ([`Self::set_error`]).
+    error: Option<PickError>,
 }
 
 impl FileBrowserView {
@@ -240,6 +261,7 @@ impl FileBrowserView {
             field: FieldMouse::default(),
             name_field: FieldMouse::default(),
             search: search::Search::new(None),
+            error: None,
         }
     }
 
@@ -268,6 +290,41 @@ impl FileBrowserView {
     /// Set the file name [`Mode::Save`] saves under.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name.set_text(name);
+    }
+
+    /// Show why picking `path` failed, until the user changes the answer
+    /// (the name, the selection, the shown directory, or the filter). Until
+    /// then, picking `path` again does nothing.
+    pub fn set_error(&mut self, message: impl Into<String>, path: PathBuf) {
+        let at = self.answer();
+        self.error = Some(PickError { message: message.into(), path, at });
+    }
+
+    /// The failed answer's error, while the answer is unchanged.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_ref().filter(|e| e.at == self.answer()).map(|e| e.message.as_str())
+    }
+
+    /// Whether picking `path` now would only repeat the failure that shows.
+    pub fn blocks(&self, path: &Path) -> bool {
+        self.error().is_some() && self.error.as_ref().is_some_and(|e| e.path == path)
+    }
+
+    fn answer(&self) -> Answer {
+        Answer {
+            name: self.name.text().to_string(),
+            chosen: self.chosen.clone(),
+            root: self.tree.root().to_path_buf(),
+            query: self.tree.query().to_string(),
+        }
+    }
+
+    /// Drop an error whose answer has changed, so changing it back doesn't
+    /// bring the error back.
+    fn settle_error(&mut self) {
+        if self.error.is_some() && self.error().is_none() {
+            self.error = None;
+        }
     }
 
     /// Show `path` selected: expand the folders down to it when it is under
@@ -422,13 +479,13 @@ impl FileBrowserView {
                 self.opens += 1;
                 cx.request(Request::OpenFile(path));
             }
-            Mode::PickFile => cx.request(Request::Pick(path)),
+            Mode::PickFile if !self.blocks(&path) => cx.request(Request::Pick(path)),
             Mode::Save => {
-                if let Some(target) = self.choice() {
+                if let Some(target) = self.choice().filter(|t| !self.blocks(t)) {
                     cx.request(Request::Pick(target));
                 }
             }
-            Mode::PickDir => {}
+            Mode::PickFile | Mode::PickDir => {}
         }
     }
 
@@ -446,6 +503,7 @@ impl FileBrowserView {
             }
         } else if k.key == Key::Enter {
             match self.choice() {
+                Some(target) if self.blocks(&target) => {}
                 Some(target) => cx.request(Request::Pick(target)),
                 None => return false,
             }
@@ -473,10 +531,28 @@ impl FileBrowserView {
             w: (row.x + row.w - pad - x).max(1.0),
             h: field_h,
         };
-        field_box(cx, field, cx.focused);
+        field_box(cx, field, cx.focused, self.error().is_some());
         let text = Rect { x: field.x + pad * 0.5, w: (field.w - pad).max(1.0), ..field };
         let geom = widgets::field_text(cx, text, &self.name, "file name", cx.focused);
         self.name_field.painted(cx, geom);
+        h
+    }
+
+    /// The failed answer's error as one row just above `bottom` (the name
+    /// row, else the bottom of `rect`), cut to fit with the whole text as its
+    /// tooltip. Returns its height (0 with no error).
+    fn paint_error(&self, cx: &mut PaintCx, rect: Rect, bottom: f32) -> f32 {
+        let Some(message) = self.error() else { return 0.0 };
+        let ui = cx.ui;
+        let pad = (8.0 * ui.scale).round();
+        let h = row_height(ui);
+        let row = Rect { x: rect.x, y: bottom - h, w: rect.w, h };
+        let avail = (row.w - pad * 2.0).max(1.0);
+        let shown = cx.cut_to_fit(message, Font::SANS, avail);
+        if shown != message {
+            cx.tooltip(row, message);
+        }
+        cx.label(&shown, Font::SANS, row.x + pad, row.y + (h - ui.cell_h) * 0.5, row, theme::TOAST_ERROR);
         h
     }
 
@@ -679,7 +755,7 @@ impl FileBrowserView {
         let typed_into = self.mode != Mode::Save;
         let x = up.x + up.w + (pad * 0.5).round();
         let field = Rect { x, y, w: (more.x - (pad * 0.5).round() - x).max(1.0), h: side };
-        field_box(cx, field, cx.focused && typed_into);
+        field_box(cx, field, cx.focused && typed_into, false);
         let icon_side = (ui.cell_h * 0.8).round();
         let icon = Rect {
             x: field.x + pad,
@@ -774,10 +850,13 @@ impl FileBrowserView {
     }
 }
 
-/// A filter or name field's rounded box: outlined, in the focus colour while
-/// typing goes to it.
-fn field_box(cx: &mut PaintCx, r: Rect, focused: bool) {
-    let border = if focused {
+/// A filter or name field's rounded box: outlined, in the error colour while
+/// its value has failed (`invalid`), else in the focus colour while typing
+/// goes to it.
+fn field_box(cx: &mut PaintCx, r: Rect, focused: bool, invalid: bool) {
+    let border = if invalid {
+        (theme::focus_ring_w(cx.ui), theme::TOAST_ERROR, 1.0)
+    } else if focused {
         (theme::focus_ring_w(cx.ui), theme::FIELD_FOCUS_BORDER, 1.0)
     } else {
         (theme::hairline(cx.ui), theme::INPUT_BORDER, 1.0)
@@ -835,11 +914,13 @@ impl View for FileBrowserView {
         let editable = preview.is_none() && self.mode != Mode::Save;
         let value = preview.unwrap_or_else(|| self.input.clone());
         let header_h = self.paint_header(cx, rect, &value, editable);
-        let footer_h = if self.mode == Mode::Save {
+        self.settle_error();
+        let name_h = if self.mode == Mode::Save {
             self.paint_name_field(cx, rect)
         } else {
             0.0
         };
+        let footer_h = name_h + self.paint_error(cx, rect, rect.y + rect.h - name_h);
 
         let body = Rect {
             x: rect.x,
@@ -921,6 +1002,7 @@ impl View for FileBrowserView {
     /// a directory is the answer there, so Enter picks it and the arrows and Tab
     /// move between directories.
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
+        self.settle_error();
         if self.mode == Mode::Save {
             return self.save_key(cx, k);
         }
@@ -944,6 +1026,7 @@ impl View for FileBrowserView {
             Key::Tab if pick_dir && plain && !path_mode => self.enter_highlighted_dir(),
             Key::Left | Key::Backspace if pick_dir && plain && browsing => self.leave_dir(),
             Key::Down | Key::Up | Key::Tab if !m.super_ => {
+                self.error = None;
                 let delta = if k.key == Key::Up { -1 } else { 1 };
                 if path_mode {
                     let n = self.tree.completions().len();
@@ -1011,6 +1094,7 @@ impl View for FileBrowserView {
         if event.is_other_button() {
             return;
         }
+        self.settle_error();
         let extend = cx.mods.shift;
         if self.field.event(&mut self.input, event, extend) || self.name_field.event(&mut self.name, event, extend) {
             cx.redraw();
@@ -1929,6 +2013,45 @@ mod tests {
         assert_eq!(v.choice(), Some(d.join("new.md")), "a file's own dir; the name stays");
         h.key(&mut v, press(Key::Up));
         assert_eq!(v.sel, Some(0));
+    }
+
+    #[test]
+    fn a_failed_save_shows_its_error_until_the_name_changes() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        v.set_name("new.md");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        v.set_error("Can't save: denied", d.join("new.md"));
+        h.paint(&mut v, RECT);
+        assert!(h.texts().iter().any(|t| t == "Can't save: denied"), "{:?}", h.texts());
+        assert!(v.blocks(&d.join("new.md")) && !v.blocks(&d.join("other.md")));
+        let (used, out) = h.key(&mut v, press(Key::Enter));
+        assert!(used && out.requests.is_empty(), "the same answer isn't tried again");
+        // Typing clears it, and changing the name back doesn't bring it back.
+        h.key(&mut v, press(Key::Char('x')));
+        h.key(&mut v, press(Key::Backspace));
+        assert_eq!(v.error(), None);
+        h.paint(&mut v, RECT);
+        assert!(!h.texts().iter().any(|t| t.contains("denied")));
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(out.requests, vec![Request::Pick(d.join("new.md"))]);
+    }
+
+    #[test]
+    fn a_file_that_would_not_open_shows_its_error_under_the_listing() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let file = d.join("b.txt");
+        v.set_error("Can't edit b.txt: not text", file.clone());
+        h.paint(&mut v, RECT);
+        assert!(h.texts().iter().any(|t| t == "Can't edit b.txt: not text"));
+        assert!(v.blocks(&file));
+        // Moving the highlight clears it.
+        h.key(&mut v, press(Key::Down));
+        assert_eq!(v.error(), None);
     }
 
     #[test]

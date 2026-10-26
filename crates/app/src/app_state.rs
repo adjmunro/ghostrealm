@@ -1052,9 +1052,9 @@ impl AppState {
         true
     }
 
-    /// Confirm the picker with its browser's choice, then close it. With no
-    /// choice yet (a file picker with nothing selected), it stays open.
-    /// Returns the file written, if any.
+    /// Confirm the picker with its browser's choice ([`Self::confirm_picker_with`]).
+    /// With no choice yet (a file picker with nothing selected), it stays
+    /// open. Returns the file written, if any.
     pub fn confirm_picker(&mut self) -> Result<Option<std::path::PathBuf>> {
         match self.picker.as_mut().and_then(|(b, _)| b.choice()) {
             Some(path) => self.confirm_picker_with(path),
@@ -1062,13 +1062,18 @@ impl AppState {
         }
     }
 
-    /// Close the picker and act on `path` per its purpose. Saving over another
-    /// existing file asks first ([`Self::confirm`]) and leaves the picker open.
-    /// Returns the file written, if any.
+    /// Act on `path` per the picker's purpose, then close it. Saving over
+    /// another existing file asks first ([`Self::confirm`]) and leaves the
+    /// picker open; so does a failure, with its error in the picker
+    /// ([`Self::finish_picker`]), and picking the path that failed again
+    /// does nothing. Returns the file written, if any.
     pub fn confirm_picker_with(
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
+        if self.picker.as_ref().is_some_and(|(b, _)| b.blocks(&path)) {
+            return Ok(None);
+        }
         if let Some((_, Pick::SaveAs(doc) | Pick::SaveCopy(doc))) = &self.picker {
             let own = self.doc(*doc).and_then(|v| v.path());
             let copy = matches!(self.picker, Some((_, Pick::SaveCopy(_))));
@@ -1088,11 +1093,29 @@ impl AppState {
         self.finish_picker(path)
     }
 
-    /// Close the picker and act on `path` per its purpose.
+    /// Act on `path` per the picker's purpose, then close it. On failure the
+    /// picker stays open with the error under its listing.
     fn finish_picker(&mut self, path: std::path::PathBuf) -> Result<Option<std::path::PathBuf>> {
-        let Some((_, purpose)) = self.picker.take() else {
+        let Some(&(_, purpose)) = self.picker.as_ref() else {
             return Ok(None);
         };
+        match self.act_on_pick(purpose, path.clone()) {
+            Ok(written) => {
+                self.picker = None;
+                Ok(written)
+            }
+            Err(e) => {
+                eprintln!("ghostrealm: picker: {e:#}");
+                if let Some((browser, _)) = self.picker.as_mut() {
+                    browser.set_error(capitalized(&format!("{e:#}")), path);
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Act on `path` per `purpose`. Returns the file written, if any.
+    fn act_on_pick(&mut self, purpose: Pick, path: std::path::PathBuf) -> Result<Option<std::path::PathBuf>> {
         match purpose {
             Pick::ActiveRoot => self.set_active_root_dir(path),
             Pick::NewWorkspace => {
@@ -2657,6 +2680,84 @@ mod tests {
         let sid = s.focused_surface().unwrap();
         let ed = s.editor(sid).unwrap();
         assert_eq!(ed.buffer().path.as_deref(), Some(file.as_path()));
+    }
+
+    fn set_writable(path: &Path, on: bool) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(!on);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn picker_error(s: &AppState) -> Option<String> {
+        s.picker().and_then(|b| b.error()).map(str::to_string)
+    }
+
+    #[test]
+    fn a_failed_save_as_keeps_the_picker_open_with_its_error() {
+        let dir = crate::plugin::testing::tmpdir("picker-save-fails");
+        let ro = dir.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let (mut s, sid, _) = edited(&dir, "a.txt");
+        s.open_save_as(sid);
+        s.picker_mut().unwrap().set_name("ro/new.txt");
+        set_writable(&ro, false);
+        assert_eq!(s.confirm_picker().unwrap(), None);
+        set_writable(&ro, true);
+        assert!(s.picker_open());
+        let e = picker_error(&s).expect("the error shows in the picker");
+        assert!(e.starts_with(&format!("Can't save {}: ", ro.join("new.txt").display())), "{e}");
+        assert!(s.toasts().is_empty(), "inline, not a toast");
+        // The same answer isn't tried again, though it would work now.
+        assert_eq!(s.confirm_picker().unwrap(), None);
+        assert!(!ro.join("new.txt").exists());
+        // A changed name saves.
+        s.picker_mut().unwrap().set_name("new.txt");
+        assert_eq!(picker_error(&s), None);
+        assert_eq!(s.confirm_picker().unwrap(), Some(dir.join("new.txt")));
+        assert!(!s.picker_open());
+
+        // Cancel closes it with the error showing.
+        let (mut s, sid, _) = edited(&dir, "b.txt");
+        s.open_save_as(sid);
+        let target = dir.join("missing").join("x.txt");
+        std::fs::write(dir.join("missing"), "a file, not a folder").unwrap();
+        s.confirm_picker_with(target).unwrap();
+        assert!(picker_error(&s).is_some());
+        s.close_picker();
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn a_failed_replace_shows_its_error_in_the_picker() {
+        let dir = crate::plugin::testing::tmpdir("picker-replace-fails");
+        let (mut s, sid, _) = edited(&dir, "a.txt");
+        let theirs = dir.join("theirs.txt");
+        std::fs::write(&theirs, "keep\n").unwrap();
+        set_writable(&theirs, false);
+        s.open_save_as(sid);
+        s.confirm_picker_with(theirs.clone()).unwrap();
+        assert_eq!(s.confirm().and_then(|c| c.accept), Some("Replace"));
+        assert_eq!(s.accept_confirm().unwrap(), Vec::<std::path::PathBuf>::new());
+        assert!(s.confirm().is_none(), "the question closes");
+        assert!(s.picker_open());
+        assert!(picker_error(&s).is_some_and(|e| e.starts_with("Can't save ")));
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "keep\n");
+        assert!(s.view(sid).unwrap().modified());
+    }
+
+    #[test]
+    fn a_file_that_wont_open_keeps_the_open_picker_with_its_error() {
+        let mut s = AppState::new();
+        let dir = crate::plugin::testing::tmpdir("picker-open-binary");
+        let file = dir.join("latin1.txt");
+        std::fs::write(&file, b"caf\xe9").unwrap();
+        s.set_default_dir(Some(dir));
+        s.new_empty_vtab();
+        s.open_picker(Pick::Open);
+        assert_eq!(s.confirm_picker_with(file.clone()).unwrap(), None);
+        assert!(s.picker_open());
+        assert!(picker_error(&s).is_some_and(|e| e.contains("latin1.txt")), "{:?}", picker_error(&s));
+        assert!(s.toasts().is_empty());
     }
 
     #[test]

@@ -2975,8 +2975,10 @@ impl State {
         };
         view.paint(&mut cx, body);
         // Read after painting: a paint drops a selection that is no longer listed.
-        // With nothing chosen yet, the confirm button shows but is inert.
+        // With nothing chosen yet, or the choice that just failed, the confirm
+        // button shows but is inert.
         let choice = view.choice();
+        let can_confirm = choice.as_ref().is_some_and(|p| !view.blocks(p));
         let verb = match purpose {
             Pick::Open => "Open",
             Pick::SaveAs(_) | Pick::SaveCopy(_) if choice.as_ref().is_some_and(|p| p.exists()) => "Replace",
@@ -2998,7 +3000,7 @@ impl State {
         ] {
             let w = label.chars().count() as f32 * ui.cell_w;
             let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
-            let live = !primary || choice.is_some();
+            let live = !primary || can_confirm;
             let hov = live && cx.hovered(hit);
             if primary {
                 cx.fill_alpha(hit, cx.chrome.accent, if live { 0.5 } else { 0.15 });
