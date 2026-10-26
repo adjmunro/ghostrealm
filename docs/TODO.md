@@ -1533,3 +1533,29 @@
   break a too-long word, or cut for the ellipsis, inside one. Proper
   grapheme segmentation fixes it.
 - Reason: a split flag or skin tone draws as two wrong glyphs.
+
+---
+
+[2026-10-26T23:12+1300@1947ee37] Window — tooltip cache invalidation is untested
+
+- Requires: NO BLOCKERS
+- Detail: `a_tooltip_rewraps_when_its_text_width_rows_or_metrics_change`
+  (`crates/app/src/window.rs`) only checks that `tooltip_key` distinguishes
+  its inputs. Nothing checks that `apply_config` (font_size change) and
+  `upgrade_fonts` bump `metrics_gen`, or that the window passes `metrics_gen`
+  to `tooltip_key`. Needs a test that does not require a GPU surface, e.g.
+  pulling the metrics-change decision into a pure function.
+- Reason: dropping a `metrics_gen` bump would leave a held tooltip wrapped for
+  old font metrics with every test green.
+
+---
+
+[2026-10-26T23:12+1300@1947ee37] Window — `metrics_gen` follows the monospace cell only
+
+- Requires: NO BLOCKERS
+- Detail: `apply_config` (`crates/app/src/window.rs`, ~line 1448) bumps
+  `metrics_gen` only when the preview serif changes or the mono cell `cw`/`ch`
+  moves by more than 0.01 px. Tooltips shape in SansSerif. A future option
+  that changes the UI/sans font without changing the mono cell would leave
+  cached tooltip rows stale.
+- Reason: keep the tooltip cache correct if UI font options are added.
