@@ -2806,9 +2806,9 @@ mod tests {
     }
 
     #[test]
-    fn an_open_settings_choice_opens_the_file_and_goes() {
+    fn an_open_settings_choice_opens_the_file_at_its_line_and_goes() {
         let path = crate::plugin::testing::tmpdir("toast-settings").join("config.toml");
-        std::fs::write(&path, "a = 1\nb = 2\n").unwrap();
+        std::fs::write(&path, "a = 1\nb = 2\nc = 3\n").unwrap();
         let mut s = AppState::new();
         let id = s.notify(
             Toast::new(Level::Warning, "config.toml line 2: unknown key")
@@ -2818,6 +2818,8 @@ mod tests {
         s.choose_toast_with(id, 0, || Some(path.clone()));
         let sid = s.focused_surface().expect("the settings file is focused");
         assert_eq!(s.editor(sid).and_then(|e| e.path()), Some(path));
+        // Line 2 (1-based) is index 1.
+        assert_eq!(s.editor(sid).unwrap().buffer().cursor, (1, 0));
         assert!(s.toasts().is_empty());
     }
 

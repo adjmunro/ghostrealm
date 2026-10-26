@@ -628,6 +628,17 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_toast_clears_the_floating_sidebar_toggle() {
+        let panes = [pane(1, 200.0, 28.0, 400.0, 600.0, 0.0), pane(2, 606.0, 28.0, 394.0, 600.0, STRIP)];
+        let toggle = Rect { x: 200.0, y: 28.0, w: 24.0, h: 24.0 };
+        let r = place(Scope::Pane(PaneId(1)), &area(&panes, Some(toggle)));
+        assert_eq!((r.x, r.y, r.x + r.w), (230.0, 34.0, 594.0));
+        // The pane beside it is clear of the toggle.
+        let r = place(Scope::Pane(PaneId(2)), &area(&panes, Some(toggle)));
+        assert_eq!((r.x, r.x + r.w), (612.0, 994.0));
+    }
+
+    #[test]
     fn a_narrow_or_missing_pane_falls_back_to_the_workspace() {
         let panes = [pane(1, 200.0, 28.0, 100.0, 600.0, STRIP), pane(2, 306.0, 28.0, 694.0, 600.0, STRIP)];
         let app = place(Scope::App, &area(&panes, None));

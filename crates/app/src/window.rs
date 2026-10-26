@@ -6053,8 +6053,6 @@ mod tests {
         assert!(flag.get());
     }
 
-    /// A confirmation's message is drawn as lines that each fit the panel, so
-    /// none of it (such as the warning that a buffer would be lost) is cut off.
     #[test]
     fn the_toast_pass_follows_the_top_layer_and_precedes_the_menu() {
         assert_eq!(pass_ranges(3, 2, 4, 1), [0..3, 3..5, 5..9, 9..10]);
@@ -6064,6 +6062,8 @@ mod tests {
         assert_eq!((bg, menu), (0..3, 3..5));
     }
 
+    /// A confirmation's message is drawn as lines that each fit the panel, so
+    /// none of it (such as the warning that a buffer would be lost) is cut off.
     #[test]
     fn a_message_breaks_into_lines_that_fit() {
         let width = |s: &str| s.chars().count() as f32 * 10.0;
