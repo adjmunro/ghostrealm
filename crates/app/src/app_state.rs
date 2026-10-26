@@ -976,6 +976,11 @@ impl AppState {
         any
     }
 
+    /// `path` was written: a toast about a failed write of it goes.
+    pub fn file_saved(&mut self, path: &Path) {
+        self.toasts.dismiss_key(&toasts::save_key(path));
+    }
+
     /// Warn that `[editor] preview_font` isn't installed (`missing` says
     /// so), or with `None`, withdraw the warning: the font now resolves.
     pub fn report_preview_font(&mut self, missing: Option<String>) {
@@ -1008,11 +1013,14 @@ impl AppState {
         let Some(entry) = self.toasts.get(id) else { return };
         let Some((_, action)) = entry.toast.choices.get(i).cloned() else { return };
         match action {
+            // The toast stays until the save succeeds ([`Self::file_saved`]):
+            // a cancelled picker leaves the document unsaved.
             ToastAction::SaveAs(doc) => {
                 if self.doc(doc).is_some() {
                     self.open_save_dialog(doc, Pick::SaveAs(doc));
+                } else {
+                    self.toasts.dismiss(id);
                 }
-                self.toasts.dismiss(id);
             }
             ToastAction::OpenSettings { line } => {
                 match self.try_open_settings(settings()) {
@@ -1142,10 +1150,12 @@ impl AppState {
             }
             Pick::Open => self.open_file(&path)?,
             Pick::SaveAs(doc) => {
-                self.doc_mut(doc)
-                    .ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?
-                    .save_as(path.clone())
-                    .with_context(|| can_t_save(&path))?;
+                let view = self.doc_mut(doc).ok_or_else(|| anyhow::anyhow!("the view to save has closed"))?;
+                let old = view.path();
+                view.save_as(path.clone()).with_context(|| can_t_save(&path))?;
+                for p in old.iter().chain([&path]) {
+                    self.file_saved(p);
+                }
                 if let Some(t) = self.views.get(&doc.0).and_then(|v| v.title()) {
                     self.tree.set_surface_title(doc.0, t, false);
                 }
@@ -1224,11 +1234,15 @@ impl AppState {
     fn autosave_all_with_config(&mut self, cfg: &Config, config_path: Option<&Path>) -> bool {
         let mut saved_config = false;
         let mut failed = Vec::new();
+        let mut written = Vec::new();
         for (&sid, view) in self.views.iter_mut() {
             for doc in view.docs() {
                 let Some(d) = view.document_mut(doc) else { continue };
                 match d.autosave(cfg) {
-                    Ok(Some(path)) => saved_config |= config_path.is_some_and(|c| same_file(c, &path)),
+                    Ok(Some(path)) => {
+                        saved_config |= config_path.is_some_and(|c| same_file(c, &path));
+                        written.push(path);
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         let path = d.path().unwrap_or_default();
@@ -1238,11 +1252,14 @@ impl AppState {
                 }
             }
         }
+        for path in written {
+            self.file_saved(&path);
+        }
         for ((sid, doc), path, e) in failed {
             let req = Request::Toast {
                 level: Level::Error,
                 message: toasts::save_failed(&path, &e),
-                key: Some(format!("autosave:{}", path.display())),
+                key: Some(toasts::save_key(&path)),
                 choices: vec![ToastChoice::SaveAs],
                 doc: Some(doc),
             };
@@ -1647,6 +1664,7 @@ impl AppState {
                 req @ Request::Toast { .. } => {
                     self.toast_request(sid, req);
                 }
+                Request::Saved(path) => self.file_saved(&path),
                 Request::OpenFile(path) => {
                     let _ = self.open_file_from(sid, &path);
                 }
@@ -2791,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_save_as_choice_opens_the_picker_for_its_document_and_goes() {
+    fn a_save_as_choice_opens_the_picker_for_its_document_and_stays() {
         let dir = crate::plugin::testing::tmpdir("toast-save-as");
         let file = dir.join("a.txt");
         std::fs::write(&file, "x").unwrap();
@@ -2802,7 +2820,7 @@ mod tests {
         let id = s.notify(Toast::new(Level::Error, "Couldn't save a.txt").with_choice("Save As…", ToastAction::SaveAs(doc)));
         s.choose_toast(id, 0);
         assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(doc)));
-        assert!(s.toasts().is_empty());
+        assert_eq!(s.toasts().len(), 1, "until the save succeeds");
     }
 
     #[test]
@@ -3684,7 +3702,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_autosave_on_blur_or_quit_toasts_once_on_its_pane() {
+    fn a_failed_save_or_autosave_toasts_once_on_its_pane_until_a_save_succeeds() {
         let dir = crate::plugin::testing::tmpdir("autosave-toast");
         let (mut s, sid, file) = edited(&dir, "a.txt");
         make_read_only(&file);
@@ -3696,11 +3714,33 @@ mod tests {
             assert_eq!(s.toasts().len(), 1, "a repeat replaces it");
             let toast = &s.toasts().head().unwrap().toast;
             assert_eq!((toast.level, toast.scope), (Level::Error, Scope::Pane(pane)));
-            assert_eq!(toast.key, Some(format!("autosave:{}", file.display())));
+            assert_eq!(toast.key, Some(toasts::save_key(&file)));
             assert!(toast.message.starts_with("Couldn't save a.txt: "), "{}", toast.message);
             assert_eq!(toast.choices, vec![("Save As\u{2026}".to_string(), ToastAction::SaveAs(doc))]);
         }
         assert!(s.view(sid).unwrap().modified());
+        // Cmd+S failing too replaces the same toast.
+        assert!(s.send_key_to_focused(&cmd(Key::Char('s'))));
+        assert_eq!(s.toasts().len(), 1, "one toast for the file");
+        // A save that succeeds dismisses it.
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&file, perms).unwrap();
+        assert!(s.send_key_to_focused(&cmd(Key::Char('s'))));
+        assert!(!s.view(sid).unwrap().modified());
+        assert!(s.toasts().is_empty());
+        // So does an autosave that succeeds.
+        make_read_only(&file);
+        edit_doc(&mut s, doc);
+        s.autosave_all(&cfg);
+        assert_eq!(s.toasts().len(), 1);
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&file, perms).unwrap();
+        s.autosave_all(&cfg);
+        assert!(s.toasts().is_empty());
     }
 
     #[test]
@@ -3735,6 +3775,13 @@ mod tests {
         let id = s.toast_request(sid, req).unwrap();
         s.choose_toast(id, 0);
         assert_eq!(s.picker_purpose(), Some(Pick::SaveAs((sid, a))));
+        // Cancelling the picker leaves the toast: the document is unsaved.
+        s.close_picker();
+        assert_eq!(s.toasts().len(), 1);
+        // Saving it elsewhere dismisses it.
+        s.choose_toast(id, 0);
+        s.confirm_picker_with(dir.join("c.txt")).unwrap();
+        assert_eq!(s.doc((sid, a)).unwrap().path(), Some(dir.join("c.txt")));
         assert!(s.toasts().is_empty());
     }
 

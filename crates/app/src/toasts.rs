@@ -122,6 +122,12 @@ pub fn save_failed(path: &Path, e: &anyhow::Error) -> String {
     format!("Couldn't save {name}: {e:#}")
 }
 
+/// The key of the toast for a failed write of `path`: a save and an
+/// autosave of one file share it, and a successful write of it dismisses it.
+pub fn save_key(path: &Path) -> String {
+    format!("save:{}", path.display())
+}
+
 /// A queued toast.
 #[derive(Debug)]
 pub struct Entry {

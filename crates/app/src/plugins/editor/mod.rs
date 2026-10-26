@@ -649,7 +649,7 @@ impl EditorView {
     }
 
     /// [`Self::save_if_modified`], reporting the file written to the app and a
-    /// failure in a toast keyed `autosave:<path>`.
+    /// failure in a toast ([`toasts::save_key`]).
     fn autosave_now(&mut self, cx: &mut EventCx) {
         match self.save_if_modified() {
             Ok(Some(path)) => cx.request(Request::Saved(path)),
@@ -658,15 +658,16 @@ impl EditorView {
         }
     }
 
-    /// Report a failed write of the buffer's file, on stderr and in an error
-    /// toast keyed `<kind>:<path>` (so repeats replace it) offering Save As.
+    /// Report a failed `kind` of write of the buffer's file, on stderr and in
+    /// an error toast keyed by its path ([`toasts::save_key`]: repeats of
+    /// either kind replace it) offering Save As.
     fn save_failed(&self, cx: &mut EventCx, kind: &str, e: &anyhow::Error) {
         let path = self.buf.path.as_deref().unwrap_or(Path::new(""));
         eprintln!("ghostrealm: {kind} {}: {e:#}", path.display());
         cx.request(Request::Toast {
             level: Level::Error,
             message: toasts::save_failed(path, e),
-            key: Some(format!("{kind}:{}", path.display())),
+            key: Some(toasts::save_key(path)),
             choices: vec![ToastChoice::SaveAs],
             doc: None,
         });
@@ -2756,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_save_or_autosave_raises_a_keyed_toast_and_keeps_the_edits() {
+    fn a_failed_save_or_autosave_raises_one_keyed_toast_and_keeps_the_edits() {
         let path = tmpdir("editor-save-toast").join("f.txt");
         std::fs::write(&path, "disk\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
@@ -2764,11 +2765,11 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();
-        let toast = |kind: &str, out: crate::plugin::Outcome| match &out.requests[..] {
+        let toast = |out: crate::plugin::Outcome| match &out.requests[..] {
             [Request::Toast { level, message, key, choices, doc }] => {
                 assert_eq!(*level, Level::Error);
                 assert!(message.starts_with("Couldn't save f.txt: "), "{message}");
-                assert_eq!(key.as_deref(), Some(format!("{kind}:{}", path.display()).as_str()));
+                assert_eq!(key.as_deref(), Some(toasts::save_key(&path).as_str()), "one key for both");
                 assert_eq!(choices, &[ToastChoice::SaveAs]);
                 assert_eq!(*doc, None, "the host names the document");
             }
@@ -2777,9 +2778,9 @@ mod tests {
         let h = Harness::new();
         let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
         assert!(used);
-        toast("save", out);
+        toast(out);
         assert!(v.modified());
-        toast("autosave", h.focus(&mut v, false));
+        toast(h.focus(&mut v, false));
         assert!(v.modified());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk\n");
     }
