@@ -437,14 +437,15 @@ the path that failed meanwhile.
 - Toasts: `Request::Toast { level, message, key, choices, doc }` queues a
   toast on the view's pane (`toasts::Level`: info, success, warning,
   error). A `key` replaces the queued toast with the same key, so a failure
-  that repeats (an autosave each idle tick) leaves one; without one, the
+  that repeats (an autosave after each pause in typing) leaves one; without one, the
   same pane and message replace it. `choices` are `ToastChoice`s the app
   runs itself (`SaveAs`: the Save As picker for the document), so the view
   names no button ids. Leave `doc` `None`: a view hosting documents passes
   each call to one through `EventCx::with_doc(id, ...)`, which fills in that
   document's `DocId`, so a choice acts on the document that failed whichever
   shows by then (`FilesView` does for focus, input, and every document's
-  `tick`). A failed save's text is `toasts::save_failed(path, e)`; print
+  `tick`). A failed save's text is `toasts::save_failed(path, e)` and its key
+  `toasts::save_key(path)`, which `Request::Saved(path)` dismisses; print
   your own stderr line, as the app doesn't. Failures in a form the view
   draws show inline instead.
 - View menu: `Request::Menu { items, at, align }` opens a menu of the view's
