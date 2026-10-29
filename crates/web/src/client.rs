@@ -821,22 +821,27 @@ mod tests {
             js: "x".repeat(1000),
             gesture: false,
         };
+        // More than a pipe holds: once the writer thread takes it, it is
+        // stuck on that write for good, and takes nothing more from the
+        // queue (otherwise it may first run after the loop below and take
+        // the whole queue).
+        let huge = Request::Eval { id: 1, req: 0, js: "x".repeat(4 << 20), gesture: false };
+        assert!(host.send(&huge));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !host.outbox.0.lock().unwrap().queue.is_empty() {
+            assert!(Instant::now() < until, "the writer never took the first request");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let start = Instant::now();
-        // Far more than the pipe holds.
+        // Far more than the queue holds.
         for i in 0..5_000 {
-            assert!(host.send(&key) || i > 100, "refused before the pipe could fill");
+            assert!(host.send(&key) || i > 100, "refused before the queue could fill");
             host.send(&mouse(i, MouseAction::Move));
         }
         assert!(start.elapsed() < Duration::from_secs(2), "send blocked");
-        // A full queue refuses requests. The writer thread may first run
-        // after the loop and take the whole queue, more than the pipe holds:
-        // it is then stuck on that write, and the queue fills once more.
-        let until = Instant::now() + Duration::from_secs(2);
-        while host.send(&key) {
-            assert!(Instant::now() < until, "the queue never filled");
-        }
         let queued = host.outbox.0.lock().unwrap().queue.len();
-        assert!(queued <= OUTBOX_MAX, "the queue stays bounded: {queued}");
+        assert_eq!(queued, OUTBOX_MAX, "the queue stays bounded");
+        assert!(!host.send(&key), "a full queue refuses requests");
         assert!(host.send(&mouse(0, MouseAction::Wheel { dx: 0, dy: 1 })), "wheel steps are dropped");
         assert!(host.send(&mouse(7, MouseAction::Move)), "moves are dropped or coalesced");
         let pid = host.pid().unwrap();
