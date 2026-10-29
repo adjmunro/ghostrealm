@@ -1464,15 +1464,6 @@
 
 ---
 
-[2026-10-26T22:13+1300@462d3daa] Core — config tests leave their temp dirs behind
-
-- Requires: NO BLOCKERS
-- Detail: `core::config`'s test helper `tmp()` (`config.rs:706`) makes a
-  directory per test in the temp dir and never removes it.
-- Reason: test runs shouldn't fill the temp directory.
-
----
-
 [2026-10-26T22:32+1300@b11e6ef3] Picker — Save As for a closed document can only be cancelled
 
 - Requires: NO BLOCKERS
