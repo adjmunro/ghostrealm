@@ -8,12 +8,13 @@ ninja = "1.13.2"
 # app looks for it. Always build with `--features bundle` so cef isn't rebuilt
 # when switching between the host and the bundler.
 # It ends with clean-stale: a changed CEF build leaves the old ~600 MB
-# download behind.
+# download behind. Not with CARGO_TARGET_DIR set: that dir may be shared with
+# other workspaces, whose units clean-stale would take for unlisted ones.
 [tasks.web]
 run = [
     "cargo build -p ghostrealm-web-host --features bundle --bins",
     "cargo run -p ghostrealm-web-host --features bundle --bin ghostrealm-web-bundle",
-    "mise run clean-stale",
+    'if [ -z "${CARGO_TARGET_DIR:-}" ]; then mise run clean-stale; else echo "CARGO_TARGET_DIR is set; clean-stale skipped"; fi',
 ]
 
 # Remove build artifacts that a newer build superseded (Cargo never does).
