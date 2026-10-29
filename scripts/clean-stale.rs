@@ -57,9 +57,11 @@
 //!   once 5 minutes old while no web host runs.
 //!
 //! The target dir given (or `target`) is never emptied, and temp-dir
-//! entries of other users are not touched. Emptying keeps a target's
-//! `CACHEDIR.TAG` and Cargo's lock files, so a build queued on a lock while
-//! it is emptied still excludes the next.
+//! entries of other users are not touched. Emptying holds the `debug` and
+//! `release` locks (creating them) and keeps `CACHEDIR.TAG` and those lock
+//! files, so a build queued on a lock while it is emptied still excludes the
+//! next. Any other dir in it with lock files (a custom profile's or a target
+//! triple's) is kept whole.
 //!
 //! Idle means `--idle-hours` (default 2) have passed since anything was
 //! built in the target dir or any executable in it was run (by its access
@@ -68,17 +70,16 @@
 //! re-runs tests without compiling, so a filesystem mounted `noatime` makes
 //! such a worktree look idle; raise `--idle-hours` there.
 //!
-//! What runs is read from the kernel (`proc_pidpath` on macOS,
-//! `/proc/<pid>/exe` on Linux) just before each emptying it guards, and
-//! once for the temp dir, whose entry ages are measured to that reading. A
-//! process whose path can't be read counts as another user's only when its
-//! owner is read (`sysctl` `KERN_PROC_PID`, `/proc/<pid>/status`) and
+//! What runs is read from the kernel on macOS (`proc_pidpath`) just before
+//! each emptying it guards, and once for the temp dir, whose entry ages are
+//! measured to that reading. A process whose path can't be read counts as
+//! another user's only when its owner is read (`sysctl` `KERN_PROC_PID`) and
 //! differs, or it is gone. Every target dir counts as in use, and a web host
-//! as running, if the process list can't be read, lacks this process, or
-//! is of a nested pid namespace, if this process's own owner can't be read,
-//! or if any other process may be this user's and has no readable path; on
-//! other systems likewise. A path that can't be removed is reported and the
-//! exit status is 1.
+//! as running, if the process list can't be read or lacks this process, if
+//! this process's own owner can't be read, or if any other process may be
+//! this user's and has no readable path. Other systems don't read what runs,
+//! so there `--all` empties no target dir and removes nothing from the temp
+//! dir. A path that can't be removed is reported and the exit status is 1.
 //!
 //! Run it from the repo root with `mise run clean-stale [-- --dry-run]` (or
 //! `mise run clean-all`), or build it with
@@ -93,6 +94,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+#[cfg(target_os = "macos")]
 use std::os::raw::c_int;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -263,6 +265,9 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
         let dir = target.join(profile);
         if dir.is_dir() {
             let t = clean_profile(&dir, lock, opts);
+            if t.units == 0 {
+                continue;
+            }
             println!(
                 "{}: {} of {} units superseded; {} {}",
                 dir.display(),
@@ -285,15 +290,17 @@ struct BuildLock {
 }
 
 impl BuildLock {
-    /// `None` while a build holds any of them.
+    /// `None` while a build holds any of them, or one can't be opened.
+    /// Missing ones are created, so a build that starts meanwhile in a
+    /// profile not built before waits too.
     fn take(target: &Path) -> Option<BuildLock> {
         let mut held = Vec::new();
         for profile in ["debug", "release"] {
+            let dir = target.join(profile);
+            fs::create_dir_all(&dir).ok()?;
             for name in LOCK_FILES {
-                let Ok(f) = File::open(target.join(profile).join(name)) else { continue };
-                if f.try_lock().is_err() {
-                    return None;
-                }
+                let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(name)).ok()?;
+                f.try_lock().ok()?;
                 held.push(f);
             }
         }
@@ -323,6 +330,7 @@ enum Exe {
 }
 
 /// Who owns a process whose executable path couldn't be read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum Owner {
     /// Its real and effective uids.
     Uids(Vec<u32>),
@@ -414,6 +422,7 @@ fn inside(path: &Path, dir: &Path) -> bool {
 
 /// A process whose path couldn't be read is another's only when its owner
 /// is known and isn't `me`, or it is gone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn unresolved(owner: Owner, me: u32) -> Exe {
     match owner {
         Owner::Uids(uids) if !uids.is_empty() && !uids.contains(&me) => Exe::Other,
@@ -423,7 +432,7 @@ fn unresolved(owner: Owner, me: u32) -> Exe {
 }
 
 /// Whether `pid` no longer exists (and not just can't be signalled).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn gone(pid: u32) -> bool {
     const ESRCH: i32 = 3;
     let Ok(pid) = c_int::try_from(pid) else { return false };
@@ -505,75 +514,34 @@ fn owner(pid: u32) -> Owner {
     }
 }
 
-/// `None` inside a nested pid namespace: its `/proc` may not show every
-/// process using the dirs it can see.
-#[cfg(target_os = "linux")]
-fn list_pids() -> Option<Vec<u32>> {
-    if nested_pid_namespace(&fs::read_to_string("/proc/self/status").ok()?) {
-        return None;
-    }
-    let entries = fs::read_dir("/proc").ok()?.collect::<Result<Vec<_>, _>>().ok()?;
-    Some(entries.iter().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
-}
-
-/// `/proc/<pid>/exe` is the executable's absolute path, with ` (deleted)`
-/// appended once it is removed (still inside its directory).
-#[cfg(target_os = "linux")]
-fn exe(pid: u32, me: u32) -> Exe {
-    match fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(p) => Exe::At(p),
-        Err(_) => unresolved(owner(pid), me),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn owner(pid: u32) -> Owner {
-    match fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(status) => status_uids(&status).map_or(Owner::Unknown, Owner::Uids),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && gone(pid) => Owner::Gone,
-        Err(_) => Owner::Unknown,
-    }
-}
-
-/// The real, effective, saved and filesystem uids of a `/proc/<pid>/status`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn status_uids(status: &str) -> Option<Vec<u32>> {
-    let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
-    let uids = line.split_whitespace().map(|u| u.parse().ok()).collect::<Option<Vec<u32>>>()?;
-    (uids.len() == 4).then_some(uids)
-}
-
-/// Whether a `/proc/self/status` is of a process in a nested pid namespace:
-/// its `NSpid:` lists a pid per namespace level.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn nested_pid_namespace(status: &str) -> bool {
-    status.lines().find_map(|l| l.strip_prefix("NSpid:")).is_some_and(|ids| ids.split_whitespace().count() > 1)
-}
-
-/// Elsewhere what runs is unknown: every check that needs it keeps.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Elsewhere what runs is unknown: every check that needs it keeps. On
+/// Linux `/proc` would serve, but a sandbox or container's own procfs shows
+/// only its pid namespace, and that isn't detected yet (see `docs/TODO.md`).
+#[cfg(not(target_os = "macos"))]
 fn list_pids() -> Option<Vec<u32>> {
     None
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(target_os = "macos"))]
 fn exe(_pid: u32, _me: u32) -> Exe {
     Exe::Unknown
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(target_os = "macos"))]
 fn owner(_pid: u32) -> Owner {
     Owner::Unknown
 }
 
 /// When anything last happened in `target`: the newest modification of its
-/// profiles' lock files and unit directories, and the newest access of the
-/// executables in them (running one records it).
+/// profiles' unit directories and of `.rustc_info.json`, and the newest
+/// access of the executables in the profiles (running one records it). Not
+/// the target or profile dirs themselves, nor the lock files: taking the
+/// locks creates any that are missing.
 fn last_active(target: &Path) -> SystemTime {
-    let mut newest = mtime(target);
+    let mut newest = mtime(&target.join(".rustc_info.json"));
     for profile in ["debug", "release"] {
         let dir = target.join(profile);
-        for name in ["", ".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock", "deps", ".fingerprint", "incremental", "build"] {
+        for name in ["deps", ".fingerprint", "incremental", "build"] {
             newest = newest.max(mtime(&dir.join(name)));
         }
         for exes in [dir.clone(), dir.join("deps"), dir.join("examples")] {
@@ -640,28 +608,41 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     Some(bytes)
 }
 
-/// Remove everything in `target` but its `CACHEDIR.TAG` and Cargo's lock
+/// Remove everything in `target` but its `CACHEDIR.TAG`, the `debug` and
+/// `release` lock files (held by the caller) and any other dir with lock
 /// files. A build waiting on a lock holds that file open: were it unlinked,
 /// the build would lock a file no other build sees.
 fn empty_target(target: &Path, opts: &Opts) -> u64 {
     let mut bytes = 0;
     for e in read_dir(target) {
         let name = e.file_name();
+        let path = e.path();
+        // `DirEntry::file_type` doesn't follow symlinks: a symlinked profile
+        // is unlinked, not emptied.
+        let dir = e.file_type().is_ok_and(|t| t.is_dir());
         if name == "CACHEDIR.TAG" {
             continue;
-        }
-        let profile = (name == "debug" || name == "release") && e.file_type().is_ok_and(|t| t.is_dir());
-        if !profile {
-            bytes += remove(&e.path(), opts);
-            continue;
-        }
-        for f in read_dir(&e.path()) {
-            if !LOCK_FILES.iter().any(|l| f.file_name() == *l) {
-                bytes += remove(&f.path(), opts);
+        } else if dir && (name == "debug" || name == "release") {
+            for f in read_dir(&path) {
+                if !LOCK_FILES.iter().any(|l| f.file_name() == *l) {
+                    bytes += remove(&f.path(), opts);
+                }
             }
+        } else if dir && has_lock_files(&path) {
+            println!("{}: holds locks this run doesn't; kept", path.display());
+        } else {
+            bytes += remove(&path, opts);
         }
     }
     bytes
+}
+
+/// Whether `dir`, or a dir directly in it, has a Cargo lock file: a custom
+/// profile (`<target>/<profile>/`) or a target triple's profile
+/// (`<target>/<triple>/<profile>/`).
+fn has_lock_files(dir: &Path) -> bool {
+    let here = |d: &Path| LOCK_FILES.iter().any(|l| fs::symlink_metadata(d.join(l)).is_ok());
+    here(dir) || read_dir(dir).iter().any(|e| e.file_type().is_ok_and(|t| t.is_dir()) && here(&e.path()))
 }
 
 fn hours(d: Duration) -> String {
@@ -816,7 +797,7 @@ fn mtime_or_now(path: &Path) -> SystemTime {
 
 extern "C" {
     fn getuid() -> u32;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
@@ -1264,6 +1245,8 @@ mod tests {
         assert!(frame.is_dir() && fallback.is_dir() && built.is_dir());
     }
 
+    // Elsewhere what runs isn't read, so nothing is emptied.
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_an_agent_worktrees_target_is_emptied() {
         let base = tmpdir("trees");
@@ -1283,6 +1266,7 @@ mod tests {
         assert!(emptied(&agent.join("target")), "an idle agent worktree's is");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_target_dir_this_run_cleans_is_never_emptied() {
         let temp = tmpdir("own");
@@ -1316,6 +1300,7 @@ mod tests {
         assert!(app(&real).uses(&dir.join("gone")), "a dir that can't be resolved counts as in use");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn what_runs_is_read_from_the_kernel() {
         let running = Running::now().expect("the process list can be read");
@@ -1343,27 +1328,18 @@ mod tests {
         assert!(matches!(unresolved(Owner::Gone, me), Exe::Other));
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn owners_are_read_from_the_kernel() {
         assert!(matches!(owner(std::process::id()), Owner::Uids(u) if u.contains(&me())));
         if me() != 0 {
             assert!(matches!(owner(1), Owner::Uids(u) if !u.contains(&me())), "init is root's");
         }
-        let mut child = Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        assert!(matches!(owner(pid), Owner::Gone), "a reaped child");
-    }
-
-    #[test]
-    fn proc_status_uids_and_nested_pid_namespaces_are_read() {
-        let status = "Name:\tsh\nUid:\t1000\t1000\t1000\t1000\nNSpid:\t4242\n";
-        assert_eq!(status_uids(status), Some(vec![1000; 4]));
-        assert_eq!(status_uids("Uid:\t1000\tx\t1\t1\n"), None);
-        assert_eq!(status_uids("Name:\tsh\n"), None);
-        assert!(!nested_pid_namespace(status));
-        assert!(nested_pid_namespace("NSpid:\t4242\t7\n"));
+        // Not a spawned child: a fork while another test holds a lock would
+        // hold it too, until the exec.
+        let pids = list_pids().unwrap();
+        let unused = (2..99_999).rev().find(|p| !pids.contains(p)).unwrap();
+        assert!(matches!(owner(unused), Owner::Gone), "a pid nothing has");
     }
 
     #[test]
@@ -1426,6 +1402,41 @@ mod tests {
         assert_eq!(o.failures.get(), 1);
         assert!(freed < total, "{freed} of {total}");
         assert!(stuck.join("f").exists());
+    }
+
+    #[test]
+    fn emptying_keeps_the_tag_the_lock_files_and_dirs_with_other_locks() {
+        let t = tmpdir("empty");
+        let outside = tmpdir("empty-outside");
+        target(&t);
+        fs::write(t.join(".rustc_info.json"), "{}").unwrap();
+        fs::create_dir_all(t.join("tmp")).unwrap();
+        fs::write(t.join("tmp/x"), "x").unwrap();
+        fs::create_dir_all(t.join("debug/deps")).unwrap();
+        fs::write(outside.join("keep"), "x").unwrap();
+        symlink(&*outside, t.join("release")).unwrap();
+        fs::create_dir_all(t.join("profiling")).unwrap();
+        File::create(t.join("profiling/.cargo-lock")).unwrap();
+        fs::create_dir_all(t.join("aarch64-apple-darwin/debug/deps")).unwrap();
+        File::create(t.join("aarch64-apple-darwin/debug/.cargo-build-lock")).unwrap();
+        let held = BuildLock::take(&t).expect("no build holds it");
+        assert!(t.join("debug/.cargo-artifact-lock").is_file(), "missing lock files are created");
+        empty_target(&t, &opts());
+        drop(held);
+        let mut left: Vec<String> = Vec::new();
+        for e in read_dir(&t) {
+            for f in read_dir(&e.path()).into_iter().map(|f| f.path()).chain([e.path()]) {
+                left.push(f.strip_prefix(&*t).unwrap().to_string_lossy().into_owned());
+            }
+        }
+        left.sort();
+        let kept = ["CACHEDIR.TAG", "debug", "aarch64-apple-darwin", "aarch64-apple-darwin/debug", "profiling"];
+        let mut want: Vec<String> = kept.iter().map(|k| k.to_string()).collect();
+        want.push("profiling/.cargo-lock".into());
+        want.extend(LOCK_FILES.iter().map(|l| format!("debug/{l}")));
+        want.sort();
+        assert_eq!(left, want, "tmp/ and .rustc_info.json go, the symlinked release is unlinked");
+        assert!(outside.join("keep").exists(), "not followed");
     }
 
     #[test]

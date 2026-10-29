@@ -1495,3 +1495,17 @@
   exec). A `pre_exec` hook turns off std's `posix_spawn` path, so the
   child is forked and exec'd instead.
 - Reason: a long-lived child can stall git status for its lifetime.
+
+---
+
+[2026-10-30T08:15+1300@19b9a94a] clean-all — in-use detection on Linux
+
+- Requires: a Linux machine to test on
+- Detail: `scripts/clean-stale.rs` reads what runs only on macOS; elsewhere
+  `Running::now()` is `None`, so `--all` empties no target dir and removes
+  nothing from the temp dir. Reading `/proc/<pid>/exe` and
+  `/proc/<pid>/status` (`Uid:`) would do, but only in the initial pid
+  namespace: bwrap, Docker and podman mount a procfs of their own namespace,
+  whose `NSpid:` has one field. Check `/proc/self/ns/pid`'s inode against
+  the initial namespace's (`0xEFFFFFFC`) instead, and test it there.
+- Reason: on Linux clean-all frees only superseded units.
