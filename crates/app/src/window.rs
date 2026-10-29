@@ -1445,7 +1445,7 @@ impl State {
             let missing = pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db);
             self.app.report_preview_font(missing);
         }
-        if serif_changed || (cw - self.cell_w).abs() > 0.01 || (ch - self.cell_h).abs() > 0.01 {
+        if metrics_changed(&self.cfg, &cfg, (self.cell_w, self.cell_h), (cw, ch)) {
             self.cell_w = cw;
             self.cell_h = ch;
             self.metrics_gen = self.metrics_gen.wrapping_add(1);
@@ -5524,6 +5524,16 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
+/// Whether applying `new` over `old` changes the font metrics or font set
+/// text is shaped with, given the monospace cell each measures to: text
+/// shaped and cached under the current `metrics_gen` (tooltip rows, the
+/// shaping cache) is then stale.
+fn metrics_changed(old: &Config, new: &Config, old_cell: (f32, f32), new_cell: (f32, f32)) -> bool {
+    old.editor.preview_font != new.editor.preview_font
+        || (new_cell.0 - old_cell.0).abs() > 0.01
+        || (new_cell.1 - old_cell.1).abs() > 0.01
+}
+
 /// What a tooltip's wrapped rows depend on: its text, line width and row
 /// cap, and the font metrics and font set (`metrics_gen`, bumped on every
 /// change to either), which set the text's widths.
@@ -6425,6 +6435,24 @@ mod tests {
         assert_eq!(wrap("x  \ny\nz", 20, 1), (vec!["x\u{2026}".to_string()], true));
         // A line break in the text starts a row.
         assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
+    }
+
+    /// A config change that moves the font metrics or font set invalidates
+    /// shaped text (`metrics_gen`); one that leaves them alone keeps it.
+    #[test]
+    fn a_font_change_in_the_config_invalidates_shaped_text() {
+        let old = ghostrealm_core::Config::default();
+        let cell = (9.0, 18.0);
+        let changed = |new: &ghostrealm_core::Config, new_cell| super::metrics_changed(&old, new, cell, new_cell);
+        assert!(!changed(&old, cell));
+        let mut other = old.clone();
+        other.editor.soft_wrap = !other.editor.soft_wrap;
+        assert!(!changed(&other, cell), "not a font setting");
+        assert!(changed(&old, (9.5, 18.0)), "the cell widens");
+        assert!(changed(&old, (9.0, 20.0)), "the cell grows taller");
+        let mut serif = old.clone();
+        serif.editor.preview_font = Some("Georgia".into());
+        assert!(changed(&serif, cell), "the Preview font");
     }
 
     /// A held tooltip's cached rows are rewrapped when anything they depend
