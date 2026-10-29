@@ -163,6 +163,11 @@ impl Matcher {
         Matches { current: Some(current), ..self.matches(line) }
     }
 
+    /// This matcher with `budget` per line in place of [`LINE_TIME_BUDGET`].
+    pub fn with_line_budget(self, budget: Duration) -> Self {
+        Matcher { line_budget: budget, ..self }
+    }
+
     /// Every match in `line`, collected.
     pub fn find_iter(&self, line: &str) -> Vec<Range<usize>> {
         self.matches(line).collect()
@@ -382,8 +387,7 @@ impl Searcher {
     /// results. An invalid regex starts nothing and says why.
     pub fn start(&mut self, root: &Path, query: &SearchQuery, walk: WalkOptions) -> Result<(), String> {
         self.cancel();
-        let mut matcher = query.matcher()?;
-        matcher.line_budget = self.line_budget;
+        let matcher = query.matcher()?.with_line_budget(self.line_budget);
         let generation = self.live.load(Ordering::SeqCst);
         let job = Job { generation, root: root.to_path_buf(), matcher, walk };
         let sent = match &self.worker {

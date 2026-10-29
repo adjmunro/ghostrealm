@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghostrealm_core::search::{Case, SearchQuery, Searcher, Stop, WalkOptions};
+use ghostrealm_core::search::{Case, Matcher, SearchQuery, Searcher, Stop, WalkOptions};
 use ghostrealm_core::Rect;
 use ghostrealm_terminal::{Key, KeyPress};
 
@@ -48,7 +48,11 @@ impl MatchAt {
     /// first match from `cols` on, counting chars as it goes, so a long
     /// line of matches costs one pass.
     pub fn cols_in(&self, line: &str) -> Range<usize> {
-        let Ok(matcher) = self.query.matcher() else { return 0..0 };
+        self.query.matcher().map_or(0..0, |m| self.cols_by(&m, line))
+    }
+
+    /// [`Self::cols_in`] with `matcher`, compiled from [`Self::query`].
+    fn cols_by(&self, matcher: &Matcher, line: &str) -> Range<usize> {
         let (mut at, mut col) = (0, 0);
         let mut col_of = |b: usize| {
             col += line[at..b].chars().count();
@@ -1053,9 +1057,12 @@ mod tests {
         let line = "a ".repeat(1024 * 1024 / 2);
         let query = SearchQuery { text: "a".into(), ..SearchQuery::default() };
         let near_end = (line.len() / 2 - 10) * 2;
+        // No line budget: under load, a debug build's walk over half a
+        // million matches can pass it and stop at the line's first.
+        let matcher = query.matcher().unwrap().with_line_budget(Duration::from_secs(3600));
         let m = MatchAt { path: PathBuf::new(), line: 0, cols: near_end..near_end + 1, query };
         let at = Instant::now();
-        assert_eq!(m.cols_in(&line), near_end..near_end + 1);
+        assert_eq!(m.cols_by(&matcher, &line), near_end..near_end + 1);
         assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
         // Gone from its columns: the line's first; none: the line's start.
         let moved = MatchAt { cols: 4..5, ..m.clone() };
