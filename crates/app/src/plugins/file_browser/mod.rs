@@ -2111,7 +2111,7 @@ mod tests {
 
     #[test]
     fn the_filter_field_takes_the_mouse_but_a_save_dialogs_header_does_not() {
-        let (_, mut v) = fixture();
+        let (_d, mut v) = fixture();
         let mut h = Harness::new();
         const WIDE: Rect = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 300.0 };
         for c in "ab".chars() {

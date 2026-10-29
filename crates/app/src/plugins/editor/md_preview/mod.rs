@@ -1233,13 +1233,13 @@ mod tests {
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 500.0, h: 300.0 };
 
     /// A Markdown document shown in Preview, and its file.
-    fn previewed(tag: &str, text: &str) -> (EditorView, PathBuf, crate::plugin::testing::TmpDir) {
+    fn previewed(tag: &str, text: &str) -> (crate::plugin::testing::TmpDir, EditorView, PathBuf) {
         let dir = tmpdir(tag);
         let path = dir.join("doc.md");
         std::fs::write(&path, text).unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.set_view_mode(ViewMode::Preview);
-        (v, path, dir)
+        (dir, v, path)
     }
 
     /// The blocks drawn: (text, left, top), top to bottom.
@@ -1274,7 +1274,7 @@ mod tests {
 
     #[test]
     fn the_preview_draws_serif_body_text_and_headings_by_level() {
-        let (mut v, _, _v_dir) = previewed("pv-sizes", "# Title\n\nBody text.\n\n### Third\n");
+        let (_v_dir, mut v, _) = previewed("pv-sizes", "# Title\n\nBody text.\n\n### Third\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let body = (14.0 * BODY_SCALE).round();
@@ -1295,7 +1295,7 @@ mod tests {
 
     #[test]
     fn the_preview_sizes_and_spaces_headings_from_the_config() {
-        let (mut v, _, _v_dir) = previewed("pv-heading-config", "Body text.\n\n## Second\n");
+        let (_v_dir, mut v, _) = previewed("pv-heading-config", "Body text.\n\n## Second\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let below = |h: &Harness| top_of(h, "Second") - top_of(h, "Body text.");
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn inline_code_sits_on_a_pill_under_its_tagged_glyphs() {
-        let (mut v, _, _v_dir) = previewed("pv-code", "Run `mise exec` now.\n");
+        let (_v_dir, mut v, _) = previewed("pv-code", "Run `mise exec` now.\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let item = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Block(_))).unwrap();
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn a_link_opens_its_file_beside_the_document_or_its_url_on_release() {
-        let (mut v, path, _v_dir) = previewed("pv-link", "See [goal](GOAL.md) or [web](https://x.org/a).\n");
+        let (_v_dir, mut v, path) = previewed("pv-link", "See [goal](GOAL.md) or [web](https://x.org/a).\n");
         std::fs::write(path.parent().unwrap().join("GOAL.md"), "# Goal\n").unwrap();
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -1360,7 +1360,7 @@ mod tests {
 
     #[test]
     fn a_link_to_another_scheme_has_no_button_and_says_why() {
-        let (mut v, _, _v_dir) = previewed("pv-blocked", "[app](file:///tmp) [s](smb://h/x) and more\n");
+        let (_v_dir, mut v, _) = previewed("pv-blocked", "[app](file:///tmp) [s](smb://h/x) and more\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let links: Vec<u32> = h.frame.view_buttons.iter().filter(|b| b.2 >= BTN_LINK).map(|b| b.2).collect();
@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn link_targets_are_canonical_and_only_openable_ones_get_a_button() {
         let text = "[d](sub/x/..) [f](sub/../other.md) [z](/dev/zero) [m](missing.md) [big](big.txt) [img](big.png)\n";
-        let (mut v, path, _v_dir) = previewed("pv-dir", text);
+        let (_v_dir, mut v, path) = previewed("pv-dir", text);
         let d = path.parent().unwrap();
         std::fs::create_dir_all(d.join("sub/x")).unwrap();
         std::fs::write(d.join("other.md"), "o").unwrap();
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn keys_scroll_the_preview_and_never_edit_the_text() {
         let text: String = (0..80).map(|i| format!("Paragraph {i}.\n\n")).collect();
-        let (mut v, _, _v_dir) = previewed("pv-keys", &text);
+        let (_v_dir, mut v, _) = previewed("pv-keys", &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let before = v.text();
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn the_mode_button_steps_a_markdown_file_through_all_three() {
-        let (mut v, _, _v_dir) = previewed("pv-cycle", "# a\n");
+        let (_v_dir, mut v, _) = previewed("pv-cycle", "# a\n");
         v.set_view_mode(ViewMode::Integrated);
         let mut seen = Vec::new();
         let h = Harness::new();
@@ -1453,13 +1453,13 @@ mod tests {
             seen.push(v.view_mode());
         }
         assert_eq!(seen, [ViewMode::Source, ViewMode::Preview, ViewMode::Integrated]);
-        let (fresh, _, _fresh_dir) = previewed("pv-default", "# a\n");
+        let (_fresh_dir, fresh, _) = previewed("pv-default", "# a\n");
         assert_eq!(EditorView::new(fresh.buf).view_mode(), ViewMode::Integrated, "Markdown opens Integrated");
     }
 
     #[test]
     fn a_double_click_edits_the_source_at_the_blocks_line() {
-        let (mut v, _, _v_dir) = previewed("pv-dbl", "# A\n\npara one\n\n- item\n- two\n");
+        let (_v_dir, mut v, _) = previewed("pv-dbl", "# A\n\npara one\n\n- item\n- two\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let y = top_of(&h, "two") + 2.0;
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn switching_modes_keeps_the_source_line_at_the_top() {
         let text: String = (0..40).map(|i| format!("## Section {i}\n\nText {i}.\n\n")).collect();
-        let (mut v, _, _v_dir) = previewed("pv-switch", &text);
+        let (_v_dir, mut v, _) = previewed("pv-switch", &text);
         v.set_view_mode(ViewMode::Integrated);
         v.buf.scroll = 40; // "## Section 10"
         let mut h = Harness::new();
@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn the_top_block_stays_put_when_blocks_above_it_change_height() {
         let text: String = (0..30).map(|i| format!("Paragraph {i} with some words in it.\n\n")).collect();
-        let (mut v, _, _v_dir) = previewed("pv-anchor", &text);
+        let (_v_dir, mut v, _) = previewed("pv-anchor", &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.scroll(&mut v, (10.0, 10.0), -250.0);
@@ -1521,7 +1521,7 @@ mod tests {
     /// A Preview of 30 wrapping paragraphs, scrolled `dy` px down.
     fn scrolled(tag: &str, dy: f32) -> (EditorView, Harness) {
         let text: String = (0..30).map(|i| format!("Paragraph {i} with enough words in it to wrap at a narrower width.\n\n")).collect();
-        let (mut v, _, _v_dir) = previewed(tag, &text);
+        let (_v_dir, mut v, _) = previewed(tag, &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.scroll(&mut v, (10.0, 10.0), -dy);
@@ -1604,7 +1604,7 @@ mod tests {
     #[test]
     fn edits_during_a_parse_coalesce_into_one_more() {
         let text: String = (0..4000).map(|i| format!("Paragraph number {i}.\n\n")).collect();
-        let (mut v, _, _v_dir) = previewed("pv-coalesce", &text);
+        let (_v_dir, mut v, _) = previewed("pv-coalesce", &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let first = v.preview.job.as_ref().map(|j| j.0);
@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     fn a_long_tables_rows_out_of_view_are_laid_out_not_drawn() {
         let rows: String = (0..200).map(|i| format!("| r{i} | v{i} |\n")).collect();
-        let (mut v, _, _v_dir) = previewed("pv-table-rows", &format!("| a | b |\n|---|---|\n{rows}"));
+        let (_v_dir, mut v, _) = previewed("pv-table-rows", &format!("| a | b |\n|---|---|\n{rows}"));
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let cells = |h: &Harness| drawn(h).iter().filter(|d| d.0.starts_with('r')).count();
@@ -1657,7 +1657,7 @@ mod tests {
         let text: String = std::iter::once("```toml\na = 1\n```\n\n".to_string())
             .chain((0..300).map(|i| format!("Paragraph {i}.\n\n")))
             .collect();
-        let (mut v, _, _v_dir) = previewed("pv-release", &text);
+        let (_v_dir, mut v, _) = previewed("pv-release", &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let rows_at = |v: &EditorView| match v.preview.laid[0].prep.as_ref() {
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn a_code_block_is_boxed_with_its_language_and_copies_its_body() {
-        let (mut v, _, _v_dir) = previewed("pv-fence", "text\n\n```toml\nname = 1 # one\n```\n");
+        let (_v_dir, mut v, _) = previewed("pv-fence", "text\n\n```toml\nname = 1 # one\n```\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert!(h.texts().iter().any(|t| t == "toml"), "the language label: {:?}", h.texts());
@@ -1698,7 +1698,7 @@ mod tests {
     #[test]
     fn tables_quotes_lists_and_rules_draw() {
         let text = "| Chord | Action |\n|---|---|\n| Cmd+N | new |\n\n> quoted\n\n- [x] done\n1. one\n\n---\n";
-        let (mut v, _, _v_dir) = previewed("pv-misc", text);
+        let (_v_dir, mut v, _) = previewed("pv-misc", text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let texts: Vec<String> = drawn(&h).into_iter().map(|d| d.0).collect();
@@ -1713,7 +1713,7 @@ mod tests {
 
     #[test]
     fn front_matter_shows_dim_in_a_code_box() {
-        let (mut v, _, _v_dir) = previewed("pv-front", "---\ntitle: A\n---\n# Body\n");
+        let (_v_dir, mut v, _) = previewed("pv-front", "---\ntitle: A\n---\n# Body\n");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let row = h.frame.text.iter().find(|t| matches!(t.src, TextSrc::Row(_)) && h.text.buffer(t.src).unwrap().layout_runs().any(|r| r.text == "title: A"));
@@ -1723,7 +1723,7 @@ mod tests {
 
     #[test]
     fn the_agent_reads_the_text_whatever_the_mode() {
-        let (mut v, _, _v_dir) = previewed("pv-agent", "# a\n\nb `c`\n");
+        let (_v_dir, mut v, _) = previewed("pv-agent", "# a\n\nb `c`\n");
         let want = v.text();
         assert_eq!(want.as_deref(), Some("# a\n\nb `c`"));
         for m in ViewMode::ALL {
@@ -1736,7 +1736,7 @@ mod tests {
     fn a_long_document_parses_on_a_worker() {
         let text: String = (0..4000).map(|i| format!("Paragraph number {i}.\n\n")).collect();
         assert!(text.len() > PARSE_INLINE_MAX);
-        let (mut v, _, _v_dir) = previewed("pv-worker", &text);
+        let (_v_dir, mut v, _) = previewed("pv-worker", &text);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);

@@ -2774,19 +2774,19 @@ mod tests {
 
     /// An editor with unsaved text "x" whose file another program then
     /// rewrote.
-    fn conflicted(name: &str) -> (EditorView, PathBuf, crate::plugin::testing::TmpDir) {
+    fn conflicted(name: &str) -> (crate::plugin::testing::TmpDir, EditorView, PathBuf) {
         let dir = tmpdir(name);
         let path = dir.join("f.txt");
         std::fs::write(&path, "disk\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.buffer_mut().insert_str("x");
         std::fs::write(&path, "someone else's\n").unwrap();
-        (v, path, dir)
+        (dir, v, path)
     }
 
     #[test]
     fn cmd_s_over_a_file_changed_on_disk_asks_instead_of_writing() {
-        let (mut v, path, _dir) = conflicted("editor-save-conflict");
+        let (_dir, mut v, path) = conflicted("editor-save-conflict");
         let h = Harness::new();
         let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
         assert!(used);
@@ -2843,7 +2843,7 @@ mod tests {
 
     #[test]
     fn autosave_skips_a_file_changed_on_disk_and_keeps_the_edits() {
-        let (mut v, path, _dir) = conflicted("editor-autosave-conflict");
+        let (_dir, mut v, path) = conflicted("editor-autosave-conflict");
         let h = Harness::new();
         let out = h.focus(&mut v, false);
         assert!(out.requests.is_empty(), "no save on blur");
@@ -2879,7 +2879,7 @@ mod tests {
 
     #[test]
     fn undo_keeps_the_mark_while_the_file_changed_under_unsaved_edits() {
-        let (mut v, path, _dir) = conflicted("editor-undo-conflict");
+        let (_dir, mut v, path) = conflicted("editor-undo-conflict");
         assert!(v.changed_on_disk(&path), "the mark appears");
         v.buffer_mut().undo();
         assert!(v.marked_changed_on_disk() && v.disk_conflict(), "the file still isn't what the buffer read");
@@ -2906,7 +2906,7 @@ mod tests {
 
     #[test]
     fn saving_a_file_deleted_on_disk_recreates_it_without_asking() {
-        let (mut v, path, _dir) = conflicted("editor-save-deleted");
+        let (_dir, mut v, path) = conflicted("editor-save-deleted");
         std::fs::remove_file(&path).unwrap();
         let h = Harness::new();
         let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
@@ -2917,7 +2917,7 @@ mod tests {
 
     #[test]
     fn a_save_is_not_a_conflict_with_itself() {
-        let (mut v, path, _dir) = conflicted("editor-save-twice");
+        let (_dir, mut v, path) = conflicted("editor-save-twice");
         v.reload().unwrap();
         v.buffer_mut().insert_str("y");
         let h = Harness::new();

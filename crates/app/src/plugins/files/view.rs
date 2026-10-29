@@ -1042,7 +1042,7 @@ mod tests {
         assert_eq!(v.layout.doc.map(|r| (r.x, r.w)), Some((RECT.x, RECT.w)), "the document takes the width");
 
         // A new surface starts hidden too; without a document it still lists.
-        let (_, mut fresh) = fixture(&session);
+        let (_d, mut fresh) = fixture(&session);
         assert!(!fresh.pinned(&h.cfg));
         h.paint(&mut fresh, RECT);
         assert!(fresh.layout.sidebar.is_some(), "no document: the sidebar shows anyway");
@@ -1059,7 +1059,7 @@ mod tests {
 
         // Untoggled this session, the config decides.
         h.cfg.file_browser.sidebar = SidebarPin::Hidden;
-        let (_, other) = fixture(&Session::default());
+        let (_d, other) = fixture(&Session::default());
         assert!(!other.pinned(&h.cfg));
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Up { pos: (RECT.w, y), dragged: true, button: MouseButton::Left });
         h.paint(&mut v, RECT);
         assert_eq!(v.layout.sidebar.unwrap().w, RECT.w - DOC_MIN_W);
-        let (_, fresh) = fixture(&session);
+        let (_d, fresh) = fixture(&session);
         assert_eq!(fresh.sidebar_width(), RECT.w - DOC_MIN_W, "a new surface starts at the last width");
     }
 
@@ -1184,7 +1184,7 @@ mod tests {
         let tmp = tmpdir("files-unfocus");
         let path = tmp.join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
-        let (_, mut v) = fixture(&Session::default());
+        let (_d, mut v) = fixture(&Session::default());
         let h = Harness::new();
         h.focus(&mut v, true);
         v.show_doc(editor(&path));
@@ -1202,7 +1202,7 @@ mod tests {
         let tmp = tmpdir("files-unfocus-lost");
         let path = tmp.join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
-        let (_, mut v) = fixture(&Session::default());
+        let (_d, mut v) = fixture(&Session::default());
         let h = Harness::new();
         h.focus(&mut v, true);
         v.show_doc(editor(&path));
