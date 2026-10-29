@@ -780,6 +780,7 @@ These can't be verified in the headless sandbox:
 - **GPU compositing:** "Web — GPU (accelerated) off-screen rendering" (line ~736): does GPU compositing paint on a real display?
 - **Nested `.gitignore`:** "File browser — remaining polish" (6) (line ~420): confirm it on a real repo.
 - **Error surface:** toasts (colours, placement at the top of the pane or below the top tab strips for app-wide ones, hover highlight and dismiss on mouse-up, auto-hide timing), the Save As picker's inline error and red border, the palette prompt's error rows and their tooltip, wrapped tooltips, and the wavy red/yellow underlines in the editor. Two TODO entries also need a display: a launch-time toast under a still pointer, and wide glyphs in prompt error rows.
+- **Heading spacing and sizes:** open a Markdown file in Integrated and in Preview. Check the larger headings and the space above them (defaults in `[headings]`: `h1_scale`..`h6_scale`, `h1_space`..`h6_space`; hover the section in `config.toml` for docs), a click in the space above a heading, a table-of-contents jump, trackpad scrolling past headings, and live tuning by editing the values.
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 
 ## Parked (no decision needed yet)
