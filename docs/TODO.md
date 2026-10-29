@@ -1414,21 +1414,6 @@
 
 ---
 
-[2026-10-29T22:27+1300@98d28532] Web host — inherits pipes from concurrent spawns and hangs their readers
-
-- Requires: NO BLOCKERS
-- Detail: On macOS std marks a new pipe close-on-exec only after creating
-  it. `WebHost::spawn` (`crates/web/src/client.rs`) uses `posix_spawn`, so
-  a host started while a worker thread runs `git ... .output()`
-  (`crates/core/src/git.rs`, `crates/core/src/fs_tree.rs`) can inherit
-  that command's pipe ends; the `.output()` call then hangs until the host
-  exits. Possible fix: in a `pre_exec` hook, mark every fd above 2
-  close-on-exec (not close it: std's exec-error pipe must stay open until
-  exec).
-- Reason: a long-lived CEF host can stall git status for its lifetime.
-
----
-
 [2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
 
 - Requires: investigation (environment, or a stale host bundle)
@@ -1488,3 +1473,21 @@
   passes `metrics_gen` to `tooltip_key`: both need a `Window` (a GPU surface).
 - Reason: dropping one of those bumps would leave a held tooltip wrapped for
   old font metrics with every test green.
+
+---
+
+[2026-10-29T22:27+1300@98d28532] Processes — a long-lived child inherits pipes from concurrent spawns
+
+- Requires: NO BLOCKERS
+- Detail: On macOS std marks a new pipe close-on-exec only after creating
+  it, so any child started via std `Command` while another thread creates
+  pipes can inherit their ends. A long-lived one (the CEF host from
+  `WebHost::spawn` in `crates/web/src/client.rs`, or any other) started
+  while a worker thread runs `git ... .output()` (`crates/core/src/git.rs`,
+  `crates/core/src/fs_tree.rs`) keeps that command's pipe open, and the
+  `.output()` call hangs until the child exits.
+- Detail: Possible fix: in a `pre_exec` hook, mark every fd above 2
+  close-on-exec (not close it: std's exec-error pipe must stay open until
+  exec). A `pre_exec` hook turns off std's `posix_spawn` path, so the
+  child is forked and exec'd instead.
+- Reason: a long-lived child can stall git status for its lifetime.
