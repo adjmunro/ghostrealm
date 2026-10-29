@@ -251,29 +251,35 @@ pub fn press(key: Key) -> KeyPress {
     }
 }
 
-/// A unique, empty temp directory.
-pub fn tmpdir(tag: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ghostrealm-{tag}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A unique, empty temp directory, removed when the returned guard drops.
+pub fn tmpdir(tag: &str) -> TmpDir {
+    TmpDir::new(tag)
 }
 
-/// A [`tmpdir`] removed when dropped, so a test that fails cleans up too.
-/// Declare it before anything that writes into it (a host, a view): locals
-/// drop in reverse order, so those are dropped first. A dropped host is only
-/// asked to exit and may still be running when the directory goes.
+/// A unique, empty temp directory removed when dropped, so a test that fails
+/// cleans up too. Declare it before anything that writes into it (a host, a
+/// view): locals drop in reverse order, so those are dropped first. A dropped
+/// host is only asked to exit and may still be running when the directory
+/// goes.
+#[derive(Debug)]
 pub struct TmpDir(std::path::PathBuf);
 
 impl TmpDir {
     pub fn new(tag: &str) -> Self {
-        TmpDir(tmpdir(tag))
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ghostrealm-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TmpDir(dir)
+    }
+
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
     }
 }
 
@@ -282,6 +288,18 @@ impl std::ops::Deref for TmpDir {
 
     fn deref(&self) -> &std::path::Path {
         &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TmpDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
     }
 }
 

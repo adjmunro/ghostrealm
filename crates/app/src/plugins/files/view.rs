@@ -960,11 +960,11 @@ mod tests {
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
 
     /// A folder holding `a.md` and `b.txt`, and a Files surface on it.
-    fn fixture(session: &Session) -> (PathBuf, FilesView) {
+    fn fixture(session: &Session) -> (crate::plugin::testing::TmpDir, FilesView) {
         let d = tmpdir("files-view");
         std::fs::write(d.join("a.md"), "# Title\nbody line\n").unwrap();
         std::fs::write(d.join("b.txt"), "bee\n").unwrap();
-        let v = FilesView::with(d.clone(), None, session.clone());
+        let v = FilesView::with(d.to_path_buf(), None, session.clone());
         (d, v)
     }
 
@@ -1181,7 +1181,8 @@ mod tests {
 
     #[test]
     fn moving_the_keys_between_parts_tells_them_on_the_next_tick() {
-        let path = tmpdir("files-unfocus").join("f.txt");
+        let tmp = tmpdir("files-unfocus");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
         let (_, mut v) = fixture(&Session::default());
         let h = Harness::new();
@@ -1198,7 +1199,8 @@ mod tests {
 
     #[test]
     fn losing_focus_first_tells_a_part_whose_loss_was_queued() {
-        let path = tmpdir("files-unfocus-lost").join("f.txt");
+        let tmp = tmpdir("files-unfocus-lost");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
         let (_, mut v) = fixture(&Session::default());
         let h = Harness::new();

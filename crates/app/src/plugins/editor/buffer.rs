@@ -1549,7 +1549,8 @@ mod tests {
 
     #[test]
     fn a_reload_takes_the_file_as_one_undo_step_and_keeps_the_cursor_in_the_text() {
-        let path = crate::plugin::testing::tmpdir("buffer-reload").join("f.txt");
+        let tmp = crate::plugin::testing::tmpdir("buffer-reload");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "one\ntwo three\n").unwrap();
         let mut e = EditorBuffer::open(path.clone()).unwrap();
         e.cursor = (1, 9);
@@ -1773,7 +1774,7 @@ mod tests {
         let d = crate::plugin::testing::tmpdir("buf-irregular");
         #[cfg(unix)]
         assert!(EditorBuffer::open(PathBuf::from("/dev/zero")).is_err(), "a device never ends");
-        assert!(EditorBuffer::open(d.clone()).is_err(), "a folder");
+        assert!(EditorBuffer::open(d.to_path_buf()).is_err(), "a folder");
         let big = d.join("big.txt");
         std::fs::File::create(&big).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
         let err = EditorBuffer::open(big).err().expect("over the cap");
@@ -1784,7 +1785,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_refused_without_blocking() {
-        let fifo = crate::plugin::testing::tmpdir("buf-fifo").join("pipe");
+        let tmp = crate::plugin::testing::tmpdir("buf-fifo");
+        let fifo = tmp.join("pipe");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(EditorBuffer::open(fifo).is_err());

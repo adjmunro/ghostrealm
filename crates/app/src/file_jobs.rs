@@ -442,11 +442,11 @@ pub mod tests {
     fn a_delete_check_doesnt_wait_behind_a_copy_or_count_as_pending() {
         let d = tmpdir("jobs-lanes");
         let mut jobs = FileJobs::default();
-        jobs.submit(FileJob::DeleteCheck { path: d.clone() });
+        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf() });
         assert!(jobs.idle(), "a check alone holds up nothing");
         jobs.wait_all();
         let hold = jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
-        let check = jobs.submit(FileJob::DeleteCheck { path: d.clone() });
+        let check = jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf() });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("the check finishes first");
         assert_eq!(done.id, check);
         assert!(!jobs.idle(), "the copy still runs");
@@ -548,9 +548,9 @@ pub mod tests {
         let mut jobs = FileJobs::default();
         assert!(jobs.take_until(Instant::now() + Duration::from_millis(5)).is_none(), "no worker yet");
         let d = tmpdir("jobs-deadline");
-        jobs.submit(FileJob::DeleteCheck { path: d.clone() });
+        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf() });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("arrives");
-        assert_eq!(done.job, FileJob::DeleteCheck { path: d });
+        assert_eq!(done.job, FileJob::DeleteCheck { path: d.to_path_buf() });
         assert!(matches!(done.result.unwrap(), Output::Clean(_)));
     }
 }

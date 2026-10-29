@@ -743,7 +743,7 @@ mod tests {
     }
 
     /// A repository holding `tracked.txt`, committed; `None` without git.
-    fn repo(tag: &str) -> Option<PathBuf> {
+    fn repo(tag: &str) -> Option<crate::plugin::testing::TmpDir> {
         let d = tmpdir(tag);
         if !git_ok(&d, &["init", "-q"]) {
             return None;
@@ -790,7 +790,7 @@ mod tests {
             assert!(s.file_menu(&t).contains(&MenuEntry::Item(FileAction::AddToGitignore)));
             // The repository's own folder is an entry of whatever holds it.
             if git::repo_root(r.parent().unwrap()).is_none() {
-                let t = FileTarget { path: r.clone(), kind: Kind::Dir, ..target };
+                let t = FileTarget { path: r.to_path_buf(), kind: Kind::Dir, ..target };
                 assert!(!s.file_menu(&t).contains(&MenuEntry::Item(FileAction::AddToGitignore)));
             }
         }
@@ -1007,7 +1007,8 @@ mod tests {
     fn open_in_terminal_starts_a_terminal_in_the_folder() {
         let mut s = AppState::new().with_shell_line("pwd; sleep 2");
         s.new_empty_vtab();
-        let d = tmpdir("fm-terminal").join("here-dir");
+        let tmp = tmpdir("fm-terminal");
+        let d = tmp.join("here-dir");
         std::fs::create_dir_all(&d).unwrap();
         run(&mut s, "file.open_in_terminal", &[("path", &d)]).unwrap();
         let sid = s.focused_surface().unwrap();
@@ -1466,7 +1467,8 @@ mod tests {
         assert!(git_ok(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "to"]));
         for (target, why) in [(r.join("tracked.txt"), "the copy's source"), (r.join("to"), "the folder pasted into")] {
             let (mut s, calls) = app();
-            let go = tmpdir("fm-delete-busy-go").join("go");
+            let tmp = tmpdir("fm-delete-busy-go");
+            let go = tmp.join("go");
             s.file_jobs.submit(FileJob::Hold { src: r.join("tracked.txt"), dir: r.join("to"), until: go.clone() });
             run_until_check(&mut s, &target);
             assert!(s.confirm().is_some(), "{why}: tracked and clean, but in use, so ask");
@@ -1516,7 +1518,7 @@ mod tests {
     fn a_running_delete_check_doesnt_hold_up_a_quit() {
         let d = tmpdir("fm-quit-check");
         let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::DeleteCheck { path: d });
+        s.file_jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf() });
         s.request_quit();
         assert!(s.confirm().is_none() && s.quitting());
     }

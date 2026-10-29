@@ -262,13 +262,13 @@ mod tests {
 
     /// A guarded state with one empty workspace on a folder of `a.txt`,
     /// `b.txt`, and `c.txt` (each holding its name).
-    fn app(tag: &str) -> (AppState, PathBuf) {
+    fn app(tag: &str) -> (AppState, crate::plugin::testing::TmpDir) {
         let d = tmpdir(tag);
         for n in ["a.txt", "b.txt", "c.txt"] {
             std::fs::write(d.join(n), n).unwrap();
         }
         let mut s = AppState::new().with_unsaved_guard();
-        s.set_default_dir(Some(d.clone()));
+        s.set_default_dir(Some(d.to_path_buf()));
         s.new_empty_vtab();
         (s, d)
     }

@@ -723,13 +723,14 @@ mod tests {
 
     /// A folder with two matching files (one nested) and one that doesn't
     /// match, and a sidebar on it.
-    fn fixture() -> (PathBuf, FileBrowserView) {
+    fn fixture() -> (crate::plugin::testing::TmpDir, FileBrowserView) {
         let d = tmpdir("fb-search");
         std::fs::write(d.join("a.txt"), "one Hit\n  two hit hit\nnone\n").unwrap();
         std::fs::create_dir(d.join("sub")).unwrap();
         std::fs::write(d.join("sub").join("b.md"), "hitch\n").unwrap();
         std::fs::write(d.join("zzz.txt"), "nothing\n").unwrap();
-        (d.clone(), FileBrowserView::new(d))
+        let v = FileBrowserView::new(d.to_path_buf());
+        (d, v)
     }
 
     fn type_in(h: &Harness, v: &mut FileBrowserView, text: &str) {
@@ -940,7 +941,7 @@ mod tests {
     fn a_right_to_left_line_lights_its_match_where_it_was_drawn() {
         let d = tmpdir("fb-search-rtl");
         std::fs::write(d.join("r.txt"), "\u{5e9}\u{5dc}\u{5d5}\u{5dd} abc\n").unwrap();
-        let mut v = FileBrowserView::new(d);
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let mut h = Harness::new();
         type_in(&h, &mut v, "?abc");
         settle(&h, &mut v);
@@ -980,7 +981,7 @@ mod tests {
         assert!(git(&["add", "-A"]));
         assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "i"]));
         std::fs::write(d.join("changed.txt"), "hit again").unwrap();
-        let mut v = FileBrowserView::new(d.clone());
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let h = Harness::new();
         h.button(&mut v, super::super::BTN_GIT_MODIFIED);
         type_in(&h, &mut v, "?hit");
@@ -1070,7 +1071,7 @@ mod tests {
         let h = Harness::new();
         type_in(&h, &mut v, "./s");
         assert!(!v.searching() && v.tree().input_is_path());
-        let mut picker = FileBrowserView::picker(d, Mode::PickFile);
+        let mut picker = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         type_in(&h, &mut picker, "?a");
         assert!(!picker.searching());
         assert_eq!(picker.tree().query(), "?a");

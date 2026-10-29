@@ -1390,20 +1390,6 @@
 
 ---
 
-[2026-10-24T06:23+1300@83f8fe8d] App — tests outside the web plugin leave their temp dirs behind
-
-- Requires: NO BLOCKERS
-- Detail: One full workspace run leaves about 410 `$TMPDIR/ghostrealm-*` dirs
-  from plain `testing::tmpdir()` (about 25,600 had built up): editor 72
-  (mostly `editor-md-*`), files/file browser/file manager about 147, pv 23,
-  toc 21, ops 21, open 15, media 18, fstree 11, jobs 10, agent 2.
-- Detail: Making `tmpdir()` return the `TmpDir` guard would fix most at once;
-  a caller that lets it drop early (e.g. one that only keeps a path) needs to
-  hold it instead.
-- Reason: test runs shouldn't fill the temp directory.
-
----
-
 [2026-10-26T22:13+1300@462d3daa] App — per-modal overlay layers
 
 - Requires: NO BLOCKERS

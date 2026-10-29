@@ -1508,12 +1508,12 @@ mod tests {
     }
 
     /// A tree with a directory (holding a file) and a file: rows `adir`, `b.txt`.
-    fn fixture() -> (PathBuf, FileBrowserView) {
+    fn fixture() -> (crate::plugin::testing::TmpDir, FileBrowserView) {
         let d = tmpdir("fb");
         std::fs::create_dir(d.join("adir")).unwrap();
         std::fs::write(d.join("adir").join("inner.txt"), "x").unwrap();
         std::fs::write(d.join("b.txt"), "x").unwrap();
-        let v = FileBrowserView::new(d.clone());
+        let v = FileBrowserView::new(d.to_path_buf());
         (d, v)
     }
 
@@ -1588,7 +1588,7 @@ mod tests {
     #[test]
     fn picker_lists_directories_only() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let ids: Vec<u32> = v.options_menu().iter().map(|i| i.id).collect();
@@ -1601,15 +1601,15 @@ mod tests {
     #[test]
     fn directory_picker_enter_picks_the_highlighted_or_shown_directory() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.clone())], "nothing highlighted: the shown one");
+        assert_eq!(out.requests, vec![Request::Pick(d.to_path_buf())], "nothing highlighted: the shown one");
         h.key(&mut v, press(Key::Down));
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(out.requests, vec![Request::Pick(d.join("adir"))]);
-        assert_eq!(v.tree().root(), d, "Enter doesn't enter it");
+        assert_eq!(v.tree().root(), &*d, "Enter doesn't enter it");
     }
 
     #[test]
@@ -1617,7 +1617,7 @@ mod tests {
         let d = tmpdir("fb-pickdir-nav");
         std::fs::create_dir_all(d.join("a/b")).unwrap();
         std::fs::create_dir(d.join("c")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.key(&mut v, press(Key::Down));
@@ -1631,7 +1631,7 @@ mod tests {
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(out.requests, vec![Request::Pick(d.join("a/b"))], "the directory left stays highlighted");
         h.key(&mut v, press(Key::Left));
-        assert_eq!(v.tree().root(), d);
+        assert_eq!(v.tree().root(), &*d);
         // With a filter typed, Left and Backspace edit it instead.
         h.key(&mut v, press(Key::Char('c')));
         h.key(&mut v, press(Key::Left));
@@ -1655,7 +1655,7 @@ mod tests {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("adir").join("deep")).unwrap();
         std::fs::create_dir(d.join("adir").join("deeper")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let enter = |h: &mut Harness, v: &mut FileBrowserView| h.key(v, press(Key::Enter)).1.requests;
@@ -1663,7 +1663,7 @@ mod tests {
         assert_eq!(enter(&mut h, &mut v), vec![Request::Pick(d.join("adir"))]);
         let mut inner = FileBrowserView::picker(d.join("adir"), Mode::PickDir);
         type_in(&mut h, &mut inner, "..");
-        assert_eq!(enter(&mut h, &mut inner), vec![Request::Pick(d.clone())]);
+        assert_eq!(enter(&mut h, &mut inner), vec![Request::Pick(d.to_path_buf())]);
         if let Some(home) = std::env::var_os("HOME") {
             type_in(&mut h, &mut v, "~");
             assert_eq!(enter(&mut h, &mut v), vec![Request::Pick(PathBuf::from(home))]);
@@ -1695,7 +1695,7 @@ mod tests {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("adir").join("deep")).unwrap();
         std::fs::create_dir(d.join("adir").join("deeper")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         type_in(&mut h, &mut v, "adir/de");
         let (r, ..) = v.suggest_hits[1];
@@ -1727,7 +1727,7 @@ mod tests {
     fn directory_picker_double_click_answers_the_entered_directory() {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("adir").join("deep")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
@@ -1741,7 +1741,7 @@ mod tests {
     fn directory_picker_draws_the_keyboard_highlight_over_a_weaker_hover() {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("cdir")).unwrap();
-        let mut v = FileBrowserView::picker(d, Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.key(&mut v, press(Key::Down));
@@ -1770,7 +1770,7 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
         assert_eq!((v.sel, v.hover), (Some(0), None));
 
-        let mut save = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut save = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         save.set_name("n.md");
         h.paint(&mut save, RECT);
         h.key(&mut save, press(Key::Down));
@@ -1782,7 +1782,7 @@ mod tests {
     fn directory_picker_enter_while_filtering_picks_the_first_match() {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("cdir")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         type_in(&mut h, &mut v, "cd");
@@ -1808,14 +1808,14 @@ mod tests {
     #[test]
     fn directory_picker_enter_and_the_confirm_button_ignore_the_hover() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Move { pos: row_centre(0) });
         assert_eq!((v.hover, v.sel), (Some(0), None));
-        assert_eq!(v.choice(), Some(d.clone()), "the button shows the listed directory");
+        assert_eq!(v.choice(), Some(d.to_path_buf()), "the button shows the listed directory");
         let (_, out) = h.key(&mut v, press(Key::Enter));
-        assert_eq!(out.requests, vec![Request::Pick(d.clone())], "and Enter agrees");
+        assert_eq!(out.requests, vec![Request::Pick(d.to_path_buf())], "and Enter agrees");
         h.key(&mut v, press(Key::Down));
         h.key(&mut v, press(Key::Up));
         assert_eq!(v.choice(), Some(d.join("adir")), "a keyboard highlight is the answer");
@@ -1826,7 +1826,7 @@ mod tests {
         let d = tmpdir("fb-pickdir-hover");
         std::fs::create_dir_all(d.join("a/inner")).unwrap();
         std::fs::create_dir(d.join("b")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.key(&mut v, press(Key::Down));
@@ -1856,7 +1856,7 @@ mod tests {
         assert_eq!(v.choice(), Some(d.join("a/inner")));
         h.button(&mut v, BTN_PARENT);
         h.paint(&mut v, RECT);
-        assert_eq!((v.sel, v.choice()), (None, Some(d.clone())), "not row 0 of the parent");
+        assert_eq!((v.sel, v.choice()), (None, Some(d.to_path_buf())), "not row 0 of the parent");
         // A listing that still holds it keeps it highlighted where it moved.
         h.key(&mut v, press(Key::Down));
         assert_eq!(v.choice(), Some(d.join("a")));
@@ -1872,7 +1872,7 @@ mod tests {
     fn directory_picker_field_shows_only_a_keyboard_completion() {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("adir").join("deep")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         type_in(&mut h, &mut v, "adir/");
         let (r, ..) = v.suggest_hits[0];
@@ -1888,7 +1888,7 @@ mod tests {
     fn directory_picker_left_climbs_to_the_parent_row_then_collapses_it() {
         let d = tmpdir("fb-pickdir-left");
         std::fs::create_dir_all(d.join("a/b")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
@@ -1899,7 +1899,7 @@ mod tests {
         assert_eq!((v.sel, v.tree().root()), (Some(0), d.as_path()), "to its parent row, not above the root");
         h.key(&mut v, press(Key::Left));
         assert!(!v.tree().is_expanded(&d.join("a")), "then collapses it");
-        assert_eq!(v.tree().root(), d);
+        assert_eq!(v.tree().root(), &*d);
     }
 
     #[test]
@@ -1919,13 +1919,13 @@ mod tests {
     fn picker_confirms_the_clicked_directory_not_the_shown_one() {
         let (d, _) = fixture();
         std::fs::create_dir(d.join("cdir")).unwrap();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        assert_eq!(v.choice(), Some(d.clone()), "with nothing selected, the shown directory");
+        assert_eq!(v.choice(), Some(d.to_path_buf()), "with nothing selected, the shown directory");
         h.mouse(&mut v, MouseEvent::Down { pos: row_centre(0), clicks: 1, button: MouseButton::Left });
         assert_eq!(v.choice(), Some(d.join("adir")), "a click selects without entering");
-        assert_eq!(v.tree().root(), d, "the shown directory is unchanged");
+        assert_eq!(v.tree().root(), &*d, "the shown directory is unchanged");
         // Hover leaves the answer alone; an arrow moves it (adir's empty
         // expansion keeps cdir at row 1).
         h.paint(&mut v, RECT);
@@ -1939,7 +1939,7 @@ mod tests {
     #[test]
     fn file_picker_selects_on_click_and_picks_on_double_click() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert_eq!(v.choice(), None, "nothing selected yet");
@@ -1956,7 +1956,7 @@ mod tests {
     #[test]
     fn file_picker_picks_on_enter() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         h.key(&mut v, press(Key::Down));
@@ -1969,20 +1969,20 @@ mod tests {
     fn only_a_header_field_that_takes_the_mouse_shows_the_text_cursor() {
         let (d, _) = fixture();
         let mut h = Harness::new();
-        let mut pick = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut pick = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         h.paint(&mut pick, RECT);
         let r = pick.field.geom().expect("a picker's field is live").rect;
         h.cursor = (r.x + r.w * 0.5, r.y + r.h * 0.5);
         let icon = |h: &mut Harness, v: &mut FileBrowserView| h.paint(v, RECT).cursor.map(|(_, i)| i);
         assert_eq!(icon(&mut h, &mut pick), Some(winit::window::CursorIcon::Text));
-        let mut save = FileBrowserView::picker(d, Mode::Save);
+        let mut save = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         assert_eq!(icon(&mut h, &mut save), None, "Save's header field is inert");
     }
 
     #[test]
     fn save_types_the_name_into_the_shown_or_selected_directory() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert_eq!(v.choice(), None, "no name yet");
@@ -2001,7 +2001,7 @@ mod tests {
     #[test]
     fn save_arrows_move_the_highlight_and_keep_the_name() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         v.set_name("new.md");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -2018,7 +2018,7 @@ mod tests {
     #[test]
     fn a_failed_save_shows_its_error_until_the_name_changes() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         v.set_name("new.md");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -2041,7 +2041,7 @@ mod tests {
     #[test]
     fn a_file_that_would_not_open_shows_its_error_under_the_listing() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::PickFile);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let file = d.join("b.txt");
@@ -2057,7 +2057,7 @@ mod tests {
     #[test]
     fn save_name_supports_select_all_and_retype() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         v.set_name("draft.txt");
         let h = Harness::new();
         h.key(&mut v, crate::plugin::testing::cmd(Key::Char('a')));
@@ -2078,7 +2078,7 @@ mod tests {
     #[test]
     fn the_save_name_takes_the_mouse() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         v.set_name("draft one.txt");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -2133,7 +2133,7 @@ mod tests {
     #[test]
     fn save_takes_a_clicked_files_name() {
         let (d, _) = fixture();
-        let mut v = FileBrowserView::picker(d.clone(), Mode::Save);
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
         v.set_name("draft.txt");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
@@ -2187,12 +2187,12 @@ mod tests {
         let at = (50.0, 250.0);
         assert_eq!(
             menu(&h, &mut v, at),
-            [Request::FileMenu { target: target(d.clone(), TargetKind::Empty, ()), at, align: MenuAlign::Left }],
+            [Request::FileMenu { target: target(d.to_path_buf(), TargetKind::Empty, ()), at, align: MenuAlign::Left }],
             "below the rows: the folder shown"
         );
         // Outside the list (the header), and in a picker, there is no menu.
         assert!(menu(&h, &mut v, (50.0, 3.0)).is_empty());
-        let mut picker = FileBrowserView::picker(d, Mode::PickFile);
+        let mut picker = FileBrowserView::picker(d.to_path_buf(), Mode::PickFile);
         h.paint(&mut picker, RECT);
         assert!(menu(&h, &mut picker, row_centre(0)).is_empty());
     }
@@ -2212,7 +2212,7 @@ mod tests {
         v.files_changed(&[(chosen.clone(), d.join("renamed.txt"))]);
         assert_eq!(v.subject(), Some(d.join("renamed.txt")));
         let moved = d.with_file_name("moved-root");
-        v.files_changed(&[(d.clone(), moved.clone())]);
+        v.files_changed(&[(d.to_path_buf(), moved.clone())]);
         assert_eq!(v.tree().root(), moved);
     }
 
@@ -2221,7 +2221,7 @@ mod tests {
         let d = tmpdir("fb-reveal");
         std::fs::create_dir_all(d.join("a/b")).unwrap();
         std::fs::write(d.join("a/b/f.txt"), "").unwrap();
-        let mut v = FileBrowserView::new(d.clone());
+        let mut v = FileBrowserView::new(d.to_path_buf());
         v.reveal(&d.join("a/b/f.txt"));
         assert!(v.tree().is_expanded(&d.join("a")) && v.tree().is_expanded(&d.join("a/b")));
         assert_eq!(v.subject(), Some(d.join("a/b/f.txt")));
@@ -2229,13 +2229,13 @@ mod tests {
         let other = tmpdir("fb-reveal-other");
         std::fs::write(other.join("g.txt"), "").unwrap();
         v.reveal(&other.join("g.txt"));
-        assert_eq!(v.tree().root(), other);
+        assert_eq!(v.tree().root(), &*other);
         assert_eq!(v.subject(), Some(other.join("g.txt")));
         Harness::new().paint(&mut v, RECT);
         assert!(v.text().unwrap().contains("g.txt"));
         // Back inside the folder it opened on, the browser goes back there.
         v.reveal(&d.join("a/b/f.txt"));
-        assert_eq!(v.tree().root(), d);
+        assert_eq!(v.tree().root(), &*d);
     }
 
     #[test]
@@ -2279,7 +2279,7 @@ mod tests {
         let waker: Waker = std::sync::Arc::new(move || {
             let _ = tx.lock().unwrap().send(());
         });
-        let mut v = FileBrowserView::new(d.clone()).with_waker(Some(waker));
+        let mut v = FileBrowserView::new(d.to_path_buf()).with_waker(Some(waker));
         let h = Harness::new();
         h.button(&mut v, BTN_GIT_MODIFIED);
         let before = v.text().unwrap();
@@ -2298,7 +2298,7 @@ mod tests {
         for i in 0..50 {
             std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
         }
-        let mut v = FileBrowserView::new(d);
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let out = h.scroll(&mut v, (10.0, 100.0), -30.0);
@@ -2330,7 +2330,7 @@ mod tests {
         let d = tmpdir("fb-guides");
         std::fs::create_dir_all(d.join("a/b/c")).unwrap();
         std::fs::write(d.join("a/b/c/f.txt"), "").unwrap();
-        let mut v = FileBrowserView::new(d.clone());
+        let mut v = FileBrowserView::new(d.to_path_buf());
         v.reveal(&d.join("a/b/c/f.txt"));
         let mut h = Harness::new();
         let frame = h.paint(&mut v, RECT);
@@ -2374,7 +2374,7 @@ mod tests {
         for i in 0..30 {
             std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
         }
-        let mut v = FileBrowserView::new(d);
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let half = (row_height(UI) * 0.5).round();
@@ -2408,7 +2408,7 @@ mod tests {
         std::fs::create_dir(d.join("docs")).unwrap();
         std::fs::write(d.join("docs/GOAL.md"), "").unwrap();
         std::fs::write(d.join("AGENTS.md"), "").unwrap();
-        let mut v = FileBrowserView::new(d.clone());
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let mut h = Harness::new();
         type_in(&mut h, &mut v, "goal");
         let rows = v.tree_mut().rows().to_vec();
@@ -2432,7 +2432,7 @@ mod tests {
         let d = tmpdir("fb-smart-case");
         std::fs::write(d.join("Goal.md"), "").unwrap();
         std::fs::write(d.join("gold.txt"), "").unwrap();
-        let mut v = FileBrowserView::new(d.clone());
+        let mut v = FileBrowserView::new(d.to_path_buf());
         let mut h = Harness::new();
         let names = |v: &mut FileBrowserView| {
             let mut n: Vec<String> = v.tree_mut().rows().iter().map(|r| file_name(&r.path)).collect();
@@ -2533,7 +2533,7 @@ mod tests {
         v.tree_mut().refresh();
         assert_eq!(v.empty_note().as_deref(), Some("No matching files"));
 
-        let mut pick = FileBrowserView::picker(d.clone(), Mode::PickDir);
+        let mut pick = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
         type_in(&mut h, &mut pick, "zzz");
         assert_eq!(pick.empty_note().as_deref(), Some("No matching folders"));
     }

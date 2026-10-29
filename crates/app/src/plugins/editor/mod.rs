@@ -2431,7 +2431,8 @@ mod tests {
     #[test]
     fn the_statistic_ends_where_the_disk_button_begins_and_cycles_on_click() {
         let mut v = hosted(view_with("one two"));
-        v.buf.path = Some(tmpdir("editor-stat").join("f.txt"));
+        let tmp = tmpdir("editor-stat");
+        v.buf.path = Some(tmp.join("f.txt"));
         let mut h = Harness::new();
         let buttons = paint_plain(&mut h, &mut v).view_buttons.clone();
         let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
@@ -2444,7 +2445,8 @@ mod tests {
 
     #[test]
     fn the_headers_file_name_opens_the_file_menu_and_so_does_a_right_click_on_the_header() {
-        let path = tmpdir("editor-menu").join("f.txt");
+        let tmp = tmpdir("editor-menu");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "x
 ").unwrap();
         let mut v = hosted(EditorView::new(EditorBuffer::open(path.clone()).unwrap()));
@@ -2471,7 +2473,8 @@ mod tests {
 
     #[test]
     fn the_headers_more_button_lists_every_option_checked_as_it_stands() {
-        let path = tmpdir("editor-more").join("f.txt");
+        let tmp = tmpdir("editor-more");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "x\n").unwrap();
         let mut v = hosted(EditorView::new(EditorBuffer::open(path.clone()).unwrap()));
         let mut h = Harness::new();
@@ -2540,7 +2543,8 @@ mod tests {
         let frame = paint_plain(&mut h, &mut v);
         assert!(frame.view_buttons.iter().all(|b| b.2 != BTN_NAME), "no file, no menu");
         assert!(h.context_menu(&mut v, (RECT.w - 2.0, 3.0)).requests.is_empty());
-        let path = tmpdir("editor-menu-strip").join("f.txt");
+        let tmp = tmpdir("editor-menu-strip");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "x
 ").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
@@ -2616,7 +2620,8 @@ mod tests {
 
     #[test]
     fn a_file_that_vanishes_is_neither_reloaded_nor_marked() {
-        let path = tmpdir("editor-on-disk-gone").join("f.txt");
+        let tmp = tmpdir("editor-on-disk-gone");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "a\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.buffer_mut().insert_str("b");
@@ -2754,7 +2759,8 @@ mod tests {
 
     #[test]
     fn cmd_s_saves_and_reports_the_file() {
-        let path = tmpdir("editor-save").join("f.txt");
+        let tmp = tmpdir("editor-save");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         h.key(&mut v, press(Key::Char('x')));
@@ -2768,18 +2774,19 @@ mod tests {
 
     /// An editor with unsaved text "x" whose file another program then
     /// rewrote.
-    fn conflicted(name: &str) -> (EditorView, PathBuf) {
-        let path = tmpdir(name).join("f.txt");
+    fn conflicted(name: &str) -> (EditorView, PathBuf, crate::plugin::testing::TmpDir) {
+        let dir = tmpdir(name);
+        let path = dir.join("f.txt");
         std::fs::write(&path, "disk\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.buffer_mut().insert_str("x");
         std::fs::write(&path, "someone else's\n").unwrap();
-        (v, path)
+        (v, path, dir)
     }
 
     #[test]
     fn cmd_s_over_a_file_changed_on_disk_asks_instead_of_writing() {
-        let (mut v, path) = conflicted("editor-save-conflict");
+        let (mut v, path, _dir) = conflicted("editor-save-conflict");
         let h = Harness::new();
         let (used, out) = h.key(&mut v, cmd(Key::Char('s')));
         assert!(used);
@@ -2790,7 +2797,8 @@ mod tests {
 
     #[test]
     fn a_failed_autosave_is_an_error_and_keeps_the_edits() {
-        let path = tmpdir("editor-autosave-readonly").join("f.txt");
+        let tmp = tmpdir("editor-autosave-readonly");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "disk\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.buffer_mut().insert_str("x");
@@ -2805,7 +2813,8 @@ mod tests {
 
     #[test]
     fn a_failed_save_or_autosave_raises_one_keyed_toast_and_keeps_the_edits() {
-        let path = tmpdir("editor-save-toast").join("f.txt");
+        let tmp = tmpdir("editor-save-toast");
+        let path = tmp.join("f.txt");
         std::fs::write(&path, "disk\n").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         v.buffer_mut().insert_str("x");
@@ -2834,7 +2843,7 @@ mod tests {
 
     #[test]
     fn autosave_skips_a_file_changed_on_disk_and_keeps_the_edits() {
-        let (mut v, path) = conflicted("editor-autosave-conflict");
+        let (mut v, path, _dir) = conflicted("editor-autosave-conflict");
         let h = Harness::new();
         let out = h.focus(&mut v, false);
         assert!(out.requests.is_empty(), "no save on blur");
@@ -2870,7 +2879,7 @@ mod tests {
 
     #[test]
     fn undo_keeps_the_mark_while_the_file_changed_under_unsaved_edits() {
-        let (mut v, path) = conflicted("editor-undo-conflict");
+        let (mut v, path, _dir) = conflicted("editor-undo-conflict");
         assert!(v.changed_on_disk(&path), "the mark appears");
         v.buffer_mut().undo();
         assert!(v.marked_changed_on_disk() && v.disk_conflict(), "the file still isn't what the buffer read");
@@ -2897,7 +2906,7 @@ mod tests {
 
     #[test]
     fn saving_a_file_deleted_on_disk_recreates_it_without_asking() {
-        let (mut v, path) = conflicted("editor-save-deleted");
+        let (mut v, path, _dir) = conflicted("editor-save-deleted");
         std::fs::remove_file(&path).unwrap();
         let h = Harness::new();
         let (_, out) = h.key(&mut v, cmd(Key::Char('s')));
@@ -2908,7 +2917,7 @@ mod tests {
 
     #[test]
     fn a_save_is_not_a_conflict_with_itself() {
-        let (mut v, path) = conflicted("editor-save-twice");
+        let (mut v, path, _dir) = conflicted("editor-save-twice");
         v.reload().unwrap();
         v.buffer_mut().insert_str("y");
         let h = Harness::new();
@@ -2929,7 +2938,8 @@ mod tests {
 
     #[test]
     fn cmd_shift_s_asks_where_even_with_a_file() {
-        let path = tmpdir("editor-save-as").join("f.txt");
+        let tmp = tmpdir("editor-save-as");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
         let h = Harness::new();
         let mut k = cmd(Key::Char('S'));
@@ -2940,7 +2950,8 @@ mod tests {
 
     #[test]
     fn save_as_writes_and_adopts_the_file() {
-        let path = tmpdir("editor-save-as").join("sub").join("new.txt");
+        let tmp = tmpdir("editor-save-as");
+        let path = tmp.join("sub").join("new.txt");
         let mut v = view_with("hello");
         v.save_as(path.clone()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
@@ -2956,7 +2967,7 @@ mod tests {
         std::fs::write(&old, "x").unwrap();
         let mut v = EditorView::new(EditorBuffer::open(old.clone()).unwrap());
         // A directory can't be written as a file.
-        assert!(v.save_as(dir.clone()).is_err());
+        assert!(v.save_as(dir.to_path_buf()).is_err());
         assert_eq!(v.path(), Some(old));
     }
 
@@ -3016,10 +3027,11 @@ mod tests {
         }
     }
 
-    fn markdown_view(tag: &str, text: &str) -> EditorView {
-        let path = tmpdir(tag).join("doc.md");
+    fn markdown_view(tag: &str, text: &str) -> (crate::plugin::testing::TmpDir, EditorView) {
+        let dir = tmpdir(tag);
+        let path = dir.join("doc.md");
         std::fs::write(&path, text).unwrap();
-        EditorView::new(EditorBuffer::open(path).unwrap())
+        (dir, EditorView::new(EditorBuffer::open(path).unwrap()))
     }
 
     /// The bg quads of a painted frame as pixel rects `(x, y, w, h)`.
@@ -3049,7 +3061,7 @@ mod tests {
     fn plain_markdown_rows_draw_exactly_as_unhighlighted_ones() {
         let mut h = Harness::new();
         let text = "hello world\n- item one\n> quote";
-        let mut md = markdown_view("editor-md-plain", text);
+        let (_md_dir, mut md) = markdown_view("editor-md-plain", text);
         paint_plain(&mut h, &mut md);
         let md_quads = bg_rects(&h).len();
         let row0 = text_item(&h, 0);
@@ -3066,11 +3078,11 @@ mod tests {
     #[test]
     fn markdown_styles_draw_underline_and_code_box_quads_and_keep_the_markers() {
         let mut h = Harness::new();
-        let mut plain = markdown_view("editor-md-plain2", "see the docs now");
+        let (_plain_dir, mut plain) = markdown_view("editor-md-plain2", "see the docs now");
         paint_plain(&mut h, &mut plain);
         let base = bg_rects(&h);
 
-        let mut v = markdown_view("editor-md-link", "see [the docs](u) now");
+        let (_v_dir, mut v) = markdown_view("editor-md-link", "see [the docs](u) now");
         paint_plain(&mut h, &mut v);
         let got = bg_rects(&h);
         // "the docs" starts at column 5 and is 8 cells wide; the underline is a thin quad at the row bottom.
@@ -3082,7 +3094,7 @@ mod tests {
         // The markup is still in the document and drawn: the whole line is shaped text.
         assert_eq!(v.buffer().lines[0], "see [the docs](u) now");
 
-        let mut v = markdown_view("editor-md-code", "a `code` b");
+        let (_v_dir, mut v) = markdown_view("editor-md-code", "a `code` b");
         paint_plain(&mut h, &mut v);
         let boxes: Vec<_> = bg_rects(&h).into_iter().filter(|r| !base.contains(r) && r.3 > 3.0).collect();
         assert_eq!(boxes.len(), 1, "{boxes:?}");
@@ -3105,7 +3117,7 @@ mod tests {
     #[test]
     fn a_fenced_block_is_one_box_over_its_rows_with_its_language_colours() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-fence", "text\n```toml\nname = 1\n```\nafter `x`");
+        let (_v_dir, mut v) = markdown_view("editor-md-fence", "text\n```toml\nname = 1\n```\nafter `x`");
         paint_plain(&mut h, &mut v);
         let (text_x, ch, line) = (4.0 * UI.cell_w, UI.cell_h, theme::hairline(UI));
         let boxes = code_boxes(&h);
@@ -3126,7 +3138,7 @@ mod tests {
     fn adjacent_blocks_and_wrapped_rows_box_by_block() {
         let mut h = Harness::new();
         let long = "x".repeat(60);
-        let mut v = markdown_view("editor-md-fences", &format!("```\n{long}\n```\n```\nb\n```"));
+        let (_v_dir, mut v) = markdown_view("editor-md-fences", &format!("```\n{long}\n```\n```\nb\n```"));
         v.soft_wrap = Some(true);
         paint_plain(&mut h, &mut v);
         let ch = UI.cell_h;
@@ -3138,7 +3150,7 @@ mod tests {
     #[test]
     fn with_the_rail_on_screen_boxes_copy_buttons_and_selections_start_at_the_text() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-rail", "text\n```\ncode\n```");
+        let (_v_dir, mut v) = markdown_view("editor-md-rail", "text\n```\ncode\n```");
         h.paint(&mut v, RECT);
         let rail = toc::rail_w(UI, RECT, true);
         let text_x = rail + 4.0 * UI.cell_w;
@@ -3160,7 +3172,7 @@ mod tests {
     fn a_block_past_the_viewport_is_open_at_that_edge() {
         let mut h = Harness::new();
         let body: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
-        let mut v = markdown_view("editor-md-fence-open", &format!("text\n```\n{}\n```\n", body.join("\n")));
+        let (_v_dir, mut v) = markdown_view("editor-md-fence-open", &format!("text\n```\n{}\n```\n", body.join("\n")));
         // Starts on screen and runs past its bottom.
         paint_plain(&mut h, &mut v);
         let b = code_boxes(&h)[0];
@@ -3201,7 +3213,7 @@ mod tests {
     #[test]
     fn a_blocks_copy_button_shows_on_hover_over_the_text_and_copies_its_body() {
         let text = "text\n```toml\nname = 1\n\nb = 2\n```\n- ```\n  a\n    b\n  ```\n> ```py\n> >>> 1+1\n> ```\n  ```\n      x\n  ```\n```\nopen\n\n";
-        let mut v = markdown_view("editor-md-copy", text);
+        let (_v_dir, mut v) = markdown_view("editor-md-copy", text);
         let mut h = Harness::new();
         let tall = Rect { h: 400.0, ..RECT };
         h.paint(&mut v, tall);
@@ -3251,7 +3263,7 @@ mod tests {
 
     #[test]
     fn the_copy_pill_layers_the_box_look_over_an_opaque_base_after_the_caret() {
-        let mut v = markdown_view("editor-md-pill", "```\na\n```");
+        let (_v_dir, mut v) = markdown_view("editor-md-pill", "```\na\n```");
         let mut h = Harness::new();
         paint_plain(&mut h, &mut v);
         assert!(pill_colors(&h).is_empty(), "no pill while the pointer is away");
@@ -3271,12 +3283,12 @@ mod tests {
     #[test]
     fn a_blank_bodied_or_quoted_unclosed_block_trims_as_its_copy_does() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-blank-body", "```\n  \n```\n");
+        let (_v_dir, mut v) = markdown_view("editor-md-blank-body", "```\n  \n```\n");
         h.cursor = at(1, 0);
         paint_plain(&mut h, &mut v);
         assert!(copy_buttons(&h).is_empty(), "a body of blank rows has nothing to copy");
         // An unclosed quoted block ends at its last row with text, `>` aside.
-        let mut v = markdown_view("editor-md-quoted-open", "> ```\n> a\n>\n> \nafter");
+        let (_v_dir, mut v) = markdown_view("editor-md-quoted-open", "> ```\n> a\n>\n> \nafter");
         paint_plain(&mut h, &mut v);
         let b = code_boxes(&h)[0];
         assert_eq!(((b.1 + b.3) / UI.cell_h).round(), 2.0, "{b:?}");
@@ -3285,7 +3297,7 @@ mod tests {
 
     #[test]
     fn a_move_compares_with_the_block_last_painted_as_hovered() {
-        let mut v = markdown_view("editor-md-hover-painted", "```\na\n```\nafter");
+        let (_v_dir, mut v) = markdown_view("editor-md-hover-painted", "```\na\n```\nafter");
         let mut h = Harness::new();
         h.cursor = at(1, 0);
         paint_plain(&mut h, &mut v);
@@ -3297,7 +3309,7 @@ mod tests {
 
     #[test]
     fn copying_shows_a_check_mark_until_its_deadline() {
-        let mut v = markdown_view("editor-md-copied", "```\na\n```");
+        let (_v_dir, mut v) = markdown_view("editor-md-copied", "```\na\n```");
         let mut h = Harness::new();
         h.cursor = at(1, 0);
         paint_plain(&mut h, &mut v);
@@ -3319,7 +3331,7 @@ mod tests {
     #[test]
     fn an_empty_block_has_no_copy_button_and_crlf_rows_copy_without_cr() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-copy-empty", "```\n```\n");
+        let (_v_dir, mut v) = markdown_view("editor-md-copy-empty", "```\n```\n");
         h.cursor = at(0, 1);
         paint_plain(&mut h, &mut v);
         assert!(copy_buttons(&h).is_empty());
@@ -3327,13 +3339,13 @@ mod tests {
         h.button(&mut v, BTN_COPY_BLOCK);
         assert_eq!(h.clipboard.borrow().as_deref(), Some("kept"), "nothing to copy");
 
-        let mut v = markdown_view("editor-md-copy-crlf", "```\r\na\r\nb\r\n```\r\n");
+        let (_v_dir, mut v) = markdown_view("editor-md-copy-crlf", "```\r\na\r\nb\r\n```\r\n");
         assert_eq!(copy_at(&mut h, &mut v, RECT, at(1, 0)).as_deref(), Some("a\nb"));
     }
 
     #[test]
     fn hovering_into_and_out_of_a_block_repaints() {
-        let mut v = markdown_view("editor-md-hover", "text\n```\na\n```\nafter");
+        let (_v_dir, mut v) = markdown_view("editor-md-hover", "text\n```\na\n```\nafter");
         let mut h = Harness::new();
         paint_plain(&mut h, &mut v);
         assert!(h.mouse(&mut v, MouseEvent::Move { pos: at(2, 0) }).redraw, "into the block");
@@ -3347,7 +3359,7 @@ mod tests {
     fn with_line_numbers_off_a_blocks_left_edge_shows() {
         let mut h = Harness::new();
         h.cfg.editor.line_numbers = LineNumbers::Off;
-        let mut v = markdown_view("editor-md-no-gutter", "```\na\n```");
+        let (_v_dir, mut v) = markdown_view("editor-md-no-gutter", "```\na\n```");
         paint_plain(&mut h, &mut v);
         let pad = (UI.cell_w * 0.5).round();
         assert_eq!(v.layout.text_x, pad, "the text leaves room for the box's edge");
@@ -3539,7 +3551,8 @@ mod tests {
 
     #[test]
     fn save_as_elsewhere_stops_the_language_service() {
-        let path = tmpdir("editor-save-as-lang").join("copy.toml");
+        let tmp = tmpdir("editor-save-as-lang");
+        let path = tmp.join("copy.toml");
         let mut v = attached("bad\n");
         v.save_as(path).unwrap();
         assert!(v.lang().is_none());
@@ -3556,7 +3569,8 @@ mod tests {
 
     #[test]
     fn idle_autosave_arms_on_edit_and_fires_after_the_delay() {
-        let path = tmpdir("editor-idle").join("f.txt");
+        let tmp = tmpdir("editor-idle");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         assert_eq!(v.deadline(&h.cfg), None, "nothing to save yet");
@@ -3571,7 +3585,8 @@ mod tests {
 
     #[test]
     fn losing_focus_autosaves() {
-        let path = tmpdir("editor-blur").join("f.txt");
+        let tmp = tmpdir("editor-blur");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         h.key(&mut v, press(Key::Char('z')));
@@ -3581,7 +3596,8 @@ mod tests {
 
     #[test]
     fn the_autosave_toggle_stops_idle_and_unfocus_saves() {
-        let path = tmpdir("editor-autosave-off").join("f.txt");
+        let tmp = tmpdir("editor-autosave-off");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let h = Harness::new();
         assert!(v.autosave_on(&h.cfg), "the config's default is on");
@@ -3595,7 +3611,8 @@ mod tests {
 
     #[test]
     fn switching_autosave_on_works_even_when_the_config_has_it_off() {
-        let path = tmpdir("editor-autosave-on").join("f.txt");
+        let tmp = tmpdir("editor-autosave-on");
+        let path = tmp.join("f.txt");
         let mut v = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
         let mut h = Harness::new();
         h.cfg.editor.autosave_after = 0;
@@ -3638,10 +3655,11 @@ mod tests {
     }
 
     /// A view of `text` saved as `name` (its extension picks the highlighter).
-    fn file_view(tag: &str, name: &str, text: &str) -> EditorView {
-        let path = tmpdir(tag).join(name);
+    fn file_view(tag: &str, name: &str, text: &str) -> (crate::plugin::testing::TmpDir, EditorView) {
+        let dir = tmpdir(tag);
+        let path = dir.join(name);
         std::fs::write(&path, text).unwrap();
-        EditorView::new(EditorBuffer::open(path).unwrap())
+        (dir, EditorView::new(EditorBuffer::open(path).unwrap()))
     }
 
     /// The text column's items as `(top, scale)`, top to bottom.
@@ -3698,7 +3716,7 @@ mod tests {
     #[test]
     fn an_integrated_heading_has_its_configured_space_above_it() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-space", "body\n# Title\nmore");
+        let (_v_dir, mut v) = markdown_view("editor-md-space", "body\n# Title\nmore");
         paint_plain(&mut h, &mut v);
         let d = Headings::default();
         // In ems of the editor's font size (the harness's is 14 px).
@@ -3735,7 +3753,7 @@ mod tests {
     #[test]
     fn a_reloaded_config_resizes_integrated_headings() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-reload", "body\n## Sub\nmore");
+        let (_v_dir, mut v) = markdown_view("editor-md-reload", "body\n## Sub\nmore");
         paint_plain(&mut h, &mut v);
         assert_eq!(text_rows(&h)[1], (UI.cell_h, SIZED.h2_scale));
         h.cfg.headings = Headings { h2_scale: 2.5, h2_space: 2.0, ..SIZED };
@@ -3753,7 +3771,7 @@ mod tests {
     #[test]
     fn heading_rows_draw_larger_and_push_the_rows_below_down() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-sized", "# Title\n## Sub\nbody\n### Three\n##### Five");
+        let (_v_dir, mut v) = markdown_view("editor-md-sized", "# Title\n## Sub\nbody\n### Three\n##### Five");
         paint_plain(&mut h, &mut v);
         let y2 = R1 + R2;
         assert_eq!(
@@ -3766,7 +3784,7 @@ mod tests {
     #[test]
     fn a_line_number_beside_a_heading_is_base_size_on_its_baseline() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-gutter", "# Title\nbody");
+        let (_v_dir, mut v) = markdown_view("editor-md-gutter", "# Title\nbody");
         paint_plain(&mut h, &mut v);
         let text_x = 4.0 * UI.cell_w;
         let nums: Vec<&crate::plugin::TextItem> = h.frame.text.iter().filter(|t| t.left < text_x).collect();
@@ -3788,7 +3806,7 @@ mod tests {
     #[test]
     fn a_click_on_a_heading_row_maps_through_its_scaled_columns() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-click", "# Title here\nbody text");
+        let (_v_dir, mut v) = markdown_view("editor-md-click", "# Title here\nbody text");
         paint_plain(&mut h, &mut v);
         let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
         let down = |h: &mut Harness, v: &mut EditorView, pos| {
@@ -3812,7 +3830,7 @@ mod tests {
     #[test]
     fn a_squiggle_scrolled_partly_out_of_view_keeps_its_phase() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-squiggle-scroll", &format!("# ok bad {}\nbody", "x".repeat(300)));
+        let (_v_dir, mut v) = markdown_view("editor-md-squiggle-scroll", &format!("# ok bad {}\nbody", "x".repeat(300)));
         v.attach(Client::in_process(Flags, None), "markdown");
         settle(&mut v);
         v.soft_wrap = Some(false);
@@ -3838,7 +3856,7 @@ mod tests {
     #[test]
     fn caret_selection_and_diagnostics_on_a_heading_measure_its_cells() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-caret", "# ok bad\nbody");
+        let (_v_dir, mut v) = markdown_view("editor-md-caret", "# ok bad\nbody");
         v.attach(Client::in_process(Flags, None), "markdown");
         settle(&mut v);
         v.buf.anchor = Some((0, 2));
@@ -3863,7 +3881,7 @@ mod tests {
         let mut h = heading_harness();
         // Eleven body rows (176px), then an H1 row running 5px past the 200px body.
         let text = format!("{}# ok bad", "x\n".repeat(11));
-        let mut v = markdown_view("editor-md-clip", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-clip", &text);
         v.attach(Client::in_process(Flags, None), "markdown");
         settle(&mut v);
         v.buf.anchor = Some((11, 2));
@@ -3909,7 +3927,7 @@ mod tests {
     fn following_the_cursor_fits_tall_rows() {
         let mut h = heading_harness();
         let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
-        let mut v = markdown_view("editor-md-follow", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-follow", &text);
         paint_plain(&mut h, &mut v);
         v.buf.cursor = (10, 0);
         paint_plain(&mut h, &mut v);
@@ -3924,7 +3942,7 @@ mod tests {
         let mut h = heading_harness();
         // 62 chars: 2 rows at 46 base columns, 3 at H1's 25 (breaking after a space).
         let line = format!("# {}", "word ".repeat(12));
-        let mut v = markdown_view("editor-md-wrap", &format!("{line}\nx"));
+        let (_v_dir, mut v) = markdown_view("editor-md-wrap", &format!("{line}\nx"));
         v.soft_wrap = Some(true);
         paint_plain(&mut h, &mut v);
         assert_eq!(v.layout.rows.cols(H1), 25);
@@ -3940,7 +3958,7 @@ mod tests {
     #[test]
     fn a_scaled_row_scrolled_sideways_measures_scaled_columns() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-hscroll", "# heading long line\nplain");
+        let (_v_dir, mut v) = markdown_view("editor-md-hscroll", "# heading long line\nplain");
         v.soft_wrap = Some(false);
         v.buf.hscroll = 2;
         v.buf.anchor = Some((0, 4));
@@ -3962,7 +3980,7 @@ mod tests {
     #[test]
     fn up_and_down_keep_the_carets_x_across_row_sizes() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-updown", "# Title here\nbody text that runs on\nmore text here");
+        let (_v_dir, mut v) = markdown_view("editor-md-updown", "# Title here\nbody text that runs on\nmore text here");
         paint_plain(&mut h, &mut v);
         v.buf.cursor = (0, 5);
         // Column 5 at H1 is 72px in: column 9 of a body row.
@@ -3998,7 +4016,7 @@ another long line");
     #[test]
     fn a_run_through_a_heading_returns_to_its_column_without_snapping() {
         let mut h = Harness::new();
-        let mut v = markdown_view("editor-md-goal", "body text here
+        let (_v_dir, mut v) = markdown_view("editor-md-goal", "body text here
 # Title here
 body text here");
         paint_plain(&mut h, &mut v);
@@ -4013,7 +4031,7 @@ body text here");
     #[test]
     fn a_caret_scrolled_off_to_the_left_keeps_its_offset() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-goal-left", "# Title here at length
+        let (_v_dir, mut v) = markdown_view("editor-md-goal-left", "# Title here at length
 body text here at length");
         v.soft_wrap = Some(false);
         paint_plain(&mut h, &mut v);
@@ -4041,7 +4059,7 @@ short line here", "x".repeat(60)));
     fn scrolling_up_past_a_heading_takes_its_rows_height() {
         let h = heading_harness();
         let mut hh = heading_harness();
-        let mut v = markdown_view("editor-md-wheel-mixed", &"body
+        let (_v_dir, mut v) = markdown_view("editor-md-wheel-mixed", &"body
 # H
 body
 ".repeat(5));
@@ -4067,7 +4085,7 @@ body
         let h = heading_harness();
         let mut hh = heading_harness();
         let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
-        let mut v = markdown_view("editor-md-wheel", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-wheel", &text);
         paint_plain(&mut hh, &mut v);
         h.scroll(&mut v, (10.0, 10.0), -UI.cell_h);
         assert_eq!(v.buffer().scroll, 0, "a base row's travel doesn't pass an H1 row");
@@ -4076,7 +4094,7 @@ body
         h.scroll(&mut v, (10.0, 10.0), R1);
         assert_eq!(v.buffer().scroll, 0, "and back");
         // Base rows move a line per cell.
-        let mut plain = markdown_view("editor-md-wheel-plain", &"x\n".repeat(20));
+        let (_plain_dir, mut plain) = markdown_view("editor-md-wheel-plain", &"x\n".repeat(20));
         paint_plain(&mut hh, &mut plain);
         h.scroll(&mut plain, (10.0, 10.0), -2.0 * UI.cell_h);
         assert_eq!(plain.buffer().scroll, 2);
@@ -4094,7 +4112,7 @@ body
     #[test]
     fn the_wheel_passes_a_headings_space_as_the_text_moves() {
         let mut h = spaced_harness();
-        let mut v = markdown_view("editor-md-wheel-space", &format!("x\n# Head\n{}", "y\n".repeat(20)));
+        let (_v_dir, mut v) = markdown_view("editor-md-wheel-space", &format!("x\n# Head\n{}", "y\n".repeat(20)));
         paint_plain(&mut h, &mut v);
         assert_eq!(text_rows(&h).into_iter().map(|r| r.0).take(2).collect::<Vec<_>>(), [0.0, UI.cell_h + SPACE1]);
         let at = (10.0, 10.0);
@@ -4118,7 +4136,7 @@ body
     #[test]
     fn centring_the_caret_counts_spaces_below_the_top_line_only() {
         let mut h = spaced_harness();
-        let mut v = markdown_view("editor-md-centre-space", "# A\nb\n# C\nd\n# E\nf\n# G\nh\n# I\nj");
+        let (_v_dir, mut v) = markdown_view("editor-md-centre-space", "# A\nb\n# C\nd\n# E\nf\n# G\nh\n# I\nj");
         v.reveal(7, 0..0);
         paint_plain(&mut h, &mut v);
         // Above half of "h" (8 of the 100 px): G's row (29), f's row and G's
@@ -4132,7 +4150,7 @@ body
     fn following_the_cursor_counts_the_space_below_the_top_line() {
         let mut h = spaced_harness();
         let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
-        let mut v = markdown_view("editor-md-follow-space", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-follow-space", &text);
         paint_plain(&mut h, &mut v);
         v.buf.cursor = (10, 0);
         paint_plain(&mut h, &mut v);
@@ -4147,7 +4165,7 @@ body
         let mut h = spaced_harness();
         // Twelve body rows fill 192 of the 200 px; the heading's space runs past.
         let text = format!("{}# Head\nafter\nend", "x\n".repeat(12));
-        let mut v = markdown_view("editor-md-space-bottom", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-space-bottom", &text);
         paint_plain(&mut h, &mut v);
         let pos = (4.0 * UI.cell_w + 1.0, 196.0);
         h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
@@ -4159,7 +4177,7 @@ body
     fn a_wrapped_heading_has_its_space_above_its_first_row_only() {
         let mut h = spaced_harness();
         let line = format!("# {}", "word ".repeat(12));
-        let mut v = markdown_view("editor-md-wrap-space", &format!("x\n{line}\ny"));
+        let (_v_dir, mut v) = markdown_view("editor-md-wrap-space", &format!("x\n{line}\ny"));
         v.soft_wrap = Some(true);
         paint_plain(&mut h, &mut v);
         let top = UI.cell_h + SPACE1;
@@ -4180,7 +4198,7 @@ body
     #[test]
     fn code_boxes_sit_on_their_rows_below_a_heading() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-boxes", "# Head\ntext `x`\n```\ncode\n```");
+        let (_v_dir, mut v) = markdown_view("editor-md-boxes", "# Head\ntext `x`\n```\ncode\n```");
         paint_plain(&mut h, &mut v);
         let (ch, line) = (UI.cell_h, theme::hairline(UI));
         let fence = R1 + ch;
@@ -4196,7 +4214,7 @@ body
     #[test]
     fn toml_tables_draw_by_their_level() {
         let mut h = heading_harness();
-        let mut v = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]\n  [1, 2],");
+        let (_v_dir, mut v) = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]\n  [1, 2],");
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
         assert_eq!(scales, vec![H1, 1.0, H2, H2, 1.25, 1.0]);
@@ -4205,7 +4223,7 @@ body
     #[test]
     fn hashes_in_a_fence_quote_or_list_are_not_headings() {
         let mut h = heading_harness();
-        let mut v = markdown_view("editor-md-nested", "```\n# code\n```\n> # quoted\n- # item\n# real");
+        let (_v_dir, mut v) = markdown_view("editor-md-nested", "```\n# code\n```\n> # quoted\n- # item\n# real");
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
         assert_eq!(scales, vec![1.0, 1.0, 1.0, 1.0, 1.0, H1]);
@@ -4219,7 +4237,8 @@ body
     #[test]
     fn the_mode_button_steps_through_the_modes_the_language_offers() {
         let mut h = Harness::new();
-        let mut v = hosted(file_view("editor-modes-toml", "a.toml", "[a]\nk = 1\n"));
+        let (_v_dir, v) = file_view("editor-modes-toml", "a.toml", "[a]\nk = 1\n");
+        let mut v = hosted(v);
         assert_eq!(v.view_mode(), ViewMode::Integrated, "a highlighted file opens formatted");
         let b = mode_button(&mut h, &mut v).expect("a mode button");
         let more = h.frame.view_buttons.iter().find(|b| b.2 == BTN_MORE).unwrap().0;
@@ -4239,7 +4258,8 @@ body
         h.button(&mut v, BTN_SHOW_MODE + 1);
         assert_eq!(v.view_mode(), ViewMode::Integrated);
         // A file with no highlighter has only its source: no button, no items.
-        let mut plain = hosted(file_view("editor-modes-txt", "a.txt", "x"));
+        let (_plain_dir, plain) = file_view("editor-modes-txt", "a.txt", "x");
+        let mut plain = hosted(plain);
         assert_eq!(plain.view_mode(), ViewMode::Source);
         assert!(mode_button(&mut h, &mut plain).is_none());
         let out = h.button(&mut plain, BTN_MORE);
@@ -4258,7 +4278,8 @@ body
     #[test]
     fn header_icons_are_the_configured_options_in_order_and_the_menu_keeps_every_option() {
         let mut h = Harness::new();
-        let mut v = hosted(markdown_view("editor-header-icons", "# a\n"));
+        let (_v_dir, v) = markdown_view("editor-header-icons", "# a\n");
+        let mut v = hosted(v);
         assert_eq!(
             header_controls(&mut h, &mut v),
             [BTN_STAT, BTN_AUTOSAVE, BTN_WRAP, BTN_VIEW_MODE, BTN_MORE],
@@ -4306,7 +4327,7 @@ body
     fn source_draws_every_row_plain_at_one_size_with_no_boxes() {
         let mut h = Harness::new();
         let text = "# Title\n**bold** `code` [l](u)\n```\nx\n```\nend";
-        let mut v = markdown_view("editor-md-source", text);
+        let (_v_dir, mut v) = markdown_view("editor-md-source", text);
         paint_plain(&mut h, &mut v);
         assert!(text_rows(&h).iter().any(|r| r.1 > 1.0));
         assert!(!code_boxes(&h).is_empty());
@@ -4331,7 +4352,7 @@ body
     fn switching_between_integrated_and_source_keeps_the_top_line() {
         let mut h = Harness::new();
         let text: String = (0..60).map(|i| if i % 5 == 0 { format!("# H{i}\n") } else { format!("line {i}\n") }).collect();
-        let mut v = markdown_view("editor-md-switch", &text);
+        let (_v_dir, mut v) = markdown_view("editor-md-switch", &text);
         v.buf.scroll = 23;
         paint_plain(&mut h, &mut v);
         v.cycle_view_mode();

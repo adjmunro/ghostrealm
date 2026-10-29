@@ -383,10 +383,11 @@ mod tests {
 
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 };
 
-    fn doc(tag: &str, name: &str, text: &str) -> EditorView {
-        let path = tmpdir(tag).join(name);
+    fn doc(tag: &str, name: &str, text: &str) -> (crate::plugin::testing::TmpDir, EditorView) {
+        let dir = tmpdir(tag);
+        let path = dir.join(name);
         std::fs::write(&path, text).unwrap();
-        EditorView::new(EditorBuffer::open(path).unwrap())
+        (dir, EditorView::new(EditorBuffer::open(path).unwrap()))
     }
 
     /// Headings of levels 1 to 5, each followed by `gap` lines of text.
@@ -442,17 +443,17 @@ mod tests {
     #[test]
     fn fewer_than_two_headings_show_no_dashes_but_keep_the_rail() {
         let mut h = Harness::new();
-        let mut v = doc("toc-one", "doc.md", "# Only\ntext\n```\n## code\n```\n");
+        let (_v_dir, mut v) = doc("toc-one", "doc.md", "# Only\ntext\n```\n## code\n```\n");
         h.paint(&mut v, RECT);
         assert!(buttons(&h).is_empty());
         assert!(dashes(&h).is_empty());
         let rail = (RAIL_CELLS * UI.cell_w).round();
         assert_eq!(text_x(&h), rail + 4.0 * UI.cell_w, "the rail stays for a language with headings");
-        let mut v = doc("toc-plain", "doc.txt", "# a\n# b\n");
+        let (_v_dir, mut v) = doc("toc-plain", "doc.txt", "# a\n# b\n");
         h.paint(&mut v, RECT);
         assert!(buttons(&h).is_empty(), "a file with no highlighter has no outline");
         assert_eq!(text_x(&h), 4.0 * UI.cell_w, "nor a rail");
-        let mut v = doc("toc-narrow", "doc.md", &sections(2));
+        let (_v_dir, mut v) = doc("toc-narrow", "doc.md", &sections(2));
         h.paint(&mut v, Rect { w: MIN_COLS * UI.cell_w - 1.0, ..RECT });
         assert!(buttons(&h).is_empty(), "too narrow");
         assert_eq!(text_x(&h), 4.0 * UI.cell_w);
@@ -461,7 +462,7 @@ mod tests {
     #[test]
     fn a_second_heading_brings_the_dashes_without_moving_the_text() {
         let mut h = Harness::new();
-        let mut v = doc("toc-second", "doc.md", "# One\ntext\n");
+        let (_v_dir, mut v) = doc("toc-second", "doc.md", "# One\ntext\n");
         h.paint(&mut v, RECT);
         let before = text_x(&h);
         let b = v.buffer_mut();
@@ -481,7 +482,7 @@ mod tests {
     #[test]
     fn collapsed_dashes_narrow_by_level_and_the_current_section_follows_the_scroll() {
         let mut h = Harness::new();
-        let mut v = doc("toc-dashes", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-dashes", "doc.md", &sections(20));
         h.paint(&mut v, RECT);
         let widths: Vec<f32> = dashes(&h).iter().map(|d| d.0).collect();
         assert_eq!(widths, [12.0, 10.0, 7.0, 5.0, 5.0], "1.5, 1.2, 0.9, then 0.6 cells, rounded");
@@ -502,7 +503,7 @@ mod tests {
         h.paint(&mut v, RECT);
         assert_eq!(at(&h), scrolled);
         // Above the first heading no section is current.
-        let mut v = doc("toc-preamble", "doc.md", &format!("intro\n{}", sections(2)));
+        let (_v_dir, mut v) = doc("toc-preamble", "doc.md", &format!("intro\n{}", sections(2)));
         h.paint(&mut v, RECT);
         assert_eq!(lit(&h), None);
     }
@@ -511,7 +512,7 @@ mod tests {
     fn a_long_outline_shows_a_window_of_dashes_around_the_current_section() {
         let mut h = Harness::new();
         let text: String = (0..60).map(|i| format!("## h{i}\ntext\n")).collect();
-        let mut v = doc("toc-many", "doc.md", &text);
+        let (_v_dir, mut v) = doc("toc-many", "doc.md", &text);
         let rect = Rect { h: 600.0, ..RECT };
         h.paint(&mut v, rect);
         let ids: Vec<u32> = buttons(&h).iter().map(|b| b.0).collect();
@@ -529,7 +530,7 @@ mod tests {
     #[test]
     fn resting_on_the_dashes_opens_the_panel_after_a_moment_listing_the_headings() {
         let mut h = Harness::new();
-        let mut v = doc("toc-open", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-open", "doc.md", &sections(20));
         h.paint(&mut v, RECT);
         let (_, dash) = buttons(&h)[2];
         let t0 = Instant::now();
@@ -567,7 +568,7 @@ mod tests {
     #[test]
     fn escape_leaving_the_view_or_the_panel_closes_it() {
         let mut h = Harness::new();
-        let mut v = doc("toc-close", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-close", "doc.md", &sections(20));
         open(&mut h, &mut v);
         let (used, _) = h.key(&mut v, press(Key::Escape));
         assert!(used && !v.toc.is_open());
@@ -598,7 +599,7 @@ mod tests {
     fn a_click_jumps_to_the_heading_in_integrated_and_source() {
         for mode in [ViewMode::Integrated, ViewMode::Source] {
             let mut h = Harness::new();
-            let mut v = doc("toc-jump", "doc.md", &sections(20));
+            let (_v_dir, mut v) = doc("toc-jump", "doc.md", &sections(20));
             v.set_view_mode(mode);
             open(&mut h, &mut v);
             let (i, _) = buttons(&h)[2];
@@ -621,7 +622,7 @@ mod tests {
     #[test]
     fn a_click_scrolls_the_preview_to_the_heading() {
         let mut h = Harness::new();
-        let mut v = doc("toc-preview", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-preview", "doc.md", &sections(20));
         v.set_view_mode(ViewMode::Preview);
         h.paint(&mut v, RECT);
         let lit = dashes(&h).iter().position(|d| d.1 == color(h.chrome.accent));
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn a_press_beside_the_dashes_places_the_caret_and_one_on_them_does_not() {
         let mut h = Harness::new();
-        let mut v = doc("toc-click", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-click", "doc.md", &sections(20));
         h.paint(&mut v, RECT);
         let (_, dash) = buttons(&h)[3];
         let y = centre(dash).1;
@@ -660,7 +661,7 @@ mod tests {
     fn the_wheel_over_the_open_panel_scrolls_its_rows_not_the_text() {
         let mut h = Harness::new();
         let text: String = (0..60).map(|i| format!("## h{i}\ntext\n")).collect();
-        let mut v = doc("toc-wheel", "doc.md", &text);
+        let (_v_dir, mut v) = doc("toc-wheel", "doc.md", &text);
         open(&mut h, &mut v);
         let (_, row) = buttons(&h)[0];
         h.scroll(&mut v, centre(row), -100.0);
@@ -675,7 +676,7 @@ mod tests {
     fn a_long_documents_outline_follows_edits_once_they_pause() {
         let mut h = Harness::new();
         let text = format!("# A\n{}# B\n", "text\n".repeat(ghostrealm_core::outline::DEBOUNCE_LINES));
-        let mut v = doc("toc-debounce", "doc.md", &text);
+        let (_v_dir, mut v) = doc("toc-debounce", "doc.md", &text);
         h.paint(&mut v, RECT);
         assert_eq!(buttons(&h).len(), 2);
         let b = v.buffer_mut();
@@ -694,13 +695,14 @@ mod tests {
     fn losing_the_highlighter_drops_a_waiting_outline() {
         let mut h = Harness::new();
         let text = format!("# A\n{}# B\n", "text\n".repeat(ghostrealm_core::outline::DEBOUNCE_LINES));
-        let mut v = doc("toc-lost", "doc.md", &text);
+        let (_v_dir, mut v) = doc("toc-lost", "doc.md", &text);
         h.paint(&mut v, RECT);
         v.buffer_mut().insert_str("# New\n");
         v.note_edits();
         h.paint(&mut v, RECT);
         assert!(v.deadline(&h.cfg).is_some(), "the outline waits");
-        let plain = tmpdir("toc-lost").join("doc.txt");
+        let tmp = tmpdir("toc-lost");
+        let plain = tmp.join("doc.txt");
         v.save_as(plain).unwrap();
         h.paint(&mut v, RECT);
         assert_eq!(v.deadline(&h.cfg), None, "nothing left to wait for, so no tick repaints");
@@ -711,7 +713,7 @@ mod tests {
     fn a_jump_while_the_outline_waits_lands_on_the_moved_heading() {
         let mut h = Harness::new();
         let text = format!("# A\n{}# B\n", "text\n".repeat(ghostrealm_core::outline::DEBOUNCE_LINES));
-        let mut v = doc("toc-moved", "doc.md", &text);
+        let (_v_dir, mut v) = doc("toc-moved", "doc.md", &text);
         h.paint(&mut v, RECT);
         let b = ghostrealm_core::outline::DEBOUNCE_LINES + 1;
         let buf = v.buffer_mut();
@@ -729,7 +731,7 @@ mod tests {
     #[test]
     fn a_drag_from_the_panel_leaves_the_caret_be() {
         let mut h = Harness::new();
-        let mut v = doc("toc-drag", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-drag", "doc.md", &sections(20));
         open(&mut h, &mut v);
         // Its padding: no row's button takes the press, so the view gets it.
         let panel = v.toc.panel.unwrap();
@@ -750,7 +752,7 @@ mod tests {
     #[test]
     fn losing_the_keys_or_the_screen_closes_it_and_stops_the_wait() {
         let mut h = Harness::new();
-        let mut v = doc("toc-hidden", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-hidden", "doc.md", &sections(20));
         open(&mut h, &mut v);
         h.focus(&mut v, false);
         assert!(!v.toc.is_open());
@@ -767,7 +769,7 @@ mod tests {
     #[test]
     fn the_panel_covers_the_rail() {
         let mut h = Harness::new();
-        let mut v = doc("toc-cover", "doc.md", &sections(20));
+        let (_v_dir, mut v) = doc("toc-cover", "doc.md", &sections(20));
         open(&mut h, &mut v);
         let panel = v.toc.panel.unwrap();
         assert_eq!(panel.x, RECT.x);

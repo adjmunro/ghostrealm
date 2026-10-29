@@ -63,15 +63,16 @@ mod tests {
     use crate::media::testing;
     use crate::plugin::testing::tmpdir;
 
-    fn write(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = tmpdir("media-image").join(name);
+    fn write(name: &str, bytes: &[u8]) -> (crate::plugin::testing::TmpDir, std::path::PathBuf) {
+        let dir = tmpdir("media-image");
+        let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn a_png_decodes_to_rgba_pixels() {
-        let path = write("a.png", &testing::png(3, 2, [10, 20, 30, 255]));
+        let (_dir, path) = write("a.png", &testing::png(3, 2, [10, 20, 30, 255]));
         let d = decode(&path, 100).unwrap();
         assert_eq!((d.width, d.height, d.source_width, d.source_height), (3, 2, 3, 2));
         assert_eq!(d.rgba.len(), 3 * 2 * 4);
@@ -80,7 +81,7 @@ mod tests {
 
     #[test]
     fn a_gif_decodes_to_rgba_pixels() {
-        let path = write("a.gif", &testing::gif(4, 5, [200, 100, 0, 255]));
+        let (_dir, path) = write("a.gif", &testing::gif(4, 5, [200, 100, 0, 255]));
         let d = decode(&path, 100).unwrap();
         assert_eq!((d.width, d.height), (4, 5));
         assert!(d.rgba.chunks(4).all(|px| px == [200, 100, 0, 255]), "{:?}", &d.rgba[..4]);
@@ -88,7 +89,7 @@ mod tests {
 
     #[test]
     fn an_image_over_the_cap_shrinks_and_reports_its_source_size() {
-        let path = write("wide.png", &testing::png(40, 10, [255, 0, 0, 255]));
+        let (_dir, path) = write("wide.png", &testing::png(40, 10, [255, 0, 0, 255]));
         let d = decode(&path, 20).unwrap();
         assert_eq!((d.source_width, d.source_height), (40, 10));
         assert_eq!((d.width, d.height), (20, 5), "fitted, aspect ratio kept");
@@ -99,7 +100,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_an_image_is_an_error() {
-        let path = write("bad.png", b"not a png");
+        let (_dir, path) = write("bad.png", b"not a png");
         assert!(decode(&path, 100).is_err());
         assert!(decode(&path.with_file_name("missing.png"), 100).is_err());
     }
@@ -107,7 +108,7 @@ mod tests {
     #[test]
     fn an_image_with_no_pixels_is_an_error_not_a_panic() {
         // A fuzzed 17x0 GIF that used to panic building mips.
-        let path = write("zero-height.gif", include_bytes!("testdata/zero-height.gif"));
+        let (_dir, path) = write("zero-height.gif", include_bytes!("testdata/zero-height.gif"));
         assert_eq!(decode(&path, 100), Err("empty image".to_string()));
     }
 

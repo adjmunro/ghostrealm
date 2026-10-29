@@ -2665,7 +2665,7 @@ mod tests {
         let mut s = AppState::new();
         let dir = crate::plugin::testing::tmpdir("app-fb");
         std::fs::write(dir.join("hello.txt"), "x").unwrap();
-        s.set_default_dir(Some(dir.clone()));
+        s.set_default_dir(Some(dir.to_path_buf()));
         s.new_empty_vtab();
         let mut r = build_registry();
         r.execute("file_browser.new", &ghostrealm_core::Args::new(), &mut s)
@@ -2685,7 +2685,7 @@ mod tests {
     fn picker_confirm_pins_the_workspace_root() {
         let mut s = AppState::new();
         let dir = crate::plugin::testing::tmpdir("app-picker");
-        s.set_default_dir(Some(dir.clone()));
+        s.set_default_dir(Some(dir.to_path_buf()));
         let vt = s.new_empty_vtab();
         s.open_picker(Pick::ActiveRoot);
         assert!(s.picker_open());
@@ -2705,7 +2705,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("app-open-pick");
         let file = dir.join("notes.txt");
         std::fs::write(&file, "hi").unwrap();
-        s.set_default_dir(Some(dir));
+        s.set_default_dir(Some(dir.to_path_buf()));
         s.new_empty_vtab();
 
         r.execute("editor.open", &Args::new(), &mut s).unwrap();
@@ -2789,7 +2789,7 @@ mod tests {
         let dir = crate::plugin::testing::tmpdir("picker-open-binary");
         let file = dir.join("latin1.txt");
         std::fs::write(&file, b"caf\xe9").unwrap();
-        s.set_default_dir(Some(dir));
+        s.set_default_dir(Some(dir.to_path_buf()));
         s.new_empty_vtab();
         s.open_picker(Pick::Open);
         assert_eq!(s.confirm_picker_with(file.clone()).unwrap(), None);
@@ -2801,7 +2801,8 @@ mod tests {
     #[test]
     fn a_file_that_is_not_text_does_not_open() {
         let mut s = AppState::new();
-        let file = crate::plugin::testing::tmpdir("app-open-binary").join("latin1.txt");
+        let tmp = crate::plugin::testing::tmpdir("app-open-binary");
+        let file = tmp.join("latin1.txt");
         std::fs::write(&file, b"caf\xe9").unwrap();
         s.new_empty_vtab();
         let err = s.open_file(&file).unwrap_err();
@@ -2844,7 +2845,8 @@ mod tests {
 
     #[test]
     fn an_open_settings_choice_opens_the_file_at_its_line_and_goes() {
-        let path = crate::plugin::testing::tmpdir("toast-settings").join("config.toml");
+        let tmp = crate::plugin::testing::tmpdir("toast-settings");
+        let path = tmp.join("config.toml");
         std::fs::write(&path, "a = 1\nb = 2\nc = 3\n").unwrap();
         let mut s = AppState::new();
         let id = s.notify(
@@ -2862,7 +2864,8 @@ mod tests {
 
     #[test]
     fn a_settings_file_that_wont_open_turns_the_toast_into_why_keeping_its_message() {
-        let path = crate::plugin::testing::tmpdir("toast-settings-bad").join("config.toml");
+        let tmp = crate::plugin::testing::tmpdir("toast-settings-bad");
+        let path = tmp.join("config.toml");
         std::fs::write(&path, b"caf\xe9").unwrap();
         let mut s = AppState::new();
         let other = s.notify(Toast::new(Level::Error, "first"));
@@ -2971,7 +2974,8 @@ mod tests {
 
     #[test]
     fn a_settings_file_that_wont_open_leaves_the_focus_alone() {
-        let path = crate::plugin::testing::tmpdir("settings-unreadable").join("config.toml");
+        let tmp = crate::plugin::testing::tmpdir("settings-unreadable");
+        let path = tmp.join("config.toml");
         std::fs::write(&path, "").unwrap();
         let mut s = AppState::new();
         s.open_settings(path.clone()).unwrap();
@@ -3088,7 +3092,7 @@ mod tests {
         let mut r = build_registry();
         let mut s = AppState::new();
         let dir = crate::plugin::testing::tmpdir("app-new-ws");
-        s.set_default_dir(Some(dir.clone()));
+        s.set_default_dir(Some(dir.to_path_buf()));
         let count = |s: &AppState| s.tree.vtabs().len();
 
         r.execute("workspace.new", &Args::new(), &mut s).unwrap();
@@ -3769,7 +3773,7 @@ mod tests {
         s.new_empty_vtab();
         let files = ["a.txt", "b.txt"].map(|n| dir.join(n));
         let cx = s.open_cx(None);
-        let mut view = FilesView::new(dir.clone(), &cx);
+        let mut view = FilesView::new(dir.to_path_buf(), &cx);
         let mut ids = Vec::new();
         for f in &files {
             std::fs::write(f, "old\n").unwrap();
