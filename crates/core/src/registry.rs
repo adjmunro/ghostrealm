@@ -36,10 +36,26 @@ pub enum CmdError {
     Args(ArgError),
     /// The handler ran and failed.
     Failed(String),
+    /// The handler failed, and the surface it acted on already shows why
+    /// (a web pane's host error): callers don't show it again.
+    Shown(String),
     /// The command doesn't apply to what has the focus: an editor command with
     /// no editor focused. A bound chord meets this wherever the focus is, so
-    /// callers don't show it the way they show a failure.
+    /// callers don't show it the way they show a failure. Text after a `"; "`
+    /// is a hint for callers that pass arguments (the agent), which the
+    /// palette leaves out ([`CmdError::for_user`]).
     Inapplicable(String),
+}
+
+impl CmdError {
+    /// The message for a person, not an agent: an [`CmdError::Inapplicable`]
+    /// without its argument hint.
+    pub fn for_user(&self) -> String {
+        match self {
+            CmdError::Inapplicable(m) => m.split("; ").next().unwrap_or(m).to_string(),
+            e => e.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for CmdError {
@@ -47,7 +63,7 @@ impl fmt::Display for CmdError {
         match self {
             CmdError::Unknown(id) => write!(f, "unknown command `{id}`"),
             CmdError::Args(e) => write!(f, "{e}"),
-            CmdError::Failed(m) | CmdError::Inapplicable(m) => write!(f, "{m}"),
+            CmdError::Failed(m) | CmdError::Shown(m) | CmdError::Inapplicable(m) => write!(f, "{m}"),
         }
     }
 }
@@ -172,6 +188,14 @@ impl<C> Registry<C> {
 mod tests {
     use super::*;
     use crate::command::{ArgKind, ArgSpec, CommandMeta, Value};
+
+    #[test]
+    fn an_inapplicable_message_for_a_person_drops_its_argument_hint() {
+        let e = CmdError::Inapplicable("no web surface focused; pass `id`".into());
+        assert_eq!(e.for_user(), "no web surface focused");
+        assert_eq!(e.to_string(), "no web surface focused; pass `id`");
+        assert_eq!(CmdError::Failed("a; b".into()).for_user(), "a; b");
+    }
 
     #[derive(Default)]
     struct Ctx {

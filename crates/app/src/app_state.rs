@@ -935,7 +935,8 @@ impl AppState {
     /// error toast on the pane of `from` (the surface whose menu ran it),
     /// else the focused pane, else the app. A command that only doesn't
     /// apply where the focus is ([`CmdError::Inapplicable`]) goes to stderr
-    /// alone: a bound chord meets that wherever the focus is.
+    /// alone: a bound chord meets that wherever the focus is. So does one
+    /// its surface already shows ([`CmdError::Shown`]).
     pub fn run_command(
         &mut self,
         registry: &mut Registry<AppState>,
@@ -972,12 +973,12 @@ impl AppState {
         if let Err(e) = &result {
             let level = match e {
                 CmdError::Inapplicable(_) if inapplicable => Some(Level::Info),
-                CmdError::Inapplicable(_) => None,
+                CmdError::Inapplicable(_) | CmdError::Shown(_) => None,
                 _ => Some(Level::Error),
             };
             if let Some(level) = level {
                 let title = registry.meta(id).map_or(id, |m| m.title);
-                self.notify(Toast::new(level, format!("{title}: {e}")).on(scope));
+                self.notify(Toast::new(level, format!("{title}: {}", e.for_user())).on(scope));
             }
         }
         result
@@ -1147,7 +1148,7 @@ impl AppState {
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
-        if self.picker.as_ref().is_some_and(|(b, _)| b.blocks(&path)) || self.close_picker_if_doc_gone() {
+        if self.close_picker_if_doc_gone() || self.picker.as_ref().is_some_and(|(b, _)| b.blocks(&path)) {
             return Ok(None);
         }
         if let Some((_, Pick::SaveAs(doc) | Pick::SaveCopy(doc))) = &self.picker {

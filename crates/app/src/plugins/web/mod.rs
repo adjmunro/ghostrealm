@@ -438,13 +438,16 @@ impl Plugin for WebPlugin {
                 CommandMeta::new(cmd, title, desc).arg(id_arg()),
                 Box::new(move |s: &mut AppState, a| {
                     let page = target(s, a)?;
-                    match cmd {
+                    let done = match cmd {
                         "web.back" => page.back(),
                         "web.forward" => page.forward(),
                         _ => page.reload(),
+                    };
+                    match done {
+                        Ok(()) => Ok(CmdOutcome::ok()),
+                        Err(e) if page.shows_inline(&e) => Err(CmdError::Shown(e)),
+                        Err(e) => Err(CmdError::Failed(e)),
                     }
-                    .map_err(CmdError::Failed)?;
-                    Ok(CmdOutcome::ok())
                 }),
             );
         }
@@ -924,19 +927,27 @@ impl WebView {
     /// Report a failed navigation the user asked for (`what` names it): on
     /// stderr and as an error toast on the pane, unless the pane already
     /// shows the error inline (the host's failure).
+    /// This page's failures share a key, so a repeat replaces the last
+    /// rather than stacking.
     fn report(&self, cx: &mut EventCx, what: &str, done: Result<(), String>) {
         let Err(e) = done else { return };
         eprintln!("ghostrealm: web: {what}: {e}");
-        if self.slot.borrow().error.as_deref() == Some(e.as_str()) {
+        if self.shows_inline(&e) {
             return;
         }
         cx.request(crate::plugin::Request::Toast {
             level: crate::toasts::Level::Error,
             message: format!("{what}: {e}"),
-            key: None,
+            key: Some(format!("web:{}", self.page)),
             choices: Vec::new(),
             doc: None,
         });
+    }
+
+    /// Whether the pane already shows error `e` in place of the page (the
+    /// host's failure).
+    fn shows_inline(&self, e: &str) -> bool {
+        self.slot.borrow().error.as_deref() == Some(e)
     }
 
     /// Send a navigation and arm the next agent read to wait for its load.
@@ -1862,6 +1873,43 @@ pub(crate) mod tests {
         v.edit_url();
         let (_, out) = h.key(&mut v, press(Key::Enter));
         assert_eq!(toasts(out), Vec::<String>::new());
+
+        // With no host and no error shown (waiting out a back-off), the
+        // address's failure toasts, keyed so a repeat replaces it.
+        {
+            let mut slot = v.slot.borrow_mut();
+            slot.error = None;
+            slot.retry_at = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        v.edit_url();
+        v.url_edit.as_mut().unwrap().set_text("example.com");
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        let keys: Vec<_> = out
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                crate::plugin::Request::Toast { key, .. } => key.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, [format!("web:{}", v.page)]);
+        assert_eq!(toasts(out), ["Can't open example.com: web host not running"]);
+    }
+
+    #[test]
+    fn a_web_command_failure_the_pane_shows_isnt_toasted_again() {
+        let mut v = hostless();
+        assert!(v.reload().is_err());
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.new_view_vtab("web", Box::new(v));
+        let mut r = crate::app_state::build_registry();
+        let err = s.run_command(&mut r, "web.reload", &Args::new(), None).unwrap_err();
+        assert!(matches!(err, CmdError::Shown(_)), "{err:?}");
+        assert!(s.toasts().is_empty());
+        let err = s.run_command(&mut r, "web.back", &Args::new(), None).unwrap_err();
+        assert!(matches!(err, CmdError::Failed(_)), "{err:?}");
+        assert_eq!(s.toasts().head().unwrap().toast.message, "Web: Back: no previous page");
     }
 
     #[test]
