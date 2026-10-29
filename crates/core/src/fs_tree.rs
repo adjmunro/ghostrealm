@@ -1176,7 +1176,7 @@ mod tests {
 
     /// A repository in a fresh temp dir with `clean.txt` committed and
     /// `changed.txt` committed then modified; `None` without git.
-    fn repo_with_a_change() -> Option<PathBuf> {
+    fn repo_with_a_change() -> Option<crate::test_dir::TmpDir> {
         let d = tmpdir();
         let git = |args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success())
@@ -1312,20 +1312,8 @@ mod tests {
         assert_eq!(file_names(&mut t), ["changed.txt"]);
     }
 
-    fn tmpdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "ghostrealm-fstree-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&base).unwrap();
-        base
+    fn tmpdir() -> crate::test_dir::TmpDir {
+        crate::test_dir::TmpDir::new("fstree")
     }
 
     #[test]
@@ -1379,7 +1367,6 @@ mod tests {
         assert!(rows[0].is_dir);
         let files: Vec<&str> = rows.iter().filter(|r| !r.is_dir).map(|r| r.name.as_str()).collect();
         assert_eq!(files, vec!["a.txt", "b.txt"], "files sort case-insensitively");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1391,7 +1378,6 @@ mod tests {
         assert!(t.rows().iter().all(|r| r.name != ".secret"), "hidden by default");
         t.set_show_hidden(true);
         assert!(t.rows().iter().any(|r| r.name == ".secret"), "shown when toggled");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1406,7 +1392,6 @@ mod tests {
         let rows = t.rows().to_vec();
         let inner = rows.iter().find(|r| r.name == "inner.txt").expect("child shown");
         assert_eq!(inner.depth, 1, "child is indented one level");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1420,7 +1405,6 @@ mod tests {
         let rows = t.rows();
         assert!(rows.iter().any(|r| r.name.ends_with("main.rs")), "match found without expanding");
         assert!(rows.iter().all(|r| !r.name.contains("readme")), "non-matches excluded");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1447,7 +1431,6 @@ mod tests {
             !names.iter().any(|n| n == "Developer/xx"),
             "intermediate dirs don't match on the ancestor's name"
         );
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1462,7 +1445,6 @@ mod tests {
         assert!(rows.iter().any(|r| r.name == "a.rs"));
         assert!(rows.iter().all(|r| r.name != "b.txt"), "other types hidden");
         assert!(rows.iter().any(|r| r.name == "sub"), "directories stay visible");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1481,7 +1463,6 @@ mod tests {
             t.rows().iter().any(|r| r.name == "new.txt"),
             "a 1h window shows a just-created file"
         );
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1506,7 +1487,6 @@ mod tests {
         t.set_query("..");
         assert!(t.navigate_input().is_none());
         assert_eq!(t.root(), std::fs::canonicalize(&d).unwrap());
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1523,7 +1503,6 @@ mod tests {
         // `*.k` is unanchored, so it matches .kt (contains ".k").
         t.set_query("*.k");
         assert!(t.rows().iter().any(|r| r.name.ends_with("main.kt")));
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1543,7 +1522,6 @@ mod tests {
         let rows = t.rows().to_vec();
         assert!(rows.iter().any(|r| !r.is_category && r.name == "main.rs"));
         assert!(rows.iter().any(|r| !r.is_category && r.name == "lib.rs"));
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1558,7 +1536,6 @@ mod tests {
         t.set_query("a");
         t.set_view(FsView::Extension);
         assert!(!t.is_filtering(), "a grouped view ignores the query");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1580,7 +1557,6 @@ mod tests {
         assert_eq!(prefixes.len(), 2);
         assert!(prefixes.contains(&"source"), "got {prefixes:?}");
         assert!(prefixes.contains(&"network"), "got {prefixes:?}");
-        fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -1599,6 +1575,5 @@ mod tests {
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"apex".to_string()));
         assert!(!names.contains(&"other".to_string()));
-        fs::remove_dir_all(&d).ok();
     }
 }

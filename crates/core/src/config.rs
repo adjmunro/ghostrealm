@@ -774,26 +774,14 @@ mod tests {
         assert!(cfg.unwrap().keybindings.is_empty());
     }
 
-    /// A per-test temp directory, removed when dropped (also when the test
-    /// fails).
-    struct Tmp(PathBuf);
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn tmp(name: &str) -> Tmp {
-        let dir = std::env::temp_dir().join(format!("ghostrealm-config-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Tmp(dir)
+    fn tmp(name: &str) -> crate::test_dir::TmpDir {
+        crate::test_dir::TmpDir::new(&format!("config-{name}"))
     }
 
     #[test]
     fn a_load_reports_each_findings_line_column_and_severity() {
         let dir = tmp("clamp");
-        let path = dir.0.join("config.toml");
+        let path = dir.join("config.toml");
         std::fs::write(&path, "[terminal]\nfont_size = 1000\n").unwrap();
         let loaded = load(path.clone(), &cat());
         assert_eq!(loaded.config.unwrap().terminal.font_size, 96.0, "clamped and applied");
@@ -810,7 +798,7 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_reported_and_not_applied() {
         let dir = tmp("unreadable");
-        let loaded = load(dir.0.clone(), &cat());
+        let loaded = load(dir.to_path_buf(), &cat());
         assert!(loaded.config.is_none());
         assert!(loaded.report.read_error.is_some());
         assert!(loaded.report.log_lines()[0].starts_with("ghostrealm: can't read "));
@@ -819,7 +807,7 @@ mod tests {
     #[test]
     fn a_clean_load_has_no_problems() {
         let dir = tmp("clean");
-        let path = dir.0.join("config.toml");
+        let path = dir.join("config.toml");
         std::fs::write(&path, "[terminal]\nfont_size = 14\n").unwrap();
         let loaded = load(path, &cat());
         assert!(loaded.config.is_some());

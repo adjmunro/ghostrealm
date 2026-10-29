@@ -15,6 +15,8 @@ pub mod line_diff;
 pub mod outline;
 pub mod registry;
 pub mod search;
+#[cfg(test)]
+mod test_dir;
 pub mod tree;
 
 pub use config::{Chrome, CloseOnExit, Config, HeaderIcon, Headings, Inbox, LineNumbers, Side, Web};

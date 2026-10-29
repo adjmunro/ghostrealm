@@ -841,16 +841,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmpdir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "ghostrealm-search-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        base
+    fn tmpdir() -> crate::test_dir::TmpDir {
+        crate::test_dir::TmpDir::new("search")
     }
 
     fn query(text: &str) -> SearchQuery {
