@@ -47,9 +47,10 @@
 //!   scratchpads (`/tmp/claude-<uid>/<project>/`) and in the temp dir (those
 //!   with ghostrealm units): removed whole once idle and unused;
 //! - `ghostrealm-*` entries in the temp dir that tests and the web host leave
-//!   when their process dies before cleaning up: removed once no process whose
-//!   pid appears in the name is running and they are 5 minutes old. The app's
-//!   frame directory `ghostrealm-<uid>` is kept;
+//!   when their process dies before cleaning up: removed once the process
+//!   whose pid the name carries (its first number) is gone and they are 5
+//!   minutes old. The app's frame directory `ghostrealm-<uid>` and its
+//!   fallbacks `ghostrealm-<uid>-*` are kept (the web host clears those);
 //! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
 //!   while no web host runs.
 //!
@@ -381,7 +382,11 @@ fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u6
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
         let stale = if name.starts_with("ghostrealm-") {
-            name != frame_dir && leftover_is_stale(&name, &path, &running.pids)
+            // The app's frame dir and its fallbacks (`ghostrealm-<uid>-<pid>-<random>`),
+            // which the host clears itself.
+            name != frame_dir
+                && !name.starts_with(&format!("{frame_dir}-"))
+                && leftover_is_stale(&name, &path, &running.pids)
         } else if name.starts_with(CEF_TEMP_PREFIX) {
             !host
         } else {
@@ -400,10 +405,12 @@ fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u6
 }
 
 /// A `ghostrealm-<tag>-<pid>[-<n>]` (or `...-<pid>.txt`) temp entry goes once
-/// no number in its name is a running pid and it is [`TEMP_MIN_AGE`] old.
-/// Counting the other numbers as pids too only keeps more.
+/// its pid (the first number in the name) is not running and it is
+/// [`TEMP_MIN_AGE`] old. One without a number is left alone.
 fn leftover_is_stale(name: &str, path: &Path, pids: &HashSet<u32>) -> bool {
-    let alive = name.split(['-', '.']).filter_map(|s| s.parse::<u32>().ok()).any(|n| pids.contains(&n));
+    let pid = name.split(['-', '.']).find(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    let Some(pid) = pid else { return false };
+    let alive = pid.parse::<u32>().map_or(true, |n| pids.contains(&n));
     let modified = fs::symlink_metadata(path).and_then(|m| m.modified()).unwrap_or_else(|_| SystemTime::now());
     !alive && older_than(modified, TEMP_MIN_AGE)
 }
@@ -703,13 +710,15 @@ mod tests {
             File::create(&p).unwrap().set_modified(modified).unwrap();
             p
         };
-        let pids: HashSet<u32> = [4242].into();
+        let pids: HashSet<u32> = [1, 4242].into();
         let dead = entry("ghostrealm-fb-1111-3", old);
         assert!(leftover_is_stale("ghostrealm-fb-1111-3", &dead, &pids));
         let alive = entry("ghostrealm-fb-4242-3", old);
         assert!(!leftover_is_stale("ghostrealm-fb-4242-3", &alive, &pids), "its test is running");
         let file = entry("ghostrealm-undo-4242.txt", old);
         assert!(!leftover_is_stale("ghostrealm-undo-4242.txt", &file, &pids), "a pid before an extension");
+        let counted = entry("ghostrealm-fb-1111-1", old);
+        assert!(leftover_is_stale("ghostrealm-fb-1111-1", &counted, &pids), "1 is a counter, not the pid");
         let new = entry("ghostrealm-fb-1111-4", SystemTime::now());
         assert!(!leftover_is_stale("ghostrealm-fb-1111-4", &new, &pids), "too new");
         let _ = fs::remove_dir_all(&dir);
