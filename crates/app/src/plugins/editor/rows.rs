@@ -127,12 +127,6 @@ impl RowLayout {
         }
         wrap_line(line, self.cols(scale)).into_iter().map(|(text, start)| (start, text.chars().count())).collect()
     }
-
-    /// `line`'s height at `size` below the top line: the space above it and
-    /// its rows.
-    pub fn line_h(&self, line: &str, size: LineSize) -> f32 {
-        size.space + self.rows(line, size.scale).len() as f32 * self.row_h(size.scale)
-    }
 }
 
 /// The rows one paint laid out, top to bottom from the scroll line, and what
@@ -151,11 +145,13 @@ pub struct RowTable {
 
 impl RowTable {
     /// Lay out `lines` from line `scroll`, the first row's top at `top`,
-    /// until a row starts at or past `bottom`. `size_of(ln)` is line `ln`'s
-    /// size under the highlighter named `highlighter`. A line's space goes
-    /// above its first row, except on the top line: the view starts at its
-    /// text. The space belongs to no row, so [`at`](Self::at) gives the line
-    /// below it.
+    /// until a line or a later row of one starts at or past `bottom` (a
+    /// line starts at its space). `size_of(ln)` is line `ln`'s size under
+    /// the highlighter named `highlighter`. A line's space goes above its
+    /// first row, except on the top line: the view starts at its text. The
+    /// space belongs to no row, so [`at`](Self::at) gives the line below
+    /// it, and a line whose space starts above `bottom` keeps its first
+    /// row (wherever that starts) so the space has a line to give.
     pub fn build(
         lines: &[String],
         scroll: usize,
@@ -168,13 +164,16 @@ impl RowTable {
         let mut rows = Vec::new();
         let mut y = top;
         'lines: for (ln, line) in lines.iter().enumerate().skip(scroll) {
+            if y >= bottom {
+                break;
+            }
             let LineSize { scale, space } = size_of(ln);
             if ln != scroll {
                 y += space;
             }
             let h = layout.row_h(scale);
-            for (start, len) in layout.rows(line, scale) {
-                if y >= bottom {
+            for (i, (start, len)) in layout.rows(line, scale).into_iter().enumerate() {
+                if i > 0 && y >= bottom {
                     break 'lines;
                 }
                 rows.push(VisualRow { kind: RowKind::Text { ln, start, len }, y, h, scale });
@@ -297,11 +296,28 @@ mod tests {
         assert_eq!(t.at(48.0).map(|r| r.y), Some(54.0), "the space above a heading takes it");
         assert_eq!(t.at(53.9).map(|r| r.y), Some(54.0));
         assert_eq!(t.at(78.0).map(|r| r.y), Some(78.0));
-        assert_eq!(LAYOUT.line_h("## sub", size(2)), 30.0, "space and row");
 
         // Scrolled to it, the heading starts at the top.
         let t = RowTable::build(&lines, 2, 0, LAYOUT, None, (0.0, 1000.0), size);
         assert_eq!(t.text_rows().map(|r| r.y).collect::<Vec<_>>(), [0.0, 24.0]);
+    }
+
+    #[test]
+    fn a_space_reaching_the_bottom_keeps_its_headings_first_row() {
+        let lines = lines(&["a", "## long heading", "b"]);
+        let size = |ln: usize| match ln {
+            1 => LineSize { scale: 1.5, space: 20.0 },
+            _ => LineSize::BODY,
+        };
+        // "a" ends at 16; the heading's space runs to 36, past the bottom.
+        let t = RowTable::build(&lines, 0, 0, LAYOUT, None, (0.0, 30.0), size);
+        let rows: Vec<(usize, usize, f32)> = t.text_rows().map(|r| (r.ln, r.start, r.y)).collect();
+        assert_eq!(rows, vec![(0, 0, 0.0), (1, 0, 36.0)], "its first row only");
+        assert_eq!(t.at(20.0).map(|r| r.y), Some(36.0), "the strip is the heading's");
+        assert_eq!(t.at(29.9).map(|r| r.y), Some(36.0));
+        // A line starting at the bottom isn't laid out.
+        let t = RowTable::build(&lines, 0, 0, LAYOUT, None, (0.0, 16.0), size);
+        assert_eq!(t.text_rows().count(), 1);
     }
 
     #[test]

@@ -285,15 +285,16 @@ impl Plugin for EditorPlugin {
         let headings = SectionSpec::options(
             "headings",
             "Headings in a document's Integrated and Preview views (Markdown headings, TOML \
-             tables): each level's size, and the space above it. A heading that starts a document, \
-             or is the top line of an Integrated view, has no space above.",
+             tables): each level's size, and the space above it, both in ems of that view's \
+             body text (Preview's is 1.15 times the editor's). In Integrated, a heading on the \
+             view's top line has no space above.",
             vec![
-                OptionSpec::new("h1_scale", SCALE, Some("2.0"), "A level-1 heading's font size, in multiples of body text."),
-                OptionSpec::new("h2_scale", SCALE, Some("1.6"), "A level-2 heading's font size, in multiples of body text."),
-                OptionSpec::new("h3_scale", SCALE, Some("1.35"), "A level-3 heading's font size, in multiples of body text."),
-                OptionSpec::new("h4_scale", SCALE, Some("1.2"), "A level-4 heading's font size, in multiples of body text."),
-                OptionSpec::new("h5_scale", SCALE, Some("1.1"), "A level-5 heading's font size, in multiples of body text."),
-                OptionSpec::new("h6_scale", SCALE, Some("1.0"), "A level-6 heading's font size, in multiples of body text."),
+                OptionSpec::new("h1_scale", SCALE, Some("2.0"), "A level-1 heading's font size, in ems of body text."),
+                OptionSpec::new("h2_scale", SCALE, Some("1.6"), "A level-2 heading's font size, in ems of body text."),
+                OptionSpec::new("h3_scale", SCALE, Some("1.35"), "A level-3 heading's font size, in ems of body text."),
+                OptionSpec::new("h4_scale", SCALE, Some("1.2"), "A level-4 heading's font size, in ems of body text."),
+                OptionSpec::new("h5_scale", SCALE, Some("1.1"), "A level-5 heading's font size, in ems of body text."),
+                OptionSpec::new("h6_scale", SCALE, Some("1.0"), "A level-6 heading's font size, in ems of body text."),
                 OptionSpec::new("h1_space", SPACE, Some("1.6"), "Space above a level-1 heading, in ems of body text."),
                 OptionSpec::new("h2_space", SPACE, Some("1.4"), "Space above a level-2 heading, in ems of body text."),
                 OptionSpec::new("h3_space", SPACE, Some("1.2"), "Space above a level-3 heading, in ems of body text."),
@@ -1420,12 +1421,15 @@ impl View for EditorView {
             if std::mem::take(&mut self.center_caret) {
                 // The lines above the caret's that fit half the body show
                 // above it; following the caret then leaves the scroll be.
+                // As in `follow_cursor`, a line's space shows only once a
+                // line is above it.
                 let mut full = |b: &EditorBuffer, ln: usize| {
-                    rows_layout.line_h(&b.lines[ln], line_size(states, b, formatter, &headings, ln))
+                    let LineSize { scale, space } = line_size(states, b, formatter, &headings, ln);
+                    (space, rows_layout.rows(&b.lines[ln], scale).len() as f32 * rows_layout.row_h(scale))
                 };
-                let (mut top, mut used) = (self.buf.cursor.0, full(&self.buf, self.buf.cursor.0) * 0.5);
+                let (mut top, mut used) = (self.buf.cursor.0, full(&self.buf, self.buf.cursor.0).1 * 0.5);
                 while top > 0 {
-                    let h = full(&self.buf, top - 1);
+                    let h = full(&self.buf, top).0 + full(&self.buf, top - 1).1;
                     if used + h > body.h * 0.5 {
                         break;
                     }
@@ -1858,9 +1862,11 @@ impl View for EditorView {
         if dy.is_finite() {
             self.scroll_accum += dy;
         }
-        // The wheel moves the top line by the height of one row at that
-        // line's scale: a heading takes as much travel to pass as its row is
-        // tall, a base line one cell.
+        // The wheel moves the top line by the height of one row at the
+        // scale of the line leaving or entering the top, plus the space of
+        // the line below it (which the top line doesn't draw): a heading
+        // takes as much travel to pass as its row is tall, a base line one
+        // cell, and a heading's space as much as it is tall.
         let layout = RowLayout { cell: (cw, ch), ..self.layout.rows };
         let h = self.formatter();
         self.sync_hl_states();
@@ -1875,9 +1881,10 @@ impl View for EditorView {
             }
             let ln = if up { top - 1 } else { top };
             let headings = &layout.headings;
-            let scale =
-                usize::try_from(ln).map_or(1.0, |ln| line_size(&mut self.hl_states, &self.buf, h, headings, ln).scale);
-            let step = layout.row_h(scale);
+            let mut size = |ln: isize| {
+                usize::try_from(ln).map_or(LineSize::BODY, |ln| line_size(&mut self.hl_states, &self.buf, h, headings, ln))
+            };
+            let step = layout.row_h(size(ln).scale) + size(ln + 1).space;
             if self.scroll_accum.abs() < step {
                 break;
             }
@@ -4073,6 +4080,82 @@ body
         paint_plain(&mut hh, &mut plain);
         h.scroll(&mut plain, (10.0, 10.0), -2.0 * UI.cell_h);
         assert_eq!(plain.buffer().scroll, 2);
+    }
+
+    /// [`SIZED`] with 14 px (one em at the harness's 14 px font) above an H1.
+    fn spaced_harness() -> Harness {
+        let mut h = heading_harness();
+        h.cfg.headings.h1_space = 1.0;
+        h
+    }
+
+    const SPACE1: f32 = 14.0;
+
+    #[test]
+    fn the_wheel_passes_a_headings_space_as_the_text_moves() {
+        let mut h = spaced_harness();
+        let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
+        let mut v = markdown_view("editor-md-wheel-space", &text);
+        paint_plain(&mut h, &mut v);
+        // Passing line 0 moves line 1 up by line 0's row and line 1's space,
+        // which it stops drawing on top.
+        let rows = |h: &Harness| text_rows(h).into_iter().map(|r| r.0).take(2).collect::<Vec<_>>();
+        assert_eq!(rows(&h), [0.0, R1 + SPACE1]);
+        h.scroll(&mut v, (10.0, 10.0), -(R1 + SPACE1 - 1.0));
+        assert_eq!(v.buffer().scroll, 0, "short of the row and the space");
+        h.scroll(&mut v, (10.0, 10.0), -1.0);
+        assert_eq!(v.buffer().scroll, 1, "the row and the space");
+        h.scroll(&mut v, (10.0, 10.0), R1 + SPACE1);
+        assert_eq!(v.buffer().scroll, 0, "and back");
+    }
+
+    #[test]
+    fn following_the_cursor_counts_the_space_below_the_top_line() {
+        let mut h = spaced_harness();
+        let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
+        let mut v = markdown_view("editor-md-follow-space", &text);
+        paint_plain(&mut h, &mut v);
+        v.buf.cursor = (10, 0);
+        paint_plain(&mut h, &mut v);
+        // Lines 7..=10: 29 + 3 * (14 + 29) = 158 px; 6..=10 would be 201.
+        assert_eq!(v.buffer().scroll, 7);
+        let caret = rects(&h, &h.frame.top).into_iter().find(|r| r.2 == 2.0).expect("a caret");
+        assert_eq!((caret.1, caret.3), (3.0 * (R1 + SPACE1), R1), "whole, on line 10's row");
+    }
+
+    #[test]
+    fn a_click_in_a_headings_space_at_the_bottom_lands_on_the_heading() {
+        let mut h = spaced_harness();
+        // Twelve body rows fill 192 of the 200 px; the heading's space runs past.
+        let text = format!("{}# Head\nafter\nend", "x\n".repeat(12));
+        let mut v = markdown_view("editor-md-space-bottom", &text);
+        paint_plain(&mut h, &mut v);
+        let pos = (4.0 * UI.cell_w + 1.0, 196.0);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
+        assert_eq!(v.buffer().cursor, (12, 0), "the heading's line, not the document's end");
+    }
+
+    #[test]
+    fn a_wrapped_heading_has_its_space_above_its_first_row_only() {
+        let mut h = spaced_harness();
+        let line = format!("# {}", "word ".repeat(12));
+        let mut v = markdown_view("editor-md-wrap-space", &format!("x\n{line}\ny"));
+        v.soft_wrap = Some(true);
+        paint_plain(&mut h, &mut v);
+        let top = UI.cell_h + SPACE1;
+        assert_eq!(
+            text_rows(&h),
+            vec![(0.0, 1.0), (top, H1), (top + R1, H1), (top + 2.0 * R1, H1), (top + 3.0 * R1, 1.0)]
+        );
+        let click = |h: &mut Harness, v: &mut EditorView, pos| {
+            h.mouse(v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+            h.mouse(v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
+            v.buffer().cursor
+        };
+        let x = 4.0 * UI.cell_w + 1.0;
+        assert_eq!(click(&mut h, &mut v, (x, UI.cell_h + 2.0)), (1, 0), "in the space");
+        assert_eq!(click(&mut h, &mut v, (x, top + R1 + 2.0)), (1, 22), "the second row");
     }
 
     #[test]
