@@ -921,6 +921,24 @@ impl WebView {
         self.navigation(HostRequest::Reload { id: self.page })
     }
 
+    /// Report a failed navigation the user asked for (`what` names it): on
+    /// stderr and as an error toast on the pane, unless the pane already
+    /// shows the error inline (the host's failure).
+    fn report(&self, cx: &mut EventCx, what: &str, done: Result<(), String>) {
+        let Err(e) = done else { return };
+        eprintln!("ghostrealm: web: {what}: {e}");
+        if self.slot.borrow().error.as_deref() == Some(e.as_str()) {
+            return;
+        }
+        cx.request(crate::plugin::Request::Toast {
+            level: crate::toasts::Level::Error,
+            message: format!("{what}: {e}"),
+            key: None,
+            choices: Vec::new(),
+            doc: None,
+        });
+    }
+
     /// Send a navigation and arm the next agent read to wait for its load.
     fn navigation(&mut self, req: HostRequest) -> Result<(), String> {
         let page = self.page;
@@ -1029,7 +1047,8 @@ impl WebView {
             Key::Enter if !press.mods.super_ => {
                 let input = edit.text().to_string();
                 self.url_edit = None;
-                let _ = self.navigate(&input);
+                let done = self.navigate(&input);
+                self.report(cx, &format!("Can't open {input}"), done);
                 self.sync_focus(true);
             }
             Key::Escape => {
@@ -1602,16 +1621,22 @@ impl View for WebView {
             cx.redraw();
             return;
         }
-        let _ = match id {
-            BTN_BACK => self.back(),
-            BTN_FORWARD => self.forward(),
-            BTN_RELOAD => self.reload(),
-            BTN_CLOSE => {
-                self.dismissed = true;
-                Ok(())
+        match id {
+            BTN_BACK => {
+                let done = self.back();
+                self.report(cx, "Can't go back", done);
             }
-            _ => Ok(()),
-        };
+            BTN_FORWARD => {
+                let done = self.forward();
+                self.report(cx, "Can't go forward", done);
+            }
+            BTN_RELOAD => {
+                let done = self.reload();
+                self.report(cx, "Can't reload", done);
+            }
+            BTN_CLOSE => self.dismissed = true,
+            _ => {}
+        }
         cx.redraw();
     }
 
@@ -1811,6 +1836,32 @@ pub(crate) mod tests {
         let dir = TmpDir::new("web-start-ok");
         let (mut v, _) = stub_host(&dir, &ready);
         assert_eq!(v.start(), Ok(()));
+    }
+
+    #[test]
+    fn a_failed_navigation_toasts_unless_the_pane_shows_it() {
+        let mut v = hostless();
+        let h = Harness::new();
+        let toasts = |out: crate::plugin::Outcome| -> Vec<String> {
+            out.requests
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::plugin::Request::Toast { level, message, .. } => {
+                        assert_eq!(level, crate::toasts::Level::Error);
+                        Some(message)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(toasts(h.button(&mut v, BTN_BACK)), ["Can't go back: no previous page"]);
+        assert_eq!(toasts(h.button(&mut v, BTN_FORWARD)), ["Can't go forward: no next page"]);
+        // The missing host's error shows in the pane.
+        assert_eq!(toasts(h.button(&mut v, BTN_RELOAD)), Vec::<String>::new());
+        assert!(v.slot.borrow().error.is_some());
+        v.edit_url();
+        let (_, out) = h.key(&mut v, press(Key::Enter));
+        assert_eq!(toasts(out), Vec::<String>::new());
     }
 
     #[test]

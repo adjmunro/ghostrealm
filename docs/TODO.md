@@ -1402,18 +1402,15 @@
 
 ---
 
-[2026-10-26T22:13+1300@462d3daa] Errors still reaching stderr only, or dropped
+[2026-10-26T22:13+1300@462d3daa] Terminal — "snapshot failed" reaches stderr only
 
 - Requires: NO BLOCKERS
-- Detail: Left out of the error surface:
-  - `terminal-ghostty`'s "snapshot failed" (`lib.rs:377`) stays on stderr:
-    it repeats every frame.
-  - The web view drops the `Result`s of navigate (`plugins/web/mod.rs:1032`)
-    and of back, forward, and reload (its toolbar buttons, `:1605`).
-  - `AppState::save_views` returns early on a failed save, losing the
-    paths it already wrote: a config written before the failure isn't
-    hot-reloaded.
-- Reason: the user can't see why these did nothing.
+- Detail: `terminal-ghostty`'s "snapshot failed" (`GhosttyTerminal::fill`,
+  `lib.rs`) prints to stderr and draws a blank grid. It repeats every
+  frame, so a toast needs the failure carried out of the terminal crate
+  and reported once per run of failures (a key, or a flag reset by the
+  next good snapshot).
+- Reason: the user sees a blank terminal with no reason.
 
 ---
 
