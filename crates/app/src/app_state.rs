@@ -736,8 +736,13 @@ impl AppState {
                     view.save_as(path.clone()).with_context(|| can_t_save(&path))?;
                     written.push(path);
                 }
-                written.extend(self.save_views(&rest, then)?);
-                Ok(written)
+                match self.save_views(&rest, then) {
+                    Ok(rest) => {
+                        written.extend(rest);
+                        Ok(written)
+                    }
+                    Err(e) => Err(partly_saved(written, e)),
+                }
             }
             Some(Confirm { then: Confirmed::Pick(path), .. }) => {
                 Ok(self.finish_picker(path)?.into_iter().collect())
@@ -756,9 +761,23 @@ impl AppState {
 
     /// Save each of `docs` to its own file, then do `then`. A document whose
     /// file changed on disk stops the saving to ask ([`Self::ask_disk_conflict`]),
-    /// which carries on with the rest once answered. Returns the files written.
+    /// which carries on with the rest once answered. Returns the files
+    /// written; on failure, the error carries those written before it
+    /// ([`PartlySaved`]).
     fn save_views(&mut self, docs: &[DocRef], then: Option<Resume>) -> Result<Vec<std::path::PathBuf>> {
         let mut written = Vec::new();
+        match self.save_views_into(docs, then, &mut written) {
+            Ok(()) => Ok(written),
+            Err(e) => Err(partly_saved(written, e)),
+        }
+    }
+
+    fn save_views_into(
+        &mut self,
+        docs: &[DocRef],
+        then: Option<Resume>,
+        written: &mut Vec<std::path::PathBuf>,
+    ) -> Result<()> {
         for (i, doc) in docs.iter().enumerate() {
             let view = self
                 .doc_mut(*doc)
@@ -766,7 +785,7 @@ impl AppState {
             let Some(path) = view.path() else { continue };
             if view.disk_conflict() {
                 self.ask_disk_conflict_then(*doc, docs[i + 1..].to_vec(), then);
-                return Ok(written);
+                return Ok(());
             }
             view.save_as(path.clone()).with_context(|| can_t_save(&path))?;
             written.push(path);
@@ -774,7 +793,7 @@ impl AppState {
         if let Some(then) = then {
             self.resume(then)?;
         }
-        Ok(written)
+        Ok(())
     }
 
     /// Go on with what a save held up.
@@ -2291,6 +2310,43 @@ pub fn build_registry() -> Registry<AppState> {
 pub(crate) fn capitalized(s: &str) -> String {
     let mut chars = s.chars();
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+}
+
+/// A failure after some files were written: they still need what follows a
+/// save (a config hot-reload, a failed-save toast dismissed). Shows as the
+/// error alone.
+#[derive(Debug)]
+pub struct PartlySaved {
+    pub written: Vec<std::path::PathBuf>,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for PartlySaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for PartlySaved {}
+
+impl PartlySaved {
+    /// The files written before failure `e`, if it is a [`PartlySaved`].
+    pub fn written_before(e: &anyhow::Error) -> &[std::path::PathBuf] {
+        e.downcast_ref::<PartlySaved>().map_or(&[], |p| &p.written)
+    }
+}
+
+/// Failure `e` after `written` were saved, as a [`PartlySaved`] holding
+/// those and any `e` already holds.
+fn partly_saved(mut written: Vec<std::path::PathBuf>, e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<PartlySaved>() {
+        Ok(p) => {
+            written.extend(p.written);
+            PartlySaved { written, error: p.error }.into()
+        }
+        Err(e) if written.is_empty() => e,
+        Err(error) => PartlySaved { written, error }.into(),
+    }
 }
 
 /// The context of a failed save, naming the file.
@@ -3907,6 +3963,22 @@ mod tests {
         for f in &files {
             assert_eq!(read(f), "newold\n");
         }
+    }
+
+    #[test]
+    fn a_failed_save_of_several_keeps_the_files_written_before_it() {
+        let dir = crate::plugin::testing::tmpdir("docs-quit-fails");
+        let (mut s, sid, files) = two_docs(&dir);
+        edit_doc(&mut s, (sid, A));
+        edit_doc(&mut s, (sid, B));
+        set_writable(&files[1], false);
+        s.request_quit();
+        let e = s.accept_confirm().unwrap_err();
+        set_writable(&files[1], true);
+        assert_eq!(PartlySaved::written_before(&e), &files[..1]);
+        assert!(format!("{e:#}").starts_with(&format!("can't save {}: ", files[1].display())), "{e:#}");
+        assert!(!s.quitting());
+        assert_eq!(read(&files[0]), "newold\n");
     }
 
     #[test]

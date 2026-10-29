@@ -2037,7 +2037,12 @@ impl State {
     fn after_confirm(&mut self, done: Result<Vec<std::path::PathBuf>>) {
         match done {
             Ok(written) => written.into_iter().for_each(|p| self.saved(p)),
-            Err(e) => self.app.confirm_failed(&e),
+            Err(e) => {
+                for p in crate::app_state::PartlySaved::written_before(&e) {
+                    self.saved(p.clone());
+                }
+                self.app.confirm_failed(&e);
+            }
         }
         self.dirty = true;
         self.exit_if_quitting();
