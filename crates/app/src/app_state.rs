@@ -2968,7 +2968,7 @@ mod tests {
         let sid = s.focused_surface().unwrap();
         s.open_save_as(sid);
         s.confirm_picker_with(target.clone()).unwrap();
-        assert!(picker_error(&s).is_some(), "the save failed: the path is blocked");
+        assert!(picker_error(&s).is_some(), "the save failed");
         s.close_surface_id(sid);
         assert_eq!(s.confirm_picker_with(target).unwrap(), None);
         assert!(!s.picker_open());
