@@ -65,16 +65,18 @@
 //! `release` locks and keeps `CACHEDIR.TAG` and those lock files, so a build
 //! queued on a lock while it is emptied still excludes the next. Any other
 //! dir in it with lock files (a custom profile's or a target triple's) is
-//! kept whole, as is one modified since the locks were taken: a build may
-//! have created it and not yet its lock file.
+//! kept whole, as is one modified since the locks were taken (a build may
+//! have created it and not yet its lock file) and a symlinked `debug` or
+//! `release` (unlocked: a build may be using it).
 //!
 //! Idle means `--idle-hours` (default 2) have passed since a unit dir
 //! (`deps`, `.fingerprint`, `incremental`, `build`) in `debug` or `release`,
 //! or `.rustc_info.json`, was modified or any executable in those profiles
 //! was run (by its access time, where the filesystem records one), and, for
-//! a worktree, since its git index or `HEAD` changed. Cargo writes nothing to a target dir when it
-//! re-runs tests without compiling, so a filesystem mounted `noatime` makes
-//! such a worktree look idle; raise `--idle-hours` there.
+//! a worktree, since its git index or `HEAD` changed. Cargo writes nothing
+//! to a target dir when it re-runs tests without compiling, so a filesystem
+//! mounted `noatime` makes such a worktree look idle; raise `--idle-hours`
+//! there.
 //!
 //! What runs is read from the kernel on macOS (`proc_pidpath`) just before
 //! each emptying it guards, and once for the temp dir, whose entry ages are
@@ -283,14 +285,18 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
             if t.units == 0 && t.bytes == 0 {
                 continue;
             }
-            println!(
-                "{}: {} of {} units superseded; {} {}",
-                dir.display(),
-                t.removed,
-                t.units,
-                opts.freed(),
-                human(t.bytes)
-            );
+            if t.units == 0 {
+                println!("{}: incremental dirs trimmed; {} {}", dir.display(), opts.freed(), human(t.bytes));
+            } else {
+                println!(
+                    "{}: {} of {} units superseded; {} {}",
+                    dir.display(),
+                    t.removed,
+                    t.units,
+                    opts.freed(),
+                    human(t.bytes)
+                );
+            }
             bytes += t.bytes;
         }
     }
@@ -679,10 +685,11 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
 }
 
 /// Remove everything in `target` but its `CACHEDIR.TAG`, the `debug` and
-/// `release` lock files (held by the caller), any other dir with lock files,
-/// and any other dir modified since `locked` (when the caller took the
-/// locks): a build creates a custom profile's or a triple's dir before its
-/// lock file. A build waiting on a lock holds that file open: were it
+/// `release` lock files (held by the caller), a symlinked `debug` or
+/// `release` (not locked, so a build may be using it), any other dir with
+/// lock files, and any other dir modified since `locked` (when the caller
+/// took the locks): a build creates a custom profile's or a triple's dir
+/// before its lock file. A build waiting on a lock holds that file open: were it
 /// unlinked, the build would lock a file no other build sees.
 fn empty_target(target: &Path, locked: SystemTime, opts: &Opts) -> u64 {
     let since = locked.checked_sub(MTIME_SLACK).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -690,12 +697,14 @@ fn empty_target(target: &Path, locked: SystemTime, opts: &Opts) -> u64 {
     for e in read_dir(target) {
         let name = e.file_name();
         let path = e.path();
-        // `DirEntry::file_type` doesn't follow symlinks: a symlinked profile
-        // is unlinked, not emptied.
+        // `DirEntry::file_type` doesn't follow symlinks.
         let dir = e.file_type().is_ok_and(|t| t.is_dir());
+        let profile = name == "debug" || name == "release";
         if name == "CACHEDIR.TAG" {
             continue;
-        } else if dir && (name == "debug" || name == "release") {
+        } else if profile && !dir {
+            println!("{}: not a directory, so not locked; kept", path.display());
+        } else if profile {
             for f in read_dir(&path) {
                 if !LOCK_FILES.iter().any(|l| f.file_name() == *l) {
                     bytes += remove(&f.path(), opts);
@@ -1512,9 +1521,12 @@ mod tests {
         let kept = ["CACHEDIR.TAG", "debug", "aarch64-apple-darwin", "aarch64-apple-darwin/debug", "profiling"];
         let mut want: Vec<String> = kept.iter().map(|k| k.to_string()).collect();
         want.push("profiling/.cargo-lock".into());
+        // Listed through the link.
+        want.extend(["release".into(), "release/keep".into()]);
         want.extend(LOCK_FILES.iter().map(|l| format!("debug/{l}")));
         want.sort();
-        assert_eq!(left, want, "tmp/ and .rustc_info.json go, the symlinked release is unlinked");
+        assert_eq!(left, want, "tmp/ and .rustc_info.json go, the symlinked release stays");
+        assert!(fs::symlink_metadata(t.join("release")).unwrap().is_symlink());
         assert!(outside.join("keep").exists(), "not followed");
     }
 
@@ -1662,5 +1674,40 @@ mod tests {
         empty_target(&t, held.at, &opts());
         assert!(!t.join("old").exists());
         assert!(t.join("x86_64-apple-darwin/debug").is_dir());
+    }
+
+    #[test]
+    fn a_lock_file_that_is_a_dangling_symlink_is_not_created_through() {
+        let t = tmpdir("dangling");
+        let outside = tmpdir("dangling-outside");
+        target(&t);
+        symlink(outside.join("lock"), t.join("debug/.cargo-lock")).unwrap();
+        let taken = BuildLock::take(&t, false).map(|_| ());
+        assert!(
+            matches!(&taken, Err(NotTaken::Unopenable(p, _)) if *p == t.join("debug/.cargo-lock")),
+            "{taken:?}"
+        );
+        assert!(!outside.join("lock").exists(), "its destination isn't created");
+    }
+
+    #[test]
+    fn a_dry_run_emptying_leaves_the_tree_unchanged() {
+        let base = tmpdir("dry-empty");
+        let t = base.join("ghostrealm-target");
+        idle_target(&t);
+        fs::create_dir_all(t.join("tmp")).unwrap();
+        fs::write(t.join(".rustc_info.json"), "{}").unwrap();
+        for p in ["tmp", ".rustc_info.json"] {
+            set_mtime(&t.join(p), SystemTime::now() - Duration::from_secs(24 * 3600));
+        }
+        let before = listing(&t);
+        let o = Opts { dry_run: true, ..opts() };
+        let held = BuildLock::take(&t, true).expect("no build holds it");
+        assert!(empty_target(&t, held.at, &o) > 0, "it would free something");
+        drop(held);
+        assert_eq!(listing(&t), before, "empty_target");
+        // What runs is read only on macOS; elsewhere it is kept before emptying.
+        remove_idle_target(&t, SystemTime::UNIX_EPOCH, Duration::from_secs(3600), &o);
+        assert_eq!(listing(&t), before, "remove_idle_target");
     }
 }
