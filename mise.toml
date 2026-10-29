@@ -25,11 +25,12 @@ run = [
 run = "mkdir -p target && rustc -O --edition 2021 scripts/clean-stale.rs -o target/clean-stale && target/clean-stale"
 
 # clean-stale, plus: other worktrees' target dirs get the same superseded-unit
-# cleanup, except agent worktrees' (.claude/worktrees/*), which are emptied once
-# idle, as are target dirs in this project's scratchpads and ghostrealm target
-# dirs in the temp dir. Idle: nothing built or run there for --idle-hours
-# (default 2). Emptying keeps CACHEDIR.TAG, the lock files and dirs with other
-# locks. Also removes temp-dir leftovers of tests and web hosts that are gone.
-# `-- --dry-run` lists what would go.
+# cleanup; agent worktrees' (.claude/worktrees/*) get it unless emptied. Those,
+# target dirs in this project's scratchpads and ghostrealm target dirs in the
+# temp dir are emptied once idle and no running program lives in them. Idle: nothing built
+# or run there for --idle-hours (default 2). Emptying keeps CACHEDIR.TAG, the
+# lock files and dirs with other locks. Also removes temp-dir leftovers of
+# tests and web hosts that are gone. Emptying and temp-dir removal need what
+# runs, which is read only on macOS. `-- --dry-run` lists what would go.
 [tasks.clean-all]
 run = "mise run clean-stale -- --all"

@@ -648,13 +648,24 @@ fn older_than(t: SystemTime, age: Duration) -> bool {
     SystemTime::now().duration_since(t).is_ok_and(|d| d >= age)
 }
 
+/// What became of a target dir [`remove_idle_target`] looked at.
+#[derive(Debug, PartialEq)]
+enum Idle {
+    /// Emptied; the bytes freed (or that would be).
+    Emptied(u64),
+    /// Kept for a reason other than its locks: it may still be cleaned.
+    Kept,
+    /// Its locks weren't taken: nothing else may touch it in this run.
+    Locked,
+}
+
 /// Empty a target dir once it and `also` (other activity of its owner) are
-/// idle and no running program lives in it. `None` if kept, else the bytes
-/// freed.
-fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Opts) -> Option<u64> {
+/// idle and no running program lives in it. Every outcome but
+/// [`Idle::Emptied`] with nothing freed prints one line.
+fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Opts) -> Idle {
     let kept = |why: &str| {
         println!("{}: {why}; kept", target.display());
-        None
+        Idle::Kept
     };
     if opts.excepts(target) {
         return kept("excepted");
@@ -665,9 +676,17 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     if !fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
         return kept("not a directory");
     }
+    // Where what runs can't be read (any system but macOS), before the locks
+    // are taken: taking them creates missing lock files.
+    if Running::now().is_none() {
+        return kept("can't tell what is running");
+    }
     let held = match BuildLock::take(target, opts.dry_run) {
         Ok(held) => held,
-        Err(why) => return kept(&why.to_string()),
+        Err(why) => {
+            println!("{}: {why}; skipped", target.display());
+            return Idle::Locked;
+        }
     };
     // Read after the lock is taken: no build can start a program from it now.
     let Some(running) = Running::now() else { return kept("can't tell what is running") };
@@ -681,7 +700,14 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     if bytes > 0 {
         println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
     }
-    Some(bytes)
+    Idle::Emptied(bytes)
+}
+
+fn emptied_bytes(idle: Idle) -> u64 {
+    match idle {
+        Idle::Emptied(bytes) => bytes,
+        Idle::Kept | Idle::Locked => 0,
+    }
 }
 
 /// Remove everything in `target` but its `CACHEDIR.TAG`, the `debug` and
@@ -757,11 +783,12 @@ fn clean_worktrees(trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 {
         }
         let parent = fs::canonicalize(tree).ok().and_then(|t| t.parent().map(Path::to_path_buf));
         let agent = agents.is_some() && parent == agents;
-        let removed = if agent { remove_idle_target(&target, git_active(tree), idle, opts) } else { None };
+        let removed = if agent { remove_idle_target(&target, git_active(tree), idle, opts) } else { Idle::Kept };
         match removed {
-            Some(freed) => bytes += freed,
-            None if opts.excepts(&target) => {}
-            None => match read_lock(&tree.join("Cargo.lock")) {
+            Idle::Emptied(freed) => bytes += freed,
+            Idle::Locked => {}
+            Idle::Kept if opts.excepts(&target) => {}
+            Idle::Kept => match read_lock(&tree.join("Cargo.lock")) {
                 Some(lock) => bytes += clean_target(&target, &lock, opts),
                 None => println!("{}: no Cargo.lock beside it; kept", target.display()),
             },
@@ -809,7 +836,7 @@ fn clean_scratch_targets(trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 
     let Some(main) = trees.first() else { return 0 };
     let mut targets = Vec::new();
     find_targets(&scratch_root(main), 4, &mut targets);
-    targets.iter().filter_map(|t| remove_idle_target(t, SystemTime::UNIX_EPOCH, idle, opts)).sum()
+    targets.iter().map(|t| emptied_bytes(remove_idle_target(t, SystemTime::UNIX_EPOCH, idle, opts))).sum()
 }
 
 /// Whether a target dir holds units of this workspace.
@@ -844,7 +871,7 @@ fn clean_temp(temp: &Path, uid: u32, idle: Duration, running: &Running, opts: &O
         // A target dir's name may hold a number that isn't a pid.
         if e.file_type().is_ok_and(|t| t.is_dir()) && is_target(&path) {
             if name.starts_with("ghostrealm") || has_ghostrealm_units(&path) {
-                bytes += remove_idle_target(&path, SystemTime::UNIX_EPOCH, idle, opts).unwrap_or(0);
+                bytes += emptied_bytes(remove_idle_target(&path, SystemTime::UNIX_EPOCH, idle, opts));
             }
             continue;
         }
@@ -1706,8 +1733,13 @@ mod tests {
         assert!(empty_target(&t, held.at, &o) > 0, "it would free something");
         drop(held);
         assert_eq!(listing(&t), before, "empty_target");
-        // What runs is read only on macOS; elsewhere it is kept before emptying.
-        remove_idle_target(&t, SystemTime::UNIX_EPOCH, Duration::from_secs(3600), &o);
+        let idle = remove_idle_target(&t, SystemTime::UNIX_EPOCH, Duration::from_secs(3600), &o);
+        // What runs is read only on macOS; elsewhere it is kept before locking.
+        if cfg!(target_os = "macos") {
+            assert!(matches!(idle, Idle::Emptied(b) if b > 0), "reached emptying: {idle:?}");
+        } else {
+            assert_eq!(idle, Idle::Kept);
+        }
         assert_eq!(listing(&t), before, "remove_idle_target");
     }
 }
