@@ -41,13 +41,13 @@
 //!
 //! - this checkout's `target/`, as above;
 //! - each other worktree's `target/`. An agent worktree's (directly under
-//!   the main checkout's `.claude/worktrees/`) is removed whole once idle and
-//!   no running program lives in it, else cleaned as above. Every other
+//!   the main checkout's `.claude/worktrees/`) is emptied once idle and no
+//!   running program lives in it, else cleaned as above. Every other
 //!   worktree's, the main checkout's included, is only cleaned as above;
 //! - Cargo target dirs (holding `CACHEDIR.TAG`) in this project's Claude
 //!   scratchpads (`/tmp/claude-<uid>/<project>/`) and in the temp dir (those
-//!   named `ghostrealm-*` or with ghostrealm units): removed whole once idle
-//!   and no running program lives in them;
+//!   named `ghostrealm-*` or with ghostrealm units): emptied once idle and no
+//!   running program lives in them;
 //! - other `ghostrealm-*` entries in the temp dir that tests and the web host
 //!   leave when their process dies before cleaning up: removed once the
 //!   process whose pid the name carries (its first number) is gone and they
@@ -55,6 +55,11 @@
 //!   fallbacks `ghostrealm-<uid>-*` are kept (the web host clears those);
 //! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
 //!   once 5 minutes old while no web host runs.
+//!
+//! The target dir given (or `target`) is never emptied, and temp-dir
+//! entries of other users are not touched. Emptying keeps a target's
+//! `CACHEDIR.TAG` and Cargo's lock files, so a build queued on a lock while
+//! it is emptied still excludes the next.
 //!
 //! Idle means `--idle-hours` (default 2) have passed since anything was
 //! built in the target dir or any executable in it was run (by its access
@@ -64,11 +69,16 @@
 //! such a worktree look idle; raise `--idle-hours` there.
 //!
 //! What runs is read from the kernel (`proc_pidpath` on macOS,
-//! `/proc/<pid>/exe` on Linux) just before each removal it guards. If the
-//! process list can't be read, or lacks this process, or one of this user's
-//! processes has no readable executable path, every target dir counts as in
-//! use and a web host as running; on other systems likewise. A path that
-//! can't be removed is reported and the exit status is 1.
+//! `/proc/<pid>/exe` on Linux) just before each emptying it guards, and
+//! once for the temp dir, whose entry ages are measured to that reading. A
+//! process whose path can't be read counts as another user's only when its
+//! owner is read (`sysctl` `KERN_PROC_PID`, `/proc/<pid>/status`) and
+//! differs, or it is gone. Every target dir counts as in use, and a web host
+//! as running, if the process list can't be read, lacks this process, or
+//! is of a nested pid namespace, if this process's own owner can't be read,
+//! or if any other process may be this user's and has no readable path; on
+//! other systems likewise. A path that can't be removed is reported and the
+//! exit status is 1.
 //!
 //! Run it from the repo root with `mise run clean-stale [-- --dry-run]` (or
 //! `mise run clean-all`), or build it with
@@ -98,6 +108,9 @@ const KEEP_INCREMENTAL: usize = 4;
 /// was read.
 const TEMP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
+/// Cargo's lock files in a profile dir.
+const LOCK_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
 /// The bundle id CEF prefixes its temp dirs with.
 const CEF_TEMP_PREFIX: &str = "dev.ghostrealm.web-host.";
 
@@ -125,6 +138,8 @@ struct Opts {
     except: Vec<PathBuf>,
     /// Paths that could not be removed.
     failures: Cell<usize>,
+    /// The target dir this run cleans (canonical): never emptied.
+    own: Option<PathBuf>,
 }
 
 impl Opts {
@@ -134,6 +149,10 @@ impl Opts {
 
     fn excepts(&self, target: &Path) -> bool {
         fs::canonicalize(target).is_ok_and(|t| self.except.contains(&t))
+    }
+
+    fn is_own(&self, target: &Path) -> bool {
+        self.own.is_some() && fs::canonicalize(target).ok() == self.own
     }
 }
 
@@ -191,7 +210,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
-    let Args { opts, target, target_given, lockfile, all, idle } = match parse_args(std::env::args().skip(1)) {
+    let Args { mut opts, target, target_given, lockfile, all, idle } = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("clean-stale: {e}");
@@ -207,14 +226,15 @@ fn main() -> ExitCode {
         eprintln!("clean-stale: no packages in {}; run it from the workspace root", lockfile.display());
         return ExitCode::from(2);
     };
+    opts.own = fs::canonicalize(&target).ok();
     let mut total = clean_target(&target, &lock, &opts);
     if all {
         let trees = worktrees();
-        total += clean_worktrees(&target, &trees, idle, &opts);
+        total += clean_worktrees(&trees, idle, &opts);
         total += clean_scratch_targets(&trees, idle, &opts);
         let temp = std::env::temp_dir();
         match Running::now() {
-            Some(running) => total += clean_temp(&temp, idle, &running, &opts),
+            Some(running) => total += clean_temp(&temp, unsafe { getuid() }, idle, &running, &opts),
             None => println!("{}: can't tell what is running; skipped", temp.display()),
         }
     }
@@ -269,7 +289,7 @@ impl BuildLock {
     fn take(target: &Path) -> Option<BuildLock> {
         let mut held = Vec::new();
         for profile in ["debug", "release"] {
-            for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+            for name in LOCK_FILES {
                 let Ok(f) = File::open(target.join(profile).join(name)) else { continue };
                 if f.try_lock().is_err() {
                     return None;
@@ -283,11 +303,13 @@ impl BuildLock {
 
 /// What is running now: each process's pid and executable path.
 struct Running {
+    /// When the list was read.
+    at: SystemTime,
     pids: HashSet<u32>,
     /// The executable paths, as the kernel reports them and canonical.
     programs: Vec<PathBuf>,
-    /// One of this user's processes has no known absolute executable path:
-    /// it may run from anywhere.
+    /// A process that may be this user's has no known absolute executable
+    /// path: it may run from anywhere.
     unknown: bool,
 }
 
@@ -296,21 +318,38 @@ enum Exe {
     At(PathBuf),
     /// Another user's process, or one that exited since it was listed.
     Other,
-    /// This user's process, path unreadable (a zombie, or a failed lookup).
+    /// Path unreadable, and the process may be this user's.
+    Unknown,
+}
+
+/// Who owns a process whose executable path couldn't be read.
+enum Owner {
+    /// Its real and effective uids.
+    Uids(Vec<u32>),
+    /// It exited since it was listed.
+    Gone,
+    /// Not readable (a sandbox can deny it).
     Unknown,
 }
 
 impl Running {
     /// `None` if the process list can't be read or is implausible.
     fn now() -> Option<Running> {
+        let at = SystemTime::now();
+        let me = unsafe { getuid() };
+        // An owner misread would count this user's processes as another's.
+        match owner(std::process::id()) {
+            Owner::Uids(uids) if uids.contains(&me) => {}
+            _ => return None,
+        }
         let pids = list_pids()?;
-        Running::from_processes(pids.into_iter().map(|pid| (pid, exe(pid))))
+        Running::from_processes(at, pids.into_iter().map(|pid| (pid, exe(pid, me))))
     }
 
     /// `None` unless the list holds this process and another: a list without
     /// them was cut short, and anything missing from it could be in use.
-    fn from_processes(processes: impl IntoIterator<Item = (u32, Exe)>) -> Option<Running> {
-        let mut running = Running { pids: HashSet::new(), programs: Vec::new(), unknown: false };
+    fn from_processes(at: SystemTime, processes: impl IntoIterator<Item = (u32, Exe)>) -> Option<Running> {
+        let mut running = Running { at, pids: HashSet::new(), programs: Vec::new(), unknown: false };
         for (pid, exe) in processes {
             running.pids.insert(pid);
             match exe {
@@ -343,6 +382,12 @@ impl Running {
                 .iter()
                 .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ghostrealm-web-host")))
     }
+
+    /// Whether `t` was `age` before the list was read: whatever started
+    /// since is newer.
+    fn older_than(&self, t: SystemTime, age: Duration) -> bool {
+        self.at.duration_since(t).is_ok_and(|d| d >= age)
+    }
 }
 
 /// `path` with its longest existing ancestor canonical: the executable of a
@@ -365,6 +410,24 @@ fn inside(path: &Path, dir: &Path) -> bool {
     } else {
         path.starts_with(dir)
     }
+}
+
+/// A process whose path couldn't be read is another's only when its owner
+/// is known and isn't `me`, or it is gone.
+fn unresolved(owner: Owner, me: u32) -> Exe {
+    match owner {
+        Owner::Uids(uids) if !uids.is_empty() && !uids.contains(&me) => Exe::Other,
+        Owner::Gone => Exe::Other,
+        _ => Exe::Unknown,
+    }
+}
+
+/// Whether `pid` no longer exists (and not just can't be signalled).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn gone(pid: u32) -> bool {
+    const ESRCH: i32 = 3;
+    let Ok(pid) = c_int::try_from(pid) else { return false };
+    pid > 0 && unsafe { kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH)
 }
 
 #[cfg(target_os = "macos")]
@@ -390,7 +453,7 @@ fn list_pids() -> Option<Vec<u32>> {
 }
 
 #[cfg(target_os = "macos")]
-fn exe(pid: u32) -> Exe {
+fn exe(pid: u32, me: u32) -> Exe {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     extern "C" {
@@ -404,12 +467,51 @@ fn exe(pid: u32) -> Exe {
             buf.truncate(n);
             Exe::At(PathBuf::from(OsString::from_vec(buf)))
         }
-        _ => owned_or_other(pid),
+        _ => unresolved(owner(pid), me),
     }
 }
 
+/// From `sysctl` `KERN_PROC_PID`, which reads any user's process (unlike
+/// `proc_pidinfo`). The offsets are of `struct kinfo_proc` (64-bit); its pid
+/// field is checked against `pid`.
+#[cfg(target_os = "macos")]
+fn owner(pid: u32) -> Owner {
+    extern "C" {
+        fn sysctl(
+            name: *mut c_int,
+            namelen: u32,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    const SIZE: usize = 648; // sizeof(struct kinfo_proc)
+    const PID: usize = 40; // kp_proc.p_pid
+    const RUID: usize = 392; // kp_eproc.e_pcred.p_ruid
+    const UID: usize = 420; // kp_eproc.e_ucred.cr_uid
+    const _: () = assert!(size_of::<usize>() == 8);
+    let Ok(id) = c_int::try_from(pid) else { return Owner::Unknown };
+    // CTL_KERN, KERN_PROC, KERN_PROC_PID
+    let mut mib = [1, 14, 1, id];
+    let mut buf = [0u8; SIZE];
+    let mut len = SIZE;
+    let r = unsafe { sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    let at = |o: usize| u32::from_ne_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    match (r, len) {
+        (0, SIZE) if at(PID) == pid => Owner::Uids(vec![at(RUID), at(UID)]),
+        (0, 0) if gone(pid) => Owner::Gone,
+        _ => Owner::Unknown,
+    }
+}
+
+/// `None` inside a nested pid namespace: its `/proc` may not show every
+/// process using the dirs it can see.
 #[cfg(target_os = "linux")]
 fn list_pids() -> Option<Vec<u32>> {
+    if nested_pid_namespace(&fs::read_to_string("/proc/self/status").ok()?) {
+        return None;
+    }
     let entries = fs::read_dir("/proc").ok()?.collect::<Result<Vec<_>, _>>().ok()?;
     Some(entries.iter().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
 }
@@ -417,11 +519,35 @@ fn list_pids() -> Option<Vec<u32>> {
 /// `/proc/<pid>/exe` is the executable's absolute path, with ` (deleted)`
 /// appended once it is removed (still inside its directory).
 #[cfg(target_os = "linux")]
-fn exe(pid: u32) -> Exe {
+fn exe(pid: u32, me: u32) -> Exe {
     match fs::read_link(format!("/proc/{pid}/exe")) {
         Ok(p) => Exe::At(p),
-        Err(_) => owned_or_other(pid),
+        Err(_) => unresolved(owner(pid), me),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn owner(pid: u32) -> Owner {
+    match fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status_uids(&status).map_or(Owner::Unknown, Owner::Uids),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && gone(pid) => Owner::Gone,
+        Err(_) => Owner::Unknown,
+    }
+}
+
+/// The real, effective, saved and filesystem uids of a `/proc/<pid>/status`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn status_uids(status: &str) -> Option<Vec<u32>> {
+    let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+    let uids = line.split_whitespace().map(|u| u.parse().ok()).collect::<Option<Vec<u32>>>()?;
+    (uids.len() == 4).then_some(uids)
+}
+
+/// Whether a `/proc/self/status` is of a process in a nested pid namespace:
+/// its `NSpid:` lists a pid per namespace level.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nested_pid_namespace(status: &str) -> bool {
+    status.lines().find_map(|l| l.strip_prefix("NSpid:")).is_some_and(|ids| ids.split_whitespace().count() > 1)
 }
 
 /// Elsewhere what runs is unknown: every check that needs it keeps.
@@ -431,19 +557,13 @@ fn list_pids() -> Option<Vec<u32>> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn exe(_pid: u32) -> Exe {
+fn exe(_pid: u32, _me: u32) -> Exe {
     Exe::Unknown
 }
 
-/// Signal 0 checks without sending: it succeeds for this user's processes
-/// (zombies too) and fails for another user's or one that is gone.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn owned_or_other(pid: u32) -> Exe {
-    match c_int::try_from(pid) {
-        Ok(pid) if pid > 0 && unsafe { kill(pid, 0) } == 0 => Exe::Unknown,
-        Ok(pid) if pid > 0 => Exe::Other,
-        _ => Exe::Unknown,
-    }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn owner(_pid: u32) -> Owner {
+    Owner::Unknown
 }
 
 /// When anything last happened in `target`: the newest modification of its
@@ -487,9 +607,9 @@ fn older_than(t: SystemTime, age: Duration) -> bool {
     SystemTime::now().duration_since(t).is_ok_and(|d| d >= age)
 }
 
-/// Remove a whole target dir once it and `also` (other activity of its
-/// owner) are idle and no running program lives in it. `None` if kept,
-/// else the bytes freed.
+/// Empty a target dir once it and `also` (other activity of its owner) are
+/// idle and no running program lives in it. `None` if kept, else the bytes
+/// freed.
 fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Opts) -> Option<u64> {
     let kept = |why: &str| {
         println!("{}: {why}; kept", target.display());
@@ -497,6 +617,9 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     };
     if opts.excepts(target) {
         return kept("excepted");
+    }
+    if opts.is_own(target) {
+        return kept("the target dir this run cleans");
     }
     if !fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
         return kept("not a directory");
@@ -510,9 +633,35 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     if !older_than(last_active(target).max(also), idle) {
         return kept(&format!("active in the last {}", hours(idle)));
     }
-    let bytes = remove(target, opts);
-    println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
+    let bytes = empty_target(target, opts);
+    if bytes > 0 {
+        println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
+    }
     Some(bytes)
+}
+
+/// Remove everything in `target` but its `CACHEDIR.TAG` and Cargo's lock
+/// files. A build waiting on a lock holds that file open: were it unlinked,
+/// the build would lock a file no other build sees.
+fn empty_target(target: &Path, opts: &Opts) -> u64 {
+    let mut bytes = 0;
+    for e in read_dir(target) {
+        let name = e.file_name();
+        if name == "CACHEDIR.TAG" {
+            continue;
+        }
+        let profile = (name == "debug" || name == "release") && e.file_type().is_ok_and(|t| t.is_dir());
+        if !profile {
+            bytes += remove(&e.path(), opts);
+            continue;
+        }
+        for f in read_dir(&e.path()) {
+            if !LOCK_FILES.iter().any(|l| f.file_name() == *l) {
+                bytes += remove(&f.path(), opts);
+            }
+        }
+    }
+    bytes
 }
 
 fn hours(d: Duration) -> String {
@@ -530,16 +679,15 @@ fn worktrees() -> Vec<PathBuf> {
 }
 
 /// Every other worktree's `target/` (`trees`: the main checkout first). An
-/// agent worktree's goes whole once idle; the rest have their superseded
+/// agent worktree's is emptied once idle; the rest have their superseded
 /// units removed.
-fn clean_worktrees(own_target: &Path, trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 {
+fn clean_worktrees(trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 {
     let Some(main) = trees.first() else { return 0 };
     let agents = fs::canonicalize(main.join(".claude/worktrees")).ok();
-    let own = fs::canonicalize(own_target).ok();
     let mut bytes = 0;
     for tree in trees {
         let target = tree.join("target");
-        if !target.is_dir() || fs::canonicalize(&target).ok() == own {
+        if !target.is_dir() || opts.is_own(&target) {
             continue;
         }
         let parent = fs::canonicalize(tree).ok().and_then(|t| t.parent().map(Path::to_path_buf));
@@ -609,15 +757,20 @@ fn has_ghostrealm_units(target: &Path) -> bool {
 }
 
 /// The temp dir: idle ghostrealm target dirs, leftovers of tests and web
-/// hosts whose process is gone, and CEF temp dirs while no host runs.
-/// `running` is read just before.
-fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
-    let frame_dir = format!("ghostrealm-{}", unsafe { getuid() });
+/// hosts whose process is gone, and CEF temp dirs while no host runs. Only
+/// `uid`'s entries are looked at. Ages are measured to when `running` was
+/// read, so what started since is never old enough.
+fn clean_temp(temp: &Path, uid: u32, idle: Duration, running: &Running, opts: &Opts) -> u64 {
+    let frame_dir = format!("ghostrealm-{uid}");
     let host = running.web_host();
     let (mut count, mut bytes) = (0, 0);
     for e in read_dir(temp) {
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
+        // Another user's, in a shared temp dir.
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.uid() == uid) {
+            continue;
+        }
         // The app's frame dir and its fallbacks (`ghostrealm-<uid>-<pid>-<random>`),
         // which the host clears itself.
         if name == frame_dir || name.starts_with(&format!("{frame_dir}-")) {
@@ -631,9 +784,9 @@ fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u6
             continue;
         }
         let stale = if name.starts_with("ghostrealm-") {
-            leftover_is_stale(&name, &path, &running.pids)
+            leftover_is_stale(&name, &path, running)
         } else if name.starts_with(CEF_TEMP_PREFIX) {
-            !host && older_than(mtime_or_now(&path), TEMP_MIN_AGE)
+            !host && running.older_than(mtime_or_now(&path), TEMP_MIN_AGE)
         } else {
             false
         };
@@ -649,11 +802,11 @@ fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u6
 /// A `ghostrealm-<tag>-<pid>[-<n>]` (or `...-<pid>.txt`) temp entry goes once
 /// its pid (the first number in the name) is not running and it is
 /// [`TEMP_MIN_AGE`] old. One without a number is left alone.
-fn leftover_is_stale(name: &str, path: &Path, pids: &HashSet<u32>) -> bool {
+fn leftover_is_stale(name: &str, path: &Path, running: &Running) -> bool {
     let pid = name.split(['-', '.']).find(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
     let Some(pid) = pid else { return false };
-    let alive = pid.parse::<u32>().map_or(true, |n| pids.contains(&n));
-    !alive && older_than(mtime_or_now(path), TEMP_MIN_AGE)
+    let alive = pid.parse::<u32>().map_or(true, |n| running.pids.contains(&n));
+    !alive && running.older_than(mtime_or_now(path), TEMP_MIN_AGE)
 }
 
 /// An unreadable time counts as new.
@@ -991,11 +1144,20 @@ mod tests {
         File::open(path).unwrap().set_modified(t).unwrap();
     }
 
-    /// A list holding this process (running this test binary) and pid 1.
+    /// A list read now, holding this process (running this test binary) and
+    /// pid 1.
     fn running_with(programs: Vec<Exe>) -> Running {
+        running_at(SystemTime::now(), programs)
+    }
+
+    fn running_at(at: SystemTime, programs: Vec<Exe>) -> Running {
         let me = (std::process::id(), Exe::At(std::env::current_exe().unwrap()));
         let others = std::iter::once(Exe::Other).chain(programs).map(|p| (1, p));
-        Running::from_processes(std::iter::once(me).chain(others)).unwrap()
+        Running::from_processes(at, std::iter::once(me).chain(others)).unwrap()
+    }
+
+    fn me() -> u32 {
+        unsafe { getuid() }
     }
 
     /// A Cargo target dir: `CACHEDIR.TAG` and an empty `debug/`.
@@ -1004,12 +1166,24 @@ mod tests {
         fs::write(dir.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55").unwrap();
     }
 
-    /// A target dir nothing has touched for a day.
+    /// A target dir nothing has touched for a day, with a lock file and a
+    /// build product.
     fn idle_target(dir: &Path) {
         target(dir);
+        File::create(dir.join("debug/.cargo-lock")).unwrap();
+        fs::create_dir(dir.join("debug/deps")).unwrap();
+        fs::write(dir.join("debug/deps/app"), b"x").unwrap();
         let old = SystemTime::now() - Duration::from_secs(24 * 3600);
-        set_mtime(&dir.join("debug"), old);
-        set_mtime(dir, old);
+        for p in ["debug/.cargo-lock", "debug/deps", "debug", ""] {
+            set_mtime(&dir.join(p), old);
+        }
+    }
+
+    /// Whether `dir` was emptied: only its tag and lock files are left.
+    fn emptied(dir: &Path) -> bool {
+        dir.join("CACHEDIR.TAG").is_file()
+            && dir.join("debug/.cargo-lock").is_file()
+            && !dir.join("debug/deps").exists()
     }
 
     /// A fingerprint directory `<package>-<hash>` with `<kind>.json` and, for a
@@ -1034,17 +1208,19 @@ mod tests {
             File::create(&p).unwrap().set_modified(modified).unwrap();
             p
         };
-        let pids: HashSet<u32> = [1, 4242].into();
+        let mut pids = running_with(vec![]);
+        pids.pids.insert(4242);
+        let pids = &pids;
         let dead = entry("ghostrealm-fb-1111-3", old);
-        assert!(leftover_is_stale("ghostrealm-fb-1111-3", &dead, &pids));
+        assert!(leftover_is_stale("ghostrealm-fb-1111-3", &dead, pids));
         let alive = entry("ghostrealm-fb-4242-3", old);
-        assert!(!leftover_is_stale("ghostrealm-fb-4242-3", &alive, &pids), "its test is running");
+        assert!(!leftover_is_stale("ghostrealm-fb-4242-3", &alive, pids), "its test is running");
         let file = entry("ghostrealm-undo-4242.txt", old);
-        assert!(!leftover_is_stale("ghostrealm-undo-4242.txt", &file, &pids), "a pid before an extension");
+        assert!(!leftover_is_stale("ghostrealm-undo-4242.txt", &file, pids), "a pid before an extension");
         let counted = entry("ghostrealm-fb-1111-1", old);
-        assert!(leftover_is_stale("ghostrealm-fb-1111-1", &counted, &pids), "1 is a counter, not the pid");
+        assert!(leftover_is_stale("ghostrealm-fb-1111-1", &counted, pids), "1 is a counter, not the pid");
         let new = entry("ghostrealm-fb-1111-4", SystemTime::now());
-        assert!(!leftover_is_stale("ghostrealm-fb-1111-4", &new, &pids), "too new");
+        assert!(!leftover_is_stale("ghostrealm-fb-1111-4", &new, pids), "too new");
     }
 
     #[test]
@@ -1070,20 +1246,26 @@ mod tests {
         set_mtime(&built, old);
 
         let host = running_with(vec![Exe::At(PathBuf::from("/x/ghostrealm-web-host.app/Contents/MacOS/ghostrealm-web-host"))]);
-        clean_temp(&temp, Duration::from_secs(3600), &host, &opts());
+        clean_temp(&temp, me() + 1, Duration::from_secs(3600), &running_with(vec![]), &opts());
+        assert!(leftover.exists() && cef.exists(), "another user's temp entries are not touched");
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        clean_temp(&temp, me(), Duration::from_secs(3600), &running_at(an_hour_ago, vec![]), &opts());
+        assert!(leftover.exists() && cef.exists(), "too new when the process list was read");
+
+        clean_temp(&temp, me(), Duration::from_secs(3600), &host, &opts());
         assert!(frame.is_dir() && fallback.is_dir(), "the app's frame dirs stay");
         assert!(!leftover.exists(), "its process is gone");
         assert!(cef.is_dir(), "a web host is running");
         assert!(built.is_dir(), "a target goes by idleness, not by a number in its name");
 
-        clean_temp(&temp, Duration::from_secs(3600), &running_with(vec![]), &opts());
+        clean_temp(&temp, me(), Duration::from_secs(3600), &running_with(vec![]), &opts());
         assert!(!cef.exists(), "no web host runs");
         assert!(new_cef.is_dir(), "too new: its host may have started since");
         assert!(frame.is_dir() && fallback.is_dir() && built.is_dir());
     }
 
     #[test]
-    fn only_an_agent_worktrees_target_is_removed_whole() {
+    fn only_an_agent_worktrees_target_is_emptied() {
         let base = tmpdir("trees");
         let main = base.join("main");
         let agent = main.join(".claude/worktrees/agent-1");
@@ -1094,11 +1276,23 @@ mod tests {
             fs::write(tree.join("Cargo.lock"), "name = \"a\"\nversion = \"1.0.0\"\n").unwrap();
         }
         let trees = [main.clone(), owner.clone(), agent.clone(), nested.clone()];
-        clean_worktrees(&base.join("own-target"), &trees, Duration::from_secs(3600), &opts());
-        assert!(main.join("target").is_dir(), "the main checkout's target is never removed whole");
-        assert!(owner.join("target").is_dir(), "nor that of a worktree outside .claude/worktrees");
-        assert!(nested.join("target").is_dir(), "nor one deeper inside it");
-        assert!(!agent.join("target").exists(), "an idle agent worktree's goes");
+        clean_worktrees(&trees, Duration::from_secs(3600), &opts());
+        assert!(main.join("target/debug/deps/app").exists(), "the main checkout's target is never emptied");
+        assert!(owner.join("target/debug/deps/app").exists(), "nor that of a worktree outside .claude/worktrees");
+        assert!(nested.join("target/debug/deps/app").exists(), "nor one deeper inside it");
+        assert!(emptied(&agent.join("target")), "an idle agent worktree's is");
+    }
+
+    #[test]
+    fn the_target_dir_this_run_cleans_is_never_emptied() {
+        let temp = tmpdir("own");
+        let own = temp.join("ghostrealm-target");
+        idle_target(&own);
+        let o = Opts { own: fs::canonicalize(&own).ok(), ..opts() };
+        clean_temp(&temp, me(), Duration::from_secs(3600), &running_with(vec![]), &o);
+        assert!(own.join("debug/deps/app").exists());
+        clean_temp(&temp, me(), Duration::from_secs(3600), &running_with(vec![]), &opts());
+        assert!(emptied(&own), "another run's");
     }
 
     #[test]
@@ -1132,10 +1326,44 @@ mod tests {
 
     #[test]
     fn a_process_list_without_this_process_is_not_trusted() {
-        assert!(Running::from_processes([]).is_none(), "an empty list");
+        let at = SystemTime::now();
+        assert!(Running::from_processes(at, []).is_none(), "an empty list");
         let others = [(1, Exe::Other), (std::process::id() + 1, Exe::Other)];
-        assert!(Running::from_processes(others).is_none(), "a list without this process");
-        assert!(Running::from_processes([(std::process::id(), Exe::Other)]).is_none(), "only this process");
+        assert!(Running::from_processes(at, others).is_none(), "a list without this process");
+        assert!(Running::from_processes(at, [(std::process::id(), Exe::Other)]).is_none(), "only this process");
+    }
+
+    #[test]
+    fn a_process_without_a_path_is_another_users_only_if_its_owner_is_read() {
+        let me = 501;
+        assert!(matches!(unresolved(Owner::Uids(vec![0, 0]), me), Exe::Other));
+        assert!(matches!(unresolved(Owner::Uids(vec![0, me]), me), Exe::Unknown), "set-uid by this user");
+        assert!(matches!(unresolved(Owner::Uids(vec![]), me), Exe::Unknown));
+        assert!(matches!(unresolved(Owner::Unknown, me), Exe::Unknown), "a sandbox may hide it");
+        assert!(matches!(unresolved(Owner::Gone, me), Exe::Other));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn owners_are_read_from_the_kernel() {
+        assert!(matches!(owner(std::process::id()), Owner::Uids(u) if u.contains(&me())));
+        if me() != 0 {
+            assert!(matches!(owner(1), Owner::Uids(u) if !u.contains(&me())), "init is root's");
+        }
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(matches!(owner(pid), Owner::Gone), "a reaped child");
+    }
+
+    #[test]
+    fn proc_status_uids_and_nested_pid_namespaces_are_read() {
+        let status = "Name:\tsh\nUid:\t1000\t1000\t1000\t1000\nNSpid:\t4242\n";
+        assert_eq!(status_uids(status), Some(vec![1000; 4]));
+        assert_eq!(status_uids("Uid:\t1000\tx\t1\t1\n"), None);
+        assert_eq!(status_uids("Name:\tsh\n"), None);
+        assert!(!nested_pid_namespace(status));
+        assert!(nested_pid_namespace("NSpid:\t4242\t7\n"));
     }
 
     #[test]
