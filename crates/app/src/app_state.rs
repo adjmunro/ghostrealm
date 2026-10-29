@@ -2956,8 +2956,8 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_path_picked_again_after_the_document_closed_closes_the_picker() {
-        let dir = crate::plugin::testing::tmpdir("picker-blocked-gone");
+    fn a_failed_path_picked_again_after_the_document_closed_closes_the_picker() {
+        let dir = crate::plugin::testing::tmpdir("picker-failed-gone");
         let file = dir.join("a.txt");
         std::fs::write(&file, "x").unwrap();
         std::fs::write(dir.join("missing"), "a file, not a folder").unwrap();
