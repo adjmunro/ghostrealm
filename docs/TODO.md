@@ -1414,18 +1414,6 @@
 
 ---
 
-[2026-10-26T22:13+1300@462d3daa] Tests — fail under full-workspace load, pass alone
-
-- Requires: NO BLOCKERS
-- Detail: The file-browser test `a_match_is_found_again_in_one_pass_over_a_long_line`
-  (`plugins/file_browser/search.rs:1051`) and `ghostrealm-web --lib`
-  `a_host_hung_up_on_is_reported_gone_once_its_process_has_gone` fail now
-  and then in a full `cargo test --workspace` and pass run alone. Find the
-  timing they depend on.
-- Reason: a flaky test hides real failures.
-
----
-
 [2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
 
 - Requires: investigation (environment, or a stale host bundle)
