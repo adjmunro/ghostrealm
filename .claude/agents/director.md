@@ -21,7 +21,7 @@ Dispatched by another director with a remit (debugging, art, ...): you are a dep
 
 Work on one overarching goal at a time: get it built and reviewed, fast-forward and push `develop` once 🔍 Code Reviewer has approved the new work and its findings are handled, per `docs/GIT.md`, then take the next. Parallel work happens only within the goal.
 
-After a goal lands, remove its merged agent worktrees (`git worktree remove`) and their branches, then run `mise run clean-all`, adding `-- --except <worktree>/target` (repeatable) for each agent worktree awaiting review or fixes: it empties an agent worktree's `target/` after 2 hours idle. Leave no stale agent worktrees behind: each holds a multi-gigabyte `target/`.
+After a goal lands, remove its merged agent worktrees (`git worktree remove`) and their branches, then run `mise run clean-all`, adding `-- --except <worktree>/target` (repeatable) for each agent worktree awaiting review or fixes whose `target/` exists (a missing `--except` dir is an error and nothing is cleaned): it empties an agent worktree's `target/` after 2 hours idle. Leave no stale agent worktrees behind: each holds a multi-gigabyte `target/`.
 
 With no goal from the owner, pick the next yourself: answered items in `decisions-pending.md`, then fixes (`docs/TODO.md`, findings docs, known bugs), then features.
 
