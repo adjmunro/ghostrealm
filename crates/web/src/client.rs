@@ -240,17 +240,24 @@ impl WebHost {
     /// Start the host at `exe`. `waker` runs (on the reader thread) after every
     /// event, so the GUI can redraw.
     pub fn spawn(exe: &Path, waker: Option<Waker>) -> Result<Self> {
+        Self::start(Command::new(exe), waker)
+    }
+
+    /// [`Self::spawn`] with `cmd` as the host: tests run a stand-in from
+    /// `/bin/sh -c` rather than writing a script, which macOS checks on its
+    /// first run for an unbounded time.
+    fn start(mut cmd: Command, waker: Option<Waker>) -> Result<Self> {
         let stderr = if std::env::var_os(DEBUG_ENV).is_some() {
             Stdio::inherit()
         } else {
             Stdio::null()
         };
-        let mut child = Command::new(exe)
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
             .spawn()
-            .with_context(|| format!("spawn web host {}", exe.display()))?;
+            .with_context(|| format!("spawn web host {}", Path::new(cmd.get_program()).display()))?;
         let stdin = child.stdin.take().context("web host stdin")?;
         let stdout = child.stdout.take().context("web host stdout")?;
         let reaped = Arc::new(Reaped { waker: waker.clone(), ..Reaped::default() });
@@ -782,18 +789,25 @@ fn page_of(ev: &Event) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Held by a test for as long as the process it starts runs. On macOS
+    /// std marks a new pipe close-on-exec only after creating it, so a
+    /// process another thread starts in between inherits it: a host's stdin
+    /// or stdout then stays open in an unrelated process.
+    #[cfg(unix)]
+    fn one_process_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static PROCESSES: Mutex<()> = Mutex::new(());
+        PROCESSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A host that starts but never reads its stdin fills the pipe; sending
     /// still returns at once, coalescing moves and refusing past the cap.
     #[cfg(unix)]
     #[test]
     fn sending_to_a_host_that_doesnt_read_never_blocks() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("ghostrealm-web-stuck-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("stuck.sh");
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let host = WebHost::spawn(&exe, None).unwrap();
+        let _one = one_process_at_a_time();
+        let mut sleep = Command::new("sleep");
+        sleep.arg("30");
+        let host = WebHost::start(sleep, None).unwrap();
         let mouse = |x, action| Request::Mouse {
             id: 1,
             x,
@@ -814,17 +828,20 @@ mod tests {
             host.send(&mouse(i, MouseAction::Move));
         }
         assert!(start.elapsed() < Duration::from_secs(2), "send blocked");
-        {
-            let o = host.outbox.0.lock().unwrap();
-            assert_eq!(o.queue.len(), OUTBOX_MAX, "the queue stays bounded");
+        // A full queue refuses requests. The writer thread may first run
+        // after the loop and take the whole queue, more than the pipe holds:
+        // it is then stuck on that write, and the queue fills once more.
+        let until = Instant::now() + Duration::from_secs(2);
+        while host.send(&key) {
+            assert!(Instant::now() < until, "the queue never filled");
         }
-        assert!(!host.send(&key), "a full queue refuses requests");
+        let queued = host.outbox.0.lock().unwrap().queue.len();
+        assert!(queued <= OUTBOX_MAX, "the queue stays bounded: {queued}");
         assert!(host.send(&mouse(0, MouseAction::Wheel { dx: 0, dy: 1 })), "wheel steps are dropped");
         assert!(host.send(&mouse(7, MouseAction::Move)), "moves are dropped or coalesced");
         let pid = host.pid().unwrap();
         drop(host);
         let _ = Command::new("kill").arg(pid.to_string()).status();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Given a host that closed its stdout at once and, once its stdin
@@ -835,16 +852,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_host_hung_up_on_is_reported_gone_once_its_process_has_gone() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::AtomicUsize;
-        let dir = std::env::temp_dir().join(format!("ghostrealm-web-hang-up-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("slow-exit.sh");
-        std::fs::write(&exe, "#!/bin/sh\nexec 1>&-\ncat > /dev/null\nsleep 0.5\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _one = one_process_at_a_time();
+        let mut sh = Command::new("/bin/sh");
+        sh.args(["-c", "exec 1>&-; cat > /dev/null; sleep 0.5"]);
         let woken = Arc::new(AtomicUsize::new(0));
         let w = woken.clone();
-        let host = WebHost::spawn(&exe, Some(Arc::new(move || {
+        let host = WebHost::start(sh, Some(Arc::new(move || {
             w.fetch_add(1, Ordering::Relaxed);
         })))
         .unwrap();
@@ -868,7 +882,6 @@ mod tests {
             assert!(Instant::now() < until, "the waker was not told");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
