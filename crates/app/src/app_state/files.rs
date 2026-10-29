@@ -257,6 +257,22 @@ impl AppState {
         }
     }
 
+    /// Block until every file job submitted since `mark`
+    /// ([`Self::file_job_mark`]) has finished, including any their results
+    /// submit, and apply them. Earlier jobs (the user's) aren't waited for.
+    /// For the agent channel, whose reply carries those jobs' outcomes.
+    pub fn wait_file_jobs_since(&mut self, mark: u64) {
+        loop {
+            let done = self.file_jobs.wait_since(mark);
+            if done.is_empty() {
+                return;
+            }
+            for done in done {
+                self.report_file_job(done);
+            }
+        }
+    }
+
     /// Whether every file job has finished.
     pub fn file_jobs_idle(&self) -> bool {
         self.file_jobs.idle()
@@ -1419,6 +1435,24 @@ mod tests {
         s.wait_file_jobs();
         s.request_quit();
         assert!(s.confirm().is_none() && s.quitting(), "nothing running: quits");
+    }
+
+    #[test]
+    fn waiting_on_jobs_since_a_mark_skips_a_running_earlier_copy() {
+        let d = tmpdir("fm-wait-since");
+        std::fs::write(d.join("x.txt"), "x").unwrap();
+        let mut s = guarded_app().with_file_job_wait(Duration::ZERO);
+        s.file_jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
+        let mark = s.file_job_mark();
+        start(&mut s, "file.delete", &[("path", &d.join("x.txt"))]).unwrap();
+        assert!(s.confirm().is_none(), "the check runs on");
+        s.wait_file_jobs_since(mark);
+        assert!(s.confirm().is_some(), "the delete's check finished and asked");
+        assert!(!s.file_jobs_idle(), "the earlier copy still runs");
+        assert_eq!(s.take_file_reports_since(mark).len(), 1);
+        std::fs::write(d.join("go"), "").unwrap();
+        s.wait_file_jobs();
+        assert!(s.file_jobs_idle());
     }
 
     #[test]

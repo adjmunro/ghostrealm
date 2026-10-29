@@ -1436,17 +1436,6 @@
 
 ---
 
-[2026-10-26T22:13+1300@462d3daa] Agent — a reply waits for the user's own file jobs
-
-- Requires: NO BLOCKERS
-- Detail: The agent's `wait_file_jobs` (`agent.rs:98`) waits for every file
-  job before replying, including a long copy the user started; the reply
-  already carries only the agent's own jobs' reports. Wait for those jobs
-  alone.
-- Reason: an agent call shouldn't stall behind the user's copy.
-
----
-
 [2026-10-26T22:50+1300@5bb2c09d] Toasts — the clock may run under a pointer already over the window at launch
 
 - Requires: a desktop check

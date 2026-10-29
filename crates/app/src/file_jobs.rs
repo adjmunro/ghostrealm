@@ -298,6 +298,18 @@ impl FileJobs {
         std::iter::from_fn(|| self.try_take()).collect()
     }
 
+    /// Block until every job given since id `mark` ([`Self::next_id`] then)
+    /// has been taken back, and return them with any earlier job that
+    /// finished meanwhile. Earlier jobs still running aren't waited for.
+    pub fn wait_since(&mut self, mark: u64) -> Vec<Done> {
+        let mut out = Vec::new();
+        while self.active.iter().any(|(id, _)| *id >= mark) || self.checks.keys().any(|id| *id >= mark) {
+            let Some(Ok(done)) = self.lanes.as_ref().map(|l| l.done.recv()) else { break };
+            out.push(self.taken(done));
+        }
+        out
+    }
+
     /// Whether every copy and move given has finished (its result may still
     /// be waiting). Delete's checks don't count: a quit drops them.
     pub fn idle(&self) -> bool {

@@ -94,8 +94,9 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
             let ran = registry.execute(id, &args, state);
             // A file command's work on the file worker finishes before the
             // reply, which carries its outcome. Jobs the user started before
-            // stay queued for the window to report.
-            state.wait_file_jobs();
+            // aren't waited for, and their reports stay queued for the
+            // window.
+            state.wait_file_jobs_since(mark);
             let finished =
                 state.take_file_reports_since(mark).into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>();
             match (ran, finished) {
