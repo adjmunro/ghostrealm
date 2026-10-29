@@ -29,10 +29,14 @@
 //! lost directory only costs one slower compile.
 //!
 //! Only `target/` is touched; `~/.cargo` is never read or written. A target
-//! dir is skipped while a build holds Cargo's lock on it (`.cargo-lock`,
-//! `.cargo-build-lock`), and that lock is held while cleaning, so a build that
-//! starts meanwhile waits. Cargo releases the lock before it runs tests; the
-//! newest copies the tests run from are kept. It refuses to run without a
+//! dir is skipped while a build holds Cargo's locks on its `debug` or
+//! `release` dir (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`),
+//! or one can't be opened, and they are held while cleaning, so a build that
+//! starts meanwhile waits. Missing lock files are created (with their profile
+//! dir), except with `--dry-run`, which creates nothing and locks only the
+//! lock files there are. A profile dir that is a symlink is neither locked
+//! nor cleaned. Cargo releases the locks before it runs tests; the newest
+//! copies the tests run from are kept. It refuses to run without a
 //! readable `Cargo.lock` (every registry unit would look unlisted), or when
 //! `CARGO_TARGET_DIR` is set but `--target-dir` is not: a target dir shared
 //! with other workspaces would lose their registry units.
@@ -58,15 +62,17 @@
 //!
 //! The target dir given (or `target`) is never emptied, and temp-dir
 //! entries of other users are not touched. Emptying holds the `debug` and
-//! `release` locks (creating them) and keeps `CACHEDIR.TAG` and those lock
-//! files, so a build queued on a lock while it is emptied still excludes the
-//! next. Any other dir in it with lock files (a custom profile's or a target
-//! triple's) is kept whole.
+//! `release` locks and keeps `CACHEDIR.TAG` and those lock files, so a build
+//! queued on a lock while it is emptied still excludes the next. Any other
+//! dir in it with lock files (a custom profile's or a target triple's) is
+//! kept whole, as is one modified since the locks were taken: a build may
+//! have created it and not yet its lock file.
 //!
-//! Idle means `--idle-hours` (default 2) have passed since anything was
-//! built in the target dir or any executable in it was run (by its access
-//! time, where the filesystem records one), and, for a worktree, since its
-//! git index or `HEAD` changed. Cargo writes nothing to a target dir when it
+//! Idle means `--idle-hours` (default 2) have passed since a unit dir
+//! (`deps`, `.fingerprint`, `incremental`, `build`) in `debug` or `release`,
+//! or `.rustc_info.json`, was modified or any executable in those profiles
+//! was run (by its access time, where the filesystem records one), and, for
+//! a worktree, since its git index or `HEAD` changed. Cargo writes nothing to a target dir when it
 //! re-runs tests without compiling, so a filesystem mounted `noatime` makes
 //! such a worktree look idle; raise `--idle-hours` there.
 //!
@@ -94,6 +100,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::io;
 #[cfg(target_os = "macos")]
 use std::os::raw::c_int;
 use std::os::unix::fs::MetadataExt;
@@ -112,6 +119,10 @@ const TEMP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Cargo's lock files in a profile dir.
 const LOCK_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
+/// How much earlier than the locks were taken a dir's modification time may
+/// be and still count as since: some filesystems keep whole seconds.
+const MTIME_SLACK: Duration = Duration::from_secs(2);
 
 /// The bundle id CEF prefixes its temp dirs with.
 const CEF_TEMP_PREFIX: &str = "dev.ghostrealm.web-host.";
@@ -256,16 +267,20 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
         println!("{}: excepted; kept", target.display());
         return 0;
     }
-    let Some(_held) = BuildLock::take(target) else {
-        println!("{}: a build is running; skipped", target.display());
-        return 0;
+    let _held = match BuildLock::take(target, opts.dry_run) {
+        Ok(held) => held,
+        Err(why) => {
+            println!("{}: {why}; skipped", target.display());
+            return 0;
+        }
     };
     let mut bytes = 0;
     for profile in ["debug", "release"] {
         let dir = target.join(profile);
-        if dir.is_dir() {
+        // A symlinked profile isn't locked: a build in its destination isn't seen.
+        if real_dir(&dir) {
             let t = clean_profile(&dir, lock, opts);
-            if t.units == 0 {
+            if t.units == 0 && t.bytes == 0 {
                 continue;
             }
             println!(
@@ -287,25 +302,75 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
 /// writing and none can start.
 struct BuildLock {
     _files: Vec<File>,
+    /// Just before the first lock was taken.
+    at: SystemTime,
+}
+
+/// Why a target dir's locks weren't taken.
+#[derive(Debug)]
+enum NotTaken {
+    /// A build holds one.
+    Held,
+    /// One can't be opened or created.
+    Unopenable(PathBuf, io::Error),
+}
+
+impl std::fmt::Display for NotTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            NotTaken::Held => write!(f, "a build is running"),
+            NotTaken::Unopenable(p, e) => write!(f, "can't lock {}: {e}", p.display()),
+        }
+    }
 }
 
 impl BuildLock {
-    /// `None` while a build holds any of them, or one can't be opened.
-    /// Missing ones are created, so a build that starts meanwhile in a
-    /// profile not built before waits too.
-    fn take(target: &Path) -> Option<BuildLock> {
+    /// The locks of the `debug` and `release` dirs that are real directories
+    /// (a symlinked one's lock files are in another target). Existing lock
+    /// files are opened read-only (`flock` needs no write access). Unless
+    /// `dry_run`, missing profile dirs and lock files are created, so a build
+    /// that starts meanwhile in a profile not built before waits too;
+    /// `dry_run` creates nothing.
+    fn take(target: &Path, dry_run: bool) -> Result<BuildLock, NotTaken> {
+        let at = SystemTime::now();
         let mut held = Vec::new();
         for profile in ["debug", "release"] {
             let dir = target.join(profile);
-            fs::create_dir_all(&dir).ok()?;
+            if !dry_run && fs::symlink_metadata(&dir).is_err() {
+                fs::create_dir_all(&dir).map_err(|e| NotTaken::Unopenable(dir.clone(), e))?;
+            }
+            if !real_dir(&dir) {
+                continue;
+            }
             for name in LOCK_FILES {
-                let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(name)).ok()?;
-                f.try_lock().ok()?;
-                held.push(f);
+                let path = dir.join(name);
+                let f = match File::open(&path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && dry_run => continue,
+                    // `create_new` doesn't follow a dangling symlink; a build
+                    // that created the file meanwhile leaves it to open.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => File::open(&path),
+                            other => other,
+                        }
+                    }
+                    other => other,
+                };
+                let f = f.map_err(|e| NotTaken::Unopenable(path.clone(), e))?;
+                match f.try_lock() {
+                    Ok(()) => held.push(f),
+                    Err(fs::TryLockError::WouldBlock) => return Err(NotTaken::Held),
+                    Err(fs::TryLockError::Error(e)) => return Err(NotTaken::Unopenable(path, e)),
+                }
             }
         }
-        Some(BuildLock { _files: held })
+        Ok(BuildLock { _files: held, at })
     }
+}
+
+/// Whether `path` is a directory and not a symlink.
+fn real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// What is running now: each process's pid and executable path.
@@ -322,6 +387,8 @@ struct Running {
 
 /// A process's executable.
 enum Exe {
+    /// Read only on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     At(PathBuf),
     /// Another user's process, or one that exited since it was listed.
     Other,
@@ -592,7 +659,10 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     if !fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
         return kept("not a directory");
     }
-    let Some(_held) = BuildLock::take(target) else { return kept("a build is running") };
+    let held = match BuildLock::take(target, opts.dry_run) {
+        Ok(held) => held,
+        Err(why) => return kept(&why.to_string()),
+    };
     // Read after the lock is taken: no build can start a program from it now.
     let Some(running) = Running::now() else { return kept("can't tell what is running") };
     if running.uses(target) {
@@ -601,7 +671,7 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
     if !older_than(last_active(target).max(also), idle) {
         return kept(&format!("active in the last {}", hours(idle)));
     }
-    let bytes = empty_target(target, opts);
+    let bytes = empty_target(target, held.at, opts);
     if bytes > 0 {
         println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
     }
@@ -609,10 +679,13 @@ fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Op
 }
 
 /// Remove everything in `target` but its `CACHEDIR.TAG`, the `debug` and
-/// `release` lock files (held by the caller) and any other dir with lock
-/// files. A build waiting on a lock holds that file open: were it unlinked,
-/// the build would lock a file no other build sees.
-fn empty_target(target: &Path, opts: &Opts) -> u64 {
+/// `release` lock files (held by the caller), any other dir with lock files,
+/// and any other dir modified since `locked` (when the caller took the
+/// locks): a build creates a custom profile's or a triple's dir before its
+/// lock file. A build waiting on a lock holds that file open: were it
+/// unlinked, the build would lock a file no other build sees.
+fn empty_target(target: &Path, locked: SystemTime, opts: &Opts) -> u64 {
+    let since = locked.checked_sub(MTIME_SLACK).unwrap_or(SystemTime::UNIX_EPOCH);
     let mut bytes = 0;
     for e in read_dir(target) {
         let name = e.file_name();
@@ -630,6 +703,8 @@ fn empty_target(target: &Path, opts: &Opts) -> u64 {
             }
         } else if dir && has_lock_files(&path) {
             println!("{}: holds locks this run doesn't; kept", path.display());
+        } else if dir && mtime_or_now(&path) >= since {
+            println!("{}: modified since the locks were taken; kept", path.display());
         } else {
             bytes += remove(&path, opts);
         }
@@ -1148,7 +1223,8 @@ mod tests {
     }
 
     /// A target dir nothing has touched for a day, with a lock file and a
-    /// build product.
+    /// build product. Only emptying uses it, which happens only on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn idle_target(dir: &Path) {
         target(dir);
         File::create(dir.join("debug/.cargo-lock")).unwrap();
@@ -1161,6 +1237,7 @@ mod tests {
     }
 
     /// Whether `dir` was emptied: only its tag and lock files are left.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn emptied(dir: &Path) -> bool {
         dir.join("CACHEDIR.TAG").is_file()
             && dir.join("debug/.cargo-lock").is_file()
@@ -1412,6 +1489,7 @@ mod tests {
         fs::write(t.join(".rustc_info.json"), "{}").unwrap();
         fs::create_dir_all(t.join("tmp")).unwrap();
         fs::write(t.join("tmp/x"), "x").unwrap();
+        set_mtime(&t.join("tmp"), SystemTime::now() - Duration::from_secs(60));
         fs::create_dir_all(t.join("debug/deps")).unwrap();
         fs::write(outside.join("keep"), "x").unwrap();
         symlink(&*outside, t.join("release")).unwrap();
@@ -1419,9 +1497,10 @@ mod tests {
         File::create(t.join("profiling/.cargo-lock")).unwrap();
         fs::create_dir_all(t.join("aarch64-apple-darwin/debug/deps")).unwrap();
         File::create(t.join("aarch64-apple-darwin/debug/.cargo-build-lock")).unwrap();
-        let held = BuildLock::take(&t).expect("no build holds it");
+        let held = BuildLock::take(&t, false).expect("no build holds it");
         assert!(t.join("debug/.cargo-artifact-lock").is_file(), "missing lock files are created");
-        empty_target(&t, &opts());
+        assert!(fs::read_dir(&*outside).unwrap().count() == 1, "not in a symlinked profile's destination");
+        empty_target(&t, held.at, &opts());
         drop(held);
         let mut left: Vec<String> = Vec::new();
         for e in read_dir(&t) {
@@ -1445,9 +1524,10 @@ mod tests {
         fs::create_dir_all(dir.join("debug")).unwrap();
         let build = File::create(dir.join("debug/.cargo-build-lock")).unwrap();
         build.lock().unwrap();
-        assert!(BuildLock::take(&dir).is_none(), "a build holds it");
+        assert!(matches!(BuildLock::take(&dir, false), Err(NotTaken::Held)), "a build holds it");
+        assert!(matches!(BuildLock::take(&dir, true), Err(NotTaken::Held)), "also when dry-running");
         build.unlock().unwrap();
-        let held = BuildLock::take(&dir).expect("free once the build is done");
+        let held = BuildLock::take(&dir, false).expect("free once the build is done");
         assert!(File::open(dir.join("debug/.cargo-build-lock")).unwrap().try_lock().is_err(), "held while cleaning");
         drop(held);
     }
@@ -1475,5 +1555,112 @@ mod tests {
         let t = clean_profile(&dir, &lock, &opts());
         assert_eq!(t.removed, 0);
         assert!(dir.join("build/pkg-00000000000000b2").is_dir(), "the run's output stays");
+    }
+
+    /// The entries below `dir`, relative to it, sorted.
+    fn listing(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for e in read_dir(dir) {
+                out.push(e.path().strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(base, &e.path(), out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_dry_run_locks_only_the_lock_files_there_are_and_creates_nothing() {
+        let t = tmpdir("dry");
+        target(&t);
+        File::create(t.join("debug/.cargo-lock")).unwrap();
+        let before = listing(&t);
+        let held = BuildLock::take(&t, true).expect("no build holds it");
+        assert_eq!(listing(&t), before, "no profile dir or lock file is created");
+        assert!(File::open(t.join("debug/.cargo-lock")).unwrap().try_lock().is_err(), "the one there is held");
+        drop(held);
+        let o = Opts { dry_run: true, ..opts() };
+        clean_target(&t, &Lock::default(), &o);
+        assert_eq!(listing(&t), before, "nor by a dry-run clean");
+    }
+
+    #[test]
+    fn a_target_that_cant_be_written_is_not_reported_as_held() {
+        let t = tmpdir("readonly");
+        target(&t);
+        File::create(t.join("debug/.cargo-lock")).unwrap();
+        fs::create_dir(t.join("release")).unwrap();
+        let read_only = |mode| {
+            for d in ["debug", "release", ""] {
+                fs::set_permissions(t.join(d), fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        read_only(0o555);
+        let wet = BuildLock::take(&t, false).map(|_| ());
+        let dry = BuildLock::take(&t, true).map(|_| ());
+        read_only(0o755);
+        assert!(
+            matches!(&wet, Err(NotTaken::Unopenable(p, _)) if p.parent() == Some(&*t.join("debug"))),
+            "a missing lock file it can't create: {wet:?}"
+        );
+        assert!(dry.is_ok(), "a dry run creates nothing, so needs no write access: {dry:?}");
+
+        // Lock files that exist are opened read-only.
+        BuildLock::take(&t, false).expect("creates them while writable");
+        read_only(0o555);
+        for l in LOCK_FILES {
+            fs::set_permissions(t.join("debug").join(l), fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let taken = BuildLock::take(&t, false).map(|_| ());
+        read_only(0o755);
+        assert!(taken.is_ok(), "{taken:?}");
+    }
+
+    #[test]
+    fn a_symlinked_profile_is_neither_locked_nor_cleaned() {
+        let t = tmpdir("symprofile");
+        let outside = tmpdir("symprofile-outside");
+        target(&t);
+        // More incremental dirs of one crate than are kept.
+        for i in 0..KEEP_INCREMENTAL + 2 {
+            let d = outside.join(format!("incremental/foo-{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("x"), vec![1u8; 4096]).unwrap();
+        }
+        // A build in the destination's own target holds its lock.
+        let build = File::create(outside.join(".cargo-lock")).unwrap();
+        build.lock().unwrap();
+        symlink(&*outside, t.join("release")).unwrap();
+        let before = listing(&outside);
+        let held = BuildLock::take(&t, false).expect("the destination's lock isn't this target's");
+        assert_eq!(listing(&outside), before, "no lock file is created there");
+        drop(held);
+        clean_target(&t, &Lock::default(), &opts());
+        assert_eq!(listing(&outside), before, "nothing there is removed");
+
+        // The same in a real profile is cleaned, and counted with no units.
+        let real = t.join("debug/incremental");
+        fs::rename(outside.join("incremental"), &real).unwrap();
+        let freed = clean_target(&t, &Lock::default(), &opts());
+        assert_eq!(read_dir(&real).len(), KEEP_INCREMENTAL);
+        assert!(freed > 0, "incremental dirs count without units");
+    }
+
+    #[test]
+    fn emptying_keeps_a_dir_modified_since_the_locks_were_taken() {
+        let t = tmpdir("race");
+        target(&t);
+        fs::create_dir(t.join("old")).unwrap();
+        set_mtime(&t.join("old"), SystemTime::now() - Duration::from_secs(60));
+        let held = BuildLock::take(&t, false).expect("no build holds it");
+        // A build creating a triple's dir, its lock file not yet.
+        fs::create_dir_all(t.join("x86_64-apple-darwin/debug")).unwrap();
+        empty_target(&t, held.at, &opts());
+        assert!(!t.join("old").exists());
+        assert!(t.join("x86_64-apple-darwin/debug").is_dir());
     }
 }
