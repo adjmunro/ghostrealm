@@ -2956,6 +2956,28 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_path_picked_again_after_the_document_closed_closes_the_picker() {
+        let dir = crate::plugin::testing::tmpdir("picker-blocked-gone");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::write(dir.join("missing"), "a file, not a folder").unwrap();
+        let target = dir.join("missing").join("x.txt");
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.open_file_in_new_surface(&file).unwrap();
+        let sid = s.focused_surface().unwrap();
+        s.open_save_as(sid);
+        s.confirm_picker_with(target.clone()).unwrap();
+        assert!(picker_error(&s).is_some(), "the save failed: the path is blocked");
+        s.close_surface_id(sid);
+        assert_eq!(s.confirm_picker_with(target).unwrap(), None);
+        assert!(!s.picker_open());
+        let head = &s.toasts().head().unwrap().toast;
+        assert_eq!(head.message, "The view to save has closed");
+        assert_eq!(head.scope, Scope::App);
+    }
+
+    #[test]
     fn a_save_as_choice_opens_the_picker_for_its_document_and_stays() {
         let dir = crate::plugin::testing::tmpdir("toast-save-as");
         let file = dir.join("a.txt");
