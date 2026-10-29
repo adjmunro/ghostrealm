@@ -924,13 +924,41 @@ impl AppState {
         args: &ghostrealm_core::Args,
         from: Option<SurfaceId>,
     ) -> std::result::Result<CmdOutcome, CmdError> {
+        self.run_command_toasting(registry, id, args, from, false)
+    }
+
+    /// [`Self::run_command`] for a command picked from the palette. One that
+    /// doesn't apply where the focus is also shows as an info toast: the
+    /// user asked for it by name, and silence would look broken.
+    pub fn run_palette_command(
+        &mut self,
+        registry: &mut Registry<AppState>,
+        id: &str,
+        args: &ghostrealm_core::Args,
+    ) -> std::result::Result<CmdOutcome, CmdError> {
+        self.run_command_toasting(registry, id, args, None, true)
+    }
+
+    fn run_command_toasting(
+        &mut self,
+        registry: &mut Registry<AppState>,
+        id: &str,
+        args: &ghostrealm_core::Args,
+        from: Option<SurfaceId>,
+        inapplicable: bool,
+    ) -> std::result::Result<CmdOutcome, CmdError> {
         // Taken first: the command may close the surface it ran from.
         let scope = self.scope_of(from);
         let result = self.run_command_logged(registry, id, args);
         if let Err(e) = &result {
-            if !matches!(e, CmdError::Inapplicable(_)) {
+            let level = match e {
+                CmdError::Inapplicable(_) if inapplicable => Some(Level::Info),
+                CmdError::Inapplicable(_) => None,
+                _ => Some(Level::Error),
+            };
+            if let Some(level) = level {
                 let title = registry.meta(id).map_or(id, |m| m.title);
-                self.notify(Toast::new(Level::Error, format!("{title}: {e}")).on(scope));
+                self.notify(Toast::new(level, format!("{title}: {e}")).on(scope));
             }
         }
         result
@@ -3092,12 +3120,19 @@ mod tests {
         assert_eq!(lines(&s), ["a = 1", "b = 2"]);
 
         // A file whose language has no comment syntax stays as it was, and
-        // the command doesn't apply there (no toast).
+        // the command doesn't apply there: no toast from a chord, an info
+        // toast from the palette.
         let txt = dir.join("a.txt");
         std::fs::write(&txt, "x").unwrap();
         s.open_file_in_new_surface(&txt).unwrap();
-        let err = r.execute("editor.toggle_comment", &Args::new(), &mut s).unwrap_err();
+        let err = s.run_command(&mut r, "editor.toggle_comment", &Args::new(), None).unwrap_err();
         assert!(matches!(err, CmdError::Inapplicable(_)), "{err:?}");
+        assert!(s.toasts().is_empty());
+        let err = s.run_palette_command(&mut r, "editor.toggle_comment", &Args::new()).unwrap_err();
+        assert!(matches!(err, CmdError::Inapplicable(_)), "{err:?}");
+        let head = &s.toasts().head().unwrap().toast;
+        assert_eq!(head.level, Level::Info);
+        assert_eq!(head.message, "Toggle Comment: this language has no comment syntax");
     }
 
     #[test]

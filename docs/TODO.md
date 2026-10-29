@@ -1462,17 +1462,6 @@
 
 ---
 
-[2026-10-26T22:50+1300@5bb2c09d] Editor — Toggle Comment from the palette without comment syntax shows nothing
-
-- Requires: NO BLOCKERS
-- Detail: In a file whose language has no comment syntax (or an untitled
-  buffer), Toggle Comment is `CmdError::Inapplicable`, which goes to stderr
-  only, so running it from the palette does nothing visible. Consider an
-  info toast for a command the user ran explicitly from the palette.
-- Reason: an explicit request that silently does nothing looks broken.
-
----
-
 [2026-10-26T22:54+1300@fdc79626] Palette — a prompt error row may hide its last wide glyph
 
 - Requires: a desktop check with a CJK or emoji error message

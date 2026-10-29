@@ -2451,7 +2451,7 @@ impl State {
         let prefill = (action == FileAction::Rename)
             .then(|| target.path.file_name().map(|n| n.to_string_lossy().into_owned()))
             .flatten();
-        self.begin_command_with(action.command(), action.args(target), prefill, Some(from));
+        self.begin_command_with(action.command(), action.args(target), prefill, Some(from), false);
     }
 
     /// A click while the palette is open: start a clicked result (prompting
@@ -2469,7 +2469,7 @@ impl State {
             .map(|(_, _, id)| id.clone())
         {
             self.palette = None;
-            self.begin_command(&id);
+            self.begin_palette_command(&id);
             return;
         }
         if !rect_contains(self.palette_panel, x, y) {
@@ -3683,13 +3683,27 @@ impl State {
     /// Run a command by id: execute immediately if it needs no required args, else
     /// open the palette to collect them (the argument prompt).
     fn begin_command(&mut self, id: &str) {
-        self.begin_command_with(id, Args::new(), None, None);
+        self.begin_command_with(id, Args::new(), None, None, false);
+    }
+
+    /// [`Self::begin_command`] for a command picked from the palette: one
+    /// that doesn't apply where the focus is says so
+    /// ([`AppState::run_palette_command`]).
+    fn begin_palette_command(&mut self, id: &str) {
+        self.begin_command_with(id, Args::new(), None, None, true);
     }
 
     /// [`Self::begin_command`] with some arguments known (`preset`) and the
     /// prompt starting with `prefill`. `from` is the surface whose menu ran
-    /// it, for where a failure shows.
-    fn begin_command_with(&mut self, id: &str, preset: Args, prefill: Option<String>, from: Option<SurfaceId>) {
+    /// it, for where a failure shows. `palette` says the palette picked it.
+    fn begin_command_with(
+        &mut self,
+        id: &str,
+        preset: Args,
+        prefill: Option<String>,
+        from: Option<SurfaceId>,
+        palette: bool,
+    ) {
         if let Entry::Prompt(specs) = command_entry(self.registry.meta(id), &preset) {
             let title = self
                 .registry
@@ -3711,6 +3725,8 @@ impl State {
                     error: None,
                 }),
             });
+        } else if palette {
+            let _ = self.app.run_palette_command(&mut self.registry, id, &preset);
         } else {
             self.run_command(id, &preset, from);
         }
@@ -3973,7 +3989,7 @@ impl State {
                     self.palette = None;
                     if let Some(id) = id {
                         // Executes now, or reopens the palette to collect args.
-                        self.begin_command(&id);
+                        self.begin_palette_command(&id);
                     }
                 }
                 PaletteMode::Run => {
