@@ -7,14 +7,23 @@ ninja = "1.13.2"
 # Build the CEF web host and bundle it beside the `ghostrealm` binary, where the
 # app looks for it. Always build with `--features bundle` so cef isn't rebuilt
 # when switching between the host and the bundler.
+# It ends with clean-stale: a changed CEF build leaves the old ~600 MB
+# download behind.
 [tasks.web]
 run = [
     "cargo build -p ghostrealm-web-host --features bundle --bins",
     "cargo run -p ghostrealm-web-host --features bundle --bin ghostrealm-web-bundle",
+    "mise run clean-stale",
 ]
 
 # Remove build artifacts that a newer build superseded (Cargo never does).
 # `mise run clean-stale -- --dry-run` lists what would go; see
-# scripts/clean-stale.rs for what is kept. Run it when no build is in progress.
+# scripts/clean-stale.rs for what is kept. A target dir a build holds is skipped.
 [tasks.clean-stale]
-run = "rustc -O --edition 2021 scripts/clean-stale.rs -o target/clean-stale && target/clean-stale"
+run = "mkdir -p target && rustc -O --edition 2021 scripts/clean-stale.rs -o target/clean-stale && target/clean-stale"
+
+# clean-stale, plus other worktrees' and scratchpads' idle target dirs and the
+# temp-dir leftovers of tests and web hosts that are gone. `-- --dry-run` lists
+# what would go.
+[tasks.clean-all]
+run = "mise run clean-stale -- --all"
