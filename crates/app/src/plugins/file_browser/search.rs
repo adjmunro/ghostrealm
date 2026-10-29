@@ -1057,9 +1057,10 @@ mod tests {
         let line = "a ".repeat(1024 * 1024 / 2);
         let query = SearchQuery { text: "a".into(), ..SearchQuery::default() };
         let near_end = (line.len() / 2 - 10) * 2;
-        // No line budget: under load, a debug build's walk over half a
-        // million matches can pass it and stop at the line's first.
-        let matcher = query.matcher().unwrap().with_line_budget(Duration::from_secs(3600));
+        // A budget past the 5 s below: under load, a debug build's walk over
+        // half a million matches can pass the 1 s one and stop at the line's
+        // first.
+        let matcher = query.matcher().unwrap().with_line_budget(Duration::from_secs(10));
         let m = MatchAt { path: PathBuf::new(), line: 0, cols: near_end..near_end + 1, query };
         let at = Instant::now();
         assert_eq!(m.cols_by(&matcher, &line), near_end..near_end + 1);
