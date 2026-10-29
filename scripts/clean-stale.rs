@@ -28,27 +28,55 @@
 //! kept, as many as the crate has units left (at least 4). It is a cache; a
 //! lost directory only costs one slower compile.
 //!
-//! Only `target/` is touched; `~/.cargo` is never read or written. Do not run
-//! it while a build is in progress. It refuses to run without a readable
-//! `Cargo.lock` (every registry unit would look unlisted), or when
+//! Only `target/` is touched; `~/.cargo` is never read or written. A target
+//! dir is skipped while a build holds Cargo's lock on it (`.cargo-lock`,
+//! `.cargo-build-lock`), and that lock is held while cleaning, so a build that
+//! starts meanwhile waits. Cargo releases the lock before it runs tests; the
+//! newest copies the tests run from are kept. It refuses to run without a
+//! readable `Cargo.lock` (every registry unit would look unlisted), or when
 //! `CARGO_TARGET_DIR` is set but `--target-dir` is not: a target dir shared
 //! with other workspaces would lose their registry units.
 //!
-//! Run it from the repo root with `mise run clean-stale [-- --dry-run]`, or
-//! build it with `rustc -O --edition 2021 scripts/clean-stale.rs`. Options:
+//! `--all` cleans every place the workflow leaves build and test output:
+//!
+//! - this checkout's `target/`, as above;
+//! - each other worktree's `target/`: removed whole once idle (no build for
+//!   `--idle-hours`, default 2) and no running program lives in it, else
+//!   cleaned as above. The main checkout's is only ever cleaned as above;
+//! - Cargo target dirs (holding `CACHEDIR.TAG`) in this project's Claude
+//!   scratchpads (`/tmp/claude-<uid>/<project>/`) and in the temp dir (those
+//!   with ghostrealm units): removed whole once idle and unused;
+//! - `ghostrealm-*` entries in the temp dir that tests and the web host leave
+//!   when their process dies before cleaning up: removed once no process whose
+//!   pid appears in the name is running and they are 5 minutes old. The app's
+//!   frame directory `ghostrealm-<uid>` is kept;
+//! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
+//!   while no web host runs.
+//!
+//! Run it from the repo root with `mise run clean-stale [-- --dry-run]` (or
+//! `mise run clean-all`), or build it with
+//! `rustc -O --edition 2021 scripts/clean-stale.rs`. Options:
 //! `--dry-run`/`-n` (remove nothing), `--verbose`/`-v` (list each path),
-//! `--keep N`, `--target-dir DIR`, `--lockfile FILE`.
+//! `--keep N`, `--target-dir DIR`, `--lockfile FILE`, `--all`,
+//! `--idle-hours N`, `--except DIR` (leave that target dir alone; repeatable).
 //! Its tests run with `rustc --test --edition 2021 scripts/clean-stale.rs`.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::SystemTime;
+use std::process::{Command, ExitCode};
+use std::time::{Duration, SystemTime};
 
 /// The fewest incremental-compilation directories kept per crate name.
 const KEEP_INCREMENTAL: usize = 4;
+
+/// How old a temp-dir leftover must be before it goes: a test creating its
+/// directory has a live pid, but the name may be read before it is written.
+const TEMP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// The bundle id CEF prefixes its temp dirs with.
+const CEF_TEMP_PREFIX: &str = "dev.ghostrealm.web-host.";
 
 struct Unit {
     package: String,
@@ -69,13 +97,27 @@ struct Opts {
     dry_run: bool,
     verbose: bool,
     keep: usize,
+    /// Target dirs left alone (canonical paths).
+    except: Vec<PathBuf>,
+}
+
+impl Opts {
+    fn freed(&self) -> &'static str {
+        if self.dry_run { "would free" } else { "freed" }
+    }
+
+    fn excepts(&self, target: &Path) -> bool {
+        fs::canonicalize(target).is_ok_and(|t| self.except.contains(&t))
+    }
 }
 
 fn main() -> ExitCode {
-    let mut opts = Opts { dry_run: false, verbose: false, keep: 3 };
+    let mut opts = Opts { dry_run: false, verbose: false, keep: 3, except: Vec::new() };
     let mut target = PathBuf::from("target");
     let mut lockfile = PathBuf::from("Cargo.lock");
     let mut target_given = false;
+    let mut all = false;
+    let mut idle = Duration::from_secs(2 * 3600);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -87,6 +129,12 @@ fn main() -> ExitCode {
                 target_given = true;
             }
             "--lockfile" => lockfile = args.next().map(PathBuf::from).unwrap_or(lockfile),
+            "--all" => all = true,
+            "--except" => opts.except.extend(args.next().and_then(|d| fs::canonicalize(d).ok())),
+            "--idle-hours" => {
+                let hours: Option<f64> = args.next().and_then(|n| n.parse().ok());
+                idle = hours.map_or(idle, |h| Duration::from_secs_f64(h.max(0.0) * 3600.0));
+            }
             other => {
                 eprintln!("clean-stale: unknown argument {other}");
                 return ExitCode::from(2);
@@ -102,24 +150,266 @@ fn main() -> ExitCode {
         eprintln!("clean-stale: no packages in {}; run it from the workspace root", lockfile.display());
         return ExitCode::from(2);
     };
-    let mut total = Totals::default();
+    let mut total = clean_target(&target, &lock, &opts);
+    if all {
+        let running = Running::now();
+        total += clean_worktrees(&target, idle, &running, &opts);
+        total += clean_scratch_targets(idle, &running, &opts);
+        total += clean_temp(&std::env::temp_dir(), idle, &running, &opts);
+    }
+    println!("{} {}", opts.freed(), human(total));
+    ExitCode::SUCCESS
+}
+
+/// Remove the superseded units of `target`, unless a build holds it.
+fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
+    if opts.excepts(target) {
+        println!("{}: excepted; kept", target.display());
+        return 0;
+    }
+    let Some(_held) = BuildLock::take(target) else {
+        println!("{}: a build is running; skipped", target.display());
+        return 0;
+    };
+    let mut bytes = 0;
     for profile in ["debug", "release"] {
         let dir = target.join(profile);
         if dir.is_dir() {
-            let t = clean_profile(&dir, &lock, &opts);
+            let t = clean_profile(&dir, lock, opts);
             println!(
                 "{}: {} of {} units superseded; {} {}",
                 dir.display(),
                 t.removed,
                 t.units,
-                if opts.dry_run { "would free" } else { "freed" },
+                opts.freed(),
                 human(t.bytes)
             );
-            total.bytes += t.bytes;
+            bytes += t.bytes;
         }
     }
-    println!("{} {}", if opts.dry_run { "would free" } else { "freed" }, human(total.bytes));
-    ExitCode::SUCCESS
+    bytes
+}
+
+/// Cargo's locks on a target dir, held exclusively. Cargo takes them for the
+/// whole build (not while tests run), so holding them means no build is
+/// writing and none can start.
+struct BuildLock {
+    _files: Vec<File>,
+}
+
+impl BuildLock {
+    /// `None` while a build holds any of them.
+    fn take(target: &Path) -> Option<BuildLock> {
+        let mut held = Vec::new();
+        for profile in ["debug", "release"] {
+            for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+                let Ok(f) = File::open(target.join(profile).join(name)) else { continue };
+                if f.try_lock().is_err() {
+                    return None;
+                }
+                held.push(f);
+            }
+        }
+        Some(BuildLock { _files: held })
+    }
+}
+
+/// What is running now: each process's pid and executable path.
+struct Running {
+    pids: HashSet<u32>,
+    programs: Vec<PathBuf>,
+}
+
+impl Running {
+    fn now() -> Running {
+        let out = Command::new("ps").args(["-axo", "pid=,comm="]).output();
+        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let mut running = Running { pids: HashSet::new(), programs: Vec::new() };
+        for line in text.lines() {
+            let line = line.trim_start();
+            let (pid, comm) = line.split_once(' ').unwrap_or((line, ""));
+            if let Ok(pid) = pid.parse() {
+                running.pids.insert(pid);
+            }
+            running.programs.push(PathBuf::from(comm.trim()));
+        }
+        running
+    }
+
+    /// Whether a running program's executable is inside `dir` (a test binary,
+    /// the app, or the bundled web host).
+    fn uses(&self, dir: &Path) -> bool {
+        let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.programs.iter().any(|p| p.starts_with(&dir))
+    }
+
+    /// Whether a web host (whose CEF temp dirs these are) is running.
+    fn web_host(&self) -> bool {
+        self.programs
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ghostrealm-web-host")))
+    }
+}
+
+/// When a build last wrote to `target`: the newest of its profiles' lock
+/// files and unit directories.
+fn last_build(target: &Path) -> SystemTime {
+    let mut newest = SystemTime::UNIX_EPOCH;
+    for profile in ["debug", "release"] {
+        for name in ["", ".cargo-lock", ".cargo-build-lock", "deps", ".fingerprint", "incremental", "build"] {
+            let p = target.join(profile).join(name);
+            if let Ok(t) = fs::metadata(&p).and_then(|m| m.modified()) {
+                newest = newest.max(t);
+            }
+        }
+    }
+    newest
+}
+
+fn older_than(t: SystemTime, age: Duration) -> bool {
+    SystemTime::now().duration_since(t).is_ok_and(|d| d >= age)
+}
+
+/// Remove a whole target dir once no build has written to it for `idle` and
+/// no running program lives in it. Returns the bytes freed.
+fn remove_idle_target(target: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
+    if opts.excepts(target) {
+        println!("{}: excepted; kept", target.display());
+        return 0;
+    }
+    let Some(_held) = BuildLock::take(target) else {
+        println!("{}: a build is running; kept", target.display());
+        return 0;
+    };
+    if running.uses(target) {
+        println!("{}: a program in it is running; kept", target.display());
+        return 0;
+    }
+    if !older_than(last_build(target), idle) {
+        println!("{}: built in the last {}; kept", target.display(), hours(idle));
+        return 0;
+    }
+    let bytes = remove(target, opts);
+    println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
+    bytes
+}
+
+fn hours(d: Duration) -> String {
+    format!("{:.1} h", d.as_secs_f64() / 3600.0)
+}
+
+/// `git worktree list`: the main checkout first, then the others.
+fn worktrees() -> Vec<PathBuf> {
+    let out = Command::new("git").args(["worktree", "list", "--porcelain"]).output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    text.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from).collect()
+}
+
+/// Every other worktree's `target/`: the main checkout's has its superseded
+/// units removed; a linked worktree's goes whole once idle, else the same.
+fn clean_worktrees(own_target: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
+    let own = fs::canonicalize(own_target).ok();
+    let mut bytes = 0;
+    for (i, tree) in worktrees().into_iter().enumerate() {
+        let target = tree.join("target");
+        if !target.is_dir() || fs::canonicalize(&target).ok() == own {
+            continue;
+        }
+        let freed = if i > 0 { remove_idle_target(&target, idle, running, opts) } else { 0 };
+        if freed == 0 && target.is_dir() && !opts.excepts(&target) {
+            match read_lock(&tree.join("Cargo.lock")) {
+                Some(lock) => bytes += clean_target(&target, &lock, opts),
+                None => println!("{}: no Cargo.lock beside it; kept", target.display()),
+            }
+        }
+        bytes += freed;
+    }
+    bytes
+}
+
+/// This project's Claude scratchpads: `/tmp/claude-<uid>/<checkout path with
+/// '/' as '-'>/`, one directory per session.
+fn scratch_root() -> Option<PathBuf> {
+    let main = worktrees().into_iter().next()?;
+    let slug = main.to_string_lossy().replace('/', "-");
+    let uid = Command::new("id").arg("-u").output().ok()?;
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    Some(PathBuf::from(format!("/tmp/claude-{uid}")).join(slug))
+}
+
+/// Cargo target dirs (marked by `CACHEDIR.TAG`) at most `depth` levels below
+/// `dir`; a target dir's own contents are not searched.
+fn find_targets(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    for e in read_dir(dir) {
+        let p = e.path();
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if p.join("CACHEDIR.TAG").is_file() {
+            found.push(p);
+        } else if depth > 1 {
+            find_targets(&p, depth - 1, found);
+        }
+    }
+}
+
+/// Idle target dirs in this project's scratchpads (reviewers build there with
+/// their own `CARGO_TARGET_DIR`).
+fn clean_scratch_targets(idle: Duration, running: &Running, opts: &Opts) -> u64 {
+    let Some(root) = scratch_root() else { return 0 };
+    let mut targets = Vec::new();
+    find_targets(&root, 4, &mut targets);
+    targets.iter().map(|t| remove_idle_target(t, idle, running, opts)).sum()
+}
+
+/// Whether a target dir holds units of this workspace.
+fn has_ghostrealm_units(target: &Path) -> bool {
+    ["debug", "release"].iter().any(|profile| {
+        read_dir(&target.join(profile).join(".fingerprint"))
+            .iter()
+            .any(|e| e.file_name().to_string_lossy().starts_with("ghostrealm"))
+    })
+}
+
+/// The temp dir: leftovers of tests and web hosts whose process is gone, CEF
+/// temp dirs while no host runs, and idle ghostrealm target dirs.
+fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
+    let frame_dir = format!("ghostrealm-{}", unsafe { getuid() });
+    let host = running.web_host();
+    let (mut count, mut bytes) = (0, 0);
+    for e in read_dir(temp) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let path = e.path();
+        let stale = if name.starts_with("ghostrealm-") {
+            name != frame_dir && leftover_is_stale(&name, &path, &running.pids)
+        } else if name.starts_with(CEF_TEMP_PREFIX) {
+            !host
+        } else {
+            if path.join("CACHEDIR.TAG").is_file() && has_ghostrealm_units(&path) {
+                bytes += remove_idle_target(&path, idle, running, opts);
+            }
+            false
+        };
+        if stale {
+            count += 1;
+            bytes += remove(&path, opts);
+        }
+    }
+    println!("{}: {count} leftovers; {} {}", temp.display(), opts.freed(), human(bytes));
+    bytes
+}
+
+/// A `ghostrealm-<tag>-<pid>[-<n>]` (or `...-<pid>.txt`) temp entry goes once
+/// no number in its name is a running pid and it is [`TEMP_MIN_AGE`] old.
+/// Counting the other numbers as pids too only keeps more.
+fn leftover_is_stale(name: &str, path: &Path, pids: &HashSet<u32>) -> bool {
+    let alive = name.split(['-', '.']).filter_map(|s| s.parse::<u32>().ok()).any(|n| pids.contains(&n));
+    let modified = fs::symlink_metadata(path).and_then(|m| m.modified()).unwrap_or_else(|_| SystemTime::now());
+    !alive && older_than(modified, TEMP_MIN_AGE)
+}
+
+extern "C" {
+    fn getuid() -> u32;
 }
 
 /// What `Cargo.lock` lists.
@@ -403,6 +693,44 @@ mod tests {
     }
 
     #[test]
+    fn a_temp_leftover_goes_once_its_process_is_gone_and_it_is_old() {
+        let dir = std::env::temp_dir().join(format!("clean-stale-leftover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::now() - TEMP_MIN_AGE - Duration::from_secs(1);
+        let entry = |name: &str, modified: SystemTime| {
+            let p = dir.join(name);
+            File::create(&p).unwrap().set_modified(modified).unwrap();
+            p
+        };
+        let pids: HashSet<u32> = [4242].into();
+        let dead = entry("ghostrealm-fb-1111-3", old);
+        assert!(leftover_is_stale("ghostrealm-fb-1111-3", &dead, &pids));
+        let alive = entry("ghostrealm-fb-4242-3", old);
+        assert!(!leftover_is_stale("ghostrealm-fb-4242-3", &alive, &pids), "its test is running");
+        let file = entry("ghostrealm-undo-4242.txt", old);
+        assert!(!leftover_is_stale("ghostrealm-undo-4242.txt", &file, &pids), "a pid before an extension");
+        let new = entry("ghostrealm-fb-1111-4", SystemTime::now());
+        assert!(!leftover_is_stale("ghostrealm-fb-1111-4", &new, &pids), "too new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_target_held_by_a_build_is_not_taken() {
+        let dir = std::env::temp_dir().join(format!("clean-stale-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("debug")).unwrap();
+        let build = File::create(dir.join("debug/.cargo-build-lock")).unwrap();
+        build.lock().unwrap();
+        assert!(BuildLock::take(&dir).is_none(), "a build holds it");
+        build.unlock().unwrap();
+        let held = BuildLock::take(&dir).expect("free once the build is done");
+        assert!(File::open(dir.join("debug/.cargo-build-lock")).unwrap().try_lock().is_err(), "held while cleaning");
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_goes_with_its_compile_whatever_order_its_links_deps_come_in() {
         let dir = std::env::temp_dir().join(format!("clean-stale-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -423,7 +751,7 @@ mod tests {
         );
         let mut lock = Lock::default();
         lock.dirs.insert("pkg-1.0.0".into());
-        let t = clean_profile(&dir, &lock, &Opts { dry_run: false, verbose: false, keep: 3 });
+        let t = clean_profile(&dir, &lock, &Opts { dry_run: false, verbose: false, keep: 3, except: Vec::new() });
         assert_eq!(t.removed, 0);
         assert!(dir.join("build/pkg-00000000000000b2").is_dir(), "the run's output stays");
         let _ = fs::remove_dir_all(&dir);
