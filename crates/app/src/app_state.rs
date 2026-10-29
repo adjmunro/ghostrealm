@@ -1094,12 +1094,13 @@ impl AppState {
     /// another existing file asks first ([`Self::confirm`]) and leaves the
     /// picker open; so does a failure, with its error in the picker
     /// ([`Self::finish_picker`]), and picking the path that failed again
-    /// does nothing. Returns the file written, if any.
+    /// does nothing. A Save As or Save Copy As picker whose document has
+    /// closed closes instead. Returns the file written, if any.
     pub fn confirm_picker_with(
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<Option<std::path::PathBuf>> {
-        if self.picker.as_ref().is_some_and(|(b, _)| b.blocks(&path)) {
+        if self.picker.as_ref().is_some_and(|(b, _)| b.blocks(&path)) || self.close_picker_if_doc_gone() {
             return Ok(None);
         }
         if let Some((_, Pick::SaveAs(doc) | Pick::SaveCopy(doc))) = &self.picker {
@@ -1121,9 +1122,28 @@ impl AppState {
         self.finish_picker(path)
     }
 
+    /// Close a Save As or Save Copy As picker whose document has closed, with
+    /// an error toast: no path the picker offers can save it. Returns whether
+    /// it closed.
+    fn close_picker_if_doc_gone(&mut self) -> bool {
+        let Some((_, Pick::SaveAs(doc) | Pick::SaveCopy(doc))) = self.picker else {
+            return false;
+        };
+        if self.doc(doc).is_some() {
+            return false;
+        }
+        self.close_picker();
+        eprintln!("ghostrealm: picker: the view to save has closed");
+        self.notify(Toast::new(Level::Error, "The view to save has closed"));
+        true
+    }
+
     /// Act on `path` per the picker's purpose, then close it. On failure the
     /// picker stays open with the error under its listing.
     fn finish_picker(&mut self, path: std::path::PathBuf) -> Result<Option<std::path::PathBuf>> {
+        if self.close_picker_if_doc_gone() {
+            return Ok(None);
+        }
         let Some(&(_, purpose)) = self.picker.as_ref() else {
             return Ok(None);
         };
@@ -2826,6 +2846,28 @@ mod tests {
         s.choose_toast(id, 0);
         assert_eq!(s.picker_purpose(), None);
         assert!(s.toasts().is_empty());
+    }
+
+    #[test]
+    fn a_save_as_picker_for_a_closed_document_closes_with_a_toast() {
+        for copy in [false, true] {
+            let dir = crate::plugin::testing::tmpdir("picker-save-as-gone");
+            let file = dir.join("a.txt");
+            std::fs::write(&file, "x").unwrap();
+            let mut s = AppState::new();
+            s.new_empty_vtab();
+            s.open_file_in_new_surface(&file).unwrap();
+            let sid = s.focused_surface().unwrap();
+            let doc = s.active_doc(sid).unwrap();
+            s.open_picker(if copy { Pick::SaveCopy(doc) } else { Pick::SaveAs(doc) });
+            s.close_surface_id(sid);
+            assert!(s.doc(doc).is_none());
+            // An existing file would ask to replace it first.
+            assert_eq!(s.confirm_picker_with(file).unwrap(), None);
+            assert!(!s.picker_open());
+            assert!(s.confirm().is_none());
+            assert_eq!(s.toasts().head().map(|t| t.toast.message.as_str()), Some("The view to save has closed"));
+        }
     }
 
     #[test]
