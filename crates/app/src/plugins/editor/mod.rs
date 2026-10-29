@@ -4094,19 +4094,38 @@ body
     #[test]
     fn the_wheel_passes_a_headings_space_as_the_text_moves() {
         let mut h = spaced_harness();
-        let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
-        let mut v = markdown_view("editor-md-wheel-space", &text);
+        let mut v = markdown_view("editor-md-wheel-space", &format!("x\n# Head\n{}", "y\n".repeat(20)));
         paint_plain(&mut h, &mut v);
-        // Passing line 0 moves line 1 up by line 0's row and line 1's space,
-        // which it stops drawing on top.
-        let rows = |h: &Harness| text_rows(h).into_iter().map(|r| r.0).take(2).collect::<Vec<_>>();
-        assert_eq!(rows(&h), [0.0, R1 + SPACE1]);
-        h.scroll(&mut v, (10.0, 10.0), -(R1 + SPACE1 - 1.0));
+        assert_eq!(text_rows(&h).into_iter().map(|r| r.0).take(2).collect::<Vec<_>>(), [0.0, UI.cell_h + SPACE1]);
+        let at = (10.0, 10.0);
+        // Passing the body line on top moves the heading up by that row and
+        // the heading's space, which it stops drawing on top.
+        h.scroll(&mut v, at, -(UI.cell_h + SPACE1 - 1.0));
         assert_eq!(v.buffer().scroll, 0, "short of the row and the space");
-        h.scroll(&mut v, (10.0, 10.0), -1.0);
+        h.scroll(&mut v, at, -1.0);
         assert_eq!(v.buffer().scroll, 1, "the row and the space");
-        h.scroll(&mut v, (10.0, 10.0), R1 + SPACE1);
+        h.scroll(&mut v, at, UI.cell_h + SPACE1);
         assert_eq!(v.buffer().scroll, 0, "and back");
+        // The heading leaving the top, a body line below it: its row alone.
+        h.scroll(&mut v, at, -(UI.cell_h + SPACE1));
+        assert_eq!(v.buffer().scroll, 1);
+        h.scroll(&mut v, at, -(R1 - 1.0));
+        assert_eq!(v.buffer().scroll, 1, "short of the heading's row");
+        h.scroll(&mut v, at, -1.0);
+        assert_eq!(v.buffer().scroll, 2, "the heading's row");
+    }
+
+    #[test]
+    fn centring_the_caret_counts_spaces_below_the_top_line_only() {
+        let mut h = spaced_harness();
+        let mut v = markdown_view("editor-md-centre-space", "# A\nb\n# C\nd\n# E\nf\n# G\nh\n# I\nj");
+        v.reveal(7, 0..0);
+        paint_plain(&mut h, &mut v);
+        // Above half of "h" (8 of the 100 px): G's row (29), f's row and G's
+        // space (16 + 14), E's row (29): 96. d would add 16 and E's space.
+        // Counting each line's space with that line, and half of "h"'s,
+        // gives 5.
+        assert_eq!(v.buffer().scroll, 4);
     }
 
     #[test]
