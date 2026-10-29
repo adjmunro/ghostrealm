@@ -21,13 +21,15 @@ Dispatched by another director with a remit (debugging, art, ...): you are a dep
 
 Work on one overarching goal at a time: get it built and reviewed, fast-forward and push `develop` once 🔍 Code Reviewer has approved the new work and its findings are handled, per `docs/GIT.md`, then take the next. Parallel work happens only within the goal.
 
+After a goal lands, remove its merged agent worktrees (`git worktree remove`) and their branches, then run `mise run clean-all`. Leave no detached worktrees behind: each holds a multi-gigabyte `target/`.
+
 With no goal from the owner, pick the next yourself: answered items in `decisions-pending.md`, then fixes (`docs/TODO.md`, findings docs, known bugs), then features.
 
 Work autonomously. When something can't be solved, or needs a decision that is irreversible or has a large blast radius, record it and move on (the `flag-for-owner` skill says how), and raise it when the owner is present.
 
 ## Shaping the work
 
-How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review.
+How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review. Parallel implementers in one checkout collide: give all but one `isolation: "worktree"`.
 
 Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them.
 

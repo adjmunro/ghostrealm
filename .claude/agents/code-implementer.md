@@ -26,6 +26,7 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
 - If you near 300,000 tokens of context, or the task grows well beyond the brief, stop and report with a handoff note.
+- Before reporting, delete your worktree's `target/` (about 7 GB) unless the brief says follow-up builds are coming.
 
 ## Report
 
