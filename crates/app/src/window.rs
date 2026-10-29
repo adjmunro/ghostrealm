@@ -863,6 +863,12 @@ fn command_entry(meta: Option<&CommandMeta>, preset: &Args) -> Entry {
     }
 }
 
+/// Run the command the argument prompt collected; on failure, the message
+/// the prompt shows, written for a person.
+fn run_prompted(app: &mut AppState, registry: &mut Registry<AppState>, id: &str, args: &Args) -> Result<(), String> {
+    app.run_command_logged(registry, id, args).map(drop).map_err(|e| capitalized(&e.for_user()))
+}
+
 /// Command-palette / run-anything overlay state.
 struct Palette {
     /// The search query, run line, or argument being typed.
@@ -4061,11 +4067,11 @@ impl State {
                 // Run with the prompt still open: a failure shows in it,
                 // with the value kept to correct.
                 if let Some((id, args)) = run {
-                    match self.app.run_command_logged(&mut self.registry, &id, &args) {
-                        Ok(_) => self.palette = None,
-                        Err(e) => {
+                    match run_prompted(&mut self.app, &mut self.registry, &id, &args) {
+                        Ok(()) => self.palette = None,
+                        Err(message) => {
                             if let Some(pend) = self.palette.as_mut().and_then(|p| p.pending.as_mut()) {
-                                pend.fail(capitalized(&e.for_user()));
+                                pend.fail(message);
                             }
                         }
                     }
@@ -5994,8 +6000,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     mod args {
-        use super::super::{command_entry, ArgStep, Entry, PendingArgs};
-        use crate::app_state::build_registry;
+        use super::super::{command_entry, run_prompted, ArgStep, Entry, PendingArgs};
+        use crate::app_state::{build_registry, AppState};
         use ghostrealm_core::{ArgKind, ArgSpec, Args, Value};
 
         fn pending() -> PendingArgs {
@@ -6054,6 +6060,15 @@ mod tests {
             assert_eq!(command_entry(reg.meta("file.rename"), &named), Entry::Run, "preset");
             assert_eq!(command_entry(reg.meta("palette.toggle"), &Args::new()), Entry::Run);
             assert_eq!(command_entry(None, &Args::new()), Entry::Run, "unknown: the registry reports it");
+        }
+
+        #[test]
+        fn a_prompted_command_that_fails_shows_its_message_for_a_person() {
+            let mut reg = build_registry();
+            let mut app = AppState::new();
+            let args = Args::new().with("url", Value::Str("example.com".into()));
+            let failed = run_prompted(&mut app, &mut reg, "web.navigate", &args);
+            assert_eq!(failed, Err("No web surface focused".into()), "without the agent's hint");
         }
     }
 
