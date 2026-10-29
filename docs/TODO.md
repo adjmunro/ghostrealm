@@ -1386,6 +1386,10 @@
   (14 KB; 2,457 had built up), plus `…Unpacker_BeginUnzipping` ones. They sit
   outside the profile, so removing the profile doesn't reach them. Find what
   creates them and point it at the profile, or remove them once the host exits.
+  Lead (unverified): Chromium's `base::GetTempDir` on macOS reads
+  `MAC_CHROMIUM_TMPDIR` before `NSTemporaryDirectory()`; the host could set it
+  to a per-pid dir under its cache before `initialize` so children inherit it.
+  Until then `mise run clean-all` removes them while no host runs.
 - Reason: test runs shouldn't fill the temp directory.
 
 ---
