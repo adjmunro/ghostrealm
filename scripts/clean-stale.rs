@@ -40,19 +40,35 @@
 //! `--all` cleans every place the workflow leaves build and test output:
 //!
 //! - this checkout's `target/`, as above;
-//! - each other worktree's `target/`: removed whole once idle (no build for
-//!   `--idle-hours`, default 2) and no running program lives in it, else
-//!   cleaned as above. The main checkout's is only ever cleaned as above;
+//! - each other worktree's `target/`. An agent worktree's (directly under
+//!   the main checkout's `.claude/worktrees/`) is removed whole once idle and
+//!   no running program lives in it, else cleaned as above. Every other
+//!   worktree's, the main checkout's included, is only cleaned as above;
 //! - Cargo target dirs (holding `CACHEDIR.TAG`) in this project's Claude
 //!   scratchpads (`/tmp/claude-<uid>/<project>/`) and in the temp dir (those
-//!   with ghostrealm units): removed whole once idle and unused;
-//! - `ghostrealm-*` entries in the temp dir that tests and the web host leave
-//!   when their process dies before cleaning up: removed once the process
-//!   whose pid the name carries (its first number) is gone and they are 5
-//!   minutes old. The app's frame directory `ghostrealm-<uid>` and its
+//!   named `ghostrealm-*` or with ghostrealm units): removed whole once idle
+//!   and no running program lives in them;
+//! - other `ghostrealm-*` entries in the temp dir that tests and the web host
+//!   leave when their process dies before cleaning up: removed once the
+//!   process whose pid the name carries (its first number) is gone and they
+//!   are 5 minutes old. The app's frame directory `ghostrealm-<uid>` and its
 //!   fallbacks `ghostrealm-<uid>-*` are kept (the web host clears those);
 //! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
-//!   while no web host runs.
+//!   once 5 minutes old while no web host runs.
+//!
+//! Idle means `--idle-hours` (default 2) have passed since anything was
+//! built in the target dir or any executable in it was run (by its access
+//! time, where the filesystem records one), and, for a worktree, since its
+//! git index or `HEAD` changed. Cargo writes nothing to a target dir when it
+//! re-runs tests without compiling, so a filesystem mounted `noatime` makes
+//! such a worktree look idle; raise `--idle-hours` there.
+//!
+//! What runs is read from the kernel (`proc_pidpath` on macOS,
+//! `/proc/<pid>/exe` on Linux) just before each removal it guards. If the
+//! process list can't be read, or lacks this process, or one of this user's
+//! processes has no readable executable path, every target dir counts as in
+//! use and a web host as running; on other systems likewise. A path that
+//! can't be removed is reported and the exit status is 1.
 //!
 //! Run it from the repo root with `mise run clean-stale [-- --dry-run]` (or
 //! `mise run clean-all`), or build it with
@@ -60,10 +76,14 @@
 //! `--dry-run`/`-n` (remove nothing), `--verbose`/`-v` (list each path),
 //! `--keep N`, `--target-dir DIR`, `--lockfile FILE`, `--all`,
 //! `--idle-hours N`, `--except DIR` (leave that target dir alone; repeatable).
-//! Its tests run with `rustc --test --edition 2021 scripts/clean-stale.rs`.
+//! An option value that doesn't parse, or an `--except` dir that doesn't
+//! exist, is an error. Its tests run with
+//! `rustc --test --edition 2021 scripts/clean-stale.rs`.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::os::raw::c_int;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -73,7 +93,9 @@ use std::time::{Duration, SystemTime};
 const KEEP_INCREMENTAL: usize = 4;
 
 /// How old a temp-dir leftover must be before it goes: a test creating its
-/// directory has a live pid, but the name may be read before it is written.
+/// directory has a live pid, but the name may be read before it is written;
+/// a CEF temp dir may belong to a host that started after the process list
+/// was read.
 const TEMP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// The bundle id CEF prefixes its temp dirs with.
@@ -94,12 +116,15 @@ struct Totals {
     bytes: u64,
 }
 
+#[derive(Default)]
 struct Opts {
     dry_run: bool,
     verbose: bool,
     keep: usize,
     /// Target dirs left alone (canonical paths).
     except: Vec<PathBuf>,
+    /// Paths that could not be removed.
+    failures: Cell<usize>,
 }
 
 impl Opts {
@@ -112,36 +137,67 @@ impl Opts {
     }
 }
 
-fn main() -> ExitCode {
-    let mut opts = Opts { dry_run: false, verbose: false, keep: 3, except: Vec::new() };
-    let mut target = PathBuf::from("target");
-    let mut lockfile = PathBuf::from("Cargo.lock");
-    let mut target_given = false;
-    let mut all = false;
-    let mut idle = Duration::from_secs(2 * 3600);
-    let mut args = std::env::args().skip(1);
+struct Args {
+    opts: Opts,
+    target: PathBuf,
+    /// Whether `--target-dir` was given.
+    target_given: bool,
+    lockfile: PathBuf,
+    all: bool,
+    idle: Duration,
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut a = Args {
+        opts: Opts { keep: 3, ..Opts::default() },
+        target: PathBuf::from("target"),
+        target_given: false,
+        lockfile: PathBuf::from("Cargo.lock"),
+        all: false,
+        idle: Duration::from_secs(2 * 3600),
+    };
     while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
-            "--dry-run" | "-n" => opts.dry_run = true,
-            "--verbose" | "-v" => opts.verbose = true,
-            "--keep" => opts.keep = args.next().and_then(|n| n.parse().ok()).unwrap_or(opts.keep).max(1),
+            "--dry-run" | "-n" => a.opts.dry_run = true,
+            "--verbose" | "-v" => a.opts.verbose = true,
+            "--keep" => {
+                let v = value()?;
+                a.opts.keep = v.parse().ok().filter(|&n| n >= 1).ok_or(format!("--keep {v}: not a count of 1 or more"))?;
+            }
             "--target-dir" => {
-                target = args.next().map(PathBuf::from).unwrap_or(target);
-                target_given = true;
+                a.target = PathBuf::from(value()?);
+                a.target_given = true;
             }
-            "--lockfile" => lockfile = args.next().map(PathBuf::from).unwrap_or(lockfile),
-            "--all" => all = true,
-            "--except" => opts.except.extend(args.next().and_then(|d| fs::canonicalize(d).ok())),
+            "--lockfile" => a.lockfile = PathBuf::from(value()?),
+            "--all" => a.all = true,
+            "--except" => {
+                let v = value()?;
+                a.opts.except.push(fs::canonicalize(&v).map_err(|e| format!("--except {v}: {e}"))?);
+            }
             "--idle-hours" => {
-                let hours: Option<f64> = args.next().and_then(|n| n.parse().ok());
-                idle = hours.map_or(idle, |h| Duration::from_secs_f64(h.max(0.0) * 3600.0));
+                let v = value()?;
+                a.idle = v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|h| *h >= 0.0)
+                    .and_then(|h| Duration::try_from_secs_f64(h * 3600.0).ok())
+                    .ok_or(format!("--idle-hours {v}: not a number of hours"))?;
             }
-            other => {
-                eprintln!("clean-stale: unknown argument {other}");
-                return ExitCode::from(2);
-            }
+            other => return Err(format!("unknown argument {other}")),
         }
     }
+    Ok(a)
+}
+
+fn main() -> ExitCode {
+    let Args { opts, target, target_given, lockfile, all, idle } = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("clean-stale: {e}");
+            return ExitCode::from(2);
+        }
+    };
     if std::env::var_os("CARGO_TARGET_DIR").is_some() && !target_given {
         eprintln!("clean-stale: CARGO_TARGET_DIR is set; pass --target-dir (and --lockfile) explicitly");
         return ExitCode::from(2);
@@ -153,13 +209,23 @@ fn main() -> ExitCode {
     };
     let mut total = clean_target(&target, &lock, &opts);
     if all {
-        let running = Running::now();
-        total += clean_worktrees(&target, idle, &running, &opts);
-        total += clean_scratch_targets(idle, &running, &opts);
-        total += clean_temp(&std::env::temp_dir(), idle, &running, &opts);
+        let trees = worktrees();
+        total += clean_worktrees(&target, &trees, idle, &opts);
+        total += clean_scratch_targets(&trees, idle, &opts);
+        let temp = std::env::temp_dir();
+        match Running::now() {
+            Some(running) => total += clean_temp(&temp, idle, &running, &opts),
+            None => println!("{}: can't tell what is running; skipped", temp.display()),
+        }
     }
     println!("{} {}", opts.freed(), human(total));
-    ExitCode::SUCCESS
+    match opts.failures.get() {
+        0 => ExitCode::SUCCESS,
+        n => {
+            eprintln!("clean-stale: {n} paths could not be removed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Remove the superseded units of `target`, unless a build holds it.
@@ -218,81 +284,235 @@ impl BuildLock {
 /// What is running now: each process's pid and executable path.
 struct Running {
     pids: HashSet<u32>,
+    /// The executable paths, as the kernel reports them and canonical.
     programs: Vec<PathBuf>,
+    /// One of this user's processes has no known absolute executable path:
+    /// it may run from anywhere.
+    unknown: bool,
+}
+
+/// A process's executable.
+enum Exe {
+    At(PathBuf),
+    /// Another user's process, or one that exited since it was listed.
+    Other,
+    /// This user's process, path unreadable (a zombie, or a failed lookup).
+    Unknown,
 }
 
 impl Running {
-    fn now() -> Running {
-        let out = Command::new("ps").args(["-axo", "pid=,comm="]).output();
-        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-        let mut running = Running { pids: HashSet::new(), programs: Vec::new() };
-        for line in text.lines() {
-            let line = line.trim_start();
-            let (pid, comm) = line.split_once(' ').unwrap_or((line, ""));
-            if let Ok(pid) = pid.parse() {
-                running.pids.insert(pid);
+    /// `None` if the process list can't be read or is implausible.
+    fn now() -> Option<Running> {
+        let pids = list_pids()?;
+        Running::from_processes(pids.into_iter().map(|pid| (pid, exe(pid))))
+    }
+
+    /// `None` unless the list holds this process and another: a list without
+    /// them was cut short, and anything missing from it could be in use.
+    fn from_processes(processes: impl IntoIterator<Item = (u32, Exe)>) -> Option<Running> {
+        let mut running = Running { pids: HashSet::new(), programs: Vec::new(), unknown: false };
+        for (pid, exe) in processes {
+            running.pids.insert(pid);
+            match exe {
+                Exe::At(p) if p.is_absolute() => {
+                    running.programs.push(canonical(&p));
+                    running.programs.push(p);
+                }
+                Exe::At(_) | Exe::Unknown => running.unknown = true,
+                Exe::Other => {}
             }
-            running.programs.push(PathBuf::from(comm.trim()));
         }
-        running
+        (running.pids.contains(&std::process::id()) && running.pids.len() >= 2).then_some(running)
     }
 
-    /// Whether a running program's executable is inside `dir` (a test binary,
-    /// the app, or the bundled web host).
+    /// Whether a running program's executable may be inside `dir` (a test
+    /// binary, the app, or the bundled web host).
     fn uses(&self, dir: &Path) -> bool {
-        let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        self.programs.iter().any(|p| p.starts_with(&dir))
+        if self.unknown {
+            return true;
+        }
+        let Ok(canonical) = fs::canonicalize(dir) else { return true };
+        self.programs.iter().any(|p| inside(p, &canonical) || inside(p, dir))
     }
 
-    /// Whether a web host (whose CEF temp dirs these are) is running.
+    /// Whether a web host (whose CEF temp dirs these are) may be running.
     fn web_host(&self) -> bool {
-        self.programs
-            .iter()
-            .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ghostrealm-web-host")))
+        self.unknown
+            || self
+                .programs
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ghostrealm-web-host")))
     }
 }
 
-/// When a build last wrote to `target`: the newest of its profiles' lock
-/// files and unit directories.
-fn last_build(target: &Path) -> SystemTime {
-    let mut newest = SystemTime::UNIX_EPOCH;
+/// `path` with its longest existing ancestor canonical: the executable of a
+/// running program may have been removed or replaced since it started.
+fn canonical(path: &Path) -> PathBuf {
+    for base in path.ancestors() {
+        if let Ok(c) = fs::canonicalize(base) {
+            return c.join(path.strip_prefix(base).unwrap_or(Path::new("")));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Whether `path` is `dir` or below it. macOS file systems are usually
+/// case-insensitive, so there case is ignored.
+fn inside(path: &Path, dir: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        lower(path).starts_with(lower(dir))
+    } else {
+        path.starts_with(dir)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn list_pids() -> Option<Vec<u32>> {
+    extern "C" {
+        fn proc_listallpids(buffer: *mut std::ffi::c_void, buffersize: c_int) -> c_int;
+    }
+    let estimate = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    let mut capacity = usize::try_from(estimate).ok().filter(|&n| n > 0)? * 2 + 64;
+    // A full buffer may have been cut short: retry with a bigger one.
+    for _ in 0..4 {
+        let mut buf: Vec<c_int> = vec![0; capacity];
+        let bytes = c_int::try_from(capacity * size_of::<c_int>()).ok()?;
+        let n = usize::try_from(unsafe { proc_listallpids(buf.as_mut_ptr().cast(), bytes) }).ok()?;
+        if n > 0 && n < capacity {
+            buf.truncate(n);
+            // 0 is the kernel.
+            return Some(buf.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect());
+        }
+        capacity *= 2;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn exe(pid: u32) -> Exe {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut std::ffi::c_void, buffersize: u32) -> c_int;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    match usize::try_from(n) {
+        Ok(n) if n > 0 => {
+            buf.truncate(n);
+            Exe::At(PathBuf::from(OsString::from_vec(buf)))
+        }
+        _ => owned_or_other(pid),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_pids() -> Option<Vec<u32>> {
+    let entries = fs::read_dir("/proc").ok()?.collect::<Result<Vec<_>, _>>().ok()?;
+    Some(entries.iter().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+}
+
+/// `/proc/<pid>/exe` is the executable's absolute path, with ` (deleted)`
+/// appended once it is removed (still inside its directory).
+#[cfg(target_os = "linux")]
+fn exe(pid: u32) -> Exe {
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(p) => Exe::At(p),
+        Err(_) => owned_or_other(pid),
+    }
+}
+
+/// Elsewhere what runs is unknown: every check that needs it keeps.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn list_pids() -> Option<Vec<u32>> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn exe(_pid: u32) -> Exe {
+    Exe::Unknown
+}
+
+/// Signal 0 checks without sending: it succeeds for this user's processes
+/// (zombies too) and fails for another user's or one that is gone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn owned_or_other(pid: u32) -> Exe {
+    match c_int::try_from(pid) {
+        Ok(pid) if pid > 0 && unsafe { kill(pid, 0) } == 0 => Exe::Unknown,
+        Ok(pid) if pid > 0 => Exe::Other,
+        _ => Exe::Unknown,
+    }
+}
+
+/// When anything last happened in `target`: the newest modification of its
+/// profiles' lock files and unit directories, and the newest access of the
+/// executables in them (running one records it).
+fn last_active(target: &Path) -> SystemTime {
+    let mut newest = mtime(target);
     for profile in ["debug", "release"] {
-        for name in ["", ".cargo-lock", ".cargo-build-lock", "deps", ".fingerprint", "incremental", "build"] {
-            let p = target.join(profile).join(name);
-            if let Ok(t) = fs::metadata(&p).and_then(|m| m.modified()) {
-                newest = newest.max(t);
+        let dir = target.join(profile);
+        for name in ["", ".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock", "deps", ".fingerprint", "incremental", "build"] {
+            newest = newest.max(mtime(&dir.join(name)));
+        }
+        for exes in [dir.clone(), dir.join("deps"), dir.join("examples")] {
+            for e in read_dir(&exes) {
+                // `DirEntry::metadata` doesn't follow symlinks.
+                let Ok(m) = e.metadata() else { continue };
+                if m.is_file() && m.mode() & 0o111 != 0 {
+                    newest = newest.max(m.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
+                }
             }
         }
     }
     newest
 }
 
+/// When a linked worktree's git state last changed (a commit, checkout,
+/// staging or status refresh): its admin dir's `HEAD`, `index` and `logs/HEAD`.
+fn git_active(tree: &Path) -> SystemTime {
+    let Ok(link) = fs::read_to_string(tree.join(".git")) else { return mtime(&tree.join(".git")) };
+    let Some(admin) = link.trim().strip_prefix("gitdir: ").map(|d| tree.join(d)) else {
+        return SystemTime::UNIX_EPOCH;
+    };
+    ["HEAD", "index", "logs/HEAD"].iter().map(|f| mtime(&admin.join(f))).max().unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    fs::symlink_metadata(path).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
 fn older_than(t: SystemTime, age: Duration) -> bool {
     SystemTime::now().duration_since(t).is_ok_and(|d| d >= age)
 }
 
-/// Remove a whole target dir once no build has written to it for `idle` and
-/// no running program lives in it. Returns the bytes freed.
-fn remove_idle_target(target: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
-    if opts.excepts(target) {
-        println!("{}: excepted; kept", target.display());
-        return 0;
-    }
-    let Some(_held) = BuildLock::take(target) else {
-        println!("{}: a build is running; kept", target.display());
-        return 0;
+/// Remove a whole target dir once it and `also` (other activity of its
+/// owner) are idle and no running program lives in it. `None` if kept,
+/// else the bytes freed.
+fn remove_idle_target(target: &Path, also: SystemTime, idle: Duration, opts: &Opts) -> Option<u64> {
+    let kept = |why: &str| {
+        println!("{}: {why}; kept", target.display());
+        None
     };
-    if running.uses(target) {
-        println!("{}: a program in it is running; kept", target.display());
-        return 0;
+    if opts.excepts(target) {
+        return kept("excepted");
     }
-    if !older_than(last_build(target), idle) {
-        println!("{}: built in the last {}; kept", target.display(), hours(idle));
-        return 0;
+    if !fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+        return kept("not a directory");
+    }
+    let Some(_held) = BuildLock::take(target) else { return kept("a build is running") };
+    // Read after the lock is taken: no build can start a program from it now.
+    let Some(running) = Running::now() else { return kept("can't tell what is running") };
+    if running.uses(target) {
+        return kept("a program in it may be running");
+    }
+    if !older_than(last_active(target).max(also), idle) {
+        return kept(&format!("active in the last {}", hours(idle)));
     }
     let bytes = remove(target, opts);
     println!("{}: idle; {} {}", target.display(), opts.freed(), human(bytes));
-    bytes
+    Some(bytes)
 }
 
 fn hours(d: Duration) -> String {
@@ -302,51 +522,67 @@ fn hours(d: Duration) -> String {
 /// `git worktree list`: the main checkout first, then the others.
 fn worktrees() -> Vec<PathBuf> {
     let out = Command::new("git").args(["worktree", "list", "--porcelain"]).output();
-    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    };
     text.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from).collect()
 }
 
-/// Every other worktree's `target/`: the main checkout's has its superseded
-/// units removed; a linked worktree's goes whole once idle, else the same.
-fn clean_worktrees(own_target: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
+/// Every other worktree's `target/` (`trees`: the main checkout first). An
+/// agent worktree's goes whole once idle; the rest have their superseded
+/// units removed.
+fn clean_worktrees(own_target: &Path, trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 {
+    let Some(main) = trees.first() else { return 0 };
+    let agents = fs::canonicalize(main.join(".claude/worktrees")).ok();
     let own = fs::canonicalize(own_target).ok();
     let mut bytes = 0;
-    for (i, tree) in worktrees().into_iter().enumerate() {
+    for tree in trees {
         let target = tree.join("target");
         if !target.is_dir() || fs::canonicalize(&target).ok() == own {
             continue;
         }
-        let freed = if i > 0 { remove_idle_target(&target, idle, running, opts) } else { 0 };
-        if freed == 0 && target.is_dir() && !opts.excepts(&target) {
-            match read_lock(&tree.join("Cargo.lock")) {
+        let parent = fs::canonicalize(tree).ok().and_then(|t| t.parent().map(Path::to_path_buf));
+        let agent = agents.is_some() && parent == agents;
+        let removed = if agent { remove_idle_target(&target, git_active(tree), idle, opts) } else { None };
+        match removed {
+            Some(freed) => bytes += freed,
+            None if opts.excepts(&target) => {}
+            None => match read_lock(&tree.join("Cargo.lock")) {
                 Some(lock) => bytes += clean_target(&target, &lock, opts),
                 None => println!("{}: no Cargo.lock beside it; kept", target.display()),
-            }
+            },
         }
-        bytes += freed;
     }
     bytes
 }
 
-/// This project's Claude scratchpads: `/tmp/claude-<uid>/<checkout path with
-/// '/' as '-'>/`, one directory per session.
-fn scratch_root() -> Option<PathBuf> {
-    let main = worktrees().into_iter().next()?;
-    let slug = main.to_string_lossy().replace('/', "-");
-    let uid = Command::new("id").arg("-u").output().ok()?;
-    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
-    Some(PathBuf::from(format!("/tmp/claude-{uid}")).join(slug))
+/// This project's Claude scratchpads: `/tmp/claude-<uid>/<slug>/`, one
+/// directory per session, where the slug is the main checkout's path with
+/// every character but ASCII letters and digits replaced by `-`.
+fn scratch_root(main: &Path) -> PathBuf {
+    PathBuf::from(format!("/tmp/claude-{}", unsafe { getuid() })).join(slug(main))
 }
 
-/// Cargo target dirs (marked by `CACHEDIR.TAG`) at most `depth` levels below
-/// `dir`; a target dir's own contents are not searched.
+fn slug(path: &Path) -> String {
+    path.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// Whether `dir` is a Cargo target dir: it holds a `CACHEDIR.TAG` file.
+fn is_target(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join("CACHEDIR.TAG")).is_ok_and(|m| m.is_file())
+}
+
+/// Cargo target dirs at most `depth` levels below `dir`; symlinks and a
+/// target dir's own contents are not searched.
 fn find_targets(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     for e in read_dir(dir) {
         let p = e.path();
+        // `DirEntry::file_type` doesn't follow symlinks.
         if !e.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        if p.join("CACHEDIR.TAG").is_file() {
+        if is_target(&p) {
             found.push(p);
         } else if depth > 1 {
             find_targets(&p, depth - 1, found);
@@ -356,11 +592,11 @@ fn find_targets(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 
 /// Idle target dirs in this project's scratchpads (reviewers build there with
 /// their own `CARGO_TARGET_DIR`).
-fn clean_scratch_targets(idle: Duration, running: &Running, opts: &Opts) -> u64 {
-    let Some(root) = scratch_root() else { return 0 };
+fn clean_scratch_targets(trees: &[PathBuf], idle: Duration, opts: &Opts) -> u64 {
+    let Some(main) = trees.first() else { return 0 };
     let mut targets = Vec::new();
-    find_targets(&root, 4, &mut targets);
-    targets.iter().map(|t| remove_idle_target(t, idle, running, opts)).sum()
+    find_targets(&scratch_root(main), 4, &mut targets);
+    targets.iter().filter_map(|t| remove_idle_target(t, SystemTime::UNIX_EPOCH, idle, opts)).sum()
 }
 
 /// Whether a target dir holds units of this workspace.
@@ -372,8 +608,9 @@ fn has_ghostrealm_units(target: &Path) -> bool {
     })
 }
 
-/// The temp dir: leftovers of tests and web hosts whose process is gone, CEF
-/// temp dirs while no host runs, and idle ghostrealm target dirs.
+/// The temp dir: idle ghostrealm target dirs, leftovers of tests and web
+/// hosts whose process is gone, and CEF temp dirs while no host runs.
+/// `running` is read just before.
 fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u64 {
     let frame_dir = format!("ghostrealm-{}", unsafe { getuid() });
     let host = running.web_host();
@@ -381,18 +618,23 @@ fn clean_temp(temp: &Path, idle: Duration, running: &Running, opts: &Opts) -> u6
     for e in read_dir(temp) {
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
-        let stale = if name.starts_with("ghostrealm-") {
-            // The app's frame dir and its fallbacks (`ghostrealm-<uid>-<pid>-<random>`),
-            // which the host clears itself.
-            name != frame_dir
-                && !name.starts_with(&format!("{frame_dir}-"))
-                && leftover_is_stale(&name, &path, &running.pids)
-        } else if name.starts_with(CEF_TEMP_PREFIX) {
-            !host
-        } else {
-            if path.join("CACHEDIR.TAG").is_file() && has_ghostrealm_units(&path) {
-                bytes += remove_idle_target(&path, idle, running, opts);
+        // The app's frame dir and its fallbacks (`ghostrealm-<uid>-<pid>-<random>`),
+        // which the host clears itself.
+        if name == frame_dir || name.starts_with(&format!("{frame_dir}-")) {
+            continue;
+        }
+        // A target dir's name may hold a number that isn't a pid.
+        if e.file_type().is_ok_and(|t| t.is_dir()) && is_target(&path) {
+            if name.starts_with("ghostrealm") || has_ghostrealm_units(&path) {
+                bytes += remove_idle_target(&path, SystemTime::UNIX_EPOCH, idle, opts).unwrap_or(0);
             }
+            continue;
+        }
+        let stale = if name.starts_with("ghostrealm-") {
+            leftover_is_stale(&name, &path, &running.pids)
+        } else if name.starts_with(CEF_TEMP_PREFIX) {
+            !host && older_than(mtime_or_now(&path), TEMP_MIN_AGE)
+        } else {
             false
         };
         if stale {
@@ -411,12 +653,18 @@ fn leftover_is_stale(name: &str, path: &Path, pids: &HashSet<u32>) -> bool {
     let pid = name.split(['-', '.']).find(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
     let Some(pid) = pid else { return false };
     let alive = pid.parse::<u32>().map_or(true, |n| pids.contains(&n));
-    let modified = fs::symlink_metadata(path).and_then(|m| m.modified()).unwrap_or_else(|_| SystemTime::now());
-    !alive && older_than(modified, TEMP_MIN_AGE)
+    !alive && older_than(mtime_or_now(path), TEMP_MIN_AGE)
+}
+
+/// An unreadable time counts as new.
+fn mtime_or_now(path: &Path) -> SystemTime {
+    fs::symlink_metadata(path).and_then(|m| m.modified()).unwrap_or_else(|_| SystemTime::now())
 }
 
 extern "C" {
     fn getuid() -> u32;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 /// What `Cargo.lock` lists.
@@ -654,17 +902,33 @@ fn dep_info_source(deps_files: Option<&Vec<PathBuf>>, build_dir: &Path) -> Strin
     String::new()
 }
 
-/// Remove `path` (unless dry-running). Returns its disk size.
+/// Remove `path` (unless dry-running). Returns the disk size removed (or
+/// that would be); a failure is reported and counted in `opts`.
 fn remove(path: &Path, opts: &Opts) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
     let size = disk_size(path, &meta);
-    if opts.verbose {
-        println!("{} {} ({})", if opts.dry_run { "would remove" } else { "remove" }, path.display(), human(size));
+    if opts.dry_run {
+        if opts.verbose {
+            println!("would remove {} ({})", path.display(), human(size));
+        }
+        return size;
     }
-    if !opts.dry_run {
-        let _ = if meta.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    match if meta.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) } {
+        Ok(()) => {
+            if opts.verbose {
+                println!("removed {} ({})", path.display(), human(size));
+            }
+            size
+        }
+        Err(e) => {
+            let left = fs::symlink_metadata(path).map_or(0, |m| disk_size(path, &m));
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("clean-stale: can't remove {}: {e}", path.display());
+                opts.failures.set(opts.failures.get() + 1);
+            }
+            size.saturating_sub(left)
+        }
     }
-    size
 }
 
 fn disk_size(path: &Path, meta: &fs::Metadata) -> u64 {
@@ -685,6 +949,68 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// A per-test directory under `base`, removed when dropped (also when the
+    /// test fails).
+    struct TmpDir(PathBuf);
+
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmpdir_in(base: &Path, tag: &str) -> TmpDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = base.join(format!("clean-stale-{tag}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        TmpDir(d)
+    }
+
+    fn tmpdir(tag: &str) -> TmpDir {
+        tmpdir_in(&std::env::temp_dir(), tag)
+    }
+
+    fn opts() -> Opts {
+        Opts { keep: 3, ..Opts::default() }
+    }
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// A list holding this process (running this test binary) and pid 1.
+    fn running_with(programs: Vec<Exe>) -> Running {
+        let me = (std::process::id(), Exe::At(std::env::current_exe().unwrap()));
+        let others = std::iter::once(Exe::Other).chain(programs).map(|p| (1, p));
+        Running::from_processes(std::iter::once(me).chain(others)).unwrap()
+    }
+
+    /// A Cargo target dir: `CACHEDIR.TAG` and an empty `debug/`.
+    fn target(dir: &Path) {
+        fs::create_dir_all(dir.join("debug")).unwrap();
+        fs::write(dir.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55").unwrap();
+    }
+
+    /// A target dir nothing has touched for a day.
+    fn idle_target(dir: &Path) {
+        target(dir);
+        let old = SystemTime::now() - Duration::from_secs(24 * 3600);
+        set_mtime(&dir.join("debug"), old);
+        set_mtime(dir, old);
+    }
 
     /// A fingerprint directory `<package>-<hash>` with `<kind>.json` and, for a
     /// build-script compile, the hash file a run's dependency names it by.
@@ -701,9 +1027,7 @@ mod tests {
 
     #[test]
     fn a_temp_leftover_goes_once_its_process_is_gone_and_it_is_old() {
-        let dir = std::env::temp_dir().join(format!("clean-stale-leftover-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("leftover");
         let old = SystemTime::now() - TEMP_MIN_AGE - Duration::from_secs(1);
         let entry = |name: &str, modified: SystemTime| {
             let p = dir.join(name);
@@ -721,13 +1045,164 @@ mod tests {
         assert!(leftover_is_stale("ghostrealm-fb-1111-1", &counted, &pids), "1 is a counter, not the pid");
         let new = entry("ghostrealm-fb-1111-4", SystemTime::now());
         assert!(!leftover_is_stale("ghostrealm-fb-1111-4", &new, &pids), "too new");
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_temp_dir_keeps_frame_dirs_targets_in_use_and_cef_dirs_of_a_running_host() {
+        let temp = tmpdir("temp");
+        let old = SystemTime::now() - TEMP_MIN_AGE - Duration::from_secs(1);
+        let uid = unsafe { getuid() };
+        let dir = |name: String| {
+            let p = temp.join(name);
+            fs::create_dir(&p).unwrap();
+            set_mtime(&p, old);
+            p
+        };
+        let frame = dir(format!("ghostrealm-{uid}"));
+        let fallback = dir(format!("ghostrealm-{uid}-1111-abc"));
+        let leftover = dir("ghostrealm-fb-1111-3".into());
+        let cef = dir(format!("{CEF_TEMP_PREFIX}1111"));
+        let new_cef = temp.join(format!("{CEF_TEMP_PREFIX}2222"));
+        fs::create_dir(&new_cef).unwrap();
+        // Read by its name, pid 2 is gone and the dir old; built in just now.
+        let built = temp.join("ghostrealm-target-2");
+        target(&built);
+        set_mtime(&built, old);
+
+        let host = running_with(vec![Exe::At(PathBuf::from("/x/ghostrealm-web-host.app/Contents/MacOS/ghostrealm-web-host"))]);
+        clean_temp(&temp, Duration::from_secs(3600), &host, &opts());
+        assert!(frame.is_dir() && fallback.is_dir(), "the app's frame dirs stay");
+        assert!(!leftover.exists(), "its process is gone");
+        assert!(cef.is_dir(), "a web host is running");
+        assert!(built.is_dir(), "a target goes by idleness, not by a number in its name");
+
+        clean_temp(&temp, Duration::from_secs(3600), &running_with(vec![]), &opts());
+        assert!(!cef.exists(), "no web host runs");
+        assert!(new_cef.is_dir(), "too new: its host may have started since");
+        assert!(frame.is_dir() && fallback.is_dir() && built.is_dir());
+    }
+
+    #[test]
+    fn only_an_agent_worktrees_target_is_removed_whole() {
+        let base = tmpdir("trees");
+        let main = base.join("main");
+        let agent = main.join(".claude/worktrees/agent-1");
+        let owner = base.join("owner");
+        let nested = main.join(".claude/worktrees/agent-1/sub");
+        for tree in [&main, &agent, &owner, &nested] {
+            idle_target(&tree.join("target"));
+            fs::write(tree.join("Cargo.lock"), "name = \"a\"\nversion = \"1.0.0\"\n").unwrap();
+        }
+        let trees = [main.clone(), owner.clone(), agent.clone(), nested.clone()];
+        clean_worktrees(&base.join("own-target"), &trees, Duration::from_secs(3600), &opts());
+        assert!(main.join("target").is_dir(), "the main checkout's target is never removed whole");
+        assert!(owner.join("target").is_dir(), "nor that of a worktree outside .claude/worktrees");
+        assert!(nested.join("target").is_dir(), "nor one deeper inside it");
+        assert!(!agent.join("target").exists(), "an idle agent worktree's goes");
+    }
+
+    #[test]
+    fn a_target_a_program_runs_from_is_in_use_however_its_path_is_spelled() {
+        // /tmp is a symlink to /private/tmp on macOS.
+        let dir = tmpdir_in(Path::new("/tmp"), "uses");
+        let target = dir.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        let real = fs::canonicalize(&target).unwrap();
+        let app = |base: &Path| running_with(vec![Exe::At(base.join("debug/app"))]);
+        assert!(app(&real).uses(&target), "run by its canonical path, asked by another");
+        assert!(app(&target).uses(&real), "and the other way round");
+        assert!(app(&target).uses(&target) && app(&real).uses(&real));
+        let other = dir.join("other");
+        fs::create_dir(&other).unwrap();
+        assert!(!app(&real).uses(&other), "a sibling dir is not in use");
+        assert!(running_with(vec![Exe::At("target/debug/app".into())]).uses(&other), "a relative path may be anywhere");
+        assert!(running_with(vec![Exe::Unknown]).uses(&other), "an unknown path may be anywhere");
+        assert!(running_with(vec![Exe::Unknown]).web_host(), "and may be a web host");
+        assert!(!running_with(vec![Exe::Other]).uses(&other), "another user's process");
+        assert!(app(&real).uses(&dir.join("gone")), "a dir that can't be resolved counts as in use");
+    }
+
+    #[test]
+    fn what_runs_is_read_from_the_kernel() {
+        let running = Running::now().expect("the process list can be read");
+        assert!(running.pids.contains(&std::process::id()));
+        let exe = std::env::current_exe().unwrap();
+        assert!(running.uses(exe.parent().unwrap()), "this test binary runs from its dir");
+    }
+
+    #[test]
+    fn a_process_list_without_this_process_is_not_trusted() {
+        assert!(Running::from_processes([]).is_none(), "an empty list");
+        let others = [(1, Exe::Other), (std::process::id() + 1, Exe::Other)];
+        assert!(Running::from_processes(others).is_none(), "a list without this process");
+        assert!(Running::from_processes([(std::process::id(), Exe::Other)]).is_none(), "only this process");
+    }
+
+    #[test]
+    fn target_dirs_are_found_without_following_symlinks_or_looking_inside_them() {
+        let root = tmpdir("find");
+        let outside = tmpdir("find-outside");
+        target(&root.join("session/scratchpad/target"));
+        target(&root.join("session/scratchpad/target/nested"));
+        target(&outside.join("target"));
+        symlink(outside.join("target"), root.join("linked-target")).unwrap();
+        symlink(&*outside, root.join("linked-dir")).unwrap();
+        // A tag that is a symlink doesn't make a target.
+        fs::create_dir(root.join("fake")).unwrap();
+        symlink(outside.join("target/CACHEDIR.TAG"), root.join("fake/CACHEDIR.TAG")).unwrap();
+        let mut found = Vec::new();
+        find_targets(&root, 4, &mut found);
+        assert_eq!(found, vec![root.join("session/scratchpad/target")]);
+    }
+
+    #[test]
+    fn the_scratchpad_slug_replaces_every_non_alphanumeric_character() {
+        assert_eq!(slug(Path::new("/Users/a.b/my_repo-2")), "-Users-a-b-my-repo-2");
+    }
+
+    #[test]
+    fn bad_option_values_are_errors() {
+        let parse = |a: &[&str]| parse_args(a.iter().map(|s| s.to_string()));
+        for bad in [
+            &["--idle-hours", "nan"][..],
+            &["--idle-hours", "-1"],
+            &["--idle-hours", "inf"],
+            &["--idle-hours", "x"],
+            &["--keep", "0"],
+            &["--keep", "x"],
+            &["--except", "/no/such/dir/here"],
+            &["--target-dir"],
+            &["--bogus"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let a = parse(&["--idle-hours", "0.5", "--keep", "2", "--except", "/tmp"]).unwrap();
+        assert_eq!(a.idle, Duration::from_secs(1800));
+        assert_eq!(a.opts.keep, 2);
+        assert_eq!(a.opts.except, vec![fs::canonicalize("/tmp").unwrap()]);
+    }
+
+    #[test]
+    fn a_failed_removal_is_reported_and_only_what_went_is_counted() {
+        let dir = tmpdir("remove");
+        let stuck = dir.join("victim/stuck");
+        fs::create_dir_all(&stuck).unwrap();
+        fs::write(stuck.join("f"), vec![1u8; 64 * 1024]).unwrap();
+        fs::write(dir.join("victim/g"), vec![1u8; 64 * 1024]).unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        let victim = dir.join("victim");
+        let total = disk_size(&victim, &fs::symlink_metadata(&victim).unwrap());
+        let o = opts();
+        let freed = remove(&victim, &o);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(o.failures.get(), 1);
+        assert!(freed < total, "{freed} of {total}");
+        assert!(stuck.join("f").exists());
     }
 
     #[test]
     fn a_target_held_by_a_build_is_not_taken() {
-        let dir = std::env::temp_dir().join(format!("clean-stale-lock-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = tmpdir("lock");
         fs::create_dir_all(dir.join("debug")).unwrap();
         let build = File::create(dir.join("debug/.cargo-build-lock")).unwrap();
         build.lock().unwrap();
@@ -736,13 +1211,11 @@ mod tests {
         let held = BuildLock::take(&dir).expect("free once the build is done");
         assert!(File::open(dir.join("debug/.cargo-build-lock")).unwrap().try_lock().is_err(), "held while cleaning");
         drop(held);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_run_goes_with_its_compile_whatever_order_its_links_deps_come_in() {
-        let dir = std::env::temp_dir().join(format!("clean-stale-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = tmpdir("runs");
         let compile = |features: &str| format!(r#"{{"features":"{features}","target":1,"deps":[]}}"#);
         // Two configurations of `pkg`, each a compile and its run. The run of
         // one lists a `links` dependency's run before its own compile.
@@ -760,9 +1233,8 @@ mod tests {
         );
         let mut lock = Lock::default();
         lock.dirs.insert("pkg-1.0.0".into());
-        let t = clean_profile(&dir, &lock, &Opts { dry_run: false, verbose: false, keep: 3, except: Vec::new() });
+        let t = clean_profile(&dir, &lock, &opts());
         assert_eq!(t.removed, 0);
         assert!(dir.join("build/pkg-00000000000000b2").is_dir(), "the run's output stays");
-        let _ = fs::remove_dir_all(&dir);
     }
 }
