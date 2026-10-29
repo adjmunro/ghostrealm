@@ -182,6 +182,21 @@ mod tests {
     }
 
     #[test]
+    fn heading_sizes_parse_and_are_checked() {
+        let cat = super::catalogue(&build_registry());
+        let text = "[headings]\nh2_scale = 1.7\nh1_space = 2\nh3_scale = 9.0\nh4_space = \"big\"\n";
+        let (cfg, findings) = parse(text, &cat);
+        let h = cfg.unwrap().headings;
+        assert_eq!((h.h2_scale, h.h1_space), (1.7, 2.0), "an integer is a number");
+        assert_eq!(h.h3_scale, 4.0, "clamped");
+        assert_eq!(h.h4_space, ghostrealm_core::Headings::default().h4_space, "dropped");
+        let severities: Vec<_> = findings.iter().map(|f| f.severity).collect();
+        assert_eq!(severities, [ghostrealm_core::config::Severity::Warning, ghostrealm_core::config::Severity::Error]);
+        let (cfg, _) = parse("[headings]\nh5_scale = 0.1\n", &cat);
+        assert_eq!(cfg.unwrap().headings.h5_scale, 0.5, "never smaller than half of body text");
+    }
+
+    #[test]
     fn every_default_binding_is_a_listed_command() {
         let reg = build_registry();
         let listed: Vec<&str> = super::keybindable_commands(&reg).iter().map(|k| k.key).collect();

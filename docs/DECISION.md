@@ -270,3 +270,12 @@
 - Detail: Toasts don't draw, and their clock stops, while the palette, picker, confirmation, or a menu is open: those modals own the pointer, and modals can't stack until `Frame` has per-modal layers.
 - Detail: Every error and warning toast's message also goes to stderr. Failures of commands an agent runs go back to the agent in its reply; web host failures stay inline in the web pane.
 - Reason: the owner's answer: "If the error is from a form, such as the Save As interface, then it should be inline and prevent progression (but not cancellation) until resolve. For code/text in the editor, we should use a red squiggly line under the affected area (or yellow if warning). For everything else, can we add blue(info)/green(succes)/orange(warning)/red(error) toasts, in the top of the affected panel. If it's an app issue not a panel issue, then make the width of the toast full-width excluding the vtab sidebar. Less important / non-actionable toasts, then can autohide. For important ones a human should read, keep it there until they click the 'x'/'dismiss'/other choices. That probably also means FIFO queuing them to ensure all errors are read and acknowledged, showing only 1 issue at a time."
+
+---
+
+[2026-10-29T21:21+1300@be5bd54a]
+
+- Category: UX / files and editing
+- Detail: `[headings]` sets each heading level's size (`h1_scale`…`h6_scale`, multiples of body text; default 2.0, 1.6, 1.35, 1.2, 1.1, 1.0) and the space above it (`h1_space`…`h6_space`, ems of body text; default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0). Integrated and Preview read the same values.
+- Detail: In Integrated the space sits above a heading's first row, except on the view's top line, so a heading scrolled or jumped to starts at the top.
+- Reason: owner request: more space above each heading and larger headings in Integrated, so they read as sections; sizes in the settings TOML.

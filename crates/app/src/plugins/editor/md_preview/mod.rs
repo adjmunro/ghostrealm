@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use ghostrealm_core::highlight;
 use ghostrealm_core::outline::OutlineItem;
-use ghostrealm_core::Rect;
+use ghostrealm_core::{Headings, Rect};
 use ghostrealm_terminal::{Key, KeyPress};
 use winit::window::CursorIcon;
 
@@ -69,6 +69,8 @@ struct Look {
     width: f32,
     accent: [u8; 3],
     ui_scale: f32,
+    /// `[headings]`: each level's size and the space above it.
+    headings: Headings,
 }
 
 /// What a tagged run of a text block is, for the quads drawn over it.
@@ -785,6 +787,7 @@ fn look_of(cx: &PaintCx, body: Rect) -> Look {
         width,
         accent: cx.chrome.accent,
         ui_scale: cx.ui.scale,
+        headings: cx.cfg.headings,
     }
 }
 
@@ -807,15 +810,14 @@ fn text_width(block: &Block, look: &Look) -> f32 {
     (look.width - indent_x(block, look)).max(look.size * 4.0)
 }
 
-/// The space above block `i`: more above a heading, less between a list's
-/// items.
+/// The space above block `i`: a heading's from `[headings]`, less between a
+/// list's items.
 fn gap(blocks: &[Block], i: usize, look: &Look) -> f32 {
     let s = look.size;
     let Some(prev) = i.checked_sub(1).map(|p| &blocks[p]) else { return (s * 0.5).round() };
     let b = &blocks[i];
     let em = match b.kind {
-        Kind::Heading(l, _) if l <= 2 => 1.5,
-        Kind::Heading(..) => 1.1,
+        Kind::Heading(l, _) => look.headings.space(Some(l)),
         Kind::Item(..) if matches!(prev.kind, Kind::Item(..)) || prev.indent > 0 => 0.3,
         _ if b.indent > 0 && prev.indent > 0 => 0.5,
         _ => 0.8,
@@ -903,7 +905,7 @@ fn prepare(block: &Block, look: &Look) -> Prep {
     let mut body = |runs: &[Inline], bold: bool| inline_text(runs, Font::SERIF.bold(bold), look.size, look.line_h, color, look, next);
     match &block.kind {
         Kind::Heading(level, runs) => {
-            let size = (look.size * syntax::heading_scale(Some(*level))).round();
+            let size = (look.size * look.headings.scale(Some(*level))).round();
             let text = inline_text(runs, Font::SERIF.bold(true), size, (size * 1.3).round(), color, look, &mut 1);
             Prep::Text { text, marker: None }
         }
@@ -1275,9 +1277,10 @@ mod tests {
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         let body = (14.0 * BODY_SCALE).round();
+        let d = Headings::default();
         assert!(glyph_sizes(&h, "Body text.").iter().all(|s| *s == body));
-        assert!(glyph_sizes(&h, "Title").iter().all(|s| *s == (body * 1.8).round()));
-        assert!(glyph_sizes(&h, "Third").iter().all(|s| *s == (body * 1.25).round()));
+        assert!(glyph_sizes(&h, "Title").iter().all(|s| *s == (body * d.h1_scale).round()));
+        assert!(glyph_sizes(&h, "Third").iter().all(|s| *s == (body * d.h3_scale).round()));
         let fonts: Vec<Font> = (0..3)
             .map(|i| match v.preview.laid[i].prep.as_ref().unwrap() {
                 Prep::Text { text, .. } => text.spans[0].font,
@@ -1286,7 +1289,22 @@ mod tests {
             .collect();
         assert_eq!(fonts, [Font::SERIF.bold(true), Font::SERIF, Font::SERIF.bold(true)]);
         let (t1, t2) = (top_of(&h, "Title"), top_of(&h, "Body text."));
-        assert!(t2 > t1 + body * 1.8, "the body follows the heading's height");
+        assert!(t2 > t1 + body * d.h1_scale, "the body follows the heading's height");
+    }
+
+    #[test]
+    fn the_preview_sizes_and_spaces_headings_from_the_config() {
+        let (mut v, _) = previewed("pv-heading-config", "Body text.\n\n## Second\n");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let below = |h: &Harness| top_of(h, "Second") - top_of(h, "Body text.");
+        let before = below(&h);
+        h.cfg.headings = Headings { h2_scale: 2.5, h2_space: 4.0, ..Headings::default() };
+        h.paint(&mut v, RECT);
+        let body = (14.0 * BODY_SCALE).round();
+        assert!(glyph_sizes(&h, "Second").iter().all(|s| *s == (body * 2.5).round()));
+        let more = (body * 4.0).round() - (body * Headings::default().h2_space).round();
+        assert_eq!(below(&h) - before, more, "the space above it, in ems of body text");
     }
 
     #[test]

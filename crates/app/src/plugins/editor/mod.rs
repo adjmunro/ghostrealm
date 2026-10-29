@@ -40,7 +40,7 @@ use crate::plugins::files::header::{text_kind, DocHeader, HeaderText};
 pub use buffer::EditorBuffer;
 use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
-use rows::{RowKind, RowLayout, RowTable, TextRow};
+use rows::{HeadingSizes, LineSize, RowKind, RowLayout, RowTable, TextRow};
 use toc::Toc;
 
 pub const ID: &str = "editor";
@@ -280,7 +280,29 @@ impl Plugin for EditorPlugin {
             ("view_mode", "The view-mode button (Preview, Integrated, Source), where a file has more than one."),
             ("autoplay", "The autoplay toggle of an audio file."),
         ];
-        vec![SectionSpec::options(
+        const SCALE: Kind = Kind::Float { min: 0.5, max: 4.0 };
+        const SPACE: Kind = Kind::Float { min: 0.0, max: 8.0 };
+        let headings = SectionSpec::options(
+            "headings",
+            "Headings in a document's Integrated and Preview views (Markdown headings, TOML \
+             tables): each level's size, and the space above it. A heading that starts a document, \
+             or is the top line of an Integrated view, has no space above.",
+            vec![
+                OptionSpec::new("h1_scale", SCALE, Some("2.0"), "A level-1 heading's font size, in multiples of body text."),
+                OptionSpec::new("h2_scale", SCALE, Some("1.6"), "A level-2 heading's font size, in multiples of body text."),
+                OptionSpec::new("h3_scale", SCALE, Some("1.35"), "A level-3 heading's font size, in multiples of body text."),
+                OptionSpec::new("h4_scale", SCALE, Some("1.2"), "A level-4 heading's font size, in multiples of body text."),
+                OptionSpec::new("h5_scale", SCALE, Some("1.1"), "A level-5 heading's font size, in multiples of body text."),
+                OptionSpec::new("h6_scale", SCALE, Some("1.0"), "A level-6 heading's font size, in multiples of body text."),
+                OptionSpec::new("h1_space", SPACE, Some("1.6"), "Space above a level-1 heading, in ems of body text."),
+                OptionSpec::new("h2_space", SPACE, Some("1.4"), "Space above a level-2 heading, in ems of body text."),
+                OptionSpec::new("h3_space", SPACE, Some("1.2"), "Space above a level-3 heading, in ems of body text."),
+                OptionSpec::new("h4_space", SPACE, Some("1.1"), "Space above a level-4 heading, in ems of body text."),
+                OptionSpec::new("h5_space", SPACE, Some("1.0"), "Space above a level-5 heading, in ems of body text."),
+                OptionSpec::new("h6_space", SPACE, Some("1.0"), "Space above a level-6 heading, in ems of body text."),
+            ],
+        );
+        let editor = SectionSpec::options(
             "editor",
             "The text editor.",
             vec![
@@ -322,7 +344,8 @@ impl Plugin for EditorPlugin {
                      the icons of the options it has.",
                 ),
             ],
-        )]
+        );
+        vec![editor, headings]
     }
 }
 
@@ -454,7 +477,7 @@ impl EditorView {
             layout: Layout {
                 body: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 text_x: 0.0,
-                rows: RowLayout { text_w: 0.0, cell: (0.0, 0.0), wrap: false },
+                rows: RowLayout { text_w: 0.0, cell: (0.0, 0.0), wrap: false, headings: HeadingSizes::FLAT },
             },
             rows: RowTable::default(),
             lang: None,
@@ -863,7 +886,7 @@ impl EditorView {
         let span = (l.body.y, l.body.y + l.body.h);
         let name = h.map(|h| h.name());
         self.rows = RowTable::build(&buf.lines, buf.scroll, buf.edits, l.rows, name, span, |ln| {
-            line_scale(states, buf, h, ln)
+            line_size(states, buf, h, &l.rows.headings, ln)
         });
     }
 
@@ -871,7 +894,7 @@ impl EditorView {
     fn scale_of(&mut self, ln: usize) -> f32 {
         let h = self.formatter();
         self.sync_hl_states();
-        line_scale(&mut self.hl_states, &self.buf, h, ln)
+        line_size(&mut self.hl_states, &self.buf, h, &self.layout.rows.headings, ln).scale
     }
 
     /// How far right of the text's left edge `(ln, col)` shows, in base
@@ -915,9 +938,10 @@ impl EditorView {
     /// The row at height `y` in the last paint's layout (wrap-, scroll- and
     /// size-aware), relaid if a scroll or an edit since has made it stale:
     /// its logical line, the column it starts at, how many characters it
-    /// shows from there, and its scale. A row above the text is the first;
-    /// `None` below the text.
-    fn visual_row(&mut self, y: f32) -> Option<(RowKind, f32)> {
+    /// shows from there, its scale, and its top. A row above the text is
+    /// the first, and the space above a heading the heading's row; `None`
+    /// below the text.
+    fn visual_row(&mut self, y: f32) -> Option<(RowKind, f32, f32)> {
         let name = self.formatter().map(|h| h.name());
         if !self.rows.fresh(self.buf.scroll, self.buf.edits, self.layout.rows, name) {
             self.sync_hl_states();
@@ -933,7 +957,7 @@ impl EditorView {
             }
             kind => kind,
         };
-        Some((kind, row.scale))
+        Some((kind, row.scale, row.y))
     }
 
     /// The `(line, col)` caret position nearest a point; a point below the
@@ -945,11 +969,11 @@ impl EditorView {
             return None;
         }
         match self.visual_row(y) {
-            Some((RowKind::Text { ln, start, len }, scale)) => {
+            Some((RowKind::Text { ln, start, len }, scale, _)) => {
                 let col_off = ((x - l.text_x) / (l.rows.cell.0 * scale)).round().max(0.0) as usize;
                 Some((ln, (start + col_off).min(start + len)))
             }
-            Some((RowKind::Widget { after_ln, .. }, _)) => Some((after_ln, self.buf.line_len(after_ln))),
+            Some((RowKind::Widget { after_ln, .. }, ..)) => Some((after_ln, self.buf.line_len(after_ln))),
             None => {
                 let last = self.buf.lines.len().saturating_sub(1);
                 Some((last, self.buf.line_len(last)))
@@ -957,13 +981,17 @@ impl EditorView {
         }
     }
 
-    /// The character under a point, if it is over one.
+    /// The character under a point, if it is over one (not over the space
+    /// above a heading).
     fn char_at(&mut self, x: f32, y: f32) -> Option<Pos> {
         let l = self.layout;
         if !rect_contains(l.body, x, y) || x < l.text_x {
             return None;
         }
-        let (RowKind::Text { ln, start, len }, scale) = self.visual_row(y)? else { return None };
+        let (RowKind::Text { ln, start, len }, scale, top) = self.visual_row(y)? else { return None };
+        if y < top {
+            return None;
+        }
         let col_off = ((x - l.text_x) / (l.rows.cell.0 * scale)).floor() as usize;
         (col_off < len).then_some((ln, start + col_off))
     }
@@ -1083,12 +1111,18 @@ impl EditorView {
     }
 }
 
-/// How much larger than the base cell line `ln` draws: its heading level's
-/// size under highlighter `h`, else 1.
-fn line_scale(states: &mut StateCache, buf: &EditorBuffer, h: Option<&dyn Highlighter>, ln: usize) -> f32 {
-    let (Some(h), Some(line)) = (h, buf.lines.get(ln)) else { return 1.0 };
+/// How line `ln` draws: its heading level's size in `headings` under
+/// highlighter `h`, else body size.
+fn line_size(
+    states: &mut StateCache,
+    buf: &EditorBuffer,
+    h: Option<&dyn Highlighter>,
+    headings: &HeadingSizes,
+    ln: usize,
+) -> LineSize {
+    let (Some(h), Some(line)) = (h, buf.lines.get(ln)) else { return LineSize::BODY };
     let state = if h.carries_state() { states.state_in(h, &buf.lines, buf.edits, ln) } else { 0 };
-    syntax::heading_scale(h.heading_level(line, state))
+    headings.size(h.heading_level(line, state))
 }
 
 /// Where line `ln` sits in a fenced block ([`Highlighter::block_row`]);
@@ -1369,7 +1403,10 @@ impl View for EditorView {
         let inset = if gutter_w > 0.0 { 0.0 } else { (cw * 0.5).round() };
         let text_x = body.x + rail + gutter_w + inset;
         let text_w = (body.w - rail - gutter_w - inset).max(1.0);
-        let rows_layout = RowLayout { text_w, cell: (cw, ch), wrap };
+        // Integrated's headings, sized and spaced from `[headings]` at the
+        // editor's font size; Source's (no formatter) stay body size.
+        let headings = HeadingSizes::new(&cx.cfg.headings, cx.metrics().font_size);
+        let rows_layout = RowLayout { text_w, cell: (cw, ch), wrap, headings };
         let text_cols = rows_layout.cols(1.0);
         self.layout = Layout { body, text_x, rows: rows_layout };
         // Heading sizes and code boxes come from it; in Source, none.
@@ -1384,8 +1421,7 @@ impl View for EditorView {
                 // The lines above the caret's that fit half the body show
                 // above it; following the caret then leaves the scroll be.
                 let mut full = |b: &EditorBuffer, ln: usize| {
-                    let scale = line_scale(states, b, formatter, ln);
-                    rows_layout.rows(&b.lines[ln], scale).len() as f32 * rows_layout.row_h(scale)
+                    rows_layout.line_h(&b.lines[ln], line_size(states, b, formatter, &headings, ln))
                 };
                 let (mut top, mut used) = (self.buf.cursor.0, full(&self.buf, self.buf.cursor.0) * 0.5);
                 while top > 0 {
@@ -1399,16 +1435,17 @@ impl View for EditorView {
                 self.buf.scroll = top;
             }
             let cursor = self.buf.cursor;
-            let hcols = (!wrap).then(|| rows_layout.cols(line_scale(states, &self.buf, formatter, cursor.0)));
+            let hcols =
+                (!wrap).then(|| rows_layout.cols(line_size(states, &self.buf, formatter, &headings, cursor.0).scale));
             let height = |b: &EditorBuffer, ln: usize| {
-                let scale = line_scale(states, b, formatter, ln);
+                let LineSize { scale, space } = line_size(states, b, formatter, &headings, ln);
                 let rows = rows_layout.rows(&b.lines[ln], scale);
                 // The cursor's line counts down to the row its caret is on.
                 let n = match ln == b.cursor.0 {
                     true => rows.iter().rposition(|(start, _)| *start <= b.cursor.1).map_or(rows.len(), |i| i + 1),
                     false => rows.len(),
                 };
-                n as f32 * rows_layout.row_h(scale)
+                (space, n as f32 * rows_layout.row_h(scale))
             };
             self.buf.follow_cursor(body.h, height, hcols);
         }
@@ -1837,7 +1874,9 @@ impl View for EditorView {
                 break;
             }
             let ln = if up { top - 1 } else { top };
-            let scale = usize::try_from(ln).map_or(1.0, |ln| line_scale(&mut self.hl_states, &self.buf, h, ln));
+            let headings = &layout.headings;
+            let scale =
+                usize::try_from(ln).map_or(1.0, |ln| line_size(&mut self.hl_states, &self.buf, h, headings, ln).scale);
             let step = layout.row_h(scale);
             if self.scroll_accum.abs() < step {
                 break;
@@ -2105,6 +2144,7 @@ impl View for EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostrealm_core::Headings;
     use crate::plugin::MouseButton;
     use crate::plugin::testing::{cmd, press, tmpdir, Harness, UI};
     use crate::plugin::TextSrc;
@@ -2959,7 +2999,7 @@ mod tests {
             .join("\n");
         std::fs::write(&path, text).unwrap();
         let mut v = EditorView::new(EditorBuffer::open(path).unwrap());
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let rows = (RECT.h / UI.cell_h) as usize;
         for scroll in [0, 20, 52] {
             v.buf.scroll = scroll;
@@ -3618,6 +3658,29 @@ mod tests {
         [a.0 - b.0, a.1 - b.1, a.2 - b.2, a.3 - b.3].iter().all(|d| d.abs() < 0.01)
     }
 
+    /// Headings at fixed sizes and with no space above, so the tests of
+    /// scaled rows hold whatever the defaults.
+    const SIZED: Headings = Headings {
+        h1_scale: 1.8,
+        h2_scale: 1.5,
+        h3_scale: 1.25,
+        h4_scale: 1.1,
+        h5_scale: 1.0,
+        h6_scale: 1.0,
+        h1_space: 0.0,
+        h2_space: 0.0,
+        h3_space: 0.0,
+        h4_space: 0.0,
+        h5_space: 0.0,
+        h6_space: 0.0,
+    };
+
+    fn heading_harness() -> Harness {
+        let mut h = Harness::new();
+        h.cfg.headings = SIZED;
+        h
+    }
+
     const H1: f32 = 1.8;
     const H2: f32 = 1.5;
     /// The rows' heights at H1, H2 and H3: whole pixels.
@@ -3626,8 +3689,63 @@ mod tests {
     const R3: f32 = 20.0;
 
     #[test]
-    fn heading_rows_draw_larger_and_push_the_rows_below_down() {
+    fn an_integrated_heading_has_its_configured_space_above_it() {
         let mut h = Harness::new();
+        let mut v = markdown_view("editor-md-space", "body\n# Title\nmore");
+        paint_plain(&mut h, &mut v);
+        let d = Headings::default();
+        // In ems of the editor's font size (the harness's is 14 px).
+        let top = UI.cell_h + (d.h1_space * 14.0).round();
+        let r1 = (UI.cell_h * d.h1_scale).round();
+        assert_eq!(text_rows(&h), vec![(0.0, 1.0), (top, d.h1_scale), (top + r1, 1.0)]);
+        let text_x = 4.0 * UI.cell_w;
+        let nums: Vec<f32> = h.frame.text.iter().filter(|t| t.left < text_x).map(|t| t.top).collect();
+        assert!(nums[1] >= top && nums[1] < top + r1, "the heading's number is on its row: {nums:?}");
+
+        // A click in the space lands on the heading, but no character is
+        // under the pointer there.
+        let gap = (text_x + 1.0, UI.cell_h + 2.0);
+        h.mouse(&mut v, MouseEvent::Down { pos: gap, clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos: gap, dragged: false, button: MouseButton::Left });
+        assert_eq!(v.buffer().cursor, (1, 0));
+        assert_eq!(v.char_at(gap.0, gap.1), None);
+        assert_eq!(v.char_at(gap.0, top + 2.0), Some((1, 0)));
+        assert_eq!(v.char_at(gap.0, top + r1 + 2.0), Some((2, 0)));
+
+        // On the top line (scrolled, or jumped to from the table of
+        // contents) it starts at the top.
+        v.buf.scroll = 1;
+        paint_plain(&mut h, &mut v);
+        assert_eq!(text_rows(&h), vec![(0.0, d.h1_scale), (r1, 1.0)]);
+
+        // Source draws every line base size, with nothing between.
+        v.buf.scroll = 0;
+        v.set_view_mode(ViewMode::Source);
+        paint_plain(&mut h, &mut v);
+        assert_eq!(text_rows(&h), vec![(0.0, 1.0), (UI.cell_h, 1.0), (2.0 * UI.cell_h, 1.0)]);
+    }
+
+    #[test]
+    fn a_reloaded_config_resizes_integrated_headings() {
+        let mut h = heading_harness();
+        let mut v = markdown_view("editor-md-reload", "body\n## Sub\nmore");
+        paint_plain(&mut h, &mut v);
+        assert_eq!(text_rows(&h)[1], (UI.cell_h, SIZED.h2_scale));
+        h.cfg.headings = Headings { h2_scale: 2.5, h2_space: 2.0, ..SIZED };
+        paint_plain(&mut h, &mut v);
+        let top = UI.cell_h + 28.0;
+        assert_eq!(text_rows(&h), vec![(0.0, 1.0), (top, 2.5), (top + 40.0, 1.0)]);
+        // A click maps through the new sizes.
+        let text_x = 4.0 * UI.cell_w;
+        let pos = (text_x + 2.0 * UI.cell_w * 2.5 + 1.0, top + 2.0);
+        h.mouse(&mut v, MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left });
+        h.mouse(&mut v, MouseEvent::Up { pos, dragged: false, button: MouseButton::Left });
+        assert_eq!(v.buffer().cursor, (1, 2));
+    }
+
+    #[test]
+    fn heading_rows_draw_larger_and_push_the_rows_below_down() {
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-sized", "# Title\n## Sub\nbody\n### Three\n##### Five");
         paint_plain(&mut h, &mut v);
         let y2 = R1 + R2;
@@ -3640,7 +3758,7 @@ mod tests {
 
     #[test]
     fn a_line_number_beside_a_heading_is_base_size_on_its_baseline() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-gutter", "# Title\nbody");
         paint_plain(&mut h, &mut v);
         let text_x = 4.0 * UI.cell_w;
@@ -3662,7 +3780,7 @@ mod tests {
 
     #[test]
     fn a_click_on_a_heading_row_maps_through_its_scaled_columns() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-click", "# Title here\nbody text");
         paint_plain(&mut h, &mut v);
         let (text_x, cw) = (4.0 * UI.cell_w, UI.cell_w * H1);
@@ -3686,7 +3804,7 @@ mod tests {
     /// span's start, not from the text's left edge.
     #[test]
     fn a_squiggle_scrolled_partly_out_of_view_keeps_its_phase() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-squiggle-scroll", &format!("# ok bad {}\nbody", "x".repeat(300)));
         v.attach(Client::in_process(Flags, None), "markdown");
         settle(&mut v);
@@ -3712,7 +3830,7 @@ mod tests {
 
     #[test]
     fn caret_selection_and_diagnostics_on_a_heading_measure_its_cells() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-caret", "# ok bad\nbody");
         v.attach(Client::in_process(Flags, None), "markdown");
         settle(&mut v);
@@ -3735,7 +3853,7 @@ mod tests {
 
     #[test]
     fn a_partial_heading_row_at_the_bottom_draws_nothing_below_the_body() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         // Eleven body rows (176px), then an H1 row running 5px past the 200px body.
         let text = format!("{}# ok bad", "x\n".repeat(11));
         let mut v = markdown_view("editor-md-clip", &text);
@@ -3782,7 +3900,7 @@ mod tests {
 
     #[test]
     fn following_the_cursor_fits_tall_rows() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
         let mut v = markdown_view("editor-md-follow", &text);
         paint_plain(&mut h, &mut v);
@@ -3796,7 +3914,7 @@ mod tests {
 
     #[test]
     fn a_long_heading_wraps_at_its_scaled_column_count() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         // 62 chars: 2 rows at 46 base columns, 3 at H1's 25 (breaking after a space).
         let line = format!("# {}", "word ".repeat(12));
         let mut v = markdown_view("editor-md-wrap", &format!("{line}\nx"));
@@ -3814,7 +3932,7 @@ mod tests {
 
     #[test]
     fn a_scaled_row_scrolled_sideways_measures_scaled_columns() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-hscroll", "# heading long line\nplain");
         v.soft_wrap = Some(false);
         v.buf.hscroll = 2;
@@ -3836,7 +3954,7 @@ mod tests {
 
     #[test]
     fn up_and_down_keep_the_carets_x_across_row_sizes() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-updown", "# Title here\nbody text that runs on\nmore text here");
         paint_plain(&mut h, &mut v);
         v.buf.cursor = (0, 5);
@@ -3887,7 +4005,7 @@ body text here");
 
     #[test]
     fn a_caret_scrolled_off_to_the_left_keeps_its_offset() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-goal-left", "# Title here at length
 body text here at length");
         v.soft_wrap = Some(false);
@@ -3914,8 +4032,8 @@ short line here", "x".repeat(60)));
 
     #[test]
     fn scrolling_up_past_a_heading_takes_its_rows_height() {
-        let h = Harness::new();
-        let mut hh = Harness::new();
+        let h = heading_harness();
+        let mut hh = heading_harness();
         let mut v = markdown_view("editor-md-wheel-mixed", &"body
 # H
 body
@@ -3939,8 +4057,8 @@ body
 
     #[test]
     fn the_wheel_passes_a_heading_in_its_own_height() {
-        let h = Harness::new();
-        let mut hh = Harness::new();
+        let h = heading_harness();
+        let mut hh = heading_harness();
         let text: String = (0..20).map(|i| format!("# H{i}\n")).collect();
         let mut v = markdown_view("editor-md-wheel", &text);
         paint_plain(&mut hh, &mut v);
@@ -3959,7 +4077,7 @@ body
 
     #[test]
     fn code_boxes_sit_on_their_rows_below_a_heading() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-boxes", "# Head\ntext `x`\n```\ncode\n```");
         paint_plain(&mut h, &mut v);
         let (ch, line) = (UI.cell_h, theme::hairline(UI));
@@ -3975,7 +4093,7 @@ body
 
     #[test]
     fn toml_tables_draw_by_their_level() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = file_view("editor-toml-sized", "doc.toml", "[a]\nk = 1\n[a.b]\n[[bin]]\n[a.b.c]\n  [1, 2],");
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();
@@ -3984,7 +4102,7 @@ body
 
     #[test]
     fn hashes_in_a_fence_quote_or_list_are_not_headings() {
-        let mut h = Harness::new();
+        let mut h = heading_harness();
         let mut v = markdown_view("editor-md-nested", "```\n# code\n```\n> # quoted\n- # item\n# real");
         paint_plain(&mut h, &mut v);
         let scales: Vec<f32> = text_rows(&h).into_iter().map(|r| r.1).collect();

@@ -847,14 +847,20 @@ impl EditorBuffer {
     }
 
     /// Scroll to keep the cursor visible — vertically within `body_h` px,
-    /// line `ln` taking `height(self, ln)` (for the cursor's line, down to the
-    /// bottom of the cursor's row), and (when `hcols` is `Some`, i.e.
+    /// line `ln` taking `height(self, ln)`: the space above it and its rows'
+    /// height (for the cursor's line, down to the bottom of the cursor's
+    /// row) — and (when `hcols` is `Some`, i.e.
     /// soft-wrap off) horizontally within `hcols` columns — but only when the
     /// cursor actually moved since the last follow, so manual scrolling (which
     /// leaves the cursor put) isn't yanked back each frame. The scroll stays a
     /// top line: the cursor's line shows from its top, even when it alone is
     /// taller than the body.
-    pub fn follow_cursor(&mut self, body_h: f32, mut height: impl FnMut(&Self, usize) -> f32, hcols: Option<usize>) {
+    pub fn follow_cursor(
+        &mut self,
+        body_h: f32,
+        mut height: impl FnMut(&Self, usize) -> (f32, f32),
+        hcols: Option<usize>,
+    ) {
         if self.cursor == self.last_cursor {
             return;
         }
@@ -862,10 +868,11 @@ impl EditorBuffer {
             self.scroll = self.cursor.0;
         } else {
             // Walk up from the cursor while the lines fit: bounded by the
-            // body's height, however far the cursor jumped.
-            let (mut top, mut used) = (self.cursor.0, height(self, self.cursor.0));
+            // body's height, however far the cursor jumped. The top line's
+            // space doesn't show; a line's shows once one is above it.
+            let (mut top, mut used) = (self.cursor.0, height(self, self.cursor.0).1);
             while top > self.scroll {
-                let h = height(self, top - 1);
+                let h = height(self, top).0 + height(self, top - 1).1;
                 // Slack for the float sum of fractional row heights.
                 if used + h > body_h + 0.01 {
                     break;
@@ -1656,7 +1663,7 @@ mod tests {
         for _ in 0..30 {
             e.insert_newline();
         }
-        let unit = |_: &EditorBuffer, _| 1.0;
+        let unit = |_: &EditorBuffer, _| (0.0, 1.0);
         // cursor at row 30; a 10-row window scrolls to keep it visible.
         e.follow_cursor(10.0, unit, None);
         assert_eq!(e.scroll, 21, "the cursor on the last row");
@@ -1681,7 +1688,7 @@ mod tests {
             e.insert_newline();
         }
         // Every third line is three rows tall.
-        let tall = |_: &EditorBuffer, ln: usize| if ln.is_multiple_of(3) { 3.0 } else { 1.0 };
+        let tall = |_: &EditorBuffer, ln: usize| (0.0, if ln.is_multiple_of(3) { 3.0 } else { 1.0 });
         e.follow_cursor(10.0, tall, None);
         // Lines 24..=30 are 3+1+1+3+1+1+3 = 13 tall; 25..=30 are 10.
         assert_eq!(e.scroll, 25);
@@ -1693,6 +1700,28 @@ mod tests {
         e.cursor.0 = 28;
         e.follow_cursor(10.0, tall, None);
         assert_eq!(e.scroll, 27);
+    }
+
+    #[test]
+    fn follow_cursor_counts_a_lines_space_only_below_the_top() {
+        let mut e = EditorBuffer::scratch();
+        for _ in 0..30 {
+            e.insert_newline();
+        }
+        // Line 25 has 2 of space above its row; every row is 1 tall.
+        let spaced = |_: &EditorBuffer, ln: usize| (if ln == 25 { 2.0 } else { 0.0 }, 1.0);
+        // On top, 25 shows no space: 25..=30 fit 6.
+        e.follow_cursor(6.0, spaced, None);
+        assert_eq!(e.scroll, 25);
+        // Below 24 it does: 24..=29 would take 8.
+        e.cursor.0 = 29;
+        e.scroll = 0;
+        e.follow_cursor(7.0, spaced, None);
+        assert_eq!(e.scroll, 25);
+        e.cursor.0 = 28;
+        e.scroll = 0;
+        e.follow_cursor(7.0, spaced, None);
+        assert_eq!(e.scroll, 24, "24..=28 take 7");
     }
 
     #[test]

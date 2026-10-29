@@ -284,6 +284,75 @@ impl Default for Editor {
     }
 }
 
+/// `[headings]`: how a document's headings draw in its Integrated and Preview
+/// views. Per level (from `Highlighter::heading_level`, 1–6): the font size
+/// as a multiple of body text, and the space above, in ems of body text.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Headings {
+    pub h1_scale: f32,
+    pub h2_scale: f32,
+    pub h3_scale: f32,
+    pub h4_scale: f32,
+    pub h5_scale: f32,
+    pub h6_scale: f32,
+    pub h1_space: f32,
+    pub h2_space: f32,
+    pub h3_space: f32,
+    pub h4_space: f32,
+    pub h5_space: f32,
+    pub h6_space: f32,
+}
+
+impl Default for Headings {
+    fn default() -> Self {
+        Headings {
+            h1_scale: 2.0,
+            h2_scale: 1.6,
+            h3_scale: 1.35,
+            h4_scale: 1.2,
+            h5_scale: 1.1,
+            h6_scale: 1.0,
+            h1_space: 1.6,
+            h2_space: 1.4,
+            h3_space: 1.2,
+            h4_space: 1.1,
+            h5_space: 1.0,
+            h6_space: 1.0,
+        }
+    }
+}
+
+impl Headings {
+    /// How much larger than body text a heading of `level` draws; 1 for no
+    /// heading or a level past 6.
+    pub fn scale(&self, level: Option<u8>) -> f32 {
+        match level {
+            Some(1) => self.h1_scale,
+            Some(2) => self.h2_scale,
+            Some(3) => self.h3_scale,
+            Some(4) => self.h4_scale,
+            Some(5) => self.h5_scale,
+            Some(6) => self.h6_scale,
+            _ => 1.0,
+        }
+    }
+
+    /// The space above a heading of `level`, in ems of body text; 0 for no
+    /// heading or a level past 6.
+    pub fn space(&self, level: Option<u8>) -> f32 {
+        match level {
+            Some(1) => self.h1_space,
+            Some(2) => self.h2_space,
+            Some(3) => self.h3_space,
+            Some(4) => self.h4_space,
+            Some(5) => self.h5_space,
+            Some(6) => self.h6_space,
+            _ => 0.0,
+        }
+    }
+}
+
 /// `[workspace]`
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -306,6 +375,7 @@ pub struct Config {
     pub chrome: Option<Chrome>,
     pub tabs: Tabs,
     pub editor: Editor,
+    pub headings: Headings,
     pub input: Input,
     pub file_browser: FileBrowser,
     pub web: Web,
@@ -329,6 +399,7 @@ impl Default for Config {
             chrome: None,
             tabs: Tabs::default(),
             editor: Editor::default(),
+            headings: Headings::default(),
             input: Input::default(),
             file_browser: FileBrowser::default(),
             web: Web::default(),

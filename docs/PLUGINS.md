@@ -289,8 +289,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   build); a longer one on a worker woken through the waker, the old blocks
   showing until it is done. Blocks lay out in a centred column at most 46
   body sizes wide: body text in `Font::SERIF` at 1.15 times the editor's
-  size (a serif reads small beside the monospace), headings bold at
-  `heading_scale`, each text block one `cx.block` whose spans tag inline
+  size (a serif reads small beside the monospace), headings bold at their
+  `[headings]` scale with its space above (as Integrated's), each text block one `cx.block` whose spans tag inline
   code (a pill behind its `block_rects`, monospace at the editor's size),
   links (accent, underlined; `md_preview::target` says where one goes: an
   `http`, `https`, or `mailto` URL to the system's handler,
@@ -516,8 +516,13 @@ indent, and shows a check mark for a moment after; Markdown carries a fence's la
 body with that language's line-local highlighter. `Highlighter::heading_level`
 gives a line's outline level when it heads a section (Markdown: an ATX
 heading's `#` count, where the highlighter marks a heading; TOML: `[a]` 1,
-`[a.b]` and `[[a]]` 2, deeper 3); `syntax::heading_scale` maps it to the
-size the editor draws the row at (H1 1.8, H2 1.5, H3 1.25, H4 1.1, else 1).
+`[a.b]` and `[[a]]` 2, deeper 3); `[headings]` (`ghostrealm_core::Headings`,
+catalogued by the editor plugin) gives each level a scale (default H1 2.0, H2
+1.6, H3 1.35, H4 1.2, H5 1.1, H6 1.0) and a space above in ems of body text
+(default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0), which Integrated and Preview share.
+`rows::HeadingSizes` holds them at the editor's font size, the space rounded
+to whole pixels, inside `RowLayout`, so a config reload makes the
+`RowTable` stale.
 `Highlighter::heading_title` gives a heading's title without its markup
 (Markdown: no `#`s, closing `#`s, inline markers, or link targets; TOML: the
 key between the brackets); `has_headings` says the language has headings
@@ -546,10 +551,14 @@ scale }` from the scroll line, and every mapping between screen y and text
 (clicks, selection, caret, diagnostics, popup anchor, code boxes, line
 numbers) reads it. A row's columns are `cell_w * scale` wide (so a soft-wrapped
 heading wraps at fewer columns) and `cell_h * scale` tall (a scaled row's
-height is rounded to whole pixels); decorations over the rows are clipped to the text body. Line numbers
+height is rounded to whole pixels); decorations over the rows are clipped to the text body.
+A heading's space sits above its first row and belongs to no row: a click
+there lands on the heading (`RowTable::at` gives the row below), no character
+is under the pointer, and the cursor-line and selection fills skip it. The
+top line has none, so a heading scrolled or jumped to starts at the top. Line numbers
 stay base size on the heading's baseline (`PaintCx::row_baseline` of its
 shaped row). Scrolling stays a top line;
-`EditorBuffer::follow_cursor` fits lines by their heights. `Widget` rows
+`EditorBuffer::follow_cursor` fits lines by their heights and spaces. `Widget` rows
 (nothing places one yet) are where a view's own rows between lines go:
 comment threads, and maybe deleted lines (TODO.md "Comment mode", "Editor
 — inline git change highlights").

@@ -67,7 +67,9 @@ via glyphon. Text comes from one of three places:
   within a per-frame time budget (terminal grid, editor text, lists). A row
   may carry run styles (bold, italic, underline, code box) and a scale: a
   scaled row (an Integrated heading) is shaped once at the frame's metrics and
-  rasterised larger (glyphon's `TextArea.scale`).
+  rasterised larger (glyphon's `TextArea.scale`). An Integrated heading also
+  has space above its first row (none on the view's top line); both come
+  from `[headings]`.
 - **Blocks** (`BlockCache`): word-wrapped proportional text with per-span
   font, size, colour, and tags (a Preview paragraph), keyed by content, width,
   and metrics, under the same budget; an unshaped block lays out at an
@@ -80,9 +82,9 @@ its cell grid changes.
 Files are shown by the **Files surface** (plugin `files`): a file sidebar, a
 file tab per document, and each document under its document header. A text
 document is an `EditorView` in one of its language's view modes: Source and
-Integrated draw the buffer as rows (Integrated with styles, scaled heading
-rows, and code boxes) through a per-paint `RowTable` that maps screen y to
-text; Preview (Markdown) draws parsed blocks. Images and audio are a
+Integrated draw the buffer as rows (Integrated with styles, scaled and
+spaced heading rows, and code boxes) through a per-paint `RowTable` that maps
+screen y to text; Preview (Markdown) draws parsed blocks. Images and audio are a
 `MediaView`. Contract and details: [PLUGINS.md](PLUGINS.md).
 
 Status/`needs_input` sourcing (planned): Enter-submission = optimistic busy;
