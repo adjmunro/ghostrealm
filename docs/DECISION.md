@@ -276,6 +276,6 @@
 [2026-10-29T21:21+1300@be5bd54a]
 
 - Category: UX / files and editing
-- Detail: `[headings]` sets each heading level's size (`h1_scale`…`h6_scale`, multiples of body text; default 2.0, 1.6, 1.35, 1.2, 1.1, 1.0) and the space above it (`h1_space`…`h6_space`, ems of body text; default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0). Integrated and Preview read the same values.
+- Detail: `[headings]` sets each heading level's size (`h1_scale`…`h6_scale`; default 2.0, 1.6, 1.35, 1.2, 1.1, 1.0) and the space above it (`h1_space`…`h6_space`; default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0), both in ems of the view's body text (Preview's is 1.15 times the editor's). Integrated and Preview read the same values; Preview's first block keeps its 0.5 em page padding.
 - Detail: In Integrated the space sits above a heading's first row, except on the view's top line, so a heading scrolled or jumped to starts at the top.
 - Reason: owner request: more space above each heading and larger headings in Integrated, so they read as sections; sizes in the settings TOML.

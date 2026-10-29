@@ -290,8 +290,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   showing until it is done. Blocks lay out in a centred column at most 46
   body sizes wide: body text in `Font::SERIF` at 1.15 times the editor's
   size (a serif reads small beside the monospace), headings bold at their
-  `[headings]` scale with its space above (as Integrated's), each text block one `cx.block` whose spans tag inline
-  code (a pill behind its `block_rects`, monospace at the editor's size),
+  `[headings]` scale with its space above (in ems of that body size; the
+  first block has 0.5 em whatever it is), each text block one `cx.block`
+  whose spans tag inline code (a pill behind its `block_rects`, monospace at the editor's size),
   links (accent, underlined; `md_preview::target` says where one goes: an
   `http`, `https`, or `mailto` URL to the system's handler,
   `Request::OpenUrl`; a path, relative to the document's folder, or a
@@ -518,8 +519,9 @@ gives a line's outline level when it heads a section (Markdown: an ATX
 heading's `#` count, where the highlighter marks a heading; TOML: `[a]` 1,
 `[a.b]` and `[[a]]` 2, deeper 3); `[headings]` (`ghostrealm_core::Headings`,
 catalogued by the editor plugin) gives each level a scale (default H1 2.0, H2
-1.6, H3 1.35, H4 1.2, H5 1.1, H6 1.0) and a space above in ems of body text
-(default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0), which Integrated and Preview share.
+1.6, H3 1.35, H4 1.2, H5 1.1, H6 1.0) and a space above (default 1.6, 1.4,
+1.2, 1.1, 1.0, 1.0), both in ems of the view's body text: the editor's font
+size in Integrated, 1.15 times it in Preview.
 `rows::HeadingSizes` holds them at the editor's font size, the space rounded
 to whole pixels, inside `RowLayout`, so a config reload makes the
 `RowTable` stale.

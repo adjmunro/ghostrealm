@@ -286,7 +286,7 @@ impl Default for Editor {
 
 /// `[headings]`: how a document's headings draw in its Integrated and Preview
 /// views. Per level (from `Highlighter::heading_level`, 1–6): the font size
-/// as a multiple of body text, and the space above, in ems of body text.
+/// and the space above, both in ems of the view's body text.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Headings {
