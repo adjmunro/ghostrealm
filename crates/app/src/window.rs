@@ -4065,7 +4065,7 @@ impl State {
                         Ok(_) => self.palette = None,
                         Err(e) => {
                             if let Some(pend) = self.palette.as_mut().and_then(|p| p.pending.as_mut()) {
-                                pend.fail(capitalized(&e.to_string()));
+                                pend.fail(capitalized(&e.for_user()));
                             }
                         }
                     }
