@@ -1513,18 +1513,6 @@
 
 ---
 
-[2026-10-26T23:12+1300@1947ee37] Window — `metrics_gen` follows the monospace cell only
-
-- Requires: NO BLOCKERS
-- Detail: `apply_config` (`crates/app/src/window.rs`, ~line 1448) bumps
-  `metrics_gen` only when the preview serif changes or the mono cell `cw`/`ch`
-  moves by more than 0.01 px. Tooltips shape in SansSerif. A future option
-  that changes the UI/sans font without changing the mono cell would leave
-  cached tooltip rows stale.
-- Reason: keep the tooltip cache correct if UI font options are added.
-
----
-
 [2026-10-29T21:45+1300@684d69e5] Window — font DB and scale invalidation is untested
 
 - Requires: NO BLOCKERS

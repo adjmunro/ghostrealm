@@ -1432,22 +1432,19 @@ impl State {
     /// the default directory, and re-measure cell metrics if the font changed
     /// (invalidating the shaping cache; views reflow to the new cell size).
     fn apply_config(&mut self, cfg: Config) {
-        let (cw, ch) = measure_cell(
-            &mut self.text.font_system,
-            self.scale,
-            cfg.terminal.font_size,
-            cfg.terminal.line_height,
-        );
         let serif = cfg.editor.preview_font.as_deref();
-        let serif_changed = serif != self.cfg.editor.preview_font.as_deref();
-        if serif_changed {
+        if serif != self.cfg.editor.preview_font.as_deref() {
             let full_db = self.pending_fonts.is_none();
             let missing = pin_and_report_preview_serif(self.text.font_system.db_mut(), serif, &self.serif_alias, full_db);
             self.app.report_preview_font(missing);
         }
-        if metrics_changed(&self.cfg, &cfg, (self.cell_w, self.cell_h), (cw, ch)) {
-            self.cell_w = cw;
-            self.cell_h = ch;
+        if metrics_changed(&self.cfg, &cfg) {
+            (self.cell_w, self.cell_h) = measure_cell(
+                &mut self.text.font_system,
+                self.scale,
+                cfg.terminal.font_size,
+                cfg.terminal.line_height,
+            );
             self.metrics_gen = self.metrics_gen.wrapping_add(1);
         }
         self.chrome = cfg.resolved_chrome();
@@ -5524,14 +5521,30 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
     toast.is_some_and(|r| focused && !pointer.is_some_and(|(x, y)| rect_contains(r, x, y)))
 }
 
-/// Whether applying `new` over `old` changes the font metrics or font set
-/// text is shaped with, given the monospace cell each measures to: text
-/// shaped and cached under the current `metrics_gen` (tooltip rows, the
-/// shaping cache) is then stale.
-fn metrics_changed(old: &Config, new: &Config, old_cell: (f32, f32), new_cell: (f32, f32)) -> bool {
-    old.editor.preview_font != new.editor.preview_font
-        || (new_cell.0 - old_cell.0).abs() > 0.01
-        || (new_cell.1 - old_cell.1).abs() > 0.01
+/// Whether applying `new` over `old` changes a font setting (a family, size
+/// or line height): text shaped and cached under the current `metrics_gen`
+/// (tooltip rows, the shaping cache) is then stale. Compared by setting, not
+/// by the monospace cell they measure to, since text in other families
+/// (tooltips shape in SansSerif) can change while the cell does not. Any font
+/// option added to the config belongs in `fonts`; its `[terminal]` and
+/// `[editor]` patterns name every field so a new one there is sorted in or
+/// out here.
+fn metrics_changed(old: &Config, new: &Config) -> bool {
+    use ghostrealm_core::config::{Editor, Terminal};
+    fn fonts(cfg: &Config) -> (f32, f32, Option<&str>) {
+        let Terminal { font_size, line_height, close_on_exit: _ } = &cfg.terminal;
+        let Editor {
+            preview_font,
+            line_numbers: _,
+            cursor_line: _,
+            soft_wrap: _,
+            autosave_on_unfocus: _,
+            autosave_after: _,
+            header_icons: _,
+        } = &cfg.editor;
+        (*font_size, *line_height, preview_font.as_deref())
+    }
+    fonts(old) != fonts(new)
 }
 
 /// What a tooltip's wrapped rows depend on: its text, line width and row
@@ -6437,22 +6450,23 @@ mod tests {
         assert_eq!(wrap("one\ntwo", 20, 4), (vec!["one".to_string(), "two".to_string()], false));
     }
 
-    /// A config change that moves the font metrics or font set invalidates
-    /// shaped text (`metrics_gen`); one that leaves them alone keeps it.
+    /// A config change to any font setting invalidates shaped text
+    /// (`metrics_gen`), whether or not it moves the monospace cell; any
+    /// other change keeps it.
     #[test]
     fn a_font_change_in_the_config_invalidates_shaped_text() {
         let old = ghostrealm_core::Config::default();
-        let cell = (9.0, 18.0);
-        let changed = |new: &ghostrealm_core::Config, new_cell| super::metrics_changed(&old, new, cell, new_cell);
-        assert!(!changed(&old, cell));
-        let mut other = old.clone();
-        other.editor.soft_wrap = !other.editor.soft_wrap;
-        assert!(!changed(&other, cell), "not a font setting");
-        assert!(changed(&old, (9.5, 18.0)), "the cell widens");
-        assert!(changed(&old, (9.0, 20.0)), "the cell grows taller");
-        let mut serif = old.clone();
-        serif.editor.preview_font = Some("Georgia".into());
-        assert!(changed(&serif, cell), "the Preview font");
+        let changed = |edit: fn(&mut ghostrealm_core::Config)| {
+            let mut new = old.clone();
+            edit(&mut new);
+            super::metrics_changed(&old, &new)
+        };
+        assert!(!changed(|_| {}));
+        assert!(!changed(|c| c.editor.soft_wrap = !c.editor.soft_wrap), "not a font setting");
+        assert!(!changed(|c| c.chrome = Some(Default::default())), "not a font setting");
+        assert!(changed(|c| c.terminal.font_size += 0.001), "a size too small to move the cell");
+        assert!(changed(|c| c.terminal.line_height += 2.0), "the line height");
+        assert!(changed(|c| c.editor.preview_font = Some("Georgia".into())), "the Preview font");
     }
 
     /// A held tooltip's cached rows are rewrapped when anything they depend
