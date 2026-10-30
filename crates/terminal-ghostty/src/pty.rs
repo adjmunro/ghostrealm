@@ -279,7 +279,9 @@ pub(crate) struct ReaderStop(PipeWriter);
 impl Drop for ReaderStop {
     fn drop(&mut self) {
         // A byte, not just the close: a copy of this end leaked to a child
-        // would keep the close from showing.
+        // would keep the close from showing. The reader has usually ended
+        // already, so the write fails with EPIPE; that raises SIGPIPE, which
+        // the Rust runtime ignores in every binary and test this crate runs in.
         let _ = self.0.write_all(&[0]);
     }
 }
@@ -351,28 +353,6 @@ pub(crate) fn spawn(slave: OwnedFd, cmd: CommandBuilder) -> Result<Child> {
     }
     ghostrealm_process::inherit_stdio_only(&mut command);
     command.spawn().with_context(|| format!("spawn {program:?}"))
-}
-
-/// Sends the child SIGHUP from any thread.
-#[derive(Clone, Copy, Debug)]
-pub struct ChildKiller {
-    pid: u32,
-}
-
-impl ChildKiller {
-    pub(crate) fn new(pid: u32) -> Self {
-        Self { pid }
-    }
-
-    /// Send SIGHUP, which ends the child unless it handles or ignores it.
-    pub fn kill(&self) -> io::Result<()> {
-        let pid = libc::pid_t::try_from(self.pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: kill only sends a signal.
-        if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
 }
 
 /// `$SHELL` if it is executable, else the password database's shell if it

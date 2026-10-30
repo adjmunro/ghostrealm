@@ -10,7 +10,7 @@ compile_error!("ghostrealm-terminal-ghostty opens its PTY with unix calls only")
 
 mod pty;
 pub mod threaded;
-pub use pty::{ChildKiller, CommandBuilder};
+pub use pty::CommandBuilder;
 pub use threaded::{ThreadedTerminal, UiWaker};
 
 use std::cell::RefCell;
@@ -234,11 +234,6 @@ impl GhosttyTerminal {
     /// shell).
     pub fn foreground_group(&self) -> Option<i32> {
         self.master.foreground_group()
-    }
-
-    /// A handle that kills the child from another thread.
-    pub fn child_killer(&self) -> ChildKiller {
-        ChildKiller::new(self.child.id())
     }
 
     /// Return the child, still to be reaped, dropping the rest: the reader

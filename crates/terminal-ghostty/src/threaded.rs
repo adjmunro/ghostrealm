@@ -86,7 +86,10 @@ struct Shared {
     generation: AtomicU64,
     /// What may be done with the child's pid. Whoever reaps the child or
     /// signals its process group holds this lock and checks it first, so no
-    /// reap or signal reaches the pid once reaped (and maybe reused).
+    /// reap or signal reaches the pid once reaped (and maybe reused). That
+    /// holds only while lock holders are the child's only reapers: nothing
+    /// else in the process may call `wait` or `waitpid(-1)`, or
+    /// set SIGCHLD to `SIG_IGN` (which reaps children on exit).
     child: Mutex<ChildState>,
 }
 
