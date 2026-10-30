@@ -14,6 +14,13 @@ use common::{host_exe, running, shut_down};
 use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
+/// Deadline for an eval on a hidden page: every pop-up, until the app shows
+/// it. Chromium runs a hidden page's renderer at background priority, which a
+/// loaded machine starves: each DevTools step of an eval can then wait
+/// seconds (a page's first eval takes five), where a visible page's take
+/// milliseconds.
+const HIDDEN_EVAL: Duration = Duration::from_secs(30);
+
 /// Hosts this suite runs at once. Each is a browser, GPU, network and
 /// renderer processes; unbounded, the suite's two dozen hosts load the
 /// machine enough that the OS starves hidden pages' renderers (Chromium runs
@@ -655,7 +662,7 @@ fn a_popup_says_how_the_page_asked_for_it() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(!host.is_closed(tab.id));
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)));
-    assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(tab.id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()));
 
     shut_down(host, &cache);
 }
@@ -684,7 +691,7 @@ fn a_persons_tab_outlives_its_opener() {
     let tab = click_for_popup(&host, 1);
     wait_closed(&host, 1);
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "the tab lives on");
-    assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(tab.id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()));
     host.forget(tab.id);
 
     // An opener the app closes and forgets before its view takes the tab.
@@ -706,7 +713,7 @@ fn a_persons_tab_outlives_its_opener() {
     };
     assert!(tabs.iter().all(|t| t.opener == 2 && t.is_tab()), "{tabs:?}");
     assert!(host.wait_loaded(tabs[0].id, Duration::from_secs(20)), "the tab lives on");
-    assert_eq!(host.eval(tabs[0].id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(tabs[0].id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()));
     for t in tabs {
         host.send(&Request::Close { id: t.id });
         host.forget(t.id);
@@ -754,7 +761,7 @@ fn a_modified_or_middle_clicked_link_opens_a_tab() {
         assert_eq!(tab.kind, kind, "{case}");
         assert_eq!(tab.url, format!("{base}/stay"), "{case}");
         assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "{case}");
-        assert_eq!(host.eval(tab.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()), "{case}");
+        assert_eq!(host.eval(tab.id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()), "{case}");
         assert_eq!(host.eval(id, "document.title", Duration::from_secs(5)), Ok("\"Link\"".into()), "{case}");
         assert_eq!(host.view(id).unwrap().url, format!("{base}/link"), "{case}");
         assert!(host.take_popups(id).is_empty(), "one click, one tab: {case}");
@@ -817,7 +824,7 @@ fn an_agents_modified_click_opens_a_hidden_popup() {
     assert_eq!(p.kind, PopupKind::BackgroundTab, "{p:?}");
     assert_eq!(p.url, format!("{base}/stay"));
     assert!(host.wait_loaded(p.id, Duration::from_secs(20)), "pop-up never loaded");
-    assert_eq!(host.eval(p.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(p.id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()));
 
     let max = ghostrealm_web::protocol::MAX_POPUPS;
     for _ in 1..=max {
@@ -1212,7 +1219,7 @@ fn a_modified_click_in_a_sandboxed_document_keeps_its_sandbox() {
     let tab = click_for_popup_with(&host, 1, NEW_TAB, MouseButton::Left);
     assert!(tab.from_input && tab.is_tab(), "{tab:?}");
     assert!(host.wait_loaded(tab.id, Duration::from_secs(20)), "the tab never loaded");
-    assert_eq!(host.eval(tab.id, "self.origin", Duration::from_secs(5)), Ok("\"null\"".into()));
+    assert_eq!(host.eval(tab.id, "self.origin", HIDDEN_EVAL), Ok("\"null\"".into()));
 
     let url = format!("{b}/sealedlink?{a}/hit-sealed");
     open(&mut host, 2, &url);
@@ -1376,17 +1383,17 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     assert_eq!((p.width, p.height), (200, 150), "the opener's size");
 
     assert!(host.wait_loaded(p.id, Duration::from_secs(20)), "pop-up never loaded");
-    assert_eq!(host.eval(p.id, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(p.id, "document.title", HIDDEN_EVAL), Ok("\"Stay\"".into()));
     assert!(host.text(p.id, Duration::from_secs(5)).unwrap().contains("stay text"));
     assert_eq!(host.view(p.id).unwrap().url, format!("{base}/stay"));
     assert_eq!(
-        host.eval(p.id, "window.opener.postMessage('from the agent', '*'); 1", Duration::from_secs(5)),
+        host.eval(p.id, "window.opener.postMessage('from the agent', '*'); 1", HIDDEN_EVAL),
         Ok("1".into())
     );
     assert_eq!(wait_got(&host, 1, "agent"), "\"from the agent;\"");
 
     // `window.close()` from an eval closes it.
-    host.eval(p.id, "window.close()", Duration::from_secs(5)).ok();
+    host.eval(p.id, "window.close()", HIDDEN_EVAL).ok();
     wait_closed(&host, p.id);
 
     // A page keeps at most `MAX_POPUPS` open; closing it closes them.

@@ -2991,7 +2991,10 @@ pub(crate) mod tests {
             assert_eq!(opened[0].place, Place::Tab { focus }, "{case}");
             assert!(v.floating.is_empty(), "{case}");
             let tab = opened[0].view.page;
-            let title = v.with_host(|h, _| h.eval(tab, "document.title", Duration::from_secs(5)));
+            // The tab is hidden until shown: Chromium runs its renderer at
+            // background priority, which a loaded machine (this whole suite)
+            // starves for seconds per DevTools step of an eval.
+            let title = v.with_host(|h, _| h.eval(tab, "document.title", Duration::from_secs(30)));
             assert_eq!(title, Some(Ok("\"Stay\"".into())), "{case}");
             assert_eq!(v.eval("document.title", false), Ok("\"Link\"".into()), "{case}");
         }
