@@ -725,6 +725,9 @@ Agents read comments through the agent channel, within item 3's scope.
 
 Each line gives the item and the default that will be applied if you don't veto it.
 
+**Toasts over modals**
+- **Toast choices while a modal is open** (`docs/DECISION.md`, the error surface's toast detail): while the picker or a confirmation is open, a toast's choices (e.g. "Save As…", "Open Settings") are inert and Dismiss stays live; error and warning toasts stay until dismissed, so the choice is there once the modal closes. The alternative is for a choice to cancel the picker or confirmation first, discarding what was in progress.
+
 **Disk**
 - **Automatic cleanup hook** (`.claude/skills/build/SKILL.md`, clean-all): no `SessionStart`/`SessionEnd` hook in `.claude/settings.json`; the director runs `mise run clean-all` after each goal lands. A hook would be lock-aware, but it can't pass `--except` for agent worktrees awaiting review, so it would empty their `target/` once idle 2 h and the reviewer would rebuild.
 
@@ -784,6 +787,7 @@ These can't be verified in the headless sandbox:
 - **Nested `.gitignore`:** "File browser — remaining polish" (6) (line ~420): confirm it on a real repo.
 - **Error surface:** toasts (colours, placement at the top of the pane or below the top tab strips for app-wide ones, hover highlight and dismiss on mouse-up, auto-hide timing), the Save As picker's inline error and red border, the palette prompt's error rows and their tooltip, wrapped tooltips, and the wavy red/yellow underlines in the editor. Also the palette's info toast for a command that doesn't apply (e.g. Toggle Comment in a file with no comment syntax), the error toast when a Save As picker's document has closed, and a web pane's toasts for a failed Back, Forward, Reload or address (one per web pane, each replacing the last). Two TODO entries also need a display: a launch-time toast under a still pointer, and wide glyphs in prompt error rows.
 - **Heading spacing and sizes:** open a Markdown file in Integrated and in Preview. Check the larger headings and the space above them (defaults in `[headings]`: `h1_scale`..`h6_scale`, `h1_space`..`h6_space`; hover the section in `config.toml` for docs), a click in the space above a heading, a table-of-contents jump, trackpad scrolling past headings, and live tuning by editing the values.
+- **Stacked modals and toasts:** Save As onto an existing file: the picker stays visible and dimmed under the Replace? question, with no picker text showing through. A toast raised while the palette, picker or a confirmation is open draws on top, its × works, its choices are inert under the picker or a confirmation and work once it closes, and hover, click and scroll don't reach the modal beneath; an info toast over a modal hides after about 4 s. A context menu and tooltips draw over the toast. Editor hover popups and images still draw, with no text bleeding between layers. Judge whether a toast covering the palette's input line is acceptable.
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 
 ## Parked (no decision needed yet)
