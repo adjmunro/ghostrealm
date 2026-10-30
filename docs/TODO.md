@@ -1457,7 +1457,7 @@
 
 ---
 
-[2026-10-31T05:08+1300@b9cb6045] Roles — rebase rule leftovers
+[2026-10-31T05:08+1300@b9cb604f] Roles — rebase rule leftovers
 
 - Requires: NO BLOCKERS
 - Detail: `docs/GIT.md:60` lists commits "rebased from such a commit without
