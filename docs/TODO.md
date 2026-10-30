@@ -1297,6 +1297,10 @@
   drive the GUI, a gesture eval within 5 s of a person's click would count
   as the person's: a visible, focused tab that the pop-up cap doesn't count.
   Tell the two apart by the source of the activation, not by timing.
+- Detail: Likewise a page is an agent's when opened without a window (the
+  agent channel): the host keeps an agent's page visible to Chromium off
+  screen. In the GUI every page `web.new` opens is a person's, an agent's
+  included; tell them apart by the command's source.
 - Reason: agent activity must stay in the background.
 
 ---
@@ -1316,26 +1320,6 @@
   `proc:::signal-send`, or `log stream` while it happens). Run with
   `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
 - Reason: a flaky test hides real failures.
-
----
-
-[2026-10-31T03:36+1300@0273a1c] Web — an agent's eval on a hidden pop-up can miss `REPLY_WAIT`
-
-- Requires: a design
-- Detail: The host hides every pop-up from Chromium (`was_hidden`) until the
-  app shows it, and Chromium runs a hidden page's renderer at background
-  priority. On a loaded machine each DevTools step of an eval there waited
-  1-4 s (up to 7 s), and a page's first eval takes five steps, so `web.eval`
-  on an agent's hidden pop-up fails after `REPLY_WAIT` (5 s). Visible pages'
-  steps stayed under 0.6 s, and pop-ups left visible to Chromium never
-  waited over 50 ms. `--disable-renderer-backgrounding` and
-  `--disable-background-timer-throttling` did not help. Choices: keep agent
-  pop-ups visible to Chromium (they then paint, and their timers run
-  unthrottled), show a page to Chromium while an eval on it runs (pages see
-  `visibilitychange`), or wait longer for hidden pages (the eval blocks the
-  UI thread).
-- Reason: agents drive their pop-ups hidden; a slow machine shouldn't make
-  them undrivable.
 
 ---
 
@@ -1476,3 +1460,17 @@
   inherits the PTY slave (it holds it only for its own life).
 - Reason: a failed shell spawn should surface as an error, and allocation
   after fork can deadlock on a lock another thread held at fork.
+
+---
+
+[2026-10-31T04:00+1300@98fb091a] Tests — `giving_up_a_row_drops_the_selection` flakes under load
+
+- Requires: NO BLOCKERS
+- Detail: `plugins::terminal::tests::giving_up_a_row_drops_the_selection`
+  (crates/app/src/plugins/terminal.rs) failed twice with "the grid never
+  gave up a row" on a loaded machine (the CEF host tests running beside
+  `cargo test -p ghostrealm --lib`). One 5 s deadline covers both of its
+  waits: the shell printing a full grid, and then, after the second line
+  of input, the shell's `stty -echo` and `read` and the grid giving up a
+  row. Give each wait its own deadline, or find what the grid waits on.
+- Reason: a flaky test hides real failures.
