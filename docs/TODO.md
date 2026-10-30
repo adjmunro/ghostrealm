@@ -1304,21 +1304,38 @@
 [2026-10-23T22:46+1300@0fd87271] Web — a host test's host can fail to start
 
 - Requires: NO BLOCKERS
-- Detail: `right_and_middle_presses_reach_the_page` and
-  `a_modified_click_loads_as_its_page_asked` (crates/web/tests/host.rs) each
-  failed once with "host never became ready", well inside its 20 s wait, so
-  the host reported a failure or exited: 2 of about 30 suite runs on
-  `feat/web-modified-link-clicks`, which grew the suite from 12 hosts at
-  once to 21. A third, with two suites running at once, said `failure:
-  None` about 9.6 s in: the host exited without reporting a failure. The
-  assertion now prints the exit status: under heavy load it read `failure
-  None, stdout closed true, status Some(ExitStatus(unix_wait_status(9)))`,
-  so the host is SIGKILLed, with nothing in the system log. Guessed
-  senders: jetsam (memory pressure), or Chromium's ProcessSingleton killing
-  an "unresponsive" holder of a stale profile lock (thousands of leaked
-  profiles make a reused name possible). Run with `GHOSTREALM_WEB_DEBUG=1`
-  to see its stderr.
+- Detail: Under heavy load a host in `crates/web/tests/host.rs` now and then
+  dies with "host never became ready: failure None, stdout closed true,
+  status ... (9)": SIGKILLed while starting, before it creates its profile
+  dir (none is left behind), so before Chromium's ProcessSingleton runs.
+  Seen 3 times in about 40 suite runs on 2026-10-31, all with the
+  machine's load average over 40 and swap all but full (10.3 of 11.2 GB
+  used) on an 8 GB machine. The system log shows no jetsam or memorystatus
+  kill for the host. The suite now runs at most four hosts at once
+  (`HOSTS_AT_ONCE`), which made it rarer. Find the sender (`dtrace` on
+  `proc:::signal-send`, or `log stream` while it happens). Run with
+  `GHOSTREALM_WEB_DEBUG=1` to see its stderr.
 - Reason: a flaky test hides real failures.
+
+---
+
+[2026-10-31T03:36+1300@0273a1c] Web — an agent's eval on a hidden pop-up can miss `REPLY_WAIT`
+
+- Requires: a design
+- Detail: The host hides every pop-up from Chromium (`was_hidden`) until the
+  app shows it, and Chromium runs a hidden page's renderer at background
+  priority. On a loaded machine each DevTools step of an eval there waited
+  1-4 s (up to 7 s), and a page's first eval takes five steps, so `web.eval`
+  on an agent's hidden pop-up fails after `REPLY_WAIT` (5 s). Visible pages'
+  steps stayed under 0.6 s, and pop-ups left visible to Chromium never
+  waited over 50 ms. `--disable-renderer-backgrounding` and
+  `--disable-background-timer-throttling` did not help. Choices: keep agent
+  pop-ups visible to Chromium (they then paint, and their timers run
+  unthrottled), show a page to Chromium while an eval on it runs (pages see
+  `visibilitychange`), or wait longer for hidden pages (the eval blocks the
+  UI thread).
+- Reason: agents drive their pop-ups hidden; a slow machine shouldn't make
+  them undrivable.
 
 ---
 
@@ -1373,16 +1390,6 @@
   reap time and ignore the back-off; GUI `start()` would report a failure as a
   restart; headless `host()` would block in the exit wait during the back-off.
 - Reason: a failure shouldn't cost a second, spurious "profile in use" failure.
-
----
-
-[2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
-
-- Requires: investigation (environment, or a stale host bundle)
-- Detail: `ghostrealm-web --test host` and `popups_with_the_real_host` fail
-  on `develop` too, not only on branches. Find whether the environment or a
-  stale bundle is at fault, and fix it or document the setup they need.
-- Reason: the web host's integration is untested while they fail.
 
 ---
 
