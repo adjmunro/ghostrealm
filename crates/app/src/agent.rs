@@ -237,7 +237,17 @@ mod tests {
         TEST_IDLE_EXIT.set(None);
         let replies: Vec<Json> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert!(replies.iter().all(|r| r["ok"] == json!(true)), "{replies:?}");
-        assert!(std::fs::read_to_string(&log).unwrap().starts_with("run\neof\nrun\n"));
+        // `web.new` returns once the host reports ready, which the stub does
+        // before it notes its start: wait for the second host's note.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let log = loop {
+            let got = std::fs::read_to_string(&log).unwrap();
+            if got.matches("run\n").count() == 2 || std::time::Instant::now() >= deadline {
+                break got;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(log.starts_with("run\neof\nrun\n"), "{log:?}");
     }
 
     #[test]
