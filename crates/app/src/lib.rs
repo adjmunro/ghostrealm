@@ -53,7 +53,7 @@ pub fn run_cli() -> Result<()> {
             state.new_vtab()?;
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            agent::run(stdin.lock(), stdout.lock(), state)
+            agent::run(std::io::BufReader::new(stdin), stdout.lock(), state)
         }
         Some("lsp") => settings::serve_stdio(args.get(1).map_or("", String::as_str)),
         Some("dump") => {

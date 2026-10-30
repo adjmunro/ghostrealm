@@ -1675,7 +1675,8 @@ impl AppState {
 
     /// Hang up on the web host once no web surface has been left for a
     /// while (see [`web::IdleExit::tick`]). Call on every pass of the event
-    /// loop and between agent requests.
+    /// loop, and in the agent channel around each request and at
+    /// [`next_web_deadline`](Self::next_web_deadline) while it waits.
     pub fn tick_web(&mut self, now: Instant) {
         self.web_idle.tick(now);
     }

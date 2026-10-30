@@ -19,6 +19,9 @@
 //! display-free way to test app behaviour end to end.
 
 use std::io::{BufRead, Write};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use ghostrealm_core::{Args, CloseOnExit, CommandMeta, Registry, SurfaceId, Value};
 use serde_json::{json, Value as Json};
@@ -27,37 +30,110 @@ use crate::app_state::{build_registry, AppState};
 
 /// Run the REPL until the input reaches EOF.
 ///
-/// The web host's idle exit is checked around each request: nothing wakes
-/// this loop while it waits for the next one.
+/// The web host's idle exit is checked before and after each request, and at
+/// its deadline while the loop waits for the next one.
 ///
 /// Exited terminals stay in the tree whatever the config says: the agent has to
 /// read a finished command's output with `get surface`, which a closed surface
 /// no longer answers.
-pub fn run<R: BufRead, W: Write>(
-    mut input: R,
+pub fn run<R: BufRead + Send + 'static, W: Write>(
+    input: R,
     mut output: W,
     mut state: AppState,
 ) -> anyhow::Result<()> {
     keep_exited(&mut state);
     let mut registry = build_registry();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if input.read_line(&mut line)? == 0 {
-            break;
-        }
+    let mut lines = Lines::spawn(input)?;
+    while let Some(line) = lines.next(&mut state)? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        state.tick_web(std::time::Instant::now());
+        state.tick_web(Instant::now());
         let response = handle(trimmed, &mut state, &mut registry);
-        state.tick_web(std::time::Instant::now());
+        state.tick_web(Instant::now());
         serde_json::to_writer(&mut output, &response)?;
         output.write_all(b"\n")?;
         output.flush()?;
     }
     Ok(())
+}
+
+/// One reply from the reader thread: a line, `None` at EOF, or the read's
+/// error.
+type LineRead = std::io::Result<Option<String>>;
+
+/// Request lines read on a thread, so the loop can tick the web host's idle
+/// exit while it waits for one.
+///
+/// The thread reads a line only when [`next`](Self::next) asks for it, so
+/// input is consumed exactly as a blocking `read_line` per request would.
+/// Waiting on a line is the only time it is blocked reading.
+struct Lines {
+    want: Option<mpsc::Sender<()>>,
+    got: mpsc::Receiver<LineRead>,
+    /// A line was asked for and hasn't arrived: the thread may be blocked
+    /// reading.
+    reading: bool,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Lines {
+    fn spawn<R: BufRead + Send + 'static>(mut input: R) -> std::io::Result<Self> {
+        let (want, wanted) = mpsc::channel::<()>();
+        let (send, got) = mpsc::channel::<LineRead>();
+        let thread = std::thread::Builder::new().name("agent-input".into()).spawn(move || {
+            while wanted.recv().is_ok() {
+                let mut line = String::new();
+                let read = input.read_line(&mut line).map(|n| (n > 0).then_some(line));
+                let last = !matches!(read, Ok(Some(_)));
+                if send.send(read).is_err() || last {
+                    break;
+                }
+            }
+        })?;
+        Ok(Self { want: Some(want), got, reading: false, thread: Some(thread) })
+    }
+
+    /// The next line, `None` at EOF. Ticks the web host's idle exit at its
+    /// deadline while waiting.
+    fn next(&mut self, state: &mut AppState) -> std::io::Result<Option<String>> {
+        if !self.reading {
+            // The thread is gone only after EOF or an error, both returned
+            // before anything asks again.
+            if let Some(want) = &self.want {
+                let _ = want.send(());
+            }
+            self.reading = true;
+        }
+        let read = loop {
+            let got = match state.next_web_deadline() {
+                Some(at) => self.got.recv_timeout(at.saturating_duration_since(Instant::now())),
+                None => self.got.recv().map_err(mpsc::RecvTimeoutError::from),
+            };
+            match got {
+                Ok(read) => break read,
+                Err(mpsc::RecvTimeoutError::Timeout) => state.tick_web(Instant::now()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(std::io::Error::other("the agent input reader stopped"))
+                }
+            }
+        };
+        self.reading = false;
+        read
+    }
+}
+
+impl Drop for Lines {
+    /// Ends the thread with the loop. While it may be blocked reading (the
+    /// loop unwinding from a panic mid-wait) it is left to end at its next
+    /// line or EOF, since joining it could block forever on a quiet input.
+    fn drop(&mut self) {
+        self.want = None;
+        if let Some(thread) = self.thread.take().filter(|_| !self.reading) {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Keep exited terminals in the tree whatever the config says (see [`run`]).
@@ -248,6 +324,51 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         assert!(log.starts_with("run\neof\nrun\n"), "{log:?}");
+    }
+
+    /// Given the agent channel and a web host whose idle exit is 300 ms,
+    /// noting each start and when its stdin closes;
+    /// when the agent opens a web surface, closes it, and sends nothing more
+    /// with its input still open;
+    /// then the host is hung up on once 300 ms have passed, while the agent
+    /// waits.
+    #[cfg(unix)]
+    #[test]
+    fn the_web_host_is_hung_up_on_while_the_agent_waits_once_idle() {
+        use crate::plugins::web::tests::{stub_app_host, TEST_HOST, TEST_IDLE_EXIT};
+        use std::time::{Duration, Instant};
+        const IDLE: Duration = Duration::from_millis(300);
+        let dir = crate::plugin::testing::TmpDir::new("agent-web-idle-wait");
+        let log = dir.join("log");
+        stub_app_host(&dir, &[], &format!("echo run >> '{0}'; cat > /dev/null; echo eof >> '{0}'", log.display()));
+        TEST_IDLE_EXIT.set(Some(IDLE));
+        let (input, mut requests) = std::io::pipe().unwrap();
+        let agent = std::thread::spawn(move || {
+            let lines = [r#"{"op":"set","id":"web.new","args":{}}"#, r#"{"op":"set","id":"web.close","args":{}}"#];
+            for l in lines {
+                writeln!(requests, "{l}").unwrap();
+            }
+            let sent = Instant::now();
+            let deadline = sent + Duration::from_secs(10);
+            // The input stays open until the host has gone, or the wait
+            // gives up.
+            while !std::fs::read_to_string(&log).unwrap_or_default().contains("eof") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (Instant::now() < deadline).then(|| sent.elapsed())
+        });
+        let mut state = AppState::new().with_shell_line("sleep 1");
+        state.new_empty_vtab();
+        state.new_empty_vtab();
+        let mut out: Vec<u8> = Vec::new();
+        run(std::io::BufReader::new(input), &mut out, state).unwrap();
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+        TEST_IDLE_EXIT.set(None);
+        let replies: Vec<Json> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(replies.iter().all(|r| r["ok"] == json!(true)), "{replies:?}");
+        let gone = agent.join().unwrap().expect("the host is hung up on while the input stays open");
+        assert!(gone >= IDLE, "not before its idle deadline: {gone:?}");
     }
 
     #[test]

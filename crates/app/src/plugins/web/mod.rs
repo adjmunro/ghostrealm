@@ -309,7 +309,8 @@ impl IdleExit {
     /// in any workspace, a hidden or floating pop-up, a pop-up not yet
     /// placed) and no person's tab waiting to be placed has been left for
     /// `IDLE_EXIT`; it respawns on demand. Call on every pass of the event
-    /// loop, and between agent requests.
+    /// loop, and in the agent channel around each request and at
+    /// [`deadline`](Self::deadline) while it waits.
     pub fn tick(&self, now: Instant) {
         if let Ok(mut slot) = self.0.try_borrow_mut() {
             slot.idle_tick(now);
