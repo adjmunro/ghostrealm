@@ -119,6 +119,31 @@ pub(crate) fn hover_index(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y):
     buttons.iter().position(|(r, a)| (!toast || a.in_toast()) && rect_contains(*r, x, y))
 }
 
+/// Where a right press goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightPress {
+    /// Nowhere: the picker or a confirmation keeps the pointer (a menu would
+    /// open beneath it, and its actions run under an unanswered question).
+    Kept,
+    /// Onto the toast: it closes a menu, and nothing beneath the toast (the
+    /// palette, a view) hears it.
+    Toast,
+    /// Beneath the overlays: the palette and a menu close, and the sidebar or
+    /// the view under the pointer takes it.
+    Through,
+}
+
+/// Where a right press at `pos` goes.
+pub(crate) fn right_press(gate: &Gate, pos: (f32, f32)) -> RightPress {
+    if gate.picker || gate.confirm {
+        RightPress::Kept
+    } else if covered(gate, pos) {
+        RightPress::Toast
+    } else {
+        RightPress::Through
+    }
+}
+
 /// The view the wheel scrolls: the one `under` the pointer, else the
 /// `focused` one; none under the toast.
 pub(crate) fn wheel_target<T>(gate: &Gate, pos: (f32, f32), under: Option<T>, focused: Option<T>) -> Option<T> {
@@ -134,6 +159,23 @@ mod tests {
 
     const R: Rect = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
     const IN: (f32, f32) = (5.0, 5.0);
+
+    /// A right press on the toast reaches nothing beneath it, the palette
+    /// included; off it, it goes through unless a modal keeps the pointer.
+    #[test]
+    fn a_right_press_on_the_toast_goes_no_further() {
+        let gate = Gate { palette: true, toast: Some(R), ..Gate::default() };
+        assert_eq!(right_press(&gate, IN), RightPress::Toast);
+        assert_eq!(right_press(&gate, (20.0, 5.0)), RightPress::Through);
+        let menu = Gate { menu: true, ..gate };
+        assert_eq!(right_press(&menu, IN), RightPress::Toast);
+        let picker = Gate { picker: true, ..gate };
+        assert_eq!(right_press(&picker, IN), RightPress::Kept);
+        assert_eq!(right_press(&picker, (20.0, 5.0)), RightPress::Kept);
+        let confirm = Gate { confirm: true, ..gate };
+        assert_eq!(right_press(&confirm, IN), RightPress::Kept);
+        assert_eq!(right_press(&Gate::default(), IN), RightPress::Through);
+    }
 
     #[test]
     fn the_first_button_in_paint_order_takes_the_hit() {

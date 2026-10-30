@@ -41,7 +41,7 @@ use crate::plugin::{
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
-use crate::pointer::{self, ButtonAction, Gate};
+use crate::pointer::{self, ButtonAction, Gate, RightPress};
 use crate::toasts::{self, Level, Toast, ToastHit};
 use crate::images::ImageRenderer;
 use crate::tap::{HeldKey, TapDetector};
@@ -2299,10 +2299,14 @@ impl State {
 
     /// Right-click opens a context menu over the sidebar vtab under the cursor.
     fn on_right_click(&mut self) {
-        // The picker and a confirmation keep the pointer: a menu would open
-        // beneath them, and its actions run under an unanswered question.
-        if self.app.picker_open() || self.app.confirm().is_some() {
-            return;
+        match pointer::right_press(&self.gate(), self.cursor) {
+            RightPress::Kept => return,
+            RightPress::Toast => {
+                self.menu = None;
+                self.dirty = true;
+                return;
+            }
+            RightPress::Through => {}
         }
         self.palette = None;
         let (x, y) = self.cursor;
