@@ -53,13 +53,15 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
 ## Rendering model (current)
 
 Per frame: every view is pumped (a terminal checks its VT worker's published
-grid); then each pane's active view paints into a `Frame`: quads under text, images,
-text items, quads over text, overlay images, overlay text. The head of the toast
-queue paints into a `Frame` of its own, drawn in a pass after the overlay text
-(toast quads, then its text through a renderer of its own) and before the
-menu and tooltip; so it covers views' popups and the tooltip covers it. While
-the palette, picker, confirmation, or a menu is open no toast draws. The app draws the quads
-via an instanced quad pipeline (rounded corners and borders by an SDF in the
+grid); then each pane's active view paints into a `Frame`'s base layer: quads
+under text, images, text items, quads over text. Overlay layers stack above
+it, each drawn whole (quads, images, then text through a text renderer of its
+own) before the next: views' popups, then the picker, the palette, a
+confirmation, the head of the toast queue, a menu, and the tooltip, each that
+is open. So a confirmation covers the picker that raised it, the toast shows
+(and its clock runs) over the palette, picker and confirmation, and a menu
+and the tooltip cover the toast. The app draws the quads via an instanced
+quad pipeline (rounded corners and borders by an SDF in the
 shader), images via a textured-quad pipeline (a texture per view image,
 re-uploaded only when its version changes and freed once undrawn), and the text
 via glyphon. Text comes from one of three places:

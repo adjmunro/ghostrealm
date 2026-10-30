@@ -886,8 +886,16 @@ impl AppState {
         self.toasts.tick(now, visible)
     }
 
+    /// Whether a toast's choices act: not while the picker or a confirmation
+    /// is open, since a choice would replace the picker (and so what an open
+    /// "Replace?" writes) or act on the focus the picker was opened for.
+    pub fn toast_choices_live(&self) -> bool {
+        self.picker.is_none() && self.confirm.is_none()
+    }
+
     /// Run choice `i` of toast `id`, which then goes. Opening the settings
-    /// file can fail: the toast then says why, keeping its message.
+    /// file can fail: the toast then says why, keeping its message. Does
+    /// nothing unless [`Self::toast_choices_live`].
     pub fn choose_toast(&mut self, id: u64, i: usize) {
         self.choose_toast_with(id, i, ghostrealm_core::config::ensure_file);
     }
@@ -1058,6 +1066,9 @@ impl AppState {
 
     /// [`Self::choose_toast`], with the config file from `settings`.
     fn choose_toast_with(&mut self, id: u64, i: usize, settings: impl FnOnce() -> Option<std::path::PathBuf>) {
+        if !self.toast_choices_live() {
+            return;
+        }
         let Some(entry) = self.toasts.get(id) else { return };
         let Some((_, action)) = entry.toast.choices.get(i).cloned() else { return };
         match action {
@@ -2990,6 +3001,44 @@ mod tests {
         s.choose_toast(id, 0);
         assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(doc)));
         assert_eq!(s.toasts().len(), 1, "until the save succeeds");
+    }
+
+    /// While the picker or a confirmation is open a choice does nothing: a
+    /// Save As would swap the picker's purpose under an open "Replace?".
+    #[test]
+    fn a_choice_does_nothing_while_the_picker_or_a_confirmation_is_open() {
+        let dir = crate::plugin::testing::tmpdir("toast-choice-modal");
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let mut s = AppState::new();
+        s.new_empty_vtab();
+        s.open_file_in_new_surface(&a).unwrap();
+        let doc_a = s.active_doc(s.focused_surface().unwrap()).unwrap();
+        s.open_file_in_new_surface(&b).unwrap();
+        let sid_b = s.focused_surface().unwrap();
+        let doc_b = s.active_doc(sid_b).unwrap();
+        let id = s.notify(Toast::new(Level::Error, "Couldn't save a.txt").with_choice("Save As…", ToastAction::SaveAs(doc_a)));
+
+        s.open_picker(Pick::Open);
+        assert!(!s.toast_choices_live());
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), Some(Pick::Open), "the picker keeps its purpose");
+
+        // Save b.txt as a.txt: "Replace?".
+        s.close_picker();
+        s.open_save_as(sid_b);
+        s.confirm_picker_with(a.clone()).unwrap();
+        assert!(s.confirm().is_some());
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(doc_b)), "Replace still writes b.txt");
+        assert!(s.confirm().is_some());
+        assert_eq!(s.toasts().len(), 1, "the toast stays for later");
+
+        s.close_picker();
+        assert!(s.toast_choices_live());
+        s.choose_toast(id, 0);
+        assert_eq!(s.picker_purpose(), Some(Pick::SaveAs(doc_a)));
     }
 
     #[test]

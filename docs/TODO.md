@@ -478,9 +478,7 @@
 - Detail: The picker chooses a directory, a file (`editor.open`), or where to
   save (Save As). In save mode typing goes to the name, so the list can't be
   filtered or given a typed path — e.g. Tab to move focus between the name and
-  the header field. While a confirmation is open the picker is hidden: overlay
-  text draws above all overlay quads, so modals can't stack (needs per-modal
-  layers in `Frame`).
+  the header field.
 - Reason: the picker is now the app's open/save dialog; it should feel like one.
 
 ---
@@ -1391,18 +1389,6 @@
   to a per-pid dir under its cache before `initialize` so children inherit it.
   Until then `mise run clean-all` removes them while no host runs.
 - Reason: test runs shouldn't fill the temp directory.
-
----
-
-[2026-10-26T22:13+1300@462d3daa] App — per-modal overlay layers
-
-- Requires: NO BLOCKERS
-- Detail: `Frame` draws overlay text above every overlay quad, so modals
-  can't stack: the picker hides while a confirmation is open, and toasts
-  don't draw (their clock stops) while the palette, picker, confirmation, or
-  a menu is open. Give each modal a layer of its own (quads, then text), so
-  one can draw over another and a toast can show over a modal.
-- Reason: a toast raised while a modal is open waits until it closes.
 
 ---
 

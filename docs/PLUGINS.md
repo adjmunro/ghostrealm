@@ -245,11 +245,12 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
 - Cursor: `cursor(rect, icon)` shows a mouse cursor while `rect` is hovered (a
   link's pointer, a text field's I-beam).
 - `request_frame` asks for another paced frame (e.g. eased scrolling).
-- `above(|cx| ...)` paints into the overlay pass, over every pane (a view's
-  popups, such as the editor's hover docs). While `cx.modal` (a palette, menu,
-  picker, or confirmation covers the panes) it paints nothing; close popups
-  then, so they don't reappear when the modal goes. A toast draws over
-  popups; the tooltip draws over the toast.
+- `above(|cx| ...)` paints into the popups' overlay layer, over every pane (a
+  view's popups, such as the editor's hover docs) and under every modal.
+  While `cx.modal` (a palette, menu, picker, or confirmation covers the
+  panes) it paints nothing; close popups then, so they don't reappear when
+  the modal goes. A toast draws over popups; the tooltip draws over the
+  toast.
 - Document header: `plugins::files::header::DocHeader` draws a document's
   details (name, kind and size, modified) in its rect, from what
   `refresh(path)` last read (call it when the document shows, saves,
@@ -362,7 +363,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   and triple-click (all) then edit the `LineEdit` like the editor's.
 
 A view hosted in a modal (the floating picker's file browser) paints the same way
-into the overlay layer; it doesn't need to know. The picker shows a failed
+into the modal's overlay layer; it doesn't need to know. A confirmation the
+picker raises draws over it, the picker still showing beneath. The picker shows a failed
 answer's error in its browser: `FileBrowserView::set_error(message, path)`
 draws it under the listing (above the name row in Save mode, whose field
 turns red) until the answer changes, and `blocks(path)` holds back picking

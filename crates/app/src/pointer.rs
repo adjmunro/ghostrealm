@@ -53,14 +53,18 @@ impl ButtonAction {
     }
 }
 
-/// What covers the window this frame.
+/// What covers the window this frame. The toast draws over the palette,
+/// picker and confirmation, and under a menu.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Gate {
-    /// The palette or a menu is open: it owns the pointer.
-    pub modal: bool,
-    /// The floating picker is open: only its buttons are live.
+    /// A menu is open: it owns the pointer, over the toast too.
+    pub menu: bool,
+    /// The palette is open: it owns the pointer outside the toast.
+    pub palette: bool,
+    /// The floating picker is open: only its buttons (and the toast's) are
+    /// live.
     pub picker: bool,
-    /// A confirmation is open: only its buttons are live.
+    /// A confirmation is open: only its buttons (and the toast's) are live.
     pub confirm: bool,
     /// The toast's rect, as last drawn.
     pub toast: Option<Rect>,
@@ -71,24 +75,31 @@ pub(crate) fn covered(gate: &Gate, (x, y): (f32, f32)) -> bool {
     gate.toast.is_some_and(|r| rect_contains(r, x, y))
 }
 
-/// The button at `pos`, if any. The palette and menus own the pointer; while
-/// a confirmation or the picker is open only its buttons are live, and under
-/// the toast only the toast's (view buttons under it come first in paint
-/// order). The
+/// The button at `pos`, if any. A menu owns the pointer; under the toast
+/// only the toast's buttons are live (view buttons under it come first in
+/// paint order); elsewhere the palette owns the pointer, and while a
+/// confirmation or the picker is open only its buttons are live. The
 /// sidebar toggle wins any overlap (it can float over a pane's tab strip when
 /// the sidebar is hidden); otherwise the first button in paint order takes
 /// the hit.
 pub(crate) fn button_at(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (f32, f32)) -> Option<ButtonAction> {
-    if gate.modal {
+    if gate.menu {
         return None;
     }
     let toast = covered(gate, (x, y));
+    if gate.palette && !toast {
+        return None;
+    }
     let mut hit = None;
     for &(r, action) in buttons {
-        if toast && !action.in_toast() {
-            continue;
-        }
-        if (gate.confirm && !action.in_confirm()) || (gate.picker && !gate.confirm && !action.in_picker()) {
+        let live = if toast {
+            action.in_toast()
+        } else if gate.confirm {
+            action.in_confirm()
+        } else {
+            !gate.picker || action.in_picker()
+        };
+        if !live {
             continue;
         }
         if rect_contains(r, x, y) {
@@ -145,12 +156,42 @@ mod tests {
             (R, ButtonAction::PickerConfirm),
             (R, ButtonAction::ConfirmCancel),
         ];
-        let modal = Gate { modal: true, ..Gate::default() };
-        assert_eq!(button_at(&modal, &buttons, IN), None);
+        for owner in [Gate { menu: true, ..Gate::default() }, Gate { palette: true, ..Gate::default() }] {
+            assert_eq!(button_at(&owner, &buttons, IN), None);
+        }
         let picker = Gate { picker: true, ..Gate::default() };
         assert_eq!(button_at(&picker, &buttons, IN), Some(ButtonAction::PickerConfirm));
         let confirm = Gate { picker: true, confirm: true, ..Gate::default() };
         assert_eq!(button_at(&confirm, &buttons, IN), Some(ButtonAction::ConfirmCancel));
+    }
+
+    /// The toast draws over the palette, picker and confirmation: its
+    /// buttons stay live over them, and nothing of theirs under it is.
+    /// A menu draws over the toast and owns the pointer.
+    #[test]
+    fn the_toast_takes_the_pointer_over_a_modal_but_not_over_a_menu() {
+        let toast = Rect { x: 0.0, y: 0.0, w: 10.0, h: 6.0 };
+        let close = Rect { x: 6.0, y: 2.0, w: 4.0, h: 4.0 };
+        let buttons = [
+            (R, ButtonAction::PickerCancel),
+            (R, ButtonAction::ConfirmCancel),
+            (close, ButtonAction::Toast(7, ToastHit::Dismiss)),
+        ];
+        let (on_close, on_body, below) = ((8.0, 4.0), (2.0, 2.0), (2.0, 8.0));
+        let dismiss = Some(ButtonAction::Toast(7, ToastHit::Dismiss));
+        let modals = [
+            (Gate { palette: true, ..Gate::default() }, None),
+            (Gate { picker: true, ..Gate::default() }, Some(ButtonAction::PickerCancel)),
+            (Gate { picker: true, confirm: true, ..Gate::default() }, Some(ButtonAction::ConfirmCancel)),
+        ];
+        for (gate, beneath) in modals {
+            let gate = Gate { toast: Some(toast), ..gate };
+            assert_eq!(button_at(&gate, &buttons, on_close), dismiss, "{gate:?}");
+            assert_eq!(button_at(&gate, &buttons, on_body), None, "{gate:?}");
+            assert_eq!(button_at(&gate, &buttons, below), beneath, "{gate:?}");
+        }
+        let menu = Gate { menu: true, toast: Some(toast), ..Gate::default() };
+        assert_eq!(button_at(&menu, &buttons, on_close), None);
     }
 
     #[test]

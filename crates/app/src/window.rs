@@ -1704,15 +1704,16 @@ impl State {
     /// What covers the window for pointer decisions ([`pointer`]).
     fn gate(&self) -> Gate {
         Gate {
-            modal: self.palette.is_some() || self.menu.is_some(),
+            menu: self.menu.is_some(),
+            palette: self.palette.is_some(),
             picker: self.app.picker_open(),
             confirm: self.app.confirm().is_some(),
             toast: self.toast_rect,
         }
     }
 
-    /// The pointer as panes see it: nowhere while it is over the toast, so
-    /// nothing under the toast lights up.
+    /// The pointer as panes and the modals under the toast see it: nowhere
+    /// while it is over the toast, so nothing under the toast lights up.
     fn pane_cursor(&self) -> (f32, f32) {
         if pointer::covered(&self.gate(), self.cursor) {
             (-1.0, -1.0)
@@ -1768,7 +1769,7 @@ impl State {
             ButtonAction::ConfirmCancel => self.app.cancel_confirm(),
             ButtonAction::ConfirmDiscard => self.discard_confirm(),
             ButtonAction::Toast(id, ToastHit::Dismiss) => self.app.dismiss_toast(id),
-            ButtonAction::Toast(id, ToastHit::Choice(i)) => self.app.choose_toast(id, i),
+            ButtonAction::Toast(id, ToastHit::Choice(i)) => choose_toast(&mut self.palette, &mut self.app, id, i),
         }
         self.dirty = true;
         true
@@ -1788,7 +1789,8 @@ impl State {
     }
 
     /// Deliver hover to the view under the cursor (the picker's, while it is
-    /// open). Returns whether it asked for a redraw.
+    /// open and the pointer is off the toast). Returns whether it asked for a
+    /// redraw.
     fn hover_view(&mut self) -> bool {
         if self.mouse_down {
             return false;
@@ -1796,7 +1798,7 @@ impl State {
         let pos = self.cursor;
         let may_hover = self.may_hover();
         let target = if self.app.picker_open() {
-            Some(PICKER_SID)
+            (!pointer::covered(&self.gate(), pos)).then_some(PICKER_SID)
         } else {
             self.surface_under_cursor()
                 .filter(|s| self.app.view(*s).is_some())
@@ -1864,7 +1866,8 @@ impl State {
     fn divider_under_cursor(&self) -> Option<(VtabId, Divider)> {
         let (x, y) = self.cursor;
         let gate = self.gate();
-        let covered = gate.modal
+        let covered = gate.menu
+            || gate.palette
             || gate.picker
             || gate.confirm
             || pointer::covered(&gate, self.cursor)
@@ -2153,6 +2156,11 @@ impl State {
             self.menu_click();
             return;
         }
+        // The toast draws over the picker and the palette: a press on it
+        // reaches neither (its buttons arm on press).
+        if pointer::covered(&self.gate(), self.cursor) {
+            return;
+        }
         // The picker is modal: a click in its panel goes to its file
         // browser, a click outside cancels. (Its buttons arm on press.)
         if self.app.picker_open() {
@@ -2291,8 +2299,9 @@ impl State {
 
     /// Right-click opens a context menu over the sidebar vtab under the cursor.
     fn on_right_click(&mut self) {
-        // Modal overlays keep the pointer; a context menu would open beneath them.
-        if self.app.picker_open() {
+        // The picker and a confirmation keep the pointer: a menu would open
+        // beneath them, and its actions run under an unanswered question.
+        if self.app.picker_open() || self.app.confirm().is_some() {
             return;
         }
         self.palette = None;
@@ -2537,10 +2546,14 @@ impl State {
         }
     }
 
-    /// Hover over a palette result highlights it. Returns whether the selection
-    /// moved (so the caller can redraw only on change).
+    /// Hover over a palette result highlights it (not through the toast).
+    /// Returns whether the selection moved (so the caller can redraw only on
+    /// change).
     fn palette_hover(&mut self) -> bool {
         let (x, y) = self.cursor;
+        if pointer::covered(&self.gate(), (x, y)) {
+            return false;
+        }
         let Some(sel) = self
             .palette_rows
             .iter()
@@ -2708,9 +2721,12 @@ impl State {
         if self.app.confirm().is_some() {
             return;
         }
-        // The picker is modal: the wheel scrolls its list.
+        // The picker is modal: the wheel scrolls its list, but not through
+        // the toast over it.
         if self.app.picker_open() {
-            self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
+            if !pointer::covered(&self.gate(), pos) {
+                self.view_event(PICKER_SID, |v, cx| v.scroll(cx, pos, px_x, px));
+            }
             return;
         }
         // Over the sidebar, the wheel scrolls the workspace list (pixel-precise, so
@@ -2963,8 +2979,7 @@ impl State {
     /// backdrop and a centred panel hosting a file-browser view above a
     /// confirm/cancel footer.
     fn build_picker(&mut self, frame: &mut Frame) {
-        // The picker hides while a confirmation is open.
-        if !self.app.picker_open() || self.app.confirm().is_some() {
+        if !self.app.picker_open() {
             return;
         }
         let (sw, sh) = frame.screen;
@@ -2991,8 +3006,9 @@ impl State {
             Pick::SaveAs(_) => "Save as",
             Pick::SaveCopy(_) => "Save copy as",
         };
-        // Under a menu, nothing in the picker hovers.
-        let cursor = if self.menu.is_some() { (-1.0, -1.0) } else { self.cursor };
+        // Under a menu or a confirmation, nothing in the picker hovers.
+        let covered = self.menu.is_some() || self.app.confirm().is_some();
+        let cursor = if covered { (-1.0, -1.0) } else { self.pane_cursor() };
         let Some(view) = self.app.picker_mut() else {
             return;
         };
@@ -3074,8 +3090,8 @@ impl State {
     }
 
     /// Draw the open confirmation into the frame's top layer: a dim backdrop
-    /// and a centred panel with the question above [<discard>] [Cancel]
-    /// [<accept>], right-aligned.
+    /// (over the picker too, when it raised the question) and a centred panel
+    /// with the question above [<discard>] [Cancel] [<accept>], right-aligned.
     fn build_confirm(&mut self, frame: &mut Frame) {
         let Some(confirm) = self.app.confirm().cloned() else {
             return;
@@ -3084,7 +3100,7 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let pad = 12.0 * scale;
-        let cursor = self.cursor;
+        let cursor = self.pane_cursor();
         frame.overlay().quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let bh = ch + 8.0 * scale;
         // Right to left: accept, Cancel, then the discard button. The primary
@@ -3152,9 +3168,10 @@ impl State {
         }
     }
 
-    /// Draw the head of the toast queue into the frame's top layer.
-    /// Registers its buttons and notes its rect; with the pointer over it,
-    /// its own tooltip (or none) replaces the frame's.
+    /// Draw the head of the toast queue into the frame's top layer (over the
+    /// palette, picker and confirmation; under a menu, where nothing in it
+    /// hovers). Registers its buttons and notes its rect; with the pointer
+    /// over it, its own tooltip (or none) replaces the frame's.
     fn build_toast(&mut self, frame: &mut Frame, panes: &[(PaneId, Rect, Rect)], workspace: Rect) {
         let ui = self.ui();
         let Some(head) = self.app.toasts().head() else { return };
@@ -3169,17 +3186,18 @@ impl State {
         };
         let at = toasts::place(head.toast.scope, &area);
         let under = frame.tooltip.take();
+        let cursor = if self.menu.is_some() { (-1.0, -1.0) } else { self.cursor };
         let mut cx = PaintCx::new(
             &self.cfg,
             &self.chrome,
             ui,
-            self.cursor,
+            cursor,
             &mut self.text,
             frame,
             Layer::Overlay,
             PICKER_SID,
         );
-        let layout = toasts::paint(&mut cx, &head.toast, at, more);
+        let layout = toasts::paint(&mut cx, &head.toast, at, more, self.app.toast_choices_live());
         let id = head.id;
         self.buttons.extend(layout.buttons.iter().map(|(r, hit)| (*r, ButtonAction::Toast(id, *hit))));
         self.toast_rect = Some(layout.rect);
@@ -4685,11 +4703,11 @@ impl State {
             picker: self.app.picker_open(),
             palette: self.palette.is_some(),
             confirm: self.app.confirm().is_some(),
-            // No toast draws while a modal owns the pointer.
-            toast: self.app.toasts().head().is_some() && !modal,
+            toast: self.app.toasts().head().is_some(),
             menu: self.menu.is_some(),
         };
-        // `build_toast` notes this frame's toast rect.
+        // The modals under the toast paint with last frame's toast rect
+        // (`pane_cursor`); `build_toast` notes this frame's.
         if !open.toast {
             self.toast_rect = None;
         }
@@ -5063,9 +5081,21 @@ struct Open {
     menu: bool,
 }
 
+/// Run choice `i` of toast `id` when choices act
+/// ([`AppState::toast_choices_live`]), closing the palette first: the choice
+/// opens something (a picker, the settings file) that the palette would
+/// cover.
+fn choose_toast<P>(palette: &mut Option<P>, app: &mut AppState, id: u64, i: usize) {
+    if app.toast_choices_live() {
+        *palette = None;
+        app.choose_toast(id, i);
+    }
+}
+
 /// The overlays to draw, bottom first, each over those before it: the picker,
 /// then the palette, then a confirmation (over the picker that raised it),
-/// then the toast, then a menu (the picker's view can open one), then the tooltip, which draws
+/// then the toast (over every modal, so it shows while one is open), then a
+/// menu (the picker's view can open one), then the tooltip, which draws
 /// nothing while a menu is open.
 fn overlay_stack(open: Open) -> Vec<Overlay> {
     [
@@ -6256,6 +6286,66 @@ mod tests {
         flag.hold_termination();
         assert_eq!(flag.settle(true), Some(false));
         assert!(flag.get());
+    }
+
+    /// Each overlay gets a layer over those beneath it: a confirmation over
+    /// the picker that raised it, the toast over every modal, a menu over
+    /// the toast, and the tooltip on top.
+    #[test]
+    fn overlays_stack_with_the_toast_over_the_modals_and_under_a_menu() {
+        use super::{overlay_stack, Open, Overlay::*};
+        assert_eq!(overlay_stack(Open::default()), [Tooltip]);
+        let asking = Open { picker: true, confirm: true, toast: true, ..Open::default() };
+        assert_eq!(overlay_stack(asking), [Picker, Confirm, Toast, Tooltip]);
+        let palette = Open { palette: true, toast: true, ..Open::default() };
+        assert_eq!(overlay_stack(palette), [Palette, Toast, Tooltip]);
+        let menu = Open { picker: true, toast: true, menu: true, ..Open::default() };
+        assert_eq!(overlay_stack(menu), [Picker, Toast, Menu, Tooltip]);
+    }
+
+    /// A toast drawn over a modal runs its clock: the clock asks only that
+    /// it is drawn, the window focused and the pointer off it.
+    #[test]
+    fn a_toast_over_a_modal_runs_its_clock() {
+        use crate::toasts::{Level, Toast, Toasts};
+        let mut toasts = Toasts::default();
+        toasts.push(Toast::new(Level::Info, "Copied"));
+        let open = super::Open { picker: true, confirm: true, toast: !toasts.is_empty(), ..Default::default() };
+        assert!(super::overlay_stack(open).contains(&super::Overlay::Toast), "drawn over the modals");
+        let rect = Some(Rect { x: 10.0, y: 10.0, w: 100.0, h: 30.0 });
+        let runs = super::toast_clock_runs(rect, true, Some((300.0, 300.0)));
+        assert!(runs, "the pointer is over the confirmation, not the toast");
+        let start = Instant::now();
+        toasts.tick(start, runs);
+        assert!(toasts.tick(start + Duration::from_secs(5), runs), "an info toast hides after its time on screen");
+        assert!(toasts.is_empty());
+    }
+
+    /// A toast choice closes the palette, which would cover what it opens;
+    /// while the picker is open it does neither.
+    #[test]
+    fn a_toast_choice_closes_the_palette_but_not_under_the_picker() {
+        use crate::app_state::{AppState, Pick};
+        use crate::toasts::{Level, Toast, ToastAction};
+        let dir = crate::plugin::testing::tmpdir("window-toast-choice");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut app = AppState::new();
+        app.new_empty_vtab();
+        app.open_file_in_new_surface(&file).unwrap();
+        let doc = app.active_doc(app.focused_surface().unwrap()).unwrap();
+        let id = app.notify(Toast::new(Level::Error, "Couldn't save a.txt").with_choice("Save As…", ToastAction::SaveAs(doc)));
+        let mut palette = Some(());
+
+        app.open_picker(Pick::Open);
+        super::choose_toast(&mut palette, &mut app, id, 0);
+        assert!(palette.is_some(), "an inert choice leaves the palette");
+        assert_eq!(app.picker_purpose(), Some(Pick::Open));
+
+        app.close_picker();
+        super::choose_toast(&mut palette, &mut app, id, 0);
+        assert!(palette.is_none());
+        assert_eq!(app.picker_purpose(), Some(Pick::SaveAs(doc)));
     }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so

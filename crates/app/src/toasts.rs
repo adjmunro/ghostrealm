@@ -336,7 +336,9 @@ pub struct ToastLayout {
 /// Paint `toast` across the top of `area` ([`place`]): its message wrapped
 /// to at most three lines, then right-aligned its choices, "+`more`" when
 /// more are queued, and `×`. A cut message is the toast's tooltip in full.
-pub fn paint(cx: &mut PaintCx, toast: &Toast, area: Rect, more: usize) -> ToastLayout {
+/// Unless `choices_live`, the choices draw dim and take neither hover nor
+/// clicks; `×` always does.
+pub fn paint(cx: &mut PaintCx, toast: &Toast, area: Rect, more: usize, choices_live: bool) -> ToastLayout {
     let ui = cx.ui;
     let (s, ch) = (ui.scale, ui.cell_h);
     let (pad, vpad, gap) = (8.0 * s, 6.0 * s, 6.0 * s);
@@ -409,12 +411,14 @@ pub fn paint(cx: &mut PaintCx, toast: &Toast, area: Rect, more: usize) -> ToastL
     for (i, label) in choices.iter().enumerate().rev() {
         let w = label.width + 2.0 * choice_pad;
         let hit = Rect { x: right - w, y: by, w, h: btn_h };
-        cx.fill_alpha(hit, theme::HOVER_BG, 0.12);
-        if cx.hovered(hit) {
+        cx.fill_alpha(hit, theme::HOVER_BG, if choices_live { 0.12 } else { 0.05 });
+        if choices_live && cx.hovered(hit) {
             cx.highlight(hit);
         }
-        cx.place(*label, hit.x + choice_pad, label_y, hit, theme::TEXT);
-        buttons.push((hit, ToastHit::Choice(i)));
+        cx.place(*label, hit.x + choice_pad, label_y, hit, if choices_live { theme::TEXT } else { theme::DIM });
+        if choices_live {
+            buttons.push((hit, ToastHit::Choice(i)));
+        }
         right = hit.x - gap;
     }
     ToastLayout { rect, buttons }
@@ -658,7 +662,7 @@ mod tests {
         h.frame = Frame::new((800.0, 600.0));
         h.text.begin_frame(0, glyphon::Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
         let mut cx = PaintCx::new(&h.cfg, &h.chrome, UI, cursor, &mut h.text, &mut h.frame, Layer::Overlay, SurfaceId(1));
-        let layout = paint(&mut cx, toast, Rect { x: 10.0, y: 10.0, w, h: 500.0 }, more);
+        let layout = paint(&mut cx, toast, Rect { x: 10.0, y: 10.0, w, h: 500.0 }, more, true);
         h.text.finish_paint();
         layout
     }
@@ -717,6 +721,59 @@ mod tests {
         paint_at(&mut h, &toast, 600.0, 0, centre(close));
         assert_eq!(lit(&h), 1);
         assert_eq!(h.frame.tooltip.as_ref().map(|t| t.1.as_str()), Some("Dismiss"));
+    }
+
+    /// Inert choices (a picker or confirmation is open) still show but take
+    /// neither hover nor clicks; `×` stays live.
+    #[test]
+    fn inert_choices_show_but_only_dismiss_is_a_button() {
+        let mut h = Harness::new();
+        let toast = Toast::new(Level::Warning, "config.toml: 2 problems")
+            .with_choice("Open Settings", ToastAction::OpenSettings { line: None });
+        let live = paint_at(&mut h, &toast, 600.0, 0, (-1.0, -1.0));
+        let choice = live.buttons[1].0;
+        h.frame = Frame::new((800.0, 600.0));
+        h.text.begin_frame(0, glyphon::Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let mut cx =
+            PaintCx::new(&h.cfg, &h.chrome, UI, centre(choice), &mut h.text, &mut h.frame, Layer::Overlay, SurfaceId(1));
+        let layout = paint(&mut cx, &toast, Rect { x: 10.0, y: 10.0, w: 600.0, h: 500.0 }, 0, false);
+        h.text.finish_paint();
+        let hits: Vec<ToastHit> = layout.buttons.iter().map(|(_, hit)| *hit).collect();
+        assert_eq!(hits, [ToastHit::Dismiss]);
+        let a = theme::HOVER_ALPHA;
+        assert_eq!(h.frame.overlay_quads().filter(|q| (q.color[3] - a).abs() < 1e-4).count(), 0, "no hover");
+        assert!(h.frame.overlay_text().any(|t| t.color == theme::DIM), "the label shows, dim");
+    }
+
+    /// A toast painted in a layer begun over a modal's draws over all of the
+    /// modal, its text too: its panel first, then its own text.
+    #[test]
+    fn a_toast_draws_over_a_modal_in_a_layer_of_its_own() {
+        use crate::plugin::Pass;
+        let mut h = Harness::new();
+        h.frame = Frame::new((800.0, 600.0));
+        h.text.begin_frame(0, glyphon::Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        let modal = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        h.frame.begin_layer();
+        {
+            let mut cx = PaintCx::new(&h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Overlay, SurfaceId(1));
+            cx.fill(modal, [0; 3]);
+            let s = cx.shape("Replace a.txt?", Font::SANS, 400.0);
+            cx.place(s, 20.0, 20.0, modal, [255; 3]);
+        }
+        h.frame.begin_layer();
+        {
+            let mut cx = PaintCx::new(&h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Overlay, SurfaceId(1));
+            paint(&mut cx, &Toast::new(Level::Error, "Save failed"), Rect { x: 10.0, y: 10.0, w: 600.0, h: 500.0 }, 0, true);
+        }
+        h.text.finish_paint();
+        let (_, passes) = h.frame.passes(|layer| layer == 0);
+        let at = |p: &Pass| passes.iter().position(|q| q == p).unwrap_or_else(|| panic!("{p:?} in {passes:?}"));
+        let toast_quads = passes.iter().rposition(|p| matches!(p, Pass::Quads(r) if r.start > 0)).expect("toast quads");
+        assert!(at(&Pass::Text(2)) < toast_quads, "the modal's text draws before the toast's panel: {passes:?}");
+        assert!(toast_quads < at(&Pass::Text(3)), "the toast's text draws over its panel: {passes:?}");
+        assert_eq!(passes.last(), Some(&Pass::Text(3)));
+        assert!(h.texts().iter().any(|t| t == "Save failed"));
     }
 
     #[test]
