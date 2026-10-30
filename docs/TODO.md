@@ -1502,8 +1502,10 @@
   `Vec`: it allocates after fork, which is not async-signal-safe. It also
   closes std's exec-error pipe, so a shell that fails to exec isn't
   reported as a spawn error: std reads no error, the child exits 1 and the pane
-  sees an exited shell. Marking fds close-on-exec without allocating
-  (`ghostrealm_process::inherit_stdio_only`) would fix both.
+  sees an exited shell. Adding `ghostrealm_process::inherit_stdio_only` to
+  the command can't fix this: portable-pty's own `pre_exec` still runs. It
+  needs our own spawn on the PTY slave (or a patched or forked portable-pty)
+  with `inherit_stdio_only` in place of `close_random_fds`.
 - Detail: `openpty` marks master and slave close-on-exec only after it
   returns, so a short-lived `.output()` child started in between briefly
   inherits the PTY slave (it holds it only for its own life).

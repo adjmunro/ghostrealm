@@ -20,19 +20,32 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
+/// Children with their start times, killed and reaped when dropped, so a
+/// spawner that panics leaves none running.
+struct Children(VecDeque<(Instant, Child)>);
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        for (_, child) in self.0.drain(..) {
+            stop(child);
+        }
+    }
+}
+
+/// How long a racing child lives: longer than a wait may take, so a pipe it
+/// holds shows as a slow wait.
+const CHILD_LIFE: Duration = Duration::from_secs(3);
+
 /// Given threads starting long-lived children while others make pipes as
 /// `Command::output()` does and wait for their end, and others call
 /// `output()` itself;
 /// when they race for a second;
 /// then every wait returns at once rather than when a child exits.
 ///
-/// Each child lives [`CHILD_LIFE`], longer than a wait may take, so a pipe it
-/// holds shows as a slow wait; older ones are killed as spawning goes on.
+/// Children older than [`CHILD_LIFE`] are killed as spawning goes on.
 ///
 /// A pipe is inheritable only between two syscalls, so bare pipes, made far
 /// faster than `output()` can spawn, are what make the race likely.
-const CHILD_LIFE: Duration = Duration::from_secs(3);
-
 #[test]
 fn pipes_end_while_long_lived_children_start_alongside() {
     const PIPERS: usize = 4;
@@ -44,16 +57,13 @@ fn pipes_end_while_long_lived_children_start_alongside() {
             std::thread::spawn(move || {
                 // Bounds a spawner whose test panicked before stopping it.
                 let until = Instant::now() + Duration::from_secs(10);
-                let mut children = VecDeque::new();
+                let mut children = Children(VecDeque::new());
                 while !stopping.load(Ordering::Relaxed) && Instant::now() < until {
-                    children.push_back((Instant::now(), long_lived()));
-                    while children.front().is_some_and(|(born, _)| born.elapsed() > CHILD_LIFE) {
-                        stop(children.pop_front().unwrap().1);
+                    children.0.push_back((Instant::now(), long_lived()));
+                    while children.0.front().is_some_and(|(born, _)| born.elapsed() > CHILD_LIFE) {
+                        stop(children.0.pop_front().unwrap().1);
                     }
                     std::thread::sleep(Duration::from_millis(5));
-                }
-                for (_, child) in children {
-                    stop(child);
                 }
             })
         })
