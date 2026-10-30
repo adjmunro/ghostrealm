@@ -452,8 +452,8 @@ the path that failed meanwhile.
   your own stderr line, as the app doesn't. `Request::DismissToast { key }`
   removes a keyed toast once what it reported is over; `toast_keys()` names
   the keys that concern the view alone, which the app dismisses when the
-  view closes (a terminal's snapshot failure, a web page's refused pop-up). Failures in a form the view
-  draws show inline instead.
+  view closes (a terminal's snapshot failure, a web page's refused
+  pop-up). Failures in a form the view draws show inline instead.
 - View menu: `Request::Menu { items, at, align }` opens a menu of the view's
   own with its top edge at `at` (physical px) and its left or right edge
   there per `align` (`MenuAlign::Right` for a button at the view's right end,

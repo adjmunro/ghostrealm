@@ -168,6 +168,10 @@ struct Shared {
     orphans: Vec<PopupInfo>,
     /// Pages the host closed and the app hasn't forgotten.
     closed: std::collections::HashSet<u64>,
+    /// Of those, the ones that went with a person's refused pop-ups untaken
+    /// ([`ViewState::input_refusals`]): a floating pop-up can close before
+    /// its view takes them.
+    closed_refusals: HashMap<u64, u32>,
     /// Pages the app forgot, and untaken pop-ups the client closed, until the
     /// host reports them closed: their late events are dropped rather than
     /// bring their state back.
@@ -382,6 +386,7 @@ impl WebHost {
     pub fn forget(&mut self, id: u64) {
         let mut s = self.shared.0.lock().unwrap();
         s.views.remove(&id);
+        s.closed_refusals.remove(&id);
         if !s.closed.remove(&id) {
             s.forgotten.insert(id);
         }
@@ -433,7 +438,8 @@ impl WebHost {
     /// since last asked.
     pub fn take_input_refusals(&self, id: u64) -> u32 {
         let mut s = self.shared.0.lock().unwrap();
-        s.views.get_mut(&id).map_or(0, |v| std::mem::take(&mut v.input_refusals))
+        let closed = s.closed_refusals.remove(&id).unwrap_or(0);
+        closed + s.views.get_mut(&id).map_or(0, |v| std::mem::take(&mut v.input_refusals))
     }
 
     /// The latest frame of `id`.
@@ -755,9 +761,13 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
         // A page that closed itself may still have a view: that view takes
         // the pop-ups it opened (a tab can outlive it).
         Event::Closed { id } => {
-            let known = s.views.remove(&id).is_some() || s.popups.iter().any(|p| p.id == id);
+            let view = s.views.remove(&id);
+            let known = view.is_some() || s.popups.iter().any(|p| p.id == id);
             if known {
                 s.closed.insert(id);
+                if let Some(n) = view.map(|v| v.input_refusals).filter(|n| *n > 0) {
+                    s.closed_refusals.insert(id, n);
+                }
             }
         }
         Event::Failed { error } => s.failure = Some(error),
@@ -784,6 +794,7 @@ fn drop_popups_of(s: &mut Shared, opener: u64) -> Vec<u64> {
     let mut open = Vec::new();
     for p in gone {
         if s.closed.remove(&p.id) {
+            s.closed_refusals.remove(&p.id);
             s.views.remove(&p.id);
         } else if p.is_tab() {
             s.orphans.push(p);
@@ -1100,6 +1111,20 @@ mod tests {
         assert_eq!(host.take_input_refusals(1), 0, "taken once");
         assert_eq!(host.view(1).unwrap().popups_refused, 3, "all are counted");
         assert_eq!(host.take_input_refusals(2), 0, "an unknown page");
+
+        // A page that closes before they are taken keeps them until taken,
+        // or until the app forgets it.
+        let mut host = host;
+        apply_event(&host.shared, Event::Title { id: 3, title: "t".into() });
+        for id in [1, 3] {
+            apply_event(&host.shared, Event::PopupRefused { opener: id, url: String::new(), from_input: true });
+            apply_event(&host.shared, Event::Closed { id });
+        }
+        assert_eq!(host.take_input_refusals(1), 1);
+        assert_eq!(host.take_input_refusals(1), 0, "taken once");
+        host.forget(3);
+        assert_eq!(host.take_input_refusals(3), 0, "forgotten");
+        assert!(host.shared.0.lock().unwrap().closed_refusals.is_empty());
     }
 
     #[test]

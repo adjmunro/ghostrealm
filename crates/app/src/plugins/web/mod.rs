@@ -990,7 +990,7 @@ impl WebView {
         let max = ghostrealm_web::protocol::MAX_POPUPS;
         Some(crate::plugin::Request::Toast {
             level: crate::toasts::Level::Info,
-            message: format!("Pop-up blocked: this page already has {max} open"),
+            message: format!("Pop-up blocked: too many pop-ups open (max {max})"),
             key: Some(self.popups_toast_key()),
             choices: Vec::new(),
             doc: None,
@@ -2110,7 +2110,8 @@ pub(crate) mod tests {
 
     /// Given a page whose host refuses its pop-ups;
     /// when an agent's is refused, then a person's (twice), then a person's
-    /// from a pop-up floating over the page;
+    /// from a pop-up floating over the page that closes before the view
+    /// refreshes;
     /// then the agent's says nothing, each run of a person's is one info
     /// toast on the pane, keyed by the page so a repeat replaces it, and the
     /// view's closing dismisses it.
@@ -2125,7 +2126,7 @@ pub(crate) mod tests {
             r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'; while read l; do case "$l" in
              *agent*) echo '{}'; echo '{{"ev":"title","id":1,"title":"agent"}}';;
              *person*) echo '{}'; echo '{}'; echo '{{"ev":"title","id":1,"title":"person"}}';;
-             *float*) echo '{}'; echo '{}'; echo '{{"ev":"title","id":1,"title":"float"}}';; esac; done"#,
+             *float*) echo '{}'; echo '{}'; echo '{{"ev":"closed","id":{float}}}'; echo '{{"ev":"title","id":1,"title":"float"}}';; esac; done"#,
             refused(1, false),
             refused(1, true),
             refused(1, true),
@@ -2148,7 +2149,7 @@ pub(crate) mod tests {
                 .collect()
         };
         let key = format!("web-popups:{}", v.page);
-        let note = (crate::toasts::Level::Info, "Pop-up blocked: this page already has 4 open".to_string(), Some(key.clone()));
+        let note = (crate::toasts::Level::Info, "Pop-up blocked: too many pop-ups open (max 4)".to_string(), Some(key.clone()));
 
         ask(&mut v, "agent");
         wait("the agent's refusal", || title(&v) == "agent");
@@ -2167,7 +2168,7 @@ pub(crate) mod tests {
         ask(&mut v, "float");
         wait("the floating pop-up's refusal", || title(&v) == "float");
         v.refresh();
-        assert_eq!(v.floating.len(), 1);
+        assert!(v.floating.is_empty(), "it closed");
         let due = v.deadline(&Default::default()).expect("a toast is due");
         assert_eq!(toasts(h.tick(&mut v, due)), [note], "on the pane, as the page's");
 
