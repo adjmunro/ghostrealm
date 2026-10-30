@@ -1125,6 +1125,14 @@ mod tests {
         host.forget(3);
         assert_eq!(host.take_input_refusals(3), 0, "forgotten");
         assert!(host.shared.0.lock().unwrap().closed_refusals.is_empty());
+
+        // A closed pop-up's are dropped once the app forgets its opener.
+        apply_event(&host.shared, popup(5, 1, false, PopupKind::Popup));
+        apply_event(&host.shared, Event::PopupRefused { opener: 5, url: String::new(), from_input: true });
+        apply_event(&host.shared, Event::Closed { id: 5 });
+        assert!(host.shared.0.lock().unwrap().closed_refusals.contains_key(&5));
+        host.forget(1);
+        assert!(host.shared.0.lock().unwrap().closed_refusals.is_empty(), "dropped with its opener");
     }
 
     #[test]
