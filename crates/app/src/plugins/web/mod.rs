@@ -650,6 +650,10 @@ pub struct WebView {
     focused: bool,
     /// Pop-ups to open as tabs or hidden surfaces, until the app takes them.
     opened: Vec<Opened>,
+    /// Since when a person's pop-up (from the page or one floating over it)
+    /// was refused and the next tick hasn't said so: refresh sees it but
+    /// can't raise requests.
+    refused_at: Option<Instant>,
 }
 
 /// A pop-up the app opens as a surface of its own.
@@ -708,6 +712,7 @@ impl WebView {
             float_hover: false,
             focused: false,
             opened: Vec::new(),
+            refused_at: None,
         }
     }
 
@@ -757,14 +762,19 @@ impl WebView {
     /// agent's pop-up wait in `opened`. Drop floating ones that closed.
     /// Returns whether the floating ones changed.
     fn pull_popups(&mut self) -> bool {
-        let popups = {
+        let (popups, refused) = {
             let slot = self.slot.borrow();
             match slot.host.as_ref() {
                 // A page made in an older host is not this host's page.
-                Some(h) if self.created_in == slot.generation => h.take_popups(self.page),
-                _ => Vec::new(),
+                Some(h) if self.created_in == slot.generation => {
+                    (h.take_popups(self.page), h.take_input_refusals(self.page))
+                }
+                _ => (Vec::new(), 0),
             }
         };
+        if refused > 0 {
+            self.refused_at.get_or_insert_with(Instant::now);
+        }
         let mut changed = false;
         for p in &popups {
             let place = match (p.from_input, p.kind) {
@@ -784,6 +794,9 @@ impl WebView {
         for f in &mut self.floating {
             changed |= f.pull_popups();
             self.opened.extend(f.opened.drain(..).map(|o| Opened { from_floating: true, ..o }));
+            if let Some(at) = f.refused_at.take() {
+                self.refused_at.get_or_insert(at);
+            }
         }
         if self.drop_closed_floating() {
             return true;
@@ -962,6 +975,26 @@ impl WebView {
     /// The key this page's failure toasts share.
     fn toast_key(&self) -> String {
         format!("web:{}", self.page)
+    }
+
+    /// The key of the toast saying a person's pop-up was refused: its own,
+    /// so it doesn't replace a failure, and a repeat replaces it.
+    fn popups_toast_key(&self) -> String {
+        format!("web-popups:{}", self.page)
+    }
+
+    /// The info toast saying a person's pop-up was refused, once per run of
+    /// refusals refresh has seen.
+    fn take_refused_toast(&mut self) -> Option<crate::plugin::Request> {
+        self.refused_at.take()?;
+        let max = ghostrealm_web::protocol::MAX_POPUPS;
+        Some(crate::plugin::Request::Toast {
+            level: crate::toasts::Level::Info,
+            message: format!("Pop-up blocked: this page already has {max} open"),
+            key: Some(self.popups_toast_key()),
+            choices: Vec::new(),
+            doc: None,
+        })
     }
 
     /// Whether the pane already shows error `e` in place of the page (the
@@ -1701,17 +1734,24 @@ impl View for WebView {
     /// While the host is backing off after an exit, or being hung up on:
     /// when to try again.
     fn deadline(&self, _cfg: &ghostrealm_core::Config) -> Option<Instant> {
-        self.slot.borrow().retry_at()
+        let retry = self.slot.borrow().retry_at();
+        match (retry, self.refused_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn toast_keys(&self) -> Vec<String> {
-        vec![self.toast_key()]
+        vec![self.toast_key(), self.popups_toast_key()]
     }
 
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
         if self.slot.borrow().retry_at().is_some_and(|t| now >= t) {
             self.send(None);
             cx.redraw();
+        }
+        if let Some(toast) = self.take_refused_toast() {
+            cx.request(toast);
         }
     }
 
@@ -2066,6 +2106,72 @@ pub(crate) mod tests {
         wait("a frame on screen", || view(&v).frames == 3);
         assert!(v.refresh(), "a frame on screen");
         assert!(!v.refresh());
+    }
+
+    /// Given a page whose host refuses its pop-ups;
+    /// when an agent's is refused, then a person's (twice), then a person's
+    /// from a pop-up floating over the page;
+    /// then the agent's says nothing, each run of a person's is one info
+    /// toast on the pane, keyed by the page so a repeat replaces it, and the
+    /// view's closing dismisses it.
+    #[test]
+    fn a_persons_refused_popup_toasts_on_the_pane() {
+        let dir = TmpDir::new("web-popup-refused");
+        let refused = |opener: u64, from_input: bool| {
+            format!(r#"{{"ev":"popup_refused","opener":{opener},"url":"https://pop.test/","from_input":{from_input}}}"#)
+        };
+        let float = POPUP_IDS;
+        let script = format!(
+            r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'; while read l; do case "$l" in
+             *agent*) echo '{}'; echo '{{"ev":"title","id":1,"title":"agent"}}';;
+             *person*) echo '{}'; echo '{}'; echo '{{"ev":"title","id":1,"title":"person"}}';;
+             *float*) echo '{}'; echo '{}'; echo '{{"ev":"title","id":1,"title":"float"}}';; esac; done"#,
+            refused(1, false),
+            refused(1, true),
+            refused(1, true),
+            popup_event(float, 1, true),
+            refused(float, true),
+        );
+        let (mut v, _) = stub_host(&dir, &script);
+        assert!(v.send(None));
+        assert_eq!(v.page, 1);
+        let h = Harness::new();
+        let title = |v: &WebView| v.slot.borrow().host.as_ref().and_then(|h| h.view(1)).unwrap_or_default().title;
+        let ask = |v: &mut WebView, url: &str| assert!(v.send(Some(HostRequest::Navigate { id: 1, url: url.into() })));
+        let toasts = |out: crate::plugin::Outcome| -> Vec<(crate::toasts::Level, String, Option<String>)> {
+            out.requests
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::plugin::Request::Toast { level, message, key, .. } => Some((level, message, key)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let key = format!("web-popups:{}", v.page);
+        let note = (crate::toasts::Level::Info, "Pop-up blocked: this page already has 4 open".to_string(), Some(key.clone()));
+
+        ask(&mut v, "agent");
+        wait("the agent's refusal", || title(&v) == "agent");
+        v.refresh();
+        assert_eq!(v.deadline(&Default::default()), None, "an agent reads the count");
+        assert_eq!(toasts(h.tick(&mut v, Instant::now())), []);
+
+        ask(&mut v, "person");
+        wait("the person's refusals", || title(&v) == "person");
+        v.refresh();
+        let due = v.deadline(&Default::default()).expect("a toast is due");
+        assert_eq!(toasts(h.tick(&mut v, due)), std::slice::from_ref(&note), "one for the run");
+        assert_eq!(v.deadline(&Default::default()), None, "sent once");
+        assert_eq!(toasts(h.tick(&mut v, Instant::now())), []);
+
+        ask(&mut v, "float");
+        wait("the floating pop-up's refusal", || title(&v) == "float");
+        v.refresh();
+        assert_eq!(v.floating.len(), 1);
+        let due = v.deadline(&Default::default()).expect("a toast is due");
+        assert_eq!(toasts(h.tick(&mut v, due)), [note], "on the pane, as the page's");
+
+        assert!(v.toast_keys().contains(&key), "closing the view dismisses it");
     }
 
     /// The mouse requests in the stub host's log.

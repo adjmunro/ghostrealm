@@ -2984,17 +2984,19 @@ mod tests {
     /// that only the other stays.
     fn assert_closing_dismisses_its_toasts(s: &mut AppState, sid: SurfaceId, close: impl FnOnce(&mut AppState), how: &str) {
         let keys = s.view(sid).unwrap().toast_keys();
-        let [key] = &keys[..] else { panic!("{how}: {keys:?}") };
-        let req = Request::Toast {
-            level: Level::Error,
-            message: "it failed".into(),
-            key: Some(key.clone()),
-            choices: Vec::new(),
-            doc: None,
-        };
-        s.toast_request(sid, req);
+        assert!(!keys.is_empty(), "{how}");
+        for key in &keys {
+            let req = Request::Toast {
+                level: Level::Error,
+                message: format!("{key} failed"),
+                key: Some(key.clone()),
+                choices: Vec::new(),
+                doc: None,
+            };
+            s.toast_request(sid, req);
+        }
         s.notify(Toast::new(Level::Error, "bad config").keyed("config"));
-        assert_eq!(s.toasts().len(), 2, "{how}");
+        assert_eq!(s.toasts().len(), keys.len() + 1, "{how}");
         close(s);
         assert!(s.view(sid).is_none(), "{how}");
         let left: Vec<_> = s.toasts().iter().map(|e| e.toast.key.clone()).collect();

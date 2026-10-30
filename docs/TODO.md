@@ -1280,17 +1280,6 @@
 
 ---
 
-[2026-10-23T18:52+1300@cfbb8bc1] Web — say when a pop-up is refused
-
-- Requires: NO BLOCKERS
-- Detail: Past four open pop-ups a page's next is refused (DECISION.md, Web
-  surface / pop-ups). An agent reads the count in `get surface`; a person
-  sees nothing happen. Show a brief note in the pane; nothing in the app
-  shows transient messages yet.
-- Reason: a click that does nothing looks broken.
-
----
-
 [2026-10-23T18:52+1300@cfbb8bc1] Web — revisit the person/agent pop-up rule if agents drive the GUI
 
 - Requires: the agent channel moving into the running app (agent.rs; TODO.md
