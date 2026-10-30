@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -25,8 +26,13 @@ fn stop(mut child: Child) {
 /// when they race for a second;
 /// then every wait returns at once rather than when a child exits.
 ///
+/// Each child lives [`CHILD_LIFE`], longer than a wait may take, so a pipe it
+/// holds shows as a slow wait; older ones are killed as spawning goes on.
+///
 /// A pipe is inheritable only between two syscalls, so bare pipes, made far
 /// faster than `output()` can spawn, are what make the race likely.
+const CHILD_LIFE: Duration = Duration::from_secs(3);
+
 #[test]
 fn pipes_end_while_long_lived_children_start_alongside() {
     const PIPERS: usize = 4;
@@ -36,11 +42,19 @@ fn pipes_end_while_long_lived_children_start_alongside() {
         .map(|_| {
             let stopping = stop_spawning.clone();
             std::thread::spawn(move || {
-                let mut children = Vec::new();
-                while !stopping.load(Ordering::Relaxed) && children.len() < 100 {
-                    children.push(long_lived());
+                // Bounds a spawner whose test panicked before stopping it.
+                let until = Instant::now() + Duration::from_secs(10);
+                let mut children = VecDeque::new();
+                while !stopping.load(Ordering::Relaxed) && Instant::now() < until {
+                    children.push_back((Instant::now(), long_lived()));
+                    while children.front().is_some_and(|(born, _)| born.elapsed() > CHILD_LIFE) {
+                        stop(children.pop_front().unwrap().1);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                children
+                for (_, child) in children {
+                    stop(child);
+                }
             })
         })
         .collect();
@@ -75,9 +89,7 @@ fn pipes_end_while_long_lived_children_start_alongside() {
     stop_spawning.store(true, Ordering::Relaxed);
     // Killing the children ends any wait still held up by them.
     for spawner in spawners {
-        for child in spawner.join().unwrap() {
-            stop(child);
-        }
+        spawner.join().unwrap();
     }
     assert_eq!(slowest.len(), PIPERS + CALLERS, "a pipe stayed open in a long-lived child");
     let slowest = slowest.into_iter().max().unwrap();
