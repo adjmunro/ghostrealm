@@ -1,9 +1,10 @@
 //! Immediate-mode painting for views (and the app's own chrome).
 //!
-//! A frame is built into a [`Frame`]: quads in two layers (under text, over
-//! text), images, and text items that reference either the content-keyed
-//! [`RowCache`], the [`BlockCache`], or a per-frame scratch buffer pool in the
-//! shared [`TextKit`].
+//! A frame is built into a [`Frame`]: the base layer (quads under text,
+//! images, text, quads over text) and overlay layers stacked above it (each
+//! its quads, images, then text). Text items reference either the
+//! content-keyed [`RowCache`], the [`BlockCache`], or a per-frame scratch
+//! buffer pool in the shared [`TextKit`].
 //! The app turns the frame into GPU draws after every view has painted. Nothing
 //! here touches the GPU, so views can be painted (and tested) headless.
 
@@ -469,18 +470,38 @@ pub struct ImageItem {
     pub clip: Rect,
 }
 
-/// Which pass a view paints into. Views in panes paint the base layer; a view
-/// hosted in a modal (the picker) paints the overlay layer, above all
-/// pane content.
+/// Which pass a view paints into. Views in panes paint the base layer; a
+/// view's popups ([`PaintCx::above`]) and a view hosted in a modal (the
+/// picker) paint the frame's top overlay layer, above all pane content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
     Base,
     Overlay,
 }
 
+/// One overlay layer: its quads, then its images, then its text, all drawn
+/// over every layer beneath it. Each modal paints a layer of its own, so one
+/// stacks over another (a confirmation over the picker that raised it).
+#[derive(Default)]
+pub struct OverlayLayer {
+    pub quads: Vec<QuadInstance>,
+    pub images: Vec<ImageItem>,
+    pub text: Vec<TextItem>,
+}
+
+/// One draw of a [`Frame`], in order (see [`Frame::passes`]). `Images` and
+/// `Text` name a layer: 0 the base, `i + 1` overlay layer `i`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// These instances of the frame's quad buffer.
+    Quads(std::ops::Range<u32>),
+    Images(usize),
+    Text(usize),
+}
+
 /// Everything painted this frame, in draw order: `bg` quads, then `images`, then
-/// `text`, then `top` quads (cursors, borders, overlay panels), then
-/// `overlay_images`, then `overlay_text`.
+/// `text`, then `top` quads (cursors, borders), then each of `layers`, bottom
+/// first.
 pub struct Frame {
     /// Surface size in physical pixels.
     pub screen: (f32, f32),
@@ -488,8 +509,10 @@ pub struct Frame {
     pub images: Vec<ImageItem>,
     pub text: Vec<TextItem>,
     pub top: Vec<QuadInstance>,
-    pub overlay_images: Vec<ImageItem>,
-    pub overlay_text: Vec<TextItem>,
+    /// The overlay layers, bottom first. Overlay painting goes to the last:
+    /// the first ([`new`](Self::new) makes it) takes views' popups, and
+    /// [`begin_layer`](Self::begin_layer) starts each one above it.
+    pub layers: Vec<OverlayLayer>,
     /// The mouse cursor a view asked for, and the rect it applies to.
     pub cursor: Option<(Rect, CursorIcon)>,
     /// Buttons views registered: (hit rect, owning surface, view-local id).
@@ -509,8 +532,7 @@ impl Frame {
             images: Vec::new(),
             text: Vec::new(),
             top: Vec::new(),
-            overlay_images: Vec::new(),
-            overlay_text: Vec::new(),
+            layers: vec![OverlayLayer::default()],
             cursor: None,
             view_buttons: Vec::new(),
             wants_frame: false,
@@ -520,6 +542,64 @@ impl Frame {
 
     pub fn quad(&self, r: Rect, color: [u8; 3], alpha: f32) -> QuadInstance {
         rect_quad(r, self.screen.0, self.screen.1, color, alpha)
+    }
+
+    /// Start an overlay layer above every one so far: overlay painting goes
+    /// there from now on.
+    pub fn begin_layer(&mut self) {
+        self.layers.push(OverlayLayer::default());
+    }
+
+    /// The top overlay layer, which overlay painting goes to.
+    pub fn overlay(&mut self) -> &mut OverlayLayer {
+        if self.layers.is_empty() {
+            self.begin_layer();
+        }
+        self.layers.last_mut().expect("a layer")
+    }
+
+    /// Every overlay layer's text, bottom first.
+    pub fn overlay_text(&self) -> impl Iterator<Item = &TextItem> {
+        self.layers.iter().flat_map(|l| &l.text)
+    }
+
+    /// Every overlay layer's quads, bottom first.
+    pub fn overlay_quads(&self) -> impl Iterator<Item = &QuadInstance> {
+        self.layers.iter().flat_map(|l| &l.quads)
+    }
+
+    /// The frame's quads in one buffer, and the passes that draw it in order:
+    /// the base layer's `bg` quads, images, text and `top` quads, then each
+    /// overlay layer's quads, images and text. A pass with nothing to draw is
+    /// left out. `chrome_text(layer)` says whether the app adds text of its
+    /// own to that layer (named as in [`Pass`]).
+    pub fn passes(&self, chrome_text: impl Fn(usize) -> bool) -> (Vec<QuadInstance>, Vec<Pass>) {
+        let mut quads = Vec::with_capacity(
+            self.bg.len() + self.top.len() + self.layers.iter().map(|l| l.quads.len()).sum::<usize>(),
+        );
+        let mut passes = Vec::new();
+        let push_quads = |quads: &mut Vec<QuadInstance>, passes: &mut Vec<Pass>, q: &[QuadInstance]| {
+            if !q.is_empty() {
+                let start = quads.len() as u32;
+                quads.extend_from_slice(q);
+                passes.push(Pass::Quads(start..quads.len() as u32));
+            }
+        };
+        let layers = std::iter::once((&self.bg, &self.images, &self.text, Some(&self.top)))
+            .chain(self.layers.iter().map(|l| (&l.quads, &l.images, &l.text, None)));
+        for (i, (under, images, text, over)) in layers.enumerate() {
+            push_quads(&mut quads, &mut passes, under);
+            if !images.is_empty() {
+                passes.push(Pass::Images(i));
+            }
+            if !text.is_empty() || chrome_text(i) {
+                passes.push(Pass::Text(i));
+            }
+            if let Some(over) = over {
+                push_quads(&mut quads, &mut passes, over);
+            }
+        }
+        (quads, passes)
     }
 }
 
@@ -879,7 +959,9 @@ impl<'a> PaintCx<'a> {
         }
         match (top || self.over_text, self.layer) {
             (false, Layer::Base) => self.frame.bg.push(q),
-            _ => self.frame.top.push(q),
+            (true, Layer::Base) => self.frame.top.push(q),
+            // An overlay layer's quads all draw under its text.
+            (_, Layer::Overlay) => self.frame.overlay().quads.push(q),
         }
     }
 
@@ -1018,7 +1100,7 @@ impl<'a> PaintCx<'a> {
         };
         match self.layer {
             Layer::Base => self.frame.images.push(item),
-            Layer::Overlay => self.frame.overlay_images.push(item),
+            Layer::Overlay => self.frame.overlay().images.push(item),
         }
     }
 
@@ -1425,8 +1507,9 @@ impl<'a> PaintCx<'a> {
     }
 
     /// Paint `f` above every pane's content (a view's popups): its quads and
-    /// text go to the overlay pass. Nothing paints while a modal is open: it
-    /// would draw over (or under the dim of) the modal.
+    /// text go to the frame's top overlay layer (the popups' own, below every
+    /// modal's). Nothing paints while a modal is open: the modal takes the
+    /// pointer a popup follows.
     pub fn above(&mut self, f: impl FnOnce(&mut Self)) {
         if self.modal {
             return;
@@ -1448,7 +1531,7 @@ impl<'a> PaintCx<'a> {
     fn push_text(&mut self, item: TextItem) {
         match self.layer {
             Layer::Base => self.frame.text.push(item),
-            Layer::Overlay => self.frame.overlay_text.push(item),
+            Layer::Overlay => self.frame.overlay().text.push(item),
         }
     }
 }
@@ -1769,7 +1852,7 @@ mod tests {
                 cx.with_clip(Rect { x: 120.0, y: 0.0, w: 100.0, h: 600.0 }, |cx| {
                     cx.round_rect(Rect { x: 110.0, y: 110.0, w: 20.0, h: 20.0 }, 4.0, white, 1.0, None);
                 });
-                cx.above(|cx| cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white)); // top 1
+                cx.above(|cx| cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white)); // popup 0
                 cx.fill(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, white); // dropped: the clip is back
                 cx.button(Rect { x: 90.0, y: 140.0, w: 30.0, h: 30.0 }, 1);
                 cx.button(Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, 2);
@@ -1792,8 +1875,10 @@ mod tests {
         assert_eq!(px(&bg[8]), [0.0, 0.0, 10.0, 10.0], "the clip ends with its closure");
         assert_eq!(bg.len(), 9);
         assert_eq!(px(&top[0]), [140.0, 100.0, 10.0, 10.0], "fill_top is cut");
-        assert_eq!(px(&top[1]), [0.0, 0.0, 10.0, 10.0], "a popup escapes the clip");
-        assert_eq!(top.len(), 2);
+        assert_eq!(top.len(), 1);
+        let popups = &h.frame.layers[0].quads;
+        assert_eq!(px(&popups[0]), [0.0, 0.0, 10.0, 10.0], "a popup escapes the clip");
+        assert_eq!(popups.len(), 1);
         let buttons: Vec<(Rect, u32)> = h.frame.view_buttons.iter().map(|(r, _, id)| (*r, *id)).collect();
         assert_eq!(
             buttons,
@@ -1840,5 +1925,76 @@ mod tests {
         for c in 0..=255u8 {
             assert_eq!(encode(DECODE[c as usize]), c, "encoding inverts decoding");
         }
+    }
+
+    /// Paint a panel `w` wide with a label and, with `image`, an image on
+    /// `frame`'s `layer` (its top overlay layer for `Layer::Overlay`).
+    fn panel(h: &mut Harness, layer: Layer, w: f32, image: bool) {
+        let mut cx = PaintCx::new(&h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, layer, SurfaceId(1));
+        let r = Rect { x: 0.0, y: 0.0, w, h: 20.0 };
+        cx.fill(r, [40; 3]);
+        if image {
+            cx.image(1, 0, Image::from_rgba(1, 1, vec![0; 4]), r, r);
+        }
+        let s = cx.shape("label", Family::SansSerif, w);
+        cx.place(s, 0.0, 0.0, r, [200; 3]);
+    }
+
+    /// Each overlay layer draws its quads, then its images, then its text,
+    /// all after the layer beneath it: a modal's text never draws over the
+    /// panel of a modal stacked on it. Empty layers draw nothing.
+    #[test]
+    fn each_layer_draws_its_quads_images_then_text_over_the_layer_beneath() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        panel(&mut h, Layer::Base, 10.0, false);
+        {
+            let mut cx = PaintCx::new(&h.cfg, &h.chrome, UI, (-1.0, -1.0), &mut h.text, &mut h.frame, Layer::Base, SurfaceId(1));
+            cx.fill_top(Rect { x: 0.0, y: 0.0, w: 11.0, h: 2.0 }, [255; 3], 1.0);
+            cx.above(|cx| cx.fill(Rect { x: 0.0, y: 0.0, w: 12.0, h: 2.0 }, [255; 3]));
+        }
+        h.frame.begin_layer();
+        panel(&mut h, Layer::Overlay, 20.0, true);
+        h.frame.begin_layer();
+        h.frame.begin_layer();
+        panel(&mut h, Layer::Overlay, 30.0, false);
+        h.frame.begin_layer();
+
+        let (quads, passes) = h.frame.passes(|layer| layer == 0);
+        let widths: Vec<f32> = quads.iter().map(|q| q.px[0]).collect();
+        assert_eq!(widths, [10.0, 11.0, 12.0, 20.0, 30.0], "bg, top, popup, then each modal's panel");
+        assert_eq!(
+            passes,
+            [
+                Pass::Quads(0..1),
+                Pass::Text(0),
+                Pass::Quads(1..2),
+                // The popups' layer: a quad, no text.
+                Pass::Quads(2..3),
+                Pass::Quads(3..4),
+                Pass::Images(2),
+                Pass::Text(2),
+                Pass::Quads(4..5),
+                Pass::Text(4),
+            ]
+        );
+        // The app's own text (a menu's labels) gets its layer a text pass.
+        let (_, passes) = h.frame.passes(|layer| layer == 0 || layer == 5);
+        assert_eq!(passes.last(), Some(&Pass::Text(5)));
+    }
+
+    /// Overlay painting goes to the top layer as it is when painted, so a
+    /// layer begun later draws over what painted before it.
+    #[test]
+    fn overlay_painting_goes_to_the_layer_begun_last() {
+        let mut h = Harness::new();
+        h.text.begin_frame(0, Metrics::new(14.0, UI.cell_h), UI.cell_h, Duration::from_millis(50));
+        panel(&mut h, Layer::Overlay, 10.0, false);
+        h.frame.begin_layer();
+        panel(&mut h, Layer::Overlay, 20.0, false);
+        let counts: Vec<(usize, usize)> = h.frame.layers.iter().map(|l| (l.quads.len(), l.text.len())).collect();
+        assert_eq!(counts, [(1, 1), (1, 1)]);
+        assert_eq!(h.frame.layers[1].quads[0].px[0], 20.0);
+        assert_eq!(h.frame.overlay_text().count(), 2);
     }
 }

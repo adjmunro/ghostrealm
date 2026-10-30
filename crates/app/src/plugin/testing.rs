@@ -85,7 +85,7 @@ impl Harness {
 
     /// The text of every text item the last paint drew, in order.
     pub fn texts(&self) -> Vec<String> {
-        let items = self.frame.text.iter().chain(&self.frame.overlay_text);
+        let items = self.frame.text.iter().chain(self.frame.overlay_text());
         items
             .filter_map(|t| self.text.buffer(t.src))
             .map(|b| b.layout_runs().map(|r| r.text).collect::<Vec<_>>().join("\n"))
@@ -96,7 +96,7 @@ impl Harness {
     /// shaped line: 0 for a line laid out from the left, as right-to-left
     /// text must be to show where it is placed.
     pub fn text_left(&self, text: &str) -> Option<f32> {
-        let mut items = self.frame.text.iter().chain(&self.frame.overlay_text).filter_map(|t| self.text.buffer(t.src));
+        let mut items = self.frame.text.iter().chain(self.frame.overlay_text()).filter_map(|t| self.text.buffer(t.src));
         let buf = items.find(|b| b.layout_runs().any(|r| r.text == text))?;
         Some(buf.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x)).fold(f32::MAX, f32::min))
     }

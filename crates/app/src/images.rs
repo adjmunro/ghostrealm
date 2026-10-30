@@ -1,7 +1,7 @@
 //! Draws the images views place with [`PaintCx::image`]: one GPU texture per
 //! `(surface, id)`, re-uploaded only when the image's version changes, stretched
-//! over its rect and clipped to its clip rect. Base-layer images draw after the
-//! fills, overlay images after the top quads.
+//! over its rect and clipped to its clip rect. Each layer's images draw after
+//! its quads (the base layer's after its fills) and before its text.
 //!
 //! [`PaintCx::image`]: crate::plugin::PaintCx::image
 
@@ -59,9 +59,10 @@ pub struct ImageRenderer {
     max_side: u32,
     instances: wgpu::Buffer,
     capacity: u64,
-    /// This frame's draws in instance order: base layer, then overlay.
+    /// This frame's draws in instance order, layer by layer.
     draws: Vec<Draw>,
-    n_base: usize,
+    /// Where each layer's draws start in `draws`, and then where they end.
+    layers: Vec<usize>,
 }
 
 impl ImageRenderer {
@@ -162,30 +163,20 @@ impl ImageRenderer {
             instances: instance_buffer(device, capacity),
             capacity,
             draws: Vec::new(),
-            n_base: 0,
+            layers: Vec::new(),
         }
     }
 
     /// Upload changed images and lay out this frame's draws on a `sw`x`sh`
-    /// target: `base` for [`draw_base`](Self::draw_base), `overlay` for
-    /// [`draw_overlay`](Self::draw_overlay). Textures of images not placed this
-    /// frame are dropped.
-    pub fn prepare(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        base: &[ImageItem],
-        overlay: &[ImageItem],
-        sw: u32,
-        sh: u32,
-    ) {
+    /// target: each of `layers` for [`draw`](Self::draw) with its index.
+    /// Textures of images not placed this frame are dropped.
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layers: &[&[ImageItem]], sw: u32, sh: u32) {
         self.draws.clear();
-        self.n_base = 0;
+        self.layers.clear();
         let mut quads: Vec<ImageQuad> = Vec::new();
-        for (i, img) in base.iter().chain(overlay).enumerate() {
-            if i == base.len() {
-                // The overlay's draws start here.
-                self.n_base = self.draws.len();
+        for (layer, img) in layers.iter().enumerate().flat_map(|(l, items)| items.iter().map(move |i| (l, i))) {
+            while self.layers.len() <= layer {
+                self.layers.push(self.draws.len());
             }
             let key = (img.owner, img.id);
             let (w, h) = img.source.size();
@@ -225,11 +216,11 @@ impl ImageRenderer {
                 scaled: r.w != w as f32 || r.h != h as f32,
             });
         }
-        if overlay.is_empty() {
-            self.n_base = self.draws.len();
+        // Each layer's draws run from its start to the next one's.
+        while self.layers.len() <= layers.len() {
+            self.layers.push(self.draws.len());
         }
-        let placed: Vec<(SurfaceId, u32)> =
-            base.iter().chain(overlay).map(|i| (i.owner, i.id)).collect();
+        let placed: Vec<(SurfaceId, u32)> = layers.iter().flat_map(|l| l.iter()).map(|i| (i.owner, i.id)).collect();
         self.textures.retain(|k, _| placed.contains(k));
         if quads.is_empty() {
             return;
@@ -241,19 +232,16 @@ impl ImageRenderer {
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&quads));
     }
 
-    /// Draw the base layer's images (after the background quads).
-    pub fn draw_base(&self, pass: &mut wgpu::RenderPass<'_>, sw: u32, sh: u32) {
-        self.draw(pass, 0..self.n_base, sw, sh);
-    }
-
-    /// Draw the overlay layer's images (after the top quads).
-    pub fn draw_overlay(&self, pass: &mut wgpu::RenderPass<'_>, sw: u32, sh: u32) {
-        self.draw(pass, self.n_base..self.draws.len(), sw, sh);
+    /// Draw the images of layer `layer` (its index in what was prepared).
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, layer: usize, sw: u32, sh: u32) {
+        if let (Some(&start), Some(&end)) = (self.layers.get(layer), self.layers.get(layer + 1)) {
+            self.draw_range(pass, start..end, sw, sh);
+        }
     }
 
     /// Draw `range` of the prepared images; restores a full-target scissor
     /// afterwards.
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, range: Range<usize>, sw: u32, sh: u32) {
+    fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, range: Range<usize>, sw: u32, sh: u32) {
         if range.is_empty() {
             return;
         }
@@ -508,7 +496,7 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        r.prepare(device, queue, base, overlay, DIM, DIM);
+        r.prepare(device, queue, &[base, overlay], DIM, DIM);
 
         let bpr = DIM * 4;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -535,8 +523,8 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            r.draw_base(&mut pass, DIM, DIM);
-            r.draw_overlay(&mut pass, DIM, DIM);
+            r.draw(&mut pass, 0, DIM, DIM);
+            r.draw(&mut pass, 1, DIM, DIM);
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -736,7 +724,7 @@ mod tests {
             assert_eq!(r.textures[&(SurfaceId(1), 0)].levels, 8, "128x8 down to 1x1");
 
             // A frame that places nothing frees every texture.
-            r.prepare(&device, &queue, &[], &[], DIM, DIM);
+            r.prepare(&device, &queue, &[], DIM, DIM);
             assert!(r.textures.is_empty(), "freed once a frame stops drawing it");
         });
     }

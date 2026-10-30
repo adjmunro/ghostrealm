@@ -36,8 +36,8 @@ use crate::file_menu::{FileAction, FileTarget, MenuEntry};
 use crate::plugin::paint::{line_quad, push_border, rect_quad, round_quad, srgb_to_linear, QuadInstance};
 use crate::plugin::text_edit::{Applied, LineEdit};
 use crate::plugin::{
-    hover_box, rect_contains, theme, EventCx, Font, Frame, Layer, MouseButton, MouseEvent, Outcome, PaintCx, RawKey,
-    MenuAlign, MenuItem, Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
+    hover_box, rect_contains, theme, EventCx, Font, Frame, ImageItem, Layer, MouseButton, MouseEvent, Outcome, PaintCx,
+    Pass, RawKey, MenuAlign, MenuItem, Request, Shaped, TextItem, TextKit, TextSrc, UiMetrics, View,
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
@@ -620,15 +620,10 @@ struct State {
     quad_buffer: wgpu::Buffer,
     quad_capacity: u64,
 
-    /// Separate text renderer for the palette so its text draws above the panel
-    /// (terminal text and palette text can't share one pass with a quad between).
-    palette_renderer: TextRenderer,
-    /// Draws the context menu's text, after its quads: a menu can stack over
-    /// another overlay (the picker), whose text draws in the palette pass.
-    menu_renderer: TextRenderer,
-    /// Draws the toast's text, after its quads: above every pane and view
-    /// popup, below the menu and tooltip.
-    toast_renderer: TextRenderer,
+    /// A text renderer per overlay layer with text this frame, in layer
+    /// order: a renderer draws all its text in one go, so each layer whose
+    /// text draws over the quads beneath it needs its own. Grown on demand.
+    layer_renderers: Vec<TextRenderer>,
     /// The toast as last drawn: nothing under it takes the pointer. `None`
     /// while no toast shows.
     toast_rect: Option<Rect>,
@@ -653,7 +648,7 @@ struct State {
     strip_buffers: Vec<Buffer>,
     /// Sidebar context menu, when open.
     menu: Option<Menu>,
-    /// Text buffers for the context-menu item labels (drawn via the overlay pass).
+    /// Text buffers for the context-menu item labels (drawn in the menu's layer).
     menu_buffers: Vec<Buffer>,
     /// Vertical scroll offset of the workspace list (physical px).
     sidebar_scroll: f32,
@@ -1248,10 +1243,6 @@ impl State {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let palette_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let menu_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let toast_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         // The registry and plugins make up the catalogue the config is checked
         // against.
@@ -1352,9 +1343,7 @@ impl State {
             mono_family,
             font_locale: locale,
             serif_alias,
-            palette_renderer,
-            menu_renderer,
-            toast_renderer,
+            layer_renderers: Vec::new(),
             toast_rect: None,
             palette_buffers: Vec::new(),
             palette: None,
@@ -2970,12 +2959,11 @@ impl State {
         }
     }
 
-    /// Draw the floating picker overlay: a dim backdrop and a centred
-    /// panel hosting a file-browser view (on the overlay layer) above a
+    /// Draw the floating picker overlay into the frame's top layer: a dim
+    /// backdrop and a centred panel hosting a file-browser view above a
     /// confirm/cancel footer.
     fn build_picker(&mut self, frame: &mut Frame) {
-        // Overlay text draws above every overlay quad, so a confirmation can't
-        // stack over the picker: the picker hides until it is answered.
+        // The picker hides while a confirmation is open.
         if !self.app.picker_open() || self.app.confirm().is_some() {
             return;
         }
@@ -2983,7 +2971,7 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let pad = 10.0 * scale;
-        frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
+        frame.overlay().quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let pw = (sw * 0.6).clamp(360.0 * scale, 760.0 * scale).min((sw - 40.0 * scale).max(1.0));
         let ph = (sh * 0.7).min((sh - 40.0 * scale).max(1.0));
         let (px, py) = ((sw - pw) * 0.5, (sh - ph) * 0.5);
@@ -3085,8 +3073,9 @@ impl State {
         self.buttons.extend(owned.map(|(r, s, id)| (r, ButtonAction::View(s, id))));
     }
 
-    /// Draw the open confirmation: a dim backdrop and a centred panel with the
-    /// question above [<discard>] [Cancel] [<accept>], right-aligned.
+    /// Draw the open confirmation into the frame's top layer: a dim backdrop
+    /// and a centred panel with the question above [<discard>] [Cancel]
+    /// [<accept>], right-aligned.
     fn build_confirm(&mut self, frame: &mut Frame) {
         let Some(confirm) = self.app.confirm().cloned() else {
             return;
@@ -3095,7 +3084,8 @@ impl State {
         let scale = self.scale;
         let ch = self.cell_h;
         let pad = 12.0 * scale;
-        frame.top.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
+        let cursor = self.cursor;
+        frame.overlay().quads.push(rect_quad(Rect { x: 0.0, y: 0.0, w: sw, h: sh }, sw, sh, [0, 0, 0], 0.5));
         let bh = ch + 8.0 * scale;
         // Right to left: accept, Cancel, then the discard button. The primary
         // one is what Enter presses.
@@ -3120,7 +3110,7 @@ impl State {
             &self.cfg,
             &self.chrome,
             ui,
-            self.cursor,
+            cursor,
             &mut self.text,
             frame,
             Layer::Overlay,
@@ -3162,21 +3152,12 @@ impl State {
         }
     }
 
-    /// Draw the head of the toast queue, unless a modal (palette, picker,
-    /// confirmation, menu) is open, into a frame of its own: its quads and
-    /// text draw after every overlay but the menu and tooltip. Registers its
-    /// buttons and notes its rect; with the pointer over it, its own tooltip
-    /// (or none) replaces the frame's.
-    fn build_toast(
-        &mut self,
-        frame: &mut Frame,
-        panes: &[(PaneId, Rect, Rect)],
-        workspace: Rect,
-        modal: bool,
-    ) -> Option<Frame> {
-        self.toast_rect = None;
+    /// Draw the head of the toast queue into the frame's top layer.
+    /// Registers its buttons and notes its rect; with the pointer over it,
+    /// its own tooltip (or none) replaces the frame's.
+    fn build_toast(&mut self, frame: &mut Frame, panes: &[(PaneId, Rect, Rect)], workspace: Rect) {
         let ui = self.ui();
-        let head = self.app.toasts().head().filter(|_| !modal)?;
+        let Some(head) = self.app.toasts().head() else { return };
         let more = self.app.toasts().len() - 1;
         let toggle = self.buttons.iter().find(|(_, a)| *a == ButtonAction::ToggleSidebar).map(|(r, _)| *r);
         let area = toasts::Area {
@@ -3187,14 +3168,14 @@ impl State {
             margin: 6.0 * self.scale,
         };
         let at = toasts::place(head.toast.scope, &area);
-        let mut tf = Frame::new(frame.screen);
+        let under = frame.tooltip.take();
         let mut cx = PaintCx::new(
             &self.cfg,
             &self.chrome,
             ui,
             self.cursor,
             &mut self.text,
-            &mut tf,
+            frame,
             Layer::Overlay,
             PICKER_SID,
         );
@@ -3202,10 +3183,9 @@ impl State {
         let id = head.id;
         self.buttons.extend(layout.buttons.iter().map(|(r, hit)| (*r, ButtonAction::Toast(id, *hit))));
         self.toast_rect = Some(layout.rect);
-        if rect_contains(layout.rect, self.cursor.0, self.cursor.1) {
-            frame.tooltip = tf.tooltip.take();
+        if !rect_contains(layout.rect, self.cursor.0, self.cursor.1) {
+            frame.tooltip = under;
         }
-        Some(tf)
     }
 
     /// Draw the hovered tooltip once its anchor has been hovered for
@@ -3213,10 +3193,9 @@ impl State {
     /// panel of wrapped lines below the anchor (above, near the bottom edge;
     /// as low as fits when neither fits). A pane's tooltip is suppressed while
     /// a modal overlay is open, and every tooltip while the pointer is outside
-    /// the window. It goes into a frame of its own, drawn in the menu's pass
-    /// (after overlay images, which would cover its panel but not its text):
+    /// the window. It goes into the frame's top layer, above every other;
     /// never with a menu, which suppresses it.
-    fn build_tooltip(&mut self, frame: &mut Frame) -> Option<Frame> {
+    fn build_tooltip(&mut self, frame: &mut Frame) {
         let modal = self.palette.is_some()
             || self.menu.is_some()
             || self.app.picker_open()
@@ -3232,7 +3211,7 @@ impl State {
             self.tooltip_hover = None;
             self.tooltip_due = None;
             self.tooltip_rows = None;
-            return None;
+            return;
         };
         let now = Instant::now();
         let since = match self.tooltip_hover {
@@ -3242,12 +3221,11 @@ impl State {
         self.tooltip_hover = Some((anchor, since));
         if now < since + TOOLTIP_DELAY {
             self.tooltip_due = Some(since + TOOLTIP_DELAY);
-            return None;
+            return;
         }
         self.tooltip_due = None;
 
         let (sw, sh) = frame.screen;
-        let mut tip = Frame::new(frame.screen);
         let (scale, ch) = (self.scale, self.cell_h);
         let pad = 6.0 * scale;
         let ui = self.ui();
@@ -3257,7 +3235,7 @@ impl State {
             ui,
             self.cursor,
             &mut self.text,
-            &mut tip,
+            frame,
             Layer::Overlay,
             PICKER_SID,
         );
@@ -3297,7 +3275,6 @@ impl State {
         for (i, line) in lines.into_iter().enumerate() {
             cx.place(line, x + pad, y + pad + i as f32 * ch, panel, theme::TEXT);
         }
-        Some(tip)
     }
 
     /// Push sidebar quads and shape vtab-name text; returns placements into
@@ -4692,8 +4669,6 @@ impl State {
             self.cursor_rect = (!dragging).then(|| d.grab_rect(DIVIDER_SLOP * self.scale));
         }
 
-        // Palette overlay: dim + panel + selection quads (drawn after terminal
-        // text), and its text (drawn last, via a second renderer).
         // Sidebar (bg quads before text; its names join the main text pass).
         let sidebar_placements = self.build_sidebar(sw, sh, &mut frame.bg, &mut close_placements);
         // Custom title-bar strip (macOS); a no-op elsewhere. Drawn after the
@@ -4701,59 +4676,64 @@ impl State {
         self.title_place = None;
         self.build_titlebar(sw, sh, &mut frame.bg);
 
+        // Each overlay paints a layer of its own (quads, then text) over
+        // those beneath it. The palette's and the menu's text come from the
+        // window's own buffers: note their layers (as `Pass` names them).
         self.palette_error_tip = None;
-        let palette_placements = if self.palette.is_some() {
-            self.build_palette(sw, sh, &mut frame.top)
-        } else {
-            Vec::new()
+        let pane_rects: Vec<(PaneId, Rect, Rect)> = resolved.iter().map(|(pr, _, term)| (pr.id, pr.rect, *term)).collect();
+        let open = Open {
+            picker: self.app.picker_open(),
+            palette: self.palette.is_some(),
+            confirm: self.app.confirm().is_some(),
+            // No toast draws while a modal owns the pointer.
+            toast: self.app.toasts().head().is_some() && !modal,
+            menu: self.menu.is_some(),
         };
-        if let Some((r, text)) = &self.palette_error_tip {
-            if rect_contains(*r, self.cursor.0, self.cursor.1) {
-                frame.tooltip = Some((*r, text.clone(), Layer::Overlay));
+        // `build_toast` notes this frame's toast rect.
+        if !open.toast {
+            self.toast_rect = None;
+        }
+        let mut palette_text: Option<(usize, Vec<Placement>)> = None;
+        let mut menu_text: Option<(usize, Vec<Placement>)> = None;
+        for overlay in overlay_stack(open) {
+            frame.begin_layer();
+            let layer = frame.layers.len();
+            match overlay {
+                Overlay::Picker => self.build_picker(&mut frame),
+                Overlay::Palette => {
+                    let placements = self.build_palette(sw, sh, &mut frame.overlay().quads);
+                    palette_text = Some((layer, placements));
+                    if let Some((r, text)) = &self.palette_error_tip {
+                        if rect_contains(*r, self.cursor.0, self.cursor.1) {
+                            frame.tooltip = Some((*r, text.clone(), Layer::Overlay));
+                        }
+                    }
+                }
+                Overlay::Confirm => self.build_confirm(&mut frame),
+                Overlay::Toast => self.build_toast(&mut frame, &pane_rects, workspace),
+                Overlay::Menu => {
+                    let placements = self.build_menu(sw, sh, &mut frame.overlay().quads);
+                    menu_text = Some((layer, placements));
+                }
+                Overlay::Tooltip => self.build_tooltip(&mut frame),
             }
         }
-        // Floating picker and confirmation (modal overlays). Their text joins the
-        // overlay pass.
-        self.build_picker(&mut frame);
-        self.build_confirm(&mut frame);
-        let pane_rects: Vec<(PaneId, Rect, Rect)> = resolved.iter().map(|(pr, _, term)| (pr.id, pr.rect, *term)).collect();
-        let toast = self.build_toast(&mut frame, &pane_rects, workspace, modal);
-        let tooltip = self.build_tooltip(&mut frame);
-        // The menu (or else the tooltip) draws after every other overlay,
-        // quads and text, so one opened from the picker's view shows above
-        // the picker, and neither loses its panel under an overlay image.
-        let mut menu_quads = Vec::new();
-        let menu_placements = if self.menu.is_some() {
-            self.build_menu(sw, sh, &mut menu_quads)
-        } else {
-            Vec::new()
-        };
-        let tooltip_text = match tooltip {
-            Some(tip) if menu_placements.is_empty() => {
-                menu_quads.extend_from_slice(&tip.top);
-                tip.overlay_text
-            }
-            _ => Vec::new(),
-        };
 
-        self.images.prepare(
-            &self.device,
-            &self.queue,
-            &frame.images,
-            &frame.overlay_images,
-            self.config.width,
-            self.config.height,
-        );
-        let (toast_quads, toast_text) = match toast {
-            Some(t) => (t.top, t.overlay_text),
-            None => (Vec::new(), Vec::new()),
+        let image_layers: Vec<&[ImageItem]> =
+            std::iter::once(&frame.images[..]).chain(frame.layers.iter().map(|l| &l.images[..])).collect();
+        self.images.prepare(&self.device, &self.queue, &image_layers, self.config.width, self.config.height);
+        let chrome_text = |layer: usize| {
+            let at = |t: &Option<(usize, Vec<Placement>)>| t.as_ref().is_some_and(|(l, p)| *l == layer && !p.is_empty());
+            layer == 0 || at(&palette_text) || at(&menu_text)
         };
-        let ranges = pass_ranges(frame.bg.len(), frame.top.len(), toast_quads.len(), menu_quads.len());
-        let mut quads = std::mem::take(&mut frame.bg);
-        quads.extend_from_slice(&frame.top);
-        quads.extend_from_slice(&toast_quads);
-        quads.extend_from_slice(&menu_quads);
+        let (quads, passes) = frame.passes(chrome_text);
         self.upload_quads(&quads);
+        // A text renderer for each overlay layer with text.
+        let text_layers = passes.iter().filter(|p| matches!(p, Pass::Text(l) if *l > 0)).count();
+        while self.layer_renderers.len() < text_layers {
+            let r = TextRenderer::new(&mut self.atlas, &self.device, wgpu::MultisampleState::default(), None);
+            self.layer_renderers.push(r);
+        }
 
         self.viewport.update(
             &self.queue,
@@ -4884,91 +4864,34 @@ impl State {
             )
             .context("text prepare")?;
 
-        // The palette and the picker are mutually exclusive; each draws above
-        // everything but the menu via the overlay text renderer (each from its
-        // own pool).
-        let overlay_areas: Vec<TextArea> = if !palette_placements.is_empty() {
-            palette_placements
-                .iter()
-                .map(|p| TextArea {
-                    buffer: &self.palette_buffers[p.idx],
-                    left: p.left,
-                    top: p.top,
-                    scale: 1.0,
-                    bounds: p.bounds,
-                    default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                    custom_glyphs: &[],
-                })
-                .collect()
-        } else {
-            frame.overlay_text.iter().filter_map(area).collect()
-        };
-        let has_overlay_text = !overlay_areas.is_empty();
-        if !overlay_areas.is_empty() {
-            self.palette_renderer
+        // Each overlay layer's text, through a renderer of its own, so it
+        // draws over that layer's quads and under the next layer's.
+        // `text_renderers[i]` is the renderer of the layer `Pass::Text(i)`
+        // names: only those prepared this frame draw (a renderer replays its
+        // last prepared text otherwise).
+        let mut text_renderers: Vec<Option<usize>> = vec![None; frame.layers.len() + 1];
+        for (j, layer) in passes.iter().filter_map(|p| match p {
+            Pass::Text(l) if *l > 0 => Some(*l),
+            _ => None,
+        }).enumerate() {
+            let mut areas: Vec<TextArea> = frame.layers[layer - 1].text.iter().filter_map(area).collect();
+            for (text, buffers) in [(&palette_text, &self.palette_buffers), (&menu_text, &self.menu_buffers)] {
+                if let Some((_, placements)) = text.as_ref().filter(|(l, _)| *l == layer) {
+                    areas.extend(placements.iter().map(|p| placement_area(buffers, p)));
+                }
+            }
+            self.layer_renderers[j]
                 .prepare(
                     &self.device,
                     &self.queue,
                     &mut self.text.font_system,
                     &mut self.atlas,
                     &self.viewport,
-                    overlay_areas,
+                    areas,
                     &mut self.swash_cache,
                 )
                 .context("overlay prepare")?;
-        }
-        // The toast's text, in a pass of its own after its quads.
-        let has_toast_text = !toast_text.is_empty();
-        if has_toast_text {
-            let areas: Vec<TextArea> = toast_text.iter().filter_map(area).collect();
-            self.toast_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.text.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    areas,
-                    &mut self.swash_cache,
-                )
-                .context("toast prepare")?;
-        }
-        // The menu's (or tooltip's) text, in a pass of its own after its quads.
-        let has_menu_text = !menu_placements.is_empty() || !tooltip_text.is_empty();
-        if !tooltip_text.is_empty() {
-            let areas: Vec<TextArea> = tooltip_text.iter().filter_map(area).collect();
-            self.menu_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.text.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    areas,
-                    &mut self.swash_cache,
-                )
-                .context("tooltip prepare")?;
-        } else if !menu_placements.is_empty() {
-            let areas = menu_placements.iter().map(|p| TextArea {
-                buffer: &self.menu_buffers[p.idx],
-                left: p.left,
-                top: p.top,
-                scale: 1.0,
-                bounds: p.bounds,
-                default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
-                custom_glyphs: &[],
-            });
-            self.menu_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.text.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    areas,
-                    &mut self.swash_cache,
-                )
-                .context("menu prepare")?;
+            text_renderers[layer] = Some(j);
         }
         // No text pass references the row or block cache any more: trim them
         // to their caps.
@@ -5028,41 +4951,28 @@ impl State {
                 multiview_mask: None,
             });
 
-            let [bg_quads, top_quads, toast_quads, menu_quads] = ranges;
-            let quad_pipeline = &self.quad_pipeline;
-            let quad_buffer = &self.quad_buffer;
-            let draw_quads = |pass: &mut wgpu::RenderPass, range: std::ops::Range<u32>| {
-                if !range.is_empty() {
-                    pass.set_pipeline(quad_pipeline);
-                    pass.set_vertex_buffer(0, quad_buffer.slice(..));
-                    pass.draw(0..4, range);
+            let (w, h) = (self.config.width, self.config.height);
+            for step in &passes {
+                match step {
+                    Pass::Quads(range) => {
+                        pass.set_pipeline(&self.quad_pipeline);
+                        pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
+                        pass.draw(0..4, range.clone());
+                    }
+                    Pass::Images(layer) => self.images.draw(&mut pass, *layer, w, h),
+                    Pass::Text(0) => {
+                        self.text_renderer
+                            .render(&self.atlas, &self.viewport, &mut pass)
+                            .context("text render")?;
+                    }
+                    Pass::Text(layer) => {
+                        if let Some(j) = text_renderers[*layer] {
+                            self.layer_renderers[j]
+                                .render(&self.atlas, &self.viewport, &mut pass)
+                                .context("overlay render")?;
+                        }
+                    }
                 }
-            };
-            draw_quads(&mut pass, bg_quads);
-            self.images.draw_base(&mut pass, self.config.width, self.config.height);
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .context("text render")?;
-            draw_quads(&mut pass, top_quads);
-            self.images.draw_overlay(&mut pass, self.config.width, self.config.height);
-            if has_overlay_text {
-                self.palette_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .context("overlay render")?;
-            }
-            // Only what was prepared this frame: a renderer replays its last
-            // prepared text otherwise.
-            draw_quads(&mut pass, toast_quads);
-            if has_toast_text {
-                self.toast_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .context("toast render")?;
-            }
-            draw_quads(&mut pass, menu_quads);
-            if has_menu_text {
-                self.menu_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .context("menu render")?;
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -5118,17 +5028,57 @@ fn is_modifier_key(key: &WKey) -> bool {
     )
 }
 
-/// The instance ranges of the quad passes, in draw order, for a buffer laid
-/// out `bg ++ top ++ toast ++ menu`: the background, the top layer (after
-/// the base text), the toast (after the overlay text), and the menu or
-/// tooltip (after the toast's text).
-fn pass_ranges(n_bg: usize, n_top: usize, n_toast: usize, n_menu: usize) -> [std::ops::Range<u32>; 4] {
-    let mut start = 0u32;
-    [n_bg, n_top, n_toast, n_menu].map(|n| {
-        let r = start..start + n as u32;
-        start = r.end;
-        r
-    })
+/// `p`'s text area, drawing the buffer it indexes in `buffers`.
+fn placement_area<'a>(buffers: &'a [Buffer], p: &Placement) -> TextArea<'a> {
+    TextArea {
+        buffer: &buffers[p.idx],
+        left: p.left,
+        top: p.top,
+        scale: 1.0,
+        bounds: p.bounds,
+        default_color: Color::rgb(p.color[0], p.color[1], p.color[2]),
+        custom_glyphs: &[],
+    }
+}
+
+/// What draws over the panes, each in an overlay layer of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overlay {
+    Picker,
+    Palette,
+    Confirm,
+    Toast,
+    Menu,
+    Tooltip,
+}
+
+/// Which overlays are open this frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct Open {
+    picker: bool,
+    palette: bool,
+    confirm: bool,
+    /// A toast is queued.
+    toast: bool,
+    menu: bool,
+}
+
+/// The overlays to draw, bottom first, each over those before it: the picker,
+/// then the palette, then a confirmation (over the picker that raised it),
+/// then the toast, then a menu (the picker's view can open one), then the tooltip, which draws
+/// nothing while a menu is open.
+fn overlay_stack(open: Open) -> Vec<Overlay> {
+    [
+        (open.picker, Overlay::Picker),
+        (open.palette, Overlay::Palette),
+        (open.confirm, Overlay::Confirm),
+        (open.toast, Overlay::Toast),
+        (open.menu, Overlay::Menu),
+        (true, Overlay::Tooltip),
+    ]
+    .into_iter()
+    .filter_map(|(open, overlay)| open.then_some(overlay))
+    .collect()
 }
 
 /// Break `text` at spaces into lines no wider than `max_w` as `width_of`
@@ -5991,7 +5941,7 @@ fn close_slot(
 mod tests {
     use super::{
         build_quad_pipeline, char_under, glyph_x, input_shift, nearest_caret, measure_cell, rect_contains, sidebar_rect_for,
-        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, close_slot, pass_ranges,
+        workspace_rect_for, wrap_words, Hover, QuadInstance, divider_icon, close_slot,
     };
     use crate::plugin::theme;
     use ghostrealm_core::{Axis, Rect, Side, SurfaceId};
@@ -6306,15 +6256,6 @@ mod tests {
         flag.hold_termination();
         assert_eq!(flag.settle(true), Some(false));
         assert!(flag.get());
-    }
-
-    #[test]
-    fn the_toast_pass_follows_the_top_layer_and_precedes_the_menu() {
-        assert_eq!(pass_ranges(3, 2, 4, 1), [0..3, 3..5, 5..9, 9..10]);
-        // Empty passes are empty ranges, which draw nothing.
-        let [bg, top, toast, menu] = pass_ranges(3, 0, 0, 2);
-        assert!(top.is_empty() && toast.is_empty());
-        assert_eq!((bg, menu), (0..3, 3..5));
     }
 
     /// A confirmation's message is drawn as lines that each fit the panel, so

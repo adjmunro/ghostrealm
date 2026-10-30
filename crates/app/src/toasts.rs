@@ -710,7 +710,7 @@ mod tests {
         assert!(layout.buttons.iter().all(|(r, _)| inside(*r, layout.rect)));
         let lit = |h: &Harness| {
             let a = theme::HOVER_ALPHA;
-            h.frame.top.iter().filter(|q| (q.color[3] - a).abs() < 1e-4).count()
+            h.frame.overlay_quads().filter(|q| (q.color[3] - a).abs() < 1e-4).count()
         };
         assert_eq!(lit(&h), 0);
         let close = layout.buttons[0].0;

@@ -553,7 +553,7 @@ mod tests {
             let text = |i: &&crate::plugin::TextItem| {
                 h.text.buffer(i.src).and_then(|b| b.layout_runs().next().map(|r| r.text))
             };
-            h.frame.overlay_text.iter().find(|i| text(i) == Some(title)).map(|i| i.left)
+            h.frame.overlay_text().find(|i| text(i) == Some(title)).map(|i| i.left)
         };
         let (one, two, five) = (left("One").unwrap(), left("Two").unwrap(), left("Five").unwrap());
         assert!(one < two && two < five, "{one} {two} {five}");
@@ -562,7 +562,7 @@ mod tests {
         h.cursor = centre(row);
         h.paint(&mut v, RECT);
         let pill = color(theme::HOVER_BG);
-        assert!(h.frame.top.iter().any(|q| q.color[..3] == pill[..3] && q.color[3] == theme::HOVER_ALPHA));
+        assert!(h.frame.overlay_quads().any(|q| q.color[..3] == pill[..3] && q.color[3] == theme::HOVER_ALPHA));
     }
 
     #[test]

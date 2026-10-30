@@ -49,8 +49,8 @@ use crate::app_state::AppState;
 
 pub use event::{EventCx, MenuAlign, MenuItem, MouseButton, MouseEvent, Outcome, RawKey, Request, ToastChoice};
 pub use paint::{
-    Font, Frame, Image, ImageItem, ImageSource, Layer, PaintCx, RowStyles, Shaped, TextItem, TextKit,
-    TextSrc,
+    Font, Frame, Image, ImageItem, ImageSource, Layer, OverlayLayer, PaintCx, Pass, RowStyles, Shaped, TextItem,
+    TextKit, TextSrc,
 };
 pub use crate::block_cache::{BlockLayout, BlockSpan};
 pub use crate::row_cache::RunStyle;

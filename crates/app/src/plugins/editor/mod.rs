@@ -2369,7 +2369,7 @@ mod tests {
         settle(&mut v);
         assert_eq!(popup_text(&v), Some(vec!["flagged".to_string(), "docs for bad".to_string()]));
         paint_plain(&mut h, &mut v);
-        assert!(!h.frame.overlay_text.is_empty(), "the popup paints above the panes");
+        assert!(h.frame.overlay_text().next().is_some(), "the popup paints above the panes");
 
         // Moving within the word keeps it; moving off closes it.
         h.mouse(&mut v, MouseEvent::Move { pos: at(0, 5) });
@@ -2391,11 +2391,11 @@ mod tests {
         settle(&mut v);
         paint_plain(&mut h, &mut v);
         assert!(popup_text(&v).is_some(), "a plain repaint keeps it");
-        assert!(!h.frame.overlay_text.is_empty());
+        assert!(h.frame.overlay_text().next().is_some());
         h.modal = true;
         paint_plain(&mut h, &mut v);
         assert_eq!(popup_text(&v), None);
-        assert!(h.frame.overlay_text.is_empty(), "nothing paints over the modal");
+        assert!(h.frame.overlay_text().next().is_none(), "nothing paints over the modal");
         assert_eq!(v.deadline(&h.cfg), None, "and it doesn't come back under it");
     }
 
