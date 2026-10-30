@@ -146,6 +146,7 @@
 - Category: UX principle / agent-operated surfaces
 - Detail: Strong preference: agent-operated browser or emulator work happens in the background and does not refocus or distract the human. If it can be done in the background, it is.
 - Detail: Web pop-ups: when a human triggers one, it opens as a floating pop-up window above the whole app while the originating tab stays alive (fallback: a new tab), so `window.opener` and OAuth/payment flows work. When an agent triggers one, it opens hidden, in the background. Pop-ups do not open in place.
+- Detail: "Hidden" means off screen, not hidden from Chromium: an agent's page off screen (its pop-up, or any page opened without a window) stays visible to Chromium and paints at `UNSEEN_FRAME_RATE` (10 fps), so its renderer keeps foreground priority; a person's page off screen is hidden from Chromium (Web surface / pop-ups, 2026-10-23).
 - Reason: owner, verbatim: "it's really distracting when the agent keeps on refocusing on a browser to do things or an emulator to do things while I'm trying to do things as a human. So if you can do things in the background, then that's definitely a preference for agent operated stuff."
 
 ---
@@ -220,6 +221,7 @@
 - Detail: An eval runs as a user gesture only when asked (`web.eval` `gesture: true`). The activation is the frame's, not the isolated world's: the page's own scripts can spend it (write the clipboard, open pop-ups) and see it (`navigator.userActivation`), so a read-only eval never hands it over.
 - Detail: A page has at most four pop-ups open at once (floating or hidden, a person's and an agent's together; a person's tabs don't count): the host refuses more (`window.open` returns `null`), and the opener's `get surface` says how many were refused since it last loaded. Each pop-up is a renderer process.
 - Detail: `web.close` closes a web surface by id, a hidden pop-up included. While a floating pop-up has the keyboard, Close (Cmd+W) closes it rather than the tab, the keyboard going to the next floating pop-up or else the page; editing the URL (Cmd+L) takes the keyboard back to the page's URL bar.
+- Detail: An agent's pop-up, hidden or not, stays visible to Chromium off screen at `UNSEEN_FRAME_RATE` (10 fps instead of 60), as does any page an agent opened without a window: Chromium runs a hidden page's renderer at background priority, which a loaded machine starves for seconds per DevTools step, past the agent's reply wait. A person's page off screen (a background tab, a pop-up not yet shown) is hidden from Chromium and doesn't paint. Frames from a page off screen don't redraw the window.
 - Detail: The floating pop-up is bounded by its opener's page, not the whole window: a view receives input only inside its own rect, and floating over other panes would need the window to route the pointer to a view outside its pane.
 - Reason: OAuth and payment pop-ups need `window.opener`; agent-operated browser activity runs in the background (UX principle / agent-operated surfaces).
 

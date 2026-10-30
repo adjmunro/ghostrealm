@@ -1478,3 +1478,17 @@
   of input, the shell's `stty -echo` and `read` and the grid giving up a
   row. Give each wait its own deadline, or find what the grid waits on.
 - Reason: a flaky test hides real failures.
+
+---
+
+[2026-10-31T04:40+1300@8e02fb1d] Tests — `the_web_host_is_hung_up_on_between_requests_once_idle` flakes under load
+
+- Requires: NO BLOCKERS
+- Detail: `agent::tests::the_web_host_is_hung_up_on_between_requests_once_idle`
+  (crates/app/src/agent.rs) failed once in 7 runs on a loaded machine: the
+  stub host's log didn't start with `"run\neof\nrun\n"`, so the second host
+  started before the first wrote `eof` (or the first never wrote `run`).
+  Candidates: the reaper's 5 s kill landing before the stub's `sleep 0.5;
+  echo eof` finished, or the reaper thread failing to spawn, which reports
+  the host gone at once. Print the log on failure to tell which.
+- Reason: a flaky test hides real failures.
