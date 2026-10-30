@@ -171,7 +171,7 @@ impl Pty {
         // creation on macOS, where `inherit_stdio_only` keeps it from
         // long-lived children.
         let (stop_rx, stop_tx) = UnixStream::pair()?;
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_vendor = "apple", not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))]
         no_sigpipe(&stop_tx)?;
         Ok((PtyReader { master: self.master.try_clone()?, stop: stop_rx }, ReaderStop(stop_tx)))
     }
@@ -285,19 +285,23 @@ impl Drop for ReaderStop {
         // A byte, not just the close: a copy of this end leaked to a child
         // would keep the close from showing. The reader has usually ended
         // already, so the send fails with EPIPE, without raising SIGPIPE
-        // whatever its disposition: `MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE`
-        // (set in `Pty::reader`) on macOS.
-        #[cfg(target_os = "linux")]
-        let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
-        let flags = 0;
+        // whatever its disposition (see [`STOP_SEND_FLAGS`]).
         // SAFETY: send reads only the one byte it is given.
-        unsafe { libc::send(self.0.as_raw_fd(), [0u8].as_ptr().cast(), 1, flags) };
+        unsafe { libc::send(self.0.as_raw_fd(), [0u8].as_ptr().cast(), 1, STOP_SEND_FLAGS) };
     }
 }
 
+/// Flags for the stop byte's `send`: `MSG_NOSIGNAL` where the OS honours it;
+/// on Apple, `SO_NOSIGPIPE` (set in `Pty::reader`) does that job instead.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))]
+const STOP_SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(all(target_vendor = "apple", not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))]
+const STOP_SEND_FLAGS: libc::c_int = 0;
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris")))]
+compile_error!("no way to send the reader stop byte without raising SIGPIPE on this target");
+
 /// Keep writes to `socket` from raising SIGPIPE.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_vendor = "apple", not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))]
 fn no_sigpipe(socket: &UnixStream) -> io::Result<()> {
     let on: libc::c_int = 1;
     // SAFETY: setsockopt reads the int it is given.
@@ -467,14 +471,40 @@ mod tests {
         assert!(cloexec(stop.0.as_raw_fd()), "stop end");
     }
 
-    /// Set in the child process that runs [`stop_after_its_reader`].
+    #[cfg(all(target_vendor = "apple", not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))]
+    #[test]
+    fn the_stop_end_sets_no_sigpipe() {
+        let (pty, _slave) = Pty::open(SIZE).unwrap();
+        let (_reader, stop) = pty.reader().unwrap();
+        let mut on: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes into `on`.
+        let r = unsafe {
+            libc::getsockopt(
+                stop.0.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&mut on as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(r, 0, "{}", io::Error::last_os_error());
+        assert_ne!(on, 0);
+    }
+
+    /// Set, to the parent's pid, in the child process that runs
+    /// [`stop_after_its_reader`].
     const SIGPIPE_CHILD: &str = "GHOSTREALM_TEST_SIGPIPE_CHILD";
 
     /// Run in a child process by
-    /// [`a_stop_dropped_after_its_reader_raises_no_sigpipe`]; a no-op otherwise.
+    /// [`a_stop_dropped_after_its_reader_raises_no_sigpipe`]; a no-op unless
+    /// [`SIGPIPE_CHILD`] names this process's parent, since it sets SIGPIPE
+    /// to `SIG_DFL` for the whole process.
     #[test]
+    #[ignore = "run by a_stop_dropped_after_its_reader_raises_no_sigpipe"]
     fn stop_after_its_reader() {
-        if std::env::var_os(SIGPIPE_CHILD).is_none() {
+        let parent = std::os::unix::process::parent_id().to_string();
+        if std::env::var_os(SIGPIPE_CHILD).is_none_or(|v| v != *parent) {
             return;
         }
         // SAFETY: resets one signal's disposition in this child process.
@@ -489,8 +519,8 @@ mod tests {
     fn a_stop_dropped_after_its_reader_raises_no_sigpipe() {
         use std::os::unix::process::ExitStatusExt;
         let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "pty::tests::stop_after_its_reader", "--test-threads=1"])
-            .env(SIGPIPE_CHILD, "1")
+            .args(["--ignored", "--exact", "pty::tests::stop_after_its_reader", "--test-threads=1"])
+            .env(SIGPIPE_CHILD, std::process::id().to_string())
             .output()
             .unwrap();
         assert_eq!(out.status.signal(), None, "killed by a signal");
