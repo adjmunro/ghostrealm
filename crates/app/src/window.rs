@@ -2303,15 +2303,16 @@ impl State {
         true
     }
 
-    /// A right press ([`pointer::right_press`]): nothing while the picker or a
-    /// confirmation is open; on the toast (off any menu) it only closes a
-    /// menu; otherwise it closes the palette and any menu, then over the
-    /// sidebar opens the workspace menu of the vtab under the cursor, and
-    /// over a pane gives the view the press and asks it for its context menu.
+    /// A right press ([`pointer::right_press`]): on a menu or the toast it
+    /// only closes a menu; elsewhere nothing while the picker or a
+    /// confirmation is open; otherwise it closes the palette and any menu,
+    /// then over the sidebar opens the workspace menu of the vtab under the
+    /// cursor, and over a pane gives the view the press and asks it for its
+    /// context menu.
     fn on_right_click(&mut self) {
         match pointer::right_press(&self.gate(), self.cursor) {
             RightPress::Kept => return,
-            RightPress::Toast => {
+            RightPress::Menu | RightPress::Toast => {
                 self.menu = None;
                 self.dirty = true;
                 return;

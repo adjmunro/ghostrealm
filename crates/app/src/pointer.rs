@@ -123,24 +123,28 @@ pub(crate) fn hover_index(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y):
 /// Where a right press goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightPress {
+    /// Onto a menu's panel: it closes the menu and goes no further, whatever
+    /// is under the menu (the menu owns the pointer, over the toast and the
+    /// picker too).
+    Menu,
     /// Nowhere: the picker or a confirmation keeps the pointer (a menu would
     /// open beneath it, and its actions run under an unanswered question).
     Kept,
     /// Onto the toast, off any menu: it closes a menu, and nothing beneath
     /// the toast (the palette, a view) hears it.
     Toast,
-    /// Beneath the overlays, or onto a menu (which owns the pointer, over the
-    /// toast too): the palette and a menu close, and the sidebar or the view
-    /// under the pointer takes it.
+    /// Beneath the overlays, off any menu and the toast: the palette and a
+    /// menu close, and the sidebar or the view under the pointer takes it.
     Through,
 }
 
 /// Where a right press at `pos` goes.
 pub(crate) fn right_press(gate: &Gate, pos: (f32, f32)) -> RightPress {
-    let on_menu = gate.menu.is_some_and(|r| rect_contains(r, pos.0, pos.1));
-    if gate.picker || gate.confirm {
+    if gate.menu.is_some_and(|r| rect_contains(r, pos.0, pos.1)) {
+        RightPress::Menu
+    } else if gate.picker || gate.confirm {
         RightPress::Kept
-    } else if !on_menu && covered(gate, pos) {
+    } else if covered(gate, pos) {
         RightPress::Toast
     } else {
         RightPress::Through
@@ -174,7 +178,7 @@ mod tests {
         let menu = Gate { menu: Some(off), ..gate };
         assert_eq!(right_press(&menu, IN), RightPress::Toast, "off the menu");
         let menu = Gate { menu: Some(Rect { x: 4.0, ..R }), ..gate };
-        assert_eq!(right_press(&menu, IN), RightPress::Through, "the menu over the toast owns the press");
+        assert_eq!(right_press(&menu, IN), RightPress::Menu, "the menu over the toast owns the press");
         assert_eq!(right_press(&menu, (2.0, 5.0)), RightPress::Toast, "the toast beside the menu");
         let picker = Gate { picker: true, ..gate };
         assert_eq!(right_press(&picker, IN), RightPress::Kept);
@@ -182,6 +186,20 @@ mod tests {
         let confirm = Gate { confirm: true, ..gate };
         assert_eq!(right_press(&confirm, IN), RightPress::Kept);
         assert_eq!(right_press(&Gate::default(), IN), RightPress::Through);
+    }
+
+    /// A right press on a menu's panel is the menu's, with or without the
+    /// toast or a modal under it; beside the menu it goes as if it were shut.
+    #[test]
+    fn a_right_press_on_a_menu_is_the_menus() {
+        let menu = Gate { menu: Some(R), ..Gate::default() };
+        assert_eq!(right_press(&menu, IN), RightPress::Menu, "no toast under it");
+        assert_eq!(right_press(&menu, (20.0, 5.0)), RightPress::Through);
+        let toast = Gate { toast: Some(R), ..menu };
+        assert_eq!(right_press(&toast, IN), RightPress::Menu, "the toast under it");
+        let picker = Gate { picker: true, ..menu };
+        assert_eq!(right_press(&picker, IN), RightPress::Menu, "the picker under it");
+        assert_eq!(right_press(&picker, (20.0, 5.0)), RightPress::Kept);
     }
 
     #[test]
