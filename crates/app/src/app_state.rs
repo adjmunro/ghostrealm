@@ -1982,7 +1982,16 @@ impl AppState {
     /// in the focused pane. Then drop hidden ones that closed or whose opener
     /// went, and close web tabs whose page closed. Returns whether any came
     /// or went.
+    ///
+    /// First the pop-ups a host that exited made are made again in the
+    /// running one ([`web::WebView::revive`]); one that can't be is found
+    /// closed below, and the person told.
     pub fn adopt_popups(&mut self) -> bool {
+        for view in self.views.values_mut() {
+            if let Some(w) = view.downcast_mut::<web::WebView>() {
+                w.revive();
+            }
+        }
         // What went is found before placing: the host reports a page's
         // pop-ups before reporting it closed, so every pop-up of a page
         // found closed here is placed below (a tab beside it) before the
@@ -2109,6 +2118,7 @@ impl AppState {
     /// [`closed_popups`]: Self::closed_popups
     fn drop_closed_popups(&mut self, (mut gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
         let changed = !gone.is_empty() || !closed_tabs.is_empty();
+        self.tell_lost(&gone, &closed_tabs);
         // A hidden pop-up goes with its opener, which may have gone just now.
         while !gone.is_empty() {
             for p in gone {
@@ -2123,6 +2133,30 @@ impl AppState {
             self.close_surface_id(sid);
         }
         changed
+    }
+
+    /// Tell the person about the hidden pop-ups in `hidden` (on their
+    /// opener's pane) and the tabs in `tabs` that a later web host couldn't
+    /// make again.
+    fn tell_lost(&mut self, hidden: &[SurfaceId], tabs: &[SurfaceId]) {
+        let lost = |sid: &SurfaceId| {
+            self.views.get(sid).and_then(|v| v.downcast_ref::<web::WebView>()).filter(|w| w.is_lost())
+        };
+        let mut toasts = Vec::new();
+        for sid in hidden {
+            if let (Some(w), Some(o)) = (lost(sid), self.hidden.get(sid)) {
+                toasts.push((w.lost_message("Pop-up"), self.scope_of(Some(o.opener))));
+            }
+        }
+        for sid in tabs {
+            if let Some(w) = lost(sid) {
+                toasts.push((w.lost_message("Tab"), self.scope_of(Some(*sid))));
+            }
+        }
+        for (message, scope) in toasts {
+            eprintln!("ghostrealm: web: {message}");
+            self.notify(Toast::new(Level::Warning, message).on(scope));
+        }
     }
 
     /// A terminal surface's child state.

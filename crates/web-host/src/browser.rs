@@ -134,6 +134,9 @@ thread_local! {
     static NEXT_MESSAGE: Cell<i32> = const { Cell::new(1) };
     static PENDING: RefCell<HashMap<u64, PendingPopup>> = RefCell::new(HashMap::new());
     static NEXT_POPUP: Cell<u64> = const { Cell::new(POPUP_IDS) };
+    /// Pop-ups reported closed before CEF made them (their opener closed):
+    /// closed once made.
+    static DROPPED: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
     static NEXT_LINK: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -542,7 +545,7 @@ pub fn handle(req: Option<Request>) {
         shut_down();
         return;
     };
-    let req = match PENDING.with_borrow_mut(|m| match m.get_mut(&req_page(&req)) {
+    let req = match PENDING.with_borrow_mut(|m| match req_page(&req).and_then(|id| m.get_mut(&id)) {
         Some(p) => {
             p.queued.push(req);
             None
@@ -587,7 +590,9 @@ pub fn handle(req: Option<Request>) {
             height,
             scale,
             agent,
-        } => create(id, &url, width, height, scale, agent),
+            opener,
+        } => create(id, &url, width, height, scale, agent, opener),
+        Request::FirstPopup { id } => NEXT_POPUP.set(NEXT_POPUP.get().max(id)),
         Request::Close { id } => {
             if let Some(host) = browser(id).and_then(|b| b.host()) {
                 host.close_browser(1);
@@ -680,8 +685,8 @@ pub fn handle(req: Option<Request>) {
 }
 
 /// The page a request is for.
-fn req_page(req: &Request) -> u64 {
-    match req {
+fn req_page(req: &Request) -> Option<u64> {
+    Some(match req {
         Request::Create { id, .. }
         | Request::Close { id }
         | Request::Navigate { id, .. }
@@ -696,7 +701,8 @@ fn req_page(req: &Request) -> u64 {
         | Request::Edit { id, .. }
         | Request::Text { id, .. }
         | Request::Eval { id, .. } => *id,
-    }
+        Request::FirstPopup { .. } => return None,
+    })
 }
 
 fn browser(id: u64) -> Option<Browser> {
@@ -722,9 +728,16 @@ fn show(id: u64, visible: bool) {
     }
 }
 
-fn create(id: u64, url: &str, width: u32, height: u32, scale: f32, agent: bool) {
+/// Make page `id` at `url`; with `opener`, a pop-up of an earlier host made
+/// again (see [`Request::Create`]), refused past the opener's cap.
+fn create(id: u64, url: &str, width: u32, height: u32, scale: f32, agent: bool, opener: Option<u64>) {
     if browser(id).is_some() {
         resize(id, width, height, scale);
+        return;
+    }
+    if let Some(opener) = opener.filter(|o| popups_of(*o) >= MAX_POPUPS) {
+        emit(&Event::PopupRefused { opener, url: url.to_string(), from_input: !agent });
+        emit(&Event::Closed { id });
         return;
     }
     let view = new_view(id, width, height, scale);
@@ -750,7 +763,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32, agent: bool) 
                 view,
                 _devtools: devtools,
                 eval: EvalState::default(),
-                opener: None,
+                opener,
                 input_at: None,
                 enter_last: false,
                 links: Vec::new(),
@@ -921,9 +934,7 @@ fn admit_popup(
     // The app shows a person's new tab or window as a tab of its own, as a
     // browser does: it outlives its opener.
     let tab = from_input && kind != PopupKind::Popup;
-    let open = BROWSERS.with_borrow(|m| m.values().filter(|e| e.opener == Some(opener)).count())
-        + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener && !p.tab).count());
-    if !tab && open >= MAX_POPUPS {
+    if !tab && popups_of(opener) >= MAX_POPUPS {
         emit(&Event::PopupRefused { opener, url, from_input });
         return None;
     }
@@ -953,13 +964,20 @@ fn admit_popup(
     Some((id, view))
 }
 
+/// The pop-ups page `opener` has open or being made (a person's tabs aside).
+fn popups_of(opener: u64) -> usize {
+    BROWSERS.with_borrow(|m| m.values().filter(|e| e.opener == Some(opener)).count())
+        + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener && !p.tab).count())
+}
+
 /// Pop-up `id`'s browser exists: serve it, off screen (a person's hidden
 /// until the app shows it, an agent's visible to Chromium, see [`show`]),
 /// and run the requests that waited for it.
 fn popup_created(id: u64, b: &Browser) {
     let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&id)) else {
         // Its opener closed before it was made (and it was reported closed).
-        if id >= POPUP_IDS && browser(id).is_none() {
+        // Any other is a page `create` makes, a pop-up made again included.
+        if DROPPED.with_borrow_mut(|d| d.remove(&id)) {
             if let Some(h) = b.host() {
                 h.close_browser(1);
             }
@@ -1023,6 +1041,7 @@ fn close_popups(id: u64) {
         ids.into_iter().filter_map(|k| m.remove(&k).map(|p| (k, p))).collect()
     });
     for (popup, p) in pending {
+        DROPPED.with_borrow_mut(|d| d.insert(popup));
         for req in p.queued {
             match req {
                 Request::Eval { req, .. } => {

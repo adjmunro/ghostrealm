@@ -131,7 +131,8 @@ fn a_host_hung_up_on_frees_its_profile_once_gone() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(again.wait_loaded(1, Duration::from_secs(20)));
     assert_eq!(again.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
@@ -158,7 +159,7 @@ fn a_profile_reached_through_a_symlink_keeps_storage_on_disk() {
         return;
     };
     let (base, _) = serve();
-    let page = Request::Create { id: 1, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: false };
+    let page = Request::Create { id: 1, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: false, opener: None };
     assert!(host.send(&page));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     let store = "document.cookie = 'kept=cookie; max-age=3600'; localStorage.setItem('kept', 'storage'); 1";
@@ -201,8 +202,8 @@ fn an_agents_pages_stay_visible_to_chromium_off_screen() {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/blank"), width: 100, height: 100, scale: 1.0, agent: false }));
-    assert!(host.send(&Request::Create { id: 2, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: true }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/blank"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
+    assert!(host.send(&Request::Create { id: 2, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: true, opener: None }));
     for id in [1, 2] {
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page {id} never loaded");
     }
@@ -241,7 +242,7 @@ fn an_agents_page_off_screen_paints_at_the_unseen_frame_rate() {
     let Some((host, cache)) = spawn("frame-rate") else {
         return;
     };
-    let page = Request::Create { id: 1, url: data_url("<p>agent"), width: 100, height: 100, scale: 1.0, agent: true };
+    let page = Request::Create { id: 1, url: data_url("<p>agent"), width: 100, height: 100, scale: 1.0, agent: true, opener: None };
     assert!(host.send(&page));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     // Animation frames a second, over one second.
@@ -289,7 +290,8 @@ fn page_paints_and_answers_text_and_eval() {
         width: 64,
         height: 48,
         scale: 2.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(
         host.wait_loaded(1, Duration::from_secs(20)),
@@ -367,7 +369,8 @@ fn right_and_middle_presses_reach_the_page() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(
         host.wait_loaded(1, Duration::from_secs(20)),
@@ -466,7 +469,8 @@ fn a_hostile_page_cannot_shape_eval_results() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     let eval = |js: &str| host.eval(1, js, Duration::from_secs(5));
@@ -521,7 +525,8 @@ fn a_dead_renderer_is_reported_and_reload_revives_it() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     assert_eq!(host.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
@@ -747,7 +752,7 @@ fn a_clicked_popup_keeps_its_opener_and_closes_itself() {
         return;
     };
     let (base, _) = serve();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 800, height: 600, scale: 2.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 800, height: 600, scale: 2.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
 
@@ -783,7 +788,7 @@ fn a_popup_says_how_the_page_asked_for_it() {
     let mut id = 0;
     let mut click_on = |host: &mut WebHost, path: &str| {
         id += 1;
-        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
         click_for_popup(host, id)
@@ -822,7 +827,7 @@ fn a_persons_tab_outlives_its_opener() {
     };
     let (base, _) = serve();
     let open = |host: &mut WebHost, id, path: &str| {
-        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
     };
@@ -891,7 +896,7 @@ fn a_modified_or_middle_clicked_link_opens_a_tab() {
         (mods::SHIFT, middle, PopupKind::Tab),
     ];
     let open = |host: &mut WebHost, id, path: &str| {
-        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: format!("{base}{path}"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
     };
@@ -947,7 +952,7 @@ fn a_persons_popup_past_the_cap_is_refused_as_theirs() {
         return;
     };
     let (base, _) = serve();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/openwindow"), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/openwindow"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
 
@@ -990,7 +995,7 @@ fn an_agents_modified_click_opens_a_hidden_popup() {
         return;
     };
     let (base, _) = serve();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/link"), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/link"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     let click = format!(
         "document.querySelector('a').dispatchEvent(new MouseEvent('click', \
@@ -1186,10 +1191,10 @@ fn a_modified_click_loads_as_its_page_asked() {
         return;
     };
     let (a, b, hits) = serve_sites();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{a}/cookies"), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{a}/cookies"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     let open = |host: &mut WebHost, id, url: String| {
-        assert!(host.send(&Request::Create { id, url, width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url, width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
     };
@@ -1228,7 +1233,7 @@ fn a_modified_click_keeps_a_links_referrer_policy() {
     };
     let (a, b, hits) = serve_sites();
     for (id, route) in [(1, "nrlink"), (2, "nplink"), (3, "closedlink")] {
-        assert!(host.send(&Request::Create { id, url: format!("{b}/{route}?{a}/hit-{route}"), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: format!("{b}/{route}?{a}/hit-{route}"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(&mut host, id, [0, 0, 255]);
         let tab = click_for_popup_with(&host, id, NEW_TAB, MouseButton::Left);
@@ -1252,7 +1257,7 @@ fn the_link_script_runs_only_in_the_document_that_asked() {
     };
     let (a, b, hits) = serve_sites();
     let page = format!("{b}/link?{a}/hit-guard");
-    assert!(host.send(&Request::Create { id: 1, url: page.clone(), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: page.clone(), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     let url = format!("{a}/hit-guard");
     let run = |from: &str| host.eval_as(1, &link_script(from, &url, false), true, Duration::from_secs(5));
@@ -1304,7 +1309,7 @@ fn a_modified_click_after_a_navigation_opens_a_tab() {
         return;
     };
     let (a, b, hits) = serve_sites();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{b}/beacon?{a}/hit-first"), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{b}/beacon?{a}/hit-first"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     raw_click_until_heard(&host, 1, &hits, 1);
@@ -1338,7 +1343,7 @@ fn a_modified_click_does_not_open_from_an_error_page() {
         "<body style='margin:0'><a href='{a}/hit-error' style='position:fixed;inset:0;background:rgb(255,0,0)' \
          onclick=\"document.title = 'clicked'\">x</a>"
     ));
-    assert!(host.send(&Request::Create { id: 1, url: page, width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: page, width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     // No eval reaches the page before the link's, so its world is made
@@ -1393,7 +1398,7 @@ fn a_modified_click_in_a_sandboxed_document_keeps_its_sandbox() {
     };
     let (a, b, hits) = serve_sites();
     let open = |host: &mut WebHost, id, url: &str| {
-        assert!(host.send(&Request::Create { id, url: url.into(), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: url.into(), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
     };
@@ -1428,7 +1433,7 @@ fn a_modified_click_in_a_local_file_opens_a_tab() {
     let file = cache.with_extension("html");
     std::fs::write(&file, LINK.replace("LINK", &format!("href={a}/hit-file"))).unwrap();
     let url = format!("file://{}", file.display());
-    assert!(host.send(&Request::Create { id: 1, url, width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url, width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     let tab = click_for_popup_with(&host, 1, NEW_TAB, MouseButton::Left);
@@ -1456,7 +1461,7 @@ fn a_modified_click_does_not_open_from_the_next_document() {
     };
     let (a, b, hits) = serve_sites();
     let url = format!("{b}/link?{a}/hit-gated");
-    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     click_at_until(&host, 1, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
@@ -1481,7 +1486,7 @@ fn a_modified_click_in_a_frame_opens_nothing() {
     };
     let (a, b, hits) = serve_sites();
     let url = format!("{b}/sandboxed?{a}/hit-framed");
-    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: url.clone(), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     wait_painted(&mut host, 1, [0, 0, 255]);
     click_at_until(&host, 1, (20, 20), NEW_TAB, "+(document.body.dataset.clicks || 0) > 0");
@@ -1513,7 +1518,7 @@ fn a_form_submitted_with_a_modifier_posts_in_place() {
     };
     let (a, _, hits) = serve_sites();
     let open = |host: &mut WebHost, id| {
-        assert!(host.send(&Request::Create { id, url: format!("{a}/post"), width: 100, height: 100, scale: 1.0, agent: false }));
+        assert!(host.send(&Request::Create { id, url: format!("{a}/post"), width: 100, height: 100, scale: 1.0, agent: false, opener: None }));
         assert!(host.wait_loaded(id, Duration::from_secs(20)), "page never loaded");
         wait_painted(host, id, [0, 0, 255]);
     };
@@ -1551,7 +1556,7 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
         return;
     };
     let (base, _) = serve();
-    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0, agent: false }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0, agent: false, opener: None }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
 
     // An eval is no user gesture unless asked; a gesture eval opens it.
@@ -1598,6 +1603,64 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     shut_down(host, &cache);
 }
 
+/// Given a host told to number its pop-ups from past those of an earlier
+/// host, and a page;
+/// when pop-ups of that page are made again by id, up to the cap and past
+/// it, then the page opens one of its own and closes;
+/// then those made again load without `window.opener` and count toward the
+/// cap (the one past it is refused, a person's as theirs; the page can open
+/// none), the page's own takes the next number, and closing the page closes
+/// them all.
+#[test]
+fn popups_made_again_count_toward_the_cap_and_close_with_their_opener() {
+    use ghostrealm_web::protocol::{MAX_POPUPS, POPUP_IDS};
+    let Some((host, cache)) = spawn("popup-again") else {
+        return;
+    };
+    let (base, _) = serve();
+    let first = POPUP_IDS + 10;
+    assert!(host.send(&Request::FirstPopup { id: first }));
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0, agent: false, opener: None }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let again = |id, agent| Request::Create { id, url: format!("{base}/stay"), width: 200, height: 150, scale: 1.0, agent, opener: Some(1) };
+    let ids: Vec<u64> = (0..MAX_POPUPS as u64).map(|n| POPUP_IDS + n).collect();
+    for id in &ids {
+        assert!(host.send(&again(*id, true)));
+    }
+    for id in &ids {
+        assert!(host.wait_loaded(*id, Duration::from_secs(20)), "pop-up {id} never loaded");
+    }
+    let p = ids[0];
+    assert_eq!(host.eval(p, "document.title", Duration::from_secs(5)), Ok("\"Stay\"".into()));
+    assert_eq!(host.eval(p, "window.opener === null", Duration::from_secs(5)), Ok("true".into()));
+
+    // Past the cap: an agent's is refused as theirs, a person's as theirs.
+    let (agents, persons) = (POPUP_IDS + MAX_POPUPS as u64, POPUP_IDS + MAX_POPUPS as u64 + 1);
+    assert!(host.send(&again(agents, true)));
+    wait_closed(&host, agents);
+    assert!(host.send(&again(persons, false)));
+    wait_closed(&host, persons);
+    assert_eq!(host.view(1).unwrap().popups_refused, 2);
+    assert_eq!(host.take_input_refusals(1), 1, "the person's");
+    let open = |n: &str| host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5)) == Ok(n.into());
+    assert!(open("false"), "the page has pop-ups enough");
+
+    // One closes: the page's own takes its place, numbered past the earlier host's.
+    assert!(host.send(&Request::Close { id: p }));
+    wait_closed(&host, p);
+    assert!(open("true"));
+    let [own] = <[_; 1]>::try_from(wait_popups(&host, 1, 1)).unwrap();
+    assert_eq!(own.id, first, "{own:?}");
+
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, 1);
+    for id in ids[1..].iter().copied().chain([own.id]) {
+        wait_closed(&host, id);
+    }
+
+    shut_down(host, &cache);
+}
+
 #[test]
 fn an_eval_whose_page_navigates_away_runs_once() {
     let Some((host, cache)) = spawn("navigate") else {
@@ -1610,7 +1673,8 @@ fn an_eval_whose_page_navigates_away_runs_once() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"A\"".into()));
@@ -1647,7 +1711,8 @@ fn an_expired_eval_making_the_world_does_not_block_later_ones() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
     std::thread::sleep(Duration::from_millis(600));

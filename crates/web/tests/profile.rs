@@ -39,7 +39,8 @@ fn a_second_host_on_one_profile_reports_it_in_use() {
         width: 64,
         height: 48,
         scale: 1.0,
-        agent: false
+        agent: false,
+        opener: None,
     }));
     assert!(first.wait_loaded(1, Duration::from_secs(20)));
     assert_eq!(first.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));

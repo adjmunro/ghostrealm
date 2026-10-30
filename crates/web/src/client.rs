@@ -161,6 +161,10 @@ struct Shared {
     pending: HashMap<u64, u64>,
     /// Answers to pending requests, keyed by request id.
     replies: HashMap<u64, Event>,
+    /// Pages the app asked the host to make, until it forgets them: one the
+    /// host closes before any other event about it (a pop-up made again past
+    /// its opener's cap) is still reported closed.
+    made: std::collections::HashSet<u64>,
     /// Pop-ups not yet taken by their opener's view.
     popups: Vec<PopupInfo>,
     /// A person's tabs whose opener the app forgot before its view took
@@ -335,7 +339,11 @@ impl WebHost {
     /// has gone away, or isn't reading and the queue is full (a dropped mouse
     /// move or wheel step still returns true).
     pub fn send(&self, req: &Request) -> bool {
-        enqueue(&self.outbox, req)
+        let sent = enqueue(&self.outbox, req);
+        if let (true, Request::Create { id, .. }) = (sent, req) {
+            self.shared.0.lock().unwrap().made.insert(*id);
+        }
+        sent
     }
 
     /// Whether the host process is still running.
@@ -387,6 +395,7 @@ impl WebHost {
         let mut s = self.shared.0.lock().unwrap();
         s.views.remove(&id);
         s.closed_refusals.remove(&id);
+        s.made.remove(&id);
         if !s.closed.remove(&id) {
             s.forgotten.insert(id);
         }
@@ -762,7 +771,8 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
         // the pop-ups it opened (a tab can outlive it).
         Event::Closed { id } => {
             let view = s.views.remove(&id);
-            let known = view.is_some() || s.popups.iter().any(|p| p.id == id);
+            let made = s.made.remove(&id);
+            let known = made || view.is_some() || s.popups.iter().any(|p| p.id == id);
             if known {
                 s.closed.insert(id);
                 if let Some(n) = view.map(|v| v.input_refusals).filter(|n| *n > 0) {
@@ -1133,6 +1143,32 @@ mod tests {
         assert!(host.shared.0.lock().unwrap().closed_refusals.contains_key(&5));
         host.forget(1);
         assert!(host.shared.0.lock().unwrap().closed_refusals.is_empty(), "dropped with its opener");
+    }
+
+    /// A page the host closes before reporting anything else about it (a
+    /// pop-up it refuses to make again) is closed.
+    #[test]
+    fn a_page_closed_before_any_other_event_is_closed() {
+        let host = WebHost {
+            child: None,
+            outbox: Arc::default(),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+            reaped: Arc::default(),
+        };
+        let create = Request::Create {
+            id: 7,
+            url: "https://pop.test/".into(),
+            width: 200,
+            height: 100,
+            scale: 1.0,
+            agent: true,
+            opener: Some(1),
+        };
+        assert!(host.send(&create));
+        apply_event(&host.shared, Event::Closed { id: 7 });
+        assert!(host.is_closed(7));
     }
 
     #[test]

@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
-/// Ids at or above this are pages the host made for pop-ups ([`Event::Popup`]);
-/// the app numbers the pages it creates below it.
+/// Ids at or above this are pages a host made for pop-ups ([`Event::Popup`]);
+/// the app numbers the pages it creates below it. A pop-up keeps its id when
+/// the app makes it again in a later host ([`Request::FirstPopup`]).
 pub const POPUP_IDS: u64 = 1 << 40;
 
 /// Frames per second an agent's page paints at while off screen (60 on
@@ -113,6 +114,19 @@ pub enum Request {
         /// An agent drives the page: off screen it stays visible to Chromium
         /// (see [`Request::Visible`]).
         agent: bool,
+        /// The page is a pop-up of page `opener` that an earlier host made
+        /// (made again, without `window.opener`): it counts toward the
+        /// opener's [`MAX_POPUPS`] and closes with it. Past the cap the host
+        /// refuses it as it refuses a new pop-up ([`Event::PopupRefused`],
+        /// a person's unless `agent`), then reports it [`Event::Closed`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opener: Option<u64>,
+    },
+    /// The host numbers the pop-ups it makes from `id` (never below
+    /// [`POPUP_IDS`]): lower ids are pop-ups of earlier hosts that the app
+    /// makes again with `Create`. Sent before any other request.
+    FirstPopup {
+        id: u64,
     },
     Close {
         id: u64,
@@ -419,6 +433,24 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""op":"mouse""#), "{s}");
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
+    }
+
+    /// A page's `Create` has no opener; a pop-up made again names its own,
+    /// and the host is told where to number its pop-ups from.
+    #[test]
+    fn create_carries_an_opener_only_for_a_popup_made_again() {
+        let page = r#"{"op":"create","id":1,"url":"u","width":1,"height":1,"scale":1.0,"agent":false}"#;
+        let r: Request = serde_json::from_str(page).unwrap();
+        assert!(matches!(r, Request::Create { opener: None, .. }), "{r:?}");
+        assert_eq!(serde_json::to_string(&r).unwrap(), page);
+        let popup = Request::Create { id: POPUP_IDS, url: "u".into(), width: 1, height: 1, scale: 1.0, agent: true, opener: Some(1) };
+        let s = serde_json::to_string(&popup).unwrap();
+        assert!(s.ends_with(r#""opener":1}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), popup);
+        let first = Request::FirstPopup { id: POPUP_IDS + 3 };
+        let s = serde_json::to_string(&first).unwrap();
+        assert_eq!(s, format!(r#"{{"op":"first_popup","id":{}}}"#, POPUP_IDS + 3));
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), first);
     }
 
     #[test]
