@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Ids at or above this are pages the host made for pop-ups ([`Event::Popup`]);
 /// the app numbers the pages it creates below it.
@@ -317,6 +317,8 @@ pub enum Event {
     PopupRefused {
         opener: u64,
         url: String,
+        /// A person's input asked for it, as [`Event::Popup`]'s `from_input`.
+        from_input: bool,
     },
     /// The page closed: by a `Close` request, `window.close()`, its opener
     /// closing (a pop-up), or a pop-up that was never made.

@@ -82,6 +82,10 @@ pub struct ViewState {
     ///
     /// [`MAX_POPUPS`]: crate::protocol::MAX_POPUPS
     pub popups_refused: u32,
+    /// Of those, the ones a person's input asked for that the app hasn't
+    /// taken ([`WebHost::take_input_refusals`]), so it can say so: an agent
+    /// reads `popups_refused`, a person sees nothing open.
+    pub input_refusals: u32,
     /// Bumped on every event for this page but a frame, so a caller can tell
     /// it changed.
     pub version: u64,
@@ -425,6 +429,13 @@ impl WebHost {
         mine
     }
 
+    /// How many pop-ups a person asked page `id` for that the host refused
+    /// since last asked.
+    pub fn take_input_refusals(&self, id: u64) -> u32 {
+        let mut s = self.shared.0.lock().unwrap();
+        s.views.get_mut(&id).map_or(0, |v| std::mem::take(&mut v.input_refusals))
+    }
+
     /// The latest frame of `id`.
     pub fn frame(&mut self, id: u64) -> Option<SharedFrame> {
         let info = self.view(id)?.frame?;
@@ -731,7 +742,11 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
                 s.popups.push(p);
             }
         }
-        Event::PopupRefused { opener, .. } => s.views.entry(opener).or_default().popups_refused += 1,
+        Event::PopupRefused { opener, from_input, .. } => {
+            let v = s.views.entry(opener).or_default();
+            v.popups_refused += 1;
+            v.input_refusals += u32::from(from_input);
+        }
         // A person's tab no view took yet closed: none will now.
         Event::Closed { id } if s.orphans.iter().any(|p| p.id == id) => {
             s.orphans.retain(|p| p.id != id);
@@ -1055,13 +1070,36 @@ mod tests {
     #[test]
     fn refused_popups_are_counted_until_the_next_load() {
         let shared: (Mutex<Shared>, Condvar) = Default::default();
-        let refused = || Event::PopupRefused { opener: 1, url: String::new() };
+        let refused = || Event::PopupRefused { opener: 1, url: String::new(), from_input: false };
         let loading = |loading| Event::Loading { id: 1, loading, can_back: false, can_forward: false };
         apply_event(&shared, refused());
         apply_event(&shared, refused());
         assert_eq!(shared.0.lock().unwrap().views[&1].popups_refused, 2);
         apply_event(&shared, loading(true));
         assert_eq!(shared.0.lock().unwrap().views[&1].popups_refused, 0);
+    }
+
+    /// The refusals a person's input caused are handed to the app once; an
+    /// agent's are only counted.
+    #[test]
+    fn a_persons_refused_popups_are_taken_once() {
+        let host = WebHost {
+            child: None,
+            outbox: Arc::default(),
+            shared: Arc::default(),
+            next_req: AtomicU64::new(1),
+            readers: HashMap::new(),
+            reaped: Arc::default(),
+        };
+        let refused = |from_input| Event::PopupRefused { opener: 1, url: String::new(), from_input };
+        apply_event(&host.shared, refused(false));
+        assert_eq!(host.take_input_refusals(1), 0, "an agent's");
+        apply_event(&host.shared, refused(true));
+        apply_event(&host.shared, refused(true));
+        assert_eq!(host.take_input_refusals(1), 2);
+        assert_eq!(host.take_input_refusals(1), 0, "taken once");
+        assert_eq!(host.view(1).unwrap().popups_refused, 3, "all are counted");
+        assert_eq!(host.take_input_refusals(2), 0, "an unknown page");
     }
 
     #[test]

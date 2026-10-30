@@ -924,7 +924,7 @@ fn admit_popup(
     let open = BROWSERS.with_borrow(|m| m.values().filter(|e| e.opener == Some(opener)).count())
         + PENDING.with_borrow(|m| m.values().filter(|p| p.opener == opener && !p.tab).count());
     if !tab && open >= MAX_POPUPS {
-        emit(&Event::PopupRefused { opener, url });
+        emit(&Event::PopupRefused { opener, url, from_input });
         return None;
     }
     let id = NEXT_POPUP.get();

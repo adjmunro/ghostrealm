@@ -587,6 +587,7 @@ fn serve() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
                 "/stay" => "<title>Stay</title><p>stay text</p>".to_string(),
                 "/blank" => LINK.replace("LINK", "target=_blank href=/stay"),
                 "/selfclose" => LINK.replace("LINK", "target=_blank href=/stay onclick='setTimeout(() => window.close(), 0)'"),
+                "/openwindow" => LINK.replace("LINK", "onclick=\"window.open('/stay', '_blank', 'width=100,height=100')\""),
                 "/opentab" => LINK.replace("LINK", "onclick=\"window.open('/stay'); document.body.dataset.opened = 1\""),
                 "/link" => format!("<title>Link</title>{}", LINK.replace("LINK", "href=/stay")),
                 "/aboutlink" => LINK.replace("LINK", "href=about:blank"),
@@ -936,6 +937,46 @@ fn a_modified_or_middle_clicked_link_opens_a_tab() {
     shut_down(host, &cache);
 }
 
+/// Given a page that opens a pop-up window on each click;
+/// when a person clicks it one more time than the pop-up cap;
+/// then each click up to the cap opens a person's pop-up window, and the
+/// one past it is refused as a person's, for the app to say so.
+#[test]
+fn a_persons_popup_past_the_cap_is_refused_as_theirs() {
+    let Some((mut host, cache)) = spawn("popup-refused-input") else {
+        return;
+    };
+    let (base, _) = serve();
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/openwindow"), width: 100, height: 100, scale: 1.0, agent: false }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    wait_painted(&mut host, 1, [0, 0, 255]);
+
+    let max = ghostrealm_web::protocol::MAX_POPUPS;
+    let mut open = Vec::new();
+    for n in 1..=max {
+        click_until(&host, 1, &format!("+(document.body.dataset.clicks || 0) >= {n}"));
+        open.extend(wait_popups(&host, 1, 1));
+    }
+    assert!(open.iter().all(|p| p.from_input && p.kind == PopupKind::Popup), "{open:?}");
+    click_until(&host, 1, &format!("+(document.body.dataset.clicks || 0) > {max}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.view(1).unwrap().popups_refused == 0 {
+        assert!(Instant::now() < deadline, "the click past the cap was never refused");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(host.take_input_refusals(1), 1);
+    assert_eq!(host.take_input_refusals(1), 0, "taken once");
+    assert!(host.take_popups(1).is_empty());
+
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, 1);
+    for q in open {
+        wait_closed(&host, q.id);
+    }
+
+    shut_down(host, &cache);
+}
+
 /// Given a page covered by a link to `/stay` that no person has touched;
 /// when an eval without a gesture dispatches a Cmd-click (Ctrl off macOS) on
 /// it, then gesture evals dispatch one more than the pop-up cap;
@@ -979,6 +1020,7 @@ fn an_agents_modified_click_opens_a_hidden_popup() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(host.view(1).unwrap().popups_refused, 1);
+    assert_eq!(host.take_input_refusals(1), 0, "an agent's");
     assert!(host.take_popups(1).is_empty());
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Link\"".into()));
     assert_eq!(host.view(1).unwrap().url, format!("{base}/link"));
@@ -1545,6 +1587,7 @@ fn a_scripted_popup_is_drivable_and_closes_with_its_opener() {
     }
     assert!(open("false".into()), "one too many");
     assert_eq!(host.view(1).unwrap().popups_refused, 1);
+    assert_eq!(host.take_input_refusals(1), 0, "an agent's");
     let open = wait_popups(&host, 1, max);
     assert!(host.send(&Request::Close { id: 1 }));
     wait_closed(&host, 1);
