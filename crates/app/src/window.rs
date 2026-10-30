@@ -5554,8 +5554,8 @@ impl FontGen {
     }
 
     /// Set `scale` to `to` and re-measure the cell; text shaped before is
-    /// stale. Setting the scale only here gives every new scale a new
-    /// generation.
+    /// stale. By convention (nothing in this module enforces it), `Window`
+    /// sets its scale only here, so every new scale gets a new generation.
     fn rescale(
         &mut self,
         fs: &mut FontSystem,
@@ -5570,7 +5570,8 @@ impl FontGen {
     /// Replace `fs` with `full` and re-measure the cell: the same pinned
     /// monospace should measure the same, but the fuller set may resolve it
     /// to another face. Its glyphs differ, so the atlas is warmed again.
-    /// Replacing the font system only here gives every new font set a new
+    /// By convention (nothing in this module enforces it), `Window` replaces
+    /// its font system only here, so every new font set gets a new
     /// generation.
     fn swap_db(
         &mut self,
