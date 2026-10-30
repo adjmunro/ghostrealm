@@ -1443,33 +1443,6 @@
 
 ---
 
-[2026-10-31T04:59+1300@22b9fe3f] Roles — follow-ups from the review-rounds rule review
-
-- Requires: NO BLOCKERS
-- Detail: `.claude/skills/build/SKILL.md`: the "copy the crate" compile-check
-  doesn't build. Crates inherit workspace settings and depend on each other's
-  cfg code. Use a copy of the whole workspace, or a worktree with the cfg swap
-  applied to every `.rs`, built with its own `CARGO_TARGET_DIR` and
-  `CARGO_INCREMENTAL=0`.
-- Detail: `docs/GIT.md`: "a clean rebase needs no review" should require the
-  build and tests to pass after the rebase. Optionally say a commit rebased
-  cleanly from an approved one counts as approved.
-- Detail: `.claude/agents/code-reviewer.md`: the non-destructive other-OS rule
-  relies on the implementer's compile-check claim reaching the reviewer. Let
-  the reviewer's own compile-check satisfy it, or have `director.md` pass the
-  claim in the review brief.
-- Detail: `docs/GIT.md`: the exemption clauses name "non-blocking findings"
-  only. Write "non-blocking findings or nits".
-- Detail: `.claude/agents/code-implementer.md`: "Run the tests ... including a
-  test per deletion guard" becomes "write and run".
-- Detail: `.claude/skills/flag-for-owner/SKILL.md`: "rebase it onto develop"
-  should name the director's branch.
-- Detail: a decisions-pending-only rebase that conflicts triggers a delta
-  review of a record-only change. Consider a carve-out.
-- Reason: recorded from the delta review of 22b9fe3.
-
----
-
 [2026-10-31T05:04+1300@1fd5377a] Web — refused pop-up leftovers
 
 - Requires: NO BLOCKERS

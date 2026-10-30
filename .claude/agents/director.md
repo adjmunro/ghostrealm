@@ -31,7 +31,7 @@ Work autonomously. When something can't be solved, or needs a decision that is i
 
 How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review. Parallel implementers in one checkout collide: give all but one `isolation: "worktree"`.
 
-Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates.
+Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates. A review brief for code that targets an OS this machine can't run says whether the implementer compile-checked it.
 
 Review rounds, non-blocking findings and nits: per `docs/GIT.md` Branch Hygiene.
 

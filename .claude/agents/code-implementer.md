@@ -26,7 +26,7 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 ## Implement
 
 - Branch from the base in the brief, per `docs/GIT.md`. Commit as you go and push your branch. Never move `develop`.
-- Run the tests that cover what you changed, including a test per deletion guard that drives it to fail and asserts the file is kept.
+- Write and run the tests that cover what you changed, including a test per deletion guard that drives it to fail and asserts the file is kept.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
 - If you near 300,000 tokens of context, or the task grows well beyond the brief, stop and report with a handoff note.

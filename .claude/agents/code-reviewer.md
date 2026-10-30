@@ -27,7 +27,7 @@ Review the delta the brief names (base..tip), not each commit. Ignore what a lat
 
 If the delta deletes or overwrites files the change did not create, each guard needs a test that drives it to fail (error, empty, truncated or unreadable input; sandbox, symlink, another user) and asserts the file is kept. Check those tests exist and run them. A missing test, or any failure that leads to deletion, is blocking.
 
-Code for an OS this machine can't run: destructive code enabled on that OS is blocking; other code is blocking unless the implementer's report says it was compile-checked.
+Code for an OS this machine can't run: destructive code enabled on that OS is blocking; other code is blocking unless it was compile-checked for that OS, by the implementer (as the review brief says) or by you (`build` skill).
 
 Reviewing fixes for an approval with non-blocking findings: block only on blocking findings; anything else goes to `docs/TODO.md`, per `docs/GIT.md`.
 

@@ -5,7 +5,7 @@
 - COMMITTING AND PUSHING ARE PRE-AUTHORISED: commit and push freely, without asking. This
   project runs autonomously; no per-commit or per-push approval is needed.
 - NEVER SIGN COMMITS OR TAGS: always pass `--no-gpg-sign` (`git commit --no-gpg-sign`, likewise for `merge`, `rebase`, `cherry-pick` and `revert`; `git tag --no-sign`). Signing waits for a human to unlock the key, and agents work while no human is present.
-- `develop` MOVES ONLY BY FAST-FORWARD, AND ONLY ONTO COMMITS 🔍 Code Reviewer HAS APPROVED (OR THAT ONLY RECORD AN APPROVED REVIEW'S NON-BLOCKING FINDINGS). Push it after each fast-forward. Never force-push it.
+- `develop` MOVES ONLY BY FAST-FORWARD, AND ONLY ONTO COMMITS 🔍 Code Reviewer HAS APPROVED (OR THAT ONLY RECORD AN APPROVED REVIEW'S NON-BLOCKING FINDINGS OR NITS). Push it after each fast-forward. Never force-push it.
 - DO NOT COMMIT TO `develop`, `main`, or `master`. WORK ON A NEW BRANCH.
 - NEVER PUSH TO `origin/main` OR `origin/master`. STOP. ASK YOUR HUMAN FOR FURTHER INSTRUCTIONS.
 - IF THE LOCAL AND REMOTE BRANCH NAMES DO NOT MATCH, STOP. ASK YOUR HUMAN FOR FURTHER INSTRUCTION. DO NOT PROCEED.
@@ -57,14 +57,14 @@ Except for dependency bumps, which should look like so:
 - Automatically create a new stacked branch every turn (unless no changes were made in the previous turn), or when the new overarching goal is significantly/conceptually different.
 - Always make a backup branch before risky changes, for example, when modifying commit history, and then verify the backup against the new branch. Delete the backup if full and complete, and not degraded. Note that it might not be identical, such as when rebasing. However, if the sum of all changes *can* be identical (no base delta), then it *must* be identical before accepting the change & deleting the backup.
 - When rebasing, aim to preserve the *intent* behind both branches changes (unless redundant).
-- `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed and approved, or only records an approved review's non-blocking findings. Commits above `develop` are work in progress.
+- `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed and approved, or only records an approved review's non-blocking findings or nits. Commits above `develop` are work in progress.
 - Blocking findings are fixed, and the fix reviewed, before `develop` advances.
-- After an approval with non-blocking findings, they get one fix round (or are written down in findings docs / `TODO.md` when something is stacked on top) and one delta review of the fixes. That review blocks only on blocking findings; its non-blocking findings go to `TODO.md` in a recording commit and `develop` advances, with no further round. A commit that only records non-blocking findings needs no review of its own.
+- After an approval with non-blocking findings, they get one fix round (or are written down in findings docs / `TODO.md` when something is stacked on top) and one delta review of the fixes. That review blocks only on blocking findings; its non-blocking findings go to `TODO.md` in a recording commit and `develop` advances, with no further round. A commit that only records non-blocking findings or nits needs no review of its own.
 - Nits (wording, naming, comments) never start a review round. They are fixed only in a round a later review covers; nits from the last review of a branch, or from a plain approve, are only recorded in `TODO.md`.
 - Review the branch delta (tip vs base), not each commit. Ignore issues a later commit or branch already fixed.
 - Fixes get an adversarial review from a fresh context.
 - Delete findings and `TODO.md` entries once done.
-- Never rewrite a pushed branch; the permission classifier blocks force-push. To move a branch onto a newer `develop`: create `<name>-<n>` from the branch, rebase it onto `develop`, push it to a remote branch of the same name, and delete the old remote branch once `develop` advances. A rebase that changes the branch delta (conflict resolution) needs a delta review of that change; a clean rebase doesn't. A branch started after another has landed is named for its own purpose, not with a suffix.
+- Never rewrite a pushed branch; the permission classifier blocks force-push. To move a branch onto a newer `develop`: create `<name>-<n>` from the branch, rebase it onto `develop`, push it to a remote branch of the same name, and delete the old remote branch once `develop` advances. A rebase that changes the branch delta (conflict resolution) needs a delta review of that change, unless the conflict is confined to `decisions-pending.md` or `docs/TODO.md` entries and is resolved by keeping both sides. A clean rebase needs no review once the build and tests pass on the rebased branch; a commit rebased cleanly from an approved one counts as approved. A branch started after another has landed is named for its own purpose, not with a suffix.
 - Fixes take priority over features unless the owner chooses a feature.
 
 ### Format
