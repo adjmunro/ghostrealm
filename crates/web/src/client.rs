@@ -82,8 +82,12 @@ pub struct ViewState {
     ///
     /// [`MAX_POPUPS`]: crate::protocol::MAX_POPUPS
     pub popups_refused: u32,
-    /// Bumped on every event for this page, so a caller can tell it changed.
+    /// Bumped on every event for this page but a frame, so a caller can tell
+    /// it changed.
     pub version: u64,
+    /// Bumped on every frame: a page off screen can paint without anything
+    /// on screen changing.
+    pub frames: u64,
 }
 
 /// A pop-up the host made ([`Event::Popup`]), until the app takes it.
@@ -660,7 +664,12 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
         return orphans;
     }
     if let Some(id) = page_of(&ev) {
-        s.views.entry(id).or_default().version += 1;
+        let v = s.views.entry(id).or_default();
+        if matches!(ev, Event::Frame { .. }) {
+            v.frames += 1;
+        } else {
+            v.version += 1;
+        }
     }
     match ev {
         Event::Ready { protocol } if protocol == PROTOCOL_VERSION => s.ready = true,

@@ -1012,7 +1012,9 @@ impl WebView {
         let Some(v) = slot.host.as_ref().and_then(|h| h.view(self.page)) else {
             return false;
         };
-        let changed = v.version != self.state.version;
+        // Off screen, a new frame changes nothing drawn; an agent's page
+        // keeps painting there (`UNSEEN_FRAME_RATE`).
+        let changed = v.version != self.state.version || (self.on_screen && v.frames != self.state.frames);
         if !v.url.is_empty() {
             self.last_url = v.url.clone();
         }
@@ -2029,6 +2031,40 @@ pub(crate) mod tests {
         assert!(v.send(None));
         let got = requests(&log, |s| s.contains(r#""op":"create""#));
         assert!(got.contains(r#""agent":false"#), "{got}");
+    }
+
+    /// Given a page off screen (as an agent's pop-up, which keeps painting);
+    /// when the host sends it frames, a title, and frames once it is on screen;
+    /// then only the title and the frames on screen are a change, so frames
+    /// off screen don't redraw the window.
+    #[test]
+    fn frames_off_screen_are_no_change() {
+        let dir = TmpDir::new("web-frames-off-screen");
+        let script = format!(
+            r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'; n=0; while read l; do case "$l" in
+             *paint*) n=$((n+1)); echo '{{"ev":"frame","id":1,"path":"f","slot":0,"width":1,"height":1,"seq":'$n'}}';;
+             *retitle*) echo '{{"ev":"title","id":1,"title":"T"}}';; esac; done"#
+        );
+        let (mut v, _) = stub_host(&dir, &script);
+        assert!(v.send(None));
+        assert_eq!(v.page, 1);
+        v.refresh();
+        let view = |v: &WebView| v.slot.borrow().host.as_ref().and_then(|h| h.view(1)).unwrap_or_default();
+        let ask = |v: &mut WebView, url: &str| assert!(v.send(Some(HostRequest::Navigate { id: 1, url: url.into() })));
+
+        ask(&mut v, "paint");
+        ask(&mut v, "paint");
+        wait("two frames", || view(&v).frames == 2);
+        assert!(!v.refresh(), "frames off screen");
+        ask(&mut v, "retitle");
+        wait("the title", || view(&v).title == "T");
+        assert!(v.refresh(), "a title off screen");
+
+        v.on_screen = true;
+        ask(&mut v, "paint");
+        wait("a frame on screen", || view(&v).frames == 3);
+        assert!(v.refresh(), "a frame on screen");
+        assert!(!v.refresh());
     }
 
     /// The mouse requests in the stub host's log.
