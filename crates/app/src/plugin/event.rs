@@ -126,6 +126,8 @@ pub enum Request {
         choices: Vec<ToastChoice>,
         doc: Option<DocId>,
     },
+    /// Remove the toast keyed `key`, if any (what it reported is over).
+    DismissToast { key: String },
 }
 
 /// A button on a view's toast ([`Request::Toast`]). The app runs it, so the

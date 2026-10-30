@@ -77,6 +77,7 @@ fn snapshot_into_reuses_grid_without_leaving_stale_cells() {
     for (i, c) in grid.cells.iter_mut().enumerate() {
         c.text = format!("x{i}");
     }
+    grid.error = Some("an earlier failure".into());
     term.snapshot_into(&mut grid);
 
     assert_eq!(
@@ -93,6 +94,8 @@ fn snapshot_into_reuses_grid_without_leaving_stale_cells() {
         "cell past the output must be blanked, not a stale 'x…' leftover: {:?}",
         grid.cell(3, 0).unwrap().text
     );
+
+    assert_eq!(grid.error, None, "a good snapshot clears a reused grid's error");
 
     // A fresh snapshot() and a reuse snapshot_into() must agree.
     let fresh = term.snapshot();

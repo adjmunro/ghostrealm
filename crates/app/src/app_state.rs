@@ -939,6 +939,12 @@ impl AppState {
         Some(self.notify(toast))
     }
 
+    /// Remove the toast a view keyed `key` ([`Request::DismissToast`]).
+    /// Returns whether one was queued.
+    pub fn dismiss_toast_key(&mut self, key: &str) -> bool {
+        self.toasts.dismiss_key(key)
+    }
+
     /// Run command `id` from `registry`. A failure goes to stderr and to an
     /// error toast on the pane of `from` (the surface whose menu ran it),
     /// else the focused pane, else the app. A command that only doesn't
@@ -1743,6 +1749,9 @@ impl AppState {
                 Request::Close => self.close_surface_id(sid),
                 req @ Request::Toast { .. } => {
                     self.toast_request(sid, req);
+                }
+                Request::DismissToast { key } => {
+                    self.dismiss_toast_key(&key);
                 }
                 Request::Saved(path) => self.file_saved(&path),
                 Request::OpenFile(path) => {

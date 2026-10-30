@@ -158,18 +158,28 @@ pub struct TerminalView {
     failures: SnapshotFailures,
 }
 
-/// Tracks runs of failed snapshots so each run is reported once: a failure
-/// repeats on every snapshot until the VT recovers. Paint sees the failure
-/// but can't raise a toast, so the report waits for the view's next tick
-/// ([`View::deadline`]).
+/// Tracks runs of failed snapshots so each run is reported once (a failure
+/// repeats on every snapshot until the VT recovers), and its toast is
+/// dismissed when the run ends. Paint sees the outcome but can't raise
+/// requests, so each waits for the view's next tick ([`View::deadline`]).
 #[derive(Debug)]
 struct SnapshotFailures {
     /// Keys this view's toast, so a later run replaces an unread one.
     key: String,
     /// A failure is in progress (reported or not).
     failing: bool,
-    /// A run's first failure, not yet reported: when it was seen, and why.
-    due: Option<(Instant, String)>,
+    /// The toast was raised and not yet dismissed.
+    shown: bool,
+    /// The request the next tick sends, and since when it is due.
+    due: Option<(Instant, Due)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Due {
+    /// A run's first failure, and why.
+    Report(String),
+    /// The run whose failure was reported has ended.
+    Dismiss,
 }
 
 impl SnapshotFailures {
@@ -178,43 +188,54 @@ impl SnapshotFailures {
         SnapshotFailures {
             key: format!("terminal-snapshot:{}", NEXT.fetch_add(1, Ordering::Relaxed)),
             failing: false,
+            shown: false,
             due: None,
         }
     }
 
     /// Note a snapshot's outcome (its [`Grid::error`]). The first failure of
-    /// a run becomes due; a good snapshot ends the run.
+    /// a run becomes due; a good snapshot ends the run, and dismisses its
+    /// toast if one was raised.
     fn observe(&mut self, error: Option<&str>, now: Instant) {
         match error {
             Some(e) if !self.failing => {
                 self.failing = true;
-                self.due = Some((now, e.to_owned()));
+                self.due = Some((now, Due::Report(e.to_owned())));
             }
-            Some(_) => {}
-            None => {
+            None if self.failing => {
                 self.failing = false;
-                self.due = None;
+                self.due = self.shown.then_some((now, Due::Dismiss));
             }
+            _ => {}
         }
     }
 
-    /// When the unreported failure was seen, if one is due.
+    /// Since when a request is due, if one is.
     fn deadline(&self) -> Option<Instant> {
         self.due.as_ref().map(|(at, _)| *at)
     }
 
-    /// The due failure's toast, once.
+    /// The due request, once: the run's toast, or its dismissal.
     fn take(&mut self) -> Option<Request> {
-        let (_, error) = self.due.take()?;
-        let message = format!("Couldn't draw the terminal: {error}");
-        eprintln!("ghostrealm: {message}");
-        Some(Request::Toast {
-            level: Level::Error,
-            message,
-            key: Some(self.key.clone()),
-            choices: Vec::new(),
-            doc: None,
-        })
+        let (_, due) = self.due.take()?;
+        match due {
+            Due::Report(error) => {
+                let message = format!("Couldn't draw the terminal: {error}");
+                eprintln!("ghostrealm: {message}");
+                self.shown = true;
+                Some(Request::Toast {
+                    level: Level::Error,
+                    message,
+                    key: Some(self.key.clone()),
+                    choices: Vec::new(),
+                    doc: None,
+                })
+            }
+            Due::Dismiss => {
+                self.shown = false;
+                Some(Request::DismissToast { key: self.key.clone() })
+            }
+        }
     }
 }
 
@@ -1010,7 +1031,8 @@ mod tests {
     }
 
     /// A run of failed snapshots reports once, when its first is due; a
-    /// good snapshot ends the run, so the next failure reports again.
+    /// good snapshot ends the run and dismisses its toast, so the next
+    /// failure reports again.
     #[test]
     fn a_run_of_failed_snapshots_reports_once() {
         let mut f = SnapshotFailures::new();
@@ -1030,18 +1052,27 @@ mod tests {
         assert_eq!(f.deadline(), None, "the run goes on");
 
         f.observe(None, t0);
+        assert_eq!(f.take(), Some(Request::DismissToast { key: f.key.clone() }));
+        f.observe(None, t0);
+        assert!(f.take().is_none(), "dismissed once");
         f.observe(Some("cols"), t0);
-        assert!(f.take().is_some(), "a new run reports again");
+        assert!(matches!(f.take(), Some(Request::Toast { .. })), "a new run reports again");
     }
 
-    /// A failure the next snapshot recovers from before it is reported never
-    /// reports.
+    /// A run that ends before its toast's tick reports nothing and dismisses
+    /// nothing; a new failure after a dismissal goes unsent reports instead.
     #[test]
     fn a_recovered_failure_is_not_reported() {
         let mut f = SnapshotFailures::new();
         f.observe(Some("snapshot"), Instant::now());
         f.observe(None, Instant::now());
         assert!(f.take().is_none());
+
+        f.observe(Some("snapshot"), Instant::now());
+        f.take();
+        f.observe(None, Instant::now());
+        f.observe(Some("again"), Instant::now());
+        assert!(matches!(f.take(), Some(Request::Toast { .. })), "its toast replaces the shown one");
     }
 
     /// Each terminal keys its own toast, so one pane's failure doesn't
@@ -1274,6 +1305,35 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(v.selection, None, "its row moved");
+    }
+
+    /// A snapshot that failed shows as a toast from the next tick after the
+    /// paint that saw it; one that recovers dismisses it.
+    #[test]
+    fn a_failed_snapshot_toasts_from_the_tick_after_paint() {
+        // An exited shell publishes no more grids, so the paints below keep
+        // the grid set here.
+        let (mut v, mut h) = exited_after(RECT, "true", "go", 10);
+        let cfg = Config::default();
+        assert_eq!(v.deadline(&cfg), None);
+
+        v.grid.error = Some("render state".into());
+        v.snapshotted = false;
+        h.paint(&mut v, RECT);
+        let due = v.deadline(&cfg).expect("a toast is due");
+        let out = h.tick(&mut v, due);
+        let [Request::Toast { message, key: Some(key), .. }] = &out.requests[..] else {
+            panic!("{:?}", out.requests)
+        };
+        assert!(message.contains("render state"), "{message}");
+        let key = key.clone();
+        assert_eq!(v.deadline(&cfg), None, "sent once");
+
+        v.grid.error = None;
+        v.snapshotted = false;
+        h.paint(&mut v, RECT);
+        let due = v.deadline(&cfg).expect("a dismissal is due");
+        assert_eq!(h.tick(&mut v, due).requests, [Request::DismissToast { key }]);
     }
 
     #[test]

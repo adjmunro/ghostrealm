@@ -1992,6 +1992,12 @@ impl State {
                     self.dirty = true;
                     self.window.request_redraw();
                 }
+                Request::DismissToast { key } => {
+                    if self.app.dismiss_toast_key(&key) {
+                        self.dirty = true;
+                        self.window.request_redraw();
+                    }
+                }
                 Request::Close => {
                     if let Some(key) = self.key_in_flight {
                         self.closing_key.hold(key);
