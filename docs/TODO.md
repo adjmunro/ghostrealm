@@ -1467,20 +1467,6 @@
 
 ---
 
-[2026-10-31T04:00+1300@98fb091a] Tests — `giving_up_a_row_drops_the_selection` flakes under load
-
-- Requires: NO BLOCKERS
-- Detail: `plugins::terminal::tests::giving_up_a_row_drops_the_selection`
-  (crates/app/src/plugins/terminal.rs) failed twice with "the grid never
-  gave up a row" on a loaded machine (the CEF host tests running beside
-  `cargo test -p ghostrealm --lib`). One 5 s deadline covers both of its
-  waits: the shell printing a full grid, and then, after the second line
-  of input, the shell's `stty -echo` and `read` and the grid giving up a
-  row. Give each wait its own deadline, or find what the grid waits on.
-- Reason: a flaky test hides real failures.
-
----
-
 [2026-10-31T04:40+1300@8e02fb1d] Tests — `the_web_host_is_hung_up_on_between_requests_once_idle` flakes under load
 
 - Requires: NO BLOCKERS

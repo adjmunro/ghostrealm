@@ -1289,7 +1289,10 @@ mod tests {
 
     #[test]
     fn giving_up_a_row_drops_the_selection() {
-        let mut v = running("printf go; read x; seq 1 12; printf last-row; stty -echo; read y", "go");
+        // `stty -echo` runs before `last-row` shows, so the second newline
+        // isn't echoed: an echoed one would scroll a blank last row into
+        // the grid, which the banner takes without giving up a row.
+        let mut v = running("printf go; read x; seq 1 12; stty -echo; printf last-row; read y", "go");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         v.write_input(b"\n");
