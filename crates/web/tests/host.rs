@@ -6,22 +6,68 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{host_exe, running, shut_down};
 use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind};
 use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
 
+/// Hosts this suite runs at once. Each is a browser, GPU, network and
+/// renderer processes; unbounded, the suite's two dozen hosts load the
+/// machine enough that the OS starves hidden pages' renderers (Chromium runs
+/// them at background priority) for seconds and memory pressure kills hosts.
+const HOSTS_AT_ONCE: usize = 4;
+
+/// Hosts running now, out of [`HOSTS_AT_ONCE`].
+static RUNNING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// A test's turn to run a host: held until the test ends.
+struct Turn;
+
+impl Turn {
+    fn take() -> Turn {
+        let (lock, cv) = &RUNNING;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= HOSTS_AT_ONCE {
+            n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        Turn
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let (lock, cv) = &RUNNING;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
+}
+
+/// A host's profile directory, and the test's [`Turn`] to run it.
+struct Profile {
+    dir: PathBuf,
+    _turn: Turn,
+}
+
+impl std::ops::Deref for Profile {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.dir
+    }
+}
+
 /// A ready host on its own profile `ghostrealm-web-<tag>-<pid>` (removed by the
-/// caller), or `None` when the host isn't built.
-fn spawn(tag: &str) -> Option<(WebHost, PathBuf)> {
+/// caller), or `None` when the host isn't built. It waits for a [`Turn`].
+fn spawn(tag: &str) -> Option<(WebHost, Profile)> {
     spawn_with(tag, &[])
 }
 
 /// [`spawn`], with extra environment variables for the host.
-fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
+fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, Profile)> {
     // The host reads its profile from the environment at spawn; tests run in
     // parallel, so each sets and spawns in turn.
     static SPAWN: Mutex<()> = Mutex::new(());
@@ -29,9 +75,10 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
         eprintln!("skipping: web host not built (run `mise run web`)");
         return None;
     };
+    let turn = Turn::take();
     let cache = std::env::temp_dir().join(format!("ghostrealm-web-{tag}-{}", std::process::id()));
     let host = {
-        let _turn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("GHOSTREALM_WEB_CACHE", &cache);
         for (k, v) in env {
             std::env::set_var(k, v);
@@ -57,7 +104,7 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
             !host.is_alive()
         );
     }
-    Some((host, cache))
+    Some((host, Profile { dir: cache, _turn: turn }))
 }
 
 /// Given a ready host on a profile;
@@ -66,11 +113,12 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, PathBuf)> {
 /// on the same profile afterwards becomes ready and serves a page.
 #[test]
 fn a_host_hung_up_on_frees_its_profile_once_gone() {
-    let Some((host, _)) = spawn("hang-up") else { return };
+    let Some((host, first)) = spawn("hang-up") else { return };
     let pid = host.pid().expect("host pid");
     let exiting = host.hang_up();
     assert!(exiting.wait(Duration::from_secs(10)), "never reported gone");
     assert!(!running(pid), "its process is still running");
+    drop(first);
     let (again, cache) = spawn("hang-up").expect("built");
     assert!(again.send(&Request::Create {
         id: 1,
