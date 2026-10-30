@@ -1,6 +1,6 @@
 # Decisions pending
 
-Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings files, and the "decision needed" markers in `docs/DECISION.md`, `docs/SPEC.md`, and `docs/GOAL.md`, as of `develop` at `311033e`. Each one needs a call only you can make. The Files surface work (issue #1, file tabs, the unsaved dot) is decided and left out. Fill in each **Your answer** block. Sections are ordered by what they block and what they risk.
+Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings files, and the "decision needed" markers in `docs/DECISION.md`, `docs/SPEC.md`, and `docs/GOAL.md`, as of the commit that last changed this file. Each one needs a call only you can make. The Files surface work (issue #1, file tabs, the unsaved dot) is decided and left out. Fill in each **Your answer** block. Sections are ordered by what they block and what they risk.
 
 2. **Web host in the normal build**: how should plain `cargo build` / `cargo run --release` produce the CEF bundle?
 3. **Agent channel into the running app**: which processes may connect, and what may each one reach?

@@ -302,7 +302,7 @@
 - Category: Terminal backend / PTY
 - Detail: Closing a pane hangs up its PTY: the worker drops the writer (a newline and the EOF character), stops the reader and closes the master, so the child gets EOF and SIGHUP from its terminal.
 - Detail: A reaper thread reaps the child once it exits. If it is still unreaped 2 s after the drop, SIGHUP goes to the child's process group and to the PTY's foreground group (only if that group is still in the child's session); 1 s later, SIGKILL to the same groups. At 30 s the reaper gives up and leaves the pid unreaped.
-- Detail: Reaping and signalling use the raw pid (`waitid(WNOWAIT)` to see an exit, `waitpid` to reap, `killpg` to signal), each under the `Shared::child` lock, whose `ChildState` (`Watched`, `Reapable`, `Reaped`) is checked first. Nothing is signalled once the child is reaped, since its pid may be reused.
+- Detail: Reaping and signalling use the raw pid (`waitid(WNOWAIT)` to see an exit, `waitpid` to reap, `killpg` to signal), each under the `Shared::child` lock, whose `ChildState` is checked first. Nothing is signalled once the child is reaped, since its pid may be reused.
 - Detail: Only holders of that lock reap the child. Nothing else in the process may call `wait` or `waitpid(-1)`, or set SIGCHLD to `SIG_IGN`.
 - Detail: The 2 s, 1 s and 30 s timings are defaults the owner may change.
 - Reason: A program that turns echo off (vim, less, top) never writes after the hangup, so a reader blocked on the master kept the PTY open; a program that ignores SIGHUP never exits. Signalling a reaped pid could reach an unrelated process that reused it.
