@@ -10,6 +10,10 @@
 //! agent drives. The app takes tabs and hidden ones from
 //! [`WebView::take_opened`]. Each goes when it closes itself.
 //!
+//! Off screen, a person's page is hidden from Chromium; an agent's (a pop-up
+//! an agent opened, or any page opened without a window) stays visible to
+//! it, at a lower frame rate (see [`HostRequest::Visible`]).
+//!
 //! Pages render in the out-of-process CEF host (`ghostrealm-web-host`, see
 //! [`ghostrealm_web`]): one host serves every web view. It is spawned on first
 //! use and hung up on once no web view has been left for `IDLE_EXIT`. The
@@ -360,7 +364,9 @@ impl Plugin for WebPlugin {
             slot.next_page += 1;
             slot.next_page
         };
-        Ok(Box::new(WebView::new(self.slot.clone(), page)))
+        let mut view = WebView::new(self.slot.clone(), page);
+        view.agent = cx.waker.is_none();
+        Ok(Box::new(view))
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
@@ -597,9 +603,14 @@ pub struct WebView {
     sent_size: Option<(u32, u32, f32)>,
     sent_focus: bool,
     /// The view is on screen (painted, and not since hidden). A page starts
-    /// hidden, so one opened in the background doesn't render.
+    /// off screen, so a person's opened in the background doesn't render.
     on_screen: bool,
     sent_visible: bool,
+    /// An agent opened it: without a window (the agent channel), or as a
+    /// pop-up through a gesture eval. Off screen, the host keeps it visible
+    /// to Chromium, so a loaded machine doesn't starve the renderer the
+    /// agent's reads wait on.
+    agent: bool,
     /// The URL bar while it is being edited.
     url_edit: Option<LineEdit>,
     /// The mouse in the URL bar while it is being edited.
@@ -676,6 +687,7 @@ impl WebView {
             sent_focus: false,
             on_screen: false,
             sent_visible: true,
+            agent: false,
             url_edit: None,
             url_field: FieldMouse::default(),
             state: ViewState::default(),
@@ -697,13 +709,14 @@ impl WebView {
         }
     }
 
-    /// A view of pop-up `p`, which the host made (and keeps hidden) in the
-    /// running host. A `popup` one has a close button for a header.
+    /// A view of pop-up `p`, which the host made (off screen) in the running
+    /// host. A `popup` one has a close button for a header.
     fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo, popup: bool) -> Self {
         let generation = slot.borrow().generation;
         let mut v = WebView::new(slot, p.id);
         v.created_in = generation;
         v.sent_visible = false;
+        v.agent = !p.from_input;
         v.last_url.clone_from(&p.url);
         v.host_made = true;
         v.popup = popup;
@@ -823,12 +836,13 @@ impl WebView {
                 width,
                 height,
                 scale,
+                agent: self.agent,
             }) {
                 return false;
             }
             self.created_in = generation;
             self.sent_focus = false;
-            // Pages are created visible.
+            // Pages are created on screen.
             self.sent_visible = true;
             if !self.on_screen
                 && host.send(&HostRequest::Visible {
@@ -1769,6 +1783,11 @@ pub(crate) mod tests {
     /// one) in `dir`, and the file the script appends a line to each time it
     /// starts.
     fn stub_host(dir: &std::path::Path, script: &str) -> (WebView, std::path::PathBuf) {
+        stub_host_in(dir, script, &OpenCx::default())
+    }
+
+    /// [`stub_host`], the view opened with `cx`.
+    fn stub_host_in(dir: &std::path::Path, script: &str, cx: &OpenCx) -> (WebView, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let exe = dir.join("host.sh");
         let runs = dir.join("runs");
@@ -1780,7 +1799,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let plugin = WebPlugin::new();
         plugin.slot.borrow_mut().exe = Some(exe);
-        let view = plugin.open(&OpenCx::default()).unwrap();
+        let view = plugin.open(cx).unwrap();
         (*(view as Box<dyn Any>).downcast::<WebView>().unwrap(), runs)
     }
 
@@ -1980,7 +1999,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_page_starts_hidden_until_painted() {
+    fn a_page_starts_off_screen_until_painted() {
         let dir = TmpDir::new("web-hidden");
         let (mut v, runs) = stub_host(&dir, "cat > \"$0.requests\"");
         let log = runs.with_file_name("host.sh.requests");
@@ -1988,6 +2007,7 @@ pub(crate) mod tests {
         assert!(v.send(None));
         let got = requests(&log, |s| s.contains(r#""op":"visible""#));
         assert!(got.contains(r#""op":"create""#), "{got}");
+        assert!(got.contains(r#""agent":true"#), "opened without a window: {got}");
         assert!(got.contains(r#""visible":false"#), "{got}");
         assert!(!v.sent_visible);
 
@@ -1995,6 +2015,20 @@ pub(crate) mod tests {
         requests(&log, |s| s.contains(r#""visible":true"#));
         v.shown(false);
         requests(&log, |s| s.matches(r#""visible":false"#).count() == 2);
+    }
+
+    /// Given a web view opened with a window (the GUI);
+    /// when its page is created;
+    /// then the host is told it is a person's page, not an agent's.
+    #[test]
+    fn a_page_opened_with_a_window_is_a_persons() {
+        let dir = TmpDir::new("web-person");
+        let cx = OpenCx { waker: Some(Arc::new(|| {})), ..OpenCx::default() };
+        let (mut v, runs) = stub_host_in(&dir, "cat > \"$0.requests\"", &cx);
+        let log = runs.with_file_name("host.sh.requests");
+        assert!(v.send(None));
+        let got = requests(&log, |s| s.contains(r#""op":"create""#));
+        assert!(got.contains(r#""agent":false"#), "{got}");
     }
 
     /// The mouse requests in the stub host's log.
@@ -2991,10 +3025,8 @@ pub(crate) mod tests {
             assert_eq!(opened[0].place, Place::Tab { focus }, "{case}");
             assert!(v.floating.is_empty(), "{case}");
             let tab = opened[0].view.page;
-            // The tab is hidden until shown: Chromium runs its renderer at
-            // background priority, which a loaded machine (this whole suite)
-            // starves for seconds per DevTools step of an eval.
-            let title = v.with_host(|h, _| h.eval(tab, "document.title", Duration::from_secs(30)));
+            // A person's tab is hidden from Chromium until shown.
+            let title = v.with_host(|h, _| h.eval(tab, "document.title", ghostrealm_web::client::HIDDEN_EVAL));
             assert_eq!(title, Some(Ok("\"Stay\"".into())), "{case}");
             assert_eq!(v.eval("document.title", false), Ok("\"Link\"".into()), "{case}");
         }

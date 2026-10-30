@@ -10,7 +10,7 @@ use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
     eval_wrapper, link_script, Cursor, EditAction, Event, Key, KeyKind, PopupKind, MouseAction, MouseButton, Request,
-    MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS,
+    MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS, UNSEEN_FRAME_RATE,
 };
 use serde_json::{json, Value};
 
@@ -65,6 +65,9 @@ struct Entry {
     /// Main-frame documents committed: a link eval runs only in the one its
     /// click was in.
     document: u64,
+    /// An agent drives it: off screen it stays visible to Chromium
+    /// ([`Request::Visible`]).
+    agent: bool,
 }
 
 /// A link a page asked to open in a new tab, opened through `window.open`.
@@ -79,6 +82,9 @@ struct Link {
     document: u64,
     at: Instant,
 }
+
+/// Frames per second a page paints at on screen.
+const FRAME_RATE: c_int = 60;
 
 /// Windows' virtual key code for Enter, as `Key::windows_key_code` carries it.
 const VK_RETURN: i32 = 0x0D;
@@ -98,6 +104,8 @@ struct PendingPopup {
     /// A person's new tab or window: it outlives its opener and doesn't
     /// count toward its pop-ups.
     tab: bool,
+    /// An agent opened it.
+    agent: bool,
 }
 
 /// How a browser's DevTools session stands for evals.
@@ -578,7 +586,8 @@ pub fn handle(req: Option<Request>) {
             width,
             height,
             scale,
-        } => create(id, &url, width, height, scale),
+            agent,
+        } => create(id, &url, width, height, scale, agent),
         Request::Close { id } => {
             if let Some(host) = browser(id).and_then(|b| b.host()) {
                 host.close_browser(1);
@@ -615,11 +624,7 @@ pub fn handle(req: Option<Request>) {
                 host.set_focus(focused as c_int);
             }
         }
-        Request::Visible { id, visible } => {
-            if let Some(host) = browser(id).and_then(|b| b.host()) {
-                host.was_hidden((!visible) as c_int);
-            }
-        }
+        Request::Visible { id, visible } => show(id, visible),
         Request::Mouse {
             id,
             x,
@@ -702,7 +707,22 @@ fn view(id: u64) -> Option<SharedView> {
     BROWSERS.with_borrow(|m| m.get(&id).map(|e| e.view.clone()))
 }
 
-fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
+/// Page `id` came on screen or went off it. A person's page off screen is
+/// hidden from Chromium; an agent's stays visible, at a lower frame rate, so
+/// the renderer the agent drives keeps its priority.
+fn show(id: u64, visible: bool) {
+    let Some((b, agent)) = BROWSERS.with_borrow(|m| m.get(&id).map(|e| (e.browser.clone(), e.agent))) else {
+        return;
+    };
+    let Some(host) = b.host() else { return };
+    if agent {
+        host.set_windowless_frame_rate(if visible { FRAME_RATE } else { UNSEEN_FRAME_RATE as c_int });
+    } else {
+        host.was_hidden((!visible) as c_int);
+    }
+}
+
+fn create(id: u64, url: &str, width: u32, height: u32, scale: f32, agent: bool) {
     if browser(id).is_some() {
         resize(id, width, height, scale);
         return;
@@ -710,7 +730,8 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
     let view = new_view(id, width, height, scale);
     let mut client = new_client(id, &view);
     let window_info = window_info();
-    let settings = browser_settings();
+    // Created on screen, as the app's `Visible` assumes.
+    let settings = browser_settings(FRAME_RATE);
     let created = browser_host_create_browser_sync(
         Some(&window_info),
         Some(&mut client),
@@ -734,6 +755,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32) {
                 enter_last: false,
                 links: Vec::new(),
                 document: 0,
+                agent,
             };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
@@ -777,9 +799,9 @@ fn window_info() -> WindowInfo {
     }
 }
 
-fn browser_settings() -> BrowserSettings {
+fn browser_settings(frame_rate: c_int) -> BrowserSettings {
     BrowserSettings {
-        windowless_frame_rate: 60,
+        windowless_frame_rate: frame_rate,
         // Opaque white, so pages without a background don't composite transparent.
         background_color: 0xFFFF_FFFF,
         ..Default::default()
@@ -821,7 +843,8 @@ fn open_popup(
     };
     *window_info = self::window_info();
     *client = Some(new_client(id, &view));
-    *settings = browser_settings();
+    // Off screen: an agent's stays visible to Chromium (`popup_created`).
+    *settings = browser_settings(if from_input { FRAME_RATE } else { UNSEEN_FRAME_RATE as c_int });
     true
 }
 
@@ -924,13 +947,14 @@ fn admit_popup(
     };
     let view = new_view(id, width, height, scale);
     PENDING.with_borrow_mut(|m| {
-        m.insert(id, PendingPopup { view: view.clone(), opener, cef_id, queued: Vec::new(), tab })
+        m.insert(id, PendingPopup { view: view.clone(), opener, cef_id, queued: Vec::new(), tab, agent: !from_input })
     });
     emit(&Event::Popup { id, opener, url, from_input, kind, width: width.max(1), height: height.max(1) });
     Some((id, view))
 }
 
-/// Pop-up `id`'s browser exists: serve it, hidden until the app shows it,
+/// Pop-up `id`'s browser exists: serve it, off screen (a person's hidden
+/// until the app shows it, an agent's visible to Chromium, see [`show`]),
 /// and run the requests that waited for it.
 fn popup_created(id: u64, b: &Browser) {
     let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&id)) else {
@@ -943,7 +967,7 @@ fn popup_created(id: u64, b: &Browser) {
         return;
     };
     let host = b.host();
-    if let Some(h) = &host {
+    if let Some(h) = host.as_ref().filter(|_| !p.agent) {
         h.was_hidden(1);
     }
     let devtools = host.as_ref().and_then(|h| h.add_dev_tools_message_observer(Some(&mut HostDevTools::new(id))));
@@ -957,6 +981,7 @@ fn popup_created(id: u64, b: &Browser) {
         enter_last: false,
         links: Vec::new(),
         document: 0,
+        agent: p.agent,
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
     // Its opener closed meanwhile, or the host is quitting.

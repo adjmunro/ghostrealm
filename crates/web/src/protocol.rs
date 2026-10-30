@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Ids at or above this are pages the host made for pop-ups ([`Event::Popup`]);
 /// the app numbers the pages it creates below it.
 pub const POPUP_IDS: u64 = 1 << 40;
+
+/// Frames per second an agent's page paints at while off screen (60 on
+/// screen): what keeps it visible to Chromium costs at most this many paints.
+pub const UNSEEN_FRAME_RATE: u32 = 10;
 
 /// Pop-ups one page may have open (made or being made); the host refuses
 /// more ([`Event::PopupRefused`]). A person's new tab or window doesn't
@@ -106,6 +110,9 @@ pub enum Request {
         width: u32,
         height: u32,
         scale: f32,
+        /// An agent drives the page: off screen it stays visible to Chromium
+        /// (see [`Request::Visible`]).
+        agent: bool,
     },
     Close {
         id: u64,
@@ -133,7 +140,13 @@ pub enum Request {
         id: u64,
         focused: bool,
     },
-    /// A page not on screen stops painting (and waking the app).
+    /// Whether the page is on screen (a page is created on screen). Off
+    /// screen, a person's page is hidden from Chromium: it stops painting
+    /// (and waking the app), and its renderer runs at background priority,
+    /// which a loaded machine starves for seconds at a time. An agent's page
+    /// (one created with `agent`, or a pop-up an agent opened) stays visible
+    /// to Chromium, as in headless Chrome, so the agent's reads stay prompt:
+    /// it paints at [`UNSEEN_FRAME_RATE`] instead.
     Visible {
         id: u64,
         visible: bool,
@@ -278,9 +291,10 @@ pub enum Event {
     },
     /// Page `opener` opened a pop-up (`window.open`, a link to a new window,
     /// a link clicked to open in one): page `id` (from [`POPUP_IDS`] up),
-    /// made by the host and hidden until shown. It keeps `window.opener`,
-    /// unless a click with a modifier or the middle button opened it. Its
-    /// requests are served at once.
+    /// made by the host off screen (see [`Request::Visible`]): a person's is
+    /// hidden until shown, an agent's (not `from_input`) visible to Chromium.
+    /// It keeps `window.opener`, unless a click with a modifier or the middle
+    /// button opened it. Its requests are served at once.
     Popup {
         id: u64,
         opener: u64,

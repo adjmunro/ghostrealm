@@ -24,6 +24,13 @@ pub const HOST_ENV: &str = "GHOSTREALM_WEB_HOST";
 /// Set (to anything) to let the host's stderr through instead of discarding it.
 pub const DEBUG_ENV: &str = "GHOSTREALM_WEB_DEBUG";
 
+/// How long an eval on a page hidden from Chromium (a person's page off
+/// screen, or a person's pop-up the app hasn't shown) can take on a loaded
+/// machine. Chromium runs a hidden page's renderer at background priority,
+/// which the OS starves: each DevTools step of an eval (a page's first takes
+/// five) can then wait seconds, where a visible page's take milliseconds.
+pub const HIDDEN_EVAL: Duration = Duration::from_secs(30);
+
 /// Locate the host executable: `$GHOSTREALM_WEB_HOST`, else `explicit` (config),
 /// else beside the running executable (`ghostrealm-web-host.app` on macOS, a
 /// `ghostrealm-web-host/` directory or bare binary elsewhere).
