@@ -178,9 +178,14 @@ impl ThreadedTerminal {
                         if let Err(e) = spawn_exit_waiter(pid, &worker_shared, exit_tx) {
                             let _ = start_tx.send(Err(e));
                             // Nothing waits on it, so its pid is still ours.
+                            let Ok(mut state) = worker_shared.child.lock() else {
+                                return;
+                            };
                             let mut child = term.into_child();
                             let _ = child.kill();
-                            let _ = child.wait();
+                            if let Ok(status) = child.wait() {
+                                *state = ChildState::Reaped(lifecycle_of(status));
+                            }
                             return;
                         }
                     }
