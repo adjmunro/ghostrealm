@@ -29,15 +29,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// foreground command's process groups (either may ignore SIGHUP).
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// Without `waitid` (not unix), how often an otherwise idle worker checks
-/// whether the child has exited: nothing else wakes it when the exit brings
-/// no output (a background job still holds the PTY) or the reap trails the
-/// EOF. Faster once the output has ended, when the exit is due.
-#[cfg(not(unix))]
-const EXIT_POLL: Duration = Duration::from_millis(500);
-#[cfg(not(unix))]
-const EXIT_POLL_AFTER_EOF: Duration = Duration::from_millis(50);
-
 /// Wakes the UI event loop after the worker publishes a change.
 pub type UiWaker = Arc<dyn Fn() + Send + Sync>;
 
@@ -56,9 +47,8 @@ enum Cmd {
     Scroll(Scroll),
     /// The PTY reader forwarded output; drain + parse it.
     PtyReady,
-    /// The child exited (not yet reaped), by the given signal if it was killed
-    /// by one: refresh the lifecycle.
-    ChildExited(Option<i32>),
+    /// The child exited (not yet reaped): refresh the lifecycle.
+    ChildExited,
     Shutdown,
 }
 
@@ -168,12 +158,11 @@ impl ThreadedTerminal {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("vt-worker died during startup")),
         };
-        #[cfg(unix)]
         if let Some(pid) = child_pid {
             let tx = cmd_tx.clone();
             let _ = std::thread::Builder::new().name("vt-exit-waiter".into()).spawn(move || {
-                let signal = wait_for_exit(pid);
-                let _ = tx.send(Cmd::ChildExited(signal));
+                wait_for_exit(pid);
+                let _ = tx.send(Cmd::ChildExited);
             });
         }
 
@@ -235,7 +224,6 @@ impl Drop for ThreadedTerminal {
 /// SIGKILL the process group of the child `pid` (it leads its own), if
 /// `kill_child`, and the `foreground` group if it is still in the child's
 /// session: the group was read earlier and may since have gone, its id reused.
-#[cfg(unix)]
 fn force_kill(pid: Option<u32>, kill_child: bool, foreground: Option<i32>) {
     let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1) else {
         return;
@@ -251,10 +239,6 @@ fn force_kill(pid: Option<u32>, kill_child: bool, foreground: Option<i32>) {
         }
     }
 }
-
-/// The killer's TerminateProcess is already forceful.
-#[cfg(not(unix))]
-fn force_kill(_pid: Option<u32>, _kill_child: bool, _foreground: Option<i32>) {}
 
 impl TerminalBackend for ThreadedTerminal {
     fn resize(&mut self, cols: u16, rows: u16, cell_w_px: u32, cell_h_px: u32) {
@@ -346,39 +330,19 @@ impl TerminalBackend for ThreadedTerminal {
 }
 
 /// Block until the child `pid` has exited, leaving it unreaped (the worker
-/// reaps it, in `lifecycle`). Returns the signal that killed it, if one did,
-/// from the `waitid` siginfo. Returns early with `None` if it can't wait (it
-/// was reaped already).
-#[cfg(unix)]
-fn wait_for_exit(pid: u32) -> Option<i32> {
+/// reaps it, in `lifecycle`, and reads its exit status there). Returns early
+/// if it can't wait (it was reaped already).
+fn wait_for_exit(pid: u32) {
     loop {
-        match crate::peek_exit(pid, false) {
-            Ok(report) => return report.and_then(|(code, status)| killed_by(code, status)),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+        // SAFETY: waitid writes only the zeroed siginfo it is given.
+        let r = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
         }
     }
-}
-
-/// The signal in a `waitid` report with `si_code` and `si_status`: the status
-/// is a signal number only when the child was killed (`CLD_KILLED`) or dumped
-/// core (`CLD_DUMPED`), else its exit code.
-#[cfg(unix)]
-pub(crate) fn killed_by(si_code: i32, si_status: i32) -> Option<i32> {
-    matches!(si_code, libc::CLD_KILLED | libc::CLD_DUMPED).then_some(si_status)
-}
-
-/// How long the idle worker waits before checking for the child's exit:
-/// never on unix, where a waiter thread posts [`Cmd::ChildExited`].
-#[cfg(unix)]
-fn exit_poll_after(_term: &GhosttyTerminal, _lifecycle: Lifecycle) -> Option<Duration> {
-    None
-}
-
-#[cfg(not(unix))]
-fn exit_poll_after(term: &GhosttyTerminal, lifecycle: Lifecycle) -> Option<Duration> {
-    (lifecycle == Lifecycle::Running)
-        .then(|| if term.output_closed() { EXIT_POLL_AFTER_EOF } else { EXIT_POLL })
 }
 
 /// The worker's run loop: own the VT, apply commands, publish grids + meta.
@@ -392,20 +356,7 @@ fn worker_loop(
     // Block until there's something to do, then drain the whole batch so a flood of
     // PtyReady/commands collapses into one pump + one publish. Exits when the last
     // handle drops (channel closed) or on `Shutdown`.
-    let mut exit_poll: Option<Duration> = None;
-    loop {
-        let first = if let Some(timeout) = exit_poll {
-            match cmd_rx.recv_timeout(timeout) {
-                Ok(m) => Some(m),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match cmd_rx.recv() {
-                Ok(m) => Some(m),
-                Err(_) => break,
-            }
-        };
+    while let Ok(first) = cmd_rx.recv() {
         let mut pump = false;
         let mut shutdown = false;
         let mut apply = |m: Cmd, term: &mut GhosttyTerminal| match m {
@@ -421,12 +372,11 @@ fn worker_loop(
             } => term.resize(cols, rows, cell_w, cell_h),
             Cmd::Scroll(s) => term.scroll(s),
             Cmd::PtyReady => pump = true,
-            Cmd::ChildExited(signal) => term.note_exit_signal(signal),
+            // The meta refresh below reaps it.
+            Cmd::ChildExited => {}
             Cmd::Shutdown => shutdown = true,
         };
-        if let Some(m) = first {
-            apply(m, term);
-        }
+        apply(first, term);
         while let Ok(m) = cmd_rx.try_recv() {
             apply(m, term);
         }
@@ -455,7 +405,6 @@ fn worker_loop(
             viewport_active: term.viewport_active(),
             foreground: term.foreground_group(),
         };
-        exit_poll = exit_poll_after(term, new_meta.lifecycle);
         let meta_changed = {
             let mut m = shared.meta.lock().unwrap();
             let changed =
@@ -592,7 +541,6 @@ mod tests {
         assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(0)));
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_exit_waiter_leaves_the_child_to_reap() {
         let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.2; exit 3"]).spawn().unwrap();
@@ -603,53 +551,27 @@ mod tests {
         assert_eq!(status.code(), Some(3));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_exit_waiter_reports_the_signal_that_killed_the_child() {
-        let spawn = |script: &str| std::process::Command::new("sh").args(["-c", script]).spawn().unwrap();
-        let mut killed = spawn("kill -9 $$");
-        assert_eq!(wait_for_exit(killed.id()), Some(libc::SIGKILL));
-        killed.wait().unwrap();
-        let mut exited = spawn("exit 9");
-        assert_eq!(wait_for_exit(exited.id()), None, "an exit code is not a signal");
-        exited.wait().unwrap();
+    fn the_exit_waiter_returns_on_a_signal_death_leaving_the_child_to_reap() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.2; kill -9 $$"]).spawn().unwrap();
+        wait_for_exit(child.id());
+        let status = child.try_wait().unwrap().expect("exited, and still ours to reap");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_non_blocking_peek_sees_a_signal_death_without_reaping() {
-        let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.3; kill -9 $$"]).spawn().unwrap();
-        assert_eq!(crate::peek_exit(child.id(), true).unwrap(), None, "still running");
-        std::thread::sleep(Duration::from_millis(800));
-        let (code, status) = crate::peek_exit(child.id(), true).unwrap().expect("exited");
-        assert_eq!(killed_by(code, status), Some(libc::SIGKILL));
-        assert!(child.try_wait().unwrap().is_some(), "still ours to reap");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_late_signal_report_upgrades_a_stored_plain_exit() {
-        let mut term = crate::GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("exit 1"))).unwrap();
+    fn a_signal_death_is_reported_with_its_signal() {
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(sh("kill -9 $$")), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(4);
         while term.lifecycle() == Lifecycle::Running {
             assert!(Instant::now() < deadline, "the exit was never noticed");
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(term.lifecycle(), Lifecycle::Exited(Some(1)));
-        term.note_exit_signal(Some(40));
-        assert_eq!(term.lifecycle(), Lifecycle::Signaled(40));
+        assert_eq!(term.lifecycle(), Lifecycle::Signaled(libc::SIGKILL));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn only_a_killed_or_dumped_report_carries_a_signal() {
-        assert_eq!(killed_by(libc::CLD_KILLED, 40), Some(40));
-        assert_eq!(killed_by(libc::CLD_DUMPED, 11), Some(11));
-        assert_eq!(killed_by(libc::CLD_EXITED, 9), None);
-    }
-
-    /// Real-time signals are numbered from 32 on Linux, past what the
-    /// `strsignal` text lookup covers.
+    /// Real-time signals, numbered from 32 on Linux, are reported by number.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_time_signal_is_reported_by_number() {
@@ -662,7 +584,6 @@ mod tests {
         assert_eq!(term.lifecycle(), Lifecycle::Signaled(40));
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_foreground_group_is_killed_without_the_child() {
         // Job control gives `sleep` its own foreground group in the shell's
@@ -688,7 +609,6 @@ mod tests {
         assert_eq!(term.lifecycle(), Lifecycle::Running, "the shell lives on");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_stale_foreground_group_outside_the_session_is_not_killed() {
         use std::os::unix::process::CommandExt;

@@ -10,6 +10,4 @@ ghostrealm-terminal.workspace = true
 libghostty-vt.workspace = true
 ghostrealm-process.workspace = true
 anyhow.workspace = true
-
-[target.'cfg(unix)'.dependencies]
 libc = "0.2"
