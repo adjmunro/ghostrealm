@@ -1491,3 +1491,21 @@
   whose `NSpid:` has one field. Check `/proc/self/ns/pid`'s inode against
   the initial namespace's (`0xEFFFFFFC`) instead, and test it there.
 - Reason: on Linux clean-all frees only superseded units.
+
+---
+
+[2026-10-30T22:30+1300@cecfcc96] Terminal — portable-pty's spawn and openpty descriptor handling
+
+- Requires: NO BLOCKERS
+- Detail: `close_random_fds` (portable-pty 0.9 `unix.rs`), run in the
+  shell's `pre_exec`, reads `/dev/fd` with `read_dir` and collects into a
+  `Vec`: it allocates after fork, which is not async-signal-safe. It also
+  closes std's exec-error pipe, so a shell that fails to exec isn't
+  reported as a spawn error: std reads no error, the child exits 1 and the pane
+  sees an exited shell. Marking fds close-on-exec without allocating
+  (`ghostrealm_process::inherit_stdio_only`) would fix both.
+- Detail: `openpty` marks master and slave close-on-exec only after it
+  returns, so a short-lived `.output()` child started in between briefly
+  inherits the PTY slave (it holds it only for its own life).
+- Reason: a failed shell spawn should surface as an error, and allocation
+  after fork can deadlock on a lock another thread held at fork.
