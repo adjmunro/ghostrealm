@@ -1411,3 +1411,15 @@
 - Reason: on Linux clean-all frees only superseded units.
 
 ---
+
+[2026-10-31T09:22+1300@7ec72b2f] untested exit-waiter failure path
+
+- Requires: NO BLOCKERS
+- Detail: No test drives the `spawn_exit_waiter` failure path in
+  `ThreadedTerminal::spawn` (`crates/terminal-ghostty/src/threaded.rs`),
+  which kills and reaps the child under the `ChildState` lock. Add a seam
+  that makes the thread spawn fail, and test that the child ends reaped.
+- Reason: the path runs only when a thread spawn fails, so a regression in
+  it would go unnoticed.
+
+---
