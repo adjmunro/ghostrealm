@@ -1430,7 +1430,9 @@ impl AppState {
     /// goes.
     pub fn close_surface_id(&mut self, sid: SurfaceId) {
         if self.hidden.remove(&sid).is_some() {
-            self.views.remove(&sid);
+            if let Some(v) = self.views.remove(&sid) {
+                dismiss_toasts_of(&mut self.toasts, v.as_ref());
+            }
             return;
         }
         if let Some((vt, pane)) = self.pane_of(sid) {
@@ -1595,7 +1597,14 @@ impl AppState {
             live.extend(more);
         }
         self.hidden.retain(|p, _| live.contains(p));
-        self.views.retain(|id, _| live.contains(id));
+        let toasts = &mut self.toasts;
+        self.views.retain(|id, v| {
+            let keep = live.contains(id);
+            if !keep {
+                dismiss_toasts_of(toasts, v.as_ref());
+            }
+            keep
+        });
     }
 
     pub fn rename_active_vtab(&mut self, name: impl Into<String>) {
@@ -2103,7 +2112,9 @@ impl AppState {
         while !gone.is_empty() {
             for p in gone {
                 self.hidden.remove(&p);
-                self.views.remove(&p);
+                if let Some(v) = self.views.remove(&p) {
+                    dismiss_toasts_of(&mut self.toasts, v.as_ref());
+                }
             }
             gone = self.hidden.iter().filter(|(_, o)| !self.views.contains_key(&o.opener)).map(|(p, _)| *p).collect();
         }
@@ -2395,6 +2406,13 @@ fn config_toast(report: &Report, applied: bool) -> Option<Toast> {
     };
     let open = ToastAction::OpenSettings { line: first.map(|f| f.0) };
     Some(Toast::new(level, message).keyed("config").with_choice("Open Settings", open))
+}
+
+/// Dismiss the toasts that concern closing `view` alone ([`View::toast_keys`]).
+fn dismiss_toasts_of(toasts: &mut Toasts, view: &dyn View) {
+    for key in view.toast_keys() {
+        toasts.dismiss_key(&key);
+    }
 }
 
 #[cfg(test)]
@@ -2933,6 +2951,31 @@ mod tests {
         let err = s.open_file(&file).unwrap_err();
         assert!(format!("{err:#}").contains("latin1.txt"), "{err:#}");
         assert_eq!(s.focused_surface(), None, "no tab bound to it");
+    }
+
+    /// A terminal's snapshot-failure toast goes when the terminal closes;
+    /// others stay.
+    #[test]
+    fn closing_a_terminal_dismisses_its_own_toasts() {
+        let mut s = AppState::new();
+        s.new_vtab().unwrap();
+        let sid = s.focused_surface().unwrap();
+        let keys = s.view(sid).unwrap().toast_keys();
+        let [key] = &keys[..] else { panic!("{keys:?}") };
+        let toast = |key: &str| Request::Toast {
+            level: Level::Error,
+            message: "Couldn't draw the terminal".into(),
+            key: Some(key.into()),
+            choices: Vec::new(),
+            doc: None,
+        };
+        s.toast_request(sid, toast(key));
+        s.notify(Toast::new(Level::Error, "bad config").keyed("config"));
+        assert_eq!(s.toasts().len(), 2);
+        s.close_surface_id(sid);
+        assert!(s.view(sid).is_none());
+        let left: Vec<_> = s.toasts().iter().map(|e| e.toast.key.clone()).collect();
+        assert_eq!(left, [Some("config".to_string())]);
     }
 
     #[test]

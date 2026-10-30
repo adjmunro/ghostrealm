@@ -449,7 +449,10 @@ the path that failed meanwhile.
   shows by then (`FilesView` does for focus, input, and every document's
   `tick`). A failed save's text is `toasts::save_failed(path, e)` and its key
   `toasts::save_key(path)`, which `Request::Saved(path)` dismisses; print
-  your own stderr line, as the app doesn't. Failures in a form the view
+  your own stderr line, as the app doesn't. `Request::DismissToast { key }`
+  removes a keyed toast once what it reported is over; `toast_keys()` names
+  the keys that concern the view alone, which the app dismisses when the
+  view closes (a terminal's snapshot failure). Failures in a form the view
   draws show inline instead.
 - View menu: `Request::Menu { items, at, align }` opens a menu of the view's
   own with its top edge at `at` (physical px) and its left or right edge

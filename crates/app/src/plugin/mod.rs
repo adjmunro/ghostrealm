@@ -294,6 +294,12 @@ pub trait View: Any {
         Ok(None)
     }
 
+    /// Keys of the toasts ([`Request::Toast`]) that concern this view alone:
+    /// the app dismisses them when the view closes.
+    fn toast_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The file the view shows, if any (Save As starts beside it).
     fn path(&self) -> Option<PathBuf> {
         self.doc(self.active_doc()).and_then(|d| d.path())

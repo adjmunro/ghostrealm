@@ -709,6 +709,10 @@ impl View for TerminalView {
         self.failures.deadline()
     }
 
+    fn toast_keys(&self) -> Vec<String> {
+        vec![self.failures.key.clone()]
+    }
+
     fn tick(&mut self, cx: &mut EventCx, _now: Instant) {
         if let Some(toast) = self.failures.take() {
             cx.request(toast);
