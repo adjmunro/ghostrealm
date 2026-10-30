@@ -8,10 +8,11 @@
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, PipeReader, PipeWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -166,9 +167,12 @@ impl Pty {
 
     /// A reader of the child's output, and the handle that ends it.
     pub(crate) fn reader(&self) -> io::Result<(PtyReader, ReaderStop)> {
-        // Close-on-exec: atomically on Linux (`pipe2`), just after creation on
-        // macOS, where `inherit_stdio_only` keeps it from long-lived children.
-        let (stop_rx, stop_tx) = io::pipe()?;
+        // Close-on-exec: atomically on Linux (`SOCK_CLOEXEC`), just after
+        // creation on macOS, where `inherit_stdio_only` keeps it from
+        // long-lived children.
+        let (stop_rx, stop_tx) = UnixStream::pair()?;
+        #[cfg(target_os = "macos")]
+        no_sigpipe(&stop_tx)?;
         Ok((PtyReader { master: self.master.try_clone()?, stop: stop_rx }, ReaderStop(stop_tx)))
     }
 
@@ -237,7 +241,7 @@ fn slave_name(master: libc::c_int) -> io::Result<PathBuf> {
 /// [`ReaderStop`] has dropped.
 pub(crate) struct PtyReader {
     master: File,
-    stop: PipeReader,
+    stop: UnixStream,
 }
 
 impl Read for PtyReader {
@@ -274,16 +278,42 @@ impl Read for PtyReader {
 /// and the master's last close is what hangs up the child's terminal; blocked
 /// in `read`, the reader would keep it open until the child next writes, which
 /// a program that turned echo off may never do.
-pub(crate) struct ReaderStop(PipeWriter);
+pub(crate) struct ReaderStop(UnixStream);
 
 impl Drop for ReaderStop {
     fn drop(&mut self) {
         // A byte, not just the close: a copy of this end leaked to a child
         // would keep the close from showing. The reader has usually ended
-        // already, so the write fails with EPIPE; that raises SIGPIPE, which
-        // the Rust runtime ignores in every binary and test this crate runs in.
-        let _ = self.0.write_all(&[0]);
+        // already, so the send fails with EPIPE, without raising SIGPIPE
+        // whatever its disposition: `MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE`
+        // (set in `Pty::reader`) on macOS.
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        // SAFETY: send reads only the one byte it is given.
+        unsafe { libc::send(self.0.as_raw_fd(), [0u8].as_ptr().cast(), 1, flags) };
     }
+}
+
+/// Keep writes to `socket` from raising SIGPIPE.
+#[cfg(target_os = "macos")]
+fn no_sigpipe(socket: &UnixStream) -> io::Result<()> {
+    let on: libc::c_int = 1;
+    // SAFETY: setsockopt reads the int it is given.
+    let r = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Writes the child's input. Dropping it sends a newline and the EOF
@@ -427,6 +457,45 @@ mod tests {
         let (pty, slave) = Pty::open(SIZE).unwrap();
         assert!(cloexec(pty.master.as_raw_fd()), "master");
         assert!(cloexec(slave.as_raw_fd()), "slave");
+    }
+
+    #[test]
+    fn the_stop_pair_is_close_on_exec() {
+        let (pty, _slave) = Pty::open(SIZE).unwrap();
+        let (reader, stop) = pty.reader().unwrap();
+        assert!(cloexec(reader.stop.as_raw_fd()), "reader end");
+        assert!(cloexec(stop.0.as_raw_fd()), "stop end");
+    }
+
+    /// Set in the child process that runs [`stop_after_its_reader`].
+    const SIGPIPE_CHILD: &str = "GHOSTREALM_TEST_SIGPIPE_CHILD";
+
+    /// Run in a child process by
+    /// [`a_stop_dropped_after_its_reader_raises_no_sigpipe`]; a no-op otherwise.
+    #[test]
+    fn stop_after_its_reader() {
+        if std::env::var_os(SIGPIPE_CHILD).is_none() {
+            return;
+        }
+        // SAFETY: resets one signal's disposition in this child process.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let (pty, _slave) = Pty::open(SIZE).unwrap();
+        let (reader, stop) = pty.reader().unwrap();
+        drop(reader);
+        drop(stop);
+    }
+
+    #[test]
+    fn a_stop_dropped_after_its_reader_raises_no_sigpipe() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pty::tests::stop_after_its_reader", "--test-threads=1"])
+            .env(SIGPIPE_CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.signal(), None, "killed by a signal");
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{out:?}");
     }
 
     /// Read once from `reader` on another thread; its result arrives on the
