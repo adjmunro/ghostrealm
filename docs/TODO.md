@@ -1412,23 +1412,6 @@
 
 ---
 
-[2026-10-31T05:08+1300@b9cb604f] Roles — rebase rule leftovers
-
-- Requires: NO BLOCKERS
-- Detail: `docs/GIT.md:60` lists commits "rebased from such a commit without
-  a delta review" without the condition that the build and tests passed
-  after the rebase. Add it; optionally mention it at line 8, which holds
-  only through line 67's "counts as approved".
-- Detail: `docs/GIT.md:67` lets the post-rebase build and tests go to
-  🔍 Code Reviewer, which can't check out a branch. Say the run happens in
-  the checkout where the rebase was done (or goes to 🔨 Code Implementer),
-  and name the role that rebases (the director can't).
-- Detail: nit, `.claude/skills/build/SKILL.md:12`: the scratchpad route
-  doesn't name `CARGO_INCREMENTAL=0` (line 13 covers it).
-- Reason: recorded from the fix-round review of b9cb604.
-
----
-
 [2026-10-31T05:11+1300@86ac4645] Window — FontGen review leftovers
 
 - Requires: NO BLOCKERS
