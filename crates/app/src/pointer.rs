@@ -57,8 +57,9 @@ impl ButtonAction {
 /// picker and confirmation, and under a menu.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Gate {
-    /// A menu is open: it owns the pointer, over the toast too.
-    pub menu: bool,
+    /// A menu is open, with its panel as last drawn: it owns the pointer,
+    /// over the toast too.
+    pub menu: Option<Rect>,
     /// The palette is open: it owns the pointer outside the toast.
     pub palette: bool,
     /// The floating picker is open: only its buttons (and the toast's) are
@@ -83,7 +84,7 @@ pub(crate) fn covered(gate: &Gate, (x, y): (f32, f32)) -> bool {
 /// the sidebar is hidden); otherwise the first button in paint order takes
 /// the hit.
 pub(crate) fn button_at(gate: &Gate, buttons: &[(Rect, ButtonAction)], (x, y): (f32, f32)) -> Option<ButtonAction> {
-    if gate.menu {
+    if gate.menu.is_some() {
         return None;
     }
     let toast = covered(gate, (x, y));
@@ -125,19 +126,21 @@ pub(crate) enum RightPress {
     /// Nowhere: the picker or a confirmation keeps the pointer (a menu would
     /// open beneath it, and its actions run under an unanswered question).
     Kept,
-    /// Onto the toast: it closes a menu, and nothing beneath the toast (the
-    /// palette, a view) hears it.
+    /// Onto the toast, off any menu: it closes a menu, and nothing beneath
+    /// the toast (the palette, a view) hears it.
     Toast,
-    /// Beneath the overlays: the palette and a menu close, and the sidebar or
-    /// the view under the pointer takes it.
+    /// Beneath the overlays, or onto a menu (which owns the pointer, over the
+    /// toast too): the palette and a menu close, and the sidebar or the view
+    /// under the pointer takes it.
     Through,
 }
 
 /// Where a right press at `pos` goes.
 pub(crate) fn right_press(gate: &Gate, pos: (f32, f32)) -> RightPress {
+    let on_menu = gate.menu.is_some_and(|r| rect_contains(r, pos.0, pos.1));
     if gate.picker || gate.confirm {
         RightPress::Kept
-    } else if covered(gate, pos) {
+    } else if !on_menu && covered(gate, pos) {
         RightPress::Toast
     } else {
         RightPress::Through
@@ -167,8 +170,12 @@ mod tests {
         let gate = Gate { palette: true, toast: Some(R), ..Gate::default() };
         assert_eq!(right_press(&gate, IN), RightPress::Toast);
         assert_eq!(right_press(&gate, (20.0, 5.0)), RightPress::Through);
-        let menu = Gate { menu: true, ..gate };
-        assert_eq!(right_press(&menu, IN), RightPress::Toast);
+        let off = Rect { x: 20.0, ..R };
+        let menu = Gate { menu: Some(off), ..gate };
+        assert_eq!(right_press(&menu, IN), RightPress::Toast, "off the menu");
+        let menu = Gate { menu: Some(Rect { x: 4.0, ..R }), ..gate };
+        assert_eq!(right_press(&menu, IN), RightPress::Through, "the menu over the toast owns the press");
+        assert_eq!(right_press(&menu, (2.0, 5.0)), RightPress::Toast, "the toast beside the menu");
         let picker = Gate { picker: true, ..gate };
         assert_eq!(right_press(&picker, IN), RightPress::Kept);
         assert_eq!(right_press(&picker, (20.0, 5.0)), RightPress::Kept);
@@ -198,7 +205,7 @@ mod tests {
             (R, ButtonAction::PickerConfirm),
             (R, ButtonAction::ConfirmCancel),
         ];
-        for owner in [Gate { menu: true, ..Gate::default() }, Gate { palette: true, ..Gate::default() }] {
+        for owner in [Gate { menu: Some(R), ..Gate::default() }, Gate { palette: true, ..Gate::default() }] {
             assert_eq!(button_at(&owner, &buttons, IN), None);
         }
         let picker = Gate { picker: true, ..Gate::default() };
@@ -232,7 +239,7 @@ mod tests {
             assert_eq!(button_at(&gate, &buttons, on_body), None, "{gate:?}");
             assert_eq!(button_at(&gate, &buttons, below), beneath, "{gate:?}");
         }
-        let menu = Gate { menu: true, toast: Some(toast), ..Gate::default() };
+        let menu = Gate { menu: Some(toast), toast: Some(toast), ..Gate::default() };
         assert_eq!(button_at(&menu, &buttons, on_close), None);
     }
 

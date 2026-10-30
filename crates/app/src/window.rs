@@ -1704,7 +1704,7 @@ impl State {
     /// What covers the window for pointer decisions ([`pointer`]).
     fn gate(&self) -> Gate {
         Gate {
-            menu: self.menu.is_some(),
+            menu: self.menu.as_ref().map(|m| m.panel),
             palette: self.palette.is_some(),
             picker: self.app.picker_open(),
             confirm: self.app.confirm().is_some(),
@@ -1866,7 +1866,7 @@ impl State {
     fn divider_under_cursor(&self) -> Option<(VtabId, Divider)> {
         let (x, y) = self.cursor;
         let gate = self.gate();
-        let covered = gate.menu
+        let covered = gate.menu.is_some()
             || gate.palette
             || gate.picker
             || gate.confirm
@@ -2303,7 +2303,11 @@ impl State {
         true
     }
 
-    /// Right-click opens a context menu over the sidebar vtab under the cursor.
+    /// A right press ([`pointer::right_press`]): nothing while the picker or a
+    /// confirmation is open; on the toast (off any menu) it only closes a
+    /// menu; otherwise it closes the palette and any menu, then over the
+    /// sidebar opens the workspace menu of the vtab under the cursor, and
+    /// over a pane gives the view the press and asks it for its context menu.
     fn on_right_click(&mut self) {
         match pointer::right_press(&self.gate(), self.cursor) {
             RightPress::Kept => return,
