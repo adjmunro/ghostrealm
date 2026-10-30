@@ -1469,3 +1469,17 @@
 - Reason: recorded from the delta review of 22b9fe3.
 
 ---
+
+[2026-10-31T05:04+1300@1fd5377a] Web — refused pop-up leftovers
+
+- Requires: NO BLOCKERS
+- Detail: Missing test: `drop_popups_of` (crates/web/src/client.rs) removing
+  a `closed_refusals` entry. In `a_persons_refused_popups_are_taken_once`,
+  add a `Popup` event for a child of page 1, a person's refusal and
+  `Closed` for the child, then `forget(1)`, and assert `closed_refusals`
+  is empty.
+- Detail: DECISION.md (Web surface / pop-ups, the four-pop-up cap) quotes
+  the toast without "(max 4)".
+- Reason: recorded from the fix-round review of 1fd5377.
+
+---
