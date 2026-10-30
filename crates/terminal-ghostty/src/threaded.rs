@@ -11,7 +11,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,29 @@ struct Shared {
     /// Bumped on every grid publish — the UI uses it to detect "new output" and
     /// whether a re-snapshot is due.
     generation: AtomicU64,
+    /// Held by the exit waiter from before the worker's first lifecycle check
+    /// until its `waitid` returns. The worker reaps the child only while it
+    /// can take this lock, so the waiter never waits on a reaped (and possibly
+    /// reused) pid.
+    reap: Mutex<()>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            grid: Mutex::new(None),
+            meta: Mutex::new(Meta {
+                title: None,
+                busy: false,
+                lifecycle: Lifecycle::Running,
+                mouse_tracking: false,
+                viewport_active: true,
+                foreground: None,
+            }),
+            generation: AtomicU64::new(0),
+            reap: Mutex::new(()),
+        }
+    }
 }
 
 /// UI-thread handle to a worker-backed terminal. `Send` (only channels + `Arc`s).
@@ -105,23 +128,13 @@ impl ThreadedTerminal {
         ui_waker: Option<UiWaker>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-        let shared = Arc::new(Shared {
-            grid: Mutex::new(None),
-            meta: Mutex::new(Meta {
-                title: None,
-                busy: false,
-                lifecycle: Lifecycle::Running,
-                mouse_tracking: false,
-                viewport_active: true,
-                foreground: None,
-            }),
-            generation: AtomicU64::new(0),
-        });
+        let shared = Arc::new(Shared::new());
         type Started = Result<(ChildKiller, Option<u32>)>;
         let (start_tx, start_rx) = mpsc::channel::<Started>();
         let worker_shared = Arc::clone(&shared);
         // The PTY reader wakes the worker (not the UI) by posting `PtyReady`.
         let waker_tx = cmd_tx.clone();
+        let exit_tx = cmd_tx.clone();
 
         let worker = std::thread::Builder::new()
             .name("vt-worker".into())
@@ -132,14 +145,21 @@ impl ThreadedTerminal {
                         let _ = tx.send(Cmd::PtyReady);
                     })
                 };
-                let mut term = match GhosttyTerminal::spawn_with_waker(
+                let started = GhosttyTerminal::spawn_with_waker(
                     cols,
                     rows,
                     cell_w,
                     cell_h,
                     command,
                     Some(pty_waker),
-                ) {
+                )
+                .and_then(|t| {
+                    if let Some(pid) = t.child_pid() {
+                        spawn_exit_waiter(pid, &worker_shared, exit_tx)?;
+                    }
+                    Ok(t)
+                });
+                let mut term = match started {
                     Ok(t) => {
                         let _ = start_tx.send(Ok((t.child_killer(), t.child_pid())));
                         t
@@ -158,14 +178,6 @@ impl ThreadedTerminal {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("vt-worker died during startup")),
         };
-        if let Some(pid) = child_pid {
-            let tx = cmd_tx.clone();
-            let _ = std::thread::Builder::new().name("vt-exit-waiter".into()).spawn(move || {
-                wait_for_exit(pid);
-                let _ = tx.send(Cmd::ChildExited);
-            });
-        }
-
         Ok(ThreadedTerminal {
             cmd_tx,
             shared,
@@ -329,9 +341,28 @@ impl TerminalBackend for ThreadedTerminal {
     }
 }
 
+/// Start the thread that tells the worker when the child `pid` exits, and
+/// return once it holds [`Shared::reap`].
+fn spawn_exit_waiter(pid: u32, shared: &Arc<Shared>, tx: Sender<Cmd>) -> Result<()> {
+    let (locked_tx, locked_rx) = mpsc::channel::<()>();
+    let shared = Arc::clone(shared);
+    std::thread::Builder::new()
+        .name("vt-exit-waiter".into())
+        .spawn(move || {
+            {
+                let _reap = shared.reap.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = locked_tx.send(());
+                wait_for_exit(pid);
+            }
+            let _ = tx.send(Cmd::ChildExited);
+        })
+        .map_err(|e| anyhow!("spawn vt-exit-waiter: {e}"))?;
+    locked_rx.recv().map_err(|_| anyhow!("vt-exit-waiter died during startup"))
+}
+
 /// Block until the child `pid` has exited, leaving it unreaped (the worker
 /// reaps it, in `lifecycle`, and reads its exit status there). Returns early
-/// if it can't wait (it was reaped already).
+/// if `waitid` fails with anything but `EINTR`.
 fn wait_for_exit(pid: u32) {
     loop {
         // SAFETY: waitid writes only the zeroed siginfo it is given.
@@ -400,7 +431,12 @@ fn worker_loop(
         let new_meta = Meta {
             title: term.title(),
             busy: term.is_busy(),
-            lifecycle: term.lifecycle(),
+            // A held lock means the waiter hasn't seen the child exit; it
+            // sends `ChildExited` once it has, and this runs again.
+            lifecycle: match shared.reap.try_lock() {
+                Err(TryLockError::WouldBlock) => Lifecycle::Running,
+                Ok(_) | Err(TryLockError::Poisoned(_)) => term.lifecycle(),
+            },
             mouse_tracking: term.mouse_tracking(),
             viewport_active: term.viewport_active(),
             foreground: term.foreground_group(),
@@ -558,6 +594,24 @@ mod tests {
         wait_for_exit(child.id());
         let status = child.try_wait().unwrap().expect("exited, and still ours to reap");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Given a live child,
+    /// when its exit waiter starts,
+    /// then reaping is blocked until the waiter has seen the child exit.
+    #[test]
+    fn the_exit_waiter_blocks_reaping_until_it_sees_the_exit() {
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 0.3"]).spawn().unwrap();
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = mpsc::channel();
+        spawn_exit_waiter(child.id(), &shared, tx).unwrap();
+        assert!(
+            matches!(shared.reap.try_lock(), Err(TryLockError::WouldBlock)),
+            "the waiter holds the reap lock once started"
+        );
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(4)), Ok(Cmd::ChildExited)));
+        assert!(shared.reap.try_lock().is_ok(), "released after the exit");
+        assert!(child.try_wait().unwrap().is_some(), "the child is left to reap");
     }
 
     #[test]

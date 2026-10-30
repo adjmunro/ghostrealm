@@ -173,22 +173,33 @@ impl Pty {
     }
 }
 
-/// A new PTY master, close-on-exec: from `posix_openpt`, or, where it rejects
-/// `O_CLOEXEC` with `EINVAL` (older macOS Libc accepts only `O_RDWR` and
-/// `O_NOCTTY`), from opening `/dev/ptmx`.
+/// A new PTY master, close-on-exec: from `posix_openpt`, or from opening
+/// `/dev/ptmx` where `posix_openpt` fails with `EINVAL` (POSIX leaves flags
+/// other than `O_RDWR` and `O_NOCTTY` unspecified, so it may reject
+/// `O_CLOEXEC`).
 fn open_master() -> io::Result<File> {
-    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    open_master_with(openpt_cloexec, open_ptmx)
+}
+
+/// `openpt`'s master, or `fallback`'s when `openpt` fails with `EINVAL`.
+fn open_master_with(
+    openpt: impl FnOnce() -> io::Result<File>,
+    fallback: impl FnOnce() -> io::Result<File>,
+) -> io::Result<File> {
+    match openpt() {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => fallback(),
+        r => r,
+    }
+}
+
+fn openpt_cloexec() -> io::Result<File> {
     // SAFETY: posix_openpt opens a descriptor and returns it or -1.
-    let fd = unsafe { libc::posix_openpt(flags) };
-    if fd >= 0 {
-        // SAFETY: `fd` was just opened and nothing else owns it.
-        return Ok(unsafe { File::from_raw_fd(fd) });
+    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::EINVAL) {
-        return Err(err);
-    }
-    open_ptmx()
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// The master from `/dev/ptmx`; std opens every file with `O_CLOEXEC`.
@@ -404,6 +415,29 @@ mod tests {
         assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
         assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
         assert!(slave_name(master.as_raw_fd()).unwrap().starts_with("/dev"));
+    }
+
+    fn os_err(code: libc::c_int) -> io::Result<File> {
+        Err(io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn open_master_falls_back_only_on_einval() {
+        let fallback_called = std::cell::Cell::new(false);
+        let fallback = || {
+            fallback_called.set(true);
+            File::open("/dev/null")
+        };
+
+        assert!(open_master_with(|| os_err(libc::EINVAL), fallback).is_ok());
+        assert!(fallback_called.replace(false), "EINVAL opens /dev/ptmx");
+
+        let err = open_master_with(|| os_err(libc::EMFILE), fallback).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        assert!(!fallback_called.get(), "other errors are returned");
+
+        assert!(open_master_with(|| File::open("/dev/null"), fallback).is_ok());
+        assert!(!fallback_called.get(), "success keeps posix_openpt's master");
     }
 
     fn env_of(command: &Command, key: &str) -> Option<OsString> {

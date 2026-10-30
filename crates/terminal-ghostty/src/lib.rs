@@ -95,8 +95,6 @@ pub struct GhosttyTerminal {
     cell_h: u32,
     /// Cached once the child is observed to have exited.
     exited: Option<Lifecycle>,
-    /// The reader thread signalled EOF (child's PTY closed).
-    reader_done: bool,
     /// Grid changed since the last `snapshot()`; lets the app skip re-snapshotting
     /// an idle surface. Set by `pump`/`resize`, cleared by `snapshot`.
     dirty: bool,
@@ -162,8 +160,8 @@ impl GhosttyTerminal {
                         Err(_) => break,
                     }
                 }
-                // Empty send marks EOF so the UI thread can notice promptly.
-                let _ = tx.send(Vec::new());
+                // The owner refreshes the lifecycle on a wake; output ending
+                // usually means the child exited.
                 wake();
             })
             .context("spawn reader thread")?;
@@ -204,7 +202,6 @@ impl GhosttyTerminal {
             cell_w,
             cell_h,
             exited: None,
-            reader_done: false,
             dirty: true,
         })
     }
@@ -214,11 +211,6 @@ impl GhosttyTerminal {
     /// applying it.
     pub fn output_forwarded(&self) -> usize {
         self.forwarded.load(Ordering::SeqCst)
-    }
-
-    /// Whether the child's side of the PTY has closed (its output ended).
-    pub fn output_closed(&self) -> bool {
-        self.reader_done
     }
 
     /// The child's process id (its process group's, too: it leads its own
@@ -628,19 +620,11 @@ impl TerminalBackend for GhosttyTerminal {
             }
             match self.rx.try_recv() {
                 Ok(chunk) => {
-                    if chunk.is_empty() {
-                        self.reader_done = true;
-                    } else {
-                        bytes += chunk.len();
-                        self.term.vt_write(&chunk);
-                        changed = true;
-                    }
+                    bytes += chunk.len();
+                    self.term.vt_write(&chunk);
+                    changed = true;
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.reader_done = true;
-                    break;
-                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
         if changed {

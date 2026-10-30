@@ -1428,21 +1428,3 @@
 
 ---
 
-[2026-10-31T08:25+1300@1e68c53e] Terminal — own PTY review leftovers
-
-- Requires: NO BLOCKERS
-- Detail: `crates/terminal-ghostty/src/threaded.rs:161-166`: a failed
-  `vt-exit-waiter` thread spawn is dropped (`let _ =`), so an idle pane stays
-  "Running" after its shell exits. Treat it as a spawn error, or log it.
-- Detail: `threaded.rs:335-345`: once the worker reaps the child, a reused
-  pid can make a waiter that hasn't started yet block on an unrelated process
-  and send a stray `ChildExited` (a no-op; small window).
-- Detail: nit, `docs/DECISION.md:293`: doesn't mention the `/dev/ptmx`
-  fallback when `posix_openpt` returns `EINVAL`.
-- Detail: nit, `crates/terminal-ghostty/src/pty.rs` (`open_master`): its doc
-  says older macOS Libc rejects `O_CLOEXEC` (unverified), and no test drives
-  the `EINVAL` branch selection.
-- Detail: `GhosttyTerminal::output_closed()` has no callers left.
-- Reason: recorded from the review of da845b8..1e68c53.
-
----
