@@ -291,6 +291,18 @@
 
 - Category: Terminal backend / PTY
 - Detail: `crates/terminal-ghostty/src/pty.rs` opens the PTY and spawns the shell itself; `portable-pty` is no longer a dependency. The master opens with `posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)` (or, if that fails with `EINVAL`, since POSIX leaves `O_CLOEXEC` there unspecified, by opening `/dev/ptmx` through std), then `grantpt`, `unlockpt`, `ptsname_r`, and the slave opens through std (always `O_CLOEXEC`), so both are close-on-exec from the start on macOS and Linux and no spawn lock is needed.
-- Detail: The shell is a std `Command` with the slave as its stdio. Its `pre_exec` resets six signal dispositions, calls `setsid` and `ioctl(TIOCSCTTY)`, nothing else; `ghostrealm_process::inherit_stdio_only` keeps every other descriptor from it. Exit status, wait and kill are std's `Child` and a SIGHUP sender.
+- Detail: The shell is a std `Command` with the slave as its stdio. Its `pre_exec` resets six signal dispositions, calls `setsid` and `ioctl(TIOCSCTTY)`, nothing else; `ghostrealm_process::inherit_stdio_only` keeps every other descriptor from it. The child's exit status and reaping are covered by the pane-close entry below.
 - Detail: The crate builds on unix only (`compile_error!` elsewhere); Windows is out of scope (GOAL.md).
 - Reason: `portable-pty` 0.9 marks `openpty`'s descriptors close-on-exec only after it returns, so a child another thread spawns meanwhile inherits the slave. Its `pre_exec` (`close_random_fds`) allocates after fork, which can deadlock on a lock another thread held at fork, and closes std's exec-error pipe, so a shell that fails to exec reads as one that exited. Neither can be changed from outside the crate, and the rest of it (a command builder, resize, the foreground group) is a few lines of `libc`.
+
+---
+
+[2026-10-31T09:10+1300@dbefd796]
+
+- Category: Terminal backend / PTY
+- Detail: Closing a pane hangs up its PTY: the worker drops the writer (a newline and the EOF character), stops the reader and closes the master, so the child gets EOF and SIGHUP from its terminal.
+- Detail: A reaper thread reaps the child once it exits. If it is still unreaped 2 s after the drop, SIGHUP goes to the child's process group and to the PTY's foreground group (only if that group is still in the child's session); 1 s later, SIGKILL to the same groups. At 30 s the reaper gives up and leaves the pid unreaped.
+- Detail: Reaping and signalling use the raw pid (`waitid(WNOWAIT)` to see an exit, `waitpid` to reap, `killpg` to signal), each under the `Shared::child` lock, whose `ChildState` (`Watched`, `Reapable`, `Reaped`) is checked first. Nothing is signalled once the child is reaped, since its pid may be reused.
+- Detail: Only holders of that lock reap the child. Nothing else in the process may call `wait` or `waitpid(-1)`, or set SIGCHLD to `SIG_IGN`.
+- Detail: The 2 s, 1 s and 30 s timings are defaults the owner may change.
+- Reason: A program that turns echo off (vim, less, top) never writes after the hangup, so a reader blocked on the master kept the PTY open; a program that ignores SIGHUP never exits. Signalling a reaped pid could reach an unrelated process that reused it.
