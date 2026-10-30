@@ -510,7 +510,6 @@ fn unresolved(owner: Owner, me: u32) -> Exe {
 }
 
 /// Whether `pid` no longer exists (and not just can't be signalled).
-#[cfg(target_os = "macos")]
 fn gone(pid: u32) -> bool {
     const ESRCH: i32 = 3;
     let Ok(pid) = c_int::try_from(pid) else { return false };
@@ -903,13 +902,14 @@ fn clean_temp(temp: &Path, uid: u32, idle: Duration, running: &Running, opts: &O
 
 /// The web hosts' Chromium temp dirs in `base` (`ghostrealm-<uid>-cef`): each
 /// `<pid>` dir goes once its pid is not running and it is [`TEMP_MIN_AGE`]
-/// old. Returns how many went and their bytes.
+/// old, and the pid is still [`gone`] just before: a host may have started
+/// with it since the list was read. Returns how many went and their bytes.
 fn clean_host_temps(base: &Path, running: &Running, opts: &Opts) -> (u64, u64) {
     let (mut count, mut bytes) = (0, 0);
     for e in read_dir(base) {
         let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
         let path = e.path();
-        if !running.pids.contains(&pid) && running.older_than(mtime_or_now(&path), TEMP_MIN_AGE) {
+        if !running.pids.contains(&pid) && running.older_than(mtime_or_now(&path), TEMP_MIN_AGE) && gone(pid) {
             count += 1;
             bytes += remove(&path, opts);
         }
@@ -934,7 +934,6 @@ fn mtime_or_now(path: &Path) -> SystemTime {
 
 extern "C" {
     fn getuid() -> u32;
-    #[cfg(target_os = "macos")]
     fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
@@ -1357,7 +1356,8 @@ mod tests {
         let frame = dir(format!("ghostrealm-{uid}"));
         let fallback = dir(format!("ghostrealm-{uid}-1111-abc"));
         let host_temps = dir(format!("ghostrealm-{uid}-cef"));
-        let gone_host = dir(format!("ghostrealm-{uid}-cef/1111"));
+        // Past any pid limit, so never a process.
+        let gone_host = dir(format!("ghostrealm-{uid}-cef/99999999"));
         let new_host = host_temps.join("2222");
         fs::create_dir(&new_host).unwrap();
         let live_host = dir(format!("ghostrealm-{uid}-cef/{}", std::process::id()));

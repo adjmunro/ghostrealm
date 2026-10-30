@@ -9,7 +9,8 @@
 //!
 //! The dir is in the system temp dir rather than under the profile because the
 //! singleton's socket path must fit [`SOCKET_PATH_MAX`], whatever the profile's
-//! path.
+//! path. The `ghostrealm-<uid>-cef` dir itself stays, empty, once no host
+//! runs: removing it could race a host creating its dir in it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -129,8 +130,9 @@ mod tests {
         root
     }
 
-    /// Given the system temp dir, and the longest uid and pid;
-    /// then the singleton's socket path under a host's temp dir fits.
+    /// Given the default system temp dir, and the longest uid and pid;
+    /// then the singleton's socket path under a host's temp dir fits, and
+    /// the check for this machine's temp dir agrees with the arithmetic.
     #[test]
     fn the_singleton_socket_fits_under_the_default_temp_dir() {
         let worst = |temp: &str| {
@@ -147,7 +149,6 @@ mod tests {
         assert!(fits(&Path::new(default).join(format!("ghostrealm-{}-cef", u32::MAX))));
         let here = std::env::temp_dir();
         assert_eq!(fits(&base_dir(&here)), worst(here.to_str().unwrap()) <= SOCKET_PATH_MAX);
-        assert!(fits(&base_dir(&here)), "this machine's temp dir {} leaves no room", here.display());
     }
 
     /// Given a temp dir so long the singleton's socket might not fit;

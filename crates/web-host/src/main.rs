@@ -95,11 +95,11 @@ fn cache_dir() -> PathBuf {
 /// dir.
 ///
 /// [`HostTemp`]: ghostrealm_web::temp::HostTemp
-fn chromium_temp() -> Option<ghostrealm_web::temp::HostTemp> {
+fn chromium_temp(temp: &Path) -> Option<ghostrealm_web::temp::HostTemp> {
     if std::env::args_os().any(|a| a.to_string_lossy().starts_with("--type=")) {
         return None;
     }
-    match ghostrealm_web::temp::HostTemp::create(&std::env::temp_dir(), running) {
+    match ghostrealm_web::temp::HostTemp::create(temp, running) {
         Ok(temp) => {
             std::env::set_var(ghostrealm_web::temp::ENV, temp.path());
             Some(temp)
@@ -112,10 +112,13 @@ fn chromium_temp() -> Option<ghostrealm_web::temp::HostTemp> {
 }
 
 fn main() -> ExitCode {
+    // The system temp dir, read before `chromium_temp` changes `TMPDIR` (off
+    // macOS) for Chromium.
+    let temp = std::env::temp_dir();
     // First, while this is the only thread: changing the environment races
     // with other threads reading it, and loading CEF starts some. Dropped
     // last, after CEF has shut down.
-    let _temp = chromium_temp();
+    let _chromium_temp = chromium_temp(&temp);
     #[cfg(target_os = "macos")]
     let _loader = {
         let exe = std::env::current_exe().expect("current exe");
@@ -141,12 +144,12 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
-    let frames = match ghostrealm_web::frame::frame_dir() {
+    let frames = match ghostrealm_web::frame::frame_dir_from(&temp) {
         Ok(d) => d,
         Err(e) => return fail(&format!("no directory for page frames: {e}")),
     };
     ghostrealm_web::frame::remove_stale(&frames, running);
-    ghostrealm_web::frame::remove_stale_dirs(&std::env::temp_dir(), running);
+    ghostrealm_web::frame::remove_stale_dirs(&temp, running);
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);

@@ -36,14 +36,20 @@ const PREFIX: &str = "ghostrealm-web-";
 /// `su`), a fresh randomly named private directory in the temp dir is used;
 /// [`remove_stale_dirs`] clears those after their host is gone.
 pub fn frame_dir() -> io::Result<PathBuf> {
+    frame_dir_from(&std::env::temp_dir())
+}
+
+/// [`frame_dir`] with `temp` as the temp dir: the host reads it before it
+/// points `TMPDIR` at Chromium's own (`crate::temp`).
+pub fn frame_dir_from(temp: &Path) -> io::Result<PathBuf> {
     let preferred = match std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
     {
         Some(run) => run.join("ghostrealm"),
-        None => std::env::temp_dir().join(format!("ghostrealm-{}", user_id())),
+        None => temp.join(format!("ghostrealm-{}", user_id())),
     };
-    frame_dir_in(&preferred, &std::env::temp_dir())
+    frame_dir_in(&preferred, temp)
 }
 
 /// `preferred` if it is usable as a private directory, else a fresh private
@@ -649,6 +655,21 @@ mod tests {
         // Another user's directory: root owns `/`.
         assert!(private_dir(Path::new("/")).is_err());
         assert!(frame_dir().unwrap().is_dir());
+    }
+
+    /// Given a temp dir other than the environment's;
+    /// then the frame dir is made from it (or `XDG_RUNTIME_DIR`), not from
+    /// the environment's, which the host changes for Chromium.
+    #[test]
+    fn the_frame_dir_comes_from_the_temp_dir_given() {
+        let base = tmpdir("given");
+        let dir = frame_dir_from(&base).unwrap();
+        let run = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute());
+        match run {
+            Some(run) if dir.starts_with(&run) => assert_eq!(dir, run.join("ghostrealm")),
+            _ => assert!(dir.starts_with(&*base), "{} is not under {}", dir.display(), base.display()),
+        }
+        assert!(dir.is_dir());
     }
 
     #[test]
