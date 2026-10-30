@@ -17,6 +17,8 @@ You plan and implement the unit of work in your brief. Planning and implementing
 
 Read the docs `AGENTS.md` points to that bear on the task. Then write the plan: files to touch, steps, tests, risks, open questions.
 
+If the change deletes or overwrites files it did not just create, the plan states the safety rule (every error, empty, truncated or unreadable input means keep) and lists each input the deletion trusts and how it can be wrong (error, sandbox, symlink, another user, another OS). Behaviour you can't run on this machine stays off on that OS, with a `docs/TODO.md` entry.
+
 If the brief says plan only, report the plan and stop. Feedback arrives as a follow-up message; revise, then implement when told.
 
 ## Implement
@@ -34,6 +36,7 @@ Short:
 
 - Branch and commits (short sha, subject).
 - Tests run and their results, verbatim on failure.
+- For each OS-specific code path you touched: run, compile-checked (the build skill says how) or only read.
 - Deviations from the plan, and why.
 - Open questions and anything left undone.
 - Handoff note (state, branch, open items) if you stopped early.

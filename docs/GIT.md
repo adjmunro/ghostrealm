@@ -58,10 +58,13 @@ Except for dependency bumps, which should look like so:
 - Always make a backup branch before risky changes, for example, when modifying commit history, and then verify the backup against the new branch. Delete the backup if full and complete, and not degraded. Note that it might not be identical, such as when rebasing. However, if the sum of all changes *can* be identical (no base delta), then it *must* be identical before accepting the change & deleting the backup.
 - When rebasing, aim to preserve the *intent* behind both branches changes (unless redundant).
 - `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed and approved, or only records an approved review's non-blocking findings. Commits above `develop` are work in progress.
-- Blocking findings are fixed, and the fix reviewed, before `develop` advances. Non-blocking findings are fixed the same way when nothing is stacked on top; otherwise they are written down (findings docs / `TODO.md`) before `develop` advances. A commit that only records non-blocking findings needs no review of its own.
+- Blocking findings are fixed, and the fix reviewed, before `develop` advances.
+- After an approval with non-blocking findings, they get one fix round (or are written down in findings docs / `TODO.md` when something is stacked on top) and one delta review of the fixes. That review blocks only on blocking findings; its non-blocking findings go to `TODO.md` in a recording commit and `develop` advances, with no further round. A commit that only records non-blocking findings needs no review of its own.
+- Nits (wording, naming, comments) are fixed in the same round or recorded in `TODO.md`; they never start a review round.
 - Review the branch delta (tip vs base), not each commit. Ignore issues a later commit or branch already fixed.
 - Fixes get an adversarial review from a fresh context.
 - Delete findings and `TODO.md` entries once done.
+- Never rewrite a pushed branch; the permission classifier blocks force-push. To move a branch onto a newer `develop`, rebase it onto a new local branch `<name>-<n>`, push that, and delete the old remote branch once `develop` advances. A branch started after another has landed is named for its own purpose, not with a suffix.
 - Fixes take priority over features unless the owner chooses a feature.
 
 ### Format

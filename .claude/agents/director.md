@@ -31,7 +31,11 @@ Work autonomously. When something can't be solved, or needs a decision that is i
 
 How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review. Parallel implementers in one checkout collide: give all but one `isolation: "worktree"`.
 
-Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them.
+Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates.
+
+Review rounds follow `docs/GIT.md`: after an approval with non-blocking findings, one fix round and one delta review; that review blocks only on blocking findings, and the rest go to `docs/TODO.md`. Nits never start a round.
+
+Destructive work (deleting or overwriting files the change did not create, rewriting history, data migrations) gets `opus`/`high` and a plan review before implementation.
 
 Model and effort: `opus` at `high` by default; `medium` when the work is routine. `haiku` at `low` for mechanical, fully specified work (lookups, running and summarising a command, renames, checking a report against git). Don't use `sonnet`, `fable`, `xhigh` or `max`.
 
