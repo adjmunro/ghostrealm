@@ -938,10 +938,15 @@ impl WebView {
         cx.request(crate::plugin::Request::Toast {
             level: crate::toasts::Level::Error,
             message: format!("{what}: {e}"),
-            key: Some(format!("web:{}", self.page)),
+            key: Some(self.toast_key()),
             choices: Vec::new(),
             doc: None,
         });
+    }
+
+    /// The key this page's failure toasts share.
+    fn toast_key(&self) -> String {
+        format!("web:{}", self.page)
     }
 
     /// Whether the pane already shows error `e` in place of the page (the
@@ -1682,6 +1687,10 @@ impl View for WebView {
         self.slot.borrow().retry_at()
     }
 
+    fn toast_keys(&self) -> Vec<String> {
+        vec![self.toast_key()]
+    }
+
     fn tick(&mut self, cx: &mut EventCx, now: Instant) {
         if self.slot.borrow().retry_at().is_some_and(|t| now >= t) {
             self.send(None);
@@ -1746,7 +1755,7 @@ pub(crate) mod tests {
     }
 
     /// A view whose host can't be found (tests don't bundle one).
-    fn hostless() -> WebView {
+    pub(crate) fn hostless() -> WebView {
         std::env::set_var(
             ghostrealm_web::client::HOST_ENV,
             "/nonexistent/ghostrealm-web-host",

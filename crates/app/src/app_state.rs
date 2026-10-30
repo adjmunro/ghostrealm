@@ -2957,25 +2957,47 @@ mod tests {
     /// others stay.
     #[test]
     fn closing_a_terminal_dismisses_its_own_toasts() {
+        type Close = fn(&mut AppState, VtabId, SurfaceId);
+        let tab: Close = |s, _, sid| s.close_surface_id(sid);
+        let vtab: Close = |s, vt, _| s.close_vtab(vt);
+        for (how, close) in [("tab", tab), ("workspace", vtab)] {
+            let mut s = AppState::new();
+            s.new_empty_vtab();
+            let vt = s.new_vtab().unwrap();
+            let sid = s.focused_surface().unwrap();
+            assert_closing_dismisses_its_toasts(&mut s, sid, |s| close(s, vt, sid), how);
+        }
+    }
+
+    /// The same for a web page's failure toast.
+    #[test]
+    fn closing_a_web_tab_dismisses_its_own_toasts() {
         let mut s = AppState::new();
-        s.new_vtab().unwrap();
+        s.new_empty_vtab();
+        s.new_view_vtab("web", Box::new(crate::plugins::web::tests::hostless()));
         let sid = s.focused_surface().unwrap();
+        assert_closing_dismisses_its_toasts(&mut s, sid, |s| s.close_surface_id(sid), "web tab");
+    }
+
+    /// Queue view `sid`'s own toast beside another, run `close`, and check
+    /// that only the other stays.
+    fn assert_closing_dismisses_its_toasts(s: &mut AppState, sid: SurfaceId, close: impl FnOnce(&mut AppState), how: &str) {
         let keys = s.view(sid).unwrap().toast_keys();
-        let [key] = &keys[..] else { panic!("{keys:?}") };
-        let toast = |key: &str| Request::Toast {
+        let [key] = &keys[..] else { panic!("{how}: {keys:?}") };
+        let req = Request::Toast {
             level: Level::Error,
-            message: "Couldn't draw the terminal".into(),
-            key: Some(key.into()),
+            message: "it failed".into(),
+            key: Some(key.clone()),
             choices: Vec::new(),
             doc: None,
         };
-        s.toast_request(sid, toast(key));
+        s.toast_request(sid, req);
         s.notify(Toast::new(Level::Error, "bad config").keyed("config"));
-        assert_eq!(s.toasts().len(), 2);
-        s.close_surface_id(sid);
-        assert!(s.view(sid).is_none());
+        assert_eq!(s.toasts().len(), 2, "{how}");
+        close(s);
+        assert!(s.view(sid).is_none(), "{how}");
         let left: Vec<_> = s.toasts().iter().map(|e| e.toast.key.clone()).collect();
-        assert_eq!(left, [Some("config".to_string())]);
+        assert_eq!(left, [Some("config".to_string())], "{how}");
     }
 
     #[test]
