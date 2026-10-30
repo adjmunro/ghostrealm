@@ -230,6 +230,11 @@ impl GhosttyTerminal {
         ChildKiller::new(self.child.id())
     }
 
+    /// Close the PTY and return the child, still to be reaped.
+    pub(crate) fn into_child(self) -> Child {
+        self.child
+    }
+
     /// Write whatever the VT engine queued for the child, then flush.
     fn flush_pty_out(&mut self) {
         if self.pty_out.borrow().is_empty() {

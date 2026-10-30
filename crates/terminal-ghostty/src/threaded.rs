@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, TryLockError};
+use std::process::Child;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -110,7 +111,8 @@ pub struct ThreadedTerminal {
     last_snapshot_gen: u64,
     /// Last grid seen, for `snapshot()` (peek) callers like the agent.
     last_grid: Grid,
-    worker: Option<JoinHandle<()>>,
+    /// Returns the child once the worker ends, for the reaper to reap.
+    worker: Option<JoinHandle<Option<Child>>>,
     /// Kills the child if the worker doesn't shut down in time.
     killer: Option<ChildKiller>,
     child_pid: Option<u32>,
@@ -145,31 +147,28 @@ impl ThreadedTerminal {
                         let _ = tx.send(Cmd::PtyReady);
                     })
                 };
-                let started = GhosttyTerminal::spawn_with_waker(
-                    cols,
-                    rows,
-                    cell_w,
-                    cell_h,
-                    command,
-                    Some(pty_waker),
-                )
-                .and_then(|t| {
-                    if let Some(pid) = t.child_pid() {
-                        spawn_exit_waiter(pid, &worker_shared, exit_tx)?;
-                    }
-                    Ok(t)
-                });
+                let started =
+                    GhosttyTerminal::spawn_with_waker(cols, rows, cell_w, cell_h, command, Some(pty_waker));
                 let mut term = match started {
-                    Ok(t) => {
-                        let _ = start_tx.send(Ok((t.child_killer(), t.child_pid())));
-                        t
-                    }
+                    Ok(t) => t,
                     Err(e) => {
                         let _ = start_tx.send(Err(e));
-                        return;
+                        return None;
                     }
                 };
+                if let Some(pid) = term.child_pid() {
+                    if let Err(e) = spawn_exit_waiter(pid, &worker_shared, exit_tx) {
+                        let _ = start_tx.send(Err(e));
+                        // Nothing waits on it yet, so its pid is still ours.
+                        let mut child = term.into_child();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                }
+                let _ = start_tx.send(Ok((term.child_killer(), term.child_pid())));
                 worker_loop(&mut term, cmd_rx, &worker_shared, ui_waker.as_ref());
+                Some(term.into_child())
             })
             .map_err(|e| anyhow!("spawn vt-worker: {e}"))?;
 
@@ -200,7 +199,9 @@ impl ThreadedTerminal {
 /// [`SHUTDOWN_GRACE`], then after [`KILL_GRACE`] SIGKILLs the child's process
 /// group and the foreground command's (checked to still be in the child's
 /// session). A child already seen to exit isn't signalled (its pid may be
-/// reused), but a foreground command left holding the PTY still is.
+/// reused), but a foreground command left holding the PTY still is. Once the
+/// worker ends, the reaper waits for the child (the closed PTY hangs it up),
+/// after every signal, so no signal can reach its pid once reused.
 impl Drop for ThreadedTerminal {
     fn drop(&mut self) {
         self.send(Cmd::Shutdown);
@@ -217,17 +218,20 @@ impl Drop for ThreadedTerminal {
                 worker.is_finished()
             };
             let exited = || shared.meta.lock().unwrap().lifecycle.has_exited();
-            if finished(SHUTDOWN_GRACE) {
-                return;
+            if !finished(SHUTDOWN_GRACE) {
+                if !exited() {
+                    let _ = killer.kill();
+                }
+                if !finished(KILL_GRACE) {
+                    let foreground = shared.meta.lock().unwrap().foreground;
+                    force_kill(pid, !exited(), foreground);
+                }
             }
-            if !exited() {
-                let _ = killer.kill();
+            if let Ok(Some(mut child)) = worker.join() {
+                // The exit waiter holds this until it has seen the exit.
+                let _reap = shared.reap.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = child.wait();
             }
-            if finished(KILL_GRACE) {
-                return;
-            }
-            let foreground = shared.meta.lock().unwrap().foreground;
-            force_kill(pid, !exited(), foreground);
         };
         let _ = std::thread::Builder::new().name("vt-reaper".into()).spawn(reap);
     }
@@ -550,7 +554,7 @@ mod tests {
         drop(term);
         assert!(start.elapsed() < Duration::from_millis(100), "drop blocked: {:?}", start.elapsed());
 
-        // Gone, or a zombie (the test process never reaps it).
+        // Gone, or a zombie the reaper hasn't reaped yet.
         let alive = || {
             let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
             out.is_ok_and(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
@@ -594,6 +598,81 @@ mod tests {
         wait_for_exit(child.id());
         let status = child.try_wait().unwrap().expect("exited, and still ours to reap");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Whether `pid` is a child of this process that has exited and is not
+    /// yet reaped; `None` once it isn't a child (reaped).
+    fn exited_unreaped(pid: u32) -> Option<bool> {
+        // SAFETY: waitid writes only the zeroed siginfo it is given.
+        let (r, info) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            );
+            (r, info)
+        };
+        // SAFETY: si_pid is set by waitid, and zero when nothing has exited.
+        (r == 0).then(|| unsafe { info.si_pid() } != 0)
+    }
+
+    /// Given a worker whose child exits while the reap lock is held,
+    /// when the worker refreshes,
+    /// then it reports Running and leaves the child unreaped, and reaps it
+    /// once the lock is free and `ChildExited` arrives.
+    #[test]
+    fn the_worker_reaps_only_when_the_exit_waiter_lets_it() {
+        let shared = Arc::new(Shared::new());
+        let guard = shared.reap.lock().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (pid_tx, pid_rx) = mpsc::channel();
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let mut term = GhosttyTerminal::spawn(40, 10, 8, 16, Some(sh("exit 4"))).unwrap();
+            pid_tx.send(term.child_pid().unwrap()).unwrap();
+            worker_loop(&mut term, cmd_rx, &worker_shared, None);
+            term.into_child()
+        });
+        let pid = pid_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while exited_unreaped(pid) != Some(true) {
+            assert!(Instant::now() < deadline, "the child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cmd_tx.send(Cmd::ChildExited).unwrap();
+        cmd_tx.send(Cmd::PtyReady).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(shared.meta.lock().unwrap().lifecycle, Lifecycle::Running);
+        assert_eq!(exited_unreaped(pid), Some(true), "left unreaped");
+
+        drop(guard);
+        cmd_tx.send(Cmd::ChildExited).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while shared.meta.lock().unwrap().lifecycle == Lifecycle::Running {
+            assert!(Instant::now() < deadline, "the exit was never noticed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(shared.meta.lock().unwrap().lifecycle, Lifecycle::Exited(Some(4)));
+        assert_eq!(exited_unreaped(pid), None, "reaped");
+        cmd_tx.send(Cmd::Shutdown).unwrap();
+        worker.join().unwrap();
+    }
+
+    /// Given a terminal whose worker shuts down promptly,
+    /// when it is dropped,
+    /// then its child is reaped, not left a zombie.
+    #[test]
+    fn a_dropped_terminals_child_is_reaped() {
+        let term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(sh("sleep 30")), None).unwrap();
+        let pid = term.child_pid.unwrap();
+        drop(term);
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while exited_unreaped(pid).is_some() {
+            assert!(Instant::now() < deadline, "the child was never reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Given a live child,
