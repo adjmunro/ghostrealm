@@ -57,10 +57,12 @@
 //!   process whose pid the name carries (its first number) is gone and they
 //!   are 5 minutes old. The app's frame directory `ghostrealm-<uid>` and its
 //!   fallbacks `ghostrealm-<uid>-*` are kept (the web host clears those);
-//! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
-//!   once 5 minutes old while no web host runs. A web host points Chromium's
-//!   temp dir at `<profile>/tmp/<pid>` and the next host on that profile
-//!   clears it, so these are only ones Chromium made with that unset.
+//! - the web hosts' Chromium temp dirs `ghostrealm-<uid>-cef/<pid>`: removed
+//!   once that pid is gone and they are 5 minutes old (the next host also
+//!   clears them);
+//! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`), which
+//!   Chromium makes in the temp dir when a host has no dir of its own for
+//!   them: removed once 5 minutes old while no web host runs.
 //!
 //! The target dir given (or `target`) is never emptied, and temp-dir
 //! entries of other users are not touched. Emptying holds the `debug` and
@@ -867,8 +869,13 @@ fn clean_temp(temp: &Path, uid: u32, idle: Duration, running: &Running, opts: &O
             continue;
         }
         // The app's frame dir and its fallbacks (`ghostrealm-<uid>-<pid>-<random>`),
-        // which the host clears itself.
+        // which the host clears itself, and the hosts' Chromium temp dirs.
         if name == frame_dir || name.starts_with(&format!("{frame_dir}-")) {
+            if name == format!("{frame_dir}-cef") && e.file_type().is_ok_and(|t| t.is_dir()) {
+                let (n, b) = clean_host_temps(&path, running, opts);
+                count += n;
+                bytes += b;
+            }
             continue;
         }
         // A target dir's name may hold a number that isn't a pid.
@@ -892,6 +899,22 @@ fn clean_temp(temp: &Path, uid: u32, idle: Duration, running: &Running, opts: &O
     }
     println!("{}: {count} leftovers; {} {}", temp.display(), opts.freed(), human(bytes));
     bytes
+}
+
+/// The web hosts' Chromium temp dirs in `base` (`ghostrealm-<uid>-cef`): each
+/// `<pid>` dir goes once its pid is not running and it is [`TEMP_MIN_AGE`]
+/// old. Returns how many went and their bytes.
+fn clean_host_temps(base: &Path, running: &Running, opts: &Opts) -> (u64, u64) {
+    let (mut count, mut bytes) = (0, 0);
+    for e in read_dir(base) {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let path = e.path();
+        if !running.pids.contains(&pid) && running.older_than(mtime_or_now(&path), TEMP_MIN_AGE) {
+            count += 1;
+            bytes += remove(&path, opts);
+        }
+    }
+    (count, bytes)
 }
 
 /// A `ghostrealm-<tag>-<pid>[-<n>]` (or `...-<pid>.txt`) temp entry goes once
@@ -1333,6 +1356,11 @@ mod tests {
         };
         let frame = dir(format!("ghostrealm-{uid}"));
         let fallback = dir(format!("ghostrealm-{uid}-1111-abc"));
+        let host_temps = dir(format!("ghostrealm-{uid}-cef"));
+        let gone_host = dir(format!("ghostrealm-{uid}-cef/1111"));
+        let new_host = host_temps.join("2222");
+        fs::create_dir(&new_host).unwrap();
+        let live_host = dir(format!("ghostrealm-{uid}-cef/{}", std::process::id()));
         let leftover = dir("ghostrealm-fb-1111-3".into());
         let cef = dir(format!("{CEF_TEMP_PREFIX}1111"));
         let new_cef = temp.join(format!("{CEF_TEMP_PREFIX}2222"));
@@ -1353,6 +1381,9 @@ mod tests {
         assert!(frame.is_dir() && fallback.is_dir(), "the app's frame dirs stay");
         assert!(!leftover.exists(), "its process is gone");
         assert!(cef.is_dir(), "a web host is running");
+        assert!(!gone_host.exists(), "its host is gone");
+        assert!(host_temps.is_dir() && live_host.is_dir(), "a running host's temp dir stays");
+        assert!(new_host.is_dir(), "too new: its host may have started since");
         assert!(built.is_dir(), "a target goes by idleness, not by a number in its name");
 
         clean_temp(&temp, me(), Duration::from_secs(3600), &running_with(vec![]), &opts());

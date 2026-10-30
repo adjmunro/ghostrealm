@@ -89,20 +89,20 @@ fn create_private(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn user_id() -> u32 {
+pub(crate) fn user_id() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]
-fn user_id() -> u32 {
+pub(crate) fn user_id() -> u32 {
     0
 }
 
 /// Create `dir` (mode 0700) if it is missing, and check that it is a real
 /// directory (not a symlink) owned by this user with no access for others.
 #[cfg(unix)]
-fn private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -120,7 +120,7 @@ fn private_dir(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 

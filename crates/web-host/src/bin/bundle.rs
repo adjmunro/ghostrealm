@@ -24,7 +24,7 @@ fn bundle(target: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error
     use cef::build_util::mac::{bundle, BundleInfo};
     let info = BundleInfo::new(
         HOST,
-        "dev.ghostrealm.web-host",
+        ghostrealm_web::temp::BUNDLE_ID,
         HOST,
         "English",
         semver::Version::new(0, 0, 0),

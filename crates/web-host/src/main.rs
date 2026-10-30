@@ -89,7 +89,33 @@ fn cache_dir() -> PathBuf {
     base.join("ghostrealm").join("web")
 }
 
+/// Point Chromium's temp dir at one of this host's own ([`HostTemp`]), unless
+/// this is one of Chromium's subprocesses (`--type=…`; off macOS this binary
+/// serves them), which inherit it. Without one Chromium uses the system temp
+/// dir.
+///
+/// [`HostTemp`]: ghostrealm_web::temp::HostTemp
+fn chromium_temp() -> Option<ghostrealm_web::temp::HostTemp> {
+    if std::env::args_os().any(|a| a.to_string_lossy().starts_with("--type=")) {
+        return None;
+    }
+    match ghostrealm_web::temp::HostTemp::create(&std::env::temp_dir(), running) {
+        Ok(temp) => {
+            std::env::set_var(ghostrealm_web::temp::ENV, temp.path());
+            Some(temp)
+        }
+        Err(e) => {
+            eprintln!("ghostrealm-web-host: Chromium's temp files go in the system temp dir: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // First, while this is the only thread: changing the environment races
+    // with other threads reading it, and loading CEF starts some. Dropped
+    // last, after CEF has shut down.
+    let _temp = chromium_temp();
     #[cfg(target_os = "macos")]
     let _loader = {
         let exe = std::env::current_exe().expect("current exe");
@@ -124,13 +150,6 @@ fn main() -> ExitCode {
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
-    let temp = match ghostrealm_web::temp::HostTemp::create(&cache, running) {
-        Ok(t) => t,
-        Err(e) => return fail(&format!("no temp directory under {}: {e}", cache.display())),
-    };
-    // Before `initialize`, which starts Chromium's threads (none may run while
-    // the environment changes) and its child processes (which inherit it).
-    std::env::set_var(ghostrealm_web::temp::ENV, temp.path());
     let settings = Settings {
         windowless_rendering_enabled: 1,
         root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
