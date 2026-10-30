@@ -153,6 +153,10 @@ fn main() -> ExitCode {
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
+    // CEF resolves symlinks in `root_cache_path` but not in `cache_path`, and
+    // keeps the profile in memory when it then finds `cache_path` outside the
+    // root (as under macOS's temp dir, `/var` -> `/private/var`).
+    let cache = std::fs::canonicalize(&cache).unwrap_or(cache);
     let settings = Settings {
         windowless_rendering_enabled: 1,
         root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
