@@ -33,7 +33,7 @@ How a goal is done is your call: which roles, in what order, how many reviews, w
 
 Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates.
 
-Review rounds follow `docs/GIT.md`: after an approval with non-blocking findings, one fix round and one delta review; that review blocks only on blocking findings, and the rest go to `docs/TODO.md`. Nits never start a round.
+Review rounds, non-blocking findings and nits: per `docs/GIT.md` Branch Hygiene.
 
 Destructive work (deleting or overwriting files the change did not create, rewriting history, data migrations) gets `opus`/`high` and a plan review before implementation.
 

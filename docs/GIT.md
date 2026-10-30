@@ -60,11 +60,11 @@ Except for dependency bumps, which should look like so:
 - `develop` marks the reviewed boundary: every commit at or below `develop` has been reviewed and approved, or only records an approved review's non-blocking findings. Commits above `develop` are work in progress.
 - Blocking findings are fixed, and the fix reviewed, before `develop` advances.
 - After an approval with non-blocking findings, they get one fix round (or are written down in findings docs / `TODO.md` when something is stacked on top) and one delta review of the fixes. That review blocks only on blocking findings; its non-blocking findings go to `TODO.md` in a recording commit and `develop` advances, with no further round. A commit that only records non-blocking findings needs no review of its own.
-- Nits (wording, naming, comments) are fixed in the same round or recorded in `TODO.md`; they never start a review round.
+- Nits (wording, naming, comments) never start a review round. They are fixed only in a round a later review covers; nits from the last review of a branch, or from a plain approve, are only recorded in `TODO.md`.
 - Review the branch delta (tip vs base), not each commit. Ignore issues a later commit or branch already fixed.
 - Fixes get an adversarial review from a fresh context.
 - Delete findings and `TODO.md` entries once done.
-- Never rewrite a pushed branch; the permission classifier blocks force-push. To move a branch onto a newer `develop`, rebase it onto a new local branch `<name>-<n>`, push that, and delete the old remote branch once `develop` advances. A branch started after another has landed is named for its own purpose, not with a suffix.
+- Never rewrite a pushed branch; the permission classifier blocks force-push. To move a branch onto a newer `develop`: create `<name>-<n>` from the branch, rebase it onto `develop`, push it to a remote branch of the same name, and delete the old remote branch once `develop` advances. A rebase that changes the branch delta (conflict resolution) needs a delta review of that change; a clean rebase doesn't. A branch started after another has landed is named for its own purpose, not with a suffix.
 - Fixes take priority over features unless the owner chooses a feature.
 
 ### Format

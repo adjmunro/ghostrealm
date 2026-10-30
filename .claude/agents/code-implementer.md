@@ -17,14 +17,16 @@ You plan and implement the unit of work in your brief. Planning and implementing
 
 Read the docs `AGENTS.md` points to that bear on the task. Then write the plan: files to touch, steps, tests, risks, open questions.
 
-If the change deletes or overwrites files it did not just create, the plan states the safety rule (every error, empty, truncated or unreadable input means keep) and lists each input the deletion trusts and how it can be wrong (error, sandbox, symlink, another user, another OS). Behaviour you can't run on this machine stays off on that OS, with a `docs/TODO.md` entry.
+If the change deletes or overwrites files the change did not create, the plan states the safety rule (every error, empty, truncated or unreadable input means keep), lists each input the deletion trusts and how it can be wrong (error, sandbox, symlink, another user, another OS), and names a test per guard that drives it to fail and asserts the file is kept.
+
+Code for an OS this machine can't run: destructive code stays off on that OS, with a `docs/TODO.md` entry; other code is compile-checked (the build skill says how) and reported.
 
 If the brief says plan only, report the plan and stop. Feedback arrives as a follow-up message; revise, then implement when told.
 
 ## Implement
 
 - Branch from the base in the brief, per `docs/GIT.md`. Commit as you go and push your branch. Never move `develop`.
-- Run the tests that cover what you changed.
+- Run the tests that cover what you changed, including a test per deletion guard that drives it to fail and asserts the file is kept.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
 - If you near 300,000 tokens of context, or the task grows well beyond the brief, stop and report with a handoff note.
