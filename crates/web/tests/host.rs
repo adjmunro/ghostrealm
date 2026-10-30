@@ -69,6 +69,11 @@ fn spawn(tag: &str) -> Option<(WebHost, Profile)> {
 
 /// [`spawn`], with extra environment variables for the host.
 fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, Profile)> {
+    spawn_at(std::env::temp_dir().join(format!("ghostrealm-web-{tag}-{}", std::process::id())), env)
+}
+
+/// [`spawn_with`] on profile `cache`.
+fn spawn_at(cache: PathBuf, env: &[(&str, &str)]) -> Option<(WebHost, Profile)> {
     // The host reads its profile from the environment at spawn; tests run in
     // parallel, so each sets and spawns in turn.
     static SPAWN: Mutex<()> = Mutex::new(());
@@ -77,7 +82,6 @@ fn spawn_with(tag: &str, env: &[(&str, &str)]) -> Option<(WebHost, Profile)> {
         return None;
     };
     let turn = Turn::take();
-    let cache = std::env::temp_dir().join(format!("ghostrealm-web-{tag}-{}", std::process::id()));
     let host = {
         let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("GHOSTREALM_WEB_CACHE", &cache);
@@ -132,6 +136,45 @@ fn a_host_hung_up_on_frees_its_profile_once_gone() {
     assert!(again.wait_loaded(1, Duration::from_secs(20)));
     assert_eq!(again.eval(1, "1 + 1", Duration::from_secs(5)), Ok("2".into()));
     shut_down(again, &cache);
+}
+
+/// Given a host on a profile reached through a symlink (as macOS's temp dir
+/// is: `/var` -> `/private/var`);
+/// when a page stores a cookie and local storage, the app hangs up on the
+/// host, and a new host starts on the same profile;
+/// then CEF took the profile's path (it makes `profile` in it; a path it
+/// finds outside its root it drops for in-memory storage), and the page
+/// reads both back.
+#[test]
+fn a_profile_reached_through_a_symlink_keeps_storage_on_disk() {
+    let pid = std::process::id();
+    let real = std::env::temp_dir().join(format!("ghostrealm-web-symlinked-{pid}"));
+    let link = std::env::temp_dir().join(format!("ghostrealm-web-symlink-{pid}"));
+    std::fs::create_dir_all(&real).unwrap();
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let Some((host, first)) = spawn_at(link.clone(), &[]) else {
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        return;
+    };
+    assert!(real.join("profile").is_dir(), "CEF dropped the profile's path");
+    let (base, _) = serve();
+    let page = Request::Create { id: 1, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: false };
+    assert!(host.send(&page));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let store = "document.cookie = 'kept=cookie; max-age=3600'; localStorage.setItem('kept', 'storage'); 1";
+    assert_eq!(host.eval(1, store, Duration::from_secs(5)), Ok("1".into()));
+    assert!(host.hang_up().wait(Duration::from_secs(10)), "never reported gone");
+    drop(first);
+
+    let (again, second) = spawn_at(link.clone(), &[]).expect("built");
+    assert!(again.send(&page));
+    assert!(again.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let read = "[document.cookie, localStorage.getItem('kept')]";
+    assert_eq!(again.eval(1, read, Duration::from_secs(5)), Ok(r#"["kept=cookie","storage"]"#.into()));
+    shut_down(again, &second);
+    let _ = std::fs::remove_dir_all(&real);
 }
 
 /// Given a person's page and an agent's, each sent off screen;
