@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -49,6 +49,14 @@ pub type PtyWaker = Box<dyn FnMut() + Send + 'static>;
 /// library default is 10 KB, which (pruned at ~400 KB page granularity) keeps
 /// only about one page of history.
 const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
+
+/// How a child that ended with `status` ended.
+pub(crate) fn lifecycle_of(status: ExitStatus) -> Lifecycle {
+    match status.signal() {
+        Some(signal) => Lifecycle::Signaled(signal),
+        None => Lifecycle::Exited(status.code()),
+    }
+}
 
 fn rgb(c: RgbColor) -> Rgb {
     [c.r, c.g, c.b]
@@ -684,10 +692,7 @@ impl TerminalBackend for GhosttyTerminal {
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
-                let done = match status.signal() {
-                    Some(signal) => Lifecycle::Signaled(signal),
-                    None => Lifecycle::Exited(status.code()),
-                };
+                let done = lifecycle_of(status);
                 self.exited = Some(done);
                 done
             }
