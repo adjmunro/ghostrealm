@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use ghostrealm_terminal::{Grid, KeyPress, Lifecycle, MouseReport, Pumped, Scroll, TerminalBackend};
 
-use portable_pty::ChildKiller;
-
-use crate::{CommandBuilder, GhosttyTerminal, PtyWaker};
+use crate::{ChildKiller, CommandBuilder, GhosttyTerminal, PtyWaker};
 
 /// How long a dropped terminal's worker gets to see `Shutdown` before the
 /// child is sent SIGHUP. A worker blocked writing to a child that isn't
@@ -101,7 +99,7 @@ pub struct ThreadedTerminal {
     last_grid: Grid,
     worker: Option<JoinHandle<()>>,
     /// Kills the child if the worker doesn't shut down in time.
-    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    killer: Option<ChildKiller>,
     child_pid: Option<u32>,
 }
 
@@ -129,7 +127,7 @@ impl ThreadedTerminal {
             }),
             generation: AtomicU64::new(0),
         });
-        type Started = Result<(Box<dyn ChildKiller + Send + Sync>, Option<u32>)>;
+        type Started = Result<(ChildKiller, Option<u32>)>;
         let (start_tx, start_rx) = mpsc::channel::<Started>();
         let worker_shared = Arc::clone(&shared);
         // The PTY reader wakes the worker (not the UI) by posting `PtyReady`.
@@ -205,7 +203,7 @@ impl ThreadedTerminal {
 impl Drop for ThreadedTerminal {
     fn drop(&mut self) {
         self.send(Cmd::Shutdown);
-        let (Some(worker), Some(mut killer)) = (self.worker.take(), self.killer.take()) else {
+        let (Some(worker), Some(killer)) = (self.worker.take(), self.killer.take()) else {
             return;
         };
         let (shared, pid) = (Arc::clone(&self.shared), self.child_pid);

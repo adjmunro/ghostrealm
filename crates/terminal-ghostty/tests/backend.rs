@@ -1,4 +1,4 @@
-//! Integration tests for the libghostty-vt + portable-pty backend.
+//! Integration tests for the libghostty-vt + PTY backend.
 //! These spawn real PTYs, so they need Zig on PATH (via mise) to build the
 //! native lib. Failures print next steps for a follow-up agent.
 
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use ghostrealm_terminal::{
     Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton, MouseReport, Scroll, TerminalBackend,
 };
-use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
+use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal, ThreadedTerminal};
 
 fn sh(cmd: &str) -> CommandBuilder {
     let mut c = CommandBuilder::new("/bin/sh");
@@ -309,6 +309,47 @@ fn detects_child_killed_by_a_signal() {
     let mut term = GhosttyTerminal::spawn(20, 4, 8, 16, Some(sh("kill -9 $$"))).expect("spawn backend");
     pump_until_exit(&mut term, Duration::from_secs(5));
     assert_eq!(term.lifecycle(), Lifecycle::Signaled(9));
+}
+
+/// Whether `err` comes from an OS error of `kind`.
+fn caused_by(err: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    err.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == kind))
+}
+
+#[test]
+fn a_shell_that_does_not_exist_is_a_spawn_error() {
+    let missing = || CommandBuilder::new("/nonexistent/ghostrealm-shell");
+    let err = GhosttyTerminal::spawn(20, 4, 8, 16, Some(missing())).err().expect("spawn failed");
+    assert!(caused_by(&err, std::io::ErrorKind::NotFound), "{err:#}");
+    assert!(format!("{err:#}").contains("ghostrealm-shell"), "the error names the program: {err:#}");
+    let err = ThreadedTerminal::spawn(20, 4, 8, 16, Some(missing()), None).err().expect("spawn failed");
+    assert!(caused_by(&err, std::io::ErrorKind::NotFound), "{err:#}");
+}
+
+#[test]
+fn the_child_gets_the_pty_its_environment_and_directory() {
+    let dir = std::env::temp_dir().join(format!("ghostrealm-pty-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let script = "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] && printf 'tty|'; printf '%s|%s|%s' \"$TERM\" \"$EXTRA\" \"$(pwd -P)\"";
+    let mut c = sh(script);
+    c.env("EXTRA", "set");
+    c.cwd(&dir);
+    let mut term = GhosttyTerminal::spawn(200, 4, 8, 16, Some(c)).expect("spawn backend");
+    pump_until_exit(&mut term, Duration::from_secs(5));
+    let row = row_text(&mut term, 0);
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(row, format!("tty|xterm-256color|set|{}", dir.display()));
+}
+
+#[test]
+fn a_directory_that_does_not_exist_starts_the_child_at_home() {
+    let mut c = sh("pwd -P");
+    c.cwd("/nonexistent/ghostrealm-dir");
+    let mut term = GhosttyTerminal::spawn(200, 4, 8, 16, Some(c)).expect("spawn backend");
+    pump_until_exit(&mut term, Duration::from_secs(5));
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")).canonicalize().unwrap();
+    assert_eq!(row_text(&mut term, 0), home.display().to_string());
 }
 
 #[test]

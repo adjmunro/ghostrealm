@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 ghostrealm-terminal.workspace = true
 libghostty-vt.workspace = true
-portable-pty.workspace = true
+ghostrealm-process.workspace = true
 anyhow.workspace = true
 
 [target.'cfg(unix)'.dependencies]

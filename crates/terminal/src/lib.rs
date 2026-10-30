@@ -1,8 +1,8 @@
 //! The terminal-backend seam.
 //!
 //! The app talks to a terminal only through [`TerminalBackend`] and the
-//! backend-neutral types here. Concrete backends (e.g. libghostty-vt +
-//! portable-pty) live behind this boundary so they can be swapped without the
+//! backend-neutral types here. Concrete backends (e.g. libghostty-vt + a
+//! PTY) live behind this boundary so they can be swapped without the
 //! app knowing. Types deliberately avoid any dependency on the VT engine,
 //! the PTY layer, or the windowing/render layer.
 

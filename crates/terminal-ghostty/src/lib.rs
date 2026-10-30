@@ -1,16 +1,23 @@
-//! `libghostty-vt` + `portable-pty` implementation of [`TerminalBackend`].
+//! `libghostty-vt` + own unix PTY implementation of [`TerminalBackend`].
 //!
 //! Runs on a single (UI) thread: the VT engine and its render iterators are
 //! `!Send`, so they stay here. A dedicated reader thread does the only blocking
 //! work (reading the PTY master) and forwards raw bytes over a channel; every
 //! call into the VT engine happens in [`GhosttyTerminal::pump`] on this thread.
 
+#[cfg(not(unix))]
+compile_error!("ghostrealm-terminal-ghostty opens its PTY with unix calls only");
+
+mod pty;
 pub mod threaded;
+pub use pty::{ChildKiller, CommandBuilder};
 pub use threaded::{ThreadedTerminal, UiWaker};
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::os::unix::process::ExitStatusExt;
+use std::process::Child;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -31,11 +38,8 @@ use libghostty_vt::screen::Screen;
 use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::Terminal;
-use portable_pty::{native_pty_system, Child, ChildKiller, MasterPty, PtySize};
 
-/// Re-exported so the app can describe a command without depending on
-/// `portable-pty` directly.
-pub use portable_pty::CommandBuilder;
+use pty::{Pty, PtyWriter, WinSize};
 
 /// Called by the reader thread after forwarding child output, so an event loop
 /// can wake and redraw instead of polling. `Send` only (it lives on the thread).
@@ -67,10 +71,11 @@ pub struct GhosttyTerminal {
     render_state: RenderState<'static>,
     row_iter: RowIterator<'static>,
     cell_iter: CellIterator<'static>,
-    /// Kept alive for resize; the reader is cloned from it and the writer taken.
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Kept for resize and the foreground group; the reader and writer are
+    /// clones of it.
+    master: Pty,
+    writer: PtyWriter,
+    child: Child,
     /// Raw child output, forwarded from the reader thread.
     rx: Receiver<Vec<u8>>,
     /// Bytes the reader thread has put on `rx` so far (applied or not).
@@ -91,8 +96,7 @@ pub struct GhosttyTerminal {
     /// Cached once the child is observed to have exited.
     exited: Option<Lifecycle>,
     /// The signal that ended the child, from the `waitid` siginfo of the thread
-    /// that waited for it ([`Self::note_exit_signal`]). Preferred over
-    /// [`signal_number`], which only knows signals below 32.
+    /// that waited for it ([`Self::note_exit_signal`]).
     exit_signal: Option<i32>,
     /// The reader thread signalled EOF (child's PTY closed).
     reader_done: bool,
@@ -124,29 +128,16 @@ impl GhosttyTerminal {
         command: Option<CommandBuilder>,
         waker: Option<PtyWaker>,
     ) -> Result<Self> {
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: (cols as u32 * cell_w) as u16,
-                pixel_height: (rows as u32 * cell_h) as u16,
-            })
-            .context("openpty")?;
+        let (master, slave) = Pty::open(WinSize { cols, rows, cell_w, cell_h }).context("open PTY")?;
 
-        let mut cmd = match command {
-            Some(c) => c,
-            None => CommandBuilder::new_default_prog(),
-        };
+        let mut cmd = command.unwrap_or_else(CommandBuilder::new_default_prog);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
-        let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
-        // Slave fd is held by the child now; drop our copy so EOF propagates.
-        drop(pair.slave);
+        let child = pty::spawn(slave, cmd)?;
 
-        let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        let mut reader = master.reader().context("clone PTY reader")?;
+        let writer = master.writer().context("clone PTY writer")?;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let forwarded = Arc::new(AtomicUsize::new(0));
@@ -203,7 +194,7 @@ impl GhosttyTerminal {
             render_state,
             row_iter,
             cell_iter,
-            master: pair.master,
+            master,
             writer,
             child,
             rx,
@@ -237,7 +228,7 @@ impl GhosttyTerminal {
     /// The child's process id (its process group's, too: it leads its own
     /// session).
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.process_id()
+        Some(self.child.id())
     }
 
     /// Record the signal that ended the child, as its exit waiter saw it, so
@@ -256,12 +247,12 @@ impl GhosttyTerminal {
     /// The PTY's foreground process group (the running command, else the
     /// shell).
     pub fn foreground_group(&self) -> Option<i32> {
-        self.master.process_group_leader()
+        self.master.foreground_group()
     }
 
     /// A handle that kills the child from another thread.
-    pub fn child_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        self.child.clone_killer()
+    pub fn child_killer(&self) -> ChildKiller {
+        ChildKiller::new(self.child.id())
     }
 
     /// Write whatever the VT engine queued for the child, then flush.
@@ -585,12 +576,7 @@ impl TerminalBackend for GhosttyTerminal {
         }
         self.cell_w = cell_w_px;
         self.cell_h = cell_h_px;
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: (cols as u32 * cell_w_px) as u16,
-            pixel_height: (rows as u32 * cell_h_px) as u16,
-        });
+        let _ = self.master.resize(WinSize { cols, rows, cell_w: cell_w_px, cell_h: cell_h_px });
         let _ = self.term.resize(cols, rows, cell_w_px, cell_h_px);
         self.dirty = true;
     }
@@ -709,9 +695,9 @@ impl TerminalBackend for GhosttyTerminal {
         // shell's own pid/pgrp exactly when a foreground command is running. Job
         // control (interactive shells) is what makes this authoritative; a shell
         // that doesn't move the foreground group reads as never busy.
-        match (self.master.process_group_leader(), self.child.process_id()) {
-            (Some(fg), Some(shell)) => fg != shell as i32,
-            _ => false,
+        match self.master.foreground_group() {
+            Some(fg) => fg != self.child.id() as i32,
+            None => false,
         }
     }
 
@@ -719,19 +705,11 @@ impl TerminalBackend for GhosttyTerminal {
         if let Some(done) = self.exited {
             return done;
         }
-        // Read the signal before `try_wait` reaps the child: the waiter's
-        // report may not have arrived yet, and `portable_pty`'s status only
-        // knows signals below 32.
-        #[cfg(unix)]
-        if self.exit_signal.is_none() {
-            self.exit_signal = self.child.process_id().and_then(exit_signal_now);
-        }
         match self.child.try_wait() {
             Ok(Some(status)) => {
-                let signal = self.exit_signal.or_else(|| status.signal().and_then(signal_number));
-                let done = match signal {
+                let done = match self.exit_signal.or(status.signal()) {
                     Some(signal) => Lifecycle::Signaled(signal),
-                    None => Lifecycle::Exited(Some(status.exit_code() as i32)),
+                    None => Lifecycle::Exited(status.code()),
                 };
                 self.exited = Some(done);
                 done
@@ -762,30 +740,4 @@ pub(crate) fn peek_exit(pid: u32, nohang: bool) -> std::io::Result<Option<(i32, 
     let (child, status) = (info.si_pid, info.si_status);
     // WNOHANG with nothing to report leaves the siginfo zeroed.
     Ok((child != 0).then_some((info.si_code, status)))
-}
-
-/// The signal that killed the child `pid`, if it has exited that way and is
-/// not yet reaped.
-#[cfg(unix)]
-fn exit_signal_now(pid: u32) -> Option<i32> {
-    let (code, status) = peek_exit(pid, true).ok()??;
-    threaded::killed_by(code, status)
-}
-
-/// The number of the signal whose `strsignal` text is `description`: the only
-/// form of it `portable_pty`'s exit status keeps. Used when no exit waiter
-/// supplied the number (the non-threaded terminal); knows signals below 32.
-#[cfg(unix)]
-fn signal_number(description: &str) -> Option<i32> {
-    (1..32).find(|&n| {
-        // SAFETY: strsignal returns a NUL-terminated string (or null) that
-        // stays valid until the next strsignal call on this thread.
-        let text = unsafe { libc::strsignal(n) };
-        !text.is_null() && unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy() == description
-    })
-}
-
-#[cfg(not(unix))]
-fn signal_number(_description: &str) -> Option<i32> {
-    None
 }
