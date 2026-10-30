@@ -1398,17 +1398,6 @@
 
 ---
 
-[2026-10-29T21:45+1300@684d69e5] Window — font DB and scale invalidation is untested
-
-- Requires: NO BLOCKERS
-- Detail: `metrics_changed` covers `apply_config`'s decision. Nothing checks
-  that `upgrade_fonts` and `set_scale` bump `metrics_gen`, or that the window
-  passes `metrics_gen` to `tooltip_key`: both need a `Window` (a GPU surface).
-- Reason: dropping one of those bumps would leave a held tooltip wrapped for
-  old font metrics with every test green.
-
----
-
 [2026-10-30T08:15+1300@19b9a94a] clean-all — in-use detection on Linux
 
 - Requires: a Linux machine to test on

@@ -583,14 +583,11 @@ struct State {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// Bumped when font metrics change (scale/size); folded into row-cache keys so
-    /// stale shaping never survives a metrics change.
-    metrics_gen: u64,
+    /// The font metrics' generation and what is cached under it.
+    fonts: FontGen,
     /// Reusable buffer holding the common glyph set, shaped once per metrics
     /// change to pre-warm the atlas (see [`ATLAS_WARM_GLYPHS`]).
     warm_buffer: Buffer,
-    /// `metrics_gen` the atlas was last warmed for; `None` forces a warm pass.
-    atlas_warmed_gen: Option<u64>,
     /// Full system-font DB being loaded off-thread; taken and swapped in once the
     /// `FontsLoaded` event arrives. `None` when booting on the full DB already, or
     /// after the upgrade has happened.
@@ -685,9 +682,6 @@ struct State {
     tooltip_hover: Option<(Rect, Instant)>,
     /// When a pending tooltip is due to show (a wake-up).
     tooltip_due: Option<Instant>,
-    /// The shown tooltip's rows, keyed by [`tooltip_key`]: a held tooltip
-    /// wraps once, not on every redraw.
-    tooltip_rows: Option<(TooltipKey, Vec<String>)>,
     /// Notices edits to the config file made outside the app.
     config_watch: ConfigWatch,
     /// Whether the window has keyboard focus (the config file is polled only
@@ -1336,9 +1330,8 @@ impl State {
             viewport,
             atlas,
             text_renderer,
-            metrics_gen: 0,
+            fonts: FontGen::default(),
             warm_buffer,
-            atlas_warmed_gen: None,
             pending_fonts,
             mono_family,
             font_locale: locale,
@@ -1376,7 +1369,6 @@ impl State {
             picker_panel: None,
             tooltip_hover: None,
             tooltip_due: None,
-            tooltip_rows: None,
             config_watch: ConfigWatch::new(ghostrealm_core::config::config_path()),
             window_focused: true,
             pointer_in: false,
@@ -1434,13 +1426,7 @@ impl State {
             self.app.report_preview_font(missing);
         }
         if metrics_changed(&self.cfg, &cfg) {
-            (self.cell_w, self.cell_h) = measure_cell(
-                &mut self.text.font_system,
-                self.scale,
-                cfg.terminal.font_size,
-                cfg.terminal.line_height,
-            );
-            self.metrics_gen = self.metrics_gen.wrapping_add(1);
+            (self.cell_w, self.cell_h) = self.fonts.remeasure(&mut self.text.font_system, self.scale, &cfg.terminal);
         }
         self.chrome = cfg.resolved_chrome();
         self.app.set_inbox_config(cfg.inbox);
@@ -1526,16 +1512,7 @@ impl State {
 
     fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
-        let (cw, ch) = measure_cell(
-            &mut self.text.font_system,
-            scale,
-            self.cfg.terminal.font_size,
-            self.cfg.terminal.line_height,
-        );
-        self.cell_w = cw;
-        self.cell_h = ch;
-        // Metrics changed: existing shaping is stale.
-        self.metrics_gen = self.metrics_gen.wrapping_add(1);
+        (self.cell_w, self.cell_h) = self.fonts.remeasure(&mut self.text.font_system, scale, &self.cfg.terminal);
         self.dirty = true;
     }
 
@@ -1557,19 +1534,9 @@ impl State {
         self.serif_alias = db.family_name(&Family::Serif).to_owned();
         let missing = pin_and_report_preview_serif(&mut db, self.cfg.editor.preview_font.as_deref(), &self.serif_alias, true);
         self.app.report_preview_font(missing);
-        self.text.font_system = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
-        // Cell metrics should be unchanged (same pinned monospace); re-measure in
-        // case the fuller DB resolves the family to a different face.
-        let (cw, ch) = measure_cell(
-            &mut self.text.font_system,
-            self.scale,
-            self.cfg.terminal.font_size,
-            self.cfg.terminal.line_height,
-        );
-        self.cell_w = cw;
-        self.cell_h = ch;
-        self.metrics_gen = self.metrics_gen.wrapping_add(1);
-        self.atlas_warmed_gen = None;
+        let full = FontSystem::new_with_locale_and_db(self.font_locale.clone(), db);
+        (self.cell_w, self.cell_h) =
+            self.fonts.swap_db(&mut self.text.font_system, full, self.scale, &self.cfg.terminal);
         self.dirty = true;
         self.window.request_redraw();
     }
@@ -3243,7 +3210,7 @@ impl State {
         let Some((anchor, text, _)) = tip else {
             self.tooltip_hover = None;
             self.tooltip_due = None;
-            self.tooltip_rows = None;
+            self.fonts.tooltip_rows = None;
             return;
         };
         let now = Instant::now();
@@ -3276,19 +3243,15 @@ impl State {
         // than the screen holds, the last then cut with an ellipsis.
         let max_w = (sw * 0.5).max(240.0 * scale).min(sw - pad * 4.0).max(1.0);
         let max_rows = (((sh - pad * 2.0) / ch).floor() as usize).max(1);
-        let key = tooltip_key(text, max_w, max_rows, self.metrics_gen);
-        let rows = match &self.tooltip_rows {
-            Some((k, rows)) if *k == key => rows,
-            _ => {
-                let mut rows = wrap_lines(&key.0, max_w, |t| cx.shape(t, Family::SansSerif, f32::MAX).width);
-                if rows.len() > max_rows {
-                    rows.truncate(max_rows);
-                    let last = rows.pop().expect("at least one row");
-                    rows.push(cx.cut_to_fit(&format!("{}\u{2026}", last.trim_end()), Family::SansSerif, max_w));
-                }
-                &self.tooltip_rows.insert((key, rows)).1
+        let rows = self.fonts.tooltip_rows(text, max_w, max_rows, |text| {
+            let mut rows = wrap_lines(text, max_w, |t| cx.shape(t, Family::SansSerif, f32::MAX).width);
+            if rows.len() > max_rows {
+                rows.truncate(max_rows);
+                let last = rows.pop().expect("at least one row");
+                rows.push(cx.cut_to_fit(&format!("{}\u{2026}", last.trim_end()), Family::SansSerif, max_w));
             }
-        };
+            rows
+        });
         let lines: Vec<Shaped> = rows.iter().map(|l| cx.shape(l, Family::SansSerif, f32::MAX)).collect();
         let w = lines.iter().map(|s| s.width).fold(0.0, f32::max) + pad * 2.0;
         let h = lines.len() as f32 * ch + pad * 2.0;
@@ -4500,7 +4463,7 @@ impl State {
         // Bound shaping work per frame: cache hits are free, but cache misses
         // (never-seen rows, e.g. a fast scroll into history) are shaped only
         // while under budget. Overflow rows are deferred to later frames.
-        self.text.begin_frame(self.metrics_gen, metrics, self.cell_h, SHAPE_BUDGET);
+        self.text.begin_frame(self.fonts.gen, metrics, self.cell_h, SHAPE_BUDGET);
         let mut frame = Frame::new((sw, sh));
         let ui = self.ui();
         let mut strip_placements: Vec<Placement> = Vec::new();
@@ -4781,7 +4744,7 @@ impl State {
         // atlas but is clipped away by the GPU, never drawn). Unbounded text
         // bounds keep `prepare` from culling the glyphs before they reach the
         // atlas. Cheap: happens once per font-size/scale change, not per frame.
-        let warm_area = if self.atlas_warmed_gen != Some(self.metrics_gen) {
+        let warm_area = if self.fonts.atlas_warmed != Some(self.fonts.gen) {
             self.warm_buffer.set_metrics(metrics);
             self.warm_buffer.set_size(Some(f32::MAX), Some(self.cell_h));
             self.warm_buffer.set_rich_text(
@@ -4792,7 +4755,7 @@ impl State {
             );
             self.warm_buffer
                 .shape_until_scroll(&mut self.text.font_system, false);
-            self.atlas_warmed_gen = Some(self.metrics_gen);
+            self.fonts.atlas_warmed = Some(self.fonts.gen);
             Some(TextArea {
                 buffer: &self.warm_buffer,
                 left: 0.0,
@@ -5544,7 +5507,7 @@ fn toast_clock_runs(toast: Option<Rect>, focused: bool, pointer: Option<(f32, f3
 }
 
 /// Whether applying `new` over `old` changes a font setting (a family, size
-/// or line height): text shaped and cached under the current `metrics_gen`
+/// or line height): text shaped and cached under the current [`FontGen`]
 /// (tooltip rows, the shaping cache) is then stale. Compared by setting, not
 /// by the monospace cell they measure to, since text in other families
 /// (tooltips shape in SansSerif) can change while the cell does not. Any font
@@ -5569,9 +5532,63 @@ fn metrics_changed(old: &Config, new: &Config) -> bool {
     fonts(old) != fonts(new)
 }
 
+/// The generation of the font metrics and font set, bumped on every change
+/// to either, and what is cached under it. Row-cache and tooltip keys fold
+/// it in, so text shaped for old metrics never survives a change.
+#[derive(Default)]
+struct FontGen {
+    gen: u64,
+    /// `gen` the atlas was last warmed for; `None` forces a warm pass.
+    atlas_warmed: Option<u64>,
+    /// The shown tooltip's rows, keyed by [`tooltip_key`]: a held tooltip
+    /// wraps once, not on every redraw.
+    tooltip_rows: Option<(TooltipKey, Vec<String>)>,
+}
+
+impl FontGen {
+    /// The monospace cell measured in `fs` at `scale` and `term`'s size and
+    /// line height; text shaped before is stale.
+    fn remeasure(&mut self, fs: &mut FontSystem, scale: f32, term: &ghostrealm_core::config::Terminal) -> (f32, f32) {
+        self.gen = self.gen.wrapping_add(1);
+        measure_cell(fs, scale, term.font_size, term.line_height)
+    }
+
+    /// Replace `fs` with `full` and re-measure the cell: the same pinned
+    /// monospace should measure the same, but the fuller set may resolve it
+    /// to another face. Its glyphs differ, so the atlas is warmed again.
+    fn swap_db(
+        &mut self,
+        fs: &mut FontSystem,
+        full: FontSystem,
+        scale: f32,
+        term: &ghostrealm_core::config::Terminal,
+    ) -> (f32, f32) {
+        *fs = full;
+        self.atlas_warmed = None;
+        self.remeasure(fs, scale, term)
+    }
+
+    /// `text`'s tooltip rows, wrapped by `wrap` unless the held rows were
+    /// wrapped for the same text, width, row cap and generation.
+    fn tooltip_rows(
+        &mut self,
+        text: String,
+        max_w: f32,
+        max_rows: usize,
+        wrap: impl FnOnce(&str) -> Vec<String>,
+    ) -> &[String] {
+        let key = tooltip_key(text, max_w, max_rows, self.gen);
+        if self.tooltip_rows.as_ref().is_none_or(|(k, _)| *k != key) {
+            let rows = wrap(&key.0);
+            self.tooltip_rows = Some((key, rows));
+        }
+        &self.tooltip_rows.as_ref().expect("set above").1
+    }
+}
+
 /// What a tooltip's wrapped rows depend on: its text, line width and row
-/// cap, and the font metrics and font set (`metrics_gen`, bumped on every
-/// change to either), which set the text's widths.
+/// cap, and the font metrics and font set ([`FontGen`]'s generation, bumped
+/// on every change to either), which set the text's widths.
 fn tooltip_key(text: String, max_w: f32, max_rows: usize, metrics_gen: u64) -> TooltipKey {
     (text, max_w.to_bits(), max_rows, metrics_gen)
 }
@@ -6533,7 +6550,7 @@ mod tests {
     }
 
     /// A config change to any font setting invalidates shaped text
-    /// (`metrics_gen`), whether or not it moves the monospace cell; any
+    /// ([`super::FontGen`]), whether or not it moves the monospace cell; any
     /// other change keeps it.
     #[test]
     fn a_font_change_in_the_config_invalidates_shaped_text() {
@@ -6562,6 +6579,52 @@ mod tests {
         assert_ne!(base, key("tip", 301.0, 10, 1));
         assert_ne!(base, key("tip", 300.0, 9, 1));
         assert_ne!(base, key("tip", 300.0, 10, 2));
+    }
+
+    /// A new scale and the full font set each start a generation, so text
+    /// shaped and tooltips wrapped before are redone; the full set also
+    /// re-warms the atlas, and replaces the font system.
+    #[test]
+    fn rescaling_or_swapping_the_font_set_invalidates_shaped_text() {
+        use glyphon::cosmic_text::fontdb::Database;
+        // Shaping needs a face; any monospace one does.
+        let db = || {
+            let mut db = Database::new();
+            let one = ["/System/Library/Fonts/Menlo.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]
+                .iter()
+                .any(|p| db.load_font_file(p).is_ok());
+            if !one {
+                db.load_system_fonts();
+            }
+            db
+        };
+        let term = ghostrealm_core::Config::default().terminal;
+        let mut fs = FontSystem::new_with_locale_and_db("en-US".into(), db());
+        let mut fonts = super::FontGen::default();
+        let wraps = std::cell::Cell::new(0);
+        let tip = |fonts: &mut super::FontGen| {
+            fonts.tooltip_rows("tip".into(), 300.0, 10, |t| {
+                wraps.set(wraps.get() + 1);
+                vec![t.to_string()]
+            });
+        };
+        tip(&mut fonts);
+        tip(&mut fonts);
+        assert_eq!((fonts.gen, wraps.get()), (0, 1), "a held tooltip wraps once");
+
+        fonts.remeasure(&mut fs, 2.0, &term);
+        assert_eq!(fonts.gen, 1, "a new scale");
+        tip(&mut fonts);
+        assert_eq!(wraps.get(), 2, "rewrapped for the new scale");
+
+        fonts.atlas_warmed = Some(fonts.gen);
+        let mut full = db();
+        full.set_monospace_family("Marker");
+        fonts.swap_db(&mut fs, FontSystem::new_with_locale_and_db("en-US".into(), full), 2.0, &term);
+        assert_eq!((fonts.gen, fonts.atlas_warmed), (2, None), "the full font set");
+        assert_eq!(fs.db().family_name(&Family::Monospace), "Marker", "swapped in");
+        tip(&mut fonts);
+        assert_eq!(wraps.get(), 3, "rewrapped for the full font set");
     }
 
     /// A tooltip breaks at its own line breaks, between words, and across a
