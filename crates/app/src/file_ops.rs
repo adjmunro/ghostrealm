@@ -69,18 +69,19 @@ impl System for HostSystem {
 /// (`https:/evil.app` in the working directory would run), so `-u` makes it
 /// a URL. The child starts at `/` with no stdin, so a relative path never
 /// resolves against the app's directory and it never reads the app's input.
-/// It may become the handler itself (`xdg-open` execs a browser), so it
-/// inherits no other descriptor.
+/// `xdg-open` may become the handler itself (it execs a browser), so it
+/// inherits no other descriptor; `open` hands off to LaunchServices and exits.
 fn url_command(url: &str) -> std::process::Command {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg("-u");
         c
     } else {
-        std::process::Command::new("xdg-open")
+        let mut c = std::process::Command::new("xdg-open");
+        inherit_stdio_only(&mut c);
+        c
     };
     cmd.arg(url).current_dir("/").stdin(std::process::Stdio::null());
-    inherit_stdio_only(&mut cmd);
     cmd
 }
 
@@ -104,10 +105,15 @@ pub fn is_web_url(url: &str) -> bool {
     url_scheme(url).is_some_and(|s| WEB_SCHEMES.iter().any(|w| s.eq_ignore_ascii_case(w)))
 }
 
-/// Run `program` to completion. It may become a long-lived handler
-/// (`xdg-open` execs a file manager), so it inherits no other descriptor.
+/// Run `program` to completion. Off macOS it may become a long-lived handler
+/// (`xdg-open` execs a file manager), so it inherits no other descriptor. On
+/// macOS (`open`) that would only cost a fork of the app per run.
 fn run<'a>(program: &str, args: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {
-    let status = inherit_stdio_only(&mut std::process::Command::new(program))
+    let mut cmd = std::process::Command::new(program);
+    if !cfg!(target_os = "macos") {
+        inherit_stdio_only(&mut cmd);
+    }
+    let status = cmd
         .args(args)
         .status()
         .with_context(|| format!("can't run `{program}`"))?;

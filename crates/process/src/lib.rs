@@ -12,8 +12,10 @@ use std::process::Command;
 /// child started while another thread holds such a descriptor keeps it open:
 /// a short-lived `Command::output()` on that thread then waits for the end of
 /// a pipe the long-lived child holds, until that child exits. Sanitising the
-/// long-lived child covers every source of stray descriptors, which a lock
-/// around the app's own spawns would not.
+/// long-lived child covers stray descriptors from any source, which a lock
+/// around the app's own spawns would not. It doesn't cover a short-lived child
+/// that starts a long-lived one of its own: that child's spawn decides what
+/// it passes on (git's `fsmonitor--daemon` keeps none).
 ///
 /// Descriptors are marked, not closed: std reports a failed exec through a
 /// close-on-exec pipe that must stay open until the exec. The `pre_exec` hook
@@ -50,9 +52,10 @@ pub fn inherit_stdio_only(cmd: &mut Command) -> &mut Command {
 fn fd_end() -> libc::c_int {
     // SAFETY: no arguments; it only reads the process's limits.
     let size = unsafe { libc::getdtablesize() };
+    const CAP: libc::c_int = 1 << 16;
     if size > 2 {
-        size.min(1 << 16)
+        size.min(CAP)
     } else {
-        1 << 10
+        CAP
     }
 }
