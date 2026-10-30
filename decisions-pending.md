@@ -725,6 +725,9 @@ Agents read comments through the agent channel, within item 3's scope.
 
 Each line gives the item and the default that will be applied if you don't veto it.
 
+**Disk**
+- **Automatic cleanup hook** (`.claude/skills/build/SKILL.md`, clean-all): no `SessionStart`/`SessionEnd` hook in `.claude/settings.json`; the director runs `mise run clean-all` after each goal lands. A hook would be lock-aware, but it can't pass `--except` for agent worktrees awaiting review, so it would empty their `target/` once idle 2 h and the reviewer would rebuild.
+
 **Terminal**
 - **Unbracketed paste** (findings-2 item 36): sanitise like xterm and Ghostty: strip control bytes and send newlines as CR. Flip the backend test `paste_is_unwrapped_when_the_program_did_not_ask_for_brackets`.
 - **Mouse** (TODO line ~60): alternate scroll (mode 1007) on, as in Ghostty; the horizontal wheel reported as buttons 6/7.
