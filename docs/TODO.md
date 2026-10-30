@@ -1448,3 +1448,19 @@
 - Reason: recorded from the fix-round review of b9cb604.
 
 ---
+
+[2026-10-31T05:11+1300@86ac4645] Window — FontGen review leftovers
+
+- Requires: NO BLOCKERS
+- Detail: nit, `crates/app/src/window.rs:6589`: the review says the FontGen
+  test needs no font face, since `measure_cell` falls back. With an empty
+  `Database`, cosmic-text 0.19 panics in `shape.rs:316` when shaping, so
+  the face is loaded; drop the loading only if a cheaper face route exists.
+- Detail: nit, `crates/app/src/window.rs:5540` (`FontGen::gen`) and the
+  closure parameter at `:6575`: `gen` is reserved in edition 2024. Rename
+  to `generation` at the migration.
+- Detail: nothing ties `Window::set_scale` and `upgrade_fonts` to calling
+  `FontGen::remeasure` / `swap_db`: dropping a call leaves every test green.
+- Reason: recorded from the review of cc0e360.
+
+---
