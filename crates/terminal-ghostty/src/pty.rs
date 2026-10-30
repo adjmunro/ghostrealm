@@ -73,7 +73,13 @@ impl CommandBuilder {
     }
 
     fn command(self) -> Command {
-        let shell = user_shell();
+        self.command_with_shell(user_shell())
+    }
+
+    /// The command, with `shell` as the login shell and as `SHELL` (unless
+    /// the caller set `SHELL`), so the child never sees a `$SHELL` that
+    /// [`user_shell`] passed over.
+    fn command_with_shell(self, shell: OsString) -> Command {
         let mut command = match self.argv.split_first() {
             None => {
                 let mut c = Command::new(&shell);
@@ -89,9 +95,7 @@ impl CommandBuilder {
             }
         };
         command.current_dir(self.cwd.filter(|d| d.is_dir()).unwrap_or_else(home_dir));
-        if std::env::var_os("SHELL").is_none() {
-            command.env("SHELL", &shell);
-        }
+        command.env("SHELL", &shell);
         command.envs(self.env);
         command
     }
@@ -124,16 +128,11 @@ pub(crate) struct Pty {
 
 impl Pty {
     /// Open a PTY of `size`: the master and its slave, both close-on-exec
-    /// from the start (`posix_openpt` and `open` with `O_CLOEXEC`), so no
-    /// child spawned meanwhile by another thread inherits either.
+    /// from the start (opened with `O_CLOEXEC`), so no child spawned
+    /// meanwhile by another thread inherits either.
     pub(crate) fn open(size: WinSize) -> io::Result<(Pty, OwnedFd)> {
-        // SAFETY: posix_openpt opens a descriptor and returns it or -1.
-        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` was just opened and nothing else owns it.
-        let master = unsafe { File::from_raw_fd(fd) };
+        let master = open_master()?;
+        let fd = master.as_raw_fd();
         // SAFETY: grantpt and unlockpt only act on the master descriptor.
         if unsafe { libc::grantpt(fd) } != 0 || unsafe { libc::unlockpt(fd) } != 0 {
             return Err(io::Error::last_os_error());
@@ -172,6 +171,29 @@ impl Pty {
     pub(crate) fn writer(&self) -> io::Result<PtyWriter> {
         Ok(PtyWriter(self.master.try_clone()?))
     }
+}
+
+/// A new PTY master, close-on-exec: from `posix_openpt`, or, where it rejects
+/// `O_CLOEXEC` with `EINVAL` (older macOS Libc accepts only `O_RDWR` and
+/// `O_NOCTTY`), from opening `/dev/ptmx`.
+fn open_master() -> io::Result<File> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: posix_openpt opens a descriptor and returns it or -1.
+    let fd = unsafe { libc::posix_openpt(flags) };
+    if fd >= 0 {
+        // SAFETY: `fd` was just opened and nothing else owns it.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EINVAL) {
+        return Err(err);
+    }
+    open_ptmx()
+}
+
+/// The master from `/dev/ptmx`; std opens every file with `O_CLOEXEC`.
+fn open_ptmx() -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOCTTY).open("/dev/ptmx")
 }
 
 /// The slave's path, from `ptsname_r` (`ptsname` shares a static buffer
@@ -303,7 +325,13 @@ impl ChildKiller {
 /// `$SHELL` if it is executable, else the password database's shell if it
 /// is, else `/bin/sh`.
 fn user_shell() -> OsString {
-    std::env::var_os("SHELL")
+    resolve_shell(std::env::var_os("SHELL"))
+}
+
+/// `shell` if it is executable, else the password database's shell if it
+/// is, else `/bin/sh`.
+fn resolve_shell(shell: Option<OsString>) -> OsString {
+    shell
         .filter(|s| executable(s))
         .or_else(|| passwd_field(|pw| pw.pw_shell).filter(|s| executable(s)))
         .unwrap_or_else(|| "/bin/sh".into())
@@ -366,6 +394,41 @@ mod tests {
         let (pty, slave) = Pty::open(SIZE).unwrap();
         assert!(cloexec(pty.master.as_raw_fd()), "master");
         assert!(cloexec(slave.as_raw_fd()), "slave");
+    }
+
+    #[test]
+    fn the_ptmx_fallback_opens_a_close_on_exec_master() {
+        let master = open_ptmx().unwrap();
+        assert!(cloexec(master.as_raw_fd()));
+        // SAFETY: grantpt and unlockpt only act on the master descriptor.
+        assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+        assert!(slave_name(master.as_raw_fd()).unwrap().starts_with("/dev"));
+    }
+
+    fn env_of(command: &Command, key: &str) -> Option<OsString> {
+        command.get_envs().find(|(k, _)| *k == key).and_then(|(_, v)| v.map(OsStr::to_owned))
+    }
+
+    /// Given a `$SHELL` that isn't executable,
+    /// when the login shell's command is built,
+    /// then the child runs the fallback shell and sees it as `SHELL`.
+    #[test]
+    fn shell_is_the_resolved_shell_not_an_unusable_one() {
+        let unusable = OsString::from("/nonexistent/shell");
+        let shell = resolve_shell(Some(unusable.clone()));
+        assert_ne!(shell, unusable);
+        let command = CommandBuilder::new_default_prog().command_with_shell(shell.clone());
+        assert_eq!(command.get_program(), shell);
+        assert_eq!(env_of(&command, "SHELL"), Some(shell));
+    }
+
+    #[test]
+    fn a_callers_shell_wins_over_the_resolved_one() {
+        let mut builder = CommandBuilder::new("/usr/bin/env");
+        builder.env("SHELL", "/bin/zsh");
+        let command = builder.command_with_shell("/bin/sh".into());
+        assert_eq!(env_of(&command, "SHELL").as_deref(), Some(OsStr::new("/bin/zsh")));
     }
 
     #[test]
