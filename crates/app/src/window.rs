@@ -1511,8 +1511,8 @@ impl State {
     }
 
     fn set_scale(&mut self, scale: f32) {
-        self.scale = scale;
-        (self.cell_w, self.cell_h) = self.fonts.remeasure(&mut self.text.font_system, scale, &self.cfg.terminal);
+        (self.cell_w, self.cell_h) =
+            self.fonts.rescale(&mut self.text.font_system, &mut self.scale, scale, &self.cfg.terminal);
         self.dirty = true;
     }
 
@@ -4463,7 +4463,7 @@ impl State {
         // Bound shaping work per frame: cache hits are free, but cache misses
         // (never-seen rows, e.g. a fast scroll into history) are shaped only
         // while under budget. Overflow rows are deferred to later frames.
-        self.text.begin_frame(self.fonts.gen, metrics, self.cell_h, SHAPE_BUDGET);
+        self.text.begin_frame(self.fonts.generation, metrics, self.cell_h, SHAPE_BUDGET);
         let mut frame = Frame::new((sw, sh));
         let ui = self.ui();
         let mut strip_placements: Vec<Placement> = Vec::new();
@@ -4744,7 +4744,7 @@ impl State {
         // atlas but is clipped away by the GPU, never drawn). Unbounded text
         // bounds keep `prepare` from culling the glyphs before they reach the
         // atlas. Cheap: happens once per font-size/scale change, not per frame.
-        let warm_area = if self.fonts.atlas_warmed != Some(self.fonts.gen) {
+        let warm_area = if self.fonts.atlas_warmed != Some(self.fonts.generation) {
             self.warm_buffer.set_metrics(metrics);
             self.warm_buffer.set_size(Some(f32::MAX), Some(self.cell_h));
             self.warm_buffer.set_rich_text(
@@ -4755,7 +4755,7 @@ impl State {
             );
             self.warm_buffer
                 .shape_until_scroll(&mut self.text.font_system, false);
-            self.fonts.atlas_warmed = Some(self.fonts.gen);
+            self.fonts.atlas_warmed = Some(self.fonts.generation);
             Some(TextArea {
                 buffer: &self.warm_buffer,
                 left: 0.0,
@@ -5537,8 +5537,8 @@ fn metrics_changed(old: &Config, new: &Config) -> bool {
 /// it in, so text shaped for old metrics never survives a change.
 #[derive(Default)]
 struct FontGen {
-    gen: u64,
-    /// `gen` the atlas was last warmed for; `None` forces a warm pass.
+    generation: u64,
+    /// `generation` the atlas was last warmed for; `None` forces a warm pass.
     atlas_warmed: Option<u64>,
     /// The shown tooltip's rows, keyed by [`tooltip_key`]: a held tooltip
     /// wraps once, not on every redraw.
@@ -5549,13 +5549,29 @@ impl FontGen {
     /// The monospace cell measured in `fs` at `scale` and `term`'s size and
     /// line height; text shaped before is stale.
     fn remeasure(&mut self, fs: &mut FontSystem, scale: f32, term: &ghostrealm_core::config::Terminal) -> (f32, f32) {
-        self.gen = self.gen.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
         measure_cell(fs, scale, term.font_size, term.line_height)
+    }
+
+    /// Set `scale` to `to` and re-measure the cell; text shaped before is
+    /// stale. Setting the scale only here gives every new scale a new
+    /// generation.
+    fn rescale(
+        &mut self,
+        fs: &mut FontSystem,
+        scale: &mut f32,
+        to: f32,
+        term: &ghostrealm_core::config::Terminal,
+    ) -> (f32, f32) {
+        *scale = to;
+        self.remeasure(fs, to, term)
     }
 
     /// Replace `fs` with `full` and re-measure the cell: the same pinned
     /// monospace should measure the same, but the fuller set may resolve it
     /// to another face. Its glyphs differ, so the atlas is warmed again.
+    /// Replacing the font system only here gives every new font set a new
+    /// generation.
     fn swap_db(
         &mut self,
         fs: &mut FontSystem,
@@ -5577,7 +5593,7 @@ impl FontGen {
         max_rows: usize,
         wrap: impl FnOnce(&str) -> Vec<String>,
     ) -> &[String] {
-        let key = tooltip_key(text, max_w, max_rows, self.gen);
+        let key = tooltip_key(text, max_w, max_rows, self.generation);
         if self.tooltip_rows.as_ref().is_none_or(|(k, _)| *k != key) {
             let rows = wrap(&key.0);
             self.tooltip_rows = Some((key, rows));
@@ -6572,7 +6588,7 @@ mod tests {
     /// on changes.
     #[test]
     fn a_tooltip_rewraps_when_its_text_width_rows_or_metrics_change() {
-        let key = |t: &str, w: f32, rows: usize, gen: u64| super::tooltip_key(t.to_string(), w, rows, gen);
+        let key = |t: &str, w: f32, rows: usize, generation: u64| super::tooltip_key(t.to_string(), w, rows, generation);
         let base = key("tip", 300.0, 10, 1);
         assert_eq!(base, key("tip", 300.0, 10, 1));
         assert_ne!(base, key("tap", 300.0, 10, 1));
@@ -6587,7 +6603,8 @@ mod tests {
     #[test]
     fn rescaling_or_swapping_the_font_set_invalidates_shaped_text() {
         use glyphon::cosmic_text::fontdb::Database;
-        // Shaping needs a face; any monospace one does.
+        // `measure_cell` shapes, and cosmic-text panics shaping with an empty
+        // `Database`, so load a face; any monospace one does.
         let db = || {
             let mut db = Database::new();
             let one = ["/System/Library/Fonts/Menlo.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]
@@ -6610,18 +6627,19 @@ mod tests {
         };
         tip(&mut fonts);
         tip(&mut fonts);
-        assert_eq!((fonts.gen, wraps.get()), (0, 1), "a held tooltip wraps once");
+        assert_eq!((fonts.generation, wraps.get()), (0, 1), "a held tooltip wraps once");
 
-        fonts.remeasure(&mut fs, 2.0, &term);
-        assert_eq!(fonts.gen, 1, "a new scale");
+        let mut scale = 1.0;
+        fonts.rescale(&mut fs, &mut scale, 2.0, &term);
+        assert_eq!((fonts.generation, scale), (1, 2.0), "a new scale");
         tip(&mut fonts);
         assert_eq!(wraps.get(), 2, "rewrapped for the new scale");
 
-        fonts.atlas_warmed = Some(fonts.gen);
+        fonts.atlas_warmed = Some(fonts.generation);
         let mut full = db();
         full.set_monospace_family("Marker");
         fonts.swap_db(&mut fs, FontSystem::new_with_locale_and_db("en-US".into(), full), 2.0, &term);
-        assert_eq!((fonts.gen, fonts.atlas_warmed), (2, None), "the full font set");
+        assert_eq!((fonts.generation, fonts.atlas_warmed), (2, None), "the full font set");
         assert_eq!(fs.db().family_name(&Family::Monospace), "Marker", "swapped in");
         tip(&mut fonts);
         assert_eq!(wraps.get(), 3, "rewrapped for the full font set");
