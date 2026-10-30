@@ -163,10 +163,10 @@ fn main() -> ExitCode {
         windowless_rendering_enabled: 1,
         root_cache_path: cache_str.clone(),
         // The global request context, which every page uses, keeps its
-        // profile in Chromium's `<cache>/Default` whatever path is given here
-        // (CEF ignores a dir in the root); the root itself is CEF's form for
-        // that. Other profiles would be request contexts with a `cache_path`
-        // of their own, sibling dirs in the root.
+        // profile in Chromium's `<cache>/Default` for the root or any dir in
+        // it (CEF ignores a dir in the root); the root itself is CEF's form
+        // for that. Other profiles would be request contexts with a
+        // `cache_path` of their own, sibling dirs in the root.
         cache_path: cache_str,
         persist_session_cookies: 1,
         log_file: CefString::from(cache.join("host.log").to_string_lossy().as_ref()),

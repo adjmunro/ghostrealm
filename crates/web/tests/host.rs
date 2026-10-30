@@ -234,7 +234,8 @@ fn an_agents_pages_stay_visible_to_chromium_off_screen() {
 /// Given an agent's page on screen;
 /// when it goes off screen and back, twice;
 /// then off screen it runs animation frames at [`UNSEEN_FRAME_RATE`], on
-/// screen at several times that, and Chromium sees it visible throughout.
+/// screen at over twice that (Chromium caps it at 30 on a low battery), and
+/// Chromium sees it visible throughout.
 #[test]
 fn an_agents_page_off_screen_paints_at_the_unseen_frame_rate() {
     let Some((host, cache)) = spawn("frame-rate") else {
@@ -265,13 +266,13 @@ fn an_agents_page_off_screen_paints_at_the_unseen_frame_rate() {
     };
     let unseen = f64::from(UNSEEN_FRAME_RATE);
     for _ in 0..2 {
-        wait_rate("on screen", &|r| r > 3.0 * unseen);
+        wait_rate("on screen", &|r| r > 2.0 * unseen);
         assert!(host.send(&Request::Visible { id: 1, visible: false }));
         wait_rate("off screen", &|r| r > unseen / 2.0 && r < unseen * 1.5);
         assert_eq!(host.eval(1, "document.visibilityState", Duration::from_secs(5)), Ok("\"visible\"".into()));
         assert!(host.send(&Request::Visible { id: 1, visible: true }));
     }
-    wait_rate("back on screen", &|r| r > 3.0 * unseen);
+    wait_rate("back on screen", &|r| r > 2.0 * unseen);
     shut_down(host, &cache);
 }
 
