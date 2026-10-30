@@ -18,7 +18,8 @@ use std::sync::{Mutex, OnceLock};
 use cef::*;
 use ghostrealm_web::protocol::{Event, Request, PROTOCOL_VERSION};
 
-/// Overrides the profile directory (cookies, cache, local storage).
+/// Overrides the profile root: CEF's `root_cache_path`, which holds the
+/// profile's cookies, cache and local storage in `Default/`.
 const CACHE_ENV: &str = "GHOSTREALM_WEB_CACHE";
 
 /// How long closing the browsers may take after the app hangs up before the
@@ -71,7 +72,7 @@ fn running(pid: u32) -> bool {
     }
 }
 
-/// Profile directory: `$GHOSTREALM_WEB_CACHE`, else the platform cache dir.
+/// Profile root: `$GHOSTREALM_WEB_CACHE`, else the platform cache dir.
 fn cache_dir() -> PathBuf {
     if let Some(p) = std::env::var_os(CACHE_ENV) {
         return PathBuf::from(p);
@@ -153,14 +154,20 @@ fn main() -> ExitCode {
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
-    // CEF resolves symlinks in `root_cache_path` but not in `cache_path`, and
-    // keeps the profile in memory when it then finds `cache_path` outside the
-    // root (as under macOS's temp dir, `/var` -> `/private/var`).
+    // CEF resolves symlinks in `root_cache_path` (as under macOS's temp dir,
+    // `/var` -> `/private/var`) but not in `cache_path`, which must be the
+    // root or in it.
     let cache = std::fs::canonicalize(&cache).unwrap_or(cache);
+    let cache_str = CefString::from(cache.to_string_lossy().as_ref());
     let settings = Settings {
         windowless_rendering_enabled: 1,
-        root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
-        cache_path: CefString::from(cache.join("profile").to_string_lossy().as_ref()),
+        root_cache_path: cache_str.clone(),
+        // The global request context, which every page uses, keeps its
+        // profile in Chromium's `<cache>/Default` whatever path is given here
+        // (CEF ignores a dir in the root); the root itself is CEF's form for
+        // that. Other profiles would be request contexts with a `cache_path`
+        // of their own, sibling dirs in the root.
+        cache_path: cache_str,
         persist_session_cookies: 1,
         log_file: CefString::from(cache.join("host.log").to_string_lossy().as_ref()),
         log_severity: LogSeverity::WARNING,

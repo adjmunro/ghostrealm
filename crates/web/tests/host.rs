@@ -142,9 +142,8 @@ fn a_host_hung_up_on_frees_its_profile_once_gone() {
 /// is: `/var` -> `/private/var`);
 /// when a page stores a cookie and local storage, the app hangs up on the
 /// host, and a new host starts on the same profile;
-/// then CEF took the profile's path (it makes `profile` in it; a path it
-/// finds outside its root it drops for in-memory storage), and the page
-/// reads both back.
+/// then the cookie is on disk in the profile's `Default`, where Chromium keeps
+/// it, and the page reads both back.
 #[test]
 fn a_profile_reached_through_a_symlink_keeps_storage_on_disk() {
     let pid = std::process::id();
@@ -158,7 +157,6 @@ fn a_profile_reached_through_a_symlink_keeps_storage_on_disk() {
         let _ = std::fs::remove_dir_all(&real);
         return;
     };
-    assert!(real.join("profile").is_dir(), "CEF dropped the profile's path");
     let (base, _) = serve();
     let page = Request::Create { id: 1, url: format!("{base}/stay"), width: 100, height: 100, scale: 1.0, agent: false };
     assert!(host.send(&page));
@@ -167,6 +165,8 @@ fn a_profile_reached_through_a_symlink_keeps_storage_on_disk() {
     assert_eq!(host.eval(1, store, Duration::from_secs(5)), Ok("1".into()));
     assert!(host.hang_up().wait(Duration::from_secs(10)), "never reported gone");
     drop(first);
+    let cookies = std::fs::read(real.join("Default/Cookies")).unwrap_or_default();
+    assert!(cookies.windows(4).any(|w| w == b"kept"), "the cookie isn't in {}", real.join("Default").display());
 
     let (again, second) = spawn_at(link.clone(), &[]).expect("built");
     assert!(again.send(&page));

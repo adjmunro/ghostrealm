@@ -1016,6 +1016,10 @@
   channel → running app entry for the shared host
 - Detail: Decided: the profile lives in Application Support, not
   `~/Library/Caches/ghostrealm/web` (DECISION.md, Web surface / profiles).
+- Detail: The host's root holds one profile today, Chromium's `Default`: CEF
+  154 puts the global request context there whatever `CefSettings.cache_path`
+  says. Other profiles have to be `CefRequestContext`s with a `cache_path` of
+  their own in the same root (untried).
 - Detail: Profile model:
   - A profile picker in the browser and the GUI.
   - Human-only profiles that agents cannot reach structurally: the agent channel
