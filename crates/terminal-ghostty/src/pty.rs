@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
@@ -164,8 +164,12 @@ impl Pty {
         (group > 0).then_some(group)
     }
 
-    pub(crate) fn reader(&self) -> io::Result<PtyReader> {
-        Ok(PtyReader(self.master.try_clone()?))
+    /// A reader of the child's output, and the handle that ends it.
+    pub(crate) fn reader(&self) -> io::Result<(PtyReader, ReaderStop)> {
+        // Close-on-exec: atomically on Linux (`pipe2`), just after creation on
+        // macOS, where `inherit_stdio_only` keeps it from long-lived children.
+        let (stop_rx, stop_tx) = io::pipe()?;
+        Ok((PtyReader { master: self.master.try_clone()?, stop: stop_rx }, ReaderStop(stop_tx)))
     }
 
     pub(crate) fn writer(&self) -> io::Result<PtyWriter> {
@@ -229,16 +233,54 @@ fn slave_name(master: libc::c_int) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
 }
 
-/// Reads the child's output; EOF once the slave has closed.
-pub(crate) struct PtyReader(File);
+/// Reads the child's output; EOF once the slave has closed or its
+/// [`ReaderStop`] has dropped.
+pub(crate) struct PtyReader {
+    master: File,
+    stop: PipeReader,
+}
 
 impl Read for PtyReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.0.read(buf) {
+        loop {
+            let mut fds = [
+                libc::pollfd { fd: self.master.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: self.stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: poll writes only the `revents` of the pollfds it is given.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if fds[1].revents != 0 {
+                return Ok(0);
+            }
+            if fds[0].revents != 0 {
+                break;
+            }
+        }
+        match self.master.read(buf) {
             // Linux reports a closed slave as EIO.
             Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(0),
             other => other,
         }
+    }
+}
+
+/// Ends its [`PtyReader`] when dropped. The reader holds a copy of the master,
+/// and the master's last close is what hangs up the child's terminal; blocked
+/// in `read`, the reader would keep it open until the child next writes, which
+/// a program that turned echo off may never do.
+pub(crate) struct ReaderStop(PipeWriter);
+
+impl Drop for ReaderStop {
+    fn drop(&mut self) {
+        // A byte, not just the close: a copy of this end leaked to a child
+        // would keep the close from showing.
+        let _ = self.0.write_all(&[0]);
     }
 }
 
@@ -405,6 +447,46 @@ mod tests {
         let (pty, slave) = Pty::open(SIZE).unwrap();
         assert!(cloexec(pty.master.as_raw_fd()), "master");
         assert!(cloexec(slave.as_raw_fd()), "slave");
+    }
+
+    /// Read once from `reader` on another thread; its result arrives on the
+    /// returned channel.
+    fn read_on_a_thread(mut reader: PtyReader) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = tx.send(reader.read(&mut buf).map(|n| buf[..n].to_vec()));
+        });
+        rx
+    }
+
+    /// Given a reader blocked on a PTY whose child side is open and silent,
+    /// when its stop drops,
+    /// then it reads EOF, so its copy of the master can close.
+    #[test]
+    fn a_blocked_reader_ends_when_its_stop_drops() {
+        let (pty, _slave) = Pty::open(SIZE).unwrap();
+        let (reader, stop) = pty.reader().unwrap();
+        let rx = read_on_a_thread(reader);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx.try_recv().is_err(), "blocked while the PTY is silent");
+        drop(stop);
+        let read = rx.recv_timeout(Duration::from_secs(2)).expect("woken by the stop");
+        assert_eq!(read.unwrap(), b"");
+    }
+
+    #[test]
+    fn a_reader_reads_output_and_ends_when_the_slave_closes() {
+        let (pty, slave) = Pty::open(SIZE).unwrap();
+        let (reader, _stop) = pty.reader().unwrap();
+        let mut slave = File::from(slave);
+        slave.write_all(b"hi").unwrap();
+        assert_eq!(read_on_a_thread(reader).recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), b"hi");
+
+        let (reader, _stop) = pty.reader().unwrap();
+        drop(slave);
+        let read = read_on_a_thread(reader).recv_timeout(Duration::from_secs(2)).expect("woken by the close");
+        assert_eq!(read.unwrap(), b"");
     }
 
     #[test]

@@ -39,7 +39,7 @@ use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::Terminal;
 
-use pty::{Pty, PtyWriter, WinSize};
+use pty::{Pty, PtyWriter, ReaderStop, WinSize};
 
 /// Called by the reader thread after forwarding child output, so an event loop
 /// can wake and redraw instead of polling. `Send` only (it lives on the thread).
@@ -76,6 +76,8 @@ pub struct GhosttyTerminal {
     master: Pty,
     writer: PtyWriter,
     child: Child,
+    /// Ends the reader thread, closing its copy of the master, when dropped.
+    _reader_stop: ReaderStop,
     /// Raw child output, forwarded from the reader thread.
     rx: Receiver<Vec<u8>>,
     /// Bytes the reader thread has put on `rx` so far (applied or not).
@@ -131,7 +133,7 @@ impl GhosttyTerminal {
 
         let child = pty::spawn(slave, cmd)?;
 
-        let mut reader = master.reader().context("clone PTY reader")?;
+        let (mut reader, _reader_stop) = master.reader().context("clone PTY reader")?;
         let writer = master.writer().context("clone PTY writer")?;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -192,6 +194,7 @@ impl GhosttyTerminal {
             master,
             writer,
             child,
+            _reader_stop,
             rx,
             forwarded,
             pty_out,
@@ -230,7 +233,9 @@ impl GhosttyTerminal {
         ChildKiller::new(self.child.id())
     }
 
-    /// Close the PTY and return the child, still to be reaped.
+    /// Return the child, still to be reaped, dropping the rest: the reader
+    /// thread then ends and the master's last copy closes, hanging up the
+    /// child's terminal.
     pub(crate) fn into_child(self) -> Child {
         self.child
     }
