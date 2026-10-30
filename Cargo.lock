@@ -1174,6 +1174,7 @@ dependencies = [
  "dispatch2",
  "ghostrealm-core",
  "ghostrealm-lsp",
+ "ghostrealm-process",
  "ghostrealm-terminal",
  "ghostrealm-terminal-ghostty",
  "ghostrealm-web",
@@ -1210,10 +1211,18 @@ name = "ghostrealm-lsp"
 version = "0.0.0"
 dependencies = [
  "crossbeam-channel",
+ "ghostrealm-process",
  "lsp-server",
  "lsp-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ghostrealm-process"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1236,6 +1245,7 @@ name = "ghostrealm-web"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ghostrealm-process",
  "libc",
  "memmap2",
  "serde",

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use ghostrealm_process::inherit_stdio_only;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
@@ -90,7 +91,7 @@ impl Client {
     /// Start an external server process speaking LSP on its stdin/stdout.
     /// `root` is the workspace folder it should treat as the project.
     pub fn spawn(mut command: Command, root: Option<&Path>, waker: Option<Waker>) -> io::Result<Client> {
-        let mut child = command
+        let mut child = inherit_stdio_only(&mut command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

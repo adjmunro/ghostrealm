@@ -124,6 +124,7 @@ line — over the same command registry the palette and keybindings use:
 crates/app        bin: winit + wgpu scene, sidebar/palette/tabs, agent channel, config wiring
 crates/core       registry, tab/split tree, inbox status, fuzzy search, config   (headless, tested)
 crates/lsp        language services over LSP: first-party server host + editor client
+crates/process    long-lived child processes that inherit only their stdio
 crates/terminal   the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
 ```

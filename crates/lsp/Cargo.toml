@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ghostrealm-process.workspace = true
 lsp-types = "0.97"
 lsp-server = "0.10"
 serde = "1.0.229"

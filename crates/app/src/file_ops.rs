@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use ghostrealm_core::git;
+use ghostrealm_process::inherit_stdio_only;
 
 /// What the app asks of the operating system outside its own windows.
 pub trait System {
@@ -68,6 +69,8 @@ impl System for HostSystem {
 /// (`https:/evil.app` in the working directory would run), so `-u` makes it
 /// a URL. The child starts at `/` with no stdin, so a relative path never
 /// resolves against the app's directory and it never reads the app's input.
+/// It may become the handler itself (`xdg-open` execs a browser), so it
+/// inherits no other descriptor.
 fn url_command(url: &str) -> std::process::Command {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
@@ -77,6 +80,7 @@ fn url_command(url: &str) -> std::process::Command {
         std::process::Command::new("xdg-open")
     };
     cmd.arg(url).current_dir("/").stdin(std::process::Stdio::null());
+    inherit_stdio_only(&mut cmd);
     cmd
 }
 
@@ -100,8 +104,10 @@ pub fn is_web_url(url: &str) -> bool {
     url_scheme(url).is_some_and(|s| WEB_SCHEMES.iter().any(|w| s.eq_ignore_ascii_case(w)))
 }
 
+/// Run `program` to completion. It may become a long-lived handler
+/// (`xdg-open` execs a file manager), so it inherits no other descriptor.
 fn run<'a>(program: &str, args: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {
-    let status = std::process::Command::new(program)
+    let status = inherit_stdio_only(&mut std::process::Command::new(program))
         .args(args)
         .status()
         .with_context(|| format!("can't run `{program}`"))?;

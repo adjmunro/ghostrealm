@@ -12,6 +12,7 @@ ghostrealm-lsp.workspace = true
 ghostrealm-terminal.workspace = true
 ghostrealm-terminal-ghostty.workspace = true
 ghostrealm-web.workspace = true
+ghostrealm-process.workspace = true
 anyhow.workspace = true
 winit = "0.30"
 wgpu = "30"

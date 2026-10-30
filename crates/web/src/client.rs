@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use ghostrealm_process::inherit_stdio_only;
 
 use crate::frame::FrameReader;
 use crate::protocol::{Cursor, Event, MouseAction, PopupKind, Request, PROTOCOL_VERSION};
@@ -252,7 +253,7 @@ impl WebHost {
         } else {
             Stdio::null()
         };
-        let mut child = cmd
+        let mut child = inherit_stdio_only(&mut cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -789,22 +790,11 @@ fn page_of(ev: &Event) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// Held by a test for as long as the process it starts runs. On macOS
-    /// std marks a new pipe close-on-exec only after creating it, so a
-    /// process another thread starts in between inherits it: a host's stdin
-    /// or stdout then stays open in an unrelated process.
-    #[cfg(unix)]
-    fn one_process_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-        static PROCESSES: Mutex<()> = Mutex::new(());
-        PROCESSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// A host that starts but never reads its stdin fills the pipe; sending
     /// still returns at once, coalescing moves and refusing past the cap.
     #[cfg(unix)]
     #[test]
     fn sending_to_a_host_that_doesnt_read_never_blocks() {
-        let _one = one_process_at_a_time();
         let mut sleep = Command::new("sleep");
         sleep.arg("30");
         let host = WebHost::start(sleep, None).unwrap();
@@ -858,7 +848,6 @@ mod tests {
     #[test]
     fn a_host_hung_up_on_is_reported_gone_once_its_process_has_gone() {
         use std::sync::atomic::AtomicUsize;
-        let _one = one_process_at_a_time();
         let mut sh = Command::new("/bin/sh");
         sh.args(["-c", "exec 1>&-; cat > /dev/null; sleep 0.5"]);
         let woken = Arc::new(AtomicUsize::new(0));

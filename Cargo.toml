@@ -8,6 +8,7 @@ members = [
     "crates/app",
     "crates/web",
     "crates/web-host",
+    "crates/process",
 ]
 # The CEF web host downloads and links Chromium; keep plain `cargo build/test`
 # free of it. Build it with `mise run web` (see mise.toml).
@@ -18,6 +19,7 @@ default-members = [
     "crates/lsp",
     "crates/app",
     "crates/web",
+    "crates/process",
 ]
 
 # Every test binary links wgpu, Ghostty and cosmic-text; with full debug info
@@ -37,6 +39,7 @@ ghostrealm-terminal-ghostty = { path = "crates/terminal-ghostty" }
 ghostrealm-core = { path = "crates/core" }
 ghostrealm-lsp = { path = "crates/lsp" }
 ghostrealm-web = { path = "crates/web" }
+ghostrealm-process = { path = "crates/process" }
 
 # libghostty-vt: git, not crates.io — the published crate pins a Zig-0.15-era
 # Ghostty. This rev pins Ghostty 22d13172 (requires Zig 0.16.0, see mise.toml).

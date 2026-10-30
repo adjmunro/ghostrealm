@@ -20,6 +20,7 @@ crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input rout
   src/plugins/       first-party plugins: terminal, files (+ editor, file_browser), web
 crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree, syntax highlighters
 crates/lsp         language services over LSP: first-party server host + editor client
+crates/process     long-lived child processes that inherit only their stdio
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
 crates/web         web surface contract: JSON-line protocol, shared-memory frames, host client
