@@ -1392,18 +1392,6 @@
 
 ---
 
-[2026-10-26T22:13+1300@462d3daa] Terminal — "snapshot failed" reaches stderr only
-
-- Requires: NO BLOCKERS
-- Detail: `terminal-ghostty`'s "snapshot failed" (`GhosttyTerminal::fill`,
-  `lib.rs`) prints to stderr and draws a blank grid. It repeats every
-  frame, so a toast needs the failure carried out of the terminal crate
-  and reported once per run of failures (a key, or a flag reset by the
-  next good snapshot).
-- Reason: the user sees a blank terminal with no reason.
-
----
-
 [2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
 
 - Requires: investigation (environment, or a stale host bundle)

@@ -75,6 +75,8 @@ pub struct Grid {
     pub viewport_active: bool,
     /// The rows are the alternate screen, which keeps no scrollback.
     pub alt_screen: bool,
+    /// Why the backend couldn't build this snapshot, which is then blank.
+    pub error: Option<String>,
 }
 
 impl Grid {
@@ -94,6 +96,7 @@ impl Grid {
             default_bg,
             viewport_active: true,
             alt_screen: false,
+            error: None,
         }
     }
 
@@ -112,6 +115,7 @@ impl Grid {
             default_bg: [0, 0, 0],
             viewport_active: true,
             alt_screen: false,
+            error: None,
         }
     }
 

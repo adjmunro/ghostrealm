@@ -371,13 +371,17 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// [`Self::build_into`], or a blank grid of the VT's size if that fails.
+    /// [`Self::build_into`], or if that fails a blank grid of the VT's size
+    /// carrying the error ([`Grid::error`]) for the UI to report.
     fn fill(&mut self, out: &mut Grid) {
-        if let Err(e) = self.build_into(out) {
-            eprintln!("ghostrealm: snapshot failed: {e:#}");
-            let cols = self.term.cols().unwrap_or(0);
-            let rows = self.term.rows().unwrap_or(0);
-            *out = Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0]);
+        match self.build_into(out) {
+            Ok(()) => out.error = None,
+            Err(e) => {
+                let cols = self.term.cols().unwrap_or(0);
+                let rows = self.term.rows().unwrap_or(0);
+                *out = Grid::blank(GridSize { cols, rows }, [220, 220, 220], [0, 0, 0]);
+                out.error = Some(format!("{e:#}"));
+            }
         }
     }
 

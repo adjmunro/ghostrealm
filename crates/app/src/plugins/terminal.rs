@@ -7,9 +7,11 @@
 //! frames so the viewport never outruns shaping.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
-use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Rect, Registry};
+use ghostrealm_core::{CmdError, CmdOutcome, CommandMeta, Config, Rect, Registry};
 use ghostrealm_terminal::{
     Cell, Grid, Key, KeyPress, Lifecycle, Mods, MouseAction, MouseButton as ReportButton, MouseReport, Pumped,
     Scroll, TerminalBackend,
@@ -19,6 +21,7 @@ use ghostrealm_terminal_ghostty::{CommandBuilder, ThreadedTerminal};
 use crate::app_state::AppState;
 use crate::plugin::text_edit::{Action, Keymap, Motion};
 use crate::plugin::{EventCx, MouseButton, MouseEvent, OpenCx, PaintCx, Plugin, Request, View};
+use crate::toasts::Level;
 
 pub const ID: &str = "terminal";
 
@@ -151,6 +154,68 @@ pub struct TerminalView {
     /// The grid has given up the pane's last row to the exit banner. Never
     /// undone, so a reflow that frees a blank row can't flip the size back.
     banner_reserved: bool,
+    /// Failed snapshots, reported as a toast once per run.
+    failures: SnapshotFailures,
+}
+
+/// Tracks runs of failed snapshots so each run is reported once: a failure
+/// repeats on every snapshot until the VT recovers. Paint sees the failure
+/// but can't raise a toast, so the report waits for the view's next tick
+/// ([`View::deadline`]).
+#[derive(Debug)]
+struct SnapshotFailures {
+    /// Keys this view's toast, so a later run replaces an unread one.
+    key: String,
+    /// A failure is in progress (reported or not).
+    failing: bool,
+    /// A run's first failure, not yet reported: when it was seen, and why.
+    due: Option<(Instant, String)>,
+}
+
+impl SnapshotFailures {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        SnapshotFailures {
+            key: format!("terminal-snapshot:{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            failing: false,
+            due: None,
+        }
+    }
+
+    /// Note a snapshot's outcome (its [`Grid::error`]). The first failure of
+    /// a run becomes due; a good snapshot ends the run.
+    fn observe(&mut self, error: Option<&str>, now: Instant) {
+        match error {
+            Some(e) if !self.failing => {
+                self.failing = true;
+                self.due = Some((now, e.to_owned()));
+            }
+            Some(_) => {}
+            None => {
+                self.failing = false;
+                self.due = None;
+            }
+        }
+    }
+
+    /// When the unreported failure was seen, if one is due.
+    fn deadline(&self) -> Option<Instant> {
+        self.due.as_ref().map(|(at, _)| *at)
+    }
+
+    /// The due failure's toast, once.
+    fn take(&mut self) -> Option<Request> {
+        let (_, error) = self.due.take()?;
+        let message = format!("Couldn't draw the terminal: {error}");
+        eprintln!("ghostrealm: {message}");
+        Some(Request::Toast {
+            level: Level::Error,
+            message,
+            key: Some(self.key.clone()),
+            choices: Vec::new(),
+            doc: None,
+        })
+    }
 }
 
 impl TerminalView {
@@ -169,6 +234,7 @@ impl TerminalView {
             pending_scroll: 0,
             exit: None,
             banner_reserved: false,
+            failures: SnapshotFailures::new(),
         }
     }
 
@@ -331,6 +397,7 @@ impl View for TerminalView {
         if self.term.needs_snapshot() || !self.snapshotted {
             self.term.snapshot_into(&mut self.grid);
             self.snapshotted = true;
+            self.failures.observe(self.grid.error.as_deref(), Instant::now());
         }
         let cols = ((rect.w / cw).floor() as u16).max(1);
         let pane_rows = ((rect.h / ch).floor() as u16).max(1);
@@ -615,6 +682,16 @@ impl View for TerminalView {
 
     fn is_busy(&self) -> bool {
         self.term.is_busy()
+    }
+
+    fn deadline(&self, _cfg: &Config) -> Option<Instant> {
+        self.failures.deadline()
+    }
+
+    fn tick(&mut self, cx: &mut EventCx, _now: Instant) {
+        if let Some(toast) = self.failures.take() {
+            cx.request(toast);
+        }
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> bool {
@@ -928,7 +1005,50 @@ mod tests {
             default_bg: [0, 0, 0],
             viewport_active: true,
             alt_screen: false,
+            error: None,
         }
+    }
+
+    /// A run of failed snapshots reports once, when its first is due; a
+    /// good snapshot ends the run, so the next failure reports again.
+    #[test]
+    fn a_run_of_failed_snapshots_reports_once() {
+        let mut f = SnapshotFailures::new();
+        let t0 = Instant::now();
+        f.observe(None, t0);
+        assert_eq!(f.deadline(), None);
+
+        f.observe(Some("render state"), t0);
+        f.observe(Some("render state"), t0 + std::time::Duration::from_millis(16));
+        assert_eq!(f.deadline(), Some(t0), "due from the run's first failure");
+        let Some(Request::Toast { level, message, key, .. }) = f.take() else { panic!("a toast") };
+        assert_eq!(level, Level::Error);
+        assert!(message.contains("render state"), "{message}");
+        assert_eq!(key.as_deref(), Some(f.key.as_str()));
+        assert!(f.take().is_none(), "reported once");
+        f.observe(Some("render state"), t0);
+        assert_eq!(f.deadline(), None, "the run goes on");
+
+        f.observe(None, t0);
+        f.observe(Some("cols"), t0);
+        assert!(f.take().is_some(), "a new run reports again");
+    }
+
+    /// A failure the next snapshot recovers from before it is reported never
+    /// reports.
+    #[test]
+    fn a_recovered_failure_is_not_reported() {
+        let mut f = SnapshotFailures::new();
+        f.observe(Some("snapshot"), Instant::now());
+        f.observe(None, Instant::now());
+        assert!(f.take().is_none());
+    }
+
+    /// Each terminal keys its own toast, so one pane's failure doesn't
+    /// replace another's.
+    #[test]
+    fn each_terminal_keys_its_own_toast() {
+        assert_ne!(SnapshotFailures::new().key, SnapshotFailures::new().key);
     }
 
     #[test]
