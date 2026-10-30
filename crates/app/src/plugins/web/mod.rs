@@ -606,10 +606,11 @@ pub struct WebView {
     /// off screen, so a person's opened in the background doesn't render.
     on_screen: bool,
     sent_visible: bool,
-    /// An agent opened it: without a window (the agent channel), or as a
-    /// pop-up through a gesture eval. Off screen, the host keeps it visible
-    /// to Chromium, so a loaded machine doesn't starve the renderer the
-    /// agent's reads wait on.
+    /// The page's `Create` says an agent drives it: the view was opened
+    /// without a window (the agent channel). Off screen, the host keeps it
+    /// visible to Chromium, so a loaded machine doesn't starve the renderer
+    /// the agent's reads wait on. The host makes pop-ups itself, and decides
+    /// theirs from how they were opened.
     agent: bool,
     /// The URL bar while it is being edited.
     url_edit: Option<LineEdit>,
@@ -716,7 +717,6 @@ impl WebView {
         let mut v = WebView::new(slot, p.id);
         v.created_in = generation;
         v.sent_visible = false;
-        v.agent = !p.from_input;
         v.last_url.clone_from(&p.url);
         v.host_made = true;
         v.popup = popup;
