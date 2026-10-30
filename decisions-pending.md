@@ -728,6 +728,9 @@ Each line gives the item and the default that will be applied if you don't veto 
 **Web**
 - **Pages an agent drives stay visible to Chromium** (`docs/DECISION.md`, Web pop-ups; built in 8af2376): agent-owned pages, including hidden pop-ups and pages created off screen, report themselves visible to Chromium (as headless Chrome and Puppeteer do), at 10 fps while nobody sees them; a person's background tabs stay hidden. Alternatives: show a page only while an eval runs (pages see `visibilitychange` around each eval), or wait longer for hidden pages (blocks the UI thread up to 30 s).
 
+**Terminal**
+- **Closing a pane stops its program** (`crates/terminal-ghostty/src/threaded.rs`, built in dbefd79): closing a pane hangs up its terminal; a program still running 2 s after the close gets SIGHUP (its process group and the foreground group), then SIGKILL 1 s later; nothing is signalled once the shell has been reaped, and the reaper gives up after 30 s. A program that needs longer to clean up on SIGHUP (an editor writing a recovery file, a dev server shutting down) is cut off at 3 s. Alternatives: longer graces (e.g. SIGKILL at 10 s), or no SIGKILL at all (a `trap '' HUP` program outlives its pane).
+
 **Toasts over modals**
 - **Toast choices while a modal is open** (`docs/DECISION.md`, the error surface's toast detail): while the picker or a confirmation is open, a toast's choices (e.g. "Save As…", "Open Settings") are inert and Dismiss stays live; error and warning toasts stay until dismissed, so the choice is there once the modal closes. The alternative is for a choice to cancel the picker or confirmation first, discarding what was in progress.
 
