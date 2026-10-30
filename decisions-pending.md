@@ -725,6 +725,9 @@ Agents read comments through the agent channel, within item 3's scope.
 
 Each line gives the item and the default that will be applied if you don't veto it.
 
+**Web**
+- **Pages an agent drives stay visible to Chromium** (`docs/DECISION.md`, Web pop-ups; built in 8af2376): agent-owned pages, including hidden pop-ups and pages created off screen, report themselves visible to Chromium (as headless Chrome and Puppeteer do), at 10 fps while nobody sees them; a person's background tabs stay hidden. Alternatives: show a page only while an eval runs (pages see `visibilitychange` around each eval), or wait longer for hidden pages (blocks the UI thread up to 30 s).
+
 **Toasts over modals**
 - **Toast choices while a modal is open** (`docs/DECISION.md`, the error surface's toast detail): while the picker or a confirmation is open, a toast's choices (e.g. "Save As…", "Open Settings") are inert and Dismiss stays live; error and warning toasts stay until dismissed, so the choice is there once the modal closes. The alternative is for a choice to cancel the picker or confirmation first, discarding what was in progress.
 
