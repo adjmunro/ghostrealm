@@ -126,7 +126,7 @@ crates/core       registry, tab/split tree, inbox status, fuzzy search, config  
 crates/lsp        language services over LSP: first-party server host + editor client
 crates/process    long-lived child processes that inherit only their stdio
 crates/terminal   the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
-crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
+crates/terminal-ghostty   libghostty-vt + PTY impl of the seam
 ```
 
 The backend yields a cell `Grid`; the app draws it (glyphs via glyphon, cell

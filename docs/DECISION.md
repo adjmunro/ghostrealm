@@ -36,6 +36,7 @@
 > (`e96f61f chore(repo): initialise project baseline`).
 
 - Category: Terminal backend / core dependency
+- Status: PARTLY SUPERSEDED BY [2026-10-31T08:06+1300@e01f4b6e] (the PTY is our own code, not `portable-pty`)
 - Detail: Build on `libghostty-vt` (VT engine only) + own PTY (`portable-pty`) + own wgpu glyph renderer + font/shaping stack (`cosmic-text` candidate). `libghostty-vt` gives cells; we draw pixels. Ghostling (single-file reference terminal shipped with the crate) is the renderer starting point.
 - Detail: Terminal substrate walled behind a trait seam from the app core; PTY / VT / renderer / fonts each behind their own internal seam so any one can be swapped as upstream Ghostty publishes more.
 - Detail: Terminals render into the same wgpu scene as chrome (no native subviews) → unified compositing, palette overlay is trivial, fully cross-platform.
@@ -283,3 +284,13 @@
 - Detail: `[headings]` sets each heading level's size (`h1_scale`…`h6_scale`; default 2.0, 1.6, 1.35, 1.2, 1.1, 1.0) and the space above it (`h1_space`…`h6_space`; default 1.6, 1.4, 1.2, 1.1, 1.0, 1.0), both in ems of the view's body text (Preview's is 1.15 times the editor's). Integrated and Preview read the same values; Preview's first block keeps its 0.5 em page padding.
 - Detail: In Integrated the space sits above a heading's first row, except on the view's top line, so a heading scrolled or jumped to starts at the top.
 - Reason: owner request: more space above each heading and larger headings in Integrated, so they read as sections; sizes in the settings TOML.
+
+---
+
+[2026-10-31T08:06+1300@e01f4b6e]
+
+- Category: Terminal backend / PTY
+- Detail: `crates/terminal-ghostty/src/pty.rs` opens the PTY and spawns the shell itself; `portable-pty` is no longer a dependency. The master opens with `posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)`, then `grantpt`, `unlockpt`, `ptsname_r`, and the slave opens through std (always `O_CLOEXEC`), so both are close-on-exec from the start on macOS and Linux and no spawn lock is needed.
+- Detail: The shell is a std `Command` with the slave as its stdio. Its `pre_exec` resets six signal dispositions, calls `setsid` and `ioctl(TIOCSCTTY)`, nothing else; `ghostrealm_process::inherit_stdio_only` keeps every other descriptor from it. Exit status, wait and kill are std's `Child` and a SIGHUP sender.
+- Detail: The crate builds on unix only (`compile_error!` elsewhere); Windows is out of scope (GOAL.md).
+- Reason: `portable-pty` 0.9 marks `openpty`'s descriptors close-on-exec only after it returns, so a child another thread spawns meanwhile inherits the slave. Its `pre_exec` (`close_random_fds`) allocates after fork, which can deadlock on a lock another thread held at fork, and closes std's exec-error pipe, so a shell that fails to exec reads as one that exited. Neither can be changed from outside the crate, and the rest of it (a command builder, resize, the foreground group) is a few lines of `libc`.

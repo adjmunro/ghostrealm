@@ -8,7 +8,7 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 - Language: Rust (workspace). Windowing/event loop: `winit`. GPU: `wgpu`.
 - Terminal engine: `libghostty-vt` (VT parse + grid state + input encoding) — git
   dependency, pinned rev; see DECISION.md. It gives us cells, not pixels.
-- PTY: `portable-pty`. Fonts/shaping/raster: `glyphon` (cosmic-text) for now.
+- PTY: own unix code (`posix_openpt`, std `Command`). Fonts/shaping/raster: `glyphon` (cosmic-text) for now.
 - Toolchain: Zig 0.16.0 (pinned in [`../mise.toml`](../mise.toml)) is required to
   build `libghostty-vt-sys`. `.cargo/config.toml` sets `LIBGHOSTTY_VT_SYS_CPU=native`.
 
@@ -22,7 +22,7 @@ crates/core        app spine: command registry, tab/split tree, inbox, config, f
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/process     long-lived child processes that inherit only their stdio
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
-crates/terminal-ghostty   libghostty-vt + portable-pty impl of the seam
+crates/terminal-ghostty   libghostty-vt + PTY impl of the seam
 crates/web         web surface contract: JSON-line protocol, shared-memory frames, host client
 crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; not a default member
 ```
