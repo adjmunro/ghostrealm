@@ -107,7 +107,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::raw::c_int;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
