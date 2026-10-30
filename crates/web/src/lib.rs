@@ -7,6 +7,7 @@
 pub mod client;
 pub mod frame;
 pub mod protocol;
+pub mod temp;
 
 pub use client::{find_host, Exiting, FrameInfo, PopupInfo, SharedFrame, ViewState, WebHost};
 pub use protocol::{Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, PopupKind, Request};

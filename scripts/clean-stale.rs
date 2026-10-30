@@ -58,7 +58,9 @@
 //!   are 5 minutes old. The app's frame directory `ghostrealm-<uid>` and its
 //!   fallbacks `ghostrealm-<uid>-*` are kept (the web host clears those);
 //! - CEF's `<bundle id>.*` temp dirs (`dev.ghostrealm.web-host.*`): removed
-//!   once 5 minutes old while no web host runs.
+//!   once 5 minutes old while no web host runs. A web host points Chromium's
+//!   temp dir at `<profile>/tmp/<pid>` and the next host on that profile
+//!   clears it, so these are only ones Chromium made with that unset.
 //!
 //! The target dir given (or `target`) is never emptied, and temp-dir
 //! entries of other users are not touched. Emptying holds the `debug` and
@@ -126,7 +128,8 @@ const LOCK_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artif
 /// be and still count as since: some filesystems keep whole seconds.
 const MTIME_SLACK: Duration = Duration::from_secs(2);
 
-/// The bundle id CEF prefixes its temp dirs with.
+/// The bundle id CEF prefixes its temp dirs with, in the temp dir when the
+/// host has not pointed Chromium's own (`ghostrealm_web::temp`) elsewhere.
 const CEF_TEMP_PREFIX: &str = "dev.ghostrealm.web-host.";
 
 struct Unit {

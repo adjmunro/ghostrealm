@@ -124,6 +124,13 @@ fn main() -> ExitCode {
     let _ = FRAME_DIR.set(frames);
     let cache = cache_dir();
     let _ = std::fs::create_dir_all(&cache);
+    let temp = match ghostrealm_web::temp::HostTemp::create(&cache, running) {
+        Ok(t) => t,
+        Err(e) => return fail(&format!("no temp directory under {}: {e}", cache.display())),
+    };
+    // Before `initialize`, which starts Chromium's threads (none may run while
+    // the environment changes) and its child processes (which inherit it).
+    std::env::set_var(ghostrealm_web::temp::ENV, temp.path());
     let settings = Settings {
         windowless_rendering_enabled: 1,
         root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),

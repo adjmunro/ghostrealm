@@ -1376,22 +1376,6 @@
 
 ---
 
-[2026-10-24T06:23+1300@83f8fe8d] Web — the real host leaves CEF temp dirs outside its profile
-
-- Requires: NO BLOCKERS
-- Detail: Each `plugins::web` run with the real host leaves a
-  `$TMPDIR/dev.ghostrealm.web-host.chromium_chrome_url_fetcher_.*` dir
-  (14 KB; 2,457 had built up), plus `…Unpacker_BeginUnzipping` ones. They sit
-  outside the profile, so removing the profile doesn't reach them. Find what
-  creates them and point it at the profile, or remove them once the host exits.
-  Lead (unverified): Chromium's `base::GetTempDir` on macOS reads
-  `MAC_CHROMIUM_TMPDIR` before `NSTemporaryDirectory()`; the host could set it
-  to a per-pid dir under its cache before `initialize` so children inherit it.
-  Until then `mise run clean-all` removes them while no host runs.
-- Reason: test runs shouldn't fill the temp directory.
-
----
-
 [2026-10-26T22:13+1300@462d3daa] Tests — the CEF host tests fail on `develop`
 
 - Requires: investigation (environment, or a stale host bundle)
