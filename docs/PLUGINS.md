@@ -65,6 +65,10 @@ should be too. The API lives in
   hidden surfaces, and a person's new tabs (right after the opener's tab).
   A pop-up window a person opened floats over its opener's page instead
   (`WebView` draws it `above` and routes the input over it to it).
+  Pop-ups outlive the host: before placing, `adopt_popups` calls
+  `WebView::revive` on every web view, which makes again in a running host
+  the pop-ups an earlier host made; one that can't be made again closes
+  with a warning toast.
 - **Documents**: a view may host several files, each a `View` of its own
   (file tabs inside one surface). `docs()` lists their `DocId`s (default
   `[DocId::SELF]`: the view is its one document), `active_doc()` is the one

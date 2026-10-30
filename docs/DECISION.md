@@ -306,3 +306,13 @@
 - Detail: Only holders of that lock reap the child. Nothing else in the process may call `wait` or `waitpid(-1)`, or set SIGCHLD to `SIG_IGN`.
 - Detail: The 2 s, 1 s and 30 s timings are defaults the owner may change.
 - Reason: A program that turns echo off (vim, less, top) never writes after the hangup, so a reader blocked on the master kept the PTY open; a program that ignores SIGHUP never exits. Signalling a reaped pid could reach an unrelated process that reused it.
+
+---
+
+[2026-10-31T09:47+1300@7e00ebd9]
+
+- Category: Web surface / pop-ups
+- Detail: A pop-up the app has taken outlives the web host that made it (a crash, an idle exit, a new bundle): a floating pop-up, an agent's hidden pop-up, and a tab a page opened are each made again in the next host at their last address, under the same page id, so each keeps its surface, kind, owner (person or agent) and place (its opener's page, or its pane). It has no `window.opener`. A floating one is made with its opener's page; the others on the next pump once a host runs, or when driven or painted (no host starts for them alone).
+- Detail: A floating or hidden pop-up made again counts toward its opener's four pop-ups and closes with it: `create` names its opener. Past the cap the host refuses it as it refuses a new one (a person's with the info toast, an agent's counted in `get surface`) and it goes. Before anything else the app tells a new host to number its own pop-ups past the ids the app holds (`first_popup`), so no id is reused. Protocol version 7.
+- Detail: One with no address, or at `about:` or `blob:`, can't be made again: what it showed came from its opener's script or from a renderer that went with the host. It goes, with a warning toast naming it and saying the web host restarted and it had no address to reopen, on its opener's pane (a tab's own pane for a tab). An agent's hidden pop-up gets one too: the person otherwise can't tell why it went.
+- Reason: a host crash lost every pop-up silently, an OAuth window or an agent's work among them.

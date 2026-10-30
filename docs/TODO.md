@@ -1242,6 +1242,11 @@
   button hover and its tooltip) and that clicks, typing, and scrolling in
   it reach it. Also check a person's `target=_blank` tab opens beside its
   opener.
+- Detail: Kill the web host (`kill -9` its pid) with a floating pop-up, a
+  tab a page opened, and an `about:blank` pop-up open: the first two come
+  back at their address once the host restarts (the floating one still
+  floating with the keyboard), and the third leaves a warning toast on its
+  opener's pane.
 - Reason: no display in the agent sandbox.
 
 ---
@@ -1267,16 +1272,6 @@
   draw before overlay images).
 - Reason: OAuth flows rarely stack pop-ups; showing them all needs a way to
   switch between them and a layer per pop-up.
-
----
-
-[2026-10-23T09:43+1300@5a747143] Web — pop-ups across a host restart
-
-- Requires: NO BLOCKERS
-- Detail: A pop-up's page belongs to the host that made it: when the host
-  exits, floating and hidden pop-ups go and tabs opened from pop-ups close.
-  They could reopen at their last address (without `window.opener`).
-- Reason: a host crash loses them silently.
 
 ---
 
