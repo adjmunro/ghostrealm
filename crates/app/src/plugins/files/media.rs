@@ -193,8 +193,6 @@ pub struct MediaView {
     hidden: bool,
     /// When to redraw the playback position.
     progress_at: Option<Instant>,
-    /// This view's autoplay override; `None` follows `[file_browser] preview_autoplay`.
-    autoplay: Option<bool>,
     /// Started on the first play.
     audio: Option<AudioPlayer>,
     // Geometry from the last paint, for input.
@@ -217,7 +215,6 @@ impl MediaView {
             autoplay_at: None,
             hidden: true,
             progress_at: None,
-            autoplay: None,
             audio: None,
             header_rect: None,
             name_hit: None,
@@ -260,7 +257,7 @@ impl MediaView {
     }
 
     fn autoplay_on(&self, cfg: &Config) -> bool {
-        self.autoplay.unwrap_or(cfg.file_browser.preview_autoplay)
+        cfg.file_browser.preview_autoplay
     }
 
     /// The file, if it is a track.
@@ -497,7 +494,11 @@ impl View for MediaView {
                     player.resume();
                 }
             }
-            BTN_AUTOPLAY => self.autoplay = Some(!self.autoplay_on(cx.cfg)),
+            BTN_AUTOPLAY => cx.request(Request::SetConfig {
+                section: "file_browser",
+                key: "preview_autoplay",
+                value: toml::Value::Boolean(!self.autoplay_on(cx.cfg)),
+            }),
             BTN_NAME => {
                 if let Some(hit) = self.name_hit {
                     self.open_file_menu(cx, (hit.x, hit.y + hit.h), MenuAlign::Left);
@@ -811,8 +812,9 @@ mod tests {
         assert_eq!(in_header(&mut h, &mut v), [BTN_MORE], "not listed by default");
         h.cfg.editor.header_icons = vec![HeaderIcon::SoftWrap, HeaderIcon::Autoplay];
         assert_eq!(in_header(&mut h, &mut v), [BTN_AUTOPLAY, BTN_MORE]);
-        h.button(&mut v, BTN_AUTOPLAY);
-        assert!(v.autoplay_on(&h.cfg));
+        let out = h.button(&mut v, BTN_AUTOPLAY);
+        let set = Request::SetConfig { section: "file_browser", key: "preview_autoplay", value: toml::Value::Boolean(true) };
+        assert_eq!(out.requests, [set], "the button sets the global default");
         // An image has no autoplay.
         let d = tmpdir("media-icons");
         std::fs::write(d.join("c.png"), media::testing::png(4, 2, [0, 0, 255, 255])).unwrap();

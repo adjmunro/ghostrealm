@@ -79,6 +79,9 @@ pub enum Request {
     ShowInSidebar(PathBuf),
     /// The view wrote this file (the app hot-reloads it if it is the config).
     Saved(PathBuf),
+    /// The user chose a setting in the view: write `[section] key = value`
+    /// into `config.toml` and reload the config.
+    SetConfig { section: &'static str, key: &'static str, value: toml::Value },
     /// A view hosted in the floating picker chose this path: the picker confirms
     /// with it.
     Pick(PathBuf),

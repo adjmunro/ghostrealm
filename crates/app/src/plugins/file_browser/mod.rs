@@ -127,8 +127,8 @@ impl Plugin for FileBrowserPlugin {
                     "preview_autoplay",
                     Kind::Bool,
                     Some("true"),
-                    "Play a track once it has been shown for a moment (toggle per document with \
-                     its `autoplay` button).",
+                    "Play a track once it has been shown for a moment. A track's `autoplay` \
+                     button sets this.",
                 ),
             ],
         )]

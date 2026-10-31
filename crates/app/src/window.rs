@@ -2012,6 +2012,7 @@ impl State {
                 Request::ShowInSidebar(path) => self.app.show_requested(sid, &path),
                 Request::OpenUrl(url) => self.app.open_requested_url(sid, &url),
                 Request::Saved(path) => self.saved(path),
+                Request::SetConfig { section, key, value } => self.set_config(section, key, &value),
                 Request::Pick(path) if sid == PICKER_SID => self.confirm_picker(Some(path)),
                 Request::Pick(_) => {}
                 Request::SaveAs => self.app.open_save_as(sid),
@@ -2047,6 +2048,25 @@ impl State {
         if ghostrealm_core::config::is_config_file(&path) {
             self.reload_config();
         }
+    }
+
+    /// Write `[section] key = value` into `config.toml` and reload it, or
+    /// toast why it wasn't written.
+    fn set_config(&mut self, section: &str, key: &str, value: &toml::Value) {
+        let written = match ghostrealm_core::config::config_path() {
+            Some(path) => ghostrealm_core::config::write::set(&path, section, key, value),
+            None => Err("there is no config path".to_string()),
+        };
+        match written {
+            Ok(()) => self.reload_config(),
+            Err(why) => {
+                eprintln!("ghostrealm: can't set {section}.{key}: {why}");
+                let message = format!("Couldn't save the setting: {why}");
+                self.app.notify(Toast::new(Level::Error, message).keyed("config_write"));
+                self.window.request_redraw();
+            }
+        }
+        self.dirty = true;
     }
 
     /// Confirm the picker with `path`, else with its browser's choice.
