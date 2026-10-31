@@ -1457,3 +1457,13 @@
   rather than fixed.
 
 ---
+
+[2026-10-31T22:05+1300@cfac8629]
+
+- Requires: NO BLOCKERS
+- Detail: Terminal, alternate-screen keys: decisions-pending item 8 said a `[terminal]` boolean would control the translation, but the owner's answer (B) didn't mention one and none was added. Ask whether one is wanted.
+- Detail: `keys_are_translated_on_the_primary_screen_only` doesn't cover Cmd+C/V still working on the alternate screen, nor Cmd+Left sending nothing there.
+- Detail: Each `sent_bytes` call in that test waits about 2 s for the raw-mode read to time out.
+- Reason: gaps found reviewing `fix/alt-screen-native-keys`.
+
+---
