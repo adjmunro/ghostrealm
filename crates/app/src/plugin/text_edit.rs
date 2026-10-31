@@ -18,8 +18,8 @@
 //!
 //! Backspace/Delete remove a character, Option a word, Cmd to the line's start
 //! (Backspace) or end (Delete); with a selection they remove it. Cmd+A selects
-//! all; Cmd+C/X/V copy, cut, and paste; Cmd+Z undoes and Cmd+Shift+Z redoes
-//! (where the text keeps history). Ctrl chords are never edits (Ctrl+arrows
+//! all; Cmd+C/X/V copy, cut, and paste; Cmd+Z undoes and Cmd+Shift+Z redoes.
+//! Ctrl chords are never edits (Ctrl+arrows
 //! belong to macOS). Linux and Windows use Ctrl where macOS uses Option (words)
 //! and Cmd (the text's ends, select all, clipboard), and Home/End for lines.
 //!
@@ -425,8 +425,55 @@ impl Applied {
     }
 }
 
+/// Most undo steps a [`LineEdit`] keeps; older ones are dropped.
+const LINE_UNDO_MAX: usize = 100;
+
+/// A [`LineEdit`]'s text, cursor, and selection at one point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LineSnapshot {
+    text: String,
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+/// What the open undo run merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    /// Typed characters; `word` is whether the last one was a word character.
+    Typing { word: bool },
+    /// Single-character deletes.
+    Deleting,
+}
+
+impl Run {
+    /// Whether `next` joins a run of `self`: same kind, and typing doesn't
+    /// start a new word.
+    fn takes(self, next: Run) -> bool {
+        match (self, next) {
+            (Run::Typing { word: prev }, Run::Typing { word }) => prev || !word,
+            (a, b) => a == b,
+        }
+    }
+}
+
+/// Linear undo/redo for a [`LineEdit`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LineHistory {
+    undo: Vec<LineSnapshot>,
+    redo: Vec<LineSnapshot>,
+    /// The open run and the cursor its last edit left.
+    run: Option<(Run, usize)>,
+}
+
 /// One line of editable text with a cursor and an optional selection. Columns
 /// count Unicode scalar values.
+///
+/// Edits keep a linear undo history of up to [`LINE_UNDO_MAX`] steps. A run of
+/// typed characters is one step until a word character follows a non-word one
+/// (`hello ` then `world`); a run of single-character deletes is one step; a
+/// cursor move, click, or selection ends a run; and a paste, cut, word or line
+/// delete, or bracket wrap is a step of its own. [`set_text`](Self::set_text)
+/// clears the history: the owner replaced the text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineEdit {
     text: String,
@@ -436,6 +483,7 @@ pub struct LineEdit {
     anchor: Option<usize>,
     /// Brackets are plain text: typing one over a selection replaces it.
     plain_brackets: bool,
+    history: LineHistory,
 }
 
 impl LineEdit {
@@ -469,11 +517,31 @@ impl LineEdit {
         self.text.chars().count()
     }
 
-    /// Replace the text, cursor at the end, no selection.
+    /// Replace the text, cursor at the end, no selection, no undo history.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.len();
         self.anchor = None;
+        self.history = LineHistory::default();
+    }
+
+    fn snapshot(&self) -> LineSnapshot {
+        LineSnapshot { text: self.text.clone(), cursor: self.cursor, anchor: self.anchor }
+    }
+
+    /// Undo (`undo`) or redo one step. With nothing to step to, the key is
+    /// still used: it never falls through to whatever holds the field.
+    fn step_history(&mut self, undo: bool) -> Applied {
+        let cur = self.snapshot();
+        let h = &mut self.history;
+        let (from, to) = if undo { (&mut h.undo, &mut h.redo) } else { (&mut h.redo, &mut h.undo) };
+        let Some(s) = from.pop() else {
+            return Applied::Moved;
+        };
+        to.push(cur);
+        h.run = None;
+        (self.text, self.cursor, self.anchor) = (s.text, s.cursor, s.anchor);
+        Applied::Changed
     }
 
     /// The selection as an ordered, non-empty `(start, end)` column range.
@@ -574,6 +642,7 @@ impl LineEdit {
     /// selection of a single press.
     pub fn press(&mut self, caret: usize, over: usize, clicks: u32, extend: bool) {
         let caret = caret.min(self.len());
+        self.history.run = None;
         match clicks {
             0 | 1 if extend => {
                 self.anchor.get_or_insert(self.cursor);
@@ -617,7 +686,39 @@ impl LineEdit {
         }
     }
 
+    /// Apply `edit`, recording a text change for undo (see [`LineEdit`]).
     pub fn apply(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
+        let fresh = self.selection().is_some();
+        let run = match &edit {
+            Edit::Undo => return self.step_history(true),
+            Edit::Redo => return self.step_history(false),
+            Edit::Insert(s) => typed_char(s).map(|c| Run::Typing { word: is_word(c) }),
+            Edit::Delete(Motion::Left | Motion::Right) if !fresh => Some(Run::Deleting),
+            _ => None,
+        };
+        let before = self.snapshot();
+        let applied = self.apply_edit(edit, clip);
+        let h = &mut self.history;
+        match applied {
+            Applied::Changed => {
+                let joins = !fresh
+                    && run.is_some_and(|r| h.run.is_some_and(|(open, at)| at == before.cursor && open.takes(r)));
+                if !joins {
+                    h.undo.push(before);
+                    if h.undo.len() > LINE_UNDO_MAX {
+                        h.undo.remove(0);
+                    }
+                }
+                h.redo.clear();
+                h.run = run.map(|r| (r, self.cursor));
+            }
+            Applied::Moved => h.run = None,
+            Applied::Ignored => {}
+        }
+        applied
+    }
+
+    fn apply_edit(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
         match edit {
             Edit::Move { to, select } => {
                 let Some(t) = self.target(to) else {
@@ -896,6 +997,164 @@ mod tests {
         let mut e = LineEdit::new("x");
         assert_eq!(e.key(&plain(Key::Up), &mut None::<String>), Applied::Ignored);
         assert_eq!(e.key(&plain(Key::Enter), &mut None::<String>), Applied::Ignored);
+    }
+
+    fn typed(e: &mut LineEdit, s: &str) {
+        for c in s.chars() {
+            e.apply(Edit::Insert(c.to_string()), &mut None::<String>);
+        }
+    }
+
+    fn undo(e: &mut LineEdit) -> Applied {
+        e.apply(Edit::Undo, &mut None::<String>)
+    }
+
+    fn redo(e: &mut LineEdit) -> Applied {
+        e.apply(Edit::Redo, &mut None::<String>)
+    }
+
+    #[test]
+    fn a_typing_run_undoes_a_word_at_a_time_and_redoes() {
+        let mut e = LineEdit::new("");
+        typed(&mut e, "hello world");
+        assert_eq!(undo(&mut e), Applied::Changed);
+        assert_eq!(e.text(), "hello ", "a word starts a new step");
+        undo(&mut e);
+        assert_eq!(e.text(), "");
+        assert_eq!(undo(&mut e), Applied::Moved, "nothing left, but the key is used");
+        redo(&mut e);
+        assert_eq!((e.text(), e.cursor()), ("hello ", 6));
+        redo(&mut e);
+        assert_eq!(e.text(), "hello world");
+        assert_eq!(redo(&mut e), Applied::Moved);
+    }
+
+    #[test]
+    fn a_cursor_move_or_click_ends_a_typing_run() {
+        let mut clip: Option<String> = None;
+        let mut e = LineEdit::new("");
+        typed(&mut e, "ab");
+        e.apply(Edit::Move { to: Motion::Left, select: false }, &mut clip);
+        e.apply(Edit::Move { to: Motion::Right, select: false }, &mut clip);
+        typed(&mut e, "cd");
+        undo(&mut e);
+        assert_eq!(e.text(), "ab", "back at the same spot, still a new step");
+        e.press(0, 0, 1, false);
+        e.release();
+        e.press(2, 2, 1, false);
+        e.release();
+        typed(&mut e, "x");
+        undo(&mut e);
+        assert_eq!(e.text(), "ab");
+    }
+
+    #[test]
+    fn single_deletes_merge_and_a_word_delete_is_its_own_step() {
+        let mut e = LineEdit::new("one two three");
+        let mut clip: Option<String> = None;
+        e.key(&plain(Key::Backspace), &mut clip);
+        e.key(&plain(Key::Backspace), &mut clip);
+        e.key(&k(Key::Backspace, |m| m.alt = true), &mut clip);
+        assert_eq!(e.text(), "one two ");
+        undo(&mut e);
+        assert_eq!(e.text(), "one two thr", "the word delete alone");
+        undo(&mut e);
+        assert_eq!(e.text(), "one two three", "both backspaces at once");
+    }
+
+    #[test]
+    fn paste_and_cut_are_steps_of_their_own() {
+        let mut e = LineEdit::new("");
+        typed(&mut e, "ab");
+        let mut clip = Some("XY".to_string());
+        e.apply(Edit::Paste, &mut clip);
+        typed(&mut e, "c");
+        assert_eq!(e.text(), "abXYc");
+        undo(&mut e);
+        assert_eq!(e.text(), "abXY", "typing after a paste doesn't join it");
+        undo(&mut e);
+        assert_eq!(e.text(), "ab", "the paste alone");
+        e.apply(Edit::SelectAll, &mut clip);
+        e.apply(Edit::Cut, &mut clip);
+        assert_eq!(e.text(), "");
+        undo(&mut e);
+        assert_eq!((e.text(), e.selection()), ("ab", Some((0, 2))), "the selection comes back");
+    }
+
+    #[test]
+    fn typing_over_a_selection_is_one_step() {
+        let mut e = LineEdit::new("hello big world");
+        let mut clip: Option<String> = None;
+        e.apply(Edit::Move { to: Motion::WordLeft, select: true }, &mut clip);
+        typed(&mut e, "there");
+        assert_eq!(e.text(), "hello big there");
+        undo(&mut e);
+        assert_eq!(e.text(), "hello big world");
+        // Wrapping in brackets is a step of its own.
+        e.apply(Edit::Insert("(".into()), &mut clip);
+        assert_eq!(e.text(), "hello big (world)");
+        undo(&mut e);
+        assert_eq!(e.text(), "hello big world");
+    }
+
+    #[test]
+    fn a_new_edit_clears_redo() {
+        let mut e = LineEdit::new("");
+        typed(&mut e, "ab cd");
+        undo(&mut e);
+        assert_eq!(e.text(), "ab ");
+        typed(&mut e, "x");
+        assert_eq!(redo(&mut e), Applied::Moved);
+        assert_eq!(e.text(), "ab x");
+        // A move alone keeps redo.
+        undo(&mut e);
+        e.apply(Edit::Move { to: Motion::LineStart, select: false }, &mut None::<String>);
+        redo(&mut e);
+        assert_eq!(e.text(), "ab x");
+    }
+
+    #[test]
+    fn set_text_clears_the_history() {
+        let mut e = LineEdit::new("");
+        typed(&mut e, "ab cd");
+        undo(&mut e);
+        e.set_text("reset");
+        assert_eq!(undo(&mut e), Applied::Moved);
+        assert_eq!(redo(&mut e), Applied::Moved);
+        assert_eq!(e.text(), "reset");
+    }
+
+    #[test]
+    fn undo_keeps_at_most_line_undo_max_steps() {
+        let mut e = LineEdit::new("");
+        let mut clip = Some("x".to_string());
+        for _ in 0..LINE_UNDO_MAX + 5 {
+            e.apply(Edit::Paste, &mut clip);
+        }
+        assert_eq!(e.history.undo.len(), LINE_UNDO_MAX);
+        while undo(&mut e) == Applied::Changed {}
+        assert_eq!(e.text().len(), 5, "the oldest steps went");
+    }
+
+    #[test]
+    fn the_undo_chords_reach_the_field() {
+        let mut e = LineEdit::new("");
+        let mut clip: Option<String> = None;
+        typed(&mut e, "a");
+        let mac = Keymap::macos();
+        let cmd_z = k(Key::Char('z'), |m| m.super_ = true);
+        let cmd_shift_z = k(Key::Char('z'), |m| {
+            m.super_ = true;
+            m.shift = true;
+        });
+        e.apply(mac.edit_for(&cmd_z).unwrap(), &mut clip);
+        assert_eq!(e.text(), "");
+        e.apply(mac.edit_for(&cmd_shift_z).unwrap(), &mut clip);
+        assert_eq!(e.text(), "a");
+        let pc = Keymap::pc();
+        e.apply(pc.edit_for(&k(Key::Char('z'), |m| m.ctrl = true)).unwrap(), &mut clip);
+        e.apply(pc.edit_for(&k(Key::Char('y'), |m| m.ctrl = true)).unwrap(), &mut clip);
+        assert_eq!(e.text(), "a");
     }
 
     #[test]
