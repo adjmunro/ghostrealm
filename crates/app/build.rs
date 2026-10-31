@@ -1,8 +1,11 @@
 //! Builds the CEF web host in its own target dir (`<target>/web-host`),
 //! bundles it there, and moves the bundle beside the app binary, where the
 //! app looks for it. `GHOSTREALM_NO_WEB=1` skips it. The rules are in
-//! `build/web_host.rs`.
+//! `build/web_host.rs`. It also prunes superseded units from `target/` once
+//! the build is done (`build/prune.rs`).
 
+#[path = "build/prune.rs"]
+mod prune;
 #[path = "build/watch.rs"]
 mod watch;
 #[path = "build/web_host.rs"]
@@ -38,6 +41,8 @@ fn main() {
             ),
         }
     }
+    #[cfg(unix)]
+    prune_after_build(&root);
     if let Some(why) = web_host::env_skip(|k| env::var(k).ok()) {
         return skip(&why);
     }
@@ -45,6 +50,41 @@ fn main() {
     host::build(start, &root, &target);
     #[cfg(not(unix))]
     let _ = (start, root);
+}
+
+/// Starts clean-stale detached, if due; it waits for this build to finish.
+#[cfg(unix)]
+fn prune_after_build(root: &Path) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let Some(target) = prune::own_target(root, &out_dir, env::var("CARGO_TARGET_DIR").ok().as_deref()) else {
+        return;
+    };
+    if !prune::due(env::var(prune::OPT_OUT).ok().as_deref(), &target.join(prune::STAMP), SystemTime::now()) {
+        return;
+    }
+    let bin = target.join(prune::BIN);
+    // Not inherited pipes: cargo reads this script's output until they close.
+    let Ok(out) = std::fs::File::create(bin.with_extension("log")) else { return };
+    let Ok(err) = out.try_clone() else { return };
+    // Builds the pruner when the script is newer, then waits for the locks.
+    let script = r#"cd "$1" && { [ "$2" -nt scripts/clean-stale.rs ] || "$3" -O --edition 2021 scripts/clean-stale.rs -o "$2"; } && exec "$2" --wait "$5" --target-dir "$4" --lockfile Cargo.lock"#;
+    let spawned = Command::new("sh")
+        .args(["-c", script, "sh"])
+        .arg(root)
+        .arg(&bin)
+        .arg(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .arg(&target)
+        .arg(prune::WAIT)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .process_group(0)
+        .spawn();
+    if let Err(e) = spawned {
+        println!("cargo::warning=target/ not pruned: {e}");
+    }
 }
 
 fn skip(why: &str) {
