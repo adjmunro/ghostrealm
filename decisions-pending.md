@@ -323,6 +323,8 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 > 6. **Simple linear undo/redo built into the standard single-line text field** (`LineEdit`), used everywhere (rename, palette, URL bar, etc.). No tree.
 > 7. **Standing note:** revisit undo coverage as new surfaces are added. Each new pane type should be assessed for whether it needs undo, e.g. web form interactions, or a future Git pane where undoing and redoing Git actions would be very valuable.
 
+**Built:** part 6 (linear undo/redo in `LineEdit`); see DECISION.md. Parts 1–4 are open.
+
 ---
 
 ## 15. Markdown syntax for colour and embed size

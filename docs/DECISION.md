@@ -370,3 +370,12 @@
 - Detail (implementation choices): `config::write::set(path, section, key, value)` is the one writer. It refuses, leaving the file untouched, a missing, unreadable, empty, invalid, or read-only file, or a section or key of the wrong kind; it writes a temp file beside the file's resolved target and renames it over, so a crash never truncates the file and a symlink into a dotfiles checkout survives. A replaced value keeps its trailing comment. Views ask for a write with `Request::SetConfig`; the app writes, reloads, and toasts a refusal. A key `config.local.toml` sets is not written (the local value would hide it); a toast says the local file sets it. The temp file has a unique name and is opened with `create_new`.
 - Detail (implementation choices): the state dir is `$XDG_STATE_HOME/ghostrealm/state`, else `~/Library/Application Support/ghostrealm/state` on macOS, else `~/.local/state/ghostrealm/state`. `StateStore::load` gives `None` for a missing or corrupt file (the feature starts from its defaults); `save` replaces atomically. No feature uses it yet.
 - Reason: synced settings stay the user's text, and nothing the app learns or one machine needs leaks into the synced file. Owner's call (decisions-pending item 9).
+
+---
+
+[2026-11-01T01:08+1300@5935b08]
+
+- Category: UX / text input
+- Detail (owner): every single-line field (`LineEdit`: rename, palette, URL bar, file filter, save name) has linear undo and redo on the editor's chords (Cmd+Z / Cmd+Shift+Z on macOS, Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z elsewhere). No tree.
+- Detail (implementation choices): a run of typed characters is one step until a word character follows a non-word one; single-character deletes merge; a cursor move, click or selection ends a run; a paste, cut, word or line delete, or bracket wrap is its own step; typing over a selection starts a step. At most 100 steps, as whole-line snapshots. A new edit clears redo. `set_text` from the owner (rename start, picked file name, palette's next argument, cleared filter) clears the history. Undo or redo with nothing to step to still takes the key.
+- Reason: owner's call (decisions-pending item 14, part 6): "Simple linear undo/redo built into the standard single-line text field".

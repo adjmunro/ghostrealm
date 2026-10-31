@@ -294,8 +294,8 @@
   snapshots (200 steps), typing runs and single-char delete runs coalesce,
   undoing to the saved text clears `modified`. REMAINING: (1) a reversible op
   log instead of snapshots (each step copies the whole buffer — costly for big
-  files); (2) finer runs (break at word boundaries / after a pause); (3) undo in
-  single-line fields (`LineEdit`); (4) history survives Save As / reload. User
+  files); (2) finer runs (break at word boundaries / after a pause); (3) history
+  survives Save As / reload. Single-line fields (`LineEdit`) have linear undo. User
   has further ideas on scope/behaviour — discuss before extending.
 - Reason: basic editing expectation.
 
