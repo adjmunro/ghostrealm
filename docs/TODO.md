@@ -205,14 +205,14 @@
 
 ---
 
-[2026-09-15@2e8e8c7] Horizontal tabs — overflow scroll, drag-reorder, drag-to-split
+[2026-09-15@2e8e8c7] Horizontal tabs — overflow scroll, drag-reorder
 
 - Requires: NO BLOCKERS
 - Detail: (1) htabs shrink as you add more; add horizontal scroll when they overflow.
-  (2) Drag a htab (its name area, shown only when >1 tab) to reorder. (3) Drag a htab
-  out to a pane edge (side/top/bottom) to break it into a split — the drag-to-split
-  idea in IDEAS.md.
-- Reason: expected tab UX; requested drag-to-split.
+  (2) Drag a htab within its strip to reorder. A drag already starts on a tab press
+  (`tab_press` in `window.rs`); a pane's centre zone moves the tab to the end of
+  that pane's strip.
+- Reason: expected tab UX.
 
 ---
 

@@ -10,7 +10,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 9. **Config write-back and a machine-local state file**: may the app edit `config.toml`, and where does per-machine state go?
 10. **Settings regenerate / cleanup / reset**: which of these commands, and how do they behave?
 11. **Video playback**: which decoder stack, if any?
-13. **Dragging a tab to split**: leaf-only drops, or workspace-edge drops as well?
 14. **Undo scope**: what should undo cover beyond what it does today?
 15. **Markdown syntax for colour and embed size**: which dialect do we extend?
 16. **Markdown features that reach outside the file**: should link checks use the network, and what does the run button do?
@@ -329,33 +328,6 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 > - Load ffmpeg dynamically at runtime, not linked at build time. If it's missing, video is disabled and the UI shows a clear "install ffmpeg to play video" message. Images and audio keep working.
 > - Licence note (see item 7): distro builds (e.g. Homebrew) are often GPL. Because we neither distribute nor statically link it, this should be acceptable, but it's a grey area. Keep it runtime-loaded and record the reasoning.
 > - Standing rule: flag any future dependency that is a notably large binary for my review.
-
----
-
-## 13. Dragging a tab to split
-
-**Source:** docs/IDEAS.md "Drag a htab to re-place it / create a split" (line ~13); docs/TODO.md entry "Horizontal tabs — overflow scroll, drag-reorder, drag-to-split" (line ~239)
-
-**What's being decided:** where a dragged tab can be dropped, including your "full-width pane across the bottom" case.
-
-**Background:**
-- The split tree (`core::tree`) is binary. A full-width pane under two side-by-side panes is a split of the root (root = top/bottom of the old root and the new pane), so the tree can express it.
-- What's missing is drop zones that target an ancestor rather than a leaf.
-
-**Options:**
-- **A. Leaf zones only.** A pane's edge regions split that pane on that side, and its centre moves the tab into the pane's tab strip.
-  - Pros: simple.
-  - Cons: spanning splits are impossible by dragging.
-- **B. A, plus workspace-edge bands.** A thin band at each edge of the workspace splits the root.
-  - Pros: covers your example with one extra zone type.
-- **C. B, plus ancestor zones.** Near an edge shared by several levels, nested hints let you pick which split to divide.
-  - Pros: any layout.
-  - Cons: busy hints; harder to hit.
-
-**Recommendation:** B.
-
-**Your answer:**
-> **B: leaf zones plus workspace-edge bands.** Must include clear visual guides: once a drag starts, all drop zones (pane edges/centre and workspace edge bands) faintly highlight. Hovering a zone shows a translucent preview of exactly where and how big the resulting pane will be (VS Code style).
 
 ---
 
@@ -693,6 +665,7 @@ These can't be verified in the headless sandbox:
 - **Stacked modals and toasts:** Save As onto an existing file: the picker stays visible and dimmed under the Replace? question, with no picker text showing through. A toast raised while the palette, picker or a confirmation is open draws on top, its × works, its choices are inert under the picker or a confirmation and work once it closes, and hover, click and scroll don't reach the modal beneath; an info toast over a modal hides after about 4 s. A context menu and tooltips draw over the toast. Editor hover popups and images still draw, with no text bleeding between layers. Judge whether a toast covering the palette's input line is acceptable.
 - **Full-screen program keys:** on branch `fix/alt-screen-native-keys`, check word-left, Shift+Left and Option+Up in vim/nvim, less and htop in the app.
 - **Sidebar order:** on branch `feat/sidebar-inbox-order`, check in the app the attention order, the hover hold and the re-sort slide when the pointer leaves, directory headers (fold on release, hover highlight), and Pin/Unpin in the workspace menu.
+- **Dragging a tab:** on branch `feat/drag-tab-to-split`, drag a tab (its strip shows with two or more tabs) in a split workspace: every drop zone shows faintly once the drag starts, the zone under the pointer previews where the pane lands and how big, and mouse-up moves it there (try the bottom band under two side-by-side panes for a full-width pane, a pane's centre, and its sides).
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 
 ## Parked (no decision needed yet)
