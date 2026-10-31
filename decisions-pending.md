@@ -2,7 +2,6 @@
 
 Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings files, and the "decision needed" markers in `docs/DECISION.md`, `docs/SPEC.md`, and `docs/GOAL.md`, as of the commit that last changed this file. Each one needs a call only you can make. The Files surface work (issue #1, file tabs, the unsaved dot) is decided and left out. Fill in each **Your answer** block. Sections are ordered by what they block and what they risk.
 
-2. **Web host in the normal build**: how should plain `cargo build` / `cargo run --release` produce the CEF bundle?
 3. **Agent channel into the running app**: which processes may connect, and what may each one reach?
 4. **Web profiles, concrete model**: which profiles exist by default, who creates them, what scope they default to, and who owns the host?
 5. **Web downloads, uploads, and JS dialogs**: what may an agent-driven page do with files and dialogs?
@@ -24,43 +23,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 21. **Web preload / prerender default**: off, connect, or prerender?
 22. **Comment mode storage**: where do comment threads live?
 23. **GIT.md "committing is pre-authorised"**: is this intended?
-
----
-
-## 2. Web host in the normal build
-
-**Source:** docs/TODO.md entry "HIGHEST web priority: build the web host with the normal build" (line ~852)
-
-**What's being decided:** how plain `cargo build` and `cargo run --release` end up with a working browser. You asked for it to be part of the normal build, cached when nothing changed. Of the options in the TODO, at least one has to be picked.
-
-**Background:**
-- The host must be a macOS `.app` bundle containing the CEF framework and helper apps. `ghostrealm-web-bundle` (the `bundle` feature) assembles it and downloads CEF (about 250 MB).
-- `crates/web-host` is excluded from `default-members`, and Cargo has no post-build packaging step. `mise run web` exists only to run the two commands (build, then bundle).
-- A nested `cargo build` inside `build.rs` deadlocks on the build-directory lock unless it uses a separate target dir, for example `target/web-host`.
-- CMake and Ninja come from `mise.toml`, the same way Zig already does. Every option still needs mise's tools on PATH.
-- Enabling the Chromium sandbox (decided) means linking `cef_sandbox` into these same helper bundles, so whichever option is picked also hosts that work.
-
-**Options:**
-- **A. The app's `build.rs` builds and bundles the host.** It uses a separate target dir and `rerun-if-changed` on `crates/web-host` and `crates/web`.
-  - Pros: `cargo build`, `cargo run`, and `--release` all just work.
-  - Cons: the first build pays for the CEF download and the C++ wrapper compile, and `cargo test` of the app crate pays it too. Cargo hides `build.rs` progress, so the first build looks stuck for minutes. Offline builds fail unless an opt-out such as `GHOSTREALM_NO_WEB=1` skips the step.
-  - Effort: small to medium.
-- **B. A Cargo runner.** `.cargo/config.toml` sets `runner = "scripts/run-ghostrealm"`, which brings the bundle up to date and then execs the binary.
-  - Pros: no nested cargo; `cargo run --release` works.
-  - Cons: plain `cargo build` produces no bundle. The runner also wraps test binaries, so it must pass them straight through.
-  - Effort: small.
-- **C. Build or fetch on first use of a web surface**, with progress shown in the pane.
-  - Pros: only users who open a browser pay for it.
-  - Cons: you want the browser anyway. Fetching needs a hosted, signed prebuilt bundle; building at runtime only works inside a checkout.
-- **D. `xtask` or a cargo alias** (`cargo xr`).
-  - Cons: doesn't change what plain `cargo run --release` does, which is the command you use.
-
-All options keep `[web] host` and `$GHOSTREALM_WEB_HOST` as overrides.
-
-**Recommendation:** A, with the separate target dir and an opt-out env var for offline builds and CI. It is the only option where both `cargo build` and `cargo run` give a working browser.
-
-**Your answer:**
-> A
 
 ---
 

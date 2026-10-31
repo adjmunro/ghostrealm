@@ -82,7 +82,7 @@
 [2026-10-05T21:13+1300@04794e15]
 
 - Category: Web surface / embedded browser
-- Status: PARTLY SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (pop-up handling)
+- Status: PARTLY SUPERSEDED BY [2026-10-13T20:40+1300@e534aa0] (pop-up handling), [2026-10-31T15:27+1300@00d7e28d] (building without CEF)
 - Detail: Web pages render via CEF (`cef` crate, prebuilt CEF binary distribution) in a separate host process (`crates/web-host`), off-screen, with software compositing. Frames reach the app through shared-memory files and are drawn as textures in the app's own wgpu scene; input and commands go over a JSON-line pipe (`crates/web`).
 - Detail: One page per web surface — no in-browser tabs; popups and new-window links open in place. The pane/tab system provides tabs.
 - Detail: The app side is the `web` plugin (`crates/app/src/plugins/web/`). It draws pages through `PaintCx::image` and takes keys through `View::raw_key` (presses and releases with the physical key), both added to the plugin API for it.
@@ -318,3 +318,15 @@
 - Detail: The pop-ups one that can't be made again opened (hidden, or floating over it, and theirs) close with it, as they would had it closed: its toast names them.
 - Detail: A page the exited host reported closed, before the app saw it, stays closed: it isn't made again.
 - Reason: a host crash lost every pop-up silently, an OAuth window or an agent's work among them.
+
+---
+
+[2026-10-31T15:27+1300@00d7e28d]
+
+- Category: Build / web host
+- Detail: The app's build script builds and bundles the web host: `crates/app/build.rs` (rules in `crates/app/build/web_host.rs`) runs a nested `cargo build` of `ghostrealm-web-host` in its own target dir (`<target>/web-host`, the app's profile), runs the bundler there, and moves the bundle beside the app binary. Plain `cargo build`, `cargo run [--release]` and `cargo test -p ghostrealm` produce it.
+- Detail: Cached: the script reruns only when a host input changes (the host's path-dependency sources and manifests, the workspace manifest, lock file, Cargo config and `mise.toml`, the nested build scripts' env inputs) or the placed bundle goes; a stamp (the host, helper and bundler executables' mtimes and sizes, and a rules version) skips re-bundling.
+- Detail: A failed host build fails the app build. It is skipped, with a warning and the reason in the app's "web host not found", when `GHOSTREALM_NO_WEB` is set (agents set it unless the task touches web), in rust-analyzer's build-script pass, for non-macOS and cross targets, and when the build's target dir isn't the one `cargo metadata` names (a command-line `--target-dir`).
+- Detail: Placement replaces only a bundle that is ours: a real directory owned by the build's user whose `Info.plist` names `dev.ghostrealm.web-host`.
+- Detail: `mise run web` is removed. `clean-stale` cleans `target/web-host` as a target dir of its own and has an opt-in `--unused-days`.
+- Reason: the owner wants plain `cargo build` and `cargo run --release` to give a working browser (decisions-pending item 2, option A). The separate target dir keeps the nested build off the outer build's lock, and CEF out of the app's own units.

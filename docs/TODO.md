@@ -750,60 +750,6 @@
 
 ---
 
-[2026-10-13T20:25+1300@e9617b8] HIGHEST web priority: build the web host with the normal build
-
-- Requires: a choice between the options below (the CEF download size is the cost)
-- Detail: The CEF host bundle is built only by `mise run web`. After a normal
-  `cargo build` or `cargo run --release` the web surface reports "web host not
-  found: build it with `mise run web`", so the browser is always down until a
-  second command is run. The owner wants `cargo build` and `cargo run
-  --release` to build the web host too, skipped when nothing changed (cached).
-  Priority: the highest item the next time web work starts; other work may go
-  first.
-- Why it is a separate build:
-  - The host is a separate executable (DECISION.md, Web surface): it must be
-    packaged as a macOS `.app` bundle with the CEF framework and helper apps,
-    because Chromium requires that layout. A bundle binary
-    (`ghostrealm-web-bundle`, behind the `bundle` feature) produces it and also
-    downloads CEF (~250 MB).
-  - Cargo has no post-build step that packages another binary, and the host
-    crate is excluded from the workspace's `default-members`, so `cargo build`
-    never touches it.
-  - `mise run web` is the repo's task-runner wrapper (`mise.toml`, which also
-    pins Zig, CMake, and Ninja) around two cargo commands: build the host with
-    `--features bundle`, then run the bundler. It is not a Rust-ecosystem
-    command; it exists because cargo cannot express the packaging step.
-- Options:
-  - The app's `build.rs` drives the bundle step with change detection. A plain
-    `cargo run --release` then yields a working browser. Costs: a nested cargo
-    invocation (slower, build-directory lock contention), and every first build
-    needs CMake + Ninja and the CEF download.
-  - A cargo alias or `xtask` for build/run. Does not help plain `cargo run
-    --release`, which is what the owner uses.
-  - The app builds or fetches the bundle on first use of a web surface (with
-    progress shown), so only users who open a browser pay for it. The owner
-    notes they want the browser anyway, so the saving is theoretical for them.
-  - Either way, keep `[web] host` / `$GHOSTREALM_WEB_HOST` as overrides.
-- Owner, verbatim:
-  > I definitely think that cargo build or cargo run, etc., should also be
-  > triggering the web browser build. I'm not actually sure why that's a
-  > separate build, to be honest. You might have to expand on that. Though I do,
-  > I guess I like the idea of it being a plugin that I could disable. But
-  > what's the point? I do actually want the web browser, so it might as well be
-  > in there. So yeah, we should absolutely make that part of the normal build
-  > process and maybe just like skip it if there's been no changes. We use the
-  > cached version if we don't need to build it.
-  >
-  > Why is the build command for the web module mise run web anyway? That
-  > doesn't really make sense to me. I've just been using cargo run dash dash
-  > release the whole time. Like, why is it mise rather than a Rust ecosystem
-  > command? I think patching the web build into the rest of the build command
-  > is the highest priority the next time we're touching web stuff. So we can do
-  > other stuff first, but when we get to web, fixing that is very important.
-- Reason: a feature that needs a separate manual build step looks broken.
-
----
-
 [2026-10-14@7364079] File and folder context menu — remaining
 
 - Requires: NO BLOCKERS (each item below is independent)
@@ -1442,5 +1388,24 @@
   F's page. Skip pop-ups already in `went_with` when building later roots'
   `with`.
 - Reason: non-blocking findings of the review of c11a355..b28f80e.
+
+---
+
+[2026-10-31T15:27+1300@00d7e28d] Linux: build and place the web host bundle
+
+- Requires: NO BLOCKERS (a Linux machine to test on)
+- Detail: The app's build script (`crates/app/build.rs`) builds and places the
+  web host only for macOS targets; nothing bundles it on Linux now that
+  `mise run web` is gone. By hand:
+  `cargo build -p ghostrealm-web-host --features bundle --bins --target-dir
+  target/web-host --config 'build.build-dir="target/web-host"'`, then
+  `target/web-host/debug/ghostrealm-web-bundle`, then copy the
+  `ghostrealm-web-host/` dir it makes beside `ghostrealm` (`target/debug/`).
+- Detail: To do: build and place the Linux bundle (a plain directory with the
+  binary and CEF libraries) from `build.rs`, with an ownership guard of its own
+  (the macOS one reads the bundle id from `Info.plist`, which the Linux bundle
+  lacks), its completeness rules, and tests per guard.
+- Reason: the Linux bundle has another layout and this machine can't run it,
+  so the build script skips every OS but macOS.
 
 ---
