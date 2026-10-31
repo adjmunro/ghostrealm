@@ -8,7 +8,7 @@ Record it in `decisions-pending.md`, skip it, carry on with other work, and rais
 Where it goes in `decisions-pending.md`:
 
 - **Owner's decision:** a new numbered section, plus its line in the list at the top, in the existing shape: **Source**, **What's being decided**, **Background**, **Options**, **Recommendation**, and an empty **Your answer:** `>` block.
-- **Small and reversible:** take the default yourself and add a line under "Decisions I'd take by default unless you object".
+- **Small and reversible:** take the default yourself and add a line under "Decisions I'd take by default unless you object". A default never adds scope: when an answer would add a feature, option, command or tool the goal doesn't need, the default leaves it out.
 - **Needs a human at a desktop:** a line under "Needs you at a desktop".
 - **Unsolved problem:** a numbered section with what you tried and what blocked you, in place of **Options**.
 

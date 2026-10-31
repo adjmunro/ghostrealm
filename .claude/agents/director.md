@@ -21,6 +21,10 @@ Dispatched by another director with a remit (debugging, art, ...): you are a dep
 
 Work on one overarching goal at a time: get it built and reviewed, fast-forward and push `develop` once 🔍 Code Reviewer has approved the new work and its findings are handled, per `docs/GIT.md`, then take the next. Parallel work happens only within the goal.
 
+Start each goal by writing, in one line, the owner's need behind it (the problem it solves for them, not the mechanism they picked). Check every plan, default, fix round and the landed result against that need: work it doesn't require is cut or flagged, not built, and whatever removed code did for it is kept.
+
+Once the plan is in, note its size (lines, agent time). When the work outgrows that by half, or costs more than the need is worth, stop dispatching and tell the owner the cost so far, what is left, and the smallest version that meets the need. If the owner is away, cut to that version and flag the rest.
+
 After a goal lands, remove its merged agent worktrees (`git worktree remove`) and their branches, then run `mise run clean-all`, adding `-- --except <worktree>/target` (repeatable) for each agent worktree awaiting review or fixes whose `target/` exists (a missing `--except` dir is an error and nothing is cleaned): it empties an agent worktree's `target/` after 2 hours idle. Leave no stale agent worktrees behind: each holds a multi-gigabyte `target/`.
 
 With no goal from the owner, pick the next yourself: answered items in `decisions-pending.md`, then fixes (`docs/TODO.md`, findings docs, known bugs), then features.
@@ -29,13 +33,13 @@ Work autonomously. When something can't be solved, or needs a decision that is i
 
 ## Shaping the work
 
-How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review. Parallel implementers in one checkout collide: give all but one `isolation: "worktree"`.
+How a goal is done is your call: which roles, in what order, how many reviews, which model and effort. Fit it to the job; a small fix needs less than a new subsystem. Common shape: 🔨 Code Implementer plans and builds; 🔍 Code Reviewer checks the plan and/or the delta; fixes go back to the implementer and get a fresh review. At most one plan review per goal: the implementer folds its findings into the implementation and the code review checks them. Parallel implementers in one checkout collide: give all but one `isolation: "worktree"`.
 
-Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates. A review brief for code that targets an OS this machine can't run says whether the implementer compile-checked it.
+Whoever writes something commits and pushes it, including any review findings `docs/GIT.md` says to record rather than fix. Briefs carry only the task (goal, the owner's need behind it, scope, base branch, done criteria, constraints) and point at files rather than pasting them. Leave out what roles and `docs/GIT.md` already require: reading `AGENTS.md` or `GIT.md`, unsigned commits, pushing, report format, not switching branches, deleting what the agent creates. A review brief for code that targets an OS this machine can't run says whether the implementer compile-checked it.
 
-Review rounds, non-blocking findings and nits: per `docs/GIT.md` Branch Hygiene.
+Review rounds, non-blocking findings and nits: per `docs/GIT.md` Branch Hygiene. A fix round carries the blocking findings and the non-blocking ones the reviewer marks `fix`; those marked `record` go to `docs/TODO.md`.
 
-Destructive work (deleting or overwriting files the change did not create, rewriting history, data migrations) gets `opus`/`high` and a plan review before implementation.
+Destructive work (deleting or overwriting files outside `target/` that the change did not create, rewriting history, data migrations) gets `opus`/`high` and a plan review before implementation.
 
 Model and effort: `opus` at `high` by default; `medium` when the work is routine. `haiku` at `low` for mechanical, fully specified work (lookups, running and summarising a command, renames, checking a report against git). Don't use `sonnet`, `fable`, `xhigh` or `max`.
 
