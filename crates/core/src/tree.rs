@@ -51,6 +51,20 @@ impl Pane {
     pub fn active_surface(&self) -> Option<&Surface> {
         self.surfaces.get(self.active)
     }
+
+    /// Take surface `id` out of the strip, keeping the same surface active
+    /// when it stays (or the one beside it when it goes).
+    pub(crate) fn remove_surface(&mut self, id: SurfaceId) -> Option<Surface> {
+        let pos = self.surfaces.iter().position(|s| s.id == id)?;
+        let surface = self.surfaces.remove(pos);
+        if pos < self.active {
+            // The active surface moved down a place with the ones after `pos`.
+            self.active -= 1;
+        } else if self.active >= self.surfaces.len() && self.active > 0 {
+            self.active = self.surfaces.len().saturating_sub(1);
+        }
+        Some(surface)
+    }
 }
 
 /// How a split arranges its two children.
@@ -192,7 +206,7 @@ impl Node {
         }
     }
 
-    fn find_pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+    pub(crate) fn find_pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         match self {
             Node::Leaf(p) if p.id == id => Some(p),
             Node::Leaf(_) => None,
@@ -234,7 +248,7 @@ impl Node {
 
     /// Remove the leaf `target`, collapsing the parent split into the sibling.
     /// Returns the new subtree, or `None` if this whole subtree was the target.
-    fn remove_pane(self, target: PaneId) -> Option<Node> {
+    pub(crate) fn remove_pane(self, target: PaneId) -> Option<Node> {
         match self {
             Node::Leaf(p) => {
                 if p.id == target {
@@ -445,7 +459,7 @@ impl Tree {
         Self::default()
     }
 
-    fn fresh(&mut self) -> u64 {
+    pub(crate) fn fresh(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -659,15 +673,8 @@ impl Tree {
         let Some(p) = v.pane_mut(pane) else {
             return false;
         };
-        let Some(pos) = p.surfaces.iter().position(|s| s.id == surface) else {
+        if p.remove_surface(surface).is_none() {
             return false;
-        };
-        p.surfaces.remove(pos);
-        if pos < p.active {
-            // The active surface moved down a place with the ones after `pos`.
-            p.active -= 1;
-        } else if p.active >= p.surfaces.len() && p.active > 0 {
-            p.active = p.surfaces.len().saturating_sub(1);
         }
         if p.surfaces.is_empty() {
             // Collapse into a sibling if there is one; the sole pane is kept empty.
