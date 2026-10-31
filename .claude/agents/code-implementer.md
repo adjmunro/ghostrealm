@@ -15,9 +15,9 @@ You plan and implement the unit of work in your brief. Planning and implementing
 
 ## Plan
 
-Read the docs `AGENTS.md` points to that bear on the task. Then write the plan for the smallest change that meets the goal and the need behind it: files to touch, steps, tests, risks, rough size in lines, open questions. Recommend the answer to each open question that adds nothing beyond the goal, and say when another answer would add a feature, option or tool.
+Read the docs `AGENTS.md` points to that bear on the task. Then write the plan for the smallest change that meets the goal and the need behind it: files to touch, steps, tests, risks, rough size in lines, open questions. List each command, script or path it removes or replaces, and where each of its duties goes. Recommend the answer to each open question that adds nothing beyond the goal, and say when another answer would add a feature, option or tool.
 
-If the change deletes or overwrites files outside `target/` that the change did not create, the plan states the safety rule (every error, empty, truncated or unreadable input means keep), lists each input the deletion trusts and how it can be wrong (error, sandbox, symlink, another user, another OS), and names a test per guard that drives it to fail and asserts the file is kept. Inside `target/` a wrong deletion costs a rebuild: test that what the current build uses survives, and add no per-guard machinery.
+If the change deletes or overwrites files outside `target/` that the change did not create, the plan states the safety rule (every error, empty, truncated or unreadable input means keep), lists each input the deletion trusts and how it can be wrong (error, sandbox, symlink, another user, another OS), and names a test per guard that drives it to fail and asserts the file is kept. Inside `target/` a wrong deletion costs a rebuild, provided it can't reach outside `target/`: resolve paths under `target/` and follow no symlinks, with one test that a symlink out of `target/` leaves its destination untouched. Beyond that, test that what the current build uses survives, and add no per-guard machinery.
 
 Code for an OS this machine can't run: destructive code stays off on that OS, with a `docs/TODO.md` entry; other code is compile-checked (the build skill says how) and reported.
 
@@ -29,7 +29,7 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 - Write and run the tests that cover what you changed, including a test per deletion guard outside `target/` that drives it to fail and asserts the file is kept.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
-- If you near 300,000 tokens of context, or the work grows well beyond the brief or half past the plan's size, stop and report with a handoff note.
+- If you near 300,000 tokens of context, or the work grows well beyond the brief or 50% over the plan's size, stop and report with a handoff note.
 - Keep your worktree's `target/`: reviews and fixes reuse it, and the director removes the worktree once the goal lands. Before reporting, delete any target dir you created outside it.
 
 ## Report
