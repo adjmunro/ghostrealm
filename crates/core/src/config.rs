@@ -7,6 +7,7 @@
 
 pub mod catalogue;
 pub mod check;
+pub mod write;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
