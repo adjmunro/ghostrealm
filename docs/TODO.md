@@ -1473,6 +1473,14 @@
 - Detail: with `--wait`, a member unit outranked by `--keep` newer copies of
   its identity (more than three commands sharing one) still goes, and the
   deps only it reached go with it; that command rebuilds them.
+- Detail: the `--wait` walk (`scripts/clean-stale.rs:1089`) passes through a
+  unit only when its hash file reads. A unit whose JSON reads but hash file
+  doesn't stops the walk, so outranked units below it can go though a kept
+  member uses them: an unreadable file means "as without `--wait`", not
+  "keep".
+- Detail: Nit: `dep_fingerprints` (`scripts/clean-stale.rs:1281`) relies on
+  cargo's compact JSON (`"deps":[`, the first match being the top-level key);
+  a format change makes the walk find nothing, without a warning.
 - Reason: findings from the review of `build/prune-after-build-2`, recorded
   rather than fixed.
 
