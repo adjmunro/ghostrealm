@@ -1457,6 +1457,9 @@
 - Detail: A directory header's hover highlight uses raw `rect_contains`, not the gated `button_hover`, so it lights under a menu or toast (as the sidebar's × buttons do).
 - Detail: `close_vtab` moves focus to a neighbour in tree order, not sidebar order.
 - Detail: A folded group can hide the active workspace; its header shows no highlight for it.
+- Detail: No test drives `pump_all` to show that a background workspace really becoming unread (or a busy one finishing) gets a newer stamp: `background_output_marks_unread_and_dwell_reads` and `reading_a_background_surface_still_marks_it_unread` check the status only, so a wrong restore condition would pass. Assert the stamp increases in one of them.
+- Detail: The poll's restore check (`AppState::pump_all_budgeted`, `let asks = ...`) and `Tree::set_status` compare the whole `TabStatus`, so `Unread { success: false }` → `Unread { success: true }` would count as new attention once failures mark workspaces; compare the status kind.
+- Detail: Nit: that `let asks = ...` line is longer than rustfmt would leave it.
 - Reason: findings from the review of `feat/sidebar-inbox-order`, recorded rather than fixed.
 
 ---
