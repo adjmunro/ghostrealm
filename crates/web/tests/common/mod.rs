@@ -6,8 +6,13 @@ use std::time::{Duration, Instant};
 use ghostrealm_web::client::{HOST_ENV, HOST_NAME};
 use ghostrealm_web::WebHost;
 
-/// The bundled host (`mise run web`), if it has been built.
+/// The bundled host (`mise run web`), if it has been built, unless
+/// `GHOSTREALM_NO_WEB` is set: such a build leaves whatever bundle an earlier
+/// one placed.
 pub fn host_exe() -> Option<PathBuf> {
+    if std::env::var("GHOSTREALM_NO_WEB").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
     if let Some(p) = std::env::var_os(HOST_ENV) {
         return Some(PathBuf::from(p));
     }

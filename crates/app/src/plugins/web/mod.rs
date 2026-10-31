@@ -3421,8 +3421,12 @@ pub(crate) mod tests {
     }
 
     /// The bundled host (`mise run web`) beside the test binary's profile
-    /// directory, if built.
+    /// directory, if built, unless `GHOSTREALM_NO_WEB` is set.
     fn real_host() -> Option<std::path::PathBuf> {
+        // Such a build leaves whatever bundle an earlier one placed.
+        if std::env::var("GHOSTREALM_NO_WEB").is_ok_and(|v| !v.is_empty() && v != "0") {
+            return None;
+        }
         let dir = std::env::current_exe().ok()?.parent()?.parent()?.to_path_buf();
         let name = ghostrealm_web::client::HOST_NAME;
         let mac = dir.join(format!("{name}.app/Contents/MacOS/{name}"));
