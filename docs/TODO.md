@@ -1458,3 +1458,22 @@
   `docs/anti-rabbit-hole-roles`, recorded rather than fixed.
 
 ---
+
+[2026-10-31 20:55@b71f7521]
+
+- Requires: NO BLOCKERS
+- Detail: the post-build prune (`crates/app/build/prune.rs`) holds the target
+  dir's locks while it cleans, so a build started right after the one that
+  spawned it waits for the prune to finish.
+- Detail: two builds that start together can both find the stamp due and each
+  spawn a pruner, racing on `rustc -o target/clean-stale-after-build`. Create
+  the stamp with `create_new` (after removing a stale one) so only one wins.
+- Detail: `due()` writes the stamp before `build.rs` creates the log file, so
+  a failed `File::create` of the log skips pruning for an hour.
+- Detail: with `--wait`, a member unit outranked by `--keep` newer copies of
+  its identity (more than three commands sharing one) still goes, and the
+  deps only it reached go with it; that command rebuilds them.
+- Reason: findings from the review of `build/prune-after-build-2`, recorded
+  rather than fixed.
+
+---
