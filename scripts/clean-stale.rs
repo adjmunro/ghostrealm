@@ -26,13 +26,17 @@
 //! a large download, such as CEF). A run whose compile is already gone is
 //! removed once another run of the same package has a compile that stays.
 //!
-//! `--unused-days N` also removes a unit nothing has modified, or read
-//! (access times, where recorded), in N days: its `.fingerprint/`, `build/`
-//! and `deps/` entries. Where access times aren't recorded an in-use unit
-//! older than that goes too; it is rebuilt, never data lost. In the web
-//! host's target dir the build-script runs of package versions `Cargo.lock`
-//! lists, and their compiles, are kept whatever their age: the `cef-dll-sys`
-//! run holds the CEF download (~250 MB), which a lost run downloads again.
+//! `--unused-days N` also removes a unit none of whose files was modified in
+//! N days: its `.fingerprint/`, `build/` and `deps/` entries. Modification
+//! times are the only record: Cargo doesn't touch the files of a unit it
+//! reuses, and access times say nothing (APFS sets one on a read only while
+//! it is older than the file's mtime, and Cargo writes files with the two
+//! equal). So a unit still in use goes too once it is that old; it is
+//! rebuilt, never data lost. Build-script runs, and the compiles they go
+//! with, are kept whatever their age unless their package version is a
+//! registry one `Cargo.lock` no longer lists (or `--keep` superseded them):
+//! a run's `out/` can hold a download or a clone (CEF's ~250 MB, Ghostty's
+//! git checkout) that a lost run fetches again, or fails to offline.
 //!
 //! `incremental/` has no such record, so per crate the newest directories are
 //! kept, as many as the crate has units left (at least 4). It is a cache; a
@@ -178,7 +182,8 @@ struct Opts {
     failures: Cell<usize>,
     /// The target dir this run cleans (canonical): never emptied.
     own: Option<PathBuf>,
-    /// `--unused-days`: also remove units nothing has used for this long.
+    /// `--unused-days`: also remove units none of whose files was modified
+    /// for this long.
     unused: Option<Duration>,
 }
 
@@ -301,17 +306,16 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
         println!("{}: excepted; kept", target.display());
         return 0;
     }
-    let mut bytes = clean_one_target(target, false, lock, opts);
+    let mut bytes = clean_one_target(target, lock, opts);
     let nested = target.join(NESTED);
     if real_dir(&nested) && is_target(&nested) {
-        bytes += clean_one_target(&nested, true, lock, opts);
+        bytes += clean_one_target(&nested, lock, opts);
     }
     bytes
 }
 
-/// Remove the superseded units of `target` alone (the web host's target
-/// dir when `nested`), unless a build holds it.
-fn clean_one_target(target: &Path, nested: bool, lock: &Lock, opts: &Opts) -> u64 {
+/// Remove the superseded units of `target` alone, unless a build holds it.
+fn clean_one_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
     let _held = match BuildLock::take(target, opts.dry_run) {
         Ok(held) => held,
         Err(why) => {
@@ -324,7 +328,7 @@ fn clean_one_target(target: &Path, nested: bool, lock: &Lock, opts: &Opts) -> u6
         let dir = target.join(profile);
         // A symlinked profile isn't locked: a build in its destination isn't seen.
         if real_dir(&dir) {
-            let t = clean_profile(&dir, nested, lock, opts);
+            let t = clean_profile(&dir, lock, opts);
             if t.units == 0 && t.bytes == 0 {
                 continue;
             }
@@ -336,7 +340,7 @@ fn clean_one_target(target: &Path, nested: bool, lock: &Lock, opts: &Opts) -> u6
                     dir.display(),
                     t.removed,
                     t.units,
-                    if opts.unused.is_some() { "superseded or unused" } else { "superseded" },
+                    if opts.unused.is_some() { "superseded or unmodified" } else { "superseded" },
                     opts.freed(),
                     human(t.bytes)
                 );
@@ -1027,9 +1031,9 @@ fn split_hash(name: &str) -> Option<(&str, &str)> {
     })
 }
 
-/// The superseded units of profile dir `dir` (in the web host's target dir
-/// when `nested`), and with `--unused-days` the unused ones.
-fn clean_profile(dir: &Path, nested: bool, lock: &Lock, opts: &Opts) -> Totals {
+/// The superseded units of profile dir `dir`, and with `--unused-days` the
+/// unmodified ones.
+fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
     let mut totals = Totals::default();
     let deps = dir.join("deps");
     // hash -> the entries of deps/ belonging to that unit.
@@ -1095,17 +1099,17 @@ fn clean_profile(dir: &Path, nested: bool, lock: &Lock, opts: &Opts) -> Totals {
     // another run of the package has a compile that stays; otherwise it is
     // left alone.
     let compile_of = |fps: &Vec<String>| fps.iter().find_map(|h| scripts.get(h));
-    // In the web host's target dir, the runs of the packages `Cargo.lock`
-    // lists, and their compiles, outlive `--unused-days`: where access times
-    // aren't recorded the current `cef-dll-sys` run would look unused, and
-    // the next build would download CEF again (or fail offline).
+    // Build-script runs, and their compiles, outlive `--unused-days`: the
+    // current run's `out/` (a CEF download, a Ghostty clone) is as old as
+    // the run, and losing it costs a download or fails offline. Only a
+    // registry version `Cargo.lock` no longer lists ages out; a run whose
+    // compile or source is unknown is kept.
     let mut exempt: HashSet<String> = HashSet::new();
-    if nested {
-        for (unit, fp) in &runs {
-            let Some(compile) = compile_of(fp) else { continue };
-            let source = sources.get(compile).map_or("", String::as_str);
-            if !source.is_empty() && !unlisted_registry_source(source, lock) {
-                exempt.insert(format!("{}-{}", unit.package, unit.hash));
+    for (unit, fp) in &runs {
+        let source = compile_of(fp).and_then(|c| sources.get(c)).map_or("", String::as_str);
+        if source.is_empty() || !unlisted_registry_source(source, lock) {
+            exempt.insert(format!("{}-{}", unit.package, unit.hash));
+            if let Some(compile) = compile_of(fp) {
                 exempt.insert(compile.clone());
             }
         }
@@ -1131,7 +1135,7 @@ fn clean_profile(dir: &Path, nested: bool, lock: &Lock, opts: &Opts) -> Totals {
         let mut used = Vec::new();
         for unit in kept {
             let name = format!("{}-{}", unit.package, unit.hash);
-            if !exempt.contains(&name) && unused_for(dir, &unit, &by_hash, age) {
+            if !exempt.contains(&name) && unmodified_for(dir, &unit, &by_hash, age) {
                 removed.insert(name);
                 totals.bytes += remove_unit(dir, &unit, &by_hash, opts);
             } else {
@@ -1167,13 +1171,10 @@ fn clean_profile(dir: &Path, nested: bool, lock: &Lock, opts: &Opts) -> Totals {
     totals
 }
 
-/// Whether nothing of a unit was modified, or read by a build or run, within
-/// `age`: its `.fingerprint/` and `build/` dirs, the files directly in them,
-/// and its `deps/` files. Access times count only for files this script
-/// never reads (it reads fingerprint JSON, a build script's hash file and
-/// dep-info), or its own runs would keep every unit in use. Metadata that
-/// can't be read counts as recent.
-fn unused_for(dir: &Path, unit: &Unit, by_hash: &HashMap<String, Vec<PathBuf>>, age: Duration) -> bool {
+/// Whether nothing of a unit was modified within `age`: its `.fingerprint/`
+/// and `build/` dirs, the files and dirs directly in them, and its `deps/`
+/// files. Metadata that can't be read counts as recent.
+fn unmodified_for(dir: &Path, unit: &Unit, by_hash: &HashMap<String, Vec<PathBuf>>, age: Duration) -> bool {
     let name = format!("{}-{}", unit.package, unit.hash);
     let mut paths = by_hash.get(&unit.hash).cloned().unwrap_or_default();
     for (d, required) in [(dir.join(".fingerprint").join(&name), true), (dir.join("build").join(&name), false)] {
@@ -1189,14 +1190,7 @@ fn unused_for(dir: &Path, unit: &Unit, by_hash: &HashMap<String, Vec<PathBuf>>, 
             Err(_) => return false,
         }
     }
-    paths.iter().all(|p| {
-        let Ok(m) = fs::symlink_metadata(p) else { return false };
-        let Ok(modified) = m.modified() else { return false };
-        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let read_here = name.ends_with(".json") || name.ends_with(".d") || name == "build-script-build-script-build";
-        let accessed = if m.is_dir() || read_here { None } else { m.accessed().ok() };
-        older_than(modified, age) && accessed.is_none_or(|a| older_than(a, age))
-    })
+    paths.iter().all(|p| fs::symlink_metadata(p).and_then(|m| m.modified()).is_ok_and(|t| older_than(t, age)))
 }
 
 /// Remove a unit's `.fingerprint/` and `build/` directories and `deps/` files.
@@ -1808,21 +1802,20 @@ mod tests {
         assert_eq!(listing(&n), before);
     }
 
-    /// Set the modified and accessed times of `path` and everything below it.
-    fn age_tree(path: &Path, modified: SystemTime, accessed: SystemTime) {
+    /// Set the modified time of `path` and everything below it.
+    fn age_tree(path: &Path, modified: SystemTime) {
         if fs::symlink_metadata(path).unwrap().is_dir() {
             for e in read_dir(path) {
-                age_tree(&e.path(), modified, accessed);
+                age_tree(&e.path(), modified);
             }
         }
-        let times = fs::FileTimes::new().set_modified(modified).set_accessed(accessed);
-        File::open(path).unwrap().set_times(times).unwrap();
+        set_mtime(path, modified);
     }
 
     const DAY: Duration = Duration::from_secs(86400);
 
     /// A lib unit `foo-<hash>` in `profile`, with its hash file and a `deps/`
-    /// file, last modified and read 30 days ago; returns its fingerprint dir.
+    /// file, last modified 30 days ago; returns its fingerprint dir.
     fn old_lib(profile: &Path, hash: &str) -> PathBuf {
         let name = format!("foo-{hash}");
         unit(profile, &name, "lib-foo", r#"{"features":"[]","target":1}"#, None);
@@ -1832,35 +1825,30 @@ mod tests {
         fs::write(profile.join("deps").join(format!("libfoo-{hash}.rlib")), "x").unwrap();
         let old = SystemTime::now() - 30 * DAY;
         for p in [fp.clone(), profile.join("build").join(&name), profile.join("deps").join(format!("libfoo-{hash}.rlib"))] {
-            age_tree(&p, old, old);
+            age_tree(&p, old);
         }
         fp
     }
 
     #[test]
-    fn unused_days_removes_units_nothing_has_modified_or_read() {
+    fn unused_days_removes_units_nothing_has_modified() {
         let t = tmpdir("unused");
         let p = t.join("debug");
-        let o = Opts { unused: Some(14 * DAY), ..opts() };
         let old = old_lib(&p, "00000000000000a1");
         let built = old_lib(&p, "00000000000000a2");
         set_mtime(&built.join("lib-foo.json"), SystemTime::now());
         let read = old_lib(&p, "00000000000000a3");
-        let times = fs::FileTimes::new().set_accessed(SystemTime::now());
-        File::open(p.join("deps/libfoo-00000000000000a3.rlib")).unwrap().set_times(times).unwrap();
-        let by_json = old_lib(&p, "00000000000000a4");
-        // This script reads the JSON itself: its access time doesn't count.
-        let times = fs::FileTimes::new().set_accessed(SystemTime::now());
-        File::open(by_json.join("lib-foo.json")).unwrap().set_times(times).unwrap();
+        // A build that reuses a unit reads it and writes nothing: it still goes.
+        fs::read(p.join("deps/libfoo-00000000000000a3.rlib")).unwrap();
+        fs::read(read.join("lib-foo.json")).unwrap();
         // Keep 4, so only age removes anything.
-        let o = Opts { keep: 4, ..o };
-        let totals = clean_profile(&p, false, &Lock::default(), &o);
-        assert!(!old.exists(), "unused for 30 days");
+        let o = Opts { unused: Some(14 * DAY), keep: 4, ..opts() };
+        let totals = clean_profile(&p, &Lock::default(), &o);
+        assert!(!old.exists(), "unmodified for 30 days");
         assert!(built.is_dir(), "modified recently");
-        assert!(read.is_dir(), "read recently");
-        assert!(!by_json.exists(), "only this script read it");
+        assert!(!read.exists(), "reads don't count");
         assert_eq!(totals.removed, 2);
-        let without = clean_profile(&p, false, &Lock::default(), &Opts { keep: 4, ..opts() });
+        let without = clean_profile(&p, &Lock::default(), &Opts { keep: 4, ..opts() });
         assert_eq!(without.removed, 0, "nothing ages out without --unused-days");
     }
 
@@ -1873,7 +1861,7 @@ mod tests {
         // Its deps/ files are listed, but their metadata can't be read.
         fs::set_permissions(p.join("deps"), fs::Permissions::from_mode(0o444)).unwrap();
         let o = Opts { unused: Some(14 * DAY), ..opts() };
-        let totals = clean_profile(&p, false, &Lock::default(), &o);
+        let totals = clean_profile(&p, &Lock::default(), &o);
         fs::set_permissions(p.join("deps"), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(fp.is_dir() && p.join("deps/libfoo-00000000000000b1.rlib").exists());
         assert_eq!((totals.removed, failures(&o)), (0, 0));
@@ -1883,39 +1871,60 @@ mod tests {
         o.failures.get()
     }
 
-    /// A `cef-dll-sys` build-script compile of a version `Cargo.lock` lists
-    /// and its run, both last used 30 days ago, in profile dir `p`.
-    fn old_script_and_run(p: &Path) -> (PathBuf, PathBuf) {
-        let compile = "cef-dll-sys-00000000000000c1";
-        let run = "cef-dll-sys-00000000000000c2";
-        unit(p, compile, "build-script-build-script-build", r#"{"features":"[]","target":2,"deps":[]}"#, Some(33));
-        let src = "/h/.cargo/registry/src/index.crates.io-0/cef-dll-sys-1.0.0/build.rs";
-        fs::write(p.join("build").join(compile).join("build_script_build-00000000000000c1.d"), format!("x: {src}\n"))
-            .unwrap();
-        let json = r#"{"features":"","target":0,"deps":[[0,"build_script_build",false,33]],"local":[]}"#;
-        unit(p, run, "run-build-script-build-script-build", json, None);
-        fs::create_dir_all(p.join("build").join(run).join("out/cef")).unwrap();
+    /// A build-script compile of package `pkg` built from `src` and its run,
+    /// both last modified 30 days ago, in profile dir `p`, the compile's
+    /// fingerprint hash `n` (distinct per package): the compile's fingerprint
+    /// dir and the run's `out/` contents.
+    fn old_script_and_run(p: &Path, pkg: &str, src: &str, n: u64) -> (PathBuf, PathBuf) {
+        let compile = format!("{pkg}-{:016x}", 2 * n);
+        let run = format!("{pkg}-{:016x}", 2 * n + 1);
+        unit(p, &compile, "build-script-build-script-build", r#"{"features":"[]","target":2,"deps":[]}"#, Some(n));
+        let dep_info = p.join("build").join(&compile).join(format!("build_script_build-{:016x}.d", 2 * n));
+        fs::write(dep_info, format!("x: {src}\n")).unwrap();
+        let json = format!(r#"{{"features":"","target":0,"deps":[[0,"build_script_build",false,{n}]],"local":[]}}"#);
+        unit(p, &run, "run-build-script-build-script-build", &json, None);
+        fs::create_dir_all(p.join("build").join(&run).join("out/download")).unwrap();
         let old = SystemTime::now() - 30 * DAY;
         for d in [".fingerprint", "build"] {
-            for n in [compile, run] {
-                age_tree(&p.join(d).join(n), old, old);
+            for n in [&compile, &run] {
+                age_tree(&p.join(d).join(n), old);
             }
         }
-        (p.join(".fingerprint").join(compile), p.join("build").join(run).join("out/cef"))
+        (p.join(".fingerprint").join(&compile), p.join("build").join(&run).join("out/download"))
     }
 
+    const REGISTRY: &str = "/h/.cargo/registry/src/index.crates.io-0";
+
     #[test]
-    fn unused_days_keeps_the_web_host_targets_current_build_script_runs() {
+    fn unused_days_keeps_build_script_runs_unless_their_version_is_unlisted() {
         let t = tmpdir("unused-runs");
         target(&t);
         target(&t.join(NESTED));
-        let (outer_compile, outer_out) = old_script_and_run(&t.join("debug"));
-        let (nested_compile, nested_out) = old_script_and_run(&t.join("web-host/debug"));
         let mut lock = Lock::default();
         lock.dirs.insert("cef-dll-sys-1.0.0".into());
-        clean_target(&t, &lock, &Opts { unused: Some(14 * DAY), ..opts() });
-        assert!(nested_compile.is_dir() && nested_out.is_dir(), "kept in the web host's target");
-        assert!(!outer_compile.exists() && !outer_out.exists(), "aged out in the outer target");
+        lock.dirs.insert("libc-0.2.0".into());
+        let o = Opts { unused: Some(14 * DAY), ..opts() };
+        let listed = |p: &Path| {
+            [
+                old_script_and_run(p, "cef-dll-sys", &format!("{REGISTRY}/cef-dll-sys-1.0.0/build.rs"), 0xc1),
+                old_script_and_run(p, "libc", &format!("{REGISTRY}/libc-0.2.0/build.rs"), 0xc2),
+                old_script_and_run(p, "vt-sys", "/h/.cargo/git/checkouts/vt-0/5988a0b/sys/build.rs", 0xc3),
+                old_script_and_run(p, "app", "/w/crates/app/build.rs", 0xc4),
+            ]
+        };
+        let outer = listed(&t.join("debug"));
+        let nested = listed(&t.join("web-host/debug"));
+        let unlisted = old_script_and_run(&t.join("debug"), "zlib", &format!("{REGISTRY}/zlib-0.1.0/build.rs"), 0xc5);
+        clean_target(&t, &lock, &o);
+        for (compile, out) in outer.iter().chain(&nested) {
+            assert!(compile.is_dir() && out.is_dir(), "{} kept", compile.display());
+        }
+        assert!(!unlisted.0.exists() && !unlisted.1.exists(), "an unlisted version goes");
+        // `--target-dir target/web-host` cleans it as a target of its own.
+        clean_target(&t.join(NESTED), &lock, &o);
+        for (compile, out) in &nested {
+            assert!(compile.is_dir() && out.is_dir(), "{} kept", compile.display());
+        }
     }
 
     #[test]
@@ -1938,7 +1947,7 @@ mod tests {
         );
         let mut lock = Lock::default();
         lock.dirs.insert("pkg-1.0.0".into());
-        let t = clean_profile(&dir, false, &lock, &opts());
+        let t = clean_profile(&dir, &lock, &opts());
         assert_eq!(t.removed, 0);
         assert!(dir.join("build/pkg-00000000000000b2").is_dir(), "the run's output stays");
     }

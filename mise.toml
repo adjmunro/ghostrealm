@@ -8,7 +8,8 @@ ninja = "1.13.2"
 # target/ and in target/web-host (the web host's own target dir).
 # `mise run clean-stale -- --dry-run` lists what would go; see
 # scripts/clean-stale.rs for what is kept. A target dir a build holds is skipped.
-# `-- --unused-days N` also removes units nothing has used for N days.
+# `-- --unused-days N` also removes units none of whose files was modified in N
+# days (in use or not; build-script runs are kept).
 [tasks.clean-stale]
 run = "mkdir -p target && rustc -O --edition 2021 scripts/clean-stale.rs -o target/clean-stale && target/clean-stale"
 
