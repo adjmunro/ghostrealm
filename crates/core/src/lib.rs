@@ -16,6 +16,7 @@ pub mod outline;
 pub mod registry;
 pub mod search;
 pub mod sidebar;
+pub mod state;
 pub mod tab_drop;
 #[cfg(test)]
 mod test_dir;
