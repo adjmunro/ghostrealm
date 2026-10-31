@@ -635,7 +635,9 @@ impl FileBrowserView {
             return;
         }
         let idx = self.completion.unwrap_or(0).min(comps.len() - 1);
-        self.tree.set_query(comps[idx].clone());
+        let comp = comps[idx].clone();
+        self.input.replace_text(comp.clone());
+        self.tree.set_query(comp);
     }
 
     /// Tree-row spans: a grouped view's dim disambiguating prefix, then the
@@ -1142,7 +1144,7 @@ impl View for FileBrowserView {
                     self.chosen = Some(row.path.clone());
                     self.last_click = Some(row.path.clone());
                     if self.mode == Mode::Save {
-                        self.name.set_text(file_name(&row.path));
+                        self.name.replace_text(file_name(&row.path));
                     }
                     if self.mode == Mode::Sidebar || again {
                         self.open_file(cx, row.path);
@@ -1702,6 +1704,49 @@ mod tests {
         h.mouse(&mut v, MouseEvent::Move { pos: (r.x + 5.0, r.y + r.h * 0.5) });
         h.key(&mut v, press(Key::Right));
         assert!(v.tree().query().ends_with("/deep/"), "the first, got {}", v.tree().query());
+    }
+
+    /// The platform's undo chord.
+    fn undo_key() -> KeyPress {
+        let mods = if cfg!(target_os = "macos") {
+            ghostrealm_terminal::Mods { super_: true, ..Default::default() }
+        } else {
+            ghostrealm_terminal::Mods { ctrl: true, ..Default::default() }
+        };
+        KeyPress { key: Key::Char('z'), mods, text: None }
+    }
+
+    #[test]
+    fn an_accepted_completion_is_an_undo_step() {
+        let (d, _) = fixture();
+        std::fs::create_dir(d.join("adir").join("deep")).unwrap();
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::PickDir);
+        let mut h = Harness::new();
+        type_in(&mut h, &mut v, "adir/de");
+        h.key(&mut v, press(Key::Right));
+        let done = v.tree().query().to_string();
+        assert!(done.ends_with("/deep/"), "{done}");
+        h.key(&mut v, press(Key::Char('x')));
+        h.key(&mut v, undo_key());
+        assert_eq!(v.input.text(), done);
+        h.key(&mut v, undo_key());
+        assert_eq!(v.input.text(), "adir/de", "back before the completion");
+        assert_eq!(v.tree().query(), "adir/de");
+    }
+
+    #[test]
+    fn a_save_row_click_that_replaces_the_name_undoes() {
+        let (d, _) = fixture();
+        let mut v = FileBrowserView::picker(d.to_path_buf(), Mode::Save);
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        for c in "new.md".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        h.mouse(&mut v, MouseEvent::Down { pos: row_centre(1), clicks: 1, button: MouseButton::Left });
+        assert_eq!(v.name.text(), "b.txt");
+        h.key(&mut v, undo_key());
+        assert_eq!(v.name.text(), "new.md");
     }
 
     /// The list rows a frame draws a pill behind in `color` at `alpha`.

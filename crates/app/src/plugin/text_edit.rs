@@ -465,6 +465,18 @@ struct LineHistory {
     run: Option<(Run, usize)>,
 }
 
+impl LineHistory {
+    /// Record `before` as a new undo step: redo goes, and the oldest step past
+    /// [`LINE_UNDO_MAX`].
+    fn push(&mut self, before: LineSnapshot) {
+        self.undo.push(before);
+        if self.undo.len() > LINE_UNDO_MAX {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+}
+
 /// One line of editable text with a cursor and an optional selection. Columns
 /// count Unicode scalar values.
 ///
@@ -474,6 +486,7 @@ struct LineHistory {
 /// cursor move, click, or selection ends a run; and a paste, cut, word or line
 /// delete, or bracket wrap is a step of its own. [`set_text`](Self::set_text)
 /// clears the history: the owner replaced the text.
+/// [`replace_text`](Self::replace_text) is a step: the user replaced it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineEdit {
     text: String,
@@ -523,6 +536,21 @@ impl LineEdit {
         self.cursor = self.len();
         self.anchor = None;
         self.history = LineHistory::default();
+    }
+
+    /// Replace the text as a user edit (a completion, a picked name): one undo
+    /// step, cursor at the end, no selection. Same text: nothing happens.
+    pub fn replace_text(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if text == self.text {
+            return;
+        }
+        let before = self.snapshot();
+        self.history.push(before);
+        self.history.run = None;
+        self.text = text;
+        self.cursor = self.len();
+        self.anchor = None;
     }
 
     fn snapshot(&self) -> LineSnapshot {
@@ -703,13 +731,11 @@ impl LineEdit {
             Applied::Changed => {
                 let joins = !fresh
                     && run.is_some_and(|r| h.run.is_some_and(|(open, at)| at == before.cursor && open.takes(r)));
-                if !joins {
-                    h.undo.push(before);
-                    if h.undo.len() > LINE_UNDO_MAX {
-                        h.undo.remove(0);
-                    }
+                if joins {
+                    h.redo.clear();
+                } else {
+                    h.push(before);
                 }
-                h.redo.clear();
                 h.run = run.map(|r| (r, self.cursor));
             }
             Applied::Moved => h.run = None,
@@ -1122,6 +1148,22 @@ mod tests {
         assert_eq!(undo(&mut e), Applied::Moved);
         assert_eq!(redo(&mut e), Applied::Moved);
         assert_eq!(e.text(), "reset");
+    }
+
+    #[test]
+    fn replace_text_is_an_undo_step() {
+        let mut e = LineEdit::new("");
+        typed(&mut e, "~/Dev");
+        e.replace_text("~/Developer/");
+        typed(&mut e, "gh");
+        undo(&mut e);
+        assert_eq!(e.text(), "~/Developer/");
+        undo(&mut e);
+        assert_eq!(e.text(), "~/Dev");
+        redo(&mut e);
+        e.replace_text("~/Developer/");
+        assert_eq!(redo(&mut e), Applied::Changed, "the same text adds no step");
+        assert_eq!(e.text(), "~/Developer/gh");
     }
 
     #[test]
