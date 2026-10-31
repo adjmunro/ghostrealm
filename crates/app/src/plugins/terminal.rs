@@ -557,8 +557,9 @@ impl View for TerminalView {
                 return true;
             }
         }
-        // Option+Up/Down send a plain arrow, not a corrupting modified CSI.
-        if m.alt && matches!(k.key, Key::Up | Key::Down) {
+        // Option+Up/Down send a plain arrow, not a corrupting modified CSI,
+        // except to a full-screen program.
+        if m.alt && !self.grid.alt_screen && matches!(k.key, Key::Up | Key::Down) {
             self.before_input();
             self.term.send_key(&KeyPress {
                 key: k.key,
@@ -1421,20 +1422,14 @@ mod tests {
         assert_eq!(drawn_on(&h, 9), [banner()]);
     }
 
-    /// The bytes a word-left chord reaches the program as, in hex, after
+    /// The bytes `key` with `mods` reaches the program as, in hex, after
     /// `setup` runs: the program reads raw input and prints it with `od`.
-    fn word_left_bytes(setup: &str) -> String {
+    fn sent_bytes(setup: &str, key: Key, mods: Mods) -> String {
         let script = format!("{setup}stty raw -echo min 0 time 20; printf ready; head -c 64 | od -An -tx1; sleep 3");
         let mut v = running(&script, "ready");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
-        let mut mods = Mods::default();
-        if cfg!(target_os = "macos") {
-            mods.alt = true;
-        } else {
-            mods.ctrl = true;
-        }
-        let (used, _) = h.key(&mut v, KeyPress { key: Key::Left, mods, text: None });
+        let (used, _) = h.key(&mut v, KeyPress { key, mods, text: None });
         assert!(used);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1450,11 +1445,19 @@ mod tests {
     }
 
     #[test]
-    fn word_left_is_readline_on_the_primary_screen_and_plain_on_the_alternate() {
-        assert_eq!(word_left_bytes(""), "1b 62", "ESC b");
-        let mods = if cfg!(target_os = "macos") { "33" } else { "35" };
-        let plain = format!("1b 5b 31 3b {mods} 44");
-        assert_eq!(word_left_bytes("printf '\\033[?1049h'; "), plain, "CSI 1;3D / CSI 1;5D");
+    fn keys_are_translated_on_the_primary_screen_only() {
+        const ALT: &str = "printf '\\033[?1049h'; ";
+        let (word, code) = if cfg!(target_os = "macos") {
+            (Mods { alt: true, ..Mods::default() }, "33")
+        } else {
+            (Mods { ctrl: true, ..Mods::default() }, "35")
+        };
+        assert_eq!(sent_bytes("", Key::Left, word), "1b 62", "ESC b");
+        let plain = format!("1b 5b 31 3b {code} 44");
+        assert_eq!(sent_bytes(ALT, Key::Left, word), plain, "CSI 1;3D / CSI 1;5D");
+        let option = Mods { alt: true, ..Mods::default() };
+        assert_eq!(sent_bytes("", Key::Up, option), "1b 5b 41", "a plain CSI A");
+        assert_eq!(sent_bytes(ALT, Key::Up, option), "1b 5b 31 3b 33 41", "CSI 1;3A");
     }
 
     #[test]
