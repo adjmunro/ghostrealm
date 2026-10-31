@@ -1409,3 +1409,26 @@
   so the build script skips every OS but macOS.
 
 ---
+
+[2026-10-31T20:13+1300@55aae18a] Web host build: findings left from the review of 197a7bd..d2cb66f
+
+- Requires: NO BLOCKERS
+- Detail: Remove `docs/plans/web-host-in-normal-build.md` once whatever it
+  holds that DECISION.md and SPEC.md lack is moved to the web-host or build
+  skill (precedent 5bb2c09): the costs by command (rust-analyzer's pass, clippy's
+  run unit), the verification list, `cargo install` placing no bundle, a CEF
+  copy per profile. Its `--unused-days` section describes the atime rule that
+  a31d006 replaced with mtime alone.
+- Detail: The Linux entry above says "now that `mise run web` is gone":
+  historical phrasing. Say what bundles it on Linux (nothing) instead.
+- Detail: `clean-all`'s idleness (`last_active` in `scripts/clean-stale.rs`)
+  counts executables' access times, which APFS sets on a read only while
+  older than the mtime, and Cargo writes files with the two equal. A worktree
+  whose tests ran from unchanged binaries can look idle and be emptied.
+- Detail: `held_by_this_build` (`crates/app/build/web_host.rs`) trusts any
+  holder of `<artifact>/.cargo-lock`: with `CARGO_BUILD_BUILD_DIR` and a
+  command-line `--target-dir`, another build running in the metadata target
+  dir at the same time makes this one place there.
+- Reason: the owner closed the fix round; these were left to record.
+
+---
