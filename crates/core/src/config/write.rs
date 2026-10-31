@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -46,29 +47,42 @@ pub fn set(path: &Path, section: &str, key: &str, value: &toml::Value) -> Result
     replace(&real, doc.to_string().as_bytes(), Some(meta.permissions()))
 }
 
-/// Write `bytes` to a temp file beside `path` and rename it over `path`,
+/// Whether the config file at `path` sets `[section] key`. `false` when it
+/// can't be read or isn't valid TOML.
+pub fn holds(path: &Path, section: &str, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    let Ok(table) = text.parse::<toml::Table>() else { return false };
+    table.get(section).and_then(toml::Value::as_table).is_some_and(|t| t.contains_key(key))
+}
+
+/// Write `bytes` to a new temp file beside `path` and rename it over `path`,
 /// giving it `permissions` when set.
 pub(crate) fn replace(path: &Path, bytes: &[u8], permissions: Option<std::fs::Permissions>) -> Result<(), String> {
     let tmp = temp_beside(path);
+    let failed = |e: std::io::Error| format!("can't write {}: {e}", path.display());
+    // A new file only: never one left behind, nor another process's.
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(failed)?;
     let written = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        if let Some(p) = permissions {
+            f.set_permissions(p)?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
-        if let Some(p) = permissions {
-            std::fs::set_permissions(&tmp, p)?;
-        }
         std::fs::rename(&tmp, path)
     })();
     written.map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("can't write {}: {e}", path.display())
+        failed(e)
     })
 }
 
-/// `.<name>.ghostrealm-tmp` in `path`'s directory.
+/// `.<name>.<pid>.<n>.ghostrealm-tmp` in `path`'s directory, unique to this
+/// call.
 fn temp_beside(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.ghostrealm-tmp"))
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.{}.{n}.ghostrealm-tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -106,7 +120,66 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "# mine\n[terminal]\nfont_size = 13\nline_height = 20.0\n\n[file_browser]\npreview_autoplay = false\n"
         );
-        assert!(!dir.join(".config.toml.ghostrealm-tmp").exists(), "no temp file left");
+        assert_eq!(entries(&dir), ["config.toml"], "no temp file left");
+    }
+
+    /// The names in `dir`.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_temp_write_keeps_the_file_and_leaves_no_temp() {
+        let dir = TmpDir::new("config-write");
+        let path = file(&dir, TEXT);
+        chmod(&dir, 0o555);
+        let before = std::fs::read(&path).unwrap();
+        let err = set(&path, "file_browser", "preview_autoplay", &off());
+        chmod(&dir, 0o755);
+        assert!(err.unwrap_err().contains("can't write"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "kept");
+        assert_eq!(entries(&dir), ["config.toml"], "no temp file left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_keeps_the_files_mode_directly_and_through_a_symlink() {
+        let dir = TmpDir::new("config-write");
+        let path = file(&dir, TEXT);
+        chmod(&path, 0o600);
+        set(&path, "file_browser", "preview_autoplay", &off()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        set(&link, "file_browser", "preview_autoplay", &toml::Value::Boolean(true)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn holds_says_whether_a_file_sets_a_key() {
+        let dir = TmpDir::new("config-write");
+        let path = file(&dir, TEXT);
+        assert!(holds(&path, "file_browser", "preview_autoplay"));
+        assert!(!holds(&path, "file_browser", "nope"));
+        assert!(!holds(&path, "tabs", "autohide_single_tab"));
+        assert!(!holds(&dir.join("absent.toml"), "file_browser", "preview_autoplay"));
     }
 
     /// `set` fails on `path` and leaves the file's bytes as they were.
