@@ -295,7 +295,14 @@
   undoing to the saved text clears `modified`. REMAINING: (1) a reversible op
   log instead of snapshots (each step copies the whole buffer — costly for big
   files); (2) finer runs (break at word boundaries / after a pause); (3) history
-  survives Save As / reload. Single-line fields (`LineEdit`) have linear undo. User
+  survives Save As / reload. Single-line fields (`LineEdit`) have linear undo.
+  `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
+  when the control-char filter leaves nothing and there is no selection (e.g.
+  pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no
+  tests for the selection and cursor restored after undoing typing over a
+  selection, the cursor restored after a merged Backspace run, or Backspace
+  then Delete merging; (c) nit: the `text_edit.rs` module doc has a broken short
+  line (lines 21-22) and doesn't mention PC redo on Ctrl+Y. User
   has further ideas on scope/behaviour — discuss before extending.
 - Reason: basic editing expectation.
 
