@@ -15,6 +15,7 @@ pub mod line_diff;
 pub mod outline;
 pub mod registry;
 pub mod search;
+pub mod sidebar;
 #[cfg(test)]
 mod test_dir;
 pub mod tree;

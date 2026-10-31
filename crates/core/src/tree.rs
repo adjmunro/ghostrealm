@@ -384,6 +384,11 @@ pub struct Vtab {
     /// The directory new terminals/editors in this workspace start in. `None`
     /// falls back to the app's default directory (then the shell's default).
     pub root_dir: Option<std::path::PathBuf>,
+    /// Shown in the sidebar's top list rather than the one below it.
+    pub pinned: bool,
+    /// When it last asked for attention (became unread or needs-input), or
+    /// was created, on the tree's own clock: the sidebar puts larger first.
+    pub attention: u64,
 }
 
 impl Vtab {
@@ -420,6 +425,8 @@ pub struct Tree {
     vtabs: Vec<Vtab>,
     active: Option<VtabId>,
     next_id: u64,
+    /// The last [`Vtab::attention`] handed out.
+    clock: u64,
 }
 
 impl Default for Tree {
@@ -428,6 +435,7 @@ impl Default for Tree {
             vtabs: Vec::new(),
             active: None,
             next_id: 1,
+            clock: 0,
         }
     }
 }
@@ -441,6 +449,11 @@ impl Tree {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
     }
 
     /// An id for a surface kept outside every pane (a hidden pop-up), unique
@@ -465,6 +478,7 @@ impl Tree {
             }],
             active: 0,
         };
+        let attention = self.tick();
         self.vtabs.push(Vtab {
             id: vtab_id,
             name: name.into(),
@@ -473,6 +487,8 @@ impl Tree {
             root: Node::Leaf(pane),
             focused_pane: pane_id,
             root_dir: None,
+            pinned: false,
+            attention,
         });
         self.active = Some(vtab_id);
         (vtab_id, pane_id, surface_id)
@@ -488,6 +504,7 @@ impl Tree {
             surfaces: Vec::new(),
             active: 0,
         };
+        let attention = self.tick();
         self.vtabs.push(Vtab {
             id: vtab_id,
             name: name.into(),
@@ -496,6 +513,8 @@ impl Tree {
             root: Node::Leaf(pane),
             focused_pane: pane_id,
             root_dir: None,
+            pinned: false,
+            attention,
         });
         self.active = Some(vtab_id);
         (vtab_id, pane_id)
@@ -728,9 +747,19 @@ impl Tree {
         }
     }
 
+    /// Set a vtab's status. Becoming unread or needs-input from any other
+    /// status is a request for attention and stamps [`Vtab::attention`].
     pub fn set_status(&mut self, vtab: VtabId, status: TabStatus) {
+        let Some(old) = self.vtab(vtab).map(|v| v.status) else {
+            return;
+        };
+        let asks = matches!(status, TabStatus::Unread { .. } | TabStatus::NeedsInput) && status != old;
+        let stamp = asks.then(|| self.tick());
         if let Some(v) = self.vtab_mut(vtab) {
             v.status = status;
+            if let Some(t) = stamp {
+                v.attention = t;
+            }
         }
     }
 
