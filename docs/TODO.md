@@ -1418,3 +1418,29 @@
   it would go unnoticed.
 
 ---
+
+[2026-10-31T14:25+1300@b28f80e9] Web — pop-ups made again: review leftovers
+
+- Requires: NO BLOCKERS
+- Detail: DECISION.md (Web surface / pop-ups, 2026-10-31) gives "a new
+  bundle" as a cause of a host restart, but nothing restarts a running host
+  when the bundle changes: `bundle_stamp` only lifts a protocol-mismatch
+  refusal. Drop it; a host that reports `failed` and is dropped
+  (`HostSlot::notice_exit`) is a second cause.
+- Detail: Orphan tabs are made with scale 1.0 (`OrphanTabs::take`,
+  `for_popup(.., 1.0)`), but their `popup_size` is physical pixels at the
+  opener's scale: an unpainted orphan tab, and pop-ups it opens, come back
+  at the wrong CSS size after a restart. Carry the scale in `PopupInfo` and
+  `WebView::release`, or use the slot's last known scale.
+- Detail: The `DROPPED` cleanup in `popup_aborted` (crates/web-host
+  browser.rs) has no test, nor has a pop-up `close_popups` drops before
+  CEF makes it: in tests CEF always made the pop-up before its opener's
+  `on_before_close`. Testing either needs a host test hook.
+- Detail: A hidden pop-up can be named in two lost toasts
+  (`AppState::tell_lost`): H made again with lost opener R, F floating over
+  H also lost, F opened hidden P; P is found through H's surface and through
+  F's page. Skip pop-ups already in `went_with` when building later roots'
+  `with`.
+- Reason: non-blocking findings of the review of c11a355..b28f80e.
+
+---
