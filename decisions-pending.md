@@ -10,7 +10,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 9. **Config write-back and a machine-local state file**: may the app edit `config.toml`, and where does per-machine state go?
 10. **Settings regenerate / cleanup / reset**: which of these commands, and how do they behave?
 11. **Video playback**: which decoder stack, if any?
-12. **Sidebar ordering**: how do inbox sections, manual order, pins, and directory groups combine?
 13. **Dragging a tab to split**: leaf-only drops, or workspace-edge drops as well?
 14. **Undo scope**: what should undo cover beyond what it does today?
 15. **Markdown syntax for colour and embed size**: which dialect do we extend?
@@ -330,34 +329,6 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 > - Load ffmpeg dynamically at runtime, not linked at build time. If it's missing, video is disabled and the UI shows a clear "install ffmpeg to play video" message. Images and audio keep working.
 > - Licence note (see item 7): distro builds (e.g. Homebrew) are often GPL. Because we neither distribute nor statically link it, this should be acceptable, but it's a grey area. Keep it runtime-loaded and record the reasoning.
 > - Standing rule: flag any future dependency that is a notably large binary for my review.
-
----
-
-## 12. Sidebar ordering: inbox sections, manual order, pins, directory groups
-
-**Source:** docs/TODO.md entries "Sidebar/workspaces — inbox sections + drag-reorder" (line ~250) and "Sidebar context menu" (line ~101, Pin); docs/IDEAS.md "vtab groups … air traffic control" (line ~7); docs/GOAL.md "behaves like an email inbox"
-
-**What's being decided:** how the workspace list orders itself. All four wanted features (inbox sections, drag-reorder, pins, directory auto-groups) move rows, and they conflict.
-
-**Background:**
-- Workspaces live in an ordered `Vec`, and each has a status: read, unread, busy, or a sticky needs_input. Pin has no definition yet.
-- Sorting unread rows to the top moves rows under the pointer and fights manual drag order.
-- From IDEAS.md: a new workspace "should autogroup if it's in the same directory".
-
-**Options:**
-- **A. Manual order only.** Status shows as dots; nothing re-sorts.
-- **B. Status sections.** Pinned (never re-sorted), then Needs input, then Unread, then the rest in manual order. A workspace returns to its manual slot once read.
-- **C. B, plus directory groups.** Workspaces with the same root fold under a collapsible header in the "rest" section, and the header shows the most urgent status inside it.
-
-**Recommendation:** B now, C when groups come up. In both, hold re-sorting while the pointer is over the sidebar so rows don't jump under a click.
-
-**Your answer:**
-> **Two lists, both sorted inbox-style; no manual order.**
-> - **Pinned** (top) and **everything else** (below). Pinning only decides which list a workspace is in.
-> - Both lists sort by most recent attention request (needs input, ready to view, etc.), newest first. Viewing a workspace does not move it back; there is no "original slot".
-> - **Directory groups:** in both lists, workspaces sharing a root folder auto-group under a collapsible directory header. If any member requests attention, the whole group moves to the top.
-> - **Drag-to-reorder is dropped entirely.**
-> - **Hover freeze:** while the pointer is over the sidebar, keep rendering the previous order (status dots still update live). When the pointer leaves, re-sort once with a short animation. The order is derived from timestamps, so nothing needs queueing.
 
 ---
 
@@ -746,7 +717,6 @@ These are already done or no longer apply (checked against `develop` at `311033e
 - **"Taller workspace tabs showing the pinned directory" (line ~275).** Done: a named workspace draws its name over its greyed directory on two lines (`window.rs`, the sidebar list).
 - **"Naming — rename vertical tabs → workspaces" (line ~160).** The UI rename is done (New/Close/Rename Workspace; GLOSSARY.md uses Workspace). Only the internal `Vtab` → workspace rename is left.
 - **Mouse entry (line ~60).** "the plugin API delivers only the left button" no longer holds: right and middle clicks are reported (`report_button`, `plugins/terminal.rs` line ~667). Still open: the horizontal wheel and mode 1007.
-- **"Sidebar context menu + new-tab button; mark-unread" (line ~101).** Rename is done (Rename… in the workspace menu). Only Pin is left; see item 12.
 - **"Splits — discoverability" (line ~227), item (1).** Default split chords exist in the new-config text (`cmd+d`, `cmd+shift+d` in `default_bindings`, `core/src/config.rs`). Item (2), the pane buttons, is open.
 - **"Plugin architecture — follow-ups" (line ~501), item (5).** The web-browser plugin is done (`plugins/web`, `PaintCx::image`).
 - **"Markdown rich text — follow-ups" (line ~441).**

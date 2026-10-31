@@ -18,7 +18,7 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input routing
   src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
   src/plugins/       first-party plugins: terminal, files (+ editor, file_browser), web
-crates/core        app spine: command registry, tab/split tree, inbox, config, fs tree, syntax highlighters
+crates/core        app spine: command registry, tab/split tree, inbox, sidebar order, config, fs tree, syntax highlighters
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/process     long-lived child processes that inherit only their stdio
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
@@ -114,7 +114,8 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
 - [~] Phase 5: inbox status — background output → unread, sticky needs_input
       (agent/palette settable), busy from the foreground process-group (+ optimistic
-      on Enter), auto-read dwell + unfocus grace. To do: OSC 133 exit code for
+      on Enter), auto-read dwell + unfocus grace; the sidebar orders by the latest
+      request for attention (`core::sidebar`). To do: OSC 133 exit code for
       unread success/failure.
 - [x] Phase 6: settings TOML (load/create, wired: font, sidebar width, chrome
       colours, autohide, config-driven keybindings, sidebar `side`, chrome

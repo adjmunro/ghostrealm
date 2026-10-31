@@ -93,15 +93,6 @@
 
 ---
 
-[2026-09-15@1641f11] Sidebar context menu: Pin
-
-- Requires: NO BLOCKERS
-- Detail: The workspace menu has no Pin (the tree has no pin/ordering concept
-  yet; how pins combine with inbox sections and manual order is undecided).
-- Reason: brief's per-vtab context actions; discoverability.
-
----
-
 > The entries below are from a live testing session (2026-09-15, @2e8e8c7). They
 > capture observed bugs/regressions and requests; diagnoses are hypotheses written
 > while the author still had the code context.
@@ -222,18 +213,6 @@
   out to a pane edge (side/top/bottom) to break it into a split — the drag-to-split
   idea in IDEAS.md.
 - Reason: expected tab UX; requested drag-to-split.
-
----
-
-[2026-09-15@2e8e8c7] Sidebar/workspaces — inbox sections + drag-reorder (scroll/wheel/+ done)
-
-- Requires: NO BLOCKERS
-- Detail: DONE (2d7c341): scrollable workspace list, wheel-over-sidebar scrolls it,
-  and the "+" button pinned at the very top. REMAINING: (3) inbox sections — group
-  unread / needs-input at the top, then the rest by order; (5) drag workspace rows
-  to reorder (the tree stores workspaces in an ordered Vec — reordering needs a move
-  op + drag handling in the sidebar).
-- Reason: the email-inbox model + reordering.
 
 ---
 

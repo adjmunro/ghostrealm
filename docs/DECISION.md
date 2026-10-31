@@ -339,3 +339,14 @@
 - Detail: On the primary screen the terminal sends the text keymap's word and line motions and deletes as the readline keys shells bind (`ESC b` / `ESC f`, `^A` / `^E`, `ESC DEL`, `ESC d`, `^U`, `^K`), and Option+Up/Down as plain arrows. Shift chords select (Shift+Arrow), drive the scrollback (Shift+Page Up/Down, Home, End) or send a bare LF (Shift+Enter).
 - Detail: While the program is on the alternate screen (as last painted), no key is translated: each sends libghostty's normal encoding (Option+Left is `CSI 1;3D`); Cmd motions and deletes send nothing, like other Cmd chords besides copy and paste.
 - Reason: full-screen programs (Vim, less, htop) bind their own keys and must get them as a plain terminal sends them; readline bytes there mean something else (`^A` increments a number in Vim). Owner's call (decisions-pending item 8, option B).
+
+---
+
+[2026-10-31T22:02+1300@db47dfab]
+
+- Category: UX / sidebar
+- Detail: The sidebar has two lists, Pinned on top and every other workspace below; Pin / Unpin in the workspace menu moves a workspace between them. Pins last for the session, like the workspaces.
+- Detail: Each list sorts by the latest request for attention, newest first: a workspace's stamp (`Vtab::attention`) is set when it is created and whenever its status becomes unread or needs-input from another status. Becoming read or busy, or being viewed, does not move it; there is no manual order and no drag-to-reorder.
+- Detail: Within a list, two or more workspaces with the same root directory sit under a header naming it, placed by their newest member; a lone root is no group. A click on the header (fired on release) folds or unfolds it for the session; folded, it shows its members' most urgent status dot. Under a header a workspace shows its name alone.
+- Detail: While the pointer is over the sidebar the order holds (sorted by the stamps it last drew with); dots, new workspaces, pins and folds still show. When the pointer leaves, it re-sorts. A row whose place changes glides there over 160 ms.
+- Reason: the sidebar behaves like an email inbox: what wants attention rises on its own, without rows moving under the pointer. Owner's call (decisions-pending item 12): "Two lists, both sorted inbox-style; no manual order."
