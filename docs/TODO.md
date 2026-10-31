@@ -141,8 +141,8 @@
 
 [2026-09-15@2e8e8c7] Palette — a "hide" button per command (config-persisted)
 
-- Requires: NO BLOCKERS. The hide list goes in `config.toml`, written with
-  `config::write::set`; builds on CommandMeta::hidden
+- Requires: config write-back (persist the hide list); builds on CommandMeta::hidden
+- Detail: The hide list goes in `config.toml`, written with `config::write::set`.
 - Detail: (user idea, IDEAS.md) A clickable hide control on a palette row appends the
   command id to a hide list in the config; hidden ids are filtered out thereafter
   (undoable by editing config). Ship a default "hide from human" list for commands
@@ -155,7 +155,7 @@
 
 [2026-09-15@2e8e8c7] Command palette — MRU order + pinning (rest done)
 
-- Requires: NO BLOCKERS
+- Requires: persistent per-user state (MRU history, pins)
 - Detail: DONE (63124fc): scrollable results (10-row window over up to 100 ranked
   matches), keybindings shown right-aligned in a dim colour, and agent-only commands
   (CommandMeta::hidden()) excluded from the human palette. REMAINING: (1) order by
@@ -558,8 +558,8 @@
 [2026-10-13@939ddd4] Shortcuts sheet for the focused pane (title-bar button)
 
 - Requires: views that declare their own chords (plugin follow-up (4),
-  view-scoped keybindings); editing writes `[keybindings]` with
-  `config::write::set`
+  view-scoped keybindings); editing needs config write-back
+  (`config::write::set` writes `[keybindings]`)
 - Detail: A button in the title bar beside the sidebar toggle opens a sheet of
   every shortcut that applies to the focused pane's view (one global button,
   not one per pane, since splits show several views). Sections, top to bottom:
@@ -1476,5 +1476,16 @@
 - Detail: The poll's restore check (`AppState::pump_all_budgeted`, `let asks = ...`) and `Tree::set_status` compare the whole `TabStatus`, so `Unread { success: false }` → `Unread { success: true }` would count as new attention once failures mark workspaces; compare the status kind.
 - Detail: Nit: that `let asks = ...` line is longer than rustfmt would leave it.
 - Reason: findings from the review of `feat/sidebar-inbox-order`, recorded rather than fixed.
+
+---
+
+[2026-10-31T23:05+1300@19b2903f]
+
+- Requires: NO BLOCKERS
+- Detail: `config::write::set`: an editor save that lands between its read and its rename is lost; compare the file's stamp before renaming.
+- Detail: `config::write::set`: the rename splits a hard-linked dotfile (the other link keeps the old text).
+- Detail: `config::write::set`: `readonly()` checks write bits, not ownership; extended attributes and ACLs on the file are dropped by the rename.
+- Detail: `config::load`: a type mismatch found after laying `config.local.toml` over `config.toml` is reported at `config.toml` 1:1, even when the local file caused it.
+- Reason: findings from the review of `feat/config-layers`, recorded rather than fixed.
 
 ---
