@@ -34,8 +34,10 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
   newest frame with `PaintCx::image`, a texture in the same wgpu scene. Input (mouse, keys, edit
   commands) is forwarded as requests. One host serves every web surface. It is
   spawned on first use and asked to exit once no web surface has been left for
-  30 s; the next web surface spawns another. Build it with `mise run web` (needs CMake + Ninja, pinned
-  in `mise.toml`; CEF's binary distribution is downloaded by `cef-dll-sys`). The
+  30 s; the next web surface spawns another. `cargo build` builds and bundles it
+  from the app's build script in `target/web-host` and places the bundle beside the
+  `ghostrealm` binary (needs CMake + Ninja, pinned in `mise.toml`; CEF's binary
+  distribution is downloaded by `cef-dll-sys`); `GHOSTREALM_NO_WEB=1` skips it. The
   app finds it beside its own binary, at `[web] host`, or `$GHOSTREALM_WEB_HOST`.
 
 - **App ↔ terminal seam:** `TerminalBackend` (in `crates/terminal`) exposes only

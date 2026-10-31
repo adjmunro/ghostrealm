@@ -713,7 +713,7 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
             s.mismatch = true;
             s.failure = Some(format!(
                 "the web host bundle is out of date (protocol {protocol}, this ghostrealm \
-                 speaks {PROTOCOL_VERSION}); rebuild it with `mise run web`"
+                 speaks {PROTOCOL_VERSION}); rebuild it with `cargo build`"
             ));
         }
         Event::Frame {
@@ -984,7 +984,7 @@ mod tests {
             let s = shared.0.lock().unwrap();
             assert!(!s.ready);
             let failure = s.failure.as_deref().unwrap_or_default();
-            assert!(failure.contains("out of date") && failure.contains("mise run web"), "{failure}");
+            assert!(failure.contains("out of date") && failure.contains("cargo build"), "{failure}");
         }
         let shared: (Mutex<Shared>, Condvar) = Default::default();
         apply_event(&shared, Event::Ready { protocol: PROTOCOL_VERSION });

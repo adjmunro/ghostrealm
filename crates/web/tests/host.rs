@@ -2,7 +2,8 @@
 //! pixels into the shared frame, answers text/eval requests (which a hostile
 //! page can't tamper with), and hears each mouse button.
 //!
-//! Needs the bundled host (`mise run web`); skipped when it isn't built.
+//! Needs the bundled host that `cargo build` places beside the test binaries;
+//! skipped without it, or with `GHOSTREALM_NO_WEB` set.
 
 mod common;
 
@@ -78,7 +79,7 @@ fn spawn_at(cache: PathBuf, env: &[(&str, &str)]) -> Option<(WebHost, Profile)> 
     // parallel, so each sets and spawns in turn.
     static SPAWN: Mutex<()> = Mutex::new(());
     let Some(exe) = host_exe() else {
-        eprintln!("skipping: web host not built (run `mise run web`)");
+        eprintln!("skipping: no web host (GHOSTREALM_NO_WEB is set, or `cargo build` hasn't placed one)");
         return None;
     };
     let turn = Turn::take();

@@ -2,7 +2,8 @@
 //! profile is in use and exits, the first keeps serving, and the first exits
 //! once the app hangs up.
 //!
-//! Needs the bundled host (`mise run web`); skipped when it isn't built.
+//! Needs the bundled host that `cargo build` places beside the test binaries;
+//! skipped without it, or with `GHOSTREALM_NO_WEB` set.
 
 mod common;
 
@@ -14,7 +15,7 @@ use ghostrealm_web::{Request, WebHost};
 #[test]
 fn a_second_host_on_one_profile_reports_it_in_use() {
     let Some(exe) = host_exe() else {
-        eprintln!("skipping: web host not built (run `mise run web`)");
+        eprintln!("skipping: no web host (GHOSTREALM_NO_WEB is set, or `cargo build` hasn't placed one)");
         return;
     };
     let cache = std::env::temp_dir().join(format!("ghostrealm-web-profile-{}", std::process::id()));

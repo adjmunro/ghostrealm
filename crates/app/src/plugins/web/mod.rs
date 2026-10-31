@@ -168,7 +168,7 @@ impl HostSlot {
                         .map(|why| format!(" (this build skipped it: {why})"))
                         .unwrap_or_default();
                     self.error = Some(format!(
-                        "web host not found: build it with `mise run web`{skipped}, or set [web] host"
+                        "web host not found: build it with `cargo build`{skipped}, or set [web] host"
                     ));
                 }
                 Some(exe) => match WebHost::spawn(&exe, self.waker.clone()) {
@@ -565,7 +565,7 @@ impl Plugin for WebPlugin {
                     Kind::Path,
                     None,
                     "The web host executable. Unset means beside the ghostrealm binary \
-                     (build it with `mise run web`).",
+                     (`cargo build` places it there).",
                 ),
             ],
         )]
@@ -2180,7 +2180,7 @@ pub(crate) mod tests {
         let dir = TmpDir::new("web-old-host");
         let (mut v, _) = stub_host(&dir, r#"echo '{"ev":"ready"}'; cat > /dev/null"#);
         let err = v.start().unwrap_err();
-        assert!(err.contains("out of date") && err.contains("mise run web"), "{err}");
+        assert!(err.contains("out of date") && err.contains("cargo build"), "{err}");
         let mut h = Harness::new();
         h.paint(&mut v, RECT);
         assert!(v.slot.borrow().error.as_deref().is_some_and(|e| e.contains("out of date")));
@@ -3420,7 +3420,7 @@ pub(crate) mod tests {
         assert!(got.contains("example.com"), "{got}");
     }
 
-    /// The bundled host (`mise run web`) beside the test binary's profile
+    /// The bundled host (placed by `cargo build`) beside the test binary's profile
     /// directory, if built, unless `GHOSTREALM_NO_WEB` is set.
     fn real_host() -> Option<std::path::PathBuf> {
         // Such a build leaves whatever bundle an earlier one placed.
@@ -3475,7 +3475,7 @@ pub(crate) mod tests {
     #[test]
     fn the_real_host_exits_when_idle_and_a_new_surface_respawns_it() {
         let Some(exe) = real_host() else {
-            eprintln!("skipping: web host not built (run `mise run web`)");
+            eprintln!("skipping: no web host (GHOSTREALM_NO_WEB is set, or `cargo build` hasn't placed one)");
             return;
         };
         let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
@@ -3575,7 +3575,7 @@ pub(crate) mod tests {
     #[test]
     fn popups_with_the_real_host() {
         let Some(exe) = real_host() else {
-            eprintln!("skipping: web host not built (run `mise run web`)");
+            eprintln!("skipping: no web host (GHOSTREALM_NO_WEB is set, or `cargo build` hasn't placed one)");
             return;
         };
         let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());
@@ -3746,7 +3746,7 @@ pub(crate) mod tests {
     #[test]
     fn a_hidden_popup_outlives_a_killed_real_host() {
         let Some(exe) = real_host() else {
-            eprintln!("skipping: web host not built (run `mise run web`)");
+            eprintln!("skipping: no web host (GHOSTREALM_NO_WEB is set, or `cargo build` hasn't placed one)");
             return;
         };
         let _turn = REAL_HOST.lock().unwrap_or_else(|e| e.into_inner());

@@ -4,20 +4,6 @@ zig = "0.16.0"
 cmake = "4.4.4"
 ninja = "1.13.2"
 
-# Build the CEF web host and bundle it beside the `ghostrealm` binary, where the
-# app looks for it. Always build with `--features bundle` so cef isn't rebuilt
-# when switching between the host and the bundler.
-# It ends with clean-stale: a changed CEF build leaves the old ~600 MB
-# download behind. Not with CARGO_TARGET_DIR set: that dir may be shared with
-# other workspaces, whose units clean-stale would take for unlisted ones. A
-# failed cleanup doesn't fail the task: the bundle is already built.
-[tasks.web]
-run = [
-    "cargo build -p ghostrealm-web-host --features bundle --bins",
-    "cargo run -p ghostrealm-web-host --features bundle --bin ghostrealm-web-bundle",
-    'if [ -n "${CARGO_TARGET_DIR:-}" ]; then echo "CARGO_TARGET_DIR is set; clean-stale skipped"; elif ! mise run clean-stale; then echo "clean-stale failed; the web host is bundled"; fi',
-]
-
 # Remove build artifacts that a newer build superseded (Cargo never does), in
 # target/ and in target/web-host (the web host's own target dir).
 # `mise run clean-stale -- --dry-run` lists what would go; see

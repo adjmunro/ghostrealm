@@ -10,8 +10,9 @@ members = [
     "crates/web-host",
     "crates/process",
 ]
-# The CEF web host downloads and links Chromium; keep plain `cargo build/test`
-# free of it. Build it with `mise run web` (see mise.toml).
+# The CEF web host downloads and links Chromium. The app's build script builds
+# and bundles it in its own target dir (target/web-host, see crates/app/build.rs),
+# so it isn't a default member: built here, its `bundle` feature would toggle.
 default-members = [
     "crates/terminal",
     "crates/terminal-ghostty",
