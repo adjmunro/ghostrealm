@@ -339,11 +339,21 @@ impl WebHost {
     /// has gone away, or isn't reading and the queue is full (a dropped mouse
     /// move or wheel step still returns true).
     pub fn send(&self, req: &Request) -> bool {
+        // Known before the host can answer: it may close the page at once.
+        let made = match req {
+            Request::Create { id, .. } => Some(*id).filter(|id| self.shared.0.lock().unwrap().made.insert(*id)),
+            _ => None,
+        };
         let sent = enqueue(&self.outbox, req);
-        if let (true, Request::Create { id, .. }) = (sent, req) {
-            self.shared.0.lock().unwrap().made.insert(*id);
+        if let (false, Some(id)) = (sent, made) {
+            self.shared.0.lock().unwrap().made.remove(&id);
         }
         sent
+    }
+
+    /// The pages the host reported closed and the app hasn't forgotten.
+    pub fn closed_pages(&self) -> Vec<u64> {
+        self.shared.0.lock().unwrap().closed.iter().copied().collect()
     }
 
     /// Whether the host process is still running.
@@ -1145,8 +1155,11 @@ mod tests {
         assert!(host.shared.0.lock().unwrap().closed_refusals.is_empty(), "dropped with its opener");
     }
 
-    /// A page the host closes before reporting anything else about it (a
-    /// pop-up it refuses to make again) is closed.
+    /// Given a pop-up made again that the host closes before reporting
+    /// anything else about it (refused past its opener's cap);
+    /// when its `Closed` arrives as soon as the `Create` is queued (the
+    /// writer and reader run on their own threads);
+    /// then it is closed. A `Create` the host never got is not awaited.
     #[test]
     fn a_page_closed_before_any_other_event_is_closed() {
         let host = WebHost {
@@ -1157,8 +1170,8 @@ mod tests {
             readers: HashMap::new(),
             reaped: Arc::default(),
         };
-        let create = Request::Create {
-            id: 7,
+        let create = |id| Request::Create {
+            id,
             url: "https://pop.test/".into(),
             width: 200,
             height: 100,
@@ -1166,9 +1179,26 @@ mod tests {
             agent: true,
             opener: Some(1),
         };
-        assert!(host.send(&create));
-        apply_event(&host.shared, Event::Closed { id: 7 });
+        // The queue held, the page is known before its `Create` is queued.
+        let (outbox, shared) = (host.outbox.clone(), host.shared.clone());
+        let held = outbox.0.lock().unwrap();
+        let sender = std::thread::spawn(move || {
+            assert!(host.send(&create(7)));
+            host
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !shared.0.lock().unwrap().made.contains(&7) {
+            assert!(Instant::now() < until, "made only once queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(held);
+        apply_event(&shared, Event::Closed { id: 7 });
+        let host = sender.join().unwrap();
         assert!(host.is_closed(7));
+
+        host.outbox.0.lock().unwrap().broken = true;
+        assert!(!host.send(&create(8)));
+        assert!(!host.shared.0.lock().unwrap().made.contains(&8), "not sent");
     }
 
     #[test]
