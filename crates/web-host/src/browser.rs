@@ -134,9 +134,10 @@ thread_local! {
     static NEXT_MESSAGE: Cell<i32> = const { Cell::new(1) };
     static PENDING: RefCell<HashMap<u64, PendingPopup>> = RefCell::new(HashMap::new());
     static NEXT_POPUP: Cell<u64> = const { Cell::new(POPUP_IDS) };
-    /// Pop-ups reported closed before CEF made them (their opener closed):
-    /// closed once made.
-    static DROPPED: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
+    /// Pop-ups reported closed before CEF made them (their opener closed),
+    /// with their opener and CEF's id for them: closed once made, forgotten
+    /// once CEF reports them made or aborted.
+    static DROPPED: RefCell<HashMap<u64, (u64, c_int)>> = RefCell::new(HashMap::new());
     static NEXT_LINK: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -977,7 +978,7 @@ fn popup_created(id: u64, b: &Browser) {
     let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&id)) else {
         // Its opener closed before it was made (and it was reported closed).
         // Any other is a page `create` makes, a pop-up made again included.
-        if DROPPED.with_borrow_mut(|d| d.remove(&id)) {
+        if DROPPED.with_borrow_mut(|d| d.remove(&id)).is_some() {
             if let Some(h) = b.host() {
                 h.close_browser(1);
             }
@@ -1014,7 +1015,8 @@ fn popup_created(id: u64, b: &Browser) {
     }
 }
 
-/// CEF dropped pop-up `cef_id` of page `opener` before making it.
+/// CEF dropped pop-up `cef_id` of page `opener` before making it. One
+/// [`close_popups`] dropped already was reported closed then.
 fn popup_aborted(opener: u64, cef_id: c_int) {
     let id = PENDING.with_borrow_mut(|m| {
         let id = m.iter().find(|(_, p)| p.opener == opener && p.cef_id == cef_id).map(|(id, _)| *id)?;
@@ -1023,6 +1025,8 @@ fn popup_aborted(opener: u64, cef_id: c_int) {
     });
     if let Some(id) = id {
         emit(&Event::Closed { id });
+    } else {
+        DROPPED.with_borrow_mut(|d| d.retain(|_, of| *of != (opener, cef_id)));
     }
 }
 
@@ -1041,7 +1045,7 @@ fn close_popups(id: u64) {
         ids.into_iter().filter_map(|k| m.remove(&k).map(|p| (k, p))).collect()
     });
     for (popup, p) in pending {
-        DROPPED.with_borrow_mut(|d| d.insert(popup));
+        DROPPED.with_borrow_mut(|d| d.insert(popup, (id, p.cef_id)));
         for req in p.queued {
             match req {
                 Request::Eval { req, .. } => {
