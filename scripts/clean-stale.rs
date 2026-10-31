@@ -116,7 +116,9 @@
 //! `--dry-run`/`-n` (remove nothing), `--verbose`/`-v` (list each path),
 //! `--keep N`, `--target-dir DIR`, `--lockfile FILE`, `--all`,
 //! `--idle-hours N`, `--except DIR` (leave that target dir alone; repeatable),
-//! `--unused-days N`.
+//! `--unused-days N`, `--wait SECS` (retry a held target dir of this
+//! checkout each second for that long before skipping it; the app's build
+//! script runs it so after a build).
 //! An option value that doesn't parse, or an `--except` dir that doesn't
 //! exist, is an error. Its tests run with
 //! `rustc --test --edition 2021 scripts/clean-stale.rs`.
@@ -185,6 +187,9 @@ struct Opts {
     /// `--unused-days`: also remove units none of whose files was modified
     /// for this long.
     unused: Option<Duration>,
+    /// `--wait`: how long to wait for a build to release this checkout's
+    /// target dirs before skipping them.
+    wait: Duration,
 }
 
 impl Opts {
@@ -244,6 +249,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let days = v.parse::<f64>().ok().filter(|d| *d >= 0.0);
                 let age = days.and_then(|d| Duration::try_from_secs_f64(d * 86400.0).ok());
                 a.opts.unused = Some(age.ok_or(format!("--unused-days {v}: not a number of days"))?);
+            }
+            "--wait" => {
+                let v = value()?;
+                let secs = v.parse::<u64>().ok().ok_or(format!("--wait {v}: not a number of seconds"))?;
+                a.opts.wait = Duration::from_secs(secs);
             }
             "--idle-hours" => {
                 let v = value()?;
@@ -316,7 +326,13 @@ fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
 
 /// Remove the superseded units of `target` alone, unless a build holds it.
 fn clean_one_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
-    let _held = match BuildLock::take(target, opts.dry_run) {
+    let until = SystemTime::now() + opts.wait;
+    let mut taken = BuildLock::take(target, opts.dry_run);
+    while matches!(taken, Err(NotTaken::Held)) && SystemTime::now() < until {
+        std::thread::sleep(Duration::from_secs(1));
+        taken = BuildLock::take(target, opts.dry_run);
+    }
+    let _held = match taken {
         Ok(held) => held,
         Err(why) => {
             println!("{}: {why}; skipped", target.display());
@@ -1633,6 +1649,8 @@ mod tests {
             &["--keep", "x"],
             &["--except", "/no/such/dir/here"],
             &["--target-dir"],
+            &["--wait", "-1"],
+            &["--wait", "x"],
             &["--bogus"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
@@ -1644,6 +1662,7 @@ mod tests {
         assert_eq!(a.opts.unused, None);
         let a = parse(&["--unused-days", "14"]).unwrap();
         assert_eq!(a.opts.unused, Some(Duration::from_secs(14 * 86400)));
+        assert_eq!(parse(&["--wait", "600"]).unwrap().opts.wait, Duration::from_secs(600));
     }
 
     #[test]
@@ -1716,6 +1735,24 @@ mod tests {
         let held = BuildLock::take(&dir, false).expect("free once the build is done");
         assert!(File::open(dir.join("debug/.cargo-build-lock")).unwrap().try_lock().is_err(), "held while cleaning");
         drop(held);
+    }
+
+    #[test]
+    fn wait_cleans_a_target_once_its_build_releases_it() {
+        let t = tmpdir("wait");
+        target(&t);
+        let units = same_units(&t.join("debug"), 4);
+        let build = File::create(t.join("debug/.cargo-lock")).unwrap();
+        build.lock().unwrap();
+        clean_target(&t, &Lock::default(), &opts());
+        assert!(units[3].is_dir(), "held without --wait: skipped");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(build);
+        });
+        clean_target(&t, &Lock::default(), &Opts { wait: Duration::from_secs(30), ..opts() });
+        release.join().unwrap();
+        assert!(!units[3].exists() && units[2].is_dir(), "cleaned once released");
     }
 
     /// `n` units of one identity in `profile`, newest first; returns their
