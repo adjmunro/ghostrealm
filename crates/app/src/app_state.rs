@@ -1639,8 +1639,13 @@ impl AppState {
                     .map(|v| matches!(v.status, TabStatus::NeedsInput | TabStatus::Busy))
                     .unwrap_or(false);
                 if !sticky {
+                    // Back to unread, in its old place: a glance asks for nothing.
+                    let stamp = self.tree.vtab(from).map(|v| v.attention);
                     self.tree
                         .set_status(from, TabStatus::Unread { success: true });
+                    if let (Some(v), Some(stamp)) = (self.tree.vtab_mut(from), stamp) {
+                        v.attention = stamp;
+                    }
                 }
             }
         }
@@ -1839,6 +1844,8 @@ impl AppState {
             self.close_surface_id(sid);
             changed = true;
         }
+        let start: Vec<(VtabId, TabStatus, u64)> =
+            self.tree.vtabs().iter().map(|v| (v.id, v.status, v.attention)).collect();
         // Output in a background vtab marks it unread (needs_input is sticky).
         for sid in changed_surfaces {
             let Some(vt) = self.vtab_of_surface(sid) else {
@@ -1889,6 +1896,16 @@ impl AppState {
                     self.optimistic_busy.remove(&vt);
                 }
                 _ => {}
+            }
+        }
+        // Only the status the poll settles on asks for attention: output from
+        // a workspace the busy check puts back to busy asks for nothing.
+        for (vt, status, attention) in start {
+            if let Some(v) = self.tree.vtab_mut(vt) {
+                let asks = v.status != status && matches!(v.status, TabStatus::Unread { .. } | TabStatus::NeedsInput);
+                if !asks {
+                    v.attention = attention;
+                }
             }
         }
 
@@ -2755,6 +2772,7 @@ mod tests {
         });
         s.focus_vtab(a); // a active, b background
         s.tree.set_status(b, TabStatus::Unread { success: true });
+        let stamp = s.tree.vtab(b).unwrap().attention;
 
         // Focus b, dwell until it auto-reads.
         s.focus_vtab(b);
@@ -2768,6 +2786,42 @@ mod tests {
             matches!(s.tree.vtab(b).unwrap().status, TabStatus::Unread { .. }),
             "leaving within the unfocus grace should revert the auto-read to unread"
         );
+        assert_eq!(s.tree.vtab(b).unwrap().attention, stamp, "the revert keeps its place in the sidebar");
+    }
+
+    /// Busy, with output on every pump.
+    struct Building;
+
+    impl View for Building {
+        fn plugin(&self) -> &'static str {
+            "building"
+        }
+        fn paint(&mut self, _cx: &mut crate::plugin::PaintCx, _rect: ghostrealm_core::Rect) {}
+        fn pump(&mut self, _budget: usize) -> ghostrealm_terminal::Pumped {
+            ghostrealm_terminal::Pumped { changed: true, more: false }
+        }
+        fn is_busy(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_busy_background_workspace_printing_keeps_its_stamp() {
+        let mut s = AppState::new();
+        let build = s.new_view_vtab("build", Box::new(Building));
+        let stamp = s.tree.vtab(build).unwrap().attention;
+        s.new_empty_vtab(); // build is in the background
+        for _ in 0..3 {
+            s.pump_all();
+            assert_eq!(s.tree.vtab(build).unwrap().status, TabStatus::Busy);
+            assert_eq!(s.tree.vtab(build).unwrap().attention, stamp, "output while busy asks for nothing");
+        }
     }
 
     #[test]
