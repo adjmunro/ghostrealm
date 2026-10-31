@@ -17,7 +17,11 @@
 //! resolve features differently and so produce sibling copies of the same
 //! unit that are all in use; the number kept bounds the stale ones. A unit
 //! reused by the latest build but older than `--keep` newer siblings is
-//! removed too; it is rebuilt on the next build. A unit built from a registry
+//! removed too; it is rebuilt on the next build, except with `--wait`: then
+//! a unit that a kept unit of a workspace member (a source path relative to
+//! the workspace) depends on, directly or not (fingerprint `deps`), stays
+//! however many siblings outrank it, so a prune after one command doesn't
+//! undo another's units. A unit built from a registry
 //! package version that `Cargo.lock` no longer lists is removed outright.
 //! Units whose fingerprint can't be read are left alone.
 //!
@@ -190,6 +194,8 @@ struct Opts {
     /// `--wait`: how long to wait for a build to release this checkout's
     /// target dirs before skipping them.
     wait: Duration,
+    /// Set by `--wait`: keep what workspace members' newest units depend on.
+    keep_reachable: bool,
 }
 
 impl Opts {
@@ -254,6 +260,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = value()?;
                 let secs = v.parse::<u64>().ok().ok_or(format!("--wait {v}: not a number of seconds"))?;
                 a.opts.wait = Duration::from_secs(secs);
+                a.opts.keep_reachable = true;
             }
             "--idle-hours" => {
                 let v = value()?;
@@ -1062,12 +1069,15 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
 
     // identity -> units sharing it. Build-script runs are decided after the
     // build-script compiles they belong to.
-    let mut groups: HashMap<String, (usize, Vec<Unit>)> = HashMap::new();
+    let mut groups: HashMap<String, (usize, bool, Vec<Unit>)> = HashMap::new();
     let mut runs: Vec<(Unit, Vec<String>)> = Vec::new();
     // fingerprint hash -> `.fingerprint/` directory of each build-script compile.
     let mut scripts: HashMap<String, String> = HashMap::new();
     // `.fingerprint/` directory -> the source it was compiled from.
     let mut sources: HashMap<String, String> = HashMap::new();
+    // fingerprint hash -> `.fingerprint/` directory, and directory -> its deps' hashes.
+    let mut by_fingerprint: HashMap<String, String> = HashMap::new();
+    let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
     for e in read_dir(&dir.join(".fingerprint")) {
         let Some(dir_name) = e.file_name().to_str().map(str::to_string) else { continue };
         if let Ok(h) = fs::read_to_string(e.path().join("build-script-build-script-build")) {
@@ -1076,6 +1086,10 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
         let Some(package) = dir_name.len().checked_sub(17).and_then(|n| dir_name.get(..n)) else { continue };
         let Some((_, hash)) = split_hash(&dir_name) else { continue };
         let Some((kind, json, built)) = fingerprint_json(&e.path()) else { continue };
+        if let Ok(h) = fs::read_to_string(e.path().join(&kind)) {
+            by_fingerprint.insert(h.trim().to_string(), dir_name.clone());
+        }
+        deps_of.insert(dir_name.clone(), dep_fingerprints(&json));
         let unit = Unit { package: package.to_string(), hash: hash.to_string(), kind: kind.clone(), built };
         if kind.starts_with("run-build-script-") {
             runs.push((unit, script_fingerprints(&json)));
@@ -1091,15 +1105,36 @@ fn clean_profile(dir: &Path, lock: &Lock, opts: &Opts) -> Totals {
             field(&json, "rustflags"),
         );
         let keep = if unlisted_registry_source(&source, lock) { 0 } else { opts.keep };
-        groups.entry(identity).or_insert((keep, Vec::new())).1.push(unit);
+        let member = !source.is_empty() && Path::new(&source).is_relative();
+        groups.entry(identity).or_insert((keep, member, Vec::new())).2.push(unit);
+    }
+    for (_, _, units) in groups.values_mut() {
+        units.sort_by(|a, b| b.built.cmp(&a.built).then_with(|| a.hash.cmp(&b.hash)));
+    }
+
+    // Everything a kept unit of a member depends on. Not just the newest:
+    // `cargo build`, `cargo test` and `cargo clippy` can each use a different
+    // copy of one member identity.
+    let mut reachable: HashSet<String> = HashSet::new();
+    if opts.keep_reachable {
+        let mut todo: Vec<String> = groups
+            .values()
+            .filter(|(_, member, _)| *member)
+            .flat_map(|(keep, _, units)| units.iter().take(*keep).map(|u| format!("{}-{}", u.package, u.hash)))
+            .collect();
+        while let Some(name) = todo.pop() {
+            if reachable.insert(name.clone()) {
+                let deps = deps_of.get(&name).into_iter().flatten();
+                todo.extend(deps.filter_map(|h| by_fingerprint.get(h)).cloned());
+            }
+        }
     }
 
     let mut kept: Vec<Unit> = Vec::new();
     let mut removed: HashSet<String> = HashSet::new();
-    for (keep, mut units) in groups.into_values() {
-        units.sort_by(|a, b| b.built.cmp(&a.built).then_with(|| a.hash.cmp(&b.hash)));
+    for (keep, _, units) in groups.into_values() {
         for (i, unit) in units.into_iter().enumerate() {
-            if i < keep {
+            if i < keep || (keep > 0 && reachable.contains(&format!("{}-{}", unit.package, unit.hash))) {
                 kept.push(unit);
             } else {
                 removed.insert(format!("{}-{}", unit.package, unit.hash));
@@ -1235,6 +1270,22 @@ fn script_fingerprints(json: &str) -> Vec<String> {
             Some(n.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect())
         })();
         hashes.extend(hash);
+    }
+    hashes
+}
+
+/// The fingerprint hashes, as `.fingerprint/` stores them, of every unit in
+/// a fingerprint JSON's `"deps":[[<id>,"<name>",<public>,<hash>],...]`.
+fn dep_fingerprints(json: &str) -> Vec<String> {
+    let mut hashes = Vec::new();
+    let Some(i) = json.find("\"deps\":[") else { return hashes };
+    let mut rest = &json[i + "\"deps\":[".len()..];
+    while let Some(r) = rest.strip_prefix('[') {
+        let Some(end) = r.find(']') else { break };
+        if let Some(n) = r[..end].rsplit(',').next().and_then(|d| d.trim().parse::<u64>().ok()) {
+            hashes.push(n.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect());
+        }
+        rest = r[end + 1..].strip_prefix(',').unwrap_or(&r[end + 1..]);
     }
     hashes
 }
@@ -1753,6 +1804,44 @@ mod tests {
         clean_target(&t, &Lock::default(), &Opts { wait: Duration::from_secs(30), ..opts() });
         release.join().unwrap();
         assert!(!units[3].exists() && units[2].is_dir(), "cleaned once released");
+    }
+
+    #[test]
+    fn with_wait_an_outranked_unit_a_kept_member_unit_reaches_stays() {
+        for keep_reachable in [false, true] {
+            let t = tmpdir("reachable");
+            target(&t);
+            let d = t.join("debug");
+            let serde: Vec<PathBuf> = (0..5u64)
+                .map(|i| {
+                    let name = format!("serde-{:016x}", 0xa0 + i);
+                    unit(&d, &name, "lib-serde", r#"{"features":"[]","target":1}"#, Some(0x100 + i));
+                    set_mtime(&d.join(format!(".fingerprint/{name}/lib-serde.json")), SystemTime::now() - Duration::from_secs(60 * (i + 1)));
+                    d.join(".fingerprint").join(name)
+                })
+                .collect();
+            // The app depends on the oldest serde, through a lib that has no siblings.
+            let json = |dep: u64| format!(r#"{{"features":"[]","target":2,"deps":[[1,"x",false,{dep}]],"local":[]}}"#);
+            unit(&d, "mid-00000000000000b0", "lib-mid", &json(0x104), Some(0x200));
+            unit(&d, "app-00000000000000c0", "bin-app", &json(0x200), Some(0x300));
+            fs::create_dir_all(d.join("deps")).unwrap();
+            fs::write(d.join("deps/app-00000000000000c0.d"), "/t/deps/app: crates/app/src/main.rs\n").unwrap();
+            // A newer copy of the app (another command's) doesn't make the older one's deps go.
+            set_mtime(&d.join(".fingerprint/app-00000000000000c0/bin-app.json"), SystemTime::now() - Duration::from_secs(600));
+            unit(&d, "app-00000000000000c1", "bin-app", &json(0x100), Some(0x301));
+            fs::write(d.join("deps/app-00000000000000c1.d"), "/t/deps/app: crates/app/src/main.rs\n").unwrap();
+            clean_target(&t, &Lock::default(), &Opts { keep_reachable, ..opts() });
+            assert!(serde[..3].iter().all(|u| u.is_dir()), "the newest 3 stay");
+            assert!(!serde[3].exists(), "outranked and unreachable: removed");
+            assert_eq!(serde[4].is_dir(), keep_reachable, "outranked but reachable from the app");
+        }
+    }
+
+    #[test]
+    fn dep_fingerprints_reads_each_deps_hash() {
+        let json = r#"{"rustc":1,"deps":[[5,"serde_json",false,2314396845880310632],[7,"b",true,1]],"local":[[2]]}"#;
+        assert_eq!(dep_fingerprints(json), vec!["68fbfa4bab631e20".to_string(), "0100000000000000".to_string()]);
+        assert!(dep_fingerprints(r#"{"deps":[]}"#).is_empty());
     }
 
     /// `n` units of one identity in `profile`, newest first; returns their
