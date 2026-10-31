@@ -330,3 +330,12 @@
 - Detail: Placement replaces only a bundle that is ours: a real directory owned by the build's user whose `Info.plist` names `dev.ghostrealm.web-host`.
 - Detail: `mise run web` is removed. `clean-stale` cleans `target/web-host` as a target dir of its own and has an opt-in `--unused-days`.
 - Reason: the owner wants plain `cargo build` and `cargo run --release` to give a working browser (decisions-pending item 2, option A). The separate target dir keeps the nested build off the outer build's lock, and CEF out of the app's own units.
+
+---
+
+[2026-10-31T21:40+1300@63bcddb3]
+
+- Category: Terminal / input
+- Detail: On the primary screen the terminal sends the text keymap's word and line motions and deletes as the readline keys shells bind (`ESC b` / `ESC f`, `^A` / `^E`, `ESC DEL`, `ESC d`, `^U`, `^K`).
+- Detail: While the program is on the alternate screen (as last painted), no key is translated: each sends libghostty's normal encoding (Option+Left is `CSI 1;3D`); Cmd motions and deletes send nothing, like other Cmd chords besides copy and paste.
+- Reason: full-screen programs (Vim, less, htop) bind their own keys and must get them as a plain terminal sends them; readline bytes there mean something else (`^A` increments a number in Vim). Owner's call (decisions-pending item 8, option B).

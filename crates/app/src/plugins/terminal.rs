@@ -511,8 +511,10 @@ impl View for TerminalView {
         }
         let action = Keymap::platform().action(k);
         // The text keymap's word/line motions and deletes become the readline
-        // keys shells bind (Shift+Cmd too; Shift+Option selects below).
-        if m.super_ || (!m.shift && (m.alt || m.ctrl)) {
+        // keys shells bind (Shift+Cmd too; Shift+Option selects below). A
+        // full-screen program on the alternate screen binds its own keys, so
+        // there they keep their normal encoding.
+        if !self.grid.alt_screen && (m.super_ || (!m.shift && (m.alt || m.ctrl))) {
             if let Some(bytes) = action.and_then(readline) {
                 self.write(bytes);
                 cx.redraw();
@@ -1417,6 +1419,42 @@ mod tests {
         assert_eq!(v.geom.map(|g| g.1), Some(10), "no row dropped from a screen without scrollback");
         assert_eq!(drawn_on(&h, 0), ["1"]);
         assert_eq!(drawn_on(&h, 9), [banner()]);
+    }
+
+    /// The bytes a word-left chord reaches the program as, in hex, after
+    /// `setup` runs: the program reads raw input and prints it with `od`.
+    fn word_left_bytes(setup: &str) -> String {
+        let script = format!("{setup}stty raw -echo min 0 time 20; printf ready; head -c 64 | od -An -tx1; sleep 3");
+        let mut v = running(&script, "ready");
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let mut mods = Mods::default();
+        if cfg!(target_os = "macos") {
+            mods.alt = true;
+        } else {
+            mods.ctrl = true;
+        }
+        let (used, _) = h.key(&mut v, KeyPress { key: Key::Left, mods, text: None });
+        assert!(used);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = v.text().unwrap_or_default();
+            // Raw mode leaves the dump on the line after "ready".
+            let dump = text.split_once("ready").and_then(|(_, rest)| rest.lines().next()).unwrap_or("");
+            if !dump.trim().is_empty() {
+                return dump.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+            assert!(Instant::now() < deadline, "no bytes echoed: {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn word_left_is_readline_on_the_primary_screen_and_plain_on_the_alternate() {
+        assert_eq!(word_left_bytes(""), "1b 62", "ESC b");
+        let mods = if cfg!(target_os = "macos") { "33" } else { "35" };
+        let plain = format!("1b 5b 31 3b {mods} 44");
+        assert_eq!(word_left_bytes("printf '\\033[?1049h'; "), plain, "CSI 1;3D / CSI 1;5D");
     }
 
     #[test]
