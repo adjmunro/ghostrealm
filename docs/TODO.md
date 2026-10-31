@@ -1486,6 +1486,9 @@
 - Detail: `config::write::set`: the rename splits a hard-linked dotfile (the other link keeps the old text).
 - Detail: `config::write::set`: `readonly()` checks write bits, not ownership; extended attributes and ACLs on the file are dropped by the rename.
 - Detail: `config::load`: a type mismatch found after laying `config.local.toml` over `config.toml` is reported at `config.toml` 1:1, even when the local file caused it.
+- Detail: No test drives the `write::holds` gate in `window.rs` `set_config`; removing or inverting it would fail nothing.
+- Detail: Temp files a crash or kill leaves behind pile up as `.config.toml.<pid>.<n>.ghostrealm-tmp` beside the config (`write.rs`, `temp_beside`) and sync with the config dir; nothing removes them, and deleting them automatically would reopen the risk `create_new` closed.
+- Detail: Uncertain: `write::holds` checks only that `config.local.toml` has the key. A local value the checker rejects doesn't apply, yet the `config.toml` write is still refused.
 - Reason: findings from the review of `feat/config-layers`, recorded rather than fixed.
 
 ---
