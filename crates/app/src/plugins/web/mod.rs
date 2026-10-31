@@ -12,8 +12,8 @@
 //!
 //! A pop-up outlives the host that made it: a new host makes it again at its
 //! last address, under the same id, without `window.opener`. One with no
-//! address to reopen (`about:blank`, a `blob:` URL) goes, and the person is
-//! told.
+//! address to reopen (`about:blank`, a `blob:` URL) goes with the pop-ups it
+//! opened, and the person is told.
 //!
 //! Off screen, a person's page is hidden from Chromium; an agent's (a pop-up
 //! an agent opened, or any page opened without a window) stays visible to
@@ -122,6 +122,10 @@ struct HostSlot {
     /// Above the id of every pop-up a view holds: a new host numbers its
     /// pop-ups from here, so it never gives one's id to another.
     popup_floor: u64,
+    /// Pages a host that exited reported closed, by the generation they
+    /// were made in, until their views go: the next host must not make
+    /// them again.
+    exited_closed: std::collections::HashMap<u64, u64>,
     /// One clone per live web view, so the slot knows when none is left.
     views: Rc<()>,
     /// Since when no web view has been left, while a host runs.
@@ -193,6 +197,9 @@ impl HostSlot {
                     None if ready => "the web host exited".into(),
                     None => "the web host exited while starting".into(),
                 };
+                for id in h.closed_pages() {
+                    self.exited_closed.insert(id, self.generation);
+                }
                 self.host = None;
                 if mismatch {
                     // Another spawn of the same bundle would be refused again.
@@ -347,7 +354,9 @@ impl OrphanTabs {
             None => return Vec::new(),
         };
         tabs.iter()
-            .map(|p| (WebView::for_popup(self.0.clone(), p, false), p.kind != PopupKind::BackgroundTab))
+            // The opener is gone: its scale with it. A tab is resized when
+            // shown.
+            .map(|p| (WebView::for_popup(self.0.clone(), p, false, 1.0), p.kind != PopupKind::BackgroundTab))
             .collect()
     }
 }
@@ -619,10 +628,11 @@ pub struct WebView {
     on_screen: bool,
     sent_visible: bool,
     /// The page's `Create` says an agent drives it: the view was opened
-    /// without a window (the agent channel). Off screen, the host keeps it
-    /// visible to Chromium, so a loaded machine doesn't starve the renderer
-    /// the agent's reads wait on. The host makes pop-ups itself, and decides
-    /// theirs from how they were opened.
+    /// without a window (the agent channel), or it is an agent's pop-up made
+    /// again in a later host. Off screen, the host keeps it visible to
+    /// Chromium, so a loaded machine doesn't starve the renderer the agent's
+    /// reads wait on. The host makes pop-ups itself, and decides theirs from
+    /// how they were opened.
     agent: bool,
     /// The URL bar while it is being edited.
     url_edit: Option<LineEdit>,
@@ -647,13 +657,16 @@ pub struct WebView {
     /// A later host couldn't make this pop-up again: it goes.
     lost: bool,
     /// Pop-ups that floated over the page and couldn't be made again in a
-    /// later host, by title, until the next tick says so.
-    lost_popups: Vec<String>,
+    /// later host, until the app takes them to tell the person.
+    lost_popups: Vec<Lost>,
     /// Its header has a close button instead of navigation (a floating or
     /// hidden pop-up).
     popup: bool,
-    /// The size a pop-up asked for (physical pixels), for floating it.
+    /// The size a pop-up asked for (physical pixels at `popup_scale`), for
+    /// floating it and making it again.
     popup_size: (u32, u32),
+    /// The scale the host made the pop-up at: its opener's.
+    popup_scale: f32,
     /// Its close button was pressed.
     dismissed: bool,
     /// Pop-ups a person opened, floating over the page; the last shows.
@@ -674,6 +687,18 @@ pub struct WebView {
     /// was refused and the next tick hasn't said so: refresh sees it but
     /// can't raise requests.
     refused_at: Option<Instant>,
+}
+
+/// A pop-up that a later host couldn't make again, and the pop-ups it
+/// opened that went with it, for the app to tell the person.
+pub struct Lost {
+    /// Its title, else its address, else "untitled".
+    pub name: String,
+    /// Its page and those of the pop-ups floating over it: what they opened
+    /// goes too.
+    pub pages: Vec<u64>,
+    /// The names of the pop-ups that floated over it.
+    pub with: Vec<String>,
 }
 
 /// A pop-up the app opens as a surface of its own.
@@ -727,6 +752,7 @@ impl WebView {
             lost_popups: Vec::new(),
             popup: false,
             popup_size: DEFAULT_SIZE,
+            popup_scale: 1.0,
             dismissed: false,
             floating: Vec::new(),
             float_rect: zero,
@@ -740,8 +766,9 @@ impl WebView {
     }
 
     /// A view of pop-up `p`, which the host made (off screen) in the running
-    /// host. A `popup` one has a close button for a header.
-    fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo, popup: bool) -> Self {
+    /// host at `scale`, its opener's. A `popup` one has a close button for a
+    /// header.
+    fn for_popup(slot: Rc<RefCell<HostSlot>>, p: &PopupInfo, popup: bool, scale: f32) -> Self {
         let generation = {
             let mut s = slot.borrow_mut();
             s.popup_floor = s.popup_floor.max(p.id + 1);
@@ -756,18 +783,26 @@ impl WebView {
         v.agent = !p.from_input;
         v.popup = popup;
         v.popup_size = (p.width, p.height);
+        v.popup_scale = scale;
         v
     }
 
-    /// The page is gone: it closed itself, its close button was pressed (a
-    /// pop-up), or a later host couldn't make it again. A page outlives its
-    /// host: it is made again in the next.
+    /// The scale the host has the page at.
+    fn scale(&self) -> f32 {
+        self.sent_size.map_or(self.popup_scale, |s| s.2)
+    }
+
+    /// The page is gone: it closed itself (in a host that may have exited
+    /// since), its close button was pressed (a pop-up), or a later host
+    /// couldn't make it again. A page outlives its host: it is made again in
+    /// the next.
     pub fn is_closed(&self) -> bool {
         if self.dismissed || self.lost {
             return true;
         }
         let slot = self.slot.borrow();
-        slot.generation == self.created_in && slot.host.as_ref().is_some_and(|h| h.is_closed(self.page))
+        slot.exited_closed.get(&self.page) == Some(&self.created_in)
+            || slot.generation == self.created_in && slot.host.as_ref().is_some_and(|h| h.is_closed(self.page))
     }
 
     /// Whether a later host couldn't make this pop-up again.
@@ -775,13 +810,39 @@ impl WebView {
         self.lost
     }
 
-    /// What to tell a person about this page, which a later host couldn't
-    /// make again: `what` is "Pop-up" or "Tab".
-    pub fn lost_message(&self, what: &str) -> String {
-        lost_message(what, &self.name())
+    /// This page, which a later host couldn't make again, and the pop-ups
+    /// floating over it, which went with it.
+    pub fn lost(&self) -> Lost {
+        let mut lost = Lost { name: self.name(), pages: vec![self.page], with: Vec::new() };
+        self.add_floating(&mut lost);
+        lost
     }
 
-    /// The page's title, else its address.
+    fn add_floating(&self, lost: &mut Lost) {
+        for f in &self.floating {
+            lost.pages.push(f.page);
+            lost.with.push(f.name());
+            f.add_floating(lost);
+        }
+    }
+
+    /// The pop-ups that floated over the page (or over one floating over
+    /// it) and couldn't be made again in a later host, since last asked.
+    pub fn take_lost(&mut self) -> Vec<Lost> {
+        let mut lost = std::mem::take(&mut self.lost_popups);
+        for f in &mut self.floating {
+            lost.extend(f.take_lost());
+        }
+        lost
+    }
+
+    /// The page that opened this pop-up, which it closes with (none for a
+    /// page the app made, or a person's tab).
+    pub fn opener_page(&self) -> Option<u64> {
+        self.opener
+    }
+
+    /// The page's title, else its address, else "untitled".
     fn name(&self) -> String {
         [&self.state.title, &self.state.url, &self.last_url]
             .into_iter()
@@ -849,11 +910,12 @@ impl WebView {
             self.refused_at.get_or_insert_with(Instant::now);
         }
         let mut changed = false;
+        let scale = self.scale();
         for p in &popups {
             let place = match (p.from_input, p.kind) {
                 (false, _) => Place::Hidden,
                 (true, PopupKind::Popup) => {
-                    self.floating.push(WebView::for_popup(self.slot.clone(), p, true));
+                    self.floating.push(WebView::for_popup(self.slot.clone(), p, true, scale));
                     self.float_keys = true;
                     changed = true;
                     continue;
@@ -861,7 +923,7 @@ impl WebView {
                 (true, PopupKind::BackgroundTab) => Place::Tab { focus: false },
                 (true, PopupKind::Tab | PopupKind::Window) => Place::Tab { focus: true },
             };
-            let view = WebView::for_popup(self.slot.clone(), p, place == Place::Hidden);
+            let view = WebView::for_popup(self.slot.clone(), p, place == Place::Hidden, scale);
             self.opened.push(Opened { view, place, from_floating: false });
         }
         for f in &mut self.floating {
@@ -919,7 +981,7 @@ impl WebView {
         if self.created_in == generation {
             return Some(false);
         }
-        if self.lost {
+        if self.lost || slot.exited_closed.get(&self.page) == Some(&self.created_in) {
             return None;
         }
         if self.host_made && !reopenable(&self.last_url) {
@@ -931,7 +993,7 @@ impl WebView {
             None if !self.last_url.is_empty() => self.last_url.clone(),
             None => slot.cfg.home.clone(),
         };
-        let (width, height, scale) = self.sent_size.unwrap_or((self.popup_size.0, self.popup_size.1, 1.0));
+        let (width, height, scale) = self.sent_size.unwrap_or((self.popup_size.0, self.popup_size.1, self.popup_scale));
         let host = slot.host.as_mut()?;
         if !host.send(&HostRequest::Create {
             id: self.page,
@@ -1363,11 +1425,18 @@ impl WebView {
         self.floating.retain_mut(|f| {
             lost.append(&mut f.lost_popups);
             if f.lost {
-                lost.push(f.name());
+                lost.push(f.lost());
             }
             !f.is_closed()
         });
-        self.lost_popups.extend(lost);
+        if !lost.is_empty() {
+            self.lost_popups.extend(lost);
+            // The app's next pass takes them (see `take_lost`).
+            let waker = self.slot.borrow().waker.clone();
+            if let Some(wake) = waker {
+                wake();
+            }
+        }
         if self.floating.len() == before {
             return false;
         }
@@ -1403,9 +1472,15 @@ fn reopenable(url: &str) -> bool {
 }
 
 /// What to tell a person about a page named `name` (a title or address)
-/// that a later host couldn't make again: `what` is "Pop-up" or "Tab".
-fn lost_message(what: &str, name: &str) -> String {
-    format!("{what} \"{name}\" closed: the web host restarted, and it had no address to reopen")
+/// that a later host couldn't make again, and the pop-ups named `with` that
+/// it opened, which closed with it: `what` is "Pop-up" or "Tab".
+pub fn lost_message(what: &str, name: &str, with: &[String]) -> String {
+    let mut message = format!("{what} \"{name}\" closed: the web host restarted, and it had no address to reopen");
+    if !with.is_empty() {
+        let names: Vec<String> = with.iter().map(|n| format!("\"{n}\"")).collect();
+        message.push_str(&format!("; the pop-ups it opened closed with it: {}", names.join(", ")));
+    }
+    message
 }
 
 impl Drop for WebView {
@@ -1414,6 +1489,9 @@ impl Drop for WebView {
             return;
         }
         if let Ok(mut slot) = self.slot.try_borrow_mut() {
+            if slot.exited_closed.get(&self.page) == Some(&self.created_in) {
+                slot.exited_closed.remove(&self.page);
+            }
             if slot.generation == self.created_in {
                 if let Some(h) = slot.host.as_mut() {
                     // A person's tab taken but not yet placed outlives this
@@ -1846,9 +1924,10 @@ impl View for WebView {
     /// when to try again.
     fn deadline(&self, _cfg: &ghostrealm_core::Config) -> Option<Instant> {
         let retry = self.slot.borrow().retry_at();
-        // A pop-up that couldn't be made again is said at once.
-        let lost = (!self.lost_popups.is_empty()).then(Instant::now);
-        [retry, self.refused_at, lost].into_iter().flatten().min()
+        match (retry, self.refused_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn toast_keys(&self) -> Vec<String> {
@@ -1862,17 +1941,6 @@ impl View for WebView {
         }
         if let Some(toast) = self.take_refused_toast() {
             cx.request(toast);
-        }
-        for name in std::mem::take(&mut self.lost_popups) {
-            let message = lost_message("Pop-up", &name);
-            eprintln!("ghostrealm: web: {message}");
-            cx.request(crate::plugin::Request::Toast {
-                level: crate::toasts::Level::Warning,
-                message,
-                key: None,
-                choices: Vec::new(),
-                doc: None,
-            });
         }
     }
 
@@ -2555,43 +2623,127 @@ pub(crate) mod tests {
     }
 
     /// Given a pop-up a person opened floating over its page, and one at
-    /// `about:blank`;
+    /// `about:blank` with one floating over it;
     /// when the host exits and a new one starts;
     /// then the first is made again at its address, still floating, as a
     /// person's pop-up of the page, after the new host is told to number its
-    /// own pop-ups past it; the second is gone, and the person told.
+    /// own pop-ups past it; the second is gone with the one over it, both
+    /// handed to the app to tell the person.
     #[test]
     fn a_floating_popup_is_made_again_in_the_next_host() {
         let blank = popup_event(POPUP_IDS + 1, 1, true).replace("https://pop.test/", "about:blank");
+        let over = popup_event(POPUP_IDS + 2, POPUP_IDS + 1, true).replace("https://pop.test/", "https://over.test/");
         let dir = TmpDir::new("web-float-restart");
-        let script = dying_host(&[popup_event(POPUP_IDS, 1, true), blank], "cat > \"$0.requests\"");
+        let script = dying_host(&[popup_event(POPUP_IDS, 1, true), blank, over], "cat > \"$0.requests\"");
         let (mut v, runs) = stub_host(&dir, &script);
         let exe = runs.with_file_name("host.sh");
         let log = runs.with_file_name("host.sh.requests");
         let mut h = Harness::new();
-        wait("both pop-ups float", || {
+        wait("the pop-ups float", || {
             h.paint(&mut v, RECT);
-            v.floating.len() == 2
+            v.floating.len() == 2 && v.floating[1].floating.len() == 1
         });
         kill_host(&exe, &v.slot);
         h.paint(&mut v, RECT);
         let got = requests(&log, |s| host_requests(s).contains(&focus(POPUP_IDS, true)));
         let got = host_requests(&got);
-        assert_eq!(got.first(), Some(&HostRequest::FirstPopup { id: POPUP_IDS + 2 }), "{got:?}");
+        assert_eq!(got.first(), Some(&HostRequest::FirstPopup { id: POPUP_IDS + 3 }), "{got:?}");
         assert!(got.iter().any(create(POPUP_IDS, "https://pop.test/", false, Some(1))), "{got:?}");
-        assert!(!got.iter().any(|r| matches!(r, HostRequest::Create { id, .. } if *id == POPUP_IDS + 1)), "{got:?}");
+        let made: Vec<u64> = got.iter().filter_map(|r| match r { HostRequest::Create { id, .. } => Some(*id), _ => None }).collect();
+        assert!(!made.contains(&(POPUP_IDS + 1)) && !made.contains(&(POPUP_IDS + 2)), "{got:?}");
         assert_eq!(v.floating.iter().map(|f| f.page).collect::<Vec<_>>(), [POPUP_IDS], "it still floats");
-        let out = h.tick(&mut v, Instant::now());
-        let toasts: Vec<_> = out
-            .requests
-            .iter()
-            .filter_map(|r| match r {
-                crate::plugin::Request::Toast { level: crate::toasts::Level::Warning, message, .. } => Some(message.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(toasts, [lost_message("Pop-up", "about:blank")]);
-        assert!(v.deadline(&Default::default()).is_none_or(|t| t > Instant::now()), "said once");
+        let lost = v.take_lost();
+        let lost: Vec<_> = lost.iter().map(|l| (l.name.as_str(), l.pages.clone(), l.with.clone())).collect();
+        assert_eq!(lost, [("about:blank", vec![POPUP_IDS + 1, POPUP_IDS + 2], vec!["https://over.test/".to_string()])]);
+        assert!(v.take_lost().is_empty(), "said once");
+    }
+
+    /// Given a background tab (never painted), an opener at scale 2, with a
+    /// pop-up a person opened floating over it and an agent's hidden one;
+    /// when the host exits and a new one starts;
+    /// then the hidden one is made again at once, at its opener's scale;
+    /// the floating one only once the tab is painted, after the tab, at the
+    /// scale it was made at.
+    #[test]
+    fn a_floating_popup_over_a_background_tab_is_made_again_once_painted() {
+        let dir = TmpDir::new("web-background-restart");
+        let events = [popup_event(POPUP_IDS, 1, true), popup_event(POPUP_IDS + 1, 1, false)];
+        let script = dying_host(&events, "cat > \"$0.requests\"");
+        let (mut v, runs) = stub_host(&dir, &script);
+        let exe = runs.with_file_name("host.sh");
+        let log = runs.with_file_name("host.sh.requests");
+        v.sent_size = Some((800, 600, 2.0));
+        assert!(v.send(None));
+        let mut opened = Vec::new();
+        wait("the pop-ups come", || {
+            opened.extend(v.take_opened());
+            v.floating.len() == 1 && opened.len() == 1
+        });
+        let mut hidden = opened.pop().unwrap().view;
+        assert_eq!(hidden.popup_scale, 2.0);
+
+        kill_host(&exe, &v.slot);
+        assert!(v.slot.borrow_mut().host().is_some(), "a new host");
+        v.revive();
+        hidden.revive();
+        let marker = HostRequest::Close { id: 999 };
+        assert!(v.slot.borrow_mut().host.as_mut().unwrap().send(&marker));
+        let got = host_requests(&requests(&log, |s| host_requests(s).contains(&marker)));
+        let made = |got: &[HostRequest]| -> Vec<(u64, f32)> {
+            got.iter().filter_map(|r| match r { HostRequest::Create { id, scale, .. } => Some((*id, *scale)), _ => None }).collect()
+        };
+        assert_eq!(made(&got), [(POPUP_IDS + 1, 2.0)], "{got:?}");
+        assert!(got.iter().any(create(POPUP_IDS + 1, "https://pop.test/", true, Some(1))), "{got:?}");
+
+        let mut h = Harness::new();
+        h.paint(&mut v, RECT);
+        let got = host_requests(&requests(&log, |s| made(&host_requests(s)).len() == 3));
+        assert_eq!(made(&got)[1..], [(1, 1.0), (POPUP_IDS, 2.0)], "{got:?}");
+        assert_eq!(v.floating.iter().map(|f| f.page).collect::<Vec<_>>(), [POPUP_IDS], "it still floats");
+    }
+
+    /// Given a pop-up floating over a page and an agent's hidden one, both
+    /// reported closed just before the host exits, before the app looked;
+    /// when a new host starts;
+    /// then neither is made again: both are closed.
+    #[test]
+    fn a_popup_that_closed_as_its_host_exited_stays_closed() {
+        let dir = TmpDir::new("web-closed-restart");
+        let ready = format!("echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\n");
+        let script = format!(
+            "if [ ! -e \"$0.once\" ]; then touch \"$0.once\"\n{ready}echo '{}'\necho '{}'\n\
+             while [ ! -e \"$0.die\" ]; do sleep 0.02; done\n\
+             echo '{{\"ev\":\"closed\",\"id\":{POPUP_IDS}}}'; echo '{{\"ev\":\"closed\",\"id\":{}}}'; exit 0; fi\n\
+             {ready}cat > \"$0.requests\"",
+            popup_event(POPUP_IDS, 1, true),
+            popup_event(POPUP_IDS + 1, 1, false),
+            POPUP_IDS + 1,
+        );
+        let (mut v, runs) = stub_host(&dir, &script);
+        let exe = runs.with_file_name("host.sh");
+        let log = runs.with_file_name("host.sh.requests");
+        let mut h = Harness::new();
+        let mut opened = Vec::new();
+        wait("the pop-ups come", || {
+            h.paint(&mut v, RECT);
+            opened.extend(v.take_opened());
+            v.floating.len() == 1 && opened.len() == 1
+        });
+        let mut hidden = opened.pop().unwrap().view;
+        assert!(!hidden.is_closed());
+
+        kill_host(&exe, &v.slot);
+        h.paint(&mut v, RECT);
+        hidden.revive();
+        assert!(v.floating.is_empty(), "it closed");
+        assert!(hidden.is_closed());
+        let marker = HostRequest::Close { id: 999 };
+        assert!(v.slot.borrow_mut().host.as_mut().unwrap().send(&marker));
+        let got = host_requests(&requests(&log, |s| host_requests(s).contains(&marker)));
+        let made: Vec<u64> = got.iter().filter_map(|r| match r { HostRequest::Create { id, .. } => Some(*id), _ => None }).collect();
+        assert_eq!(made, [1], "{got:?}");
+        drop(hidden);
+        assert!(v.slot.borrow().exited_closed.is_empty(), "forgotten with their views");
     }
 
     /// Given an agent's hidden pop-up, a person's tab and an agent's hidden
@@ -2660,9 +2812,58 @@ pub(crate) mod tests {
         let listed = |sid: SurfaceId| after.iter().position(|l| l.starts_with(&format!("surface {} ", sid.0)));
         assert_eq!(listed(tab), listed(opener).map(|i| i + 1), "the tab stays beside its opener: {after:?}");
         let lost: Vec<String> = s.toasts().iter().skip(toasts_before).map(|t| t.toast.message.clone()).collect();
-        assert_eq!(lost, [lost_message("Pop-up", "about:blank"), lost_message("Tab", "about:blank")]);
+        assert_eq!(lost, [lost_message("Pop-up", "about:blank", &[]), lost_message("Tab", "about:blank", &[])]);
         let scopes: Vec<_> = s.toasts().iter().skip(toasts_before).map(|t| t.toast.scope).collect();
         assert!(scopes.iter().all(|sc| *sc == scopes[0] && *sc != crate::toasts::Scope::App), "{scopes:?}");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// Given a person's tab at `about:blank` with an agent's hidden pop-up
+    /// of its own, and a pop-up at `about:blank` floating over the page
+    /// that opened the tab, with an agent's hidden pop-up of its own;
+    /// when the host exits and a new one starts;
+    /// then the tab and the floating pop-up go, each with its hidden pop-up,
+    /// and one toast each names both.
+    #[test]
+    fn popups_a_lost_popup_opened_go_with_it_and_are_named() {
+        let dir = TmpDir::new("web-lost-with");
+        let at = |ev: String, url: &str| ev.replace("https://pop.test/", url);
+        let events = [
+            at(popup_event_of(POPUP_IDS, 1, true, "background_tab"), "about:blank"),
+            at(popup_event(POPUP_IDS + 1, POPUP_IDS, false), "https://of-tab.test/"),
+            at(popup_event(POPUP_IDS + 2, 1, true), "about:blank"),
+            at(popup_event(POPUP_IDS + 3, POPUP_IDS + 2, false), "https://of-float.test/"),
+        ];
+        let script = dying_host(&events, "cat > \"$0.requests\"");
+        stub_app_host(&dir, &[], &script);
+        let exe = dir.join("host.sh");
+        let mut s = AppState::new().with_shell_line("sleep 1");
+        s.new_empty_vtab();
+        let mut registry = crate::app_state::build_registry();
+        registry.execute("web.new", &Args::new(), &mut s).unwrap();
+        let opener = s.focused_surface().unwrap();
+        let hidden = |s: &AppState| s.describe().lines().filter(|l| l.starts_with("hidden surface ")).count();
+        wait("the pop-ups are placed", || {
+            s.pump_all();
+            hidden(&s) == 2 && s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap().floating.len() == 1
+        });
+        let toasts_before = s.toasts().len();
+
+        let slot = s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap().slot.clone();
+        kill_host(&exe, &slot);
+        assert!(s.view_mut(opener).unwrap().downcast_mut::<WebView>().unwrap().send(None));
+        s.pump_all();
+        let tree = s.describe();
+        assert_eq!(hidden(&s), 0, "{tree}");
+        assert_eq!(tree.lines().filter(|l| l.contains("surface ")).count(), 1, "the tab went: {tree}");
+        let lost: Vec<String> = s.toasts().iter().skip(toasts_before).map(|t| t.toast.message.clone()).collect();
+        assert_eq!(
+            lost,
+            [
+                lost_message("Tab", "about:blank", &["https://of-tab.test/".into()]),
+                lost_message("Pop-up", "about:blank", &["https://of-float.test/".into()]),
+            ]
+        );
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 

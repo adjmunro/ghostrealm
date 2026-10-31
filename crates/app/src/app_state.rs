@@ -2117,8 +2117,13 @@ impl AppState {
     ///
     /// [`closed_popups`]: Self::closed_popups
     fn drop_closed_popups(&mut self, (mut gone, closed_tabs): (Vec<SurfaceId>, Vec<SurfaceId>)) -> bool {
-        let changed = !gone.is_empty() || !closed_tabs.is_empty();
-        self.tell_lost(&gone, &closed_tabs);
+        let (told, went_with) = self.tell_lost(&gone, &closed_tabs);
+        let changed = told || !gone.is_empty() || !closed_tabs.is_empty();
+        for sid in went_with {
+            if !gone.contains(&sid) {
+                gone.push(sid);
+            }
+        }
         // A hidden pop-up goes with its opener, which may have gone just now.
         while !gone.is_empty() {
             for p in gone {
@@ -2135,28 +2140,81 @@ impl AppState {
         changed
     }
 
-    /// Tell the person about the hidden pop-ups in `hidden` (on their
-    /// opener's pane) and the tabs in `tabs` that a later web host couldn't
-    /// make again.
-    fn tell_lost(&mut self, hidden: &[SurfaceId], tabs: &[SurfaceId]) {
-        let lost = |sid: &SurfaceId| {
-            self.views.get(sid).and_then(|v| v.downcast_ref::<web::WebView>()).filter(|w| w.is_lost())
-        };
-        let mut toasts = Vec::new();
+    /// Tell the person about the pop-ups a later web host couldn't make
+    /// again: the hidden ones in `hidden`, the tabs in `tabs`, and ones that
+    /// floated over a page. Each toast is on its opener's pane (a tab's own)
+    /// and names the hidden and floating pop-ups it opened, which close with
+    /// it. Returns whether any was told, and those hidden pop-ups.
+    fn tell_lost(&mut self, hidden: &[SurfaceId], tabs: &[SurfaceId]) -> (bool, Vec<SurfaceId>) {
+        fn web_of(v: &dyn View) -> Option<&web::WebView> {
+            v.downcast_ref()
+        }
+        let lost = |sid: &SurfaceId| self.views.get(sid).and_then(|v| web_of(v.as_ref())).filter(|w| w.is_lost()).map(web::WebView::lost);
+        // What it was, what went, the surface it was (none for a floating
+        // one), and where to say so.
+        let mut roots: Vec<(&str, web::Lost, Option<SurfaceId>, Scope)> = Vec::new();
         for sid in hidden {
-            if let (Some(w), Some(o)) = (lost(sid), self.hidden.get(sid)) {
-                toasts.push((w.lost_message("Pop-up"), self.scope_of(Some(o.opener))));
+            if let (Some(l), Some(o)) = (lost(sid), self.hidden.get(sid)) {
+                roots.push(("Pop-up", l, Some(*sid), self.scope_of(Some(o.opener))));
             }
         }
         for sid in tabs {
-            if let Some(w) = lost(sid) {
-                toasts.push((w.lost_message("Tab"), self.scope_of(Some(*sid))));
+            if let Some(l) = lost(sid) {
+                roots.push(("Tab", l, Some(*sid), self.scope_of(Some(*sid))));
             }
         }
-        for (message, scope) in toasts {
+        let mut floating = Vec::new();
+        for (sid, view) in self.views.iter_mut() {
+            if let Some(w) = view.downcast_mut::<web::WebView>() {
+                floating.extend(w.take_lost().into_iter().map(|l| (*sid, l)));
+            }
+        }
+        for (sid, l) in floating {
+            let at = self.hidden.get(&sid).map_or(sid, |o| o.opener);
+            roots.push(("Pop-up", l, None, self.scope_of(Some(at))));
+        }
+        // The hidden pop-ups each opened (or one floating over it did), and
+        // theirs, go with it.
+        let mut went_with: Vec<SurfaceId> = Vec::new();
+        for (_, l, surface, _) in &mut roots {
+            let mut of: Vec<SurfaceId> = surface.iter().copied().collect();
+            loop {
+                let mut next: Vec<SurfaceId> = self
+                    .hidden
+                    .iter()
+                    .filter(|(p, o)| {
+                        let opener = self.views.get(p).and_then(|v| web_of(v.as_ref())).and_then(web::WebView::opener_page);
+                        !of.contains(p) && (of.contains(&o.opener) || opener.is_some_and(|op| l.pages.contains(&op)))
+                    })
+                    .map(|(p, _)| *p)
+                    .collect();
+                if next.is_empty() {
+                    break;
+                }
+                next.sort();
+                for p in next {
+                    if let Some(w) = self.views.get(&p).and_then(|v| web_of(v.as_ref())) {
+                        let sub = w.lost();
+                        l.pages.extend(sub.pages);
+                        l.with.push(sub.name);
+                        l.with.extend(sub.with);
+                    }
+                    of.push(p);
+                    went_with.push(p);
+                }
+            }
+        }
+        let told = !roots.is_empty();
+        for (what, l, surface, scope) in roots {
+            // One that went with another is named in the other's toast.
+            if surface.is_some_and(|s| went_with.contains(&s)) {
+                continue;
+            }
+            let message = web::lost_message(what, &l.name, &l.with);
             eprintln!("ghostrealm: web: {message}");
             self.notify(Toast::new(Level::Warning, message).on(scope));
         }
+        (told, went_with)
     }
 
     /// A terminal surface's child state.
