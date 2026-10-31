@@ -1661,6 +1661,45 @@ fn popups_made_again_count_toward_the_cap_and_close_with_their_opener() {
     shut_down(host, &cache);
 }
 
+/// Given a new host, and pop-ups of page 1 made again before page 1 is (the
+/// app makes them in no order);
+/// when one more is made again past the cap, then page 1 is made and
+/// closed;
+/// then the one past the cap is refused, page 1 can open none, and closing
+/// it closes the rest.
+#[test]
+fn popups_made_again_before_their_opener_count_toward_its_cap() {
+    use ghostrealm_web::protocol::{MAX_POPUPS, POPUP_IDS};
+    let Some((host, cache)) = spawn("popup-before-opener") else {
+        return;
+    };
+    let (base, _) = serve();
+    assert!(host.send(&Request::FirstPopup { id: POPUP_IDS + 10 }));
+    let again = |id| Request::Create { id, url: format!("{base}/stay"), width: 200, height: 150, scale: 1.0, agent: true, opener: Some(1) };
+    let ids: Vec<u64> = (0..=MAX_POPUPS as u64).map(|n| POPUP_IDS + n).collect();
+    for id in &ids {
+        assert!(host.send(&again(*id)));
+    }
+    let (made, past) = ids.split_at(MAX_POPUPS);
+    for id in made {
+        assert!(host.wait_loaded(*id, Duration::from_secs(20)), "pop-up {id} never loaded");
+    }
+    wait_closed(&host, past[0]);
+    assert_eq!(host.view(1).map(|v| v.popups_refused), Some(1), "refused as page 1's");
+
+    assert!(host.send(&Request::Create { id: 1, url: format!("{base}/opener"), width: 200, height: 150, scale: 1.0, agent: false, opener: None }));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "page never loaded");
+    let open = host.eval_as(1, "window.open('/stay') !== null", true, Duration::from_secs(5));
+    assert_eq!(open, Ok("false".into()), "page 1 has pop-ups enough");
+    assert!(host.send(&Request::Close { id: 1 }));
+    wait_closed(&host, 1);
+    for id in made {
+        wait_closed(&host, *id);
+    }
+
+    shut_down(host, &cache);
+}
+
 #[test]
 fn an_eval_whose_page_navigates_away_runs_once() {
     let Some((host, cache)) = spawn("navigate") else {
