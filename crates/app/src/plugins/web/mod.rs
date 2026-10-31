@@ -163,10 +163,13 @@ impl HostSlot {
             self.retry_at = None;
             match self.find_host() {
                 None => {
-                    self.error = Some(
-                        "web host not found: build it with `mise run web`, or set [web] host"
-                            .into(),
-                    );
+                    // Why the build script left it out, when it did.
+                    let skipped = option_env!("GHOSTREALM_WEB_BUILD")
+                        .map(|why| format!(" (this build skipped it: {why})"))
+                        .unwrap_or_default();
+                    self.error = Some(format!(
+                        "web host not found: build it with `mise run web`{skipped}, or set [web] host"
+                    ));
                 }
                 Some(exe) => match WebHost::spawn(&exe, self.waker.clone()) {
                     Ok(h) => {

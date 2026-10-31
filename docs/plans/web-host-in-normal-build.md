@@ -63,7 +63,8 @@ stabilization; the workspace `rust-version` is 1.88) the build dir is
 - A test in `crates/app/tests/web_host_build.rs` runs the shape check on its
   own `env!("OUT_DIR")` with real metadata and asserts it is not a skip, so a
   toolchain whose layout changed fails a test instead of silently skipping
-  every build.
+  every build. The build script passes it the triple as
+  `cargo:rustc-env=GHOSTREALM_TARGET`, since a test sees no `TARGET`.
 - The app's artifact dir is `<target_directory>/[<triple>/]<profile>`. It
   must exist as a real directory.
 - The nested target dir is `<target_directory>/web-host`.
@@ -75,8 +76,11 @@ From the workspace root:
 ```
 $CARGO build --locked -p ghostrealm-web-host --features bundle --bins \
   --target-dir <target>/web-host --config 'build.build-dir="<target>/web-host"' \
-  [--target <triple>] --profile <p> --message-format json-render-diagnostics
+  [--target <triple>] --profile <p> --message-format json-render-diagnostics -vv
 ```
+
+The build script reads the JSON messages with `serde_json`, a build-dependency
+of the app.
 
 - `--config build.build-dir`: `--target-dir` doesn't override a
   `build.build-dir` inherited from `CARGO_BUILD_BUILD_DIR` or config. Without

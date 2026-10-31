@@ -642,3 +642,19 @@ mod placement {
         assert_eq!(snapshot(&s.artifact), before);
     }
 }
+
+/// The build script reads this build's `OUT_DIR` against `cargo metadata`;
+/// a Cargo whose build-dir layout changed would make every build skip the
+/// web host, so it fails here instead.
+#[test]
+fn this_builds_out_dir_has_the_shape_the_build_script_expects() {
+    let out = std::process::Command::new(cargo())
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (target, build) = metadata_dirs(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let got = dirs(Path::new(env!("OUT_DIR")), &target, build.as_deref(), env!("GHOSTREALM_TARGET"));
+    assert!(got.is_ok(), "{got:?}");
+}
