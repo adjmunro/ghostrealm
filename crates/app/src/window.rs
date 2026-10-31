@@ -2051,10 +2051,19 @@ impl State {
     }
 
     /// Write `[section] key = value` into `config.toml` and reload it, or
-    /// toast why it wasn't written.
+    /// toast why it wasn't written. A key `config.local.toml` sets is not
+    /// written: the local value would hide it.
     fn set_config(&mut self, section: &str, key: &str, value: &toml::Value) {
-        let written = match ghostrealm_core::config::config_path() {
-            Some(path) => ghostrealm_core::config::write::set(&path, section, key, value),
+        use ghostrealm_core::config::{config_path, local_path, write};
+        if local_path().is_some_and(|l| write::holds(&l, section, key)) {
+            let message = format!("config.local.toml sets {section}.{key}; change it there");
+            self.app.notify(Toast::new(Level::Warning, message).keyed("config_write"));
+            self.window.request_redraw();
+            self.dirty = true;
+            return;
+        }
+        let written = match config_path() {
+            Some(path) => write::set(&path, section, key, value),
             None => Err("there is no config path".to_string()),
         };
         match written {
@@ -5620,7 +5629,7 @@ fn installed_family(db: &glyphon::cosmic_text::fontdb::Database, name: &str) -> 
 /// when there is no config path.
 fn load_config(catalogue: &Catalogue) -> Option<ghostrealm_core::config::Loaded> {
     let loaded = ghostrealm_core::config::load_or_create(catalogue)?;
-    for line in loaded.report.log_lines() {
+    for line in loaded.report.log_lines().into_iter().chain(loaded.local.iter().flat_map(|r| r.log_lines())) {
         eprintln!("{line}");
     }
     Some(loaded)

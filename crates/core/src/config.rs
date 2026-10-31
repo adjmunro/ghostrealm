@@ -599,6 +599,23 @@ fn typed(table: toml::Table, findings: &mut Vec<Finding>) -> Option<Config> {
     }
 }
 
+/// Lay the local file's `local` table over the shared one: [`merge`], after
+/// dropping each shared binding whose chord `local` binds, so that chord runs
+/// the local file's command.
+fn lay_over(shared: &mut toml::Table, local: toml::Table) {
+    let chord = |c: &toml::Value| c.as_str().and_then(normalize_chord);
+    let rebound: std::collections::HashSet<String> = local
+        .get("keybindings")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|b| b.values().filter_map(chord))
+        .collect();
+    if let Some(toml::Value::Table(bindings)) = shared.get_mut("keybindings") {
+        bindings.retain(|_, c| !chord(c).is_some_and(|c| rebound.contains(&c)));
+    }
+    merge(shared, local);
+}
+
 /// Lay `over` onto `base`: tables merge key by key, any other value replaces
 /// the one below.
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -627,8 +644,9 @@ pub fn ensure_file() -> Option<PathBuf> {
 /// What loading the config files found.
 #[derive(Debug)]
 pub struct Loaded {
-    /// `None` when either file can't be read or isn't valid TOML: the caller
-    /// keeps the config it has.
+    /// `None` when `config.toml` can't be read or isn't valid TOML: the
+    /// caller keeps the config it has. A `config.local.toml` like that adds
+    /// nothing.
     pub config: Option<Config>,
     /// `config.toml`'s problems.
     pub report: Report,
@@ -694,14 +712,15 @@ pub fn load(path: PathBuf, local: Option<PathBuf>, cat: &Catalogue) -> Loaded {
         Ok(false) => None,
         _ => Some(read_checked(p, true, cat)),
     });
-    let (table, local) = match (table, local) {
-        (Some(mut table), Some((Some(over), report))) => {
-            merge(&mut table, over);
-            (Some(table), Some(report))
+    // A local file that can't be read or parsed adds nothing; its report
+    // still shows.
+    let mut table = table;
+    let local = local.map(|(over, local_report)| {
+        if let (Some(table), Some(over)) = (table.as_mut(), over) {
+            lay_over(table, over);
         }
-        (_, Some((_, report))) => (None, Some(report)),
-        (table, None) => (table, None),
-    };
+        local_report
+    });
     let mut findings = Vec::new();
     let config = table.and_then(|t| typed(t, &mut findings));
     report.findings.extend(findings.into_iter().map(|f| (1, 1, f.severity, f.message)));
@@ -909,7 +928,21 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_local_file_is_no_layer_and_a_broken_one_applies_nothing() {
+    fn a_chord_the_local_file_binds_runs_the_local_command() {
+        let dir = tmp("local");
+        let (s, l) = layers(
+            &dir,
+            "[keybindings]\n\"pane.close\" = \"cmd+w\"\n\"surface.new\" = \"cmd+t\"\n",
+            "[keybindings]\n\"surface.new\" = \"Super+W\"\n",
+        );
+        let cfg = load(s, Some(l), &cat()).config.unwrap();
+        assert_eq!(cfg.binding("cmd+w").as_deref(), Some("surface.new"));
+        assert_eq!(cfg.binding_for("pane.close"), None, "its chord went to the local command");
+        assert_eq!(cfg.keybindings.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_local_file_is_no_layer_and_a_broken_one_adds_nothing() {
         let dir = tmp("local");
         let (s, l) = layers(&dir, "[terminal]\nfont_size = 13\n", "[terminal]\nfont_size = \"big\"\n[nope]\n");
         let loaded = load(s.clone(), Some(dir.join("absent.toml")), &cat());
@@ -922,10 +955,21 @@ mod tests {
         let shown = loaded.report_to_show();
         assert!(shown.local && shown.path == l && shown.findings.len() == 2, "{shown:?}");
 
+        // Not valid TOML, or unreadable: config.toml applies alone, and the
+        // local file's report shows.
         std::fs::write(&l, "[terminal\n").unwrap();
-        let loaded = load(s, Some(l), &cat());
-        assert!(loaded.config.is_none(), "not valid TOML: keep the running config");
-        assert!(loaded.report_to_show().local);
+        let loaded = load(s.clone(), Some(l.clone()), &cat());
+        assert_eq!(loaded.config.as_ref().unwrap().terminal.font_size, 13.0);
+        assert!(loaded.report_to_show().local && loaded.report_to_show().has_problems());
+        std::fs::remove_file(&l).unwrap();
+        std::fs::create_dir(&l).unwrap();
+        let loaded = load(s.clone(), Some(l.clone()), &cat());
+        assert_eq!(loaded.config.as_ref().unwrap().terminal.font_size, 13.0);
+        assert!(loaded.report_to_show().read_error.is_some());
+
+        // A broken config.toml still applies nothing.
+        std::fs::write(&s, "[terminal\n").unwrap();
+        assert!(load(s, Some(l), &cat()).config.is_none());
     }
 
     #[test]
