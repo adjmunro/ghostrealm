@@ -59,8 +59,9 @@ pub enum Scope {
 /// What one of a toast's choices does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastAction {
-    /// Open the config file, caret at this line (1-based) when given.
-    OpenSettings { line: Option<usize> },
+    /// Open the config file (`config.local.toml` when `local`), caret at
+    /// this line (1-based) when given.
+    OpenSettings { line: Option<usize>, local: bool },
     /// Ask where to save this document (the Save As picker).
     SaveAs(DocRef),
 }
@@ -707,7 +708,7 @@ mod tests {
     fn the_buttons_sit_inside_the_toast_and_only_the_hovered_one_lights_up() {
         let mut h = Harness::new();
         let toast = Toast::new(Level::Warning, "config.toml: 2 problems")
-            .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(3) });
+            .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(3), local: false });
         let layout = paint_at(&mut h, &toast, 600.0, 0, (-1.0, -1.0));
         let hits: Vec<ToastHit> = layout.buttons.iter().map(|(_, hit)| *hit).collect();
         assert_eq!(hits, [ToastHit::Dismiss, ToastHit::Choice(0)]);
@@ -729,7 +730,7 @@ mod tests {
     fn inert_choices_show_but_only_dismiss_is_a_button() {
         let mut h = Harness::new();
         let toast = Toast::new(Level::Warning, "config.toml: 2 problems")
-            .with_choice("Open Settings", ToastAction::OpenSettings { line: None });
+            .with_choice("Open Settings", ToastAction::OpenSettings { line: None, local: false });
         let live = paint_at(&mut h, &toast, 600.0, 0, (-1.0, -1.0));
         let choice = live.buttons[1].0;
         h.frame = Frame::new((800.0, 600.0));

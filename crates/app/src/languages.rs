@@ -11,20 +11,20 @@ use ghostrealm_lsp::{Client, Waker};
 use crate::settings::ConfigServer;
 
 pub struct Languages {
-    config_path: Option<PathBuf>,
+    config_paths: Vec<PathBuf>,
     catalogue: Arc<Catalogue>,
 }
 
 impl Languages {
-    /// Services for the config file at `config_path` (checked against
+    /// Services for the config files at `config_paths` (checked against
     /// `catalogue`).
-    pub fn new(config_path: Option<PathBuf>, catalogue: Arc<Catalogue>) -> Self {
-        Languages { config_path, catalogue }
+    pub fn new(config_paths: Vec<PathBuf>, catalogue: Arc<Catalogue>) -> Self {
+        Languages { config_paths, catalogue }
     }
 
     /// Start the service for `path`, with its LSP language id, if it has one.
     pub fn start(&self, path: &Path, waker: Option<Waker>) -> Option<(Client, &'static str)> {
-        if self.config_path.as_deref().is_some_and(|c| same_file(c, path)) {
+        if self.config_paths.iter().any(|c| same_file(c, path)) {
             let server = ConfigServer::new(self.catalogue.clone());
             return Some((Client::in_process(server, waker), "toml"));
         }
@@ -32,15 +32,7 @@ impl Languages {
     }
 }
 
-/// Whether two paths name the same file: equal, or equal once symlinks and
-/// `..` are resolved.
-pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || match (a.canonicalize(), b.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
-}
+pub(crate) use ghostrealm_core::config::same_file;
 
 #[cfg(test)]
 mod tests {
@@ -57,7 +49,7 @@ mod tests {
         let other = dir.join("other.toml");
         std::fs::write(&other, "").unwrap();
         let catalogue = Arc::new(crate::settings::catalogue(&crate::app_state::build_registry()));
-        let languages = Languages::new(Some(real), catalogue);
+        let languages = Languages::new(vec![real], catalogue);
         assert!(languages.start(&link, None).is_some());
         assert!(languages.start(&other, None).is_none());
     }

@@ -1,4 +1,4 @@
-//! Notices edits to the config file made outside the app (another editor, a
+//! Notices edits to the config files made outside the app (another editor, a
 //! synced dotfile) by comparing its modification time and size. No file-watch
 //! dependency: the window polls on a slow timer while focused and when it
 //! gains focus.
@@ -12,39 +12,57 @@ use crate::file_stamp::Stamp;
 pub const POLL: Duration = Duration::from_secs(2);
 
 pub struct ConfigWatch {
-    path: Option<PathBuf>,
+    files: Vec<Watched>,
+}
+
+struct Watched {
+    path: PathBuf,
     /// The version last loaded or declined; `None` while the file is absent.
     seen: Option<Stamp>,
+    /// Removing the file is a change (it only overrides another).
+    optional: bool,
 }
 
 impl ConfigWatch {
     /// Watch `path`, taking the file as it is now to be the version loaded.
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut w = ConfigWatch { path, seen: None };
+        let files = path.map(|path| Watched { path, seen: None, optional: false });
+        let mut w = ConfigWatch { files: files.into_iter().collect() };
         w.mark_seen();
         w
     }
 
-    fn stamp(&self) -> Option<Stamp> {
-        Stamp::of(self.path.as_ref()?)
-    }
-
-    /// The file as it is now is the version the running config came from (the
-    /// app just loaded or wrote it).
-    pub fn mark_seen(&mut self) {
-        self.seen = self.stamp();
-    }
-
-    /// Whether the file changed since the last version seen. A file that has
-    /// gone missing is not a change (the running config stays); one that
-    /// reappears is.
-    pub fn changed(&mut self) -> bool {
-        let now = self.stamp();
-        if now == self.seen {
-            return false;
+    /// Also watch `path`, a file laid over the first, whose removal is a
+    /// change.
+    pub fn with_overlay(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(path) = path {
+            let seen = Stamp::of(&path);
+            self.files.push(Watched { path, seen, optional: true });
         }
-        self.seen = now;
-        now.is_some()
+        self
+    }
+
+    /// The files as they are now are the versions the running config came
+    /// from (the app just loaded or wrote them).
+    pub fn mark_seen(&mut self) {
+        for f in &mut self.files {
+            f.seen = Stamp::of(&f.path);
+        }
+    }
+
+    /// Whether a file changed since the last version seen. The main file
+    /// gone missing is not a change (the running config stays); its return
+    /// is. An overlay's removal is.
+    pub fn changed(&mut self) -> bool {
+        let mut changed = false;
+        for f in &mut self.files {
+            let now = Stamp::of(&f.path);
+            if now != f.seen {
+                changed |= now.is_some() || f.optional;
+                f.seen = now;
+            }
+        }
+        changed
     }
 
     /// Run `load` if the file changed, returning what it loaded. `load` says
@@ -122,6 +140,21 @@ mod tests {
         assert!(w.changed(), "back again");
         let mut none = ConfigWatch::new(None);
         assert!(!none.changed());
+    }
+
+    #[test]
+    fn an_overlay_edit_or_removal_is_a_change() {
+        let dir = tmpdir("watch");
+        let (path, local) = (dir.join("config.toml"), dir.join("config.local.toml"));
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let mut w = ConfigWatch::new(Some(path)).with_overlay(Some(local.clone()));
+        assert!(!w.changed(), "no overlay yet");
+        std::fs::write(&local, "a = 2\n").unwrap();
+        assert!(w.changed(), "created");
+        assert!(!w.changed());
+        std::fs::remove_file(&local).unwrap();
+        assert!(w.changed(), "removed: the main file applies alone");
+        assert!(!w.changed());
     }
 
     #[test]

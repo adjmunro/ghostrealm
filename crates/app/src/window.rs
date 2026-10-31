@@ -1280,7 +1280,7 @@ impl State {
         let registry = build_registry();
         let catalogue = Arc::new(crate::settings::catalogue(&registry));
         let (cfg, config_report) = match load_config(&catalogue) {
-            Some(l) => (l.config, Some(l.report)),
+            Some(mut l) => (l.config.take(), Some(l)),
             None => (None, None),
         };
         let config_applied = cfg.is_some();
@@ -1311,8 +1311,8 @@ impl State {
         };
         let mut app = AppState::new().with_unsaved_guard();
         app.set_windowed(true);
-        if let Some(report) = &config_report {
-            app.report_config(report, config_applied);
+        if let Some(loaded) = &config_report {
+            app.report_config(loaded.report_to_show(), config_applied);
         }
         app.report_preview_font(missing_font);
         let has_command = command_line.is_some();
@@ -1322,7 +1322,7 @@ impl State {
         app = app
             .with_waker(waker)
             .with_languages(Arc::new(crate::languages::Languages::new(
-                ghostrealm_core::config::config_path(),
+                [ghostrealm_core::config::config_path(), ghostrealm_core::config::local_path()].into_iter().flatten().collect(),
                 catalogue.clone(),
             )));
         app.set_inbox_config(cfg.inbox);
@@ -1411,7 +1411,8 @@ impl State {
             picker_panel: None,
             tooltip_hover: None,
             tooltip_due: None,
-            config_watch: ConfigWatch::new(ghostrealm_core::config::config_path()),
+            config_watch: ConfigWatch::new(ghostrealm_core::config::config_path())
+                .with_overlay(ghostrealm_core::config::local_path()),
             window_focused: true,
             pointer_in: false,
             config_check_due: Instant::now() + config_watch::POLL,
@@ -1490,7 +1491,7 @@ impl State {
 
     /// Report what a config load found, and apply the config it produced.
     fn apply_loaded(&mut self, loaded: ghostrealm_core::config::Loaded) {
-        self.app.report_config(&loaded.report, loaded.config.is_some());
+        self.app.report_config(loaded.report_to_show(), loaded.config.is_some());
         if let Some(cfg) = loaded.config {
             self.apply_config(cfg);
         }
@@ -2040,11 +2041,10 @@ impl State {
         }
     }
 
-    /// A view wrote `path`: hot-reload it if it is the config.
+    /// A view wrote `path`: hot-reload it if it is a config file.
     fn saved(&mut self, path: std::path::PathBuf) {
         self.app.file_saved(&path);
-        let config = ghostrealm_core::config::config_path();
-        if config.is_some_and(|c| crate::languages::same_file(&c, &path)) {
+        if ghostrealm_core::config::is_config_file(&path) {
             self.reload_config();
         }
     }

@@ -23,7 +23,6 @@ use ghostrealm_terminal::{KeyPress, Lifecycle};
 
 use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
-use crate::languages::same_file;
 use crate::plugin::{DocId, EventCx, Plugin, Request, ToastChoice, UiMetrics, View};
 use crate::plugins::editor;
 use crate::plugins::files::{self as files_plugin, FilesView};
@@ -1050,7 +1049,7 @@ impl AppState {
             self.toasts.dismiss_key("preview_font");
             return;
         };
-        let open = ToastAction::OpenSettings { line: None };
+        let open = ToastAction::OpenSettings { line: None, local: false };
         self.notify(Toast::new(Level::Warning, message).keyed("preview_font").with_choice("Open Settings", open));
     }
 
@@ -1087,8 +1086,12 @@ impl AppState {
                     self.toasts.dismiss(id);
                 }
             }
-            ToastAction::OpenSettings { line } => {
-                match self.try_open_settings(settings()) {
+            ToastAction::OpenSettings { line, local } => {
+                let path = match local {
+                    true => ghostrealm_core::config::local_path(),
+                    false => settings(),
+                };
+                match self.try_open_settings(path) {
                     Ok(()) => {
                         if let Some(line) = line {
                             self.reveal_focused_line(line.saturating_sub(1));
@@ -1313,11 +1316,12 @@ impl AppState {
     /// app blur/quit). Returns whether the config file was among what was saved (so
     /// the caller can hot-reload it).
     pub fn autosave_all(&mut self, cfg: &Config) -> bool {
-        self.autosave_all_with_config(cfg, ghostrealm_core::config::config_path().as_deref())
+        self.autosave_all_with_config(cfg, &ghostrealm_core::config::is_config_file)
     }
 
-    /// [`Self::autosave_all`], with the config file at `config_path`.
-    fn autosave_all_with_config(&mut self, cfg: &Config, config_path: Option<&Path>) -> bool {
+    /// [`Self::autosave_all`], with `is_config` saying which files are the
+    /// config.
+    fn autosave_all_with_config(&mut self, cfg: &Config, is_config: &dyn Fn(&Path) -> bool) -> bool {
         let mut saved_config = false;
         let mut failed = Vec::new();
         let mut written = Vec::new();
@@ -1326,7 +1330,7 @@ impl AppState {
                 let Some(d) = view.document_mut(doc) else { continue };
                 match d.autosave(cfg) {
                     Ok(Some(path)) => {
-                        saved_config |= config_path.is_some_and(|c| same_file(c, &path));
+                        saved_config |= is_config(&path);
                         written.push(path);
                     }
                     Ok(None) => {}
@@ -2514,7 +2518,7 @@ fn config_toast(report: &Report, applied: bool) -> Option<Toast> {
         false => (Level::Error, format!("Settings not applied: {message}")),
         true => (Level::Warning, message),
     };
-    let open = ToastAction::OpenSettings { line: first.map(|f| f.0) };
+    let open = ToastAction::OpenSettings { line: first.map(|f| f.0), local: report.local };
     Some(Toast::new(level, message).keyed("config").with_choice("Open Settings", open))
 }
 
@@ -2539,7 +2543,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, "[nope]\n").unwrap();
         let catalogue = Arc::new(crate::settings::catalogue(&build_registry()));
-        let languages = crate::languages::Languages::new(Some(path.clone()), catalogue);
+        let languages = crate::languages::Languages::new(vec![path.clone()], catalogue);
         let mut s = AppState::new().with_languages(Arc::new(languages));
         s.open_settings(path).unwrap();
         let sid = s.focused_surface().expect("the settings editor is focused");
@@ -3273,7 +3277,7 @@ mod tests {
         let id = s.notify(
             Toast::new(Level::Warning, "config.toml line 2: unknown key")
                 .keyed("config")
-                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2) }),
+                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2), local: false }),
         );
         s.choose_toast_with(id, 0, || Some(path.clone()));
         let sid = s.focused_surface().expect("the settings file is focused");
@@ -3293,7 +3297,7 @@ mod tests {
         let id = s.notify(
             Toast::new(Level::Warning, "config.toml line 2: unknown key")
                 .keyed("config")
-                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2) }),
+                .with_choice("Open Settings", ToastAction::OpenSettings { line: Some(2), local: false }),
         );
         s.choose_toast_with(id, 0, || Some(path.clone()));
         let ids: Vec<u64> = s.toasts().iter().map(|e| e.id).collect();
@@ -3304,7 +3308,7 @@ mod tests {
         assert!(toast.message.ends_with("\n\nconfig.toml line 2: unknown key"), "{}", toast.message);
         assert!(toast.choices.is_empty());
         // No config path at all.
-        let id = s.notify(Toast::new(Level::Warning, "w").with_choice("Open Settings", ToastAction::OpenSettings { line: None }));
+        let id = s.notify(Toast::new(Level::Warning, "w").with_choice("Open Settings", ToastAction::OpenSettings { line: None, local: false }));
         s.choose_toast_with(id, 0, || None);
         assert!(s.toasts().get(id).unwrap().toast.message.starts_with("Couldn't open the settings file"));
     }
@@ -3323,6 +3327,7 @@ mod tests {
         use ghostrealm_core::config::Severity;
         Report {
             path: std::path::PathBuf::from("/home/u/.config/ghostrealm/config.toml"),
+            local: false,
             read_error: read_error.map(str::to_string),
             findings: findings.iter().map(|&(line, m)| (line, 1, Severity::Warning, m.to_string())).collect(),
         }
@@ -3340,7 +3345,19 @@ mod tests {
         let key = Some("config".to_string());
         assert_eq!(head(&s), (Level::Error, "Settings not applied: config.toml line 3: expected `=`".into(), key));
         let choices = &s.toasts().head().unwrap().toast.choices;
-        assert!(matches!(choices[..], [(ref label, ToastAction::OpenSettings { line: Some(3) })] if label == "Open Settings"));
+        assert!(matches!(choices[..], [(ref label, ToastAction::OpenSettings { line: Some(3), local: false })] if label == "Open Settings"));
+    }
+
+    #[test]
+    fn a_problem_in_the_local_config_opens_the_local_file() {
+        let mut s = AppState::new();
+        let mut local = report(None, &[(2, "unknown key `x`")]);
+        local.path.set_file_name("config.local.toml");
+        local.local = true;
+        s.report_config(&local, true);
+        assert_eq!(head(&s).1, "config.local.toml line 2: unknown key `x`");
+        let choices = &s.toasts().head().unwrap().toast.choices;
+        assert!(matches!(choices[..], [(_, ToastAction::OpenSettings { line: Some(2), local: true })]));
     }
 
     #[test]
@@ -3422,7 +3439,8 @@ mod tests {
         s.views.get_mut(&sid).unwrap().write_input(b"x");
         let mut cfg = Config::default();
         cfg.editor.autosave_on_unfocus = true;
-        assert!(s.autosave_all_with_config(&cfg, Some(&real)), "the link is the config");
+        let is_config = |p: &Path| crate::languages::same_file(&real, p);
+        assert!(s.autosave_all_with_config(&cfg, &is_config), "the link is the config");
     }
 
     #[test]

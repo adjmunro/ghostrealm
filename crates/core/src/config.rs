@@ -1,6 +1,7 @@
-//! The TOML config: a single shareable dotfile at an XDG path. It lists only
-//! what the user sets; missing fields fall back to defaults
-//! (`#[serde(default)]`). Every option is described in the [`catalogue`], which
+//! The TOML config: a shareable dotfile at an XDG path (`config.toml`,
+//! synced), and beside it `config.local.toml` for this machine only, whose
+//! entries override it. Each lists only what the user sets; missing fields
+//! fall back to defaults (`#[serde(default)]`). Every option is described in the [`catalogue`], which
 //! the [`check`]er (shared by the loader and the config language server) uses
 //! to flag and drop bad entries without rejecting the whole file.
 
@@ -528,6 +529,27 @@ pub fn config_path() -> Option<PathBuf> {
     Some(base.join("ghostrealm").join("config.toml"))
 }
 
+/// The machine-local config file beside [`config_path`]: `config.local.toml`.
+pub fn local_path() -> Option<PathBuf> {
+    Some(config_path()?.with_file_name("config.local.toml"))
+}
+
+/// Whether `path` is one of the config files ([`config_path`],
+/// [`local_path`]), so saving it reloads the config.
+pub fn is_config_file(path: &std::path::Path) -> bool {
+    [config_path(), local_path()].into_iter().flatten().any(|c| same_file(&c, path))
+}
+
+/// Whether two paths name the same file: equal, or equal once symlinks and
+/// `..` are resolved.
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
 /// Command ids that carry a default binding (written into a new config file).
 pub fn default_binding_ids() -> Vec<&'static str> {
     default_bindings().into_values().collect()
@@ -555,7 +577,13 @@ pub fn default_file() -> String {
 pub fn parse(text: &str, cat: &Catalogue) -> (Option<Config>, Vec<Finding>) {
     let checked = check(text, cat);
     let mut findings = checked.findings;
-    let cfg = checked.table.and_then(|t| match toml::Value::Table(t).try_into::<Config>() {
+    let cfg = checked.table.and_then(|t| typed(t, &mut findings));
+    (cfg, findings)
+}
+
+/// `table` as a [`Config`], reporting a mismatch in `findings`.
+fn typed(table: toml::Table, findings: &mut Vec<Finding>) -> Option<Config> {
+    match toml::Value::Table(table).try_into::<Config>() {
         Ok(cfg) => Some(cfg),
         // The checker passed something the typed config rejects: a catalogue
         // entry disagrees with its field.
@@ -567,8 +595,20 @@ pub fn parse(text: &str, cat: &Catalogue) -> (Option<Config>, Vec<Finding>) {
             });
             None
         }
-    });
-    (cfg, findings)
+    }
+}
+
+/// Lay `over` onto `base`: tables merge key by key, any other value replaces
+/// the one below.
+fn merge(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(below)), toml::Value::Table(above)) => merge(below, above),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 /// The config file's path, creating the file with [`default_file`] when absent.
@@ -583,19 +623,35 @@ pub fn ensure_file() -> Option<PathBuf> {
     Some(path)
 }
 
-/// What loading the config file found.
+/// What loading the config files found.
 #[derive(Debug)]
 pub struct Loaded {
-    /// `None` when the file can't be read or isn't valid TOML: the caller
+    /// `None` when either file can't be read or isn't valid TOML: the caller
     /// keeps the config it has.
     pub config: Option<Config>,
+    /// `config.toml`'s problems.
     pub report: Report,
+    /// `config.local.toml`'s problems, when that file exists.
+    pub local: Option<Report>,
+}
+
+impl Loaded {
+    /// The report to tell the user about: the first with problems, else
+    /// `config.toml`'s.
+    pub fn report_to_show(&self) -> &Report {
+        match &self.local {
+            Some(local) if !self.report.has_problems() && local.has_problems() => local,
+            _ => &self.report,
+        }
+    }
 }
 
 /// The problems a load found in the config file.
 #[derive(Debug)]
 pub struct Report {
     pub path: PathBuf,
+    /// The machine-local file (`config.local.toml`).
+    pub local: bool,
     /// Why the file couldn't be read.
     pub read_error: Option<String>,
     /// Each finding: 1-based line and column (in chars), severity, message.
@@ -623,30 +679,51 @@ impl Report {
     }
 }
 
-/// Read the config file (see [`ensure_file`]). `None` when there is no
-/// config path (no home directory).
+/// Read the config files (see [`ensure_file`], [`local_path`]). `None`
+/// when there is no config path (no home directory).
 pub fn load_or_create(cat: &Catalogue) -> Option<Loaded> {
-    Some(load(ensure_file()?, cat))
+    Some(load(ensure_file()?, local_path(), cat))
 }
 
-/// Read and check the config file at `path`.
-pub fn load(path: PathBuf, cat: &Catalogue) -> Loaded {
+/// Read and check the config file at `path`, with the machine-local file at
+/// `local` (if it exists) laid over it.
+pub fn load(path: PathBuf, local: Option<PathBuf>, cat: &Catalogue) -> Loaded {
+    let (table, mut report) = read_checked(path, false, cat);
+    let local = local.and_then(|p| match p.try_exists() {
+        Ok(false) => None,
+        _ => Some(read_checked(p, true, cat)),
+    });
+    let (table, local) = match (table, local) {
+        (Some(mut table), Some((Some(over), report))) => {
+            merge(&mut table, over);
+            (Some(table), Some(report))
+        }
+        (_, Some((_, report))) => (None, Some(report)),
+        (table, None) => (table, None),
+    };
+    let mut findings = Vec::new();
+    let config = table.and_then(|t| typed(t, &mut findings));
+    report.findings.extend(findings.into_iter().map(|f| (1, 1, f.severity, f.message)));
+    Loaded { config, report, local }
+}
+
+/// Read and check one config file: its checked table (`None` when it can't
+/// be read or isn't valid TOML) and its report.
+fn read_checked(path: PathBuf, local: bool, cat: &Catalogue) -> (Option<toml::Table>, Report) {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) => {
-            let report = Report { path, read_error: Some(e.to_string()), findings: Vec::new() };
-            return Loaded { config: None, report };
-        }
+        Err(e) => return (None, Report { path, local, read_error: Some(e.to_string()), findings: Vec::new() }),
     };
-    let (config, findings) = parse(&text, cat);
-    let findings = findings
+    let checked = check(&text, cat);
+    let findings = checked
+        .findings
         .into_iter()
         .map(|f| {
             let (line, col) = line_col(&text, f.span.start);
             (line, col, f.severity, f.message)
         })
         .collect();
-    Loaded { config, report: Report { path, read_error: None, findings } }
+    (checked.table, Report { path, local, read_error: None, findings })
 }
 
 /// 1-based line and column (in chars) of byte `offset` in `text`.
@@ -783,7 +860,7 @@ mod tests {
         let dir = tmp("clamp");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[terminal]\nfont_size = 1000\n").unwrap();
-        let loaded = load(path.clone(), &cat());
+        let loaded = load(path.clone(), None, &cat());
         assert_eq!(loaded.config.unwrap().terminal.font_size, 96.0, "clamped and applied");
         let r = loaded.report;
         assert!(r.read_error.is_none());
@@ -798,10 +875,56 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_reported_and_not_applied() {
         let dir = tmp("unreadable");
-        let loaded = load(dir.to_path_buf(), &cat());
+        let loaded = load(dir.to_path_buf(), None, &cat());
         assert!(loaded.config.is_none());
         assert!(loaded.report.read_error.is_some());
         assert!(loaded.report.log_lines()[0].starts_with("ghostrealm: can't read "));
+    }
+
+    /// `config.toml` and `config.local.toml` in a temp dir.
+    fn layers(dir: &crate::test_dir::TmpDir, shared: &str, local: &str) -> (PathBuf, PathBuf) {
+        let (s, l) = (dir.join("config.toml"), dir.join("config.local.toml"));
+        std::fs::write(&s, shared).unwrap();
+        std::fs::write(&l, local).unwrap();
+        (s, l)
+    }
+
+    #[test]
+    fn the_local_file_overrides_the_shared_one_entry_by_entry() {
+        let dir = tmp("local");
+        let (s, l) = layers(
+            &dir,
+            "[terminal]\nfont_size = 13\nline_height = 20\n[keybindings]\n\"pane.close\" = \"cmd+w\"\n\"surface.new\" = \"cmd+t\"\n",
+            "[terminal]\nfont_size = 18\n[keybindings]\n\"surface.new\" = \"cmd+y\"\n[tabs]\nautohide_single_tab = false\n",
+        );
+        let loaded = load(s, Some(l), &cat());
+        let cfg = loaded.config.unwrap();
+        assert_eq!((cfg.terminal.font_size, cfg.terminal.line_height), (18.0, 20.0));
+        assert_eq!(cfg.binding("cmd+y").as_deref(), Some("surface.new"));
+        assert_eq!(cfg.binding("cmd+t"), None);
+        assert_eq!(cfg.binding("cmd+w").as_deref(), Some("pane.close"), "kept from the shared file");
+        assert!(!cfg.tabs.autohide_single_tab);
+        assert!(!loaded.report.has_problems() && !loaded.local.unwrap().has_problems());
+    }
+
+    #[test]
+    fn a_missing_local_file_is_no_layer_and_a_broken_one_applies_nothing() {
+        let dir = tmp("local");
+        let (s, l) = layers(&dir, "[terminal]\nfont_size = 13\n", "[terminal]\nfont_size = \"big\"\n[nope]\n");
+        let loaded = load(s.clone(), Some(dir.join("absent.toml")), &cat());
+        assert_eq!(loaded.config.unwrap().terminal.font_size, 13.0);
+        assert!(loaded.local.is_none());
+
+        // A bad entry costs that entry; the report shown is the local one's.
+        let loaded = load(s.clone(), Some(l.clone()), &cat());
+        assert_eq!(loaded.config.as_ref().unwrap().terminal.font_size, 13.0);
+        let shown = loaded.report_to_show();
+        assert!(shown.local && shown.path == l && shown.findings.len() == 2, "{shown:?}");
+
+        std::fs::write(&l, "[terminal\n").unwrap();
+        let loaded = load(s, Some(l), &cat());
+        assert!(loaded.config.is_none(), "not valid TOML: keep the running config");
+        assert!(loaded.report_to_show().local);
     }
 
     #[test]
@@ -809,7 +932,7 @@ mod tests {
         let dir = tmp("clean");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[terminal]\nfont_size = 14\n").unwrap();
-        let loaded = load(path, &cat());
+        let loaded = load(path, None, &cat());
         assert!(loaded.config.is_some());
         assert!(!loaded.report.has_problems());
     }
