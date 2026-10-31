@@ -341,10 +341,13 @@ Through skills only, not `.claude/settings.json`:
 - Old units, such as the `cef`/`cef-dll-sys` units in the main checkout's
   `target/debug` (~1.8 GB): `cargo test -p ghostrealm-web-host`, `--workspace`
   and rust-analyzer can still build them there, so no rule by package name.
-  A new opt-in `--unused-days N` removes a unit whose fingerprint dir and
-  `deps/` files were neither modified nor accessed (atime, where recorded) in
-  N days. Where atime isn't recorded, an in-use unit older than N days goes
-  too and is rebuilt; it costs a compile, never data. One exception: in a
+  A new opt-in `--unused-days N` removes a unit whose fingerprint dir, build
+  dir (and their direct entries) and `deps/` files were neither modified nor
+  accessed (atime, where recorded) in N days. Atime counts only for files
+  clean-stale doesn't read itself (`*.json`, `*.d`, a build script's
+  fingerprint hash file): APFS updates atime on read, so its own runs would
+  otherwise keep every unit. Where atime isn't recorded, an in-use unit older
+  than N days goes too and is rebuilt; it costs a compile, never data. One exception: in a
   nested `web-host` target dir, build-script runs (and the compiles they go
   with) of package versions `Cargo.lock` lists are kept whatever their age,
   since without atime the current `cef-dll-sys` run would go and the next
