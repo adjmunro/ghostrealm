@@ -18,7 +18,8 @@ run = [
     'if [ -n "${CARGO_TARGET_DIR:-}" ]; then echo "CARGO_TARGET_DIR is set; clean-stale skipped"; elif ! mise run clean-stale; then echo "clean-stale failed; the web host is bundled"; fi',
 ]
 
-# Remove build artifacts that a newer build superseded (Cargo never does).
+# Remove build artifacts that a newer build superseded (Cargo never does), in
+# target/ and in target/web-host (the web host's own target dir).
 # `mise run clean-stale -- --dry-run` lists what would go; see
 # scripts/clean-stale.rs for what is kept. A target dir a build holds is skipped.
 [tasks.clean-stale]
@@ -29,7 +30,8 @@ run = "mkdir -p target && rustc -O --edition 2021 scripts/clean-stale.rs -o targ
 # target dirs in this project's scratchpads and ghostrealm target dirs in the
 # temp dir are emptied once idle and no running program lives in them. Idle:
 # nothing built or run there for --idle-hours (default 2). Emptying keeps
-# CACHEDIR.TAG, the lock files and dirs with other locks. Also removes temp-dir
+# CACHEDIR.TAG, the lock files and dirs with other locks; target/web-host is
+# emptied under its own locks. Also removes temp-dir
 # leftovers of tests and web hosts that are gone. Emptying and temp-dir removal
 # need what runs, which is read only on macOS. `-- --dry-run` lists what would
 # go.

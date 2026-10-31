@@ -1,7 +1,9 @@
-//! Removes build artifacts under `target/{debug,release}` that a newer build of
-//! the same unit superseded. Cargo never removes them: every change of
-//! toolchain, dependency version, feature set, or profile leaves the old
-//! hashed copies in `deps/`, `build/`, `.fingerprint/` and `incremental/`.
+//! Removes build artifacts under `target/{debug,release}` (and
+//! `target/web-host/{debug,release}`, where the app's build script builds the
+//! web host) that a newer build of the same unit superseded. Cargo never
+//! removes them: every change of toolchain, dependency version, feature set,
+//! or profile leaves the old hashed copies in `deps/`, `build/`,
+//! `.fingerprint/` and `incremental/`.
 //!
 //! A unit (one `.fingerprint/<package>-<hash>` directory) is identified by what
 //! its fingerprint records: target kind (`lib`, `test-bin`, `build-script`,
@@ -29,8 +31,8 @@
 //! lost directory only costs one slower compile.
 //!
 //! Only `target/` is touched; `~/.cargo` is never read or written. A target
-//! dir is skipped while a build holds Cargo's locks on its `debug` or
-//! `release` dir (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`),
+//! dir (`target/web-host` counts as one of its own) is skipped while a build
+//! holds Cargo's locks on its `debug` or `release` dir (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`),
 //! or one can't be opened, and they are held while cleaning, so a build that
 //! starts meanwhile waits. Missing lock files are created (with their profile
 //! dir), except with `--dry-run`, which creates nothing and locks only the
@@ -71,10 +73,13 @@
 //! dir in it with lock files (a custom profile's or a target triple's) is
 //! kept whole, as is one modified since the locks were taken (a build may
 //! have created it and not yet its lock file) and a symlinked `debug` or
-//! `release` (unlocked: a build may be using it).
+//! `release` (unlocked: a build may be using it). Its `web-host` target dir
+//! is emptied the same way under its own locks, and kept whole while a build
+//! holds them.
 //!
 //! Idle means `--idle-hours` (default 2) have passed since a unit dir
-//! (`deps`, `.fingerprint`, `incremental`, `build`) in `debug` or `release`,
+//! (`deps`, `.fingerprint`, `incremental`, `build`) in `debug` or `release`
+//! (its own or `web-host`'s),
 //! or `.rustc_info.json`, was modified or any executable in those profiles
 //! was run (by its access time, where the filesystem records one), and, for
 //! a worktree, since its git index or `HEAD` changed. Cargo writes nothing
@@ -122,6 +127,10 @@ const KEEP_INCREMENTAL: usize = 4;
 /// a CEF temp dir may belong to a host that started after the process list
 /// was read.
 const TEMP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// The app's build script builds the web host in this target dir of its
+/// own, inside the app's (`<target>/web-host`), with the same `Cargo.lock`.
+const NESTED: &str = "web-host";
 
 /// Cargo's lock files in a profile dir.
 const LOCK_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
@@ -268,12 +277,23 @@ fn main() -> ExitCode {
     }
 }
 
-/// Remove the superseded units of `target`, unless a build holds it.
+/// Remove the superseded units of `target` and of its nested web host
+/// target dir, each unless a build holds it.
 fn clean_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
     if opts.excepts(target) {
         println!("{}: excepted; kept", target.display());
         return 0;
     }
+    let mut bytes = clean_one_target(target, lock, opts);
+    let nested = target.join(NESTED);
+    if real_dir(&nested) && is_target(&nested) {
+        bytes += clean_one_target(&nested, lock, opts);
+    }
+    bytes
+}
+
+/// Remove the superseded units of `target` alone, unless a build holds it.
+fn clean_one_target(target: &Path, lock: &Lock, opts: &Opts) -> u64 {
     let _held = match BuildLock::take(target, opts.dry_run) {
         Ok(held) => held,
         Err(why) => {
@@ -610,14 +630,16 @@ fn owner(_pid: u32) -> Owner {
 }
 
 /// When anything last happened in `target`: the newest modification of its
-/// profiles' unit directories and of `.rustc_info.json`, and the newest
-/// access of the executables in the profiles (running one records it). Not
+/// and its web host target's profiles' unit directories and of
+/// `.rustc_info.json`, and the newest access of the executables in those
+/// profiles (running one records it). Not
 /// the target or profile dirs themselves, nor the lock files: taking the
 /// locks creates any that are missing.
 fn last_active(target: &Path) -> SystemTime {
     let mut newest = mtime(&target.join(".rustc_info.json"));
-    for profile in ["debug", "release"] {
-        let dir = target.join(profile);
+    let nested = target.join(NESTED);
+    let profiles = ["debug", "release"].into_iter().flat_map(|p| [target.join(p), nested.join(p)]);
+    for dir in profiles {
         for name in ["deps", ".fingerprint", "incremental", "build"] {
             newest = newest.max(mtime(&dir.join(name)));
         }
@@ -716,8 +738,9 @@ fn emptied_bytes(idle: Idle) -> u64 {
 
 /// Remove everything in `target` but its `CACHEDIR.TAG`, the `debug` and
 /// `release` lock files (held by the caller), a symlinked `debug` or
-/// `release` (not locked, so a build may be using it), any other dir with
-/// lock files, and any other dir modified since `locked` (when the caller
+/// `release` (not locked, so a build may be using it), the web host target
+/// dir's own tag and lock files (whole while a build holds them), any other
+/// dir with lock files, and any other dir modified since `locked` (when the caller
 /// took the locks): a build creates a custom profile's or a triple's dir
 /// before its lock file. A build waiting on a lock holds that file open: were it
 /// unlinked, the build would lock a file no other build sees.
@@ -739,6 +762,12 @@ fn empty_target(target: &Path, locked: SystemTime, opts: &Opts) -> u64 {
                 if !LOCK_FILES.iter().any(|l| f.file_name() == *l) {
                     bytes += remove(&f.path(), opts);
                 }
+            }
+        } else if dir && name == NESTED && is_target(&path) {
+            // The web host's target dir: emptied the same way, under its own locks.
+            match BuildLock::take(&path, opts.dry_run) {
+                Ok(held) => bytes += empty_target(&path, held.at, opts),
+                Err(why) => println!("{}: {why}; kept", path.display()),
             }
         } else if dir && has_lock_files(&path) {
             println!("{}: holds locks this run doesn't; kept", path.display());
@@ -1603,6 +1632,90 @@ mod tests {
         let held = BuildLock::take(&dir, false).expect("free once the build is done");
         assert!(File::open(dir.join("debug/.cargo-build-lock")).unwrap().try_lock().is_err(), "held while cleaning");
         drop(held);
+    }
+
+    /// `n` units of one identity in `profile`, newest first; returns their
+    /// fingerprint dirs.
+    fn same_units(profile: &Path, n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let name = format!("foo-{:016x}", 0xa0 + i);
+                unit(profile, &name, "lib-foo", r#"{"features":"[]","target":1}"#, None);
+                let fp = profile.join(".fingerprint").join(&name);
+                set_mtime(&fp.join("lib-foo.json"), SystemTime::now() - Duration::from_secs(60 * (i as u64 + 1)));
+                fp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn superseded_units_in_the_web_host_target_are_removed() {
+        let t = tmpdir("nested");
+        target(&t);
+        target(&t.join(NESTED));
+        let outer = same_units(&t.join("debug"), 4);
+        let nested = same_units(&t.join("web-host/debug"), 4);
+        clean_target(&t, &Lock::default(), &opts());
+        for units in [&outer, &nested] {
+            assert!(units[..3].iter().all(|u| u.is_dir()), "the newest 3 stay");
+            assert!(!units[3].exists(), "the oldest goes");
+        }
+    }
+
+    #[test]
+    fn a_held_web_host_lock_skips_only_the_web_host_target() {
+        let t = tmpdir("nested-held");
+        target(&t);
+        target(&t.join(NESTED));
+        let outer = same_units(&t.join("debug"), 4);
+        let nested = same_units(&t.join("web-host/debug"), 4);
+        let build = File::create(t.join("web-host/debug/.cargo-build-lock")).unwrap();
+        build.lock().unwrap();
+        clean_target(&t, &Lock::default(), &opts());
+        assert!(!outer[3].exists(), "the outer target is cleaned");
+        assert!(nested.iter().all(|u| u.is_dir()), "the held web host target is not");
+    }
+
+    /// A web host target in `t` (itself a target) with a lock file and a
+    /// build product.
+    fn nested_target(t: &Path) -> PathBuf {
+        let n = t.join(NESTED);
+        target(&n);
+        fs::create_dir_all(n.join("debug/deps")).unwrap();
+        fs::write(n.join("debug/deps/x"), "x").unwrap();
+        File::create(n.join("debug/.cargo-lock")).unwrap();
+        fs::create_dir_all(n.join("debug/ghostrealm-web-host.app/Contents")).unwrap();
+        n
+    }
+
+    #[test]
+    fn emptying_empties_the_web_host_target_and_keeps_its_tag_and_lock_files() {
+        let t = tmpdir("empty-nested");
+        target(&t);
+        let n = nested_target(&t);
+        let held = BuildLock::take(&t, false).expect("no build holds it");
+        empty_target(&t, held.at, &opts());
+        drop(held);
+        let mut want = vec!["CACHEDIR.TAG".to_string(), "debug".into(), "release".into()];
+        for p in ["debug", "release"] {
+            want.extend(LOCK_FILES.iter().map(|l| format!("{p}/{l}")));
+        }
+        want.sort();
+        assert_eq!(listing(&n), want);
+    }
+
+    #[test]
+    fn a_held_web_host_lock_keeps_the_web_host_target_whole_when_emptying() {
+        let t = tmpdir("empty-nested-held");
+        target(&t);
+        let n = nested_target(&t);
+        let build = File::create(n.join("debug/.cargo-build-lock")).unwrap();
+        build.lock().unwrap();
+        let before = listing(&n);
+        let held = BuildLock::take(&t, false).expect("the outer target is free");
+        empty_target(&t, held.at, &opts());
+        drop(held);
+        assert_eq!(listing(&n), before);
     }
 
     #[test]
