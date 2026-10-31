@@ -21,6 +21,8 @@ pub(crate) enum ButtonAction {
     CloseSurface(VtabId, PaneId, SurfaceId),
     /// Show/hide the workspace sidebar.
     ToggleSidebar,
+    /// Fold or unfold the sidebar's directory group this workspace is in.
+    ToggleGroup(VtabId),
     /// Open a plugin's content in the given pane (the "nothing open" picker).
     OpenPlugin(VtabId, PaneId, &'static str),
     /// A button a view registered while painting: (owning surface, view-local id).

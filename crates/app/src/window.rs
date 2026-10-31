@@ -6,6 +6,7 @@
 //! commands through the registry; other keys go to the focused surface.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ghostrealm_core::config::Catalogue;
+use ghostrealm_core::sidebar::{self, Row};
 use ghostrealm_core::{
     ArgKind, ArgSpec, Args, Axis, Chrome, CommandMeta, Config, Divider, PaneId, Rect, Registry, Side,
     SurfaceId, TabStatus, Value, VtabId,
@@ -44,7 +46,15 @@ use crate::dividers::{self, Dividers, Press};
 use crate::pointer::{self, ButtonAction, Gate, RightPress};
 use crate::toasts::{self, Level, Toast, ToastHit};
 use crate::images::ImageRenderer;
+use crate::slide::Slides;
 use crate::tap::{HeldKey, TapDetector};
+
+/// A sidebar row, for gliding it to its new place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SidebarKey {
+    Vtab(VtabId),
+    Group(bool, std::path::PathBuf),
+}
 
 /// Divider gap between split panes, in physical pixels.
 const DIVIDER: f32 = 6.0;
@@ -341,6 +351,12 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(d) = state.app.toasts().next_deadline() {
             wake = Some(wake.map_or(d, |w| w.min(d)));
         }
+        // Sidebar rows gliding to their new places draw every frame.
+        if state.sidebar_slides.moving(Instant::now()) {
+            state.dirty = true;
+            let d = Instant::now() + FRAME_INTERVAL;
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
         if let Some(d) = state.tooltip_due {
             if Instant::now() >= d {
                 state.dirty = true;
@@ -426,6 +442,7 @@ impl ApplicationHandler<UserEvent> for App {
                     state.dirty = true;
                     redraw = true;
                 }
+                redraw |= state.update_sidebar_hold();
                 if redraw {
                     state.window.request_redraw();
                 }
@@ -457,6 +474,7 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw |= state.update_button_hover();
                 redraw |= state.update_htab_hover();
                 redraw |= state.update_divider_hover();
+                redraw |= state.update_sidebar_hold();
                 // Hover reaches the view under the cursor (e.g. the file browser's
                 // highlight follows the mouse).
                 redraw |= state.hover_view();
@@ -653,6 +671,14 @@ struct State {
     sidebar_max_scroll: f32,
     /// Workspace rows as last rendered: (rect, vtab id), for click/right-click.
     sidebar_rows: Vec<(Rect, ghostrealm_core::VtabId)>,
+    /// The sidebar's order, held while the pointer is over it.
+    sidebar_order: sidebar::Order,
+    /// Whether the last frame held the order (the pointer was over the sidebar).
+    sidebar_held: bool,
+    /// Folded directory groups: (in the pinned list, root directory).
+    folded_groups: HashSet<(bool, std::path::PathBuf)>,
+    /// Sidebar rows gliding to a new place after a re-sort.
+    sidebar_slides: Slides<SidebarKey>,
     /// Close-button ('×') hit rects as last rendered, for tabs and workspaces.
     buttons: Vec<(Rect, ButtonAction)>,
     /// Index into `buttons` of the close button under the cursor, if any — used
@@ -880,6 +906,8 @@ enum MenuAction {
     Dismiss,
     Rename,
     SetDir,
+    /// Move the workspace between the pinned list and the other.
+    TogglePin,
     Close,
     /// An item of the file menu.
     File(FileAction),
@@ -1357,6 +1385,10 @@ impl State {
             sidebar_scroll: 0.0,
             sidebar_max_scroll: 0.0,
             sidebar_rows: Vec::new(),
+            sidebar_order: sidebar::Order::default(),
+            sidebar_held: false,
+            folded_groups: HashSet::new(),
+            sidebar_slides: Slides::default(),
             buttons: Vec::new(),
             button_hover: None,
             htab_hover: None,
@@ -1660,6 +1692,19 @@ impl State {
         x >= r.x && x < r.x + r.w
     }
 
+    /// Whether the pointer is over the shown sidebar, so its order holds.
+    fn over_sidebar(&self) -> bool {
+        self.pointer_in && !self.sidebar_hidden && rect_contains(self.sidebar_rect(), self.cursor.0, self.cursor.1)
+    }
+
+    /// Redraw when the pointer has crossed the sidebar's edge since the last
+    /// frame: leaving it lets a held order re-sort. Returns whether it did.
+    fn update_sidebar_hold(&mut self) -> bool {
+        let crossed = self.over_sidebar() != self.sidebar_held;
+        self.dirty |= crossed;
+        crossed
+    }
+
     /// The workspace vtab under a sidebar point, from the last render's rows.
     fn sidebar_vtab_at(&self, x: f32, y: f32) -> Option<ghostrealm_core::VtabId> {
         self.sidebar_rows
@@ -1726,6 +1771,13 @@ impl State {
             ButtonAction::CloseVtab(id) => self.app.close_vtab(id),
             ButtonAction::CloseSurface(vt, pid, sid) => self.app.close_surface(vt, pid, sid),
             ButtonAction::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
+            ButtonAction::ToggleGroup(member) => {
+                if let Some(key) = self.app.tree.vtab(member).and_then(|v| Some((v.pinned, v.root_dir.clone()?))) {
+                    if !self.folded_groups.remove(&key) {
+                        self.folded_groups.insert(key);
+                    }
+                }
+            }
             ButtonAction::OpenPlugin(vt, pane, id) => self.app.open_requested_plugin(Some((vt, pane)), id),
             ButtonAction::View(sid, id) => {
                 self.view_event(sid, |v, cx| v.button(cx, id));
@@ -2303,13 +2355,16 @@ impl State {
             self.dirty = true;
             return;
         };
-        let status = self.app.tree.vtab(target).map(|v| v.status);
+        let Some((status, pinned)) = self.app.tree.vtab(target).map(|v| (v.status, v.pinned)) else {
+            return;
+        };
         let mut items = Vec::new();
         match status {
-            Some(TabStatus::Unread { .. }) => items.push(MenuRow::new("Mark read", MenuAction::MarkRead)),
-            Some(TabStatus::NeedsInput) => items.push(MenuRow::new("Dismiss", MenuAction::Dismiss)),
+            TabStatus::Unread { .. } => items.push(MenuRow::new("Mark read", MenuAction::MarkRead)),
+            TabStatus::NeedsInput => items.push(MenuRow::new("Dismiss", MenuAction::Dismiss)),
             _ => items.push(MenuRow::new("Mark unread", MenuAction::MarkUnread)),
         }
+        items.push(MenuRow::new(if pinned { "Unpin" } else { "Pin" }, MenuAction::TogglePin));
         items.push(MenuRow::new("Rename…", MenuAction::Rename));
         items.push(MenuRow::new("Set directory…", MenuAction::SetDir));
         items.push(MenuRow::new("Close workspace", MenuAction::Close));
@@ -2387,6 +2442,11 @@ impl State {
                 .tree
                 .set_status(target, TabStatus::Unread { success: true }),
             MenuAction::Close => self.app.close_vtab(target),
+            MenuAction::TogglePin => {
+                if let Some(v) = self.app.tree.vtab_mut(target) {
+                    v.pinned = !v.pinned;
+                }
+            }
             // Rename / Set directory act on the active workspace, so focus the
             // target first, then open the argument prompt for the command.
             MenuAction::Rename => {
@@ -3302,31 +3362,13 @@ impl State {
         let text_x = bar_x + pad + dot + 6.0 * self.scale;
         let metrics = self.metrics();
         let active = self.app.tree.active_vtab();
-        #[allow(clippy::type_complexity)]
-        let vtabs: Vec<(
-            ghostrealm_core::VtabId,
-            String,
-            bool,
-            TabStatus,
-            bool,
-            Option<std::path::PathBuf>,
-        )> = self
-            .app
-            .tree
-            .vtabs()
-            .iter()
-            .map(|v| {
-                (
-                    v.id,
-                    v.name.clone(),
-                    v.user_named,
-                    v.status,
-                    Some(v.id) == active,
-                    self.app.vtab_dir(v.id),
-                )
-            })
-            .collect();
-        let n = vtabs.len();
+        let hold = self.over_sidebar();
+        self.sidebar_held = hold;
+        let folded = &self.folded_groups;
+        let order = self
+            .sidebar_order
+            .rows(&self.app.tree, hold, &|pinned, dir| folded.contains(&(pinned, dir.to_path_buf())));
+        let n = order.len();
 
         quads.push(rect_quad(
             Rect {
@@ -3341,7 +3383,7 @@ impl State {
             1.0,
         ));
 
-        // One buffer per workspace plus one for the pinned "+" button.
+        // One buffer per row plus one for the pinned "+" button.
         while self.sidebar_buffers.len() < n + 1 {
             let b = Buffer::new(&mut self.text.font_system, metrics);
             self.sidebar_buffers.push(b);
@@ -3400,94 +3442,142 @@ impl State {
         });
         self.buttons.push((btn, ButtonAction::NewVtab));
 
-        // Scrollable workspace list below the pinned button. Rows are variable
-        // height: an unnamed workspace shows just its (shortened) directory on one
-        // line; a renamed one shows the name over a greyed directory on two lines.
+        // Scrollable list below the pinned button. Rows are variable height: an
+        // unnamed workspace shows just its (shortened) directory on one line; a
+        // renamed one shows the name over a greyed directory on two lines; under
+        // a directory header a workspace shows its name alone, indented.
         let list_top = btn_y + row_h;
         let visible_h = (sh - list_top).max(0.0);
         let vpad = 8.0 * self.scale;
         let close_w = self.cell_h;
         let close_x = bar_x + bar_w - close_w - pad;
+        let indent = 12.0 * self.scale;
         let text_w_chars = (((close_x - text_x) / self.cell_w).floor() as usize).max(3);
 
-        // Per-row display + height.
-        let dir_color = [140, 140, 155];
-        let name_color = [220, 220, 230];
-        let mut rows: Vec<(bool, Option<String>, String, bool)> = Vec::with_capacity(n);
-        let mut heights: Vec<f32> = Vec::with_capacity(n);
-        for (_id, name, user_named, _status, _active, dir) in &vtabs {
-            let dir_short = dir.as_ref().map(|d| shorten_dir(d, text_w_chars));
-            let two_line = *user_named && dir_short.is_some();
-            // Line 1 label: the name if named, else the directory shorthand
-            // (falling back to the stored name only when there's no directory).
-            let label = if *user_named {
-                name.clone()
-            } else {
-                dir_short.clone().unwrap_or_else(|| name.clone())
-            };
-            heights.push(if two_line { 2.0 } else { 1.0 } * self.cell_h + vpad);
-            rows.push((two_line, dir_short, label, name.as_str() == SETTINGS_VTAB_NAME));
+        /// What one sidebar row shows.
+        struct Line {
+            key: SidebarKey,
+            /// The workspace; `None` for a directory header.
+            vtab: Option<VtabId>,
+            /// A header's group, named by a member.
+            header: Option<VtabId>,
+            indent: f32,
+            label: String,
+            /// A greyed second line: a named workspace's directory.
+            sub: Option<String>,
+            italic: bool,
+            dot: Option<TabStatus>,
+            active: bool,
         }
+        let mut lines: Vec<Line> = Vec::with_capacity(n);
+        for row in &order {
+            match row {
+                Row::Group { pinned, dir, collapsed, status, lead } => {
+                    let chevron = if *collapsed { '\u{25b8}' } else { '\u{25be}' };
+                    lines.push(Line {
+                        key: SidebarKey::Group(*pinned, dir.clone()),
+                        vtab: None,
+                        header: Some(*lead),
+                        indent: 0.0,
+                        label: format!("{chevron} {}", shorten_dir(dir, text_w_chars.saturating_sub(2).max(3))),
+                        sub: None,
+                        italic: false,
+                        // Folded, the header stands for its members' dots.
+                        dot: collapsed.then_some(*status),
+                        active: false,
+                    });
+                }
+                Row::Vtab { id, grouped } => {
+                    let Some(v) = self.app.tree.vtab(*id) else { continue };
+                    let dir_short = self.app.vtab_dir(*id).map(|d| shorten_dir(&d, text_w_chars));
+                    let (label, sub) = if *grouped {
+                        (v.name.clone(), None)
+                    } else if v.user_named {
+                        (v.name.clone(), dir_short)
+                    } else {
+                        (dir_short.unwrap_or_else(|| v.name.clone()), None)
+                    };
+                    lines.push(Line {
+                        key: SidebarKey::Vtab(*id),
+                        vtab: Some(*id),
+                        header: None,
+                        indent: if *grouped { indent } else { 0.0 },
+                        label,
+                        sub,
+                        italic: v.name == SETTINGS_VTAB_NAME,
+                        dot: Some(v.status),
+                        active: Some(*id) == active,
+                    });
+                }
+            }
+        }
+        let heights: Vec<f32> = lines
+            .iter()
+            .map(|l| if l.sub.is_some() { 2.0 } else { 1.0 } * self.cell_h + vpad)
+            .collect();
         let total: f32 = heights.iter().sum();
         self.sidebar_max_scroll = (total - visible_h).max(0.0);
         self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, self.sidebar_max_scroll);
         let scroll = self.sidebar_scroll;
 
+        let dir_color = [140, 140, 155];
+        let name_color = [220, 220, 230];
+        let now = Instant::now();
+        self.sidebar_slides.retain(|k| lines.iter().any(|l| &l.key == k));
         self.sidebar_rows.clear();
-        let mut y = list_top - scroll;
-        for (i, (id, _name, _user_named, status, is_active, _dir)) in vtabs.iter().enumerate() {
-            let (two_line, dir_short, label, is_settings) = &rows[i];
-            let text_h = if *two_line { 2.0 * self.cell_h } else { self.cell_h };
+        let mut place = 0.0;
+        for (i, line) in lines.iter().enumerate() {
             let rh = heights[i];
+            // Drawn where its glide has got to; `place` is where it belongs.
+            let y = list_top - scroll + self.sidebar_slides.at(&line.key, place, now);
+            place += rh;
             if y + rh <= list_top || y >= sh {
-                y += rh;
                 continue; // scrolled out of the list viewport
             }
+            let text_h = if line.sub.is_some() { 2.0 * self.cell_h } else { self.cell_h };
             let vis_top = y.max(list_top);
             let vis_bot = (y + rh).min(sh);
-            self.sidebar_rows.push((
-                Rect {
-                    x: bar_x,
-                    y: vis_top,
-                    w: bar_w,
-                    h: (vis_bot - vis_top).max(0.0),
-                },
-                *id,
-            ));
-            if *is_active {
-                quads.push(rect_quad(
-                    Rect {
-                        x: bar_x,
-                        y: vis_top,
-                        w: bar_w,
-                        h: vis_bot - vis_top,
-                    },
-                    sw,
-                    sh,
-                    [40, 44, 60],
-                    1.0,
-                ));
+            let vis = Rect {
+                x: bar_x,
+                y: vis_top,
+                w: bar_w,
+                h: (vis_bot - vis_top).max(0.0),
+            };
+            if let Some(id) = line.vtab {
+                self.sidebar_rows.push((vis, id));
+            }
+            let header_hovered = line.header.is_some() && rect_contains(vis, self.cursor.0, self.cursor.1);
+            if line.active {
+                quads.push(rect_quad(vis, sw, sh, [40, 44, 60], 1.0));
+            }
+            if header_hovered {
+                quads.push(rect_quad(vis, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
             }
             let dot_y = y + (rh - dot) * 0.5;
-            if dot_y >= list_top && dot_y + dot <= sh {
+            if let Some(status) = line.dot.filter(|_| dot_y >= list_top && dot_y + dot <= sh) {
                 quads.push(rect_quad(
                     Rect {
-                        x: bar_x + pad,
+                        x: bar_x + pad + line.indent,
                         y: dot_y,
                         w: dot,
                         h: dot,
                     },
                     sw,
                     sh,
-                    status_color(*status),
+                    status_color(status),
                     1.0,
                 ));
             }
+            let color = match line.header {
+                Some(_) if header_hovered => theme::LABEL_HOVER,
+                Some(_) => theme::LABEL,
+                None => name_color,
+            };
             let name_attrs = || {
                 let a = Attrs::new()
                     .family(Family::SansSerif)
-                    .color(Color::rgb(name_color[0], name_color[1], name_color[2]));
-                if *is_settings {
+                    .color(Color::rgb(color[0], color[1], color[2]));
+                if line.italic {
                     a.style(Style::Italic)
                 } else {
                     a
@@ -3496,43 +3586,50 @@ impl State {
             let dir_attrs = Attrs::new()
                 .family(Family::SansSerif)
                 .color(Color::rgb(dir_color[0], dir_color[1], dir_color[2]));
+            let left = text_x + line.indent;
+            let right = if line.header.is_some() { bar_x + bar_w - pad } else { close_x };
             let buf = &mut self.sidebar_buffers[i];
             buf.set_metrics(metrics);
             buf.set_wrap(Wrap::None);
-            buf.set_size(Some((close_x - text_x).max(1.0)), Some(text_h));
-            if *two_line {
-                let dir_s = dir_short.clone().unwrap_or_default();
-                buf.set_rich_text(
+            buf.set_size(Some((right - left).max(1.0)), Some(text_h));
+            match &line.sub {
+                Some(sub) => buf.set_rich_text(
                     [
-                        (label.as_str(), name_attrs()),
+                        (line.label.as_str(), name_attrs()),
                         ("\n", name_attrs()),
-                        (dir_s.as_str(), dir_attrs),
+                        (sub.as_str(), dir_attrs),
                     ],
                     &Attrs::new().family(Family::SansSerif),
                     Shaping::Advanced,
                     None,
-                );
-            } else {
-                buf.set_rich_text(
-                    std::iter::once((label.as_str(), name_attrs())),
+                ),
+                None => buf.set_rich_text(
+                    std::iter::once((line.label.as_str(), name_attrs())),
                     &Attrs::new().family(Family::SansSerif),
                     Shaping::Advanced,
                     None,
-                );
+                ),
             }
             buf.shape_until_scroll(&mut self.text.font_system, false);
             placements.push(Placement {
                 idx: i,
-                left: text_x,
+                left,
                 top: y + (rh - text_h) * 0.5,
                 bounds: TextBounds {
                     left: bar_x as i32,
                     top: vis_top as i32,
-                    right: close_x as i32,
+                    right: right as i32,
                     bottom: vis_bot as i32,
                 },
-                color: name_color,
+                color,
             });
+            let Some(id) = line.vtab else {
+                // A header folds or unfolds its group on release.
+                if let Some(lead) = line.header {
+                    self.buttons.push((vis, ButtonAction::ToggleGroup(lead)));
+                }
+                continue;
+            };
             // Close ('×') button for this workspace (centred vertically in the row).
             let hit = Rect {
                 x: close_x,
@@ -3562,8 +3659,7 @@ impl State {
                 },
                 color: if hovered { theme::GLYPH_HOVER } else { theme::GLYPH },
             });
-            self.buttons.push((hit, ButtonAction::CloseVtab(*id)));
-            y += rh;
+            self.buttons.push((hit, ButtonAction::CloseVtab(id)));
         }
 
         placements

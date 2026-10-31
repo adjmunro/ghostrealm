@@ -26,6 +26,7 @@ pub mod toasts;
 pub mod plugins;
 pub mod row_cache;
 pub mod settings;
+mod slide;
 pub mod syntax;
 pub mod tap;
 pub mod window;
