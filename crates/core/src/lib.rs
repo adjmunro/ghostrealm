@@ -16,6 +16,7 @@ pub mod outline;
 pub mod registry;
 pub mod search;
 pub mod sidebar;
+pub mod tab_drop;
 #[cfg(test)]
 mod test_dir;
 pub mod tree;
@@ -24,4 +25,5 @@ pub use config::{Chrome, CloseOnExit, Config, HeaderIcon, Headings, Inbox, LineN
 
 pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
+pub use tab_drop::{Edge, TabDrop};
 pub use tree::{Axis, Divider, Node, Pane, PaneId, Rect, SplitPath, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};
