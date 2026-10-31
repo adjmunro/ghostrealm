@@ -205,6 +205,18 @@
 
 ---
 
+[2026-10-31@60f3d3e] Tab drop — drops that only rebuild the same layout
+
+- Requires: NO BLOCKERS
+- Detail: `dropped` (`crates/core/src/tab_drop.rs`) treats only a drop onto the
+  tab's own pane as a no-op. Dragging the only tab of a two-pane split's right pane
+  onto `Workspace(Right)` or `Split(left, Right)` shows a zone whose preview equals
+  the current rect; the drop gives the pane a new id and resets the split's ratio to
+  0.5. DECISION.md says drops that change nothing are refused and not shown.
+- Reason: review finding on `feat/drag-tab-to-split`.
+
+---
+
 [2026-09-15@2e8e8c7] Horizontal tabs — overflow scroll, drag-reorder
 
 - Requires: NO BLOCKERS

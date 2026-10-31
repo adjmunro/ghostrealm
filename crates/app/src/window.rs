@@ -18,7 +18,7 @@ use ghostrealm_core::config::Catalogue;
 use ghostrealm_core::sidebar::{self, Row};
 use ghostrealm_core::{
     ArgKind, ArgSpec, Args, Axis, Chrome, CommandMeta, Config, Divider, PaneId, Rect, Registry, Side,
-    SurfaceId, TabDrop, TabStatus, Value, VtabId,
+    SurfaceId, TabStatus, Value, VtabId,
 };
 use ghostrealm_terminal::{Key, KeyPress, Mods};
 use glyphon::{
@@ -43,6 +43,7 @@ use crate::plugin::{
 };
 use crate::clicks::{Click, ClickCounter};
 use crate::dividers::{self, Dividers, Press};
+use crate::tab_drag::{self, TabDrag};
 use crate::pointer::{self, ButtonAction, Gate, RightPress};
 use crate::toasts::{self, Level, Toast, ToastHit};
 use crate::images::ImageRenderer;
@@ -63,6 +64,9 @@ const DIVIDER_SLOP: f32 = 3.0;
 /// How far in from the workspace's edge, in logical pixels, a dragged tab
 /// drops beside the whole workspace rather than one pane.
 const TAB_DROP_BAND: f32 = 12.0;
+/// How far, in logical pixels, a pressed tab moves before it drags (it must
+/// also leave its tab strip).
+const TAB_DRAG_THRESHOLD: f32 = 3.0;
 /// How many command-palette matches to rank (the visible window scrolls through
 /// them).
 const PALETTE_SEARCH_CAP: usize = 100;
@@ -690,10 +694,8 @@ struct State {
     /// The pane tab under the cursor (pane, index): an unsaved one's close
     /// slot shows '×' instead of its dot while hovered.
     htab_hover: Option<(PaneId, usize)>,
-    /// The pane tab the left button pressed, and the zone it would drop in
-    /// once dragged past the threshold (`dragging`).
-    tab_press: Option<(VtabId, SurfaceId)>,
-    tab_drop: Option<TabDrop>,
+    /// The pane tab the left button pressed, being dragged to a drop zone.
+    tab_drag: TabDrag,
     /// A close button pressed but not yet released. It fires on release only if
     /// the cursor is still over the same button, so a press can be cancelled by
     /// moving away before releasing.
@@ -1399,8 +1401,7 @@ impl State {
             buttons: Vec::new(),
             button_hover: None,
             htab_hover: None,
-            tab_press: None,
-            tab_drop: None,
+            tab_drag: TabDrag::default(),
             armed_button: None,
             close_buffer,
             toggle_buffer,
@@ -2178,8 +2179,7 @@ impl State {
         if self.dividers.release() {
             self.dirty = true;
         }
-        if self.tab_press.take().is_some() {
-            self.tab_drop = None;
+        if self.tab_drag.cancel() {
             self.dirty = true;
         }
     }
@@ -2231,17 +2231,15 @@ impl State {
             }
             return;
         }
-        let Some(PaneHit { vt, pid, active_sid, .. }) = self.pane_under_cursor() else {
+        let Some(PaneHit { vt, pid, rect, active_sid, .. }) = self.pane_under_cursor() else {
             return;
         };
 
-        // A click in a visible tab strip switches the pane's active surface.
-        // Dragging it past the threshold moves it (see `drop_tab`).
+        // A click in a visible tab strip switches the pane's active surface;
+        // dragging the tab out of the strip moves it.
         if let Some((_, idx)) = self.htab_under_cursor() {
-            if let Some(pane) = self.app.tree.vtab_mut(vt).and_then(|v| v.pane_mut(pid)) {
-                pane.active = idx;
-                self.tab_press = pane.surfaces.get(idx).map(|s| (vt, s.id));
-            }
+            let strip = Rect { h: self.strip_height(), ..rect };
+            self.tab_drag.press(&mut self.app.tree, vt, pid, idx, (x, y), strip);
         } else if let Some(sid) = active_sid.filter(|s| self.app.view(*s).is_some()) {
             // Focus first (so anything the click opens targets this pane), then
             // hand the press to the view; it owns the rest of the press.
@@ -2704,39 +2702,20 @@ impl State {
         !due.is_empty()
     }
 
-    /// The zone a tab dragged now would drop in, in the active workspace
-    /// the tab was pressed in.
-    fn tab_drop_under_cursor(&self) -> Option<TabDrop> {
-        let (vt, _) = self.tab_press?;
-        let v = self.app.tree.vtab(vt).filter(|_| self.app.tree.active_vtab() == Some(vt))?;
-        v.tab_drop_at(self.workspace_rect(), DIVIDER, TAB_DROP_BAND * self.scale, self.cursor)
-    }
-
-    /// A pressed tab is being dragged: note the zone under the cursor.
-    /// Returns whether it changed.
-    fn track_tab_drop(&mut self) -> bool {
-        let now = self.tab_drop_under_cursor();
-        let changed = now != self.tab_drop;
-        self.tab_drop = now;
-        self.dirty |= changed;
-        changed
-    }
-
-    /// The left button came up: a tab dragged onto a zone moves there.
-    fn drop_tab(&mut self, dragged: bool) {
-        let (Some((vt, sid)), to) = (self.tab_press.take(), self.tab_drop.take()) else {
-            return;
-        };
-        if let Some(to) = to.filter(|_| dragged) {
-            self.app.tree.move_surface(vt, sid, to);
+    /// Where a tab drag finds its drop zones and when it starts.
+    fn tab_drag_frame(&self) -> tab_drag::Frame {
+        tab_drag::Frame {
+            workspace: self.workspace_rect(),
+            gap: DIVIDER,
+            band: TAB_DROP_BAND * self.scale,
+            threshold: TAB_DRAG_THRESHOLD * self.scale,
         }
-        self.dirty = true;
     }
 
     /// Paint a tab drag's drop zones faintly in a layer over the panes, and
     /// the rect the tab would land in over the zone under the cursor.
     fn build_tab_drop(&self, frame: &mut Frame, sw: f32, sh: f32) {
-        let Some((vt, sid)) = self.tab_press.filter(|_| self.dragging) else {
+        let Some((vt, sid, over)) = self.tab_drag.shown() else {
             return;
         };
         let Some(v) = self.app.tree.vtab(vt).filter(|_| self.app.tree.active_vtab() == Some(vt)) else {
@@ -2750,7 +2729,7 @@ impl State {
             let r = Rect { x: r.x + pad, y: r.y + pad, w: (r.w - 2.0 * pad).max(0.0), h: (r.h - 2.0 * pad).max(0.0) };
             quads.push(round_quad(r, sw, sh, 4.0 * s, accent, 0.08, Some((1.0 * s, accent, 0.25))));
         }
-        if let Some(r) = self.tab_drop.and_then(|to| v.tab_drop_preview(ws, DIVIDER, sid, to)) {
+        if let Some(r) = over.and_then(|to| v.tab_drop_preview(ws, DIVIDER, sid, to)) {
             quads.push(round_quad(r, sw, sh, 4.0 * s, accent, 0.25, Some((2.0 * s, accent, 0.9))));
         }
     }
@@ -2774,19 +2753,19 @@ impl State {
             return false;
         }
         let pos = self.cursor;
+        if self.tab_drag.pressed() {
+            let frame = self.tab_drag_frame();
+            let redraw = self.tab_drag.moved(&self.app.tree, &frame, pos);
+            self.dirty |= redraw;
+            return redraw;
+        }
         // Ignore sub-pixel jitter until it's clearly a drag.
-        let started = !self.dragging;
-        if started {
+        if !self.dragging {
             let (dx, dy) = (pos.0 - self.press_px.0, pos.1 - self.press_px.1);
             if dx * dx + dy * dy < 9.0 {
                 return false;
             }
             self.dragging = true;
-        }
-        if self.tab_press.is_some() {
-            // The zones show from the drag's start.
-            self.dirty |= started;
-            return self.track_tab_drop() || started;
         }
         let button = self.press_button;
         match self.mouse_capture {
@@ -2805,8 +2784,10 @@ impl State {
         if self.dividers.release() {
             self.dirty = true;
         }
+        if self.tab_drag.release(&mut self.app.tree) {
+            self.dirty = true;
+        }
         let dragged = std::mem::take(&mut self.dragging);
-        self.drop_tab(dragged);
         if let Some(sid) = self.mouse_capture.take() {
             let pos = self.cursor;
             self.view_event(sid, |v, cx| v.mouse(cx, &MouseEvent::Up { pos, dragged, button }));

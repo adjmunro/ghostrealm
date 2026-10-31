@@ -28,6 +28,7 @@ pub mod row_cache;
 pub mod settings;
 mod slide;
 pub mod syntax;
+pub mod tab_drag;
 pub mod tap;
 pub mod window;
 
