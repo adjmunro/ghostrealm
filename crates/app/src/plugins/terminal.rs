@@ -527,7 +527,9 @@ impl View for TerminalView {
             return used;
         }
         cx.redraw();
-        if m.shift {
+        // The alternate screen has no scrollback to drive or shell input to
+        // protect: Shift chords go to the full-screen program.
+        if m.shift && !self.grid.alt_screen {
             // Shift + Page/Home/End drive the scrollback.
             let page = (self.grid.size.rows as i32 - 1).max(1);
             let scroll = match k.key {
@@ -1458,6 +1460,8 @@ mod tests {
         let option = Mods { alt: true, ..Mods::default() };
         assert_eq!(sent_bytes("", Key::Up, option), "1b 5b 41", "a plain CSI A");
         assert_eq!(sent_bytes(ALT, Key::Up, option), "1b 5b 31 3b 33 41", "CSI 1;3A");
+        let shift = Mods { shift: true, ..Mods::default() };
+        assert_eq!(sent_bytes(ALT, Key::Left, shift), "1b 5b 31 3b 32 44", "CSI 1;2D, not a selection");
     }
 
     #[test]
