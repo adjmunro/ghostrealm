@@ -1444,3 +1444,17 @@
 - Reason: the owner closed the fix round; these were left to record.
 
 ---
+
+[2026-10-31 20:23@c53a573]
+
+- Requires: NO BLOCKERS
+- Detail: `.claude/agents/director.md:34` says "review findings `docs/GIT.md`
+  says to record rather than fix"; `docs/GIT.md` now defines what is recorded
+  through the reviewer's `record` tag. Point the director at that tag.
+- Detail: `.claude/agents/code-reviewer.md` doesn't tell the reviewer to check
+  the `target/` carve-out's required test (a symlink out of `target/` leaves
+  its destination untouched). Add it beside the blast-radius rule.
+- Reason: non-blocking findings from the approved review of
+  `docs/anti-rabbit-hole-roles`, recorded rather than fixed.
+
+---
