@@ -121,7 +121,11 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
       colours, autohide, config-driven keybindings, sidebar `side`, chrome
       inheritance from the Ghostty config), checked against an option catalogue,
       with diagnostics and hover docs in the editor from the config language
-      server. Follow-ups: completion, resolve Ghostty themes for inheritance
+      server. Three layers: `config.toml` (synced; the app writes one setting
+      into it only on an explicit user action, keeping comments and order),
+      `config.local.toml` beside it (this machine only; overrides it entry by
+      entry), and a `state/` dir in the platform state dir (app-generated
+      state, one JSON file per feature). Follow-ups: completion, resolve Ghostty themes for inheritance
       (TODO.md).
 - [x] Files surface (GitHub issue #1): file sidebar with name filter and `?`
       search, file tabs with a preview tab, document header with configurable

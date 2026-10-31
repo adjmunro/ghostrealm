@@ -141,7 +141,8 @@
 
 [2026-09-15@2e8e8c7] Palette — a "hide" button per command (config-persisted)
 
-- Requires: config write-back (persist the hide list); builds on CommandMeta::hidden
+- Requires: NO BLOCKERS. The hide list goes in `config.toml`, written with
+  `config::write::set`; builds on CommandMeta::hidden
 - Detail: (user idea, IDEAS.md) A clickable hide control on a palette row appends the
   command id to a hide list in the config; hidden ids are filtered out thereafter
   (undoable by editing config). Ship a default "hide from human" list for commands
@@ -154,14 +155,14 @@
 
 [2026-09-15@2e8e8c7] Command palette — MRU order + pinning (rest done)
 
-- Requires: persistent per-user state (MRU history, pins)
+- Requires: NO BLOCKERS
 - Detail: DONE (63124fc): scrollable results (10-row window over up to 100 ranked
   matches), keybindings shown right-aligned in a dim colour, and agent-only commands
   (CommandMeta::hidden()) excluded from the human palette. REMAINING: (1) order by
   most-recently-used (needs a persisted usage history); (2) pinning — a clickable
-  star on the right to keep favourites at the top (needs persisted pins). Both want
-  a small state file beside the config, not the config itself: they are
-  machine-local history, and the config is the shareable dotfile.
+  star on the right to keep favourites at the top (needs persisted pins). Pins
+  sync, so they go in `config.toml` (`config::write::set`); the MRU history is
+  machine-local and goes in the `state/` store (`ghostrealm_core::state`).
 - Reason: usability + discoverability.
 
 ---
@@ -330,9 +331,6 @@
 - Detail: Images and audio open as a Files surface's `MediaView`. Remaining:
   - **video**: decode + play (an ffmpeg-class dependency decision; spike
     separately). Reuse the audio controls and `PaintCx::image` per frame.
-  - **autoplay toggle**: the `autoplay` button is a per-document override
-    of `[file_browser] preview_autoplay`; write it back to the config instead,
-    if that is the wanted behaviour.
   - **wake, not poll**: `MediaView` polls its loader on a 15 ms timer while a
     load is in flight. `View::refresh` (repaint without marking unread) would
     replace the poll once the loader wakes the UI (`OpenCx::waker`) and the
@@ -560,7 +558,8 @@
 [2026-10-13@939ddd4] Shortcuts sheet for the focused pane (title-bar button)
 
 - Requires: views that declare their own chords (plugin follow-up (4),
-  view-scoped keybindings); editing needs config write-back
+  view-scoped keybindings); editing writes `[keybindings]` with
+  `config::write::set`
 - Detail: A button in the title bar beside the sidebar toggle opens a sheet of
   every shortcut that applies to the focused pane's view (one global button,
   not one per pane, since splits show several views). Sections, top to bottom:
@@ -797,8 +796,8 @@
 - Requires: a design session with the owner
 - Detail: Ideas: a command to regenerate `config.toml`; a cleanup command; a
   reset-to-default command that first shows a popup highlighting the options
-  that differ from their defaults. Needs config write-back and a diff of the
-  file against the catalogue defaults.
+  that differ from their defaults. Writes with `config::write`; needs a diff
+  of the file against the catalogue defaults.
 - Reason: owner review; the config file is the settings UI.
 - Owner, verbatim:
   > Maybe a regenerate settings.toml command? / a cleanup command? / or a reset

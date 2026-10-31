@@ -7,7 +7,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 5. **Web downloads, uploads, and JS dialogs**: what may an agent-driven page do with files and dialogs?
 6. **Syntax highlighting direction**: tree-sitter, hand-written lexers, or LSP semantic tokens?
 7. **Dependency policy**: what must a new dependency clear, and do we start replacing existing ones?
-9. **Config write-back and a machine-local state file**: may the app edit `config.toml`, and where does per-machine state go?
 10. **Settings regenerate / cleanup / reset**: which of these commands, and how do they behave?
 11. **Video playback**: which decoder stack, if any?
 14. **Undo scope**: what should undo cover beyond what it does today?
@@ -203,7 +202,6 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
   | 6, syntax highlighting | tree-sitter plus grammars |
   | 11, video | a video decoder |
   | Linux Trash | `trash` |
-  | 9, config write-back | `toml_edit` (keeps comments; the `toml` crate drops them when it rewrites a file) |
 
 - The project is MIT-licensed. The likely licensing conflict is ffmpeg: LGPL, or GPL with some codecs.
 
@@ -212,7 +210,7 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 - **B. Gated.** A new dependency must have an MIT/Apache/BSD/MPL-compatible license and sit behind our own trait where a swap is plausible. Anything that pulls in C/C++ or a large transitive tree needs your OK. Existing dependencies get replaced only when we touch that code anyway.
 - **C. Minimal.** Write it ourselves unless the job is large (codecs, browser, VT), and actively replace small dependencies (`crossbeam-channel` → `std::sync::mpsc`, and so on).
 
-**Recommendation:** B. It keeps licensing and build weight visible without stalling items 6, 9, and 11.
+**Recommendation:** B. It keeps licensing and build weight visible without stalling items 6 and 11.
 
 **Your answer:**
 > **Dependency policy (roughly B, leaning C for small deps):**
@@ -227,44 +225,6 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 
 ---
 
-## 9. Config write-back and a machine-local state file
-
-**Source:** docs/TODO.md entries "Palette — a 'hide' button per command" (line ~173); "Command palette — MRU order + pinning" (line ~186); "Files surface — media follow-ups" autoplay (line ~396); "Shortcuts sheet" (line ~640); "Keybindings: recommended defaults" (line ~808); "Colour swatches in the gutter + colour picker" (line ~628); "Splits" (line ~234: ratios not saved)
-
-**What's being decided:** whether the app may edit `config.toml` itself, and where per-machine history lives.
-
-**Background:**
-- The app writes `config.toml` only when creating it. GOAL.md calls the file "designed to be committed/synced", and DECISION.md says nothing is bound implicitly.
-- Six features wait on write-back: the hide button, MRU, pins, injecting recommended bindings, the colour picker, and the reset commands (item 10).
-- `config_watch.rs` already reloads the file when it changes on disk.
-- The `toml` crate drops comments and reorders the file when it rewrites it. `toml_edit` doesn't, but it is a new dependency (item 7).
-
-**Options:**
-- **A. Explicit write-back, plus a state file.**
-  - Write-back: only on an explicit action (hide, add binding, pick a colour), with `toml_edit`, keeping comments and order.
-  - State: MRU, pins, split ratios, and window size go to `state.toml` in the platform state dir (`$XDG_STATE_HOME`, or Application Support), which is never synced.
-- **B. No write-back.**
-  - The app opens the config at the right spot and offers the edit as a config-server code action, and you save it yourself.
-  - Pros: the file stays entirely yours.
-  - Cons: every one of those features takes an extra step.
-- **C. Like A, but pins go in `config.toml`**, so favourites sync across machines; MRU stays in state.
-
-Sub-question: should the media `autoplay` button stay a per-document override (as now), or write `[file_browser] preview_autoplay`?
-
-**Recommendation:** A, with the autoplay button kept per document. Pick C instead if you want pins on every machine.
-
-**Your answer:**
-> **Three layers, split by who writes it and whether it syncs:**
-> 1. `config.toml`: shared, human-intent settings, synced across machines. This includes palette hide and pin, keybindings added from the app, colour-picker writes, and human-chosen defaults (e.g. a default 75/25 split ratio). The app may write here only on an explicit user action, using `toml_edit` so comments and order are preserved.
-> 2. `config.local.toml`: human settings for this machine only, never synced. Overrides `config.toml`.
-> 3. `state/` directory (platform state dir, never synced): app-generated output, one JSON file per feature (MRU, current split sizes, window size, etc.). Uses `serde_json`, which is already in the tree via the LSP crates. One file per feature avoids write contention and limits corruption to one feature.
->
-> (Effectively option C extended: pins and hides sync; programmatic state stays local.)
->
-> **Autoplay sub-question:** the media autoplay button sets the global default for all videos (writes `[file_browser] preview_autoplay` to `config.toml`), not a per-document override. **Follow-up:** check the provenance of the current per-document behaviour (TODO "Files surface — media follow-ups" ~line 396, and git history). Was it something I specified, or an agent choice?
-
----
-
 ## 10. Settings regenerate / cleanup / reset
 
 **Source:** docs/TODO.md entry "DISCUSSION: settings regenerate / cleanup / reset-to-default" (line ~993)
@@ -274,7 +234,7 @@ Sub-question: should the media `autoplay` button stay a per-document override (a
 **Background:**
 - The file lists only what you set, and defaults live in the option catalogue.
 - DECISION.md rules out any backfill or doctor pass that rewrites the file on its own; these would be commands you run.
-- All three depend on write-back (item 9).
+- All three would write with the config writer (`config::write`).
 
 **Options:**
 - **A. Two commands.**

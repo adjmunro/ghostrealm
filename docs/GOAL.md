@@ -28,6 +28,7 @@ and own the renderer rather than the macOS-only embedder — see DECISION.md.
 
 ## Configuration
 
-A single shareable TOML dotfile at an XDG path, designed to be committed/synced.
+A shareable TOML dotfile at an XDG path, designed to be committed/synced, with
+an optional machine-only file beside it that overrides it.
 Terminal styling inherits from Ghostty's own config; chrome styling inherits the
 resolved palette unless overridden.

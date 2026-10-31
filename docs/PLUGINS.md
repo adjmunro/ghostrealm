@@ -435,7 +435,8 @@ the path that failed meanwhile.
   through `file_ops::System` so tests never launch one; `AppState::open_url`
   refuses every other scheme, whoever asks), `ShowInSidebar` (a folder,
   selected in a Files surface's sidebar),
-  `Saved` (hot-reloads the config), `Busy` (optimistic busy status), `Pick`
+  `Saved` (hot-reloads the config), `SetConfig` (a setting the user chose
+  in the view: written into `config.toml`, then reloaded), `Busy` (optimistic busy status), `Pick`
   (a view in the floating picker chose a path; the picker confirms with it),
   `SaveAs` (the picker asks where, then calls `save_as`), `SaveConflict` (an
   explicit save found the file changed on disk: the app asks before writing),
