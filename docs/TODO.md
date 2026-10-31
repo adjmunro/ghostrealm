@@ -1464,6 +1464,8 @@
 - Detail: Terminal, alternate-screen keys: decisions-pending item 8 said a `[terminal]` boolean would control the translation, but the owner's answer (B) didn't mention one and none was added. Ask whether one is wanted.
 - Detail: `keys_are_translated_on_the_primary_screen_only` doesn't cover Cmd+C/V still working on the alternate screen, nor Cmd+Left sending nothing there.
 - Detail: Each `sent_bytes` call in that test waits about 2 s for the raw-mode read to time out.
+- Detail: Shift+Enter on the alternate screen takes the generic Enter path (`TerminalView::key`): `before_input()` runs and `Request::Busy` fires, so the pane shows the busy dot the primary-screen Shift+Enter never shows. Keep the busy request off for it, or document it as intended.
+- Detail: On the alternate screen the test asserts only Shift+Left; Shift+PageUp, Shift+Up/Down and Shift+Enter there are untested.
 - Reason: gaps found reviewing `fix/alt-screen-native-keys`.
 
 ---
