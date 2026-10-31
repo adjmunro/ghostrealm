@@ -1429,6 +1429,18 @@
   holder of `<artifact>/.cargo-lock`: with `CARGO_BUILD_BUILD_DIR` and a
   command-line `--target-dir`, another build running in the metadata target
   dir at the same time makes this one place there.
+- Detail: `rerun_paths` (`crates/app/build/web_host.rs:216`) watches the
+  top-level entries that exist when the build script runs, not the package
+  dir. A new top-level dir added to `crates/web-host`, `crates/web` or
+  `crates/process` (e.g. `assets/` read via `include_bytes!`) does not rerun
+  the script, so the host bundle stays stale until a watched path changes.
+  Fix direction: treat new top-level entries like a missing `build.rs`, e.g.
+  a directory-listing stamp in `OUT_DIR`.
+- Detail: Nit: the build script keeps its own `no_web`
+  (`crates/app/build/web_host.rs:44`) beside
+  `ghostrealm_web::client::no_web_value`, because `build.rs` cannot depend on
+  the runtime crate. `the_build_script_and_the_tests_read_no_web_alike` keeps
+  them identical.
 - Reason: the owner closed the fix round; these were left to record.
 
 ---
