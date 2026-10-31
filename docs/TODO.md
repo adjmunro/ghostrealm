@@ -1448,3 +1448,15 @@
 - Reason: gaps found reviewing `fix/alt-screen-native-keys`.
 
 ---
+
+[2026-10-31T22:40+1300@db47dfab]
+
+- Requires: NO BLOCKERS
+- Detail: Sidebar: an unnamed workspace under a directory header shows its placeholder name `tab N` (`window.rs`, `build_sidebar`, `Row::Vtab { grouped: true }`).
+- Detail: Grouping compares `root_dir` paths literally: `/p` and `/p/`, or a symlink and its target, make separate groups.
+- Detail: A directory header's hover highlight uses raw `rect_contains`, not the gated `button_hover`, so it lights under a menu or toast (as the sidebar's × buttons do).
+- Detail: `close_vtab` moves focus to a neighbour in tree order, not sidebar order.
+- Detail: A folded group can hide the active workspace; its header shows no highlight for it.
+- Reason: findings from the review of `feat/sidebar-inbox-order`, recorded rather than fixed.
+
+---
