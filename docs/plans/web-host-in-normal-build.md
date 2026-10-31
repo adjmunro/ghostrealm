@@ -156,9 +156,10 @@ Each host input change therefore also recompiles the `ghostrealm` crate.
    a version constant in `build/web_host.rs` bumped whenever its completeness
    rules or placement layout change (for example adding
    `libcef_sandbox.dylib`). A change to `bundle.rs` or `BUNDLE_ID` relinks the
-   bundler, so its mtime covers them. If the stamp matches, bundling and
-   placement are skipped, and only a leftover `.old` is cleaned (step 3 under
-   Safety, if ours). A clippy rerun or a rust-analyzer flip then costs only a
+   bundler, so its mtime covers them. The stamp matches only when `<dest>` is
+   also ours. If it matches, bundling and placement are skipped, and only a
+   leftover `.old` is cleaned (step 3 under Safety, if ours; one that isn't is
+   kept with a warning, since the placed bundle is current). A clippy rerun or a rust-analyzer flip then costs only a
    nested no-op build. Tests: a bundler-only change, and a `BUNDLE_RULES`
    change, each mismatch the stamp and rebundle.
 2. Bundle: `target/web-host/<profile dir>/ghostrealm-web-bundle` (unchanged)
@@ -197,6 +198,9 @@ Order:
    fail.
 6. Set the mtime of `<dest>`'s host executable (Rerun triggers). Remove
    `.old`; if that fails, warn and leave it for step 3 of the next run.
+
+Removing a bundle (`.old`) deletes its `Info.plist` last, so a removal that
+fails part way leaves a bundle the next run still recognises as ours.
 
 The placement trusts these inputs:
 
