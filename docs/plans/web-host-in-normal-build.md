@@ -32,7 +32,10 @@ outlives its cause:
 | rust-analyzer's build-script pass (`RA_RUSTC_WRAPPER` set) | `rerun-if-env-changed=RA_RUSTC_WRAPPER` |
 | `CARGO_CFG_TARGET_OS` is not `macos` (see Non-macOS) | the target is part of the run unit |
 | `TARGET != HOST` (the bundler runs on the build machine) | the target is part of the run unit |
-| `OUT_DIR` not under the metadata build dir (see 2) | `OUT_DIR` is part of the run unit; `rerun-if-env-changed` for `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR` |
+| `OUT_DIR` not under the metadata build dir, or of another shape (see 2) | `OUT_DIR` is part of the run unit; `rerun-if-env-changed` for `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR` |
+
+A `cargo metadata` failure is not a skip (it has no tracked input): it fails
+the build with metadata's stderr.
 
 Cost of the rust-analyzer skip: `cargo check`, `build`, `test` and `doc`
 share one build-script run unit, so each rust-analyzer build-script pass
@@ -42,17 +45,25 @@ the `ghostrealm` crate once.
 
 ### 2. Dirs
 
-`cargo metadata --no-deps --format-version 1` (inherits `CARGO_TARGET_DIR`
-and config) gives `target_directory` and `build_directory`. Both are
-canonicalized, as is `OUT_DIR`.
+`cargo metadata --no-deps --format-version 1`, run from the workspace root
+(inherits `CARGO_TARGET_DIR` and config), gives `target_directory` and
+`build_directory`. Without `build_directory` (Cargo older than its
+stabilization; the workspace `rust-version` is 1.88) the build dir is
+`target_directory`. Both are canonicalized, as is `OUT_DIR`.
 
-- `OUT_DIR` must lie under `build_directory`. Relative to it, it must be
+- `OUT_DIR` must lie under the build dir. Relative to it, it must be
   `<profile>/build/<pkg>-<hash>/out` or `<triple>/<profile>/build/<pkg>-<hash>/out`
-  with `<triple>` = `$TARGET`. Anything else is a skip with: "a `--target-dir`
-  on the command line isn't visible to build scripts; set `CARGO_TARGET_DIR`
-  instead". This catches `cargo build --target-dir X`, rust-analyzer with
-  `cargo.targetDir: true`, and `cargo install`, none of which may write into
-  `<workspace>/target` without holding its lock.
+  with `<triple>` = `$TARGET`. Anything else is a skip with: "the build script
+  can't see a command-line `--target-dir` or `--config build.target-dir`, and
+  resolves a relative `CARGO_TARGET_DIR` from the workspace root; set
+  `CARGO_TARGET_DIR` to an absolute path instead". This catches
+  `cargo build --target-dir X`, rust-analyzer with `cargo.targetDir: true`,
+  and `cargo install`, none of which may write into `<workspace>/target`
+  without holding its lock.
+- A test in `crates/app/tests/web_host_build.rs` runs the shape check on its
+  own `env!("OUT_DIR")` with real metadata and asserts it is not a skip, so a
+  toolchain whose layout changed fails a test instead of silently skipping
+  every build.
 - The app's artifact dir is `<target_directory>/[<triple>/]<profile>`. It
   must exist as a real directory.
 - The nested target dir is `<target_directory>/web-host`.
@@ -63,17 +74,27 @@ From the workspace root:
 
 ```
 $CARGO build --locked -p ghostrealm-web-host --features bundle --bins \
-  --target-dir <target>/web-host --profile <p> --message-format json-render-diagnostics
+  --target-dir <target>/web-host --config 'build.build-dir="<target>/web-host"' \
+  [--target <triple>] --profile <p> --message-format json-render-diagnostics
 ```
 
+- `--config build.build-dir`: `--target-dir` doesn't override a
+  `build.build-dir` inherited from `CARGO_BUILD_BUILD_DIR` or config. Without
+  it the nested cargo locks the outer build dir and hangs (reproduced in
+  review). A test asserts the produced command carries both
+  `--target-dir` and `build.build-dir` pointing at `<target>/web-host`.
+- `--target <triple>` exactly when the outer `OUT_DIR` shape has a triple
+  (an inherited `CARGO_BUILD_TARGET` or `build.target`). The host, helper and
+  bundler executable paths come from the nested `compiler-artifact` JSON
+  messages (`executable`), not from a guessed layout.
 - `<p>` is `dev` when the profile dir is `debug`, else the dir name
-  (`release`, or a custom profile's own name). Output lands in
-  `target/web-host/<profile dir>`.
+  (`release`, or a custom profile's own name).
 - Env, by a tested filter function. Removed:
   - set by Cargo for build scripts: `OUT_DIR`, `TARGET`, `HOST`, `PROFILE`,
     `OPT_LEVEL`, `DEBUG`, `NUM_JOBS`, `RUSTC_LINKER`, `CARGO_PKG_*`,
-    `CARGO_MANIFEST_*`, `CARGO_CFG_*`, `CARGO_PRIMARY_PACKAGE`,
-    `CARGO_ENCODED_RUSTFLAGS`, `DYLD_FALLBACK_LIBRARY_PATH`;
+    `CARGO_MANIFEST_*`, `CARGO_CFG_*`, `CARGO_FEATURE_*`, `DEP_*`,
+    `CARGO_PRIMARY_PACKAGE`, `CARGO_ENCODED_RUSTFLAGS`,
+    `DYLD_FALLBACK_LIBRARY_PATH`;
   - wrappers the outer command sets: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`
     (clippy, rust-analyzer). The nested cargo still reads a wrapper from
     config.
@@ -98,33 +119,48 @@ Emitted on every run, skips included.
   package in `ghostrealm-web-host`'s dependency closure: `crates/web-host`,
   `crates/web`, `crates/process`. Not `tests/` or `benches/`. Plus
   `Cargo.lock`, the root `Cargo.toml` (profiles), `.cargo/config.toml` and
-  `mise.toml` (CMake and Ninja pins).
+  `mise.toml` (CMake and Ninja pins). Only paths that exist are emitted: a
+  missing `rerun-if-changed` path reruns the script on every build.
 - A test computes the closure from `cargo metadata --no-deps` (declared `path`
   dependencies, no network). It asserts that every lib, bin and build-script
   target's `src_path` of each package is under a watched path, and that each
   manifest is watched.
-- `rerun-if-env-changed` for each variable the nested build scripts track:
-  the script reads `cargo::rerun-if-env-changed` lines from the `output` file
-  of each `build-script-executed` message (`MACOSX_DEPLOYMENT_TARGET`, `CC`,
-  `CXX`, `CFLAGS`, CMake variables, `CEF_PATH`, ...). Names the filter removes
-  are left out.
-- `rerun-if-changed` on the placed host executable, only after a placement
-  succeeded, so a deleted bundle is rebuilt on the next build. Cargo compares
-  it against the run's start, and the placed executable was linked during the
-  run. So after placing, the script sets that file's mtime to its own start
-  time minus 5 s (`File::set_modified`). A test asserts the placed file's
-  mtime is at least 5 s before the recorded start.
+- `rerun-if-env-changed` for each variable the nested build scripts track
+  (`MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `CFLAGS`, `SDKROOT`, CMake
+  variables, `CEF_PATH`, ...). For each `build-script-executed` message the
+  script reads `<out_dir>/../output` and takes both forms,
+  `cargo:rerun-if-env-changed=` (`cc` 1.4.6 uses it) and
+  `cargo::rerun-if-env-changed=`. Names the filter removes are left out. A
+  parser test feeds both forms.
+- `rerun-if-changed` on the placed host executable, whenever `<dest>` is
+  current at the end of the run (after a placement or on a stamp match), so a
+  deleted bundle is rebuilt on the next build. A run that omits it drops the
+  trigger. Cargo compares the file against the run's start, and the placed
+  executable was linked during an earlier or the current run. So before
+  emitting, the script makes sure that file's mtime is at most its own start
+  time minus 5 s, setting it with `File::set_modified` if not. If setting it
+  fails, the script warns and doesn't emit the trigger (the bundle works;
+  only deletion detection is lost until the next rerun). Tests: the placed
+  file's mtime ends at least 5 s before the recorded start; the nested
+  host and helper executables' mtimes are unchanged by it (so the stamp and
+  the nested cargo's fingerprints stay valid).
 
 Cargo recompiles a crate whenever its build script reruns (checked on 1.99.1).
 Each host input change therefore also recompiles the `ghostrealm` crate.
 
 ### 5. Bundle and place
 
-1. Up-to-date check: the placed bundle holds `Contents/ghostrealm-stamp`, the
-   mtime (ns) and size of the nested host and helper executables it was made
-   from. If the stamp matches the nested executables, bundling and placement
-   are skipped. A clippy rerun or a rust-analyzer flip then costs only a nested
-   no-op build.
+1. Up-to-date check: the placed bundle holds
+   `Contents/Resources/ghostrealm-stamp`: the mtime (ns) and size of the nested
+   host, helper and bundler executables it was made from, and `BUNDLE_RULES`,
+   a version constant in `build/web_host.rs` bumped whenever its completeness
+   rules or placement layout change (for example adding
+   `libcef_sandbox.dylib`). A change to `bundle.rs` or `BUNDLE_ID` relinks the
+   bundler, so its mtime covers them. If the stamp matches, bundling and
+   placement are skipped, and only a leftover `.old` is cleaned (step 3 under
+   Safety, if ours). A clippy rerun or a rust-analyzer flip then costs only a
+   nested no-op build. Tests: a bundler-only change, and a `BUNDLE_RULES`
+   change, each mismatch the stamp and rebundle.
 2. Bundle: `target/web-host/<profile dir>/ghostrealm-web-bundle` (unchanged)
    writes `target/web-host/<profile dir>/ghostrealm-web-host.app`, the
    staging copy. The stamp is written into it.
@@ -159,8 +195,8 @@ Order:
 4. If `<dest>` exists: it must be ours, else fail; rename it to `.old`.
 5. Rename staged to `<dest>`. On failure, rename `.old` back to `<dest>` and
    fail.
-6. Set the mtime of `<dest>`'s host executable (Rerun triggers). Remove `.old`; if
-   that fails, warn and leave it for step 3 of the next run.
+6. Set the mtime of `<dest>`'s host executable (Rerun triggers). Remove
+   `.old`; if that fails, warn and leave it for step 3 of the next run.
 
 The placement trusts these inputs:
 
@@ -189,8 +225,9 @@ any symlink target) is kept byte for byte:
 - `.old` not ours: kept, step fails;
 - `OUT_DIR` not under the build dir, or of another shape: nothing touched;
 - happy paths: no `<dest>`; `<dest>` ours (replaced, `.old` removed); `.old`
-  ours with `<dest>` missing (restored, then replaced); matching stamp (nothing
-  touched).
+  ours with `<dest>` missing (restored, then replaced); matching stamp
+  (`<dest>` untouched, a leftover `.old` that is ours removed, the
+  placed-exe trigger still emitted).
 
 A running host keeps its open files after a swap. Helpers it launches later
 come from the new bundle.
@@ -299,7 +336,12 @@ Through skills only, not `.claude/settings.json`:
   A new opt-in `--unused-days N` removes a unit whose fingerprint dir and
   `deps/` files were neither modified nor accessed (atime, where recorded) in
   N days. Where atime isn't recorded, an in-use unit older than N days goes
-  too and is rebuilt; it costs a compile, never data. `clean-all` doesn't pass
+  too and is rebuilt; it costs a compile, never data. One exception: in a
+  nested `web-host` target dir, build-script runs (and the compiles they go
+  with) of package versions `Cargo.lock` lists are kept whatever their age,
+  since without atime the current `cef-dll-sys` run would go and the next
+  build would re-download CEF (~250 MB) and fail offline. In the outer target
+  dir they age out like other units. `clean-all` doesn't pass
   it; the owner runs `mise run clean-stale -- --unused-days 14` once after
   landing, and whenever wanted.
 - New tests (`rustc --test scripts/clean-stale.rs`):
@@ -308,7 +350,8 @@ Through skills only, not `.claude/settings.json`:
   - emptying empties `web-host` and keeps its tag and lock files;
   - a held `web-host` lock during emptying keeps `web-host` whole;
   - `--unused-days`: an old unit goes; one with a recent mtime or atime stays;
-    one whose metadata can't be read stays.
+    one whose metadata can't be read stays; an old current-lock build-script
+    run in `web-host/debug` stays, the same run in `debug` goes.
 - Doc comments in `mise.toml` and `clean-stale.rs`, and the build skill, name
   `target/web-host`.
 
@@ -324,7 +367,7 @@ the build skill's `target_os` swap; Windows can't be compile-checked here.
 Removing `mise run web` is a regression on Linux: no command bundles the
 host there. The `docs/TODO.md` entry records it, with the two manual commands
 (`cargo build -p ghostrealm-web-host --features bundle --bins --target-dir
-target/web-host`, then that dir's `debug/ghostrealm-web-bundle`, and copying
+target/web-host --config 'build.build-dir="target/web-host"'`, then that dir's `debug/ghostrealm-web-bundle`, and copying
 the result beside `ghostrealm`). It also records the work: build and place the
 Linux bundle from `build.rs` with its own ownership guard.
 
@@ -350,9 +393,10 @@ completeness check gains `libcef_sandbox.dylib` then.
 6. `build`: remove the `web` mise task; messages, docs and skills name
    `cargo build`; the skill changes under Agent default.
 7. `docs`: DECISION.md entry "the app's build script builds and bundles the web
-   host", with the 2026-10-05 Web surface entry's status set to
-   `PARTLY SUPERSEDED BY` it (that entry says the app builds and tests without
-   CEF). `docs/TODO.md`: the Linux entry; remove the "HIGHEST web priority"
+   host". The 2026-10-05 Web surface entry already reads `PARTLY SUPERSEDED
+   BY [2026-10-13T20:40+1300@e534aa0] (pop-up handling)`; add the new entry as
+   a second reference (building without CEF), since that entry says the app
+   builds and tests without CEF. `docs/TODO.md`: the Linux entry; remove the "HIGHEST web priority"
    entry and decisions-pending item 2.
 
 Verification beyond unit tests:
@@ -367,6 +411,12 @@ Verification beyond unit tests:
   replaced; the next build is `Fresh`.
 - `touch crates/web/tests/host.rs; cargo build`: the build script is `Fresh`.
 - `rm -rf target/debug/ghostrealm-web-host.app; cargo build`: re-placed.
+- `RA_RUSTC_WRAPPER=1 cargo build; cargo build` (a stamp-match run), then
+  `rm -rf target/debug/ghostrealm-web-host.app; cargo build`: re-placed.
+- `touch crates/web-host/src/bin/bundle.rs; cargo build`: rebundled and
+  replaced, though the host and helper executables are unchanged.
+- `CARGO_BUILD_BUILD_DIR=<scratch> cargo build`: the nested build doesn't hang
+  and writes only under `target/web-host`.
 - `cargo build --release`: release bundle in `target/release`.
 - `cargo build --target-dir <scratch>`: skipped with the `CARGO_TARGET_DIR`
   hint; `target/debug` untouched.
@@ -380,7 +430,14 @@ Verification beyond unit tests:
 ## Risks
 
 - rust-analyzer's variable name (`RA_RUSTC_WRAPPER`) is to be confirmed in
-  implementation against the installed rust-analyzer.
+  implementation against the installed rust-analyzer. A newer rust-analyzer
+  may run its build-script pass as `cargo check --compile-time-deps` and set
+  no variable the script can identify. Then its pass runs the full nested
+  build in the background: correct (the wrappers are removed), only slow on
+  the first run and after host input changes.
+- A future Cargo build-dir layout change makes every build a shape skip
+  (Dirs). The `OUT_DIR` shape test turns that into a test failure on the
+  toolchain that changed it.
 - Each host input change recompiles the app crate (Rerun triggers).
 - `cargo install --path crates/app` installs no bundle (skipped by 2; out of
   scope).
