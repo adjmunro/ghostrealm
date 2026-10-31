@@ -670,31 +670,6 @@
 
 ---
 
-[2026-10-13T19:46+1300@d292715] Terminal: text-editing keys inside full-screen programs (decision pending)
-
-- Requires: a decision from the owner (see "Decision session")
-- Detail: Option/Cmd word and line motions and deletes are sent to the program
-  as readline/emacs bytes (`ESC b`, `^A`, ...). Inside a full-screen program
-  (alternate screen) such as Vim, those bytes get Vim's meaning, not the editing
-  action the key stands for. The owner wants the same action in Vim.
-- Detail: Proposal: a translation layer. In the alternate screen, send the
-  standard xterm key sequences instead (Option+Left -> `CSI 1;3D`, Cmd+Left ->
-  Home), which Vim can map in insert mode. Vim's normal mode has no "word left"
-  for those keys without mappings, so the layer may need to ship suggested
-  mappings. Alternative: turn the translation off in full-screen programs.
-  Either way, a TOML boolean controls it. See
-  [stack-review-findings-2.md](stack-review-findings-2.md) item 7.
-- Owner, verbatim:
-  > I'm looking at number seven, and you're saying that my key bindings won't do
-  > the same thing in Vim. That sounds like a problem to me. I think they should
-  > do the same thing in Vim, not do whatever Vim's key bindings say to do. So I
-  > guess we need a translation layer there. Because I do actually use Vim.
-  > Alternatively, maybe we just consider turning it off.
-- Reason: the translated keys must do the same thing everywhere the owner types,
-  including Vim.
-
----
-
 [2026-10-13T19:46+1300@d292715] Reduce dependencies
 
 - Requires: NO BLOCKERS (later work, not now)
@@ -724,9 +699,6 @@
 - Requires: a session with the user
 - Detail: Go through the items still open and check the decisions are
   consistent with each other:
-  - Text-editing keys inside Vim and other full-screen programs: the
-    translation-layer proposal vs turning the translation off (findings-2 item
-    7; TODO "Terminal: text-editing keys inside full-screen programs").
   - Keybinding ids without quotes: confirm flattening nested tables (TODO
     "Keybinding ids without quotes").
   - [stack-review-findings-2.md](stack-review-findings-2.md) items 15 (load-time

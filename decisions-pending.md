@@ -7,7 +7,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 5. **Web downloads, uploads, and JS dialogs**: what may an agent-driven page do with files and dialogs?
 6. **Syntax highlighting direction**: tree-sitter, hand-written lexers, or LSP semantic tokens?
 7. **Dependency policy**: what must a new dependency clear, and do we start replacing existing ones?
-8. **Text-editing keys inside Vim and other full-screen programs**: translate, turn off, or leave as is?
 9. **Config write-back and a machine-local state file**: may the app edit `config.toml`, and where does per-machine state go?
 10. **Settings regenerate / cleanup / reset**: which of these commands, and how do they behave?
 11. **Video playback**: which decoder stack, if any?
@@ -227,41 +226,6 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 > **Licence (new decision, made here):** relicense the project under the **Functional Source License (FSL)**. Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years. The current MIT licence was not a deliberate choice: replace it.
 >
 > **Hard rule: no GPL dependencies.** GPL is incompatible with FSL. Any dependency that is GPL (or would force GPL) must be flagged to me for a licence review and never just added. LGPL is acceptable only when dynamically linked and replaceable (e.g. an LGPL-only ffmpeg build: no `--enable-gpl`, no x264/x265). Playback only needs decoders, which LGPL builds include.
-
----
-
-## 8. Text-editing keys inside Vim and other full-screen programs
-
-**Source:** docs/TODO.md entry "Terminal: text-editing keys inside full-screen programs (decision pending)" (line ~771); docs/stack-review-findings-2.md item 7
-
-**What's being decided:** what Option/Cmd word and line motions and deletes send while a program uses the alternate screen. You said: "they should do the same thing in Vim".
-
-**Background:**
-- `readline()` in `crates/app/src/plugins/terminal.rs` (line ~879) always sends readline bytes: `ESC b` / `ESC f` for word motions, `^A` / `^E` for line motions, and `ESC DEL`, `ESC d`, `^U`, `^K` for deletes.
-- In Vim normal mode today:
-  - Cmd+Left sends `^A`, which increments the number under the cursor.
-  - Cmd+Right sends `^E`, which scrolls the window.
-  - Cmd+Backspace sends `^U`, which scrolls half a page up.
-- On Linux, the translation replaces the Ctrl+arrow, Home, and End sequences everywhere.
-- The shell is spawned with `TERM=xterm-256color`. By default, Vim and Neovim read `CSI 1;5D` / `CSI 1;5C` (Ctrl+Left/Right) as word motions in both normal and insert mode, and Home/End as line start/end, with no user mappings.
-- Word and line deletes have no standard key in normal mode.
-
-**Options:**
-- **A. Translate for the alternate screen.**
-  - Word motions send Ctrl+Left/Right and line motions send Home/End, so Vim moves by word and by line with no mappings.
-  - Deletes aren't translated there. They fall through to the key's normal encoding, so they do nothing harmful.
-  - Effort: small.
-- **B. Turn translation off in the alternate screen.** Keys send libghostty's normal encoding: Option+Left becomes `CSI 1;3D`, which Vim doesn't bind by default.
-  - Pros: least surprise for heavy Vim users.
-  - Cons: the keys stop doing "the same thing".
-- **C. Leave it as it is.** Readline bytes go everywhere, including the `^A` increment above.
-
-A `[terminal]` boolean controls it under every option.
-
-**Recommendation:** A. It gives word and line motion in Vim with no mappings, and stops the `^A` / `^E` / `^U` side effects. Verify it in Vim, Neovim, `less`, and `htop` before shipping.
-
-**Your answer:**
-> **B: turn translation off in the alternate screen.** My earlier "they should do the same thing in Vim" was wrong. Full-screen programs (Vim, less, htop, etc.) must be respected: when a program is on the alternate screen, all of our readline-style key translation comes off and keys send their normal encoding. No Vim-specific translation.
 
 ---
 
@@ -600,7 +564,7 @@ Colour values could be theme names (the terminal's ANSI palette: `red`, `bright-
 **What's being decided:** whether to build the sheet, how you open it, and whether the text-editing keymap (`plugin::text_edit::Keymap`, fixed per platform) becomes configurable.
 
 **Background:**
-- The terminal's readline translation reads the same keymap, so making it configurable interacts with item 8.
+- The terminal's readline translation (primary screen only) reads the same keymap, so making the keymap configurable changes what the terminal sends too.
 - The sheet needs views to declare their own chords, which is plugin follow-up (4).
 
 **Options:**
@@ -609,7 +573,7 @@ Colour values could be theme names (the terminal's ANSI palette: `red`, `bright-
 - **C. Like A, plus an editable text keymap** in `[keybindings.text]`.
 - **D. Defer.**
 
-**Recommendation:** A, read-only. Revisit C after item 8 lands.
+**Recommendation:** A, read-only. Revisit C later.
 
 **Your answer:**
 >

@@ -12,13 +12,8 @@ test reproduced it; the rest come from reading the code. Items marked
    the Ctrl+arrow/Home/End CSI sequences. Decision needed: translate only
    outside the alternate screen / application-cursor mode, or always (as iTerm's
    "natural text editing" does)?
-   **Decision pending:** the owner wants the text-editing keys to do
-   the same thing inside Vim, not Vim's own meaning of the readline bytes. The
-   proposal is a translation layer: in the alternate screen, send standard
-   xterm key sequences (Option+Left -> `CSI 1;3D`, Cmd+Left -> Home) instead of
-   readline bytes (`ESC b`, `^A`), so Vim can map them in insert mode (normal
-   mode has no "word left" for those keys without mappings). Alternative: turn
-   the translation off in full-screen apps. Tracked in TODO.md.
+   **Decided:** translate only on the primary screen. On the alternate screen
+   the keys send their normal encoding (DECISION.md).
 14. **Missing `[keybindings]` binds nothing, silently** (`019dc17`). Files
     written before then carry the comment "If the whole section is empty, the
     built-in defaults apply", which is now false. **Decided:** a missing or empty
