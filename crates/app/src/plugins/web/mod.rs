@@ -3424,7 +3424,7 @@ pub(crate) mod tests {
     /// directory, if built, unless `GHOSTREALM_NO_WEB` is set.
     fn real_host() -> Option<std::path::PathBuf> {
         // Such a build leaves whatever bundle an earlier one placed.
-        if std::env::var("GHOSTREALM_NO_WEB").is_ok_and(|v| !v.is_empty() && v != "0") {
+        if ghostrealm_web::client::no_web() {
             return None;
         }
         let dir = std::env::current_exe().ok()?.parent()?.parent()?.to_path_buf();

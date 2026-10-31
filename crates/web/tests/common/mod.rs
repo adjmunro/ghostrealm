@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 use ghostrealm_web::client::{HOST_ENV, HOST_NAME};
 use ghostrealm_web::WebHost;
 
-/// The bundled host (placed by `cargo build`), if there is one, unless
-/// `GHOSTREALM_NO_WEB` is set: such a build leaves whatever bundle an earlier
-/// one placed.
+/// `$GHOSTREALM_WEB_HOST`, else the bundled host (placed by `cargo build`)
+/// if there is one and `GHOSTREALM_NO_WEB` isn't set: such a build leaves
+/// whatever bundle an earlier one placed.
 pub fn host_exe() -> Option<PathBuf> {
-    if std::env::var("GHOSTREALM_NO_WEB").is_ok_and(|v| !v.is_empty() && v != "0") {
-        return None;
-    }
     if let Some(p) = std::env::var_os(HOST_ENV) {
         return Some(PathBuf::from(p));
+    }
+    if ghostrealm_web::client::no_web() {
+        return None;
     }
     // Test binaries live in target/<profile>/deps; the bundle sits in target/<profile>.
     let profile_dir = std::env::current_exe()

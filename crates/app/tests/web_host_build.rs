@@ -1,7 +1,11 @@
-//! The app build script's web host rules (`build/web_host.rs`): skips, dirs,
-//! the nested build's arguments and environment, rerun triggers, the stamp,
-//! and placement, whose guards keep any bundle they can't recognise.
+//! The app build script's web host rules (`build/web_host.rs`,
+//! `build/watch.rs`): skips, dirs, the nested build's arguments and
+//! environment, rerun triggers, the stamp, and placement, whose guards keep
+//! any bundle they can't recognise.
 
+#[allow(dead_code)]
+#[path = "../build/watch.rs"]
+mod watch;
 #[allow(dead_code)]
 #[path = "../build/web_host.rs"]
 mod web_host;
@@ -54,6 +58,17 @@ fn no_web_is_off_only_when_unset_empty_or_zero() {
     assert!(!no_web(Some("0")));
     assert!(no_web(Some("1")));
     assert!(no_web(Some("yes")));
+}
+
+/// The build script can't depend on `ghostrealm-web`, so it reads
+/// `GHOSTREALM_NO_WEB` itself; the real-host tests read it through
+/// `ghostrealm_web::client`.
+#[test]
+fn the_build_script_and_the_tests_read_no_web_alike() {
+    assert_eq!(ghostrealm_web::client::NO_WEB_ENV, "GHOSTREALM_NO_WEB");
+    for v in [None, Some(""), Some("0"), Some("1"), Some("yes"), Some("00")] {
+        assert_eq!(no_web(v), ghostrealm_web::client::no_web_value(v), "{v:?}");
+    }
 }
 
 fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -165,6 +180,7 @@ fn the_nested_build_has_its_own_target_and_build_dir() {
     assert_eq!(after("--profile"), Some("dev"));
     assert_eq!(after("-p"), Some(HOST));
     assert!(args.contains(&"--locked".into()) && args.contains(&"--bins".into()));
+    assert_eq!(after("--color"), Some("never"), "warning_count reads plain lines");
     let none = Dirs { triple: None, profile_dir: "release".into(), ..d };
     let args: Vec<String> = nested_args(&none).into_iter().map(|a| a.into_string().unwrap()).collect();
     assert!(!args.contains(&"--target".into()));
@@ -245,6 +261,48 @@ fn json_messages_give_the_executables_and_out_dirs() {
 }
 
 #[test]
+fn warning_counts_come_from_cargos_summary_lines() {
+    assert_eq!(warning_count("warning: `ghostrealm-web` (lib) generated 3 warnings"), Some(3));
+    assert_eq!(warning_count("warning: `cef` (lib) generated 1 warning"), Some(1));
+    assert_eq!(
+        warning_count("warning: `w` (bin \"w\") generated 2 warnings (run `cargo fix --bin \"w\"` to apply 1 suggestion)"),
+        Some(2)
+    );
+    assert_eq!(warning_count("warning: `w` (lib) generated 4 warnings (1 duplicate)"), Some(4));
+    assert_eq!(warning_count("warning: unused variable: `x`"), None);
+    assert_eq!(warning_count("warning: cef-dll-sys@1.0.0: generated 5 files"), None);
+    assert_eq!(warning_count("   Compiling ghostrealm-web v0.1.0"), None);
+}
+
+#[cfg(unix)]
+mod artifact_lock {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    extern "C" {
+        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+
+    /// Cargo's lock on the artifact dir, as a build holding it sees it: a
+    /// separate open file description holds it.
+    #[test]
+    fn only_a_held_artifact_lock_is_this_builds() {
+        let t = TmpDir::new("artifact-lock");
+        let err = held_by_this_build(&t).unwrap_err();
+        assert!(err.contains(ARTIFACT_LOCK) && err.contains("CARGO_TARGET_DIR"), "no lock file: {err}");
+        let lock = t.join(ARTIFACT_LOCK);
+        fs::write(&lock, "").unwrap();
+        let err = held_by_this_build(&t).unwrap_err();
+        assert!(err.contains("not locked"), "{err}");
+        let held = fs::File::open(&lock).unwrap();
+        assert_eq!(unsafe { flock(held.as_raw_fd(), 2 | 4) }, 0, "LOCK_EX | LOCK_NB");
+        assert_eq!(held_by_this_build(&t), Ok(()));
+        drop(held);
+        assert!(held_by_this_build(&t).is_err(), "released with its file");
+    }
+}
+
+#[test]
 fn metadata_without_a_build_directory_has_none() {
     let (t, b) = metadata_dirs(r#"{"target_directory":"/t","build_directory":"/b"}"#).unwrap();
     assert_eq!((t, b), (PathBuf::from("/t"), Some(PathBuf::from("/b"))));
@@ -255,13 +313,112 @@ fn metadata_without_a_build_directory_has_none() {
 }
 
 #[test]
-fn rerun_paths_are_only_those_that_exist() {
+fn rerun_paths_are_the_package_entries_but_tests_and_only_those_that_exist() {
     let t = TmpDir::new("rerun");
-    fs::create_dir_all(t.join("crates/web-host/src")).unwrap();
-    fs::write(t.join("crates/web-host/Cargo.toml"), "").unwrap();
+    let pkg = t.join("crates/web-host");
+    for d in ["src", "assets", "tests", "benches", "examples", "target", ".git"] {
+        fs::create_dir_all(pkg.join(d)).unwrap();
+    }
+    for f in ["Cargo.toml", "build.rs", "README.md", ".DS_Store"] {
+        fs::write(pkg.join(f), "").unwrap();
+    }
     fs::write(t.join("Cargo.lock"), "").unwrap();
     let got = rerun_paths(&t);
-    assert_eq!(got, [t.join("crates/web-host/src"), t.join("crates/web-host/Cargo.toml"), t.join("Cargo.lock")]);
+    let want: Vec<PathBuf> =
+        ["Cargo.toml", "README.md", "assets", "build.rs", "src"].iter().map(|n| pkg.join(n)).collect();
+    // crates/web and crates/process are missing: watched whole, then dropped.
+    assert_eq!(got, [want, vec![t.join("Cargo.lock")]].concat());
+}
+
+#[test]
+fn absent_build_scripts_are_the_watched_packages_without_one() {
+    let t = TmpDir::new("absent");
+    for pkg in WATCHED_PACKAGES {
+        fs::create_dir_all(t.join(pkg)).unwrap();
+    }
+    fs::write(t.join("crates/web/build.rs"), "").unwrap();
+    assert_eq!(absent_build_scripts(&t), [t.join("crates/web-host/build.rs"), t.join("crates/process/build.rs")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_absent_watch_holds_a_link_per_absent_path_and_is_settled() {
+    use std::time::{Duration, SystemTime};
+    let t = TmpDir::new("watch");
+    let dir = t.join("out/web-host-watch");
+    let at = SystemTime::now() - Duration::from_secs(5);
+    let (a, b) = (t.join("pkg-a/build.rs"), t.join("pkg-b/build.rs"));
+    watch::watch_absent(&dir, &[a.clone(), b.clone()], at).unwrap();
+    let links = || {
+        let mut v: Vec<PathBuf> = fs::read_dir(&dir).unwrap().map(|e| fs::read_link(e.unwrap().path()).unwrap()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(links(), [a.clone(), b.clone()]);
+    assert!(fs::metadata(&dir).unwrap().modified().unwrap() <= at, "settled before the run's start");
+    // `a` appeared: its link goes.
+    watch::watch_absent(&dir, std::slice::from_ref(&b), at).unwrap();
+    assert_eq!(links(), std::slice::from_ref(&b));
+    assert!(fs::metadata(&dir).unwrap().modified().unwrap() <= at);
+    // Anything but a symlink is kept, and an error.
+    fs::write(dir.join("note"), "kept").unwrap();
+    assert!(watch::watch_absent(&dir, &[], at).is_err());
+    assert_eq!(fs::read_to_string(dir.join("note")).unwrap(), "kept");
+}
+
+/// Cargo reruns a script that watches `watch_absent`'s dir once a missing
+/// file appears, and not before: `build/watch.rs` built into a scratch crate.
+#[cfg(unix)]
+#[test]
+fn cargo_reruns_a_script_once_a_watched_absent_file_appears() {
+    let t = TmpDir::new("watch-cargo");
+    let watch_rs = workspace().join("crates/app/build/watch.rs");
+    fs::create_dir_all(t.join("src")).unwrap();
+    fs::create_dir_all(t.join("pkg")).unwrap();
+    fs::write(t.join("Cargo.toml"), "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n")
+        .unwrap();
+    fs::write(t.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let build_rs = format!(
+        r#"#[path = {watch_rs:?}]
+mod watch;
+use std::io::Write;
+use std::path::PathBuf;
+fn main() {{
+    let start = std::time::SystemTime::now();
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("watch");
+    let target = root.join("pkg/build.rs");
+    let absent: Vec<PathBuf> = if target.exists() {{ vec![] }} else {{ vec![target] }};
+    watch::watch_absent(&dir, &absent, start - std::time::Duration::from_secs(5)).unwrap();
+    println!("cargo::rerun-if-changed={{}}", dir.display());
+    println!("cargo::rerun-if-changed=build.rs");
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(root.join("runs")).unwrap();
+    writeln!(log, "ran").unwrap();
+}}
+"#
+    );
+    fs::write(t.join("build.rs"), build_rs).unwrap();
+    let build = || {
+        let out = std::process::Command::new(cargo())
+            .args(["build", "--offline", "--quiet", "--target-dir"])
+            .arg(t.join("target"))
+            .current_dir(&*t)
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        fs::read_to_string(t.join("runs")).unwrap().lines().count()
+    };
+    assert_eq!(build(), 1);
+    assert_eq!(build(), 1, "a dangling link doesn't rerun it");
+    fs::write(t.join("pkg/build.rs"), "fn main() {}\n").unwrap();
+    assert_eq!(build(), 2, "the file appeared");
+    assert_eq!(build(), 2, "removing its link doesn't rerun it");
 }
 
 fn cargo() -> String {
@@ -307,6 +464,12 @@ fn the_rerun_paths_cover_the_hosts_path_dependency_closure() {
         let watched = rerun_paths(&root);
         let manifest = PathBuf::from(p["manifest_path"].as_str().unwrap());
         assert!(watched.contains(&manifest), "{} not watched", manifest.display());
+        let build_rs = manifest.with_file_name("build.rs");
+        assert!(
+            watched.contains(&build_rs) || absent_build_scripts(&root).contains(&build_rs),
+            "{} not watched",
+            build_rs.display()
+        );
         for t in p["targets"].as_array().unwrap() {
             let kinds: Vec<&str> = t["kind"].as_array().unwrap().iter().filter_map(|k| k.as_str()).collect();
             if !kinds.iter().any(|k| ["lib", "rlib", "bin", "custom-build", "proc-macro"].contains(k)) {
@@ -427,6 +590,96 @@ mod placement {
         assert!(err.contains("not a directory"), "{err}");
     }
 
+    /// `<dest>` and its `Contents` link to `elsewhere`, a bundle of ours.
+    fn link_contents(app: &Path, elsewhere: &Path) {
+        fake_app(elsewhere, BUNDLE_ID, "real");
+        fs::create_dir_all(app).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("Contents"), app.join("Contents")).unwrap();
+    }
+
+    #[test]
+    fn a_dest_with_a_symlinked_contents_and_its_target_are_kept() {
+        let s = Setup::new("contents-link");
+        let elsewhere = s.t.join("Real.app");
+        link_contents(&s.dest(), &elsewhere);
+        let err = s.refused(&[&elsewhere]);
+        assert!(err.contains("Contents: not a directory"), "{err}");
+    }
+
+    #[test]
+    fn a_dest_with_a_symlinked_info_plist_and_its_target_are_kept() {
+        let s = Setup::new("plist-link");
+        let elsewhere = s.t.join("Real.app");
+        fake_app(&elsewhere, BUNDLE_ID, "real");
+        fake_app(&s.dest(), BUNDLE_ID, "existing");
+        let plist = s.dest().join("Contents/Info.plist");
+        fs::remove_file(&plist).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("Contents/Info.plist"), &plist).unwrap();
+        let err = s.refused(&[&elsewhere]);
+        assert!(err.contains("Info.plist: not a file"), "{err}");
+    }
+
+    #[test]
+    fn an_old_with_a_symlinked_contents_and_its_target_are_kept() {
+        let s = Setup::new("old-contents-link");
+        let elsewhere = s.t.join("Real.app");
+        fake_app(&s.dest(), BUNDLE_ID, "existing");
+        link_contents(&s.old(), &elsewhere);
+        let err = s.refused(&[&elsewhere]);
+        assert!(err.contains("remove it by hand"), "{err}");
+    }
+
+    #[test]
+    fn removing_a_bundle_doesnt_empty_a_symlinked_contents() {
+        let t = TmpDir::new("remove-contents-link");
+        let elsewhere = t.join("Real.app");
+        link_contents(&t.join(APP), &elsewhere);
+        let before = snapshot(&elsewhere);
+        remove_bundle(&t.join(APP)).unwrap();
+        assert!(!t.join(APP).exists());
+        assert_eq!(snapshot(&elsewhere), before, "the link's target kept byte for byte");
+    }
+
+    /// Make `dir` read-only, so the entries in it can't be removed.
+    fn freeze(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn thaw(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_partly_removed_old_is_still_ours_and_goes_on_the_next_run() {
+        let s = Setup::new("old-partial");
+        fake_app(&s.dest(), BUNDLE_ID, "existing");
+        freeze(&s.dest().join("Contents/Frameworks"));
+        let warnings = s.place().unwrap();
+        assert!(warnings.len() == 1 && warnings[0].contains("removed by the next build"), "{warnings:?}");
+        assert!(s.old().join("Contents/Info.plist").is_file(), "Info.plist goes last");
+        assert_eq!(ours(&s.old(), s.uid), Ok(()), "still recognised as ours");
+        thaw(&s.old().join("Contents/Frameworks"));
+        fake_app(&s.staged, BUNDLE_ID, "new");
+        assert_eq!(s.place(), Ok(vec![]));
+        s.new_in_place();
+    }
+
+    #[test]
+    fn a_failed_removal_of_old_keeps_dest() {
+        let s = Setup::new("old-stuck");
+        fake_app(&s.dest(), BUNDLE_ID, "existing");
+        fake_app(&s.old(), BUNDLE_ID, "leftover");
+        freeze(&s.old().join("Contents/Frameworks"));
+        let (dest, staged) = (snapshot(&s.dest()), snapshot(&s.staged));
+        let err = s.place().unwrap_err();
+        thaw(&s.old().join("Contents/Frameworks"));
+        assert!(err.contains(OLD), "{err}");
+        assert_eq!(snapshot(&s.dest()), dest, "dest kept byte for byte");
+        assert_eq!(snapshot(&s.staged), staged, "staged untouched");
+    }
+
     #[test]
     fn a_dest_that_is_a_file_is_kept() {
         let s = Setup::new("dest-file");
@@ -460,6 +713,9 @@ mod placement {
         }
     }
 
+    /// Tested through `ours()` alone: a test can't make a file another uid
+    /// owns without root, so `place` and `install` are driven with this
+    /// user's uid, and `ours()` takes the uid as a parameter.
     #[test]
     fn a_dest_of_another_user_is_not_ours() {
         let s = Setup::new("dest-uid");
@@ -605,8 +861,11 @@ mod placement {
         assert_eq!(done.trigger, Some(exe), "the trigger is still emitted");
         // A foreign .old is kept, with a warning.
         fake_app(&s.old(), "com.example.other", "foreign");
+        let (old, dest) = (snapshot(&s.old()), snapshot(&s.dest()));
         let done = install(&s.artifact, &st, s.uid, SystemTime::now(), || panic!("not rebundled")).unwrap();
-        assert!(s.old().exists() && done.warnings.len() == 1, "{done:?}");
+        assert!(done.warnings.len() == 1 && done.warnings[0].contains("remove it by hand"), "{done:?}");
+        assert_eq!(snapshot(&s.old()), old, "the foreign .old kept byte for byte");
+        assert_eq!(snapshot(&s.dest()), dest);
     }
 
     #[test]

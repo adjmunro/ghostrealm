@@ -21,6 +21,21 @@ pub const HOST_NAME: &str = "ghostrealm-web-host";
 /// Set to a host executable path to override discovery.
 pub const HOST_ENV: &str = "GHOSTREALM_WEB_HOST";
 
+/// Set, and neither empty nor `0`, the app's build script skips the web host
+/// (`crates/app/build/web_host.rs` reads it the same way; a test checks), so
+/// a bundle beside the binaries may be an earlier build's.
+pub const NO_WEB_ENV: &str = "GHOSTREALM_NO_WEB";
+
+/// Whether [`NO_WEB_ENV`] is set to skip the web host.
+pub fn no_web() -> bool {
+    no_web_value(std::env::var(NO_WEB_ENV).ok().as_deref())
+}
+
+/// Whether a [`NO_WEB_ENV`] value asks to skip the web host.
+pub fn no_web_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Set (to anything) to let the host's stderr through instead of discarding it.
 pub const DEBUG_ENV: &str = "GHOSTREALM_WEB_DEBUG";
 

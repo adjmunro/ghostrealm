@@ -3,6 +3,8 @@
 //! app looks for it. `GHOSTREALM_NO_WEB=1` skips it. The rules are in
 //! `build/web_host.rs`.
 
+#[path = "build/watch.rs"]
+mod watch;
 #[path = "build/web_host.rs"]
 mod web_host;
 
@@ -22,6 +24,19 @@ fn main() {
     let root = std::fs::canonicalize(manifest.join("../..")).unwrap_or_else(|e| fail(&format!("workspace root: {e}")));
     for p in web_host::rerun_paths(&root) {
         println!("cargo::rerun-if-changed={}", p.display());
+    }
+    #[cfg(unix)]
+    {
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+        let absent = out_dir.join("web-host-watch");
+        let at = start.checked_sub(web_host::SETTLE).unwrap_or(SystemTime::UNIX_EPOCH);
+        match watch::watch_absent(&absent, &web_host::absent_build_scripts(&root), at) {
+            Ok(()) => println!("cargo::rerun-if-changed={}", absent.display()),
+            Err(e) => println!(
+                "cargo::warning={}: {e}; a new build.rs in a web host package won't rerun this script",
+                absent.display()
+            ),
+        }
     }
     if let Some(why) = web_host::env_skip(|k| env::var(k).ok()) {
         return skip(&why);
@@ -129,6 +144,9 @@ mod host {
             Err(DirsError::Layout(why)) => return skip(&why),
             Err(DirsError::Fail(e)) => fail(&e),
         };
+        if let Err(why) = web_host::held_by_this_build(&dirs.artifact) {
+            return skip(&why);
+        }
 
         let profile = dirs.nested_profile();
         fs::create_dir_all(&profile).unwrap_or_else(|e| fail(&format!("{}: {e}", profile.display())));
@@ -151,8 +169,10 @@ mod host {
         let err_log = Arc::clone(&log);
         let err_thread = std::thread::spawn(move || {
             let mut cef = false;
+            let mut warnings = 0;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 let _ = writeln!(err_log.lock().unwrap(), "{line}");
+                warnings += web_host::warning_count(&line).unwrap_or(0);
                 let t = line.trim_start();
                 if t.starts_with("Compiling ") {
                     tty.line(&line);
@@ -161,7 +181,7 @@ mod host {
                     tty.line("     Running cef-dll-sys: fetches CEF, then builds its C++ wrapper");
                 }
             }
-            tty
+            (tty, warnings)
         });
         let mut built = Built::default();
         for line in BufReader::new(child.stdout.take().expect("piped")).lines().map_while(Result::ok) {
@@ -169,9 +189,13 @@ mod host {
             built.read(&line);
         }
         let status = child.wait().unwrap_or_else(|e| fail(&format!("cargo build of the web host: {e}")));
-        let mut tty = err_thread.join().unwrap_or(Tty(None));
+        let (mut tty, warnings) = err_thread.join().unwrap_or((Tty(None), 0));
         if !status.success() {
             fail_with_log("the web host build failed", &log_path);
+        }
+        // Cargo shows a nested build's diagnostics nowhere but the log.
+        if warnings > 0 {
+            println!("cargo::warning=the web host build had {warnings} compiler warnings: {}", log_path.display());
         }
         let exe = |p: Option<PathBuf>, name: &str| {
             p.unwrap_or_else(|| fail(&format!("the web host build reported no `{name}` executable")))

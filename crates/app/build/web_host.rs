@@ -154,6 +154,36 @@ pub fn dirs(out_dir: &Path, target_dir: &Path, build_dir: Option<&Path>, triple:
     Ok(Dirs { nested: target.join("web-host"), target, artifact, triple: t, profile_dir })
 }
 
+/// The lock Cargo holds on an artifact dir through every build or check
+/// that writes there.
+pub const ARTIFACT_LOCK: &str = ".cargo-lock";
+
+/// Whether this build holds `<artifact>/ARTIFACT_LOCK`, so the dir [`dirs`]
+/// worked out is this build's: with `CARGO_BUILD_BUILD_DIR` set, a
+/// command-line `--target-dir` leaves `OUT_DIR` under the build dir that
+/// metadata names, but the build writes elsewhere. A lock this process can
+/// take, a missing lock file, or any error is a skip: `Err` says why.
+#[cfg(unix)]
+pub fn held_by_this_build(artifact: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    const LOCK_EX: std::os::raw::c_int = 2;
+    const LOCK_NB: std::os::raw::c_int = 4;
+    let path = artifact.join(ARTIFACT_LOCK);
+    let skip = |why: String| format!("{}: {why}; {LAYOUT_HINT}", path.display());
+    let file = fs::File::open(&path).map_err(|e| skip(format!("{e}; this build doesn't lock it")))?;
+    // Released when `file` closes.
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Err(skip("not locked, so not this build's artifact dir".into()));
+    }
+    match io::Error::last_os_error() {
+        e if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        e => Err(skip(format!("can't tell whether this build locks it ({e})"))),
+    }
+}
+
 /// `s` as a TOML basic string.
 fn toml_string(s: &str) -> String {
     let mut out = String::from("\"");
@@ -183,7 +213,8 @@ pub fn nested_args(dirs: &Dirs) -> Vec<OsString> {
         args.push("--target".into());
         args.push(t.into());
     }
-    for a in ["--profile", dirs.profile(), "--message-format", "json-render-diagnostics", "-vv"] {
+    // `--color never`: the log is a file, and [`warning_count`] reads plain lines.
+    for a in ["--profile", dirs.profile(), "--message-format", "json-render-diagnostics", "--color", "never", "-vv"] {
         args.push(a.into());
     }
     args
@@ -215,23 +246,47 @@ pub fn keep_env(name: &str) -> bool {
     !DROP.contains(&name) && !DROP_PREFIX.iter().any(|p| name.starts_with(p))
 }
 
+/// Entries of a package dir that the host's build never reads: its test,
+/// bench and example targets, a target dir, and dot entries (`.DS_Store`).
+const UNWATCHED: [&str; 4] = ["tests", "benches", "examples", "target"];
+
 /// The files and dirs whose change reruns the script: each watched
-/// package's `src`, `Cargo.toml` and `build.rs`, and the workspace's lock
-/// file, manifest (profiles), Cargo config and `mise.toml` (CMake and Ninja
-/// pins). Only those that exist: Cargo reruns a script on every build while
-/// a `rerun-if-changed` path is missing.
+/// package's entries but [`UNWATCHED`] (Cargo watches a dir recursively, so
+/// not the package dir itself), and the workspace's lock file, manifest
+/// (profiles), Cargo config and `mise.toml` (CMake and Ninja pins). Only
+/// those that exist: Cargo reruns a script on every build while a
+/// `rerun-if-changed` path is missing. A package dir that can't be read is
+/// watched whole. A new `build.rs` is caught by [`absent_build_scripts`].
 pub fn rerun_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for pkg in WATCHED_PACKAGES {
-        for f in ["src", "Cargo.toml", "build.rs"] {
-            paths.push(root.join(pkg).join(f));
-        }
+        let dir = root.join(pkg);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            paths.push(dir);
+            continue;
+        };
+        let mut names: Vec<OsString> = entries
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| !n.to_string_lossy().starts_with('.') && !UNWATCHED.iter().any(|u| n == u))
+            .collect();
+        names.sort();
+        paths.extend(names.into_iter().map(|n| dir.join(n)));
     }
     for f in ["Cargo.lock", "Cargo.toml", ".cargo/config.toml", "mise.toml"] {
         paths.push(root.join(f));
     }
     paths.retain(|p| fs::symlink_metadata(p).is_ok());
     paths
+}
+
+/// Each watched package's `build.rs` that doesn't exist: Cargo would build
+/// and run one that appears, so `watch::watch_absent` watches for it.
+pub fn absent_build_scripts(root: &Path) -> Vec<PathBuf> {
+    WATCHED_PACKAGES
+        .iter()
+        .map(|pkg| root.join(pkg).join("build.rs"))
+        .filter(|p| fs::symlink_metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
+        .collect()
 }
 
 /// The variables a nested build script's `output` file says it reads, in
@@ -246,6 +301,17 @@ pub fn env_triggers(output: &str) -> Vec<String> {
         .filter(|n| !n.is_empty() && keep_env(n))
         .map(str::to_string)
         .collect()
+}
+
+/// The count in a nested cargo stderr line ``warning: `<pkg>` (<target>)
+/// generated N warning[s]...``, Cargo's summary of a unit's compiler
+/// warnings.
+pub fn warning_count(line: &str) -> Option<u32> {
+    let rest = line.trim_start().strip_prefix("warning: `")?;
+    let (_, after) = rest.split_once(") generated ")?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let n = digits.parse().ok()?;
+    after[digits.len()..].starts_with(" warning").then_some(n)
 }
 
 /// What the nested build's JSON messages report.
@@ -314,7 +380,9 @@ fn missing(path: &Path) -> Result<bool, String> {
 }
 
 /// Whether `app` is a web host bundle this user's builds made: a real
-/// directory owned by `uid` whose `Info.plist` names [`BUNDLE_ID`].
+/// directory owned by `uid`, holding a real `Contents` directory whose real
+/// `Info.plist` file names [`BUNDLE_ID`]. A symlinked `Contents` would let
+/// [`remove_bundle`] empty the link's target.
 #[cfg(unix)]
 pub fn ours(app: &Path, uid: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
@@ -326,7 +394,14 @@ pub fn ours(app: &Path, uid: u32) -> Result<(), String> {
     if m.uid() != uid {
         return Err(format!("{at}: owned by uid {}, not {uid}", m.uid()));
     }
-    let plist = app.join("Contents/Info.plist");
+    let contents = app.join("Contents");
+    if !fs::symlink_metadata(&contents).is_ok_and(|m| m.is_dir()) {
+        return Err(format!("{}: not a directory", contents.display()));
+    }
+    let plist = contents.join("Info.plist");
+    if !fs::symlink_metadata(&plist).is_ok_and(|m| m.is_file()) {
+        return Err(format!("{}: not a file", plist.display()));
+    }
     let out = std::process::Command::new("/usr/bin/plutil")
         .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
         .arg(&plist)
@@ -370,11 +445,14 @@ pub fn current(dest: &Path, stamp: &str, uid: u32) -> bool {
 }
 
 /// Remove a bundle, its `Info.plist` last: a removal that fails part way
-/// leaves a bundle the next run still recognises as ours.
+/// leaves a bundle the next run still recognises as ours. A `Contents` that
+/// isn't a real directory isn't looked into (`remove_dir_all` doesn't follow
+/// symlinks).
 #[cfg_attr(not(unix), allow(dead_code))]
-fn remove_bundle(app: &Path) -> io::Result<()> {
+pub fn remove_bundle(app: &Path) -> io::Result<()> {
     let contents = app.join("Contents");
-    if let Ok(entries) = fs::read_dir(&contents) {
+    let real = fs::symlink_metadata(&contents).is_ok_and(|m| m.is_dir());
+    if let Some(entries) = real.then(|| fs::read_dir(&contents).ok()).flatten() {
         for e in entries {
             let e = e?;
             if e.file_name() == "Info.plist" {
