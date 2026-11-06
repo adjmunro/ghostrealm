@@ -40,7 +40,8 @@ The panel inside the sidebar shows exactly what that Cmd+Z will reverse.
 An op is recorded in the workspace that was active when its command ran. That
 is the workspace whose menu, palette or sidebar started it. A job that
 finishes later (a cut's Paste, Delete's git check followed by its
-confirmation) carries that workspace with it.
+confirmation) carries that workspace with it: `FileJob::Paste` and
+`DeleteCheck` hold its `VtabId`, through to `Done`.
 
 ## What is recorded
 
@@ -55,11 +56,20 @@ symlink.
 | Move (a cut's Paste) | from P, to Q, `Id` after the move | `Move a.md → docs` |
 | Trash | P, the trashed location T, `Id` before trashing | `Trash a.md` |
 
-The root row reads "Start". There is no saved step.
+The root row reads "Start". There is no saved step. A step whose entry
+couldn't be read after it was acted on stores its `Id` (or T) as unknown, so
+every later check of it refuses.
 
-Not recorded:
+Not recorded, since no step could ever invert them:
 - A move that left part of the original behind (`source_left`). Its toast
   already says so, and neither direction could be checked as one entry.
+- A move across volumes (the destination's `dev` differs from the source
+  folder's).
+- A create where there is no Trash (`System::has_trash`), since its undo
+  would trash it.
+- A Trash whose location the Trash didn't report, or whose `Id` couldn't be
+  read.
+- A rename or paste that changed nothing (same path).
 - Paste-copy and Duplicate. Open question 4 covers them.
 - Any change made outside these commands.
 
@@ -70,7 +80,14 @@ different entry, an unreadable folder, a taken destination or an
 unsupported operation means **refuse and keep**. Nothing moves, nothing goes
 to the Trash, and the tree's position stays put. A toast in the pane names
 the step and the reason, for example: *Can't undo "Rename a.md → b.md": a.md
-already exists.*
+already exists.* A refused restore from the Trash adds where the entry is
+while the Trash still holds something there, and that Finder's Put Back can
+restore it.
+
+A step whose result is already in place counts as done, with no action: undo
+of a create whose P is gone, of a rename whose P holds the `Id` and Q is
+free, of a Trash whose P holds the `Id` and T is gone (Put Back by hand), and
+the same for redo. So steps made moot by other means don't block the walk.
 
 Nothing is ever deleted permanently:
 - Undoing a create moves the entry to the Trash.
@@ -93,9 +110,16 @@ Inputs the checks trust, and how each can be wrong:
 
 | Step | Undo: checks, then action | Redo: checks, then action |
 | --- | --- | --- |
-| Create P | P has `Id` and is unchanged (file: `len`, `mtime`; folder: empty). No unsaved document under P. Then `trash_now(P)`, which closes P's documents. | P is free and its parent is a folder. Then `create_file`/`create_dir` (`create_new` or `mkdir`, which fail if P is taken). Store the new `Id`. |
-| Rename / Move P→Q | Q has `Id`. P is free and P's parent is a folder. Then `rename_exclusive(Q, P)`. A case-only rename uses `same_entry_recased`, as `file_ops::rename` does. Documents follow (`changed(&[(Q, P)])`). | The same with P and Q swapped. |
-| Trash P→T | T has `Id`. P is free and P's parent is a folder. Then `rename_exclusive(T, P)`. A different device (EXDEV) refuses. Documents closed by the Trash stay closed. | P has `Id`. No unsaved document under P. Then `trash_now(P)`. Store the new T. |
+| Create P | P has `Id` and is unchanged (file: `len`, `mtime`; folder: empty). No unsaved document under P. Then `trash_now(P)`, which closes P's documents. | P is free. Then `create_file`/`create_dir` (`create_new` or `mkdir`, which fail if P is taken). Store the new `Id`. |
+| Rename / Move P→Q | Q has `Id`. P is free. Then `rename_exclusive(Q, P)`. A case-only rename uses `same_entry_recased` and a plain rename, as `file_ops::rename` does. Documents follow (`changed(&[(Q, P)])`). | The same with P and Q swapped. |
+| Trash P→T | T has `Id`. P is free. Then `rename_exclusive(T, P)`. A different device (EXDEV) refuses. Documents closed by the Trash stay closed. | P has `Id`. No unsaved document under P. Then `trash_now(P)`. Store the new T. |
+
+A missing or non-folder parent of P needs no check of its own: `stat(P)`
+fails with ENOTDIR or EACCES (refuse), or the atomic rename or create fails
+with ENOENT (refuse).
+
+Undo and redo call `trash_now`, which returns T and the `Id`; only Delete's
+callers record a Trash step, so undo and redo never record one.
 
 Undo and redo of a move across filesystems refuse: the rename returns EXDEV,
 and the toast says it was moved across volumes and must be moved back by
@@ -121,29 +145,30 @@ and the toast says which step stopped it.
 There is no confirmation, as in the editor. Every inverse is a no-replace
 rename or a move to the Trash, so no walk can lose data.
 
-### Multi-selection (later)
+### Restoring one Trash step
 
-A step is one operation today. When multi-selection lands, one command over
-N entries is one step holding N operations. Every check runs before any
-action. If an action fails partway, the ones already done are reversed with
-their own no-replace inverses, and the step is refused. This plan builds
-none of it.
+A Trash row in effect offers a Restore button in the panel. It puts that
+entry back on its own, out of order, with the undo's checks, and marks the
+row "restored"; the current step stays. Undoing it later finds the entry
+already in place (done); redoing it trashes it again and clears the mark.
+
+Multi-selection (later): one command over N entries becomes one step of N
+operations, all checked before any acts.
 
 ### Async jobs
 
-- Undo and redo refuse while any file job is pending (`!file_jobs_idle()`),
-  with the message "wait for the paste to finish". A running copy or move
-  could be using the paths a step checks, and a move's step is added only
-  when its job finishes.
+- Undo, redo and restore refuse while any file job is pending
+  (`!file_jobs_idle()`): "Can't undo while a file operation is running: wait
+  for it to finish." A running copy or move could be using the paths a step
+  checks, and a move's step is added only when its job finishes.
 - A cut's Paste records its step in `apply_file_job` when it finishes, as a
   child of the tree's current step at that moment. Undo can't run meanwhile,
   so that is the step that was current when it started, or a step recorded
   synchronously after it.
-- Delete records its Trash step in `trash_now`, when the item really moves.
+- Delete records its Trash step in `delete_now`, when the item really moves.
   That happens after the git check job and any confirmation. The workspace
-  goes with it: `FileJob` ids map to the workspace (`file_job_vtabs:
-  HashMap<u64, VtabId>`), and `Confirmed::Trash`, `UnsavedTrash` and
-  `Resume::Trash` carry the `VtabId`.
+  goes with it: `FileJob::DeleteCheck` carries the `VtabId`, and
+  `Confirmed::Trash`, `UnsavedTrash` and `Resume::Trash` carry it on.
 - A job that finishes after its workspace closed records nothing. Its toast
   still reports the outcome.
 
@@ -153,20 +178,17 @@ none of it.
 `Result<Option<PathBuf>>`, the trashed location from `trashItemAtURL
 :resultingItemURL:error:` (objc2-foundation 0.3:
 `Option<&mut Option<Retained<NSURL>>>`). A restore is
-`rename_exclusive(T, P)`. Without a reported T, the Trash step is recorded
-but its undo refuses with "the Trash didn't say where it put it".
+`rename_exclusive(T, P)`. Without a reported T, the Trash step is not
+recorded.
 
-Risk: TCC protects `~/.Trash`. Listing it fails here (`ls` exits 1) while
-`stat` works. Whether the app may rename an item out of it without Full Disk
-Access is unverified. An `#[ignore]`d test (`real_trash_round_trip`) trashes a
-temp file through `HostSystem` and restores it. The implementer runs it once
-by hand here and reports the result. If it is refused, undo refuses and keeps,
-and restoring by Finder automation becomes an owner decision (open question
-8).
+TCC protects `~/.Trash`: listing it needs Full Disk Access. Renaming a known
+item out of it does not. The `#[ignore]`d test `real_trash_round_trip`
+trashes a temp file through `HostSystem` and restores it; it passed when run
+by hand from a process without Full Disk Access (`ls ~/.Trash` refused).
 
 **Linux (compile-checked only).** There is no Trash: `HostSystem::trash`
-keeps failing, with only the signature changed. So no Trash step is ever
-recorded there, and undoing a create refuses and keeps. The plan adds no Linux
+keeps failing, with only the signature changed, and `has_trash` is false. So
+no Trash or create step is ever recorded there. The plan adds no Linux
 Trash or restore code. That is destructive work on an OS this machine can't
 run. Following the freedesktop Trash spec, a restore would rename
 `$XDG_DATA_HOME/Trash/files/<name>` (or `$topdir/.Trash-$uid/files/<name>`)
@@ -207,11 +229,13 @@ handle only while painting. `AppState` mutates it only while handling
 requests, when no view holds a borrow, so the editor's `history()` `Ref`
 hazard (TODO "Editor follow-ups (g)") can't happen here.
 
-Undo, redo and walking go in a new `app_state/file_undo.rs`, about 200
-lines, which keeps `files.rs` (1,723 lines) from growing:
-- `file_undo(sid)`, `file_redo(sid)` and `file_goto(sid, step)` resolve
-  `sid`'s workspace and run the checks and actions above.
-- They reuse `trash_now`, `changed`, `unsaved_under` and `system`.
+Undo, redo and walking go in a new `app_state/file_undo.rs`, which keeps
+`files.rs` from growing:
+- `walk_file_history(sid, Walk::{Undo, Redo, To(step), Restore(step)})`
+  resolves `sid`'s workspace and runs the checks and actions above.
+- It reuses `trash_now`, `changed`, `unsaved_under` and `system`.
+- A single undo or redo shows an info toast naming the step ("Undid rename
+  a.md → b.md"), unless the sidebar's panel is open and shows it.
 
 ## Sharing the panel
 
@@ -227,14 +251,20 @@ pub trait History {
     fn parent(&self, id: StepId) -> Option<StepId>;
     fn children(&self, id: StepId) -> &[StepId];
     fn label(&self, id: StepId) -> String;
+    fn note(&self, _id: StepId) -> Option<&'static str> { None }
+    fn action(&self, _id: StepId) -> Option<&'static str> { None }
 }
 ```
+
+`note` tags a row ("restored"); `action` labels a button on it ("Restore").
+`paint` takes `PanelIds { rows, close, actions }` and the `Edge` it borders
+its host on (a hairline): left in the editor, top in the sidebar.
 
 - `StepId` (now the editor's `NodeId`) moves with it. `history.rs` imports it
   as `NodeId`, which keeps the diff small.
 - `Graph::of`, the graph key, `UndoPanel` (`toggle`, `focus`, `key`,
-  `scroll`, `step`, `paint`) and the lane tests stay in the shared module.
-  The lane tests use a small test `History`.
+  `scroll`, `step`, `paint`) stay in the shared module. The lane tests stay
+  on `UndoTree` in the editor module.
 - The editor keeps what is its own in `plugins/editor/undo.rs`:
   `impl History for UndoTree`, plus `label`, `merged` and `snippet`, their
   tests, the panel's editor tests, and the panel's width (`PANEL_CELLS`,
@@ -245,38 +275,34 @@ pub trait History {
 The file sidebar draws the panel at its **bottom**, the full sidebar width,
 `min(14 rows, half the sidebar's height)`. The sidebar is too narrow to share
 sideways. It shows only in `Mode::Sidebar`, not in the pickers, and hides
-with the sidebar. Row `i` is button `BTN_UNDO + i`, past every other
-file-browser id. The close button is `BTN_UNDO_PANEL`, which is also the
-`⋯` menu's "Undo history" check item, as in the editor.
+with the sidebar. Row `i` is button `BTN_UNDO + i` and its Restore button
+`BTN_RESTORE + i`, past every other file-browser id and below the ids a
+Files surface keeps for its document. The close button is `BTN_UNDO_PANEL`,
+which is also the `⋯` menu's "Undo history" check item, as in the editor. A
+press on the panel gives it the keys; a click on the list or the filter
+takes them back.
 
 ## Keys
 
 | Where | Key | Does |
 | --- | --- | --- |
-| File sidebar has the keys, filter **empty** | Cmd+Z (Ctrl+Z) | Undo the workspace's last file operation |
-| same | Cmd+Shift+Z (Ctrl+Y, Ctrl+Shift+Z) | Redo |
-| File sidebar, filter has text | those chords | Undo or redo the filter's text, as today (`LineEdit`) |
+| File sidebar has the keys, filter **empty** with nothing of its own to undo | Cmd+Z (Ctrl+Z) | Undo the workspace's last file operation |
+| same, nothing of its own to redo | Cmd+Shift+Z (Ctrl+Y, Ctrl+Shift+Z) | Redo |
+| File sidebar, filter has text or its own history | those chords | Undo or redo the filter's text, as today (`LineEdit`) |
 | Sidebar undo panel has the keys | Up/Down, Page Up/Down, Home/End | Walk the steps, as the editor's panel does |
 | same | Cmd+Z / Cmd+Shift+Z | File undo and redo, whatever the filter holds |
 | same | Escape, Enter, typing, Shift or Option keys | Give the keys back to the filter. A typed key filters. |
 | Anywhere | `cmd+shift+u` | Toggle the undo panel of the part with the keys (see below) |
 
-The view's key handling sends `Request::FileHistory(Undo | Redo |
-Goto(StepId))`. That is applied in `window.rs` `apply_outcome` and in
-`send_key_to_focused` (headless).
+The view's key handling sends `Request::FileHistory(Walk)`. That is applied
+in `window.rs` `apply_outcome` and in `send_key_to_focused` (headless).
 
-**The toggle command.** `undo.toggle_history` ("Toggle Undo History")
-replaces `editor.toggle_undo_history`. It toggles the focused Files surface's
-sidebar panel while the sidebar has the keys, and otherwise the focused
-editor's panel, which was the old command's whole duty. The default binding
-`cmd+shift+u` moves to it in `default_bindings`. A config written since the
-editor panel landed today that names the old id gets the usual
-unknown-command diagnostic. Open question 2 has the alternative.
+**The toggle command.** `editor.toggle_undo_history` and its `cmd+shift+u`
+stay. While the focused Files surface's sidebar has the keys it toggles the
+sidebar's panel, and otherwise the focused editor's.
 
 ## Removed or replaced
 
-- `editor.toggle_undo_history` is replaced by `undo.toggle_history` (above).
-  The editor `⋯` item calls `toggle_undo_panel` directly, unchanged.
 - `plugins/editor/undo_panel.rs` moves to `plugin/undo_panel.rs`, and its
   editor-only parts go to `plugins/editor/undo.rs`.
 - `System::trash -> Result<()>` becomes `-> Result<Option<PathBuf>>`.
@@ -285,6 +311,8 @@ unknown-command diagnostic. Open question 2 has the alternative.
   path. Existing tests still see the entry leave its place.
 - `rename_noreplace` splits so that its strict half, `rename_exclusive`, can
   be called on its own. Existing callers keep the fallback.
+- `trash_now(path) -> Result<()>` becomes `-> Result<Option<(PathBuf, Id)>>`
+  (T and the `Id`); Delete's callers go through `delete_now`, which records.
 
 ## Tests
 
@@ -300,9 +328,14 @@ the tree's current step is unchanged.
 `app_state/file_undo.rs`, the happy paths:
 - create → undo (trashed, document closed) → redo (created again, new `Id`)
 - rename → undo → redo, with an open document following
+- a case-only rename → undo → redo (APFS)
 - move (cut's Paste) → undo → redo
 - Trash → undo (restored from the fake Trash) → redo (trashed again, new T)
 - a walk across a branch
+- steps already in effect (a create gone, a Trash put back by hand) are taken
+  without acting
+- a Trash restored on its own leaves the steps after it; a restore refuses
+  like an undo
 
 `app_state/file_undo.rs`, one test per guard:
 1. Undo create file: written since (`len` > 0) → kept.
@@ -310,10 +343,10 @@ the tree's current step is unchanged.
 3. Undo create folder: holds an entry → kept with its entry.
 4. Undo create folder: unreadable (`chmod 000`) → kept.
 5. Undo create: open document with unsaved edits → kept, document still open.
-6. Undo create with `fail_trash` (the Linux path) → kept.
+6. Undo create when the Trash fails (its folder read-only) → kept.
 7. Undo rename: P taken by a new file → both kept with their contents.
 8. Undo rename: Q's entry replaced (other inode) → both kept.
-9. Undo rename: P's parent gone → Q kept.
+9. Undo move: P's parent gone, or a file → Q kept.
 10. Undo rename: P's parent unreadable (`stat` EACCES, not NotFound) → kept.
 11. Undo move while a job is in flight (`FileJob::Hold`) → nothing moves.
 12. Undo Trash: T gone from the fake Trash → P stays free, nothing created.
@@ -330,17 +363,23 @@ the tree's current step is unchanged.
 
 Scope, keys and panel:
 - An op in workspace A is in A's tree, not B's.
-- Closing a workspace drops its tree.
+- Closing a workspace drops its tree, and a job finishing after it records
+  nothing.
 - A Trash confirmed after switching workspace records in the workspace the
   Delete started in.
+- A rename or paste that changes nothing, and a create with no Trash, record
+  nothing.
+- `rename_exclusive` refuses an existing file and an existing empty folder.
 - `file_browser` (Harness):
-  - Cmd+Z with an empty filter requests file undo; with text it edits the
-    filter.
-  - The panel toggles from `⋯` and `undo.toggle_history`, shows a row per
-    step at the sidebar's bottom, and its rows and arrows request `Goto`.
-  - Escape gives the keys back.
-- `undo.toggle_history` picks the sidebar's panel when the sidebar has the
-  keys, and the editor's otherwise. The default binding is checked.
+  - Cmd+Z with an empty filter requests file undo; with text or the filter's
+    own history it edits the filter.
+  - The panel toggles from `⋯`, shows a row per step at the sidebar's
+    bottom, its rows and arrows request `To`, and a Trash row's Restore
+    requests `Restore`.
+  - Escape, or a click on the list or the filter, gives the keys back.
+- `editor.toggle_undo_history` picks the sidebar's panel when the sidebar has
+  the keys, and the editor's otherwise.
+- A walk toasts only while the panel is closed.
 - `#[ignore]` `real_trash_round_trip` (macOS, `HostSystem`). Run once by
   hand, as described above.
 
@@ -366,6 +405,10 @@ Commands:
     sentence.
   - Add Linux restore to "Delete on other platforms".
   - Update the paths in the undo panel follow-ups.
+  - Record the follow-ups: stale paths from sync ops during a paste, inode
+    reuse, case-only renames on case-sensitive volumes, refusing only
+    overlapping paths while a job runs, `.DS_Store` in a new folder, agents'
+    ops once item 3 is built, and why SMB/exFAT/FUSE refuse.
 
 ## Commits (branch `feat/file-op-undo`)
 
@@ -374,37 +417,34 @@ Commands:
    `System::trash` returning the trashed location
 3. `feat(files): undo and redo file operations from the file sidebar`
 4. `feat(files): show the file history in an undo panel in the file sidebar`,
-   including `undo.toggle_history`
+   including the panel's `Edge` and the toggle command's sidebar case
 5. `docs: file operation undo`
 
 ## Size
 
-About 1,700 lines:
+About 2,100 changed lines of Rust, not counting the panel's move:
 
 | Part | Lines |
 | --- | --- |
-| Panel move and trait | about 120 changed, the rest moved |
-| `file_history.rs` | 200 |
-| `file_undo.rs` | 200 |
-| Recording and workspace plumbing in `files.rs`, `app_state.rs` | 120 |
-| `file_ops.rs` (`Id`, `rename_exclusive`, trash location) | 60 |
-| File-browser panel, keys and requests | 150 |
-| Command and binding | 30 |
-| **Code total** | **about 880** |
-| Tests | about 800 |
-| Docs | about 60 |
+| Panel move, trait, notes and actions | about 160 changed, the rest moved |
+| `file_history.rs` | 335 |
+| `file_undo.rs` | 210 |
+| Recording and workspace plumbing in `files.rs`, `app_state.rs`, `file_jobs.rs` | 140 |
+| `file_ops.rs` (`Id`, `rename_exclusive`, trash location) | 90 |
+| File-browser panel, keys and requests | 110 |
+| Command | 10 |
+| **Code total** | **about 1,050** |
+| Tests | about 1,000 |
+| Docs | about 120 |
 
 ## Open questions (recommended answer first)
 
 1. **Tree scope.** Per workspace. Per Files surface or app-wide are the
    alternatives (see the table above).
-2. **Toggle chord.** Replace `editor.toggle_undo_history` with
-   `undo.toggle_history`, which acts on the part with the keys. The
-   alternative keeps the editor command and adds `files.toggle_undo_history`
-   with no chord: no rename, but `cmd+shift+u` in the sidebar then toggles
-   the document's panel.
-3. **Cmd+Z in the sidebar.** File undo while the filter is empty, filter text
-   while it has some. The alternative gives file undo only while the panel
+2. **Toggle chord.** Settled by the owner: `editor.toggle_undo_history` and
+   `cmd+shift+u` stay, and toggle the sidebar's panel while it has the keys.
+3. **Cmd+Z in the sidebar.** Settled by the owner: file undo while the filter
+   is empty and has nothing of its own to undo, filter text otherwise. The alternative gives file undo only while the panel
    has the keys: stricter, and one more step for every undo.
 4. **Paste-copy and Duplicate as undoable creates.** No. Adding them is a
    feature: undo would trash the copy only if no file in it changed, which
@@ -417,10 +457,8 @@ About 1,700 lines:
    same kind would relax the brief's "still holds what the op left".
 7. **Undo/Redo items in the file context menu** (Zed's Edit section). No.
    Adding them is a feature; the chords and the panel cover the need.
-8. **macOS restore if TCC refuses renames out of `~/.Trash`.** Undo refuses
-   and keeps. Restoring through Finder automation ("put back") would add a
-   permission prompt and a feature, and is for the owner if the hand-run test
-   shows it is needed.
+8. **macOS restore if TCC refuses renames out of `~/.Trash`.** Settled: the
+   hand-run test showed TCC allows it without Full Disk Access.
 9. **Reopen documents a Trash closed when the Trash is undone.** No. Reopening
    them is a feature.
 10. **Linux Trash and restore.** They stay off, with a TODO entry, until they

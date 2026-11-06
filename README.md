@@ -38,7 +38,8 @@ Run from the repo root so `mise` puts Zig on PATH. `.cargo/config.toml` sets
 | Cmd+, | open the config file |
 | Cmd+Q | quit |
 | Cmd+S / Cmd+Shift+S | save / save as (editor; an unsaved buffer asks where) |
-| Cmd+Z / Cmd+Shift+Z | undo / redo (editor) |
+| Cmd+Z / Cmd+Shift+Z | undo / redo (editor; in the file sidebar with an empty filter, the workspace's file create, rename, move and Trash) |
+| Cmd+Shift+U | undo history panel (editor, or the file sidebar when it has the keys) |
 | Cmd+Shift+C | copy the focused file's absolute path |
 
 Drag the divider between split panes to resize them (it lights up and the cursor

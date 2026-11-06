@@ -293,9 +293,8 @@
 - Detail: DONE: editor undo is a tree of changes per open file, shared by
   its views (see DECISION.md, item 14 parts 1–2). Single-line fields
   (`LineEdit`) have linear undo. The editor has an undo panel
-  (`plugin::undo_panel`, item 14 part 4); not yet checked at a
-  desktop. REMAINING: the file browser's undo panel, with file-operation undo
-  (item 14 part 3).
+  (`plugin::undo_panel`, item 14 part 4), and the file sidebar one over its
+  workspace's file operations (part 3); neither checked at a desktop yet.
   Editor follow-ups: (a) every view keeps its own copy of the text and the
   file's shared document keeps one more, so one open file holds two copies;
   (b) a view syncs with the others at input, paint and refresh only, so a
@@ -785,15 +784,15 @@
 - Detail: The menu exists (right-click in a Files surface's sidebar or on a
   file tab, a document's file name in its header and its `⋯`; README,
   PLUGINS.md). Not built:
-  - **Undo / Redo** of file operations (Zed's Edit section). Needs an operation
-    log with an inverse for create, duplicate, paste, rename, move, and Trash
-    (move back from the Trash). Left out rather than half-done.
   - **Finder interop for Cut / Copy / Paste**: the file clipboard is the app's
     own; the system pasteboard (file URLs) would let Paste work with Finder.
   - **Delete on other platforms**: only macOS moves to the Trash
     (`NSFileManager trashItemAtURL`); elsewhere it reports "not supported" and
     never deletes permanently. The `trash` crate or the freedesktop spec would
-    cover Linux.
+    cover Linux. File-operation undo has no Trash or create steps there until
+    then; a Linux restore would rename `Trash/files/<name>` exclusively back
+    to the `Path=` in `info/<name>.trashinfo`, removing that `.trashinfo` only
+    after the rename succeeds (`file_history.rs`, `HostSystem::trash`).
   - **Cmd+Backspace** on the file browser's selection to delete (from the old
     "Delete files" entry).
   - New File / New Folder create the entry and do not open it.
@@ -1555,3 +1554,17 @@
 - Reason: findings from the review of `feat/config-layers`, recorded rather than fixed.
 
 ---
+
+---
+
+[2026-11-07T12:33+1300@aff740a]
+
+- Requires: NO BLOCKERS
+- Detail: File-operation undo (`file_history.rs`, `app_state/file_undo.rs`): a rename or delete run while a paste is in flight leaves the paste's step, recorded when it finishes, and earlier steps with paths that no longer match; their checks then refuse. Follow such moves with `file_ops::follow` over each step's paths.
+- Detail: Inode reuse: an entry removed and another created can get the same `ino`, so `Id` matches a different entry. Add the birth time to `Id`.
+- Detail: A case-only rename's undo and redo use plain `std::fs::rename` once `same_entry_recased` says both names are one entry; limit that to case-insensitive volumes (`pathconf(_PC_CASE_SENSITIVE)`).
+- Detail: Undo, redo and restore refuse while any file job is pending. Refuse only when a job's paths overlap the step's.
+- Detail: Finder writes `.DS_Store` into a folder it shows, so an undone "New folder" viewed in Finder isn't empty and refuses.
+- Detail: Agents' file operations land in the user's per-workspace tree once item 3 (per-workspace agent scope) is built; decide whether they show there.
+- Detail: SMB, exFAT and some FUSE volumes lack an atomic no-replace rename, so every undo there refuses with "this volume can't rename without risking what is in the way"; name the volume kind in the toast.
+- Reason: follow-ups from the file-operation undo plan's review, recorded rather than built.

@@ -288,12 +288,18 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   `impl History for UndoTree`, labels and width are in
   `plugins::editor::undo`): an `EditorView` toggles it
   (`toggle_undo_panel`, the `⋯` menu, `editor.toggle_undo_history`, bound
-  to `cmd+shift+u` in a new config file); it takes the right of the body,
+  to `cmd+shift+u` in a new config file, which toggles the sidebar's panel
+  instead while a file sidebar has the keys); it takes the right of the body,
   in every mode. `Graph::of` lays out the
   buffer's `history()` as rows, newest first, and lanes; the panel rebuilds
   it when the tree's root, current or saved step, or step count changes.
   Row `i` is button `BTN_UNDO + i`; a row clicked or reached with the keys
-  calls `EditorBuffer::goto`, after the `history()` borrow ends.
+  calls `EditorBuffer::goto`, after the `history()` borrow ends. The file
+  sidebar draws the same panel at its bottom (`Edge::Top`) over its
+  workspace's `FileHistory` (`file_history.rs`), handed to each `FilesView`
+  in `AppState::insert_view`; its rows, keys and Restore buttons send
+  `Request::FileHistory(Walk)`, which `AppState::walk_file_history`
+  (`app_state/file_undo.rs`) checks and applies.
 - Preview (`plugins::editor::md_preview`): the buffer rendered read-only,
   unsaved edits included. `parse` turns Markdown (pulldown-cmark:
   CommonMark, GFM tables, task lists, strikethrough) into a flat list of
