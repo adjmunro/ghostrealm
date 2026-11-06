@@ -3471,6 +3471,26 @@ mod tests {
     }
 
     #[test]
+    fn toggle_undo_history_shows_and_hides_the_focused_editors_panel() {
+        use ghostrealm_core::Args;
+        let mut r = build_registry();
+        let mut s = AppState::new();
+        let err = r.execute("editor.toggle_undo_history", &Args::new(), &mut s).unwrap_err();
+        assert!(matches!(err, CmdError::Inapplicable(_)), "{err:?}");
+        let dir = crate::plugin::testing::tmpdir("app-undo-history");
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, "x").unwrap();
+        s.new_empty_vtab();
+        s.open_file_in_new_surface(&txt).unwrap();
+        let sid = s.focused_surface().unwrap();
+        r.execute("editor.toggle_undo_history", &Args::new(), &mut s).unwrap();
+        assert!(s.editor(sid).unwrap().undo_panel_open());
+        r.execute("editor.toggle_undo_history", &Args::new(), &mut s).unwrap();
+        assert!(!s.editor(sid).unwrap().undo_panel_open());
+        assert_eq!(Config::default().binding("cmd+shift+u").as_deref(), Some("editor.toggle_undo_history"));
+    }
+
+    #[test]
     fn toggle_comment_comments_the_focused_editors_lines_per_its_language() {
         use ghostrealm_core::Args;
         let mut r = build_registry();

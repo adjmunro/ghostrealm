@@ -10,6 +10,7 @@ pub mod lang;
 pub mod md_preview;
 mod rows;
 mod toc;
+mod undo_panel;
 pub mod wrap;
 
 use std::any::Any;
@@ -43,6 +44,7 @@ use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
 use rows::{HeadingSizes, LineSize, RowKind, RowLayout, RowTable, TextRow};
 use toc::Toc;
+use undo_panel::{PanelKey, UndoPanel};
 
 pub const ID: &str = "editor";
 
@@ -71,8 +73,10 @@ const BTN_MORE: u32 = 4;
 const BTN_FILE_MENU: u32 = 5;
 /// The view-mode button: steps to the next mode the file offers.
 const BTN_VIEW_MODE: u32 = 6;
+/// The undo panel's toggle: the `⋯` menu item and the panel's close button.
+const BTN_UNDO_PANEL: u32 = 7;
 /// The `⋯` menu's mode items: `BTN_SHOW_MODE + i` shows `ViewMode::ALL[i]`.
-const BTN_SHOW_MODE: u32 = 7;
+const BTN_SHOW_MODE: u32 = 8;
 /// Menu items showing statistic `Stat::ALL[i]` are `BTN_SHOW_STAT + i`.
 const BTN_SHOW_STAT: u32 = 16;
 /// The copy button of the code block opening on line `ln` is
@@ -82,6 +86,10 @@ const BTN_COPY_BLOCK: u32 = 256;
 /// `i`. Between the copy buttons' ids and the links': a document has at
 /// most `buffer::MAX_FILE_BYTES` lines, and an outline as many items.
 const BTN_TOC: u32 = 1 << 29;
+/// The undo panel's rows: `BTN_UNDO + i` goes to the step on row `i`. A
+/// history holds far fewer than `1 << 28` steps (each costs 128 bytes of
+/// its 64 MB).
+const BTN_UNDO: u32 = BTN_TOC + (1 << 28);
 /// A Preview's links take the ids from [`md_preview::BTN_LINK`] up, past
 /// every copy button's and the table of contents'.
 use md_preview::BTN_LINK;
@@ -95,6 +103,7 @@ const _: () = assert!(
         && BTN_SHOW_STAT > BTN_MORE
         && BTN_SHOW_STAT > BTN_FILE_MENU
         && BTN_SHOW_STAT > BTN_VIEW_MODE
+        && BTN_SHOW_STAT > BTN_UNDO_PANEL
         && BTN_SHOW_STAT >= BTN_SHOW_MODE + ViewMode::ALL.len() as u32,
     "the statistic items' ids must not collide with another button's"
 );
@@ -104,8 +113,10 @@ const _: () = assert!(
 );
 const _: () = assert!(
     BTN_COPY_BLOCK as u64 + buffer::MAX_FILE_BYTES <= BTN_TOC as u64
-        && BTN_TOC as u64 + buffer::MAX_FILE_BYTES <= BTN_LINK as u64,
-    "a copy button's id is its block's line past BTN_COPY_BLOCK, a table of contents item's its index past BTN_TOC"
+        && BTN_TOC as u64 + buffer::MAX_FILE_BYTES <= BTN_UNDO as u64
+        && BTN_UNDO as u64 + (1 << 28) <= BTN_LINK as u64,
+    "a copy button's id is its block's line past BTN_COPY_BLOCK, a table of contents item's its index past BTN_TOC, \
+     an undo panel row's its index past BTN_UNDO"
 );
 /// The idle-autosave delay (seconds) when autosave is switched on in the header
 /// but `[editor] autosave_after` is 0.
@@ -248,6 +259,23 @@ impl Plugin for EditorPlugin {
                     .and_then(|v| v.downcast_mut::<EditorView>())
                     .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
                 editor.cycle_view_mode();
+                Ok(CmdOutcome::ok())
+            }),
+        );
+        r.register(
+            CommandMeta::new(
+                "editor.toggle_undo_history",
+                "Toggle Undo History",
+                "Show or hide the focused editor's undo panel: its file's undo tree, where a step clicked or reached \
+                 with Up and Down becomes the text",
+            ),
+            Box::new(move |s: &mut AppState, _| {
+                let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
+                let editor = doc
+                    .and_then(|d| s.doc_mut(d))
+                    .and_then(|v| v.downcast_mut::<EditorView>())
+                    .ok_or_else(|| CmdError::Inapplicable("no editor is focused".into()))?;
+                editor.toggle_undo_panel();
                 Ok(CmdOutcome::ok())
             }),
         );
@@ -433,6 +461,9 @@ pub struct EditorView {
     /// The press under way began on the table of contents: its drag and
     /// release aren't the text's.
     toc_press: bool,
+    undo: UndoPanel,
+    /// The press under way began on the undo panel.
+    undo_press: bool,
 }
 
 /// A fenced code block on screen.
@@ -468,6 +499,8 @@ impl EditorView {
             outline: Outline::new(waker),
             toc: Toc::default(),
             toc_press: false,
+            undo: UndoPanel::default(),
+            undo_press: false,
             stats,
             seen_edits: buf.edits,
             buf,
@@ -583,6 +616,23 @@ impl EditorView {
     /// first).
     pub fn cycle_view_mode(&mut self) {
         self.set_view_mode(self.next_view_mode());
+    }
+
+    /// Show the undo panel, with the arrow keys, or hide it.
+    pub fn toggle_undo_panel(&mut self) {
+        self.undo.toggle();
+    }
+
+    pub fn undo_panel_open(&self) -> bool {
+        self.undo.is_open()
+    }
+
+    /// Move the text to step `id` of its history.
+    fn goto_step(&mut self, id: history::NodeId) {
+        if self.buf.goto(id) {
+            self.goal_x = None;
+            self.note_edits();
+        }
     }
 
     fn next_view_mode(&self) -> ViewMode {
@@ -851,6 +901,7 @@ impl EditorView {
             MenuItem::new(BTN_AUTOSAVE, "Autosave")
                 .check(has_file && self.autosave_on(cfg))
                 .enable(has_file),
+            MenuItem::new(BTN_UNDO_PANEL, "Undo history").check(self.undo.is_open()),
             MenuItem::RULE,
         ]);
         for (i, stat) in Stat::ALL.into_iter().enumerate() {
@@ -1376,6 +1427,14 @@ impl View for EditorView {
             self.paint_header(cx, Rect { h: header_h, ..rect }, wrap);
             body = Rect { y: rect.y + header_h, h: (rect.h - header_h).max(1.0), ..rect };
         }
+        // The undo panel takes the body's right side.
+        let undo_w = self.undo.width(cx.ui, body.w);
+        if undo_w > 0.0 {
+            body.w -= undo_w;
+            let panel = Rect { x: body.x + body.w, w: undo_w, ..body };
+            let history = self.buf.history();
+            self.undo.paint(cx, panel, &history, BTN_UNDO, BTN_UNDO_PANEL);
+        }
 
         if self.view_mode() == ViewMode::Preview {
             self.dismiss_popup();
@@ -1720,6 +1779,26 @@ impl View for EditorView {
             cx.redraw();
             return true;
         }
+        if self.undo.is_focused() {
+            // The history's borrow ends before the jump edits it.
+            let used = {
+                let history = self.buf.history();
+                self.undo.update(&history);
+                self.undo.key(k)
+            };
+            match used {
+                PanelKey::Pass => cx.redraw(),
+                PanelKey::Took => {
+                    cx.redraw();
+                    return true;
+                }
+                PanelKey::Goto(id) => {
+                    self.goto_step(id);
+                    cx.redraw();
+                    return true;
+                }
+            }
+        }
         let m = k.mods;
         // The Preview is read-only: it scrolls, and saves.
         let save = m.super_ && matches!(k.key, Key::Char(c) if c.eq_ignore_ascii_case(&'s'));
@@ -1790,6 +1869,23 @@ impl View for EditorView {
             }
             _ => {}
         }
+        // The undo panel's rows are buttons; a press on it gives it the
+        // keys, a press beside it gives them back to the text.
+        match *event {
+            MouseEvent::Down { pos, .. } if self.undo.contains(pos) => {
+                self.undo_press = true;
+                self.undo.focus(true);
+                cx.redraw();
+                return;
+            }
+            MouseEvent::Drag { .. } if self.undo_press => return,
+            MouseEvent::Up { .. } if std::mem::take(&mut self.undo_press) => return,
+            MouseEvent::Down { .. } if self.undo.is_focused() => {
+                self.undo.focus(false);
+                cx.redraw();
+            }
+            _ => {}
+        }
         if self.view_mode() == ViewMode::Preview {
             if let MouseEvent::Down { pos, clicks, .. } = *event {
                 if let Some(md_preview::Action::EditAt(line)) = self.preview.press(pos, clicks) {
@@ -1840,8 +1936,9 @@ impl View for EditorView {
                 }
             }
             MouseEvent::Move { pos: (x, y) } => {
-                // Text under the table of contents isn't the pointer's.
-                let over_toc = self.toc.contains((x, y));
+                // Text under the table of contents or the undo panel isn't
+                // the pointer's.
+                let over_toc = self.toc.contains((x, y)) || self.undo.contains((x, y));
                 let at = if over_toc { None } else { self.char_at(x, y) };
                 if self.lang.as_mut().is_some_and(|l| l.pointer(at, Instant::now())) {
                     cx.redraw();
@@ -1863,7 +1960,7 @@ impl View for EditorView {
     }
 
     fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), dx: f32, dy: f32) {
-        if self.toc.scroll(pos, dy) {
+        if self.toc.scroll(pos, dy) || self.undo.scroll(pos, dy) {
             cx.redraw();
             return;
         }
@@ -1967,6 +2064,10 @@ impl View for EditorView {
                 }
                 return;
             }
+            id if id >= BTN_UNDO => {
+                let Some(step) = self.undo.step(id - BTN_UNDO) else { return };
+                self.goto_step(step);
+            }
             id if id >= BTN_TOC => {
                 let Some(line) = self.toc.target(id - BTN_TOC) else { return };
                 self.jump_to(line);
@@ -1987,6 +2088,7 @@ impl View for EditorView {
                 self.set_view_mode(ViewMode::ALL[(id - BTN_SHOW_MODE) as usize]);
             }
             BTN_WRAP => self.soft_wrap = Some(!self.wrap_on(cx.cfg)),
+            BTN_UNDO_PANEL => self.undo.toggle(),
             BTN_STAT => self.stats.cycle(),
             id if (BTN_SHOW_STAT..BTN_SHOW_STAT + Stat::ALL.len() as u32).contains(&id) => {
                 self.stats.show(Stat::ALL[(id - BTN_SHOW_STAT) as usize]);

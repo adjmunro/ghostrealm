@@ -463,6 +463,7 @@ fn default_bindings() -> HashMap<&'static str, &'static str> {
         ("cmd+[", "pane.focus_prev"),
         ("cmd+l", "web.focus_url"),
         ("cmd+/", "editor.toggle_comment"),
+        ("cmd+shift+u", "editor.toggle_undo_history"),
         ("cmd+shift+c", "file.copy_path"),
     ])
 }
