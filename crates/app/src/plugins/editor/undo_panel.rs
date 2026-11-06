@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use ghostrealm_core::Rect;
 use ghostrealm_terminal::{Key, KeyPress};
 
-use super::history::{NodeId, UndoTree};
+use super::history::{end_of, NodeId, Op, UndoTree};
 use crate::plugin::icons::Icon;
 use crate::plugin::{rect_contains, theme, Font, PaintCx, UiMetrics};
 
@@ -129,19 +129,47 @@ fn graph_key(t: &UndoTree) -> GraphKey {
 
 /// What step `id` of `t` changed, in short: `+text` inserted, `−text`
 /// deleted, `old → new` replaced, or how many changes a step of several
-/// made. The root, the oldest text kept, is "Start".
+/// made, counted after [`merged`]. The root, the oldest text kept, is
+/// "Start".
 pub fn label(t: &UndoTree, id: NodeId) -> String {
     let Some(n) = t.node(id) else { return String::new() };
     if n.parent().is_none() {
         return "Start".into();
     }
-    match n.ops() {
+    match merged(n.ops()).as_slice() {
         [] => String::new(),
         [op] if op.del.is_empty() => format!("+{}", snippet(&op.ins)),
         [op] if op.ins.is_empty() => format!("\u{2212}{}", snippet(&op.del)),
         [op] => format!("{} \u{2192} {}", snippet(&op.del), snippet(&op.ins)),
         ops => format!("{} changes", ops.len()),
     }
+}
+
+/// `ops` with neighbours joined, since typing records a change per
+/// character: an insert where the last change's inserted text ends (a typed
+/// run, or typing over a selection, whose delete inserts nothing), and a
+/// delete beside the last delete, after it (Delete) or before it
+/// (Backspace).
+fn merged(ops: &[Op]) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::new();
+    for op in ops {
+        let Some(m) = out.last_mut() else {
+            out.push(op.clone());
+            continue;
+        };
+        let deletes = op.ins.is_empty() && m.ins.is_empty();
+        if op.del.is_empty() && op.at == end_of(m.at, &m.ins) {
+            m.ins.push_str(&op.ins);
+        } else if deletes && op.at == m.at {
+            m.del.push_str(&op.del);
+        } else if deletes && end_of(op.at, &op.del) == m.at {
+            m.del.insert_str(0, &op.del);
+            m.at = op.at;
+        } else {
+            out.push(op.clone());
+        }
+    }
+    out
 }
 
 /// `s` on one line, at most [`LABEL_CHARS`] long: a newline shows as `⏎`.
@@ -502,6 +530,32 @@ mod tests {
         t.push(Caret::default(), usize::MAX);
         t.record(Op { at: (0, 0), del: "a".into(), ins: "b".into() });
         assert_eq!(label(&t, t.current()), "a \u{2192} b");
+    }
+
+    #[test]
+    fn a_run_of_typing_or_deleting_is_one_change() {
+        let mut h = Harness::new();
+        let mut v = EditorView::new(EditorBuffer::scratch());
+        let last = |v: &EditorView| {
+            let t = v.buffer().history();
+            label(&t, t.current())
+        };
+        let chars = |s: &str| s.chars().map(Key::Char).collect::<Vec<_>>();
+        typed(&h, &mut v, &chars("hello "));
+        assert_eq!(last(&v), "+hello ");
+        typed(&h, &mut v, &chars("abc"));
+        typed(&h, &mut v, &[Key::Backspace; 3]);
+        assert_eq!(last(&v), "\u{2212}abc", "a backspace run");
+        typed(&h, &mut v, &[Key::Home]);
+        typed(&h, &mut v, &[Key::Delete; 3]);
+        assert_eq!(last(&v), "\u{2212}hel", "a forward-delete run");
+        assert_eq!(lines(&v), ["lo "]);
+        h.key(&mut v, cmd(Key::Char('a')));
+        typed(&h, &mut v, &chars("xy"));
+        assert_eq!(last(&v), "lo  \u{2192} xy", "typing over a selection");
+        v.toggle_undo_panel();
+        h.paint(&mut v, RECT);
+        assert!(h.texts().iter().any(|t| t == "+hello "), "{:?}", h.texts());
     }
 
     #[test]
