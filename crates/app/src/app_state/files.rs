@@ -3,13 +3,16 @@
 //! channel. Each acts on a path argument, else on the focused view's
 //! [`subject`](crate::plugin::View::subject).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry};
+use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry, VtabId};
 
 use super::{AppState, Confirm, Confirmed, DocRef, Pick};
+use crate::file_history::{FileHistory, FileOp, Fresh};
 use crate::file_jobs::{self, Done, FileJob, Output};
 use crate::file_menu::{self, FileAction, FileTarget, MenuEntry, MenuEnv};
 use crate::file_ops;
@@ -164,11 +167,32 @@ impl AppState {
         any
     }
 
-    /// Create the file or folder `name` in `dir`.
+    /// Create the file or folder `name` in `dir`. Undo trashes it, so it is
+    /// recorded only where there is a Trash.
     pub fn new_entry(&mut self, dir: &Path, name: &str, folder: bool) -> Result<PathBuf> {
         let path = if folder { file_ops::create_dir(dir, name)? } else { file_ops::create_file(dir, name)? };
+        if self.system.has_trash() {
+            if let Ok(meta) = path.symlink_metadata() {
+                let fresh = (!folder).then(|| Fresh::of(&meta));
+                let id = Some(file_ops::Id::of_meta(&meta));
+                self.record_file_op(self.active(), FileOp::Create { path: path.clone(), id, fresh });
+            }
+        }
         self.changed(&[]);
         Ok(path)
+    }
+
+    /// Workspace `vt`'s file history, made on first use.
+    pub fn file_history(&mut self, vt: VtabId) -> Rc<RefCell<FileHistory>> {
+        self.file_histories.entry(vt).or_default().clone()
+    }
+
+    /// Add `op` to workspace `vt`'s file history. A workspace that has
+    /// closed (a job finishing after it) records nothing.
+    fn record_file_op(&mut self, vt: Option<VtabId>, op: FileOp) {
+        if let Some(vt) = vt.filter(|vt| self.tree.vtab(*vt).is_some()) {
+            self.file_history(vt).borrow_mut().record(op);
+        }
     }
 
     /// Remember `path` for Paste; `cut` moves it there instead of copying.
@@ -187,7 +211,8 @@ impl AppState {
         if clip.cut {
             self.file_clip = None;
         }
-        self.run_file_job(FileJob::Paste { src: clip.path, dir: dir.to_path_buf(), cut: clip.cut })
+        let vtab = self.active();
+        self.run_file_job(FileJob::Paste { src: clip.path, dir: dir.to_path_buf(), cut: clip.cut, vtab })
     }
 
     /// Copy `path` next to itself, on the file worker. Returns what the
@@ -319,8 +344,12 @@ impl AppState {
     /// Bring the views up to date with a finished job. Returns what its
     /// command says, and whether that is a warning.
     fn apply_file_job(&mut self, done: Done) -> (Result<String>, bool) {
-        if let (FileJob::Paste { src, cut: true, .. }, Ok(Output::Moved(moved))) = (&done.job, &done.result) {
+        if let (FileJob::Paste { src, cut: true, vtab, .. }, Ok(Output::Moved(moved))) = (&done.job, &done.result) {
             let renames = self.move_renames(src, moved);
+            if let Some(id) = undoable_move(src, moved) {
+                let op = FileOp::Rename { from: src.clone(), to: moved.dest.clone(), id: Some(id), moved: true };
+                self.record_file_op(*vtab, op);
+            }
             self.changed(&renames);
             return (Ok(pasted_message(moved)), moved.source_left);
         }
@@ -379,8 +408,8 @@ impl AppState {
             }
             // A copy or move using the path while git looked may have changed
             // what git saw (or be reading from it): ask.
-            (FileJob::DeleteCheck { path }, Ok(Output::Clean(clean))) => {
-                self.delete_checked(&path, clean && !busy).map(|()| String::new())
+            (FileJob::DeleteCheck { path, vtab }, Ok(Output::Clean(clean))) => {
+                self.delete_checked(&path, clean && !busy, vtab).map(|()| String::new())
             }
             (_, Err(e)) => Err(e),
             (job, Ok(output)) => bail!("{} produced {output:?}", job.command()),
@@ -391,6 +420,10 @@ impl AppState {
     pub fn rename_path(&mut self, path: &Path, name: &str) -> Result<PathBuf> {
         let dest = file_ops::rename(path, name)?;
         if dest != path {
+            if let Ok(id) = file_ops::Id::of(&dest) {
+                let op = FileOp::Rename { from: path.to_path_buf(), to: dest.clone(), id: Some(id), moved: false };
+                self.record_file_op(self.active(), op);
+            }
             self.changed(&[(path.to_path_buf(), dest.clone())]);
         }
         Ok(dest)
@@ -491,19 +524,20 @@ impl AppState {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
         }
+        let vtab = self.active();
         let unsaved = self.unsaved_under(path);
         if !unsaved.is_empty() {
-            self.ask_unsaved_trash(path, &unsaved);
+            self.ask_unsaved_trash(path, &unsaved, vtab);
             return Ok(String::new());
         }
-        self.run_file_job(FileJob::DeleteCheck { path: path.to_path_buf() })
+        self.run_file_job(FileJob::DeleteCheck { path: path.to_path_buf(), vtab })
     }
 
     /// Finish a Delete once git said whether it holds a copy of `path`
     /// (`clean`). What changed during the check counts: the entry must still
     /// be there, a view of it edited meanwhile asks about its unsaved
     /// changes, and a question opened meanwhile (a quit) isn't replaced.
-    fn delete_checked(&mut self, path: &Path, clean: bool) -> Result<()> {
+    fn delete_checked(&mut self, path: &Path, clean: bool, vtab: Option<VtabId>) -> Result<()> {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
         }
@@ -512,18 +546,18 @@ impl AppState {
         }
         let unsaved = self.unsaved_under(path);
         if !unsaved.is_empty() {
-            self.ask_unsaved_trash(path, &unsaved);
+            self.ask_unsaved_trash(path, &unsaved, vtab);
         } else if !clean {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             self.confirm = Some(Confirm {
                 message: format!("Move \u{201c}{name}\u{201d} to the Trash?"),
                 accept: Some("Delete"),
                 discard: None,
-                then: Confirmed::Trash(path.to_path_buf()),
+                then: Confirmed::Trash { path: path.to_path_buf(), vtab },
                 late: None,
             });
         } else {
-            self.trash_now(path)?;
+            self.delete_now(path, vtab)?;
         }
         Ok(())
     }
@@ -538,23 +572,35 @@ impl AppState {
     }
 
     /// Ask whether to save `unsaved` (documents of `path`) before trashing it.
-    fn ask_unsaved_trash(&mut self, path: &Path, unsaved: &[DocRef]) {
+    fn ask_unsaved_trash(&mut self, path: &Path, unsaved: &[DocRef], vtab: Option<VtabId>) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let (message, save, can_save) = self.unsaved_question(unsaved);
         self.confirm = Some(Confirm {
             message: format!("{message} Move \u{201c}{name}\u{201d} to the Trash?"),
             accept: can_save.then_some("Save and Delete"),
             discard: Some("Delete Without Saving"),
-            then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save },
+            then: Confirmed::UnsavedTrash { path: path.to_path_buf(), save, vtab },
             late: None,
         });
     }
 
+    /// Delete `path` for workspace `vtab`: trash it, and record that in the
+    /// workspace's file history when the Trash said where it went.
+    pub(super) fn delete_now(&mut self, path: &Path, vtab: Option<VtabId>) -> Result<()> {
+        if let Some((at, id)) = self.trash_now(path)? {
+            let op = FileOp::Trash { path: path.to_path_buf(), at: Some(at), id: Some(id), restored: false };
+            self.record_file_op(vtab, op);
+        }
+        Ok(())
+    }
+
     /// Move `path` to the Trash and close the documents of it; a surface left
-    /// with no document closes.
-    pub(super) fn trash_now(&mut self, path: &Path) -> Result<()> {
+    /// with no document closes. Returns where the Trash put it and which
+    /// entry it was, when both are known.
+    pub(super) fn trash_now(&mut self, path: &Path) -> Result<Option<(PathBuf, file_ops::Id)>> {
         let open = self.docs_under(path);
-        self.system.trash(path).with_context(|| format!("can't move {} to the Trash", path.display()))?;
+        let id = file_ops::Id::of(path).ok();
+        let at = self.system.trash(path).with_context(|| format!("can't move {} to the Trash", path.display()))?;
         for (sid, doc) in open {
             if !self.views.contains_key(&sid) || !self.close_doc((sid, doc)) {
                 continue;
@@ -567,8 +613,20 @@ impl AppState {
             }
         }
         self.changed(&[]);
-        Ok(())
+        Ok(at.zip(id))
     }
+}
+
+/// The entry a move left at `moved.dest`, when undo can move it back: it
+/// moved whole, by a rename on one volume.
+fn undoable_move(src: &Path, moved: &file_ops::Moved) -> Option<file_ops::Id> {
+    if moved.source_left || moved.dest == src {
+        return None;
+    }
+    let id = file_ops::Id::of(&moved.dest).ok()?;
+    // Followed: a rename back goes through a link to the folder.
+    let parent = file_ops::Id::of_meta(&std::fs::metadata(src.parent()?).ok()?);
+    (parent.dev == id.dev).then_some(id)
 }
 
 /// The title of file command `command` (`file.paste`: "Paste"), for a
@@ -714,7 +772,7 @@ mod tests {
 
     fn app_with(fail_trash: bool) -> (AppState, Calls) {
         let calls = Calls::default();
-        let system = FakeSystem { calls: calls.clone(), fail_trash };
+        let system = FakeSystem { calls: calls.clone(), fail_trash, ..Default::default() };
         let mut s = AppState::new().with_shell_line("sleep 1").with_system(Box::new(system));
         s.new_empty_vtab();
         (s, calls)
@@ -1233,7 +1291,7 @@ mod tests {
         let mut s = AppState::new()
             .with_unsaved_guard()
             .with_shell_line("sleep 1")
-            .with_system(Box::new(FakeSystem { calls: calls.clone(), fail_trash: false }));
+            .with_system(Box::new(FakeSystem { calls: calls.clone(), fail_trash: false, ..Default::default() }));
         s.new_empty_vtab();
         let d = tmpdir("fm-delete-unsaved");
         std::fs::write(d.join("a.txt"), "A\n").unwrap();
@@ -1293,7 +1351,7 @@ mod tests {
     /// in the background and is applied by a pump.
     fn app_in_background() -> (AppState, Calls) {
         let calls = Calls::default();
-        let system = FakeSystem { calls: calls.clone(), fail_trash: false };
+        let system = FakeSystem { calls: calls.clone(), fail_trash: false, ..Default::default() };
         let mut s = AppState::new()
             .with_shell_line("sleep 1")
             .with_system(Box::new(system))
@@ -1552,7 +1610,7 @@ mod tests {
     fn a_running_delete_check_doesnt_hold_up_a_quit() {
         let d = tmpdir("fm-quit-check");
         let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf() });
+        s.file_jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
         s.request_quit();
         assert!(s.confirm().is_none() && s.quitting());
     }
@@ -1632,7 +1690,7 @@ mod tests {
         std::fs::write(d.join("src/left.txt"), "new").unwrap();
         let done = Done {
             id: 0,
-            job: FileJob::Paste { src: d.join("src"), dir: d.join("to"), cut: true },
+            job: FileJob::Paste { src: d.join("src"), dir: d.join("to"), cut: true, vtab: None },
             result: Ok(Output::Moved(file_ops::Moved { dest: d.join("to/src"), source_left: true })),
             busy: false,
         };

@@ -9,6 +9,7 @@ pub mod block_cache;
 pub mod clicks;
 pub mod config_watch;
 pub mod dividers;
+pub mod file_history;
 pub mod file_jobs;
 pub mod file_menu;
 pub mod file_stamp;

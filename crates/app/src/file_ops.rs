@@ -13,8 +13,11 @@ use ghostrealm_process::inherit_stdio_only;
 
 /// What the app asks of the operating system outside its own windows.
 pub trait System {
-    /// Move `path` to the Trash. Never deletes permanently.
-    fn trash(&self, path: &Path) -> Result<()>;
+    /// Move `path` to the Trash. Never deletes permanently. Returns where it
+    /// went, when the system says.
+    fn trash(&self, path: &Path) -> Result<Option<PathBuf>>;
+    /// Whether [`Self::trash`] can work here: a create is undone by trashing.
+    fn has_trash(&self) -> bool;
     /// Show `path` selected in the system file manager.
     fn reveal(&self, path: &Path) -> Result<()>;
     /// Open `path` with the system's default application.
@@ -28,18 +31,24 @@ pub struct HostSystem;
 
 impl System for HostSystem {
     #[cfg(target_os = "macos")]
-    fn trash(&self, path: &Path) -> Result<()> {
+    fn trash(&self, path: &Path) -> Result<Option<PathBuf>> {
         use objc2_foundation::{NSFileManager, NSString, NSURL};
         let path = path.to_str().context("the path isn't UTF-8")?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        let mut at = None;
         NSFileManager::defaultManager()
-            .trashItemAtURL_resultingItemURL_error(&url, None)
-            .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))
+            .trashItemAtURL_resultingItemURL_error(&url, Some(&mut at))
+            .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))?;
+        Ok(at.and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string())))
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn trash(&self, _path: &Path) -> Result<()> {
+    fn trash(&self, _path: &Path) -> Result<Option<PathBuf>> {
         bail!("moving to the Trash isn't supported on this platform")
+    }
+
+    fn has_trash(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 
     fn reveal(&self, path: &Path) -> Result<()> {
@@ -350,6 +359,21 @@ fn copy_to_free(src: &Path, dir: &Path, name: &OsStr, copied: &mut Vec<Copied>) 
 /// Where the system has no atomic form of this, the check and the rename are
 /// separate steps.
 fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match rename_exclusive(from, to) {
+        Err(e) if e.kind() == ErrorKind::Unsupported => {}
+        done => return done,
+    }
+    if to.symlink_metadata().is_ok() {
+        return Err(ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
+}
+
+/// Rename `from` to `to` in one atomic step that fails with `AlreadyExists`
+/// if anything is at `to`. Fails with `Unsupported`, changing nothing, where
+/// the filesystem or kernel has no such rename: undo never risks the race
+/// [`rename_noreplace`] accepts there.
+pub fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -370,15 +394,60 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
-        // This filesystem or kernel can't do it: fall through to the plain way.
-        if !matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)) {
-            return Err(err);
+        if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)) {
+            return Err(ErrorKind::Unsupported.into());
         }
+        Err(err)
     }
-    if to.symlink_metadata().is_ok() {
-        return Err(ErrorKind::AlreadyExists.into());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(ErrorKind::Unsupported.into())
     }
-    std::fs::rename(from, to)
+}
+
+/// What kind of entry an [`Id`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// Which entry a path names, never following a link: its device, inode and
+/// kind. A rename keeps it; a new entry at the same path has another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Id {
+    pub dev: u64,
+    pub ino: u64,
+    pub kind: EntryKind,
+}
+
+impl Id {
+    pub fn of_meta(meta: &std::fs::Metadata) -> Id {
+        let t = meta.file_type();
+        let kind = match () {
+            _ if t.is_symlink() => EntryKind::Symlink,
+            _ if t.is_dir() => EntryKind::Dir,
+            _ if t.is_file() => EntryKind::File,
+            _ => EntryKind::Other,
+        };
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        // No inode to tell entries apart: never equal to a recorded one.
+        #[cfg(not(unix))]
+        let (dev, ino) = (u64::MAX, u64::MAX);
+        Id { dev, ino, kind }
+    }
+
+    /// The entry at `path` (`symlink_metadata`).
+    pub fn of(path: &Path) -> std::io::Result<Id> {
+        path.symlink_metadata().map(|m| Id::of_meta(&m))
+    }
 }
 
 /// Whether `dir` is `src` or inside it, after resolving symlinks and the case
@@ -507,7 +576,7 @@ pub fn rename(path: &Path, name: &str) -> Result<PathBuf> {
 
 /// Whether `dest` names the entry `path` with only the case changed, as a
 /// case-insensitive filesystem (macOS's default) finds it already there.
-fn same_entry_recased(path: &Path, dest: &Path) -> bool {
+pub fn same_entry_recased(path: &Path, dest: &Path) -> bool {
     let same_name = match (path.file_name(), dest.file_name()) {
         (Some(a), Some(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
         _ => false,
@@ -630,26 +699,38 @@ pub mod tests {
     use std::rc::Rc;
 
     /// A [`System`] that records what it was asked (in `calls`, which the test
-    /// keeps a handle on) and touches nothing but the entry it "trashes".
+    /// keeps a handle on) and touches nothing but the entry it "trashes": it
+    /// moves it into `trash_dir` under a fresh name, else removes it.
     #[derive(Default)]
     pub struct FakeSystem {
         pub calls: Rc<RefCell<Vec<String>>>,
         pub fail_trash: bool,
+        pub trash_dir: Option<PathBuf>,
     }
 
     impl System for FakeSystem {
-        fn trash(&self, path: &Path) -> Result<()> {
+        fn trash(&self, path: &Path) -> Result<Option<PathBuf>> {
             if self.fail_trash {
                 bail!("no Trash here");
             }
             self.calls.borrow_mut().push(format!("trash {}", path.display()));
+            if let Some(dir) = &self.trash_dir {
+                let name = path.file_name().context("nothing to trash")?;
+                let at = unique_dest(dir, name);
+                rename_exclusive(path, &at)?;
+                return Ok(Some(at));
+            }
             // Stand in for the Trash: the entry leaves its place.
             if path.is_dir() {
                 std::fs::remove_dir_all(path)?;
             } else {
                 std::fs::remove_file(path)?;
             }
-            Ok(())
+            Ok(None)
+        }
+
+        fn has_trash(&self) -> bool {
+            !self.fail_trash
         }
 
         fn reveal(&self, path: &Path) -> Result<()> {
@@ -1082,5 +1163,40 @@ pub mod tests {
         let copy = copy_into(&d.join("a"), &d).unwrap();
         let read = xattr(&["-p", "com.ghostrealm.test", copy.to_str().unwrap()]);
         assert_eq!(String::from_utf8_lossy(&read.stdout).trim(), "kept");
+    }
+
+    #[test]
+    fn an_exclusive_rename_refuses_an_existing_file_or_empty_folder() {
+        let d = tmpdir("ops-exclusive");
+        std::fs::write(d.join("a"), "A").unwrap();
+        std::fs::write(d.join("b"), "B").unwrap();
+        std::fs::create_dir(d.join("empty")).unwrap();
+        assert_eq!(rename_exclusive(&d.join("a"), &d.join("b")).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(rename_exclusive(&d.join("a"), &d.join("empty")).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(d.join("a")).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "B");
+        assert!(d.join("empty").is_dir());
+        rename_exclusive(&d.join("a"), &d.join("c")).unwrap();
+        assert_eq!(names(&d), ["b", "c", "empty"]);
+    }
+
+    /// The real Trash: trash a file through [`HostSystem`], then rename it
+    /// back out exclusively, as undo does. Run by hand: it touches
+    /// `~/.Trash`, and TCC may refuse the restore without Full Disk Access.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn real_trash_round_trip() {
+        let d = tmpdir("ops-real-trash");
+        let p = d.join(format!("ghostrealm-trash-test-{}.txt", std::process::id()));
+        std::fs::write(&p, "kept").unwrap();
+        let id = Id::of(&p).unwrap();
+        let at = HostSystem.trash(&p).unwrap().expect("the Trash says where it put it");
+        eprintln!("trashed to {}", at.display());
+        assert!(p.symlink_metadata().is_err());
+        assert_eq!(Id::of(&at).unwrap(), id, "the same entry, in the Trash");
+        rename_exclusive(&at, &p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "kept");
+        assert_eq!(Id::of(&p).unwrap(), id);
     }
 }

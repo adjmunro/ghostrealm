@@ -7,8 +7,10 @@
 //! thread. Views size themselves when the GUI paints them; headless, a terminal
 //! keeps its default grid.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,7 @@ use ghostrealm_core::config::Report;
 use ghostrealm_core::Config;
 use ghostrealm_terminal::{KeyPress, Lifecycle};
 
+use crate::file_history::FileHistory;
 use crate::file_jobs::FileJobs;
 use crate::file_ops::{HostSystem, System};
 use crate::plugin::{DocId, EventCx, Plugin, Request, ToastChoice, UiMetrics, View};
@@ -31,6 +34,7 @@ use crate::plugins::terminal::{self, TerminalView};
 use crate::plugins::web;
 use crate::toasts::{self, Level, Scope, Toast, ToastAction, Toasts};
 
+mod file_undo;
 mod files;
 mod open;
 pub use files::{FileClip, FileReport};
@@ -125,11 +129,11 @@ enum Confirmed {
     Pick(std::path::PathBuf),
     /// Leave, after saving `save` (accept) or without saving (discard).
     Unsaved { what: Leave, save: Vec<DocRef> },
-    /// Move this path to the Trash.
-    Trash(std::path::PathBuf),
+    /// Move this path to the Trash: a Delete made in workspace `vtab`.
+    Trash { path: std::path::PathBuf, vtab: Option<VtabId> },
     /// Move this path to the Trash, after saving `save` (accept) or without
     /// saving (discard) the open documents of it.
-    UnsavedTrash { path: std::path::PathBuf, save: Vec<DocRef> },
+    UnsavedTrash { path: std::path::PathBuf, save: Vec<DocRef>, vtab: Option<VtabId> },
     /// `doc`'s file changed on disk since it was loaded: write over it
     /// (accept) or load the disk version over its edits (discard). Then carry
     /// on with `rest`, the other documents a Save and Close was saving, and
@@ -145,7 +149,7 @@ enum Resume {
     /// Leave, once the saving is done.
     Leave(Leave),
     /// Move this path to the Trash, once the saving is done.
-    Trash(std::path::PathBuf),
+    Trash { path: std::path::PathBuf, vtab: Option<VtabId> },
 }
 
 /// What leaving gives up: part of the tree, or the whole app.
@@ -236,6 +240,8 @@ pub struct AppState {
     /// Outcomes of file jobs that finished after their command returned,
     /// until the window (or the agent channel) takes them.
     file_reports: Vec<FileReport>,
+    /// Each workspace's file operations, for undo; dropped with it.
+    file_histories: HashMap<VtabId, Rc<RefCell<FileHistory>>>,
     /// What the Files surfaces share (the sidebar's last pin and width).
     files_session: files_plugin::Session,
     /// When each Files surface last took the keyboard (a count, not a time):
@@ -284,6 +290,7 @@ impl AppState {
             file_jobs: FileJobs::default(),
             file_job_wait: files::INLINE_WAIT,
             file_reports: Vec::new(),
+            file_histories: HashMap::new(),
             files_session: files_plugin::Session::default(),
             files_seen: HashMap::new(),
             focus_stamp: 0,
@@ -719,12 +726,12 @@ impl AppState {
             return Ok(Vec::new());
         }
         match self.confirm.take() {
-            Some(Confirm { then: Confirmed::Trash(path), .. }) => {
-                self.trash_now(&path)?;
+            Some(Confirm { then: Confirmed::Trash { path, vtab }, .. }) => {
+                self.delete_now(&path, vtab)?;
                 Ok(Vec::new())
             }
-            Some(Confirm { then: Confirmed::UnsavedTrash { path, save }, .. }) => {
-                self.save_views(&save, Some(Resume::Trash(path)))
+            Some(Confirm { then: Confirmed::UnsavedTrash { path, save, vtab }, .. }) => {
+                self.save_views(&save, Some(Resume::Trash { path, vtab }))
             }
             Some(Confirm { then: Confirmed::DiskConflict { doc, rest, then }, .. }) => {
                 let view = self
@@ -799,7 +806,7 @@ impl AppState {
     fn resume(&mut self, then: Resume) -> Result<()> {
         match then {
             Resume::Leave(what) => self.perform(what),
-            Resume::Trash(path) => self.trash_now(&path)?,
+            Resume::Trash { path, vtab } => self.delete_now(&path, vtab)?,
         }
         Ok(())
     }
@@ -834,7 +841,7 @@ impl AppState {
         }
         match self.confirm.take() {
             Some(Confirm { then: Confirmed::Unsaved { what, .. }, .. }) => self.perform(what),
-            Some(Confirm { then: Confirmed::UnsavedTrash { path, .. }, .. }) => self.trash_now(&path)?,
+            Some(Confirm { then: Confirmed::UnsavedTrash { path, vtab, .. }, .. }) => self.delete_now(&path, vtab)?,
             // The reloaded text is new to the user: the close or quit that
             // asked stops, and so does the saving of the other views.
             Some(Confirm { then: Confirmed::DiskConflict { doc, .. }, .. }) => {
@@ -1601,6 +1608,8 @@ impl AppState {
             live.extend(more);
         }
         self.hidden.retain(|p, _| live.contains(p));
+        let tree = &self.tree;
+        self.file_histories.retain(|vt, _| tree.vtab(*vt).is_some());
         let toasts = &mut self.toasts;
         self.views.retain(|id, v| {
             let keep = live.contains(id);
