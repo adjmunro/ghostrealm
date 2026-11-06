@@ -170,6 +170,9 @@ pub enum Walk {
     Redo,
     /// Undo and redo to this step.
     To(StepId),
+    /// Put this Trash step's entry back on its own, leaving the steps as
+    /// they are ([`FileHistory::restorable`]).
+    Restore(StepId),
 }
 
 /// One step of an undo walk.
@@ -252,6 +255,12 @@ impl FileHistory {
         id != self.root && self.lineage(self.current).contains(&id)
     }
 
+    /// Whether step `id` is a Trash in effect whose entry can be put back
+    /// on its own.
+    pub fn restorable(&self, id: StepId) -> bool {
+        matches!(self.op(id), Some(FileOp::Trash { at: Some(_), restored: false, .. })) && self.in_effect(id)
+    }
+
     /// The steps from the current one to `target`: undo up to their common
     /// ancestor, then redo down. Empty when `target` isn't in the tree.
     pub fn route(&self, target: StepId) -> Vec<Move> {
@@ -313,6 +322,14 @@ impl History for FileHistory {
             Some(op) => op.label(),
             None => "Start".into(),
         }
+    }
+
+    fn note(&self, id: StepId) -> Option<&'static str> {
+        matches!(self.op(id), Some(FileOp::Trash { restored: true, .. })).then_some("restored")
+    }
+
+    fn action(&self, id: StepId) -> Option<&'static str> {
+        self.restorable(id).then_some("Restore")
     }
 }
 

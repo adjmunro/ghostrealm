@@ -14,6 +14,8 @@ use ghostrealm_core::SurfaceId;
 use super::AppState;
 use crate::file_history::{name, Act, FileHistory, FileOp, Fresh, Move, Walk};
 use crate::file_ops::{self, Id};
+use crate::plugin::undo_panel::StepId;
+use crate::plugins::files::FilesView;
 use crate::toasts::{Level, Toast};
 
 /// The key of the toast a walk shows: the next one replaces it.
@@ -26,19 +28,35 @@ impl AppState {
     pub fn walk_file_history(&mut self, sid: SurfaceId, walk: Walk) -> bool {
         let Some(vt) = self.vtab_of_surface(sid) else { return false };
         let h = self.file_history(vt);
-        let route = {
+        let route: Vec<Move> = {
             let h = h.borrow();
             match walk {
                 Walk::Undo => h.undo_step().map(Move::Undo).into_iter().collect(),
                 Walk::Redo => h.redo_step().map(Move::Redo).into_iter().collect(),
                 Walk::To(id) => h.route(id),
+                Walk::Restore(id) => h.restorable(id).then_some(Move::Undo(id)).into_iter().collect(),
             }
         };
         let Some(first) = route.first().copied() else { return false };
         // A copy or move in flight may be using the paths a step checks.
         if !self.file_jobs_idle() {
-            let what = if matches!(first, Move::Undo(_)) { "undo" } else { "redo" };
+            let what = match (walk, first) {
+                (Walk::Restore(_), _) => "restore",
+                (_, Move::Undo(_)) => "undo",
+                _ => "redo",
+            };
             self.file_undo_toast(sid, Level::Error, format!("Can't {what} while a file operation is running: wait for it to finish."));
+            return true;
+        }
+        if let Walk::Restore(id) = walk {
+            let label = match h.borrow().op(id) {
+                Some(FileOp::Trash { path, .. }) => name(path),
+                _ => String::new(),
+            };
+            match self.restore_step(&h, id) {
+                Ok(()) => self.file_undo_toast(sid, Level::Info, format!("Restored {label}")),
+                Err(why) => self.file_undo_toast(sid, Level::Error, why),
+            }
             return true;
         }
         let mut done = None;
@@ -51,7 +69,9 @@ impl AppState {
                 }
             }
         }
-        if let (Some((step, label)), Walk::Undo | Walk::Redo) = (done, walk) {
+        // The open panel shows where the walk went.
+        let quiet = self.file_undo_panel_open(sid);
+        if let (Some((step, label)), Walk::Undo | Walk::Redo, false) = (done, walk, quiet) {
             let verb = if matches!(step, Move::Undo(_)) { "Undid" } else { "Redid" };
             let mut label = label;
             if let Some(first) = label.get(..1) {
@@ -60,6 +80,12 @@ impl AppState {
             self.file_undo_toast(sid, Level::Info, format!("{verb} {label}"));
         }
         true
+    }
+
+    /// Whether surface `sid` shows its sidebar's undo panel.
+    fn file_undo_panel_open(&self, sid: SurfaceId) -> bool {
+        let files = self.view(sid).and_then(|v| v.downcast_ref::<FilesView>());
+        files.is_some_and(|f| f.sidebar().undo_panel_open())
     }
 
     fn file_undo_toast(&mut self, sid: SurfaceId, level: Level, message: String) {
@@ -76,17 +102,7 @@ impl AppState {
         };
         let op = h.borrow().op(id).cloned().ok_or("the step is gone")?;
         let label = op.label();
-        let refused = |why: String| {
-            let what = if undo { "undo" } else { "redo" };
-            let mut message = format!("Can't {what} \u{201c}{label}\u{201d}: {why}.");
-            // Only while the Trash still holds something there.
-            if let (true, FileOp::Trash { at: Some(at), .. }) = (undo, &op) {
-                if at.symlink_metadata().is_ok() {
-                    message.push_str(&put_back(at));
-                }
-            }
-            message
-        };
+        let refused = |why| refusal(if undo { "undo" } else { "redo" }, &op, why);
         let act = if undo { op.undo_act() } else { op.redo_act() }.map_err(refused)?;
         let made = self.file_act(&act).map_err(refused)?;
         let mut h = h.borrow_mut();
@@ -99,6 +115,19 @@ impl AppState {
             h.redone(id);
         }
         Ok(label)
+    }
+
+    /// Put Trash step `id`'s entry back where it was, with an undo's checks,
+    /// and mark it restored. The current step stays.
+    fn restore_step(&mut self, h: &Rc<RefCell<FileHistory>>, id: StepId) -> Result<(), String> {
+        let op = h.borrow().op(id).cloned().ok_or("the step is gone")?;
+        let refused = |why| refusal("restore", &op, why);
+        let act = op.undo_act().map_err(refused)?;
+        self.file_act(&act).map_err(refused)?;
+        if let Some(FileOp::Trash { restored, .. }) = h.borrow_mut().op_mut(id) {
+            *restored = true;
+        }
+        Ok(())
     }
 
     /// Do `act`. Returns what a create or Trash left: the entry and, for the
@@ -163,6 +192,18 @@ fn note_outcome(op: &mut FileOp, act: &Act, made: Made) {
     }
 }
 
+/// Why `what` ("undo", ...) of `op` was refused. A refused restore from the
+/// Trash says where the entry is while the Trash holds something there.
+fn refusal(what: &str, op: &FileOp, why: String) -> String {
+    let mut message = format!("Can't {what} \u{201c}{}\u{201d}: {why}.", op.label());
+    if let (true, FileOp::Trash { at: Some(at), .. }) = (what != "redo", op) {
+        if at.symlink_metadata().is_ok() {
+            message.push_str(&put_back(at));
+        }
+    }
+    message
+}
+
 /// Where a Trash refused to give an entry back left it.
 fn put_back(at: &Path) -> String {
     format!(" It is in the Trash at {}: Finder's Put Back can restore it.", at.display())
@@ -176,8 +217,12 @@ mod tests {
 
     use ghostrealm_core::{SurfaceId, VtabId};
 
+    use ghostrealm_core::Args;
+
     use super::TOAST_KEY;
-    use crate::app_state::AppState;
+    use crate::app_state::{build_registry, AppState};
+    use crate::plugins::file_browser::FileBrowserView;
+    use crate::plugins::files::FilesView;
     use crate::file_history::Walk;
     use crate::file_jobs::FileJob;
     use crate::file_ops::tests::FakeSystem;
@@ -754,5 +799,86 @@ mod tests {
         let path: PathBuf = f.s.new_entry(&f.d, "a.md", false).unwrap();
         assert!(!f.s.walk_file_history(SurfaceId(u64::MAX), Walk::Undo));
         assert!(path.is_file());
+    }
+
+    // The undo panel.
+
+    fn trash_step(f: &mut Fx) -> StepId {
+        let h = f.s.file_history(f.vt);
+        let h = h.borrow();
+        h.children(h.root())[0]
+    }
+
+    #[test]
+    fn a_trashed_entry_is_restored_on_its_own_leaving_the_steps_after_it() {
+        let mut f = fx("undo-restore");
+        let d = f.d.to_path_buf();
+        std::fs::write(d.join("a.md"), "A").unwrap();
+        std::fs::write(d.join("b.md"), "B").unwrap();
+        delete(&mut f.s, &d.join("a.md"));
+        f.s.rename_path(&d.join("b.md"), "c.md").unwrap();
+        let t = trash_step(&mut f);
+        assert!(f.go(Walk::Restore(t)));
+        assert_eq!(f.toast(), (Level::Info, "Restored a.md".into()));
+        assert_eq!(read(&d.join("a.md")), "A");
+        let steps = ["Start", "Trash a.md", "Rename b.md \u{2192} c.md"];
+        assert_eq!(trail(&mut f.s, f.vt), steps, "the steps stay");
+        {
+            let h = f.s.file_history(f.vt);
+            let h = h.borrow();
+            assert_eq!((h.note(t), h.action(t)), (Some("restored"), None));
+        }
+        assert!(!f.go(Walk::Restore(t)), "once");
+        f.go(Walk::Undo);
+        f.go(Walk::Undo);
+        assert_eq!(trail(&mut f.s, f.vt), ["Start"]);
+        assert_eq!(names(&d), ["a.md", "b.md"]);
+        f.go(Walk::Redo);
+        assert!(!d.join("a.md").exists(), "redo trashes it again");
+        assert_eq!(f.s.file_history(f.vt).borrow().action(t), Some("Restore"));
+    }
+
+    #[test]
+    fn a_restore_makes_an_undo_s_checks() {
+        let mut f = fx("guard-restore");
+        let d = f.d.to_path_buf();
+        std::fs::write(d.join("a.md"), "A").unwrap();
+        delete(&mut f.s, &d.join("a.md"));
+        std::fs::write(d.join("a.md"), "new").unwrap();
+        let t = trash_step(&mut f);
+        let message = f.refuses(Walk::Restore(t), "Can't restore \u{201c}Trash a.md\u{201d}: a.md already exists");
+        assert!(message.contains("Put Back"), "{message}");
+        assert_eq!((read(&d.join("a.md")), read(&f.trash.join("a.md"))), ("new".into(), "A".into()));
+        assert_eq!(f.s.file_history(f.vt).borrow().note(t), None);
+    }
+
+    fn sidebar(f: &mut Fx) -> &mut FileBrowserView {
+        f.s.view_mut(f.sid).and_then(|v| v.downcast_mut::<FilesView>()).unwrap().sidebar_mut()
+    }
+
+    #[test]
+    fn a_walk_toasts_only_while_the_panel_is_closed() {
+        let mut f = fx("undo-quiet");
+        let d = f.d.to_path_buf();
+        std::fs::write(d.join("a.md"), "A").unwrap();
+        f.s.rename_path(&d.join("a.md"), "b.md").unwrap();
+        assert!(sidebar(&mut f).toggle_undo_panel(), "the sidebar has the workspace's history");
+        f.go(Walk::Undo);
+        assert!(d.join("a.md").exists());
+        assert!(!f.s.toasts().iter().any(|e| e.toast.key.as_deref() == Some(TOAST_KEY)));
+        sidebar(&mut f).toggle_undo_panel();
+        f.go(Walk::Redo);
+        assert_eq!(f.toast().1, "Redid rename a.md \u{2192} b.md");
+    }
+
+    #[test]
+    fn the_toggle_command_toggles_the_panel_of_whichever_has_the_keys() {
+        let mut f = fx("undo-toggle");
+        let toggle = |s: &mut AppState| build_registry().execute("editor.toggle_undo_history", &Args::new(), s).unwrap();
+        toggle(&mut f.s);
+        assert!(f.s.editor(f.sid).unwrap().undo_panel_open() && !sidebar(&mut f).undo_panel_open());
+        f.s.view_mut(f.sid).and_then(|v| v.downcast_mut::<FilesView>()).unwrap().focus_sidebar();
+        toggle(&mut f.s);
+        assert!(f.s.editor(f.sid).unwrap().undo_panel_open() && sidebar(&mut f).undo_panel_open());
     }
 }

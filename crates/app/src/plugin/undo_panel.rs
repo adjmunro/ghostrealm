@@ -2,7 +2,8 @@
 //! step at the top, a lane per branch. The current step is highlighted and
 //! the saved one marked; the steps undo passes through draw brighter than
 //! other branches'. A click on a step, or Up/Down while the panel has the
-//! keys, asks its host to go there.
+//! keys, asks its host to go there. A history may tag a step ([`History::note`])
+//! or offer a button on its row ([`History::action`]).
 //!
 //! The host owns the history, the jump and where the panel goes; this keeps
 //! the graph, the scroll, and the geometry of the last paint.
@@ -13,7 +14,7 @@ use ghostrealm_core::Rect;
 use ghostrealm_terminal::{Key, KeyPress};
 
 use crate::plugin::icons::Icon;
-use crate::plugin::{rect_contains, theme, Font, PaintCx};
+use crate::plugin::{rect_contains, theme, Font, PaintCx, UiMetrics};
 
 /// A lane's width, in cells.
 const LANE_CELLS: f32 = 1.2;
@@ -38,6 +39,30 @@ pub trait History {
     fn children(&self, id: StepId) -> &[StepId];
     /// What step `id` did, in short.
     fn label(&self, id: StepId) -> String;
+    /// A tag shown at the right of step `id`'s row, like "saved".
+    fn note(&self, _id: StepId) -> Option<&'static str> {
+        None
+    }
+    /// The label of a button on step `id`'s row that acts on that step alone.
+    fn action(&self, _id: StepId) -> Option<&'static str> {
+        None
+    }
+}
+
+/// The button ids a panel registers: row `i` is `rows + i`, its action
+/// button `actions + i`.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelIds {
+    pub rows: u32,
+    pub close: u32,
+    pub actions: Option<u32>,
+}
+
+/// The side of the panel that borders its host's content, drawn as a hairline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Top,
 }
 
 /// One step's row.
@@ -140,6 +165,11 @@ fn graph_key(t: &dyn History) -> GraphKey {
     (t.root(), t.current(), t.saved(), t.steps())
 }
 
+/// The height of the panel's title and of each of its rows.
+pub fn row_height(ui: UiMetrics) -> f32 {
+    (ui.cell_h * 1.4).round()
+}
+
 /// What a key does in the panel.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PanelKey {
@@ -205,7 +235,6 @@ impl UndoPanel {
         &self.graph.as_ref().expect("just built").1
     }
 
-    /// The step on row `i`, as last painted.
     /// The graph as last built.
     pub fn graph(&self) -> Option<&Graph> {
         self.graph.as_ref().map(|(_, g)| g)
@@ -218,6 +247,7 @@ impl UndoPanel {
         self.page = rows;
     }
 
+    /// The step on row `i`, as last painted.
     pub fn step(&self, i: u32) -> Option<StepId> {
         self.graph.as_ref()?.1.rows.get(i as usize).map(|r| r.id)
     }
@@ -273,18 +303,22 @@ impl UndoPanel {
         true
     }
 
-    /// Draw the panel of `t` over `area`: a title with a close button
-    /// (`close`), then the graph, row `i` a button `base + i`.
-    pub fn paint(&mut self, cx: &mut PaintCx, area: Rect, t: &dyn History, base: u32, close: u32) {
+    /// Draw the panel of `t` over `area`: a title with a close button, then
+    /// the graph, each row a button ([`PanelIds`]).
+    pub fn paint(&mut self, cx: &mut PaintCx, area: Rect, t: &dyn History, ids: PanelIds, edge: Edge) {
         self.update(t);
         self.rect = Some(area);
         let ui = cx.ui;
         let (cw, ch) = (ui.cell_w, ui.cell_h);
         let hair = theme::hairline(ui);
         let pad = (cw * 0.5).round();
-        let row_h = (ch * 1.4).round();
+        let row_h = row_height(ui);
         cx.fill_alpha(area, theme::HOVER_BG, 0.03);
-        cx.fill(Rect { w: hair, ..area }, theme::INPUT_BORDER);
+        let line = match edge {
+            Edge::Left => Rect { w: hair, ..area },
+            Edge::Top => Rect { h: hair, ..area },
+        };
+        cx.fill(line, theme::INPUT_BORDER);
         if self.focused && cx.focused {
             cx.border(area, theme::FIELD_FOCUS_BORDER);
         }
@@ -296,7 +330,7 @@ impl UndoPanel {
         let b = Rect { x: area.x + area.w - bw, y: title.y, w: bw, h: row_h };
         let title_clip = Rect { w: area.w - bw, ..title };
         cx.label("Undo history", Font::SANS, area.x + pad, text_top(title.y), title_clip, theme::TITLE);
-        let hov = cx.button(b, close);
+        let hov = cx.button(b, ids.close);
         if hov {
             cx.round_rect(b, theme::box_radius(ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
         }
@@ -330,13 +364,27 @@ impl UndoPanel {
         let accent = cx.chrome.accent;
         let stroke = (1.5 * ui.scale).round().max(1.0);
         let row_top = |row: usize| (inner.y + row as f32 * row_h - scroll).round();
+        // Each row's action button, at its right: registered before the
+        // row's, so a press on it is its own.
+        let mut acts = Vec::new();
         cx.with_clip(inner, |cx| {
             for i in first..last {
                 let r = Rect { x: area.x + hair, y: row_top(i), w: area.w - hair, h: row_h };
                 if i == g.current {
                     cx.fill_alpha(r, theme::ROW_SELECTED_BG, theme::ROW_SELECTED_ALPHA);
                 }
-                if cx.button(r, base + i as u32) {
+                let act = ids.actions.zip(t.action(g.rows[i].id));
+                if let Some((base, label)) = act {
+                    let s = cx.shape(label, Font::SANS, area.w);
+                    let w = (s.width + 2.0 * pad).min(r.w);
+                    let b = Rect { x: r.x + r.w - w, w, ..r };
+                    let hov = cx.button(b, base + i as u32);
+                    if hov {
+                        cx.round_rect(b, theme::box_radius(ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
+                    }
+                    acts.push((i, b, label, hov));
+                }
+                if cx.button(r, ids.rows + i as u32) {
                     cx.highlight(r);
                 }
             }
@@ -370,8 +418,14 @@ impl UndoPanel {
             for (i, row) in g.rows.iter().enumerate().take(last).skip(first) {
                 let top = text_top(row_top(i));
                 let mut right = area.x + area.w - pad;
-                if Some(i) == g.saved {
-                    let s = cx.shape("saved", Font::SANS, area.w);
+                if let Some(&(_, b, label, hov)) = acts.iter().find(|a| a.0 == i) {
+                    let s = cx.shape(label, Font::SANS, area.w);
+                    cx.place(s, b.x + pad, top, inner, if hov { theme::TEXT } else { theme::LABEL });
+                    right = b.x;
+                }
+                let tag = if Some(i) == g.saved { Some("saved") } else { t.note(row.id) };
+                if let Some(tag) = tag {
+                    let s = cx.shape(tag, Font::SANS, area.w);
                     right -= s.width;
                     cx.place(s, right, top, inner, theme::ON);
                     right -= pad;

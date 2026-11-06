@@ -38,13 +38,14 @@ use crate::plugin::{
     Request, RowStyles, ToastChoice, View, Waker,
 };
 use crate::plugins::files::header::{text_kind, DocHeader, HeaderText};
+use crate::plugins::files::FilesView;
 
 pub use buffer::EditorBuffer;
 use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
 use rows::{HeadingSizes, LineSize, RowKind, RowLayout, RowTable, TextRow};
 use toc::Toc;
-use crate::plugin::undo_panel::{PanelKey, UndoPanel};
+use crate::plugin::undo_panel::{Edge, PanelIds, PanelKey, UndoPanel};
 
 pub const ID: &str = "editor";
 
@@ -267,9 +268,17 @@ impl Plugin for EditorPlugin {
                 "editor.toggle_undo_history",
                 "Toggle Undo History",
                 "Show or hide the focused editor's undo panel: its file's undo tree, where a step clicked or reached \
-                 with Up and Down becomes the text",
+                 with Up and Down becomes the text. While a file sidebar has the keys, its panel of the workspace's \
+                 file operations instead",
             ),
             Box::new(move |s: &mut AppState, _| {
+                let files = s.focused_surface().and_then(|sid| s.view_mut(sid)).and_then(|v| v.downcast_mut::<FilesView>());
+                if let Some(files) = files.filter(|f| f.sidebar_has_keys()) {
+                    if !files.sidebar_mut().toggle_undo_panel() {
+                        return Err(CmdError::Inapplicable("this sidebar has no file history".into()));
+                    }
+                    return Ok(CmdOutcome::ok());
+                }
                 let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
                 let editor = doc
                     .and_then(|d| s.doc_mut(d))
@@ -1433,7 +1442,8 @@ impl View for EditorView {
             body.w -= undo_w;
             let panel = Rect { x: body.x + body.w, w: undo_w, ..body };
             let history = self.buf.history();
-            self.undo.paint(cx, panel, &*history, BTN_UNDO, BTN_UNDO_PANEL);
+            let ids = PanelIds { rows: BTN_UNDO, close: BTN_UNDO_PANEL, actions: None };
+            self.undo.paint(cx, panel, &*history, ids, Edge::Left);
         }
 
         if self.view_mode() == ViewMode::Preview {

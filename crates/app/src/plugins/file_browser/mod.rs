@@ -17,8 +17,10 @@ mod search;
 pub use search::MatchAt;
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -30,8 +32,9 @@ use ghostrealm_terminal::{Key, KeyPress};
 use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::icons::{FileKind, Icon};
-use crate::file_history::Walk;
+use crate::file_history::{FileHistory, Walk};
 use crate::plugin::text_edit::{self, Applied, Edit, LineEdit};
+use crate::plugin::undo_panel::{self, Edge, PanelIds, PanelKey, UndoPanel};
 use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
     MenuItem, Request, UiMetrics, View, Waker,
@@ -57,8 +60,17 @@ const BTN_GIT_MODIFIED: u32 = 3;
 const BTN_GIT_UNTRACKED: u32 = 4;
 const BTN_MORE: u32 = 6;
 const BTN_CLEAR: u32 = 7;
-/// `BTN_GROUP + i` shows [`VIEWS`]`[i]`. Past every other id.
+/// Shows or hides the undo panel.
+const BTN_UNDO_PANEL: u32 = 11;
+/// `BTN_GROUP + i` shows [`VIEWS`]`[i]`.
 const BTN_GROUP: u32 = 20;
+/// The undo panel's rows: `BTN_UNDO + i` walks to the step on row `i`, and
+/// `BTN_RESTORE + i` restores its entry. Past every other id, and below the
+/// ids a Files surface keeps for its document.
+const BTN_UNDO: u32 = 1 << 20;
+const BTN_RESTORE: u32 = 1 << 21;
+/// How many of the undo panel's rows show, at most half the sidebar.
+const UNDO_ROWS: f32 = 14.0;
 
 /// The listings the `⋯` menu offers, with their labels.
 const VIEWS: [(FsView, &str); 6] = [
@@ -237,6 +249,12 @@ pub struct FileBrowserView {
     search: search::Search,
     /// The picker's failed answer ([`Self::set_error`]).
     error: Option<PickError>,
+    /// The workspace's file operations, which the undo panel shows
+    /// ([`Mode::Sidebar`] only).
+    history: Option<Rc<RefCell<FileHistory>>>,
+    undo: UndoPanel,
+    /// A press landed on the undo panel: its drag and release are the panel's.
+    undo_press: bool,
 }
 
 impl FileBrowserView {
@@ -263,7 +281,56 @@ impl FileBrowserView {
             name_field: FieldMouse::default(),
             search: search::Search::new(None),
             error: None,
+            history: None,
+            undo: UndoPanel::default(),
+            undo_press: false,
         }
+    }
+
+    /// Show `history`, its workspace's file operations, in the undo panel.
+    pub fn set_file_history(&mut self, history: Rc<RefCell<FileHistory>>) {
+        self.history = Some(history);
+    }
+
+    pub fn undo_panel_open(&self) -> bool {
+        self.undo.is_open()
+    }
+
+    /// Open the undo panel with the keys, or close it. Returns false when
+    /// there is no file history to show.
+    pub fn toggle_undo_panel(&mut self) -> bool {
+        if self.mode != Mode::Sidebar || self.history.is_none() {
+            return false;
+        }
+        self.undo.toggle();
+        true
+    }
+
+    /// What `k` does while the undo panel has the keys: the undo and redo
+    /// chords walk the file history whatever the filter holds; Up, Down and
+    /// the rest move through it ([`UndoPanel::key`]). `None`: not the panel's.
+    fn undo_panel_key(&mut self, cx: &mut EventCx, k: &KeyPress) -> Option<bool> {
+        let h = self.history.clone().filter(|_| self.undo.is_focused())?;
+        let walk = match text_edit::edit_for(k) {
+            Some(Edit::Undo) => Some(Walk::Undo),
+            Some(Edit::Redo) => Some(Walk::Redo),
+            _ => {
+                self.undo.update(&*h.borrow());
+                match self.undo.key(k) {
+                    PanelKey::Pass => {
+                        cx.redraw();
+                        return None;
+                    }
+                    PanelKey::Took => None,
+                    PanelKey::Goto(id) => Some(Walk::To(id)),
+                }
+            }
+        };
+        if let Some(walk) = walk {
+            cx.request(Request::FileHistory(walk));
+        }
+        cx.redraw();
+        Some(true)
     }
 
     /// Wake the UI with `waker` when background work (the git filter's
@@ -862,6 +929,10 @@ impl FileBrowserView {
             let item = MenuItem::new(BTN_GROUP + i as u32, label).check(t.view() == view);
             items.push(if view == FsView::GitStatus { loading(item) } else { item });
         }
+        if self.mode == Mode::Sidebar && self.history.is_some() {
+            items.push(MenuItem::RULE);
+            items.push(MenuItem::new(BTN_UNDO_PANEL, "Undo history").check(self.undo.is_open()));
+        }
         items
     }
 }
@@ -938,12 +1009,20 @@ impl View for FileBrowserView {
         };
         let footer_h = name_h + self.paint_error(cx, rect, rect.y + rect.h - name_h);
 
-        let body = Rect {
+        let mut body = Rect {
             x: rect.x,
             y: rect.y + header_h,
             w: rect.w,
             h: (rect.h - header_h - footer_h).max(0.0),
         };
+        // The undo panel takes the bottom of the body, its title and rows.
+        if let Some(h) = self.history.clone().filter(|_| self.mode == Mode::Sidebar && self.undo.is_open()) {
+            let panel_h = (undo_panel::row_height(cx.ui) * (UNDO_ROWS + 1.0)).min((body.h * 0.5).round());
+            body.h -= panel_h;
+            let panel = Rect { y: body.y + body.h, h: panel_h, ..body };
+            let ids = PanelIds { rows: BTN_UNDO, close: BTN_UNDO_PANEL, actions: Some(BTN_RESTORE) };
+            self.undo.paint(cx, panel, &*h.borrow(), ids, Edge::Top);
+        }
         let list = body;
         let g = RowGeom::new(cx.ui, list);
         let row_h = g.row_h;
@@ -1021,6 +1100,9 @@ impl View for FileBrowserView {
         self.settle_error();
         if self.mode == Mode::Save {
             return self.save_key(cx, k);
+        }
+        if let Some(used) = self.undo_panel_key(cx, k) {
+            return used;
         }
         if let Some(walk) = self.file_undo_key(k) {
             cx.request(Request::FileHistory(walk));
@@ -1116,6 +1198,23 @@ impl View for FileBrowserView {
             return;
         }
         self.settle_error();
+        // The undo panel's rows are buttons; a press on it gives it the
+        // keys, a press beside it (the list, the filter) takes them back.
+        match *event {
+            MouseEvent::Down { pos, .. } if self.undo.is_open() && self.undo.contains(pos) => {
+                self.undo_press = true;
+                self.undo.focus(true);
+                cx.redraw();
+                return;
+            }
+            MouseEvent::Drag { .. } if self.undo_press => return,
+            MouseEvent::Up { .. } if std::mem::take(&mut self.undo_press) => return,
+            MouseEvent::Down { .. } if self.undo.is_focused() => {
+                self.undo.focus(false);
+                cx.redraw();
+            }
+            _ => {}
+        }
         let extend = cx.mods.shift;
         if self.field.event(&mut self.input, event, extend) || self.name_field.event(&mut self.name, event, extend) {
             cx.redraw();
@@ -1256,7 +1355,11 @@ impl View for FileBrowserView {
         self.rerun_search();
     }
 
-    fn scroll(&mut self, cx: &mut EventCx, _pos: (f32, f32), _dx: f32, dy: f32) {
+    fn scroll(&mut self, cx: &mut EventCx, pos: (f32, f32), _dx: f32, dy: f32) {
+        if self.undo.is_open() && self.undo.scroll(pos, dy) {
+            cx.redraw();
+            return;
+        }
         if self.searching() {
             self.search_scroll(cx, dy);
             return;
@@ -1287,6 +1390,25 @@ impl View for FileBrowserView {
             }
             search::BTN_MATCH_CASE | search::BTN_WHOLE_WORD | search::BTN_REGEX => {
                 self.toggle_search_option(id);
+                cx.redraw();
+                return;
+            }
+            BTN_UNDO_PANEL => {
+                self.toggle_undo_panel();
+                cx.redraw();
+                return;
+            }
+            id if id >= BTN_UNDO => {
+                // The window takes presses on buttons, so a row's press never
+                // reaches `mouse`: its click gives the panel the keys.
+                let walk = match id >= BTN_RESTORE {
+                    true => self.undo.step(id - BTN_RESTORE).map(Walk::Restore),
+                    false => self.undo.step(id - BTN_UNDO).map(Walk::To),
+                };
+                self.undo.focus(true);
+                if let Some(walk) = walk {
+                    cx.request(Request::FileHistory(walk));
+                }
                 cx.redraw();
                 return;
             }
@@ -1519,6 +1641,8 @@ mod tests {
     use std::time::Instant;
     use crate::plugin::MouseButton;
     use crate::plugin::testing::{press, tmpdir, Harness, UI};
+    use crate::file_history::FileOp;
+    use crate::plugin::undo_panel::StepId;
 
     /// The browser's rect in these tests, and the centre of list row `i` in it.
     const RECT: Rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
@@ -1735,13 +1859,84 @@ mod tests {
         KeyPress { key: Key::Char('z'), mods, text: None }
     }
 
+    fn walks(out: crate::plugin::Outcome) -> Vec<Walk> {
+        out.requests.into_iter().filter_map(|r| if let Request::FileHistory(w) = r { Some(w) } else { None }).collect()
+    }
+
+    fn down(pos: (f32, f32)) -> MouseEvent {
+        MouseEvent::Down { pos, clicks: 1, button: MouseButton::Left }
+    }
+
+    /// A sidebar whose workspace renamed a file, then trashed one: its
+    /// panel's rows are the Trash, the rename, and the start.
+    fn with_history() -> (crate::plugin::testing::TmpDir, FileBrowserView, [StepId; 2]) {
+        let (d, mut v) = fixture();
+        let mut h = FileHistory::default();
+        let rename = h.record(FileOp::Rename { from: d.join("a.md"), to: d.join("b.txt"), id: None, moved: false });
+        let at = Some(d.join("trash/c.md"));
+        let trash = h.record(FileOp::Trash { path: d.join("c.md"), at, id: None, restored: false });
+        v.set_file_history(Rc::new(RefCell::new(h)));
+        (d, v, [rename, trash])
+    }
+
+    /// Where the button `id` was last painted.
+    fn button_centre(h: &Harness, id: u32) -> (f32, f32) {
+        let r = h.frame.view_buttons.iter().find(|b| b.2 == id).expect("painted").0;
+        (r.x + r.w * 0.5, r.y + r.h * 0.5)
+    }
+
+    #[test]
+    fn the_undo_panel_shows_the_file_history_under_the_list() {
+        let (_d, mut v, [_, trash]) = with_history();
+        let mut h = Harness::new();
+        let ids = |h: &mut Harness, v: &mut FileBrowserView| -> Vec<u32> {
+            h.paint(v, RECT).view_buttons.iter().map(|b| b.2).collect()
+        };
+        assert!(!ids(&mut h, &mut v).contains(&BTN_UNDO), "closed at first");
+        let menu = h.button(&mut v, BTN_MORE).requests;
+        assert!(matches!(&menu[..], [Request::Menu { items, .. }] if items.iter().any(|i| i.id == BTN_UNDO_PANEL)));
+        h.button(&mut v, BTN_UNDO_PANEL);
+        let ids = ids(&mut h, &mut v);
+        assert!((0..3).all(|i| ids.contains(&(BTN_UNDO + i))));
+        assert!(ids.contains(&BTN_RESTORE) && !ids.contains(&(BTN_RESTORE + 1)), "only the Trash row restores");
+        for text in ["Undo history", "Trash c.md", "Rename a.md \u{2192} b.txt", "Start", "Restore"] {
+            assert!(h.texts().iter().any(|t| t == text), "{text}");
+        }
+        let start = button_centre(&h, BTN_UNDO + 2);
+        assert!(start.1 > RECT.h * 0.5 && start.1 < RECT.h, "at the bottom: {start:?}");
+        assert_eq!(walks(h.button(&mut v, BTN_RESTORE)), [Walk::Restore(trash)]);
+        h.button(&mut v, BTN_UNDO_PANEL);
+        assert!(!v.undo_panel_open());
+    }
+
+    #[test]
+    fn the_undo_panel_walks_with_its_keys_until_a_click_beside_it() {
+        let (_d, mut v, [rename, _]) = with_history();
+        let mut h = Harness::new();
+        assert!(v.toggle_undo_panel());
+        h.paint(&mut v, RECT);
+        assert_eq!(walks(h.key(&mut v, press(Key::Down)).1), [Walk::To(rename)]);
+        h.key(&mut v, press(Key::Escape));
+        assert!(!v.undo.is_focused(), "Escape gives the keys back");
+        h.key(&mut v, press(Key::Char('b')));
+        h.paint(&mut v, RECT);
+        let row = button_centre(&h, BTN_UNDO + 1);
+        h.mouse(&mut v, down(row));
+        assert!(v.undo.is_focused(), "a press on the panel gives it the keys");
+        assert_eq!(walks(h.key(&mut v, undo_key()).1), [Walk::Undo], "whatever the filter holds");
+        assert_eq!(v.tree().query(), "b");
+        h.mouse(&mut v, down(row_centre(0)));
+        assert!(!v.undo.is_focused(), "a click on the list takes the keys");
+        h.mouse(&mut v, down(row));
+        h.mouse(&mut v, down((RECT.w * 0.5, header_height(UI) * 0.5)));
+        assert!(!v.undo.is_focused(), "so does a click on the filter");
+        assert!(walks(h.key(&mut v, undo_key()).1).is_empty(), "the filter's own undo");
+    }
+
     #[test]
     fn the_sidebar_undo_chord_walks_the_file_history_only_when_the_filter_has_nothing_to_undo() {
         let (_d, mut v) = fixture();
         let h = Harness::new();
-        let walks = |out: crate::plugin::Outcome| -> Vec<Walk> {
-            out.requests.into_iter().filter_map(|r| if let Request::FileHistory(w) = r { Some(w) } else { None }).collect()
-        };
         let mut redo = undo_key();
         redo.mods.shift = true;
         let (used, out) = h.key(&mut v, undo_key());

@@ -468,7 +468,11 @@ impl AppState {
     }
 
     /// Install `view` as surface `sid`'s content, titling its tab.
-    fn insert_view(&mut self, sid: SurfaceId, view: Box<dyn View>) {
+    fn insert_view(&mut self, sid: SurfaceId, mut view: Box<dyn View>) {
+        // A Files surface's sidebar shows its workspace's file operations.
+        if let (Some(vt), Some(files)) = (self.vtab_of_surface(sid), view.downcast_mut::<FilesView>()) {
+            files.sidebar_mut().set_file_history(self.file_history(vt));
+        }
         if let Some(t) = view.title() {
             self.tree.set_surface_title(sid, t, false);
         }
