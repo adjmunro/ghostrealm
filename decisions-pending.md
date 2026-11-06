@@ -559,6 +559,9 @@ Each line gives the item and the default that will be applied if you don't veto 
 **Web**
 - **Pages an agent drives stay visible to Chromium** (`docs/DECISION.md`, Web pop-ups; built in 8af2376): agent-owned pages, including hidden pop-ups and pages created off screen, report themselves visible to Chromium (as headless Chrome and Puppeteer do), at 10 fps while nobody sees them; a person's background tabs stay hidden. Alternatives: show a page only while an eval runs (pages see `visibilitychange` around each eval), or wait longer for hidden pages (blocks the UI thread up to 30 s).
 
+**Editor**
+- **Undo panel open per pane** (`docs/DECISION.md`, editor undo panel): each editor pane opens or closes its own undo panel, though every pane on a file shows the same tree. Alternative: one open/closed state per file, shared by its panes.
+
 **Terminal**
 - **Closing a pane stops its program** (`crates/terminal-ghostty/src/threaded.rs`, built in dbefd79): closing a pane hangs up its terminal; a program still running 2 s after the close gets SIGHUP (its process group and the foreground group), then SIGKILL 1 s later; nothing is signalled once the shell has been reaped, and the reaper gives up after 30 s. A program that needs longer to clean up on SIGHUP (an editor writing a recovery file, a dev server shutting down) is cut off at 3 s. Alternatives: longer graces (e.g. SIGKILL at 10 s), or no SIGKILL at all (a `trap '' HUP` program outlives its pane).
 
@@ -628,6 +631,7 @@ These can't be verified in the headless sandbox:
 - **Full-screen program keys:** on branch `fix/alt-screen-native-keys`, check word-left, Shift+Left and Option+Up in vim/nvim, less and htop in the app.
 - **Sidebar order:** on branch `feat/sidebar-inbox-order`, check in the app the attention order, the hover hold and the re-sort slide when the pointer leaves, directory headers (fold on release, hover highlight), and Pin/Unpin in the workspace menu.
 - **Dragging a tab:** on branch `feat/drag-tab-to-split`, drag a tab (its strip shows with two or more tabs) in a split workspace: every drop zone shows faintly once the drag starts, the zone under the pointer previews where the pane lands and how big, and mouse-up moves it there (try the bottom band under two side-by-side panes for a full-width pane, a pane's centre, and its sides).
+- **Editor undo panel:** on `develop`, open it from an editor's `⋯` menu ("Undo history") or Cmd+Shift+U (add `cmd+shift+u = "editor.toggle_undo_history"` to an existing `config.toml`; only new configs get it). Type, undo, type again to make a branch. Check the lanes, dots, diagonal branch edges, the "saved" tag, the focus border and close icon; whether newest-at-top reads well; that clicking a row and Up/Down walk the history; and that Cmd+Shift+U clashes with nothing in macOS.
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 
 ## Parked (no decision needed yet)
