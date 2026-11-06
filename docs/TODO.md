@@ -326,6 +326,18 @@
   the root has its changes cleared, so a view at (that step, k>0) no longer
   matches `tip()` and takes the whole text on its next sync. Correct, but a
   full copy.
+  Undo panel follow-ups: (a) `Graph::of` reruns on every new step while the
+  panel is open (about once per word): a BFS, a sort and two `HashMap`s over
+  every step, plus an O(L²) scan for a free lane when many branches overlap;
+  and the edge loop in `UndoPanel::paint` walks every row each paint
+  instead of `0..last`. Negligible at hundreds to thousands of steps; near
+  the 64 MB cap (over 100k steps) it may lag, unbenchmarked. Direction:
+  limit the edge loop to `0..last`, update the graph incrementally if
+  profiling shows it matters, interval lookup for free lanes; (b) no
+  compile-time check ties the history's most steps to the `1 << 28` row
+  ids (`BTN_UNDO`, editor/mod.rs). Direction: assert
+  `HISTORY_BYTES / NODE_BYTES < 1 << 28` in mod.rs's existing const assert,
+  making one of them `pub(super)`.
   `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
   when the control-char filter leaves nothing and there is no selection (e.g.
   pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no
