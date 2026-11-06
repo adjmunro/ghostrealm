@@ -296,7 +296,25 @@
   Editor follow-ups: (a) every view keeps its own copy of the text and the
   file's shared document keeps one more, so one open file holds two copies;
   (b) a view syncs with the others at input, paint and refresh only, so a
-  caller that reads `buf.lines` before those sees the old text.
+  caller that reads `buf.lines` before those sees the old text, e.g.
+  `EditorView::toggle_comment` reads `buf.lines` for `line_rows` and the
+  highlight lead before `buf.toggle_comment` syncs; (c) `unsaved_in`
+  (app_state.rs) counts each view of a shared document separately: closing
+  one of two panes on a modified file prompts "Close Without Saving" though
+  nothing is lost, and quit says "2 buffers" and writes twice. Direction: skip
+  the prompt while another view holds the document; dedupe by document on
+  quit; (d) `EditorView::path()`, `files_changed` and `changed_on_disk`
+  (editor/mod.rs) read the view's cached `buf.path` without syncing, so a
+  file-move job finishing in the pump before refresh can repoint a document
+  another view just saved elsewhere. Direction: read the document's path and
+  drop the cached one, or sync first; (e) Save As onto a path another open
+  document holds leaves two documents with that path, and `open_doc` returns
+  the first registered (disk stamps still raise a conflict before one
+  overwrites the other); (f) a reload whose change exceeds the 64 MB history
+  cap is one step past the cap, so the next keystroke prunes all history,
+  the reload step included; (g) for the part-4 panel: `history()` returns a
+  `Ref` into the shared document, so holding it across a call into another
+  view of the same file panics on `borrow_mut`.
   `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
   when the control-char filter leaves nothing and there is no selection (e.g.
   pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no

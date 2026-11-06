@@ -531,7 +531,9 @@ impl EditorBuffer {
     /// identical closer that follows if the editor inserted it. Anything else
     /// is inserted as is.
     pub fn insert_typed(&mut self, s: &str) {
-        let Some(c) = typed_char(s) else { return self.insert_str(s) };
+        let Some(c) = typed_char(s) else {
+            return self.insert_str(s);
+        };
         let (row, col) = self.cursor;
         if let Some(close) = closer_of(c) {
             if let Some(((sr, sc), (er, ec))) = self.selection() {
@@ -1081,11 +1083,15 @@ impl EditorBuffer {
                 return Err(e);
             }
         };
-        self.doc.borrow_mut().changed_on_disk = false;
+        // The next edit starts a step, whether the reload changed the text
+        // or only made the current step the saved one.
+        {
+            let mut d = self.doc.borrow_mut();
+            d.changed_on_disk = false;
+            d.open = None;
+        }
         let changed = lines != self.lines;
         if changed {
-            self.close_step();
-            self.doc.borrow_mut().open = None;
             self.before = Some(self.caret());
             let (from, to, text) = line_diff(&self.lines, &lines);
             self.splice(from, to, &text);
@@ -2149,6 +2155,108 @@ mod tests {
         e.undo();
         assert_eq!(e.lines, ["head", "mid", "tail"], "steps before the reload stay");
         assert!(e.modified() && e.conflicted(), "older text asks before it overwrites the file");
+    }
+
+    #[test]
+    fn an_edit_after_a_reload_that_changed_nothing_is_unsaved() {
+        let tmp = crate::plugin::testing::tmpdir("buffer-reload-same");
+        let path = tmp.join("f.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
+        e.cursor = (0, 1);
+        typed(&mut e, "b");
+        std::fs::write(&path, "ab\n").unwrap();
+        assert!(!e.reload().unwrap());
+        assert!(!e.modified());
+        // Within the run's pause: still a step of its own.
+        typed(&mut e, "c");
+        assert!(e.modified(), "the edit differs from the file");
+        e.undo();
+        assert_eq!(e.lines, ["ab"]);
+        assert!(!e.modified());
+    }
+
+    /// Sync both views and check each shows the file's text.
+    fn in_step(a: &mut EditorBuffer, b: &mut EditorBuffer) {
+        a.sync();
+        b.sync();
+        let text = a.doc.borrow().text.clone();
+        assert_eq!((&a.lines, &b.lines), (&text, &text));
+    }
+
+    #[test]
+    fn a_view_behind_by_part_of_a_step_catches_up_across_branches() {
+        let mut a = EditorBuffer::scratch();
+        let mut b = EditorBuffer::with_doc(a.doc.clone());
+        typed(&mut a, "ab");
+        b.sync();
+        let s = a.history().current();
+        assert_eq!(b.at, (s, 2));
+        typed(&mut a, "cd");
+        assert_eq!(a.history().tip(), (s, 4), "one run");
+        // A sibling of the step `b` has in part.
+        a.undo();
+        typed(&mut a, "X");
+        let t = a.history().current();
+        assert_ne!(t, s);
+        let route = a.history().route(b.at).unwrap();
+        assert_eq!(route.len(), 3, "back out the two changes `b` has, then the sibling's one");
+        in_step(&mut a, &mut b);
+        assert_eq!(b.lines, ["X"]);
+        // A child of a step `b` has in part.
+        assert!(a.goto(s));
+        typed(&mut a, "gh");
+        b.sync();
+        let u = a.history().current();
+        assert_eq!(b.at, (u, 2));
+        typed(&mut a, "ij");
+        pause(&a);
+        typed(&mut a, "k");
+        assert_eq!(a.history().node(a.history().current()).unwrap().parent(), Some(u));
+        in_step(&mut a, &mut b);
+        assert_eq!(b.lines, ["abcdghijk"]);
+        // Each undoes and edits on the other's branches.
+        b.undo();
+        in_step(&mut a, &mut b);
+        assert!(a.goto(t));
+        in_step(&mut a, &mut b);
+        b.cursor = (0, 1);
+        typed(&mut b, "Y");
+        in_step(&mut a, &mut b);
+        assert_eq!(a.lines, ["XY"]);
+        a.undo();
+        a.undo();
+        in_step(&mut a, &mut b);
+        assert_eq!(b.lines, [""]);
+        b.redo();
+        in_step(&mut a, &mut b);
+        assert_eq!(a.lines, ["X"]);
+        assert!(b.goto(u));
+        a.sync();
+        a.cursor = (0, 8);
+        typed(&mut a, "!");
+        in_step(&mut a, &mut b);
+        assert_eq!(b.lines, ["abcdghij!"]);
+    }
+
+    #[test]
+    fn a_view_whose_step_was_pruned_takes_the_text_whole() {
+        let mut a = EditorBuffer::scratch();
+        let mut b = EditorBuffer::with_doc(a.doc.clone());
+        typed(&mut a, "one");
+        b.sync();
+        let behind = b.at;
+        a.apply(Edit::Insert("\n".into()), &mut None::<String>);
+        typed(&mut a, "two");
+        a.doc.borrow_mut().history.prune(0);
+        assert!(a.history().node(behind.0).is_none() && a.history().route(behind).is_none(), "pruned");
+        assert!(b.sync());
+        assert_eq!(b.lines, ["one", "two"]);
+        typed(&mut b, "!");
+        in_step(&mut a, &mut b);
+        a.undo();
+        in_step(&mut a, &mut b);
+        assert_eq!(b.lines, ["one", "two"]);
     }
 
     #[test]
