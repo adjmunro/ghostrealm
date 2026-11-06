@@ -293,7 +293,7 @@
 - Detail: DONE: editor undo is a tree of changes per open file, shared by
   its views (see DECISION.md, item 14 parts 1–2). Single-line fields
   (`LineEdit`) have linear undo. The editor has an undo panel
-  (`plugins::editor::undo_panel`, item 14 part 4); not yet checked at a
+  (`plugin::undo_panel`, item 14 part 4); not yet checked at a
   desktop. REMAINING: the file browser's undo panel, with file-operation undo
   (item 14 part 3).
   Editor follow-ups: (a) every view keeps its own copy of the text and the
@@ -337,14 +337,14 @@
   compile-time check ties the history's most steps to the `1 << 28` row
   ids (`BTN_UNDO`, editor/mod.rs). Direction: assert
   `HISTORY_BYTES / NODE_BYTES < 1 << 28` in mod.rs's existing const assert,
-  making one of them `pub(super)`; (c) `merged` (undo_panel.rs ~154-172)
+  making one of them `pub(super)`; (c) `merged` (editor/undo.rs ~76-96)
   reads "2 changes" for a typing step that ends in an auto-closed bracket
   pair followed by a non-word character (`print("`, `if (!`, `foo((`, `({`,
   `f(&`). `insert_typed` records `(` and `)` as two ops that merge into
   `+()`; the next character lands inside that text, so it does not merge.
   Direction: also merge a pure insert whose `at` falls inside the merged
   insert's span on the same row, splicing it in at the char offset; add
-  `print("` and `((` test cases; (d) `label` (undo_panel.rs ~139, ~156-158)
+  `print("` and `((` test cases; (d) `label` (editor/undo.rs ~57, ~79-81)
   clones every op's text on every visible row each paint via `merged()`,
   including single-op steps. A select-all paste on a large file copies both
   whole strings per repaint to show `LABEL_CHARS` chars. Direction: return

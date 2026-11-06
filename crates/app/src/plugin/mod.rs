@@ -33,6 +33,7 @@ pub mod paint;
 pub mod testing;
 pub mod text_edit;
 pub mod theme;
+pub mod undo_panel;
 pub mod widgets;
 
 use std::any::Any;

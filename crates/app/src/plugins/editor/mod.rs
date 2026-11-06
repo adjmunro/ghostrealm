@@ -10,7 +10,7 @@ pub mod lang;
 pub mod md_preview;
 mod rows;
 mod toc;
-mod undo_panel;
+mod undo;
 pub mod wrap;
 
 use std::any::Any;
@@ -44,7 +44,7 @@ use stats::{Stat, Stats};
 use lang::{paint_popup, Lang, Pos};
 use rows::{HeadingSizes, LineSize, RowKind, RowLayout, RowTable, TextRow};
 use toc::Toc;
-use undo_panel::{PanelKey, UndoPanel};
+use crate::plugin::undo_panel::{PanelKey, UndoPanel};
 
 pub const ID: &str = "editor";
 
@@ -1428,12 +1428,12 @@ impl View for EditorView {
             body = Rect { y: rect.y + header_h, h: (rect.h - header_h).max(1.0), ..rect };
         }
         // The undo panel takes the body's right side.
-        let undo_w = self.undo.width(cx.ui, body.w);
+        let undo_w = undo::panel_width(&self.undo, cx.ui, body.w);
         if undo_w > 0.0 {
             body.w -= undo_w;
             let panel = Rect { x: body.x + body.w, w: undo_w, ..body };
             let history = self.buf.history();
-            self.undo.paint(cx, panel, &history, BTN_UNDO, BTN_UNDO_PANEL);
+            self.undo.paint(cx, panel, &*history, BTN_UNDO, BTN_UNDO_PANEL);
         }
 
         if self.view_mode() == ViewMode::Preview {
@@ -1783,7 +1783,7 @@ impl View for EditorView {
             // The history's borrow ends before the jump edits it.
             let used = {
                 let history = self.buf.history();
-                self.undo.update(&history);
+                self.undo.update(&*history);
                 self.undo.key(k)
             };
             match used {

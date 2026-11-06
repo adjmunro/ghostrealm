@@ -284,7 +284,9 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   top of the next; `reveal` (a search match) leaves Preview for Integrated,
   where a selection shows. `text` (the agent's) is the buffer whatever the
   mode.
-- Undo panel (`plugins::editor::undo_panel`): an `EditorView` toggles it
+- Undo panel (`plugin::undo_panel`, drawing any `History`; the editor's
+  `impl History for UndoTree`, labels and width are in
+  `plugins::editor::undo`): an `EditorView` toggles it
   (`toggle_undo_panel`, the `⋯` menu, `editor.toggle_undo_history`, bound
   to `cmd+shift+u` in a new config file); it takes the right of the body,
   in every mode. `Graph::of` lays out the

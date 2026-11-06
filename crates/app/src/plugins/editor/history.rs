@@ -93,9 +93,7 @@ pub(super) fn shift(p: Pos, op: &Op) -> Pos {
     }
 }
 
-/// A step's id, unique in its tree; later steps have larger ids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(u64);
+pub use crate::plugin::undo_panel::StepId as NodeId;
 
 /// A view's cursor, selection anchor, and auto-inserted closers.
 #[derive(Clone, Debug, Default)]
