@@ -326,17 +326,20 @@ impl UndoPanel {
         if self.focused && cx.focused {
             cx.border(area, theme::FIELD_FOCUS_BORDER);
         }
-        // The title row, its close button at the right.
+        // The title row, its close button at the right, both within the
+        // panel however narrow.
         let title = Rect { h: row_h.min(area.h), ..area };
         let text_top = |top: f32| top + ((row_h - ch) * 0.5).round();
-        cx.label("Undo history", Font::SANS, area.x + pad, text_top(title.y), title, theme::TITLE);
-        let b = Rect { x: area.x + area.w - row_h, y: title.y, w: row_h, h: row_h };
+        let bw = row_h.min(area.w);
+        let b = Rect { x: area.x + area.w - bw, y: title.y, w: bw, h: row_h };
+        let title_clip = Rect { w: area.w - bw, ..title };
+        cx.label("Undo history", Font::SANS, area.x + pad, text_top(title.y), title_clip, theme::TITLE);
         let hov = cx.button(b, close);
         if hov {
             cx.round_rect(b, theme::box_radius(ui), theme::HOVER_BG, theme::HOVER_ALPHA, None);
         }
         cx.tooltip(b, "Close undo history");
-        let side = (ch * 0.6).round();
+        let side = (ch * 0.6).round().min(b.w);
         let inset = ((b.w - side) * 0.5).round();
         let icon = Rect { x: b.x + inset, y: b.y + inset, w: side, h: side };
         Icon::Close.paint(cx, icon, if hov { theme::GLYPH_HOVER } else { theme::GLYPH });
@@ -358,7 +361,7 @@ impl UndoPanel {
         let first = (scroll / row_h).floor() as usize;
         let last = (((scroll + inner.h) / row_h).ceil() as usize).min(g.rows.len());
         let lane_w = (LANE_CELLS * cw).round();
-        let graph_w = (g.lanes as f32 * lane_w).min(((area.w - 2.0 * pad) * GRAPH_SHARE).round());
+        let graph_w = (g.lanes as f32 * lane_w).min(((area.w - 2.0 * pad).max(0.0) * GRAPH_SHARE).round());
         let gx = area.x + pad;
         let x_of = |lane: usize| gx + lane as f32 * lane_w + (lane_w * 0.5).round();
         let y_of = |row: usize| inner.y + row as f32 * row_h - scroll + (row_h * 0.5).round();
@@ -732,6 +735,19 @@ mod tests {
         assert_eq!(v.buffer().selected_text().as_deref(), Some("\u{2260}"), "Shift+Left selected");
         typed(&h, &mut v, &[Key::Down]);
         assert_eq!(lines(&v), ["a", "bA\u{2260}"], "Down moved the caret");
+    }
+
+    #[test]
+    fn a_narrow_panel_keeps_its_close_button_inside() {
+        let mut h = Harness::new();
+        let mut v = three_steps(&mut h);
+        for w in [24.0, 6.0, 1.0] {
+            let area = Rect { w, ..RECT };
+            h.paint(&mut v, area);
+            let close = h.frame.view_buttons.iter().find(|b| b.2 == BTN_UNDO_PANEL).expect("a close button").0;
+            let left = area.x + area.w - v.undo.width(UI, area.w);
+            assert!(close.x >= left && close.x + close.w <= area.x + area.w, "{w}: {close:?}");
+        }
     }
 
     #[test]
