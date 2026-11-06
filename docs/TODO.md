@@ -314,7 +314,15 @@
   cap is one step past the cap, so the next keystroke prunes all history,
   the reload step included; (g) for the part-4 panel: `history()` returns a
   `Ref` into the shared document, so holding it across a call into another
-  view of the same file panics on `borrow_mut`.
+  view of the same file panics on `borrow_mut`; (h) nit: in `reload()`
+  (crates/app/src/plugins/editor/buffer.rs, ~line 1086) the comment "The next
+  edit starts a step, whether the reload changed the text or only made the
+  current step the saved one" sits above the first `open = None`. In the
+  changed-text case it is the second reset, after the splice, that makes it
+  true. Move the comment or say so; (i) after `prune`, the step that becomes
+  the root has its changes cleared, so a view at (that step, k>0) no longer
+  matches `tip()` and takes the whole text on its next sync. Correct, but a
+  full copy.
   `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
   when the control-char filter leaves nothing and there is no selection (e.g.
   pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no
