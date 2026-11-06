@@ -290,12 +290,13 @@
 [2026-09-18@09c015c]
 
 - Requires: NO BLOCKERS
-- Detail: DONE (rudimentary): Cmd+Z / Cmd+Shift+Z in the editor; whole-buffer
-  snapshots (200 steps), typing runs and single-char delete runs coalesce,
-  undoing to the saved text clears `modified`. REMAINING: (1) a reversible op
-  log instead of snapshots (each step copies the whole buffer — costly for big
-  files); (2) finer runs (break at word boundaries / after a pause); (3) history
-  survives Save As / reload. Single-line fields (`LineEdit`) have linear undo.
+- Detail: DONE: editor undo is a tree of changes per open file, shared by
+  its views (see DECISION.md, item 14 parts 1–2). Single-line fields
+  (`LineEdit`) have linear undo. REMAINING: the undo panel (item 14 part 4).
+  Editor follow-ups: (a) every view keeps its own copy of the text and the
+  file's shared document keeps one more, so one open file holds two copies;
+  (b) a view syncs with the others at input, paint and refresh only, so a
+  caller that reads `buf.lines` before those sees the old text.
   `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
   when the control-char filter leaves nothing and there is no selection (e.g.
   pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no
