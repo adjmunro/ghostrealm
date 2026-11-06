@@ -6,15 +6,25 @@
 //! same glyphon text path the terminal uses, and routes key input here when the
 //! focused surface is an editor.
 
+use std::cell::{Ref, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ghostrealm_core::highlight::CommentSyntax;
 
+use super::history::{self, Caret, NodeId, Op, Pos, UndoTree};
 use crate::file_stamp::Stamp;
+use crate::languages::same_file;
 use crate::plugin::text_edit::{
-    closer_of, closes_before, opener_of, typed_char, word_left, word_right, word_span, Applied, Clipboard, Edit, Motion,
+    closer_of, closes_before, is_word, opener_of, typed_char, word_left, word_right, word_span, Applied, Clipboard,
+    Edit, Motion, Run,
 };
 
+/// One view's editable text. The views of one file share its [`Doc`]: its
+/// undo history and its state on disk. Each keeps its own copy of the text,
+/// which [`EditorBuffer::sync`] brings up to date with the others' edits.
 pub struct EditorBuffer {
     /// The text, one entry per line. Always at least one (possibly empty) line.
     pub lines: Vec<String>,
@@ -27,16 +37,9 @@ pub struct EditorBuffer {
     /// Cursor position the last time the view followed it, so manual scrolling
     /// (which doesn't move the cursor) isn't yanked back to the cursor each frame.
     pub last_cursor: (usize, usize),
-    /// Backing file, if any (a scratch buffer has none).
+    /// Backing file, if any (a scratch buffer has none): the [`Doc`]'s, as of
+    /// the last [`Self::sync`].
     pub path: Option<PathBuf>,
-    /// Unsaved edits since the last load/save.
-    pub modified: bool,
-    /// The file changed on disk while the buffer had unsaved edits, so the
-    /// edits were kept; cleared when the buffer loads or writes the file.
-    pub changed_on_disk: bool,
-    /// The file as of the last load or write; `None` for a scratch buffer or a
-    /// file that didn't exist then.
-    disk: Option<Stamp>,
     /// Monotonic count of text-changing edits, for the idle-autosave timer.
     pub edits: u64,
     /// The first line changed since a consumer last took this (`None` = none).
@@ -48,14 +51,81 @@ pub struct EditorBuffer {
     /// Closers typed brackets inserted, which stepping over and
     /// pair-backspace are limited to.
     auto_closers: AutoClosers,
-    history: History,
+    doc: Rc<RefCell<Doc>>,
+    /// Tells this buffer's edits from other views' in the shared [`Doc`].
+    id: u64,
+    /// The step of the history `lines` is at, and how many of its changes
+    /// they include.
+    at: (NodeId, usize),
+    /// The caret as the edit under way began, for the step it opens.
+    before: Option<Caret>,
 }
+
+/// What every view of one open file shares. It goes when the last view of
+/// the file closes, and its history with it.
+struct Doc {
+    /// The file; a view takes it when it syncs, so Save As or a move in one
+    /// view moves them all.
+    path: Option<PathBuf>,
+    /// The text at the history's current step, for a view that opens later
+    /// or fell behind a pruned step.
+    text: Vec<String>,
+    history: UndoTree,
+    /// The view whose edits the current step takes, and the run its last
+    /// edit continued; `None` when the next edit starts a step.
+    open: Option<Open>,
+    /// The file as of the last load or write; `None` for a scratch buffer or a
+    /// file that didn't exist then.
+    disk: Option<Stamp>,
+    /// The file changed on disk while the buffer had unsaved edits, so the
+    /// edits were kept; cleared when the buffer loads or writes the file.
+    changed_on_disk: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Open {
+    owner: u64,
+    /// The run, where its last edit left the cursor, and when.
+    run: Option<(Run, Pos, Instant)>,
+}
+
+impl Doc {
+    fn new(path: Option<PathBuf>, text: Vec<String>, disk: Option<Stamp>) -> Rc<RefCell<Doc>> {
+        let history = UndoTree::default();
+        Rc::new(RefCell::new(Doc { path, text, history, open: None, disk, changed_on_disk: false }))
+    }
+}
+
+thread_local! {
+    /// The documents of files a view has open, so a second view of a file
+    /// shares the first's.
+    static OPEN_DOCS: RefCell<Vec<Weak<RefCell<Doc>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The document of `path` a view already has open.
+fn open_doc(path: &Path) -> Option<Rc<RefCell<Doc>>> {
+    OPEN_DOCS.with_borrow(|docs| {
+        docs.iter().filter_map(Weak::upgrade).find(|d| d.borrow().path.as_deref().is_some_and(|p| same_file(p, path)))
+    })
+}
+
+/// Let later views of `doc`'s file share it.
+fn register(doc: &Rc<RefCell<Doc>>) {
+    OPEN_DOCS.with_borrow_mut(|docs| {
+        docs.retain(|d| d.strong_count() > 0);
+        if !docs.iter().any(|d| std::ptr::eq(d.as_ptr(), Rc::as_ptr(doc))) {
+            docs.push(Rc::downgrade(doc));
+        }
+    });
+}
+
+static NEXT_BUFFER: AtomicU64 = AtomicU64::new(1);
 
 /// The columns of the closers the editor inserted on one line, kept in step
 /// with edits on that line. Only the cursor's line is tracked: moving to
 /// another line forgets them (like VS Code's `autoClosingOvertype: auto`).
 #[derive(Clone, Debug, Default)]
-struct AutoClosers {
+pub(super) struct AutoClosers {
     row: usize,
     cols: Vec<usize>,
 }
@@ -107,66 +177,19 @@ impl AutoClosers {
     }
 }
 
-/// Most undo steps kept; older ones are dropped.
-const MAX_UNDO: usize = 200;
+/// Most bytes of changes one file's history keeps; past it the oldest
+/// steps go, with any branch off them ([`UndoTree::prune`]).
+const HISTORY_BYTES: usize = 64 << 20;
 
-/// Undo granularity: a run of typed characters, or of single-character
-/// deletes, is one step while each edit continues where the last left off.
+/// A typing or deleting run ends at a pause this long.
+const RUN_PAUSE: Duration = Duration::from_secs(1);
+
+/// What an edit adds to the history: it may continue the open run, or it is
+/// a step of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
-    Typing,
-    Deleting,
+    Run(Run),
     Other,
-}
-
-/// The buffer's text, cursor, and selection at one point, and which version
-/// of the text it is.
-#[derive(Clone, Debug)]
-struct Snapshot {
-    lines: Vec<String>,
-    cursor: (usize, usize),
-    anchor: Option<(usize, usize)>,
-    auto_closers: AutoClosers,
-    version: u64,
-    /// The text predates a reload that no save has followed.
-    stale: bool,
-}
-
-/// Undo/redo as whole-buffer snapshots.
-#[derive(Debug, Default)]
-struct History {
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
-    /// The open run of typing/deleting and where its last edit left the cursor.
-    run: Option<(Step, (usize, usize))>,
-    /// The current text's version (each undo step gets a fresh one) and the
-    /// version last written, so undoing back to it clears `modified`.
-    version: u64,
-    next_version: u64,
-    saved_version: u64,
-    /// The current text is not based on the file as the buffer last read it:
-    /// undo went back past a reload, or the file became unreadable.
-    stale: bool,
-}
-
-impl History {
-    /// An edit changed the text: what was undone can't be redone, and the
-    /// oldest steps past [`MAX_UNDO`] go.
-    fn committed(&mut self) {
-        self.redo.clear();
-        if self.undo.len() > MAX_UNDO {
-            let excess = self.undo.len() - MAX_UNDO;
-            self.undo.drain(..excess);
-        }
-    }
-
-    /// Mark the current text and every remembered one stale, or none.
-    fn set_stale(&mut self, stale: bool) {
-        self.stale = stale;
-        for s in self.undo.iter_mut().chain(&mut self.redo) {
-            s.stale = stale;
-        }
-    }
 }
 
 /// Per-row chars a comment toggle leaves before a line's indent, from row
@@ -186,29 +209,42 @@ impl Lead<'_> {
 impl EditorBuffer {
     /// An empty scratch buffer.
     pub fn scratch() -> Self {
+        Self::with_doc(Doc::new(None, vec![String::new()], None))
+    }
+
+    /// A view of `doc`'s text, at its current step.
+    fn with_doc(doc: Rc<RefCell<Doc>>) -> Self {
+        let (lines, at, path) = {
+            let d = doc.borrow();
+            (d.text.clone(), d.history.tip(), d.path.clone())
+        };
         EditorBuffer {
-            lines: vec![String::new()],
+            lines,
             cursor: (0, 0),
             scroll: 0,
             hscroll: 0,
             last_cursor: (0, 0),
-            path: None,
-            modified: false,
-            changed_on_disk: false,
-            disk: None,
+            path,
             edits: 0,
             dirty_from: None,
             anchor: None,
             auto_closers: AutoClosers::default(),
-            history: History::default(),
+            doc,
+            id: NEXT_BUFFER.fetch_add(1, Ordering::Relaxed),
+            at,
+            before: None,
         }
     }
 
-    /// Load `path` into a buffer. A missing file starts empty (a new file).
-    /// Any other read error (not UTF-8, unreadable, a directory, not a
-    /// regular file, past [`MAX_FILE_BYTES`]) fails: an empty buffer bound
+    /// Load `path` into a buffer: a view of the file's open document when
+    /// another view has one, else read. A missing file starts empty (a new
+    /// file). Any other read error (not UTF-8, unreadable, a directory, not
+    /// a regular file, past [`MAX_FILE_BYTES`]) fails: an empty buffer bound
     /// to the file would overwrite it on save.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(doc) = open_doc(&path) {
+            return Ok(Self::with_doc(doc));
+        }
         // Before reading: a write in between then shows as a change.
         let disk = Stamp::of(&path);
         let lines = match read_text(&path) {
@@ -216,22 +252,82 @@ impl EditorBuffer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![String::new()],
             Err(e) => return Err(e),
         };
-        Ok(EditorBuffer {
-            lines,
-            cursor: (0, 0),
-            scroll: 0,
-            hscroll: 0,
-            last_cursor: (0, 0),
-            path: Some(path),
-            modified: false,
-            changed_on_disk: false,
-            disk,
-            edits: 0,
-            dirty_from: None,
-            anchor: None,
-            auto_closers: AutoClosers::default(),
-            history: History::default(),
-        })
+        let doc = Doc::new(Some(path), lines, disk);
+        register(&doc);
+        Ok(Self::with_doc(doc))
+    }
+
+    /// Unsaved edits since the last load or save: the history is at another
+    /// step than the one on disk.
+    pub fn modified(&self) -> bool {
+        let d = self.doc.borrow();
+        d.history.saved() != Some(d.history.current())
+    }
+
+    /// The file changed on disk while the buffer had unsaved edits, so the
+    /// edits were kept; cleared when the buffer loads or writes the file.
+    pub fn changed_on_disk(&self) -> bool {
+        self.doc.borrow().changed_on_disk
+    }
+
+    /// Set [`Self::changed_on_disk`]; returns what it was.
+    pub fn set_changed_on_disk(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.doc.borrow_mut().changed_on_disk, on)
+    }
+
+    /// The file's undo history, shared by its views: a tree whose current
+    /// step is the text shown. [`Self::goto`] moves to any of its steps.
+    pub fn history(&self) -> Ref<'_, UndoTree> {
+        Ref::map(self.doc.borrow(), |d| &d.history)
+    }
+
+    /// The file is now `path` (Save As, or moved by the app), for every view
+    /// of it.
+    pub fn moved_to(&mut self, path: PathBuf) {
+        self.doc.borrow_mut().path = Some(path.clone());
+        register(&self.doc);
+        self.path = Some(path);
+    }
+
+    /// Catch up with the other views' edits, undos, and moves of the file:
+    /// apply the history's changes since this view's step, moving the
+    /// cursor and selection with the text. Returns whether anything changed.
+    /// A view syncs before it handles input or paints.
+    pub fn sync(&mut self) -> bool {
+        let d = self.doc.borrow();
+        let moved = self.path != d.path;
+        if moved {
+            self.path = d.path.clone();
+        }
+        let tip = d.history.tip();
+        if self.at == tip {
+            return moved;
+        }
+        let mut first = usize::MAX;
+        match d.history.route(self.at) {
+            Some(ops) => {
+                for op in &ops {
+                    first = first.min(op.at.0);
+                    op.apply(&mut self.lines);
+                    self.cursor = history::shift(self.cursor, op);
+                    self.anchor = self.anchor.map(|a| history::shift(a, op));
+                }
+            }
+            // This view's step was pruned: take the text whole.
+            None => {
+                first = 0;
+                self.lines = d.text.clone();
+            }
+        }
+        drop(d);
+        self.at = tip;
+        self.auto_closers.clear();
+        (self.cursor, self.anchor) = (self.clamp(self.cursor), self.anchor.map(|a| self.clamp(a)));
+        self.clamp_scroll_bounds();
+        if first != usize::MAX {
+            self.touch(first);
+        }
+        true
     }
 
     /// A short display name for the tab (file name, or "*scratch*").
@@ -324,12 +420,54 @@ impl EditorBuffer {
         self.anchor = None;
     }
 
-    /// Mark a text-changing edit that starts at line `row`: sets the unsaved
-    /// flag and bumps the edit count (which the idle-autosave timer watches).
+    /// Mark a text-changing edit that starts at line `row`: bumps the edit
+    /// count (which the idle-autosave timer watches).
     fn touch(&mut self, row: usize) {
         self.dirty_from = Some(self.dirty_from.map_or(row, |d| d.min(row)));
-        self.modified = true;
         self.edits = self.edits.wrapping_add(1);
+    }
+
+    /// `p` within the text.
+    fn clamp(&self, (row, col): Pos) -> Pos {
+        let row = row.min(self.lines.len() - 1);
+        (row, col.min(self.line_len(row)))
+    }
+
+    /// The cursor, anchor, and auto-inserted closers.
+    fn caret(&self) -> Caret {
+        Caret { cursor: self.cursor, anchor: self.anchor, closers: self.auto_closers.clone() }
+    }
+
+    /// Replace `from..to` with `text`: every text change goes through here.
+    /// It joins the current step when this view has it open, else starts one
+    /// after the current step (a branch, when that step has others).
+    fn splice(&mut self, from: Pos, to: Pos, text: &str) {
+        // Positions are this view's; another view's edit since would shift
+        // them, so a view syncs before it handles input. This keeps the
+        // texts alike regardless.
+        self.sync();
+        let (from, to) = (self.clamp(from), self.clamp(to));
+        let mut d = self.doc.borrow_mut();
+        if d.open.is_none_or(|o| o.owner != self.id) {
+            let before = self.before.clone().unwrap_or_else(|| self.caret());
+            d.history.push(before, HISTORY_BYTES);
+            d.open = Some(Open { owner: self.id, run: None });
+        }
+        let (del, _) = history::splice(&mut self.lines, from, to, text);
+        history::splice(&mut d.text, from, to, text);
+        d.history.record(Op { at: from, del, ins: text.to_string() });
+        self.at = d.history.tip();
+        drop(d);
+        self.touch(from.0);
+    }
+
+    /// Close the current step if this view has it open, so the next edit
+    /// starts one.
+    fn close_step(&mut self) {
+        let mut d = self.doc.borrow_mut();
+        if d.open.is_some_and(|o| o.owner == self.id) {
+            d.open = None;
+        }
     }
 
     /// Delete the selected text, placing the cursor at its start. Returns whether
@@ -349,31 +487,32 @@ impl EditorBuffer {
             return false;
         }
         if sr == er {
-            self.lines[sr].replace_range(start..end, "");
             self.auto_closers.removed(sr, sc, ec - sc);
         } else {
             self.auto_closers.clear();
-            let tail = self.lines[er][end..].to_string();
-            self.lines[sr].truncate(start);
-            self.lines[sr].push_str(&tail);
-            self.lines.drain(sr + 1..=er);
         }
+        self.splice((sr, sc), (er, ec), "");
         self.cursor = (sr, sc);
         self.anchor = None;
-        self.touch(sr);
         true
     }
 
     /// Insert text (may contain newlines), replacing any selection first.
     pub fn insert_str(&mut self, s: &str) {
         self.delete_selection();
-        for c in s.chars() {
-            if c == '\n' {
-                self.insert_newline();
-            } else if c != '\r' {
-                self.insert_char(c);
-            }
+        let text: String = s.chars().filter(|c| *c != '\r').collect();
+        if text.is_empty() {
+            return;
         }
+        let at = self.clamp(self.cursor);
+        self.splice(at, at, &text);
+        let end = history::end_of(at, &text);
+        if end.0 == at.0 {
+            self.auto_closers.inserted(at.0, at.1, end.1 - at.1);
+        } else {
+            self.auto_closers.clear();
+        }
+        self.cursor = end;
     }
 
     /// Whether typing `s` wraps the selection in brackets.
@@ -392,9 +531,7 @@ impl EditorBuffer {
     /// identical closer that follows if the editor inserted it. Anything else
     /// is inserted as is.
     pub fn insert_typed(&mut self, s: &str) {
-        let Some(c) = typed_char(s) else {
-            return self.insert_str(s);
-        };
+        let Some(c) = typed_char(s) else { return self.insert_str(s) };
         let (row, col) = self.cursor;
         if let Some(close) = closer_of(c) {
             if let Some(((sr, sc), (er, ec))) = self.selection() {
@@ -402,8 +539,7 @@ impl EditorBuffer {
             }
             if closes_before(self.char_at(row, col)) {
                 self.insert_char(c);
-                let b = self.byte_of(row, col + 1);
-                self.lines[row].insert(b, close);
+                self.splice((row, col + 1), (row, col + 1), &close.to_string());
                 self.auto_closers.inserted(row, col + 1, 1);
                 self.auto_closers.add(row, col + 1);
                 return;
@@ -424,16 +560,13 @@ impl EditorBuffer {
     /// wrapped text selected (in the direction it was).
     fn wrap_selection(&mut self, open: char, close: char, start: (usize, usize), end: (usize, usize)) {
         let forward = self.anchor.is_some_and(|a| a < self.cursor);
-        let b = self.byte_of(end.0, end.1);
-        self.lines[end.0].insert(b, close);
-        let b = self.byte_of(start.0, start.1);
-        self.lines[start.0].insert(b, open);
+        self.splice(end, end, &close.to_string());
+        self.splice(start, start, &open.to_string());
         let inner_start = (start.0, start.1 + 1);
         let inner_end = (end.0, end.1 + usize::from(start.0 == end.0));
         let (anchor, cursor) = if forward { (inner_start, inner_end) } else { (inner_end, inner_start) };
         (self.anchor, self.cursor) = (Some(anchor), cursor);
         self.auto_closers.clear();
-        self.touch(start.0);
     }
 
     /// Whether the cursor sits between an opening bracket and a closer the
@@ -450,22 +583,17 @@ impl EditorBuffer {
     pub fn insert_char(&mut self, c: char) {
         self.delete_selection();
         let (row, col) = self.cursor;
-        let b = self.byte_of(row, col);
-        self.lines[row].insert(b, c);
+        self.splice((row, col), (row, col), &c.to_string());
         self.auto_closers.inserted(row, col, 1);
         self.cursor.1 = col + 1;
-        self.touch(row);
     }
 
     pub fn insert_newline(&mut self) {
         self.delete_selection();
         let (row, col) = self.cursor;
-        let b = self.byte_of(row, col);
-        let tail = self.lines[row].split_off(b);
-        self.lines.insert(row + 1, tail);
+        self.splice((row, col), (row, col), "\n");
         self.auto_closers.clear();
         self.cursor = (row + 1, 0);
-        self.touch(row);
     }
 
     /// Delete the char before the cursor, joining with the previous line at the
@@ -557,19 +685,34 @@ impl EditorBuffer {
     }
 
     /// Apply a text edit (see [`crate::plugin::text_edit`]). Edits that change
-    /// the text are recorded for undo.
+    /// the text are recorded for undo: a run of typed characters is one step
+    /// until a word character follows a non-word one, single-character
+    /// deletes merge, and a run ends at a pause of [`RUN_PAUSE`], a cursor
+    /// move, or another kind of edit.
     pub fn apply(&mut self, edit: Edit, clip: &mut dyn Clipboard) -> Applied {
+        self.sync();
         let edits = self.edits;
+        let fresh = self.selection().is_some();
         let step = match &edit {
             // Wrapping a selection in brackets is a step of its own: typing on
             // doesn't merge into it.
             Edit::Insert(s) if self.wraps(s) => Some(Step::Other),
-            Edit::Insert(s) if s.chars().count() == 1 && s != "\n" => Some(Step::Typing),
-            Edit::Delete(Motion::Left | Motion::Right) => Some(Step::Deleting),
-            Edit::Insert(_) | Edit::Delete(_) | Edit::Cut | Edit::Paste => Some(Step::Other),
+            Edit::Insert(s) => match typed_char(s) {
+                Some(c) if c != '\n' => Some(Step::Run(Run::Typing { word: is_word(c) })),
+                _ => Some(Step::Other),
+            },
+            Edit::Delete(Motion::Left | Motion::Right) if !fresh => Some(Step::Run(Run::Deleting)),
+            Edit::Delete(_) | Edit::Cut | Edit::Paste => Some(Step::Other),
             Edit::Move { .. } | Edit::SelectAll | Edit::Copy | Edit::Undo | Edit::Redo => None,
         };
-        let opened = step.is_some_and(|step| self.checkpoint(step));
+        let now = Instant::now();
+        if let Some(step) = step {
+            // Typing over a selection starts a step; typing on continues it.
+            if fresh || !self.continues(step, now) {
+                self.close_step();
+            }
+            self.before = Some(self.caret());
+        }
         match edit {
             Edit::Move { to, select: true } => self.move_cursor_selecting(to),
             Edit::Move { to, select: false } => self.move_cursor(to),
@@ -595,96 +738,119 @@ impl EditorBuffer {
             Edit::Undo => self.undo(),
             Edit::Redo => self.redo(),
         }
+        self.before = None;
         self.auto_closers.keep_line(self.cursor.0);
-        if step.is_some() && self.edits != edits {
-            self.history.committed();
-        }
+        let changed = self.edits != edits;
         match step {
-            // A step that changed nothing leaves no undo entry.
-            Some(_) if opened && self.edits == edits => self.drop_checkpoint(),
-            Some(Step::Typing | Step::Deleting) => self.history.run = step.map(|s| (s, self.cursor)),
-            _ => self.history.run = None,
+            Some(step) if changed => self.note_run(step, now),
+            // A text edit that changed nothing opened no step.
+            Some(_) => {}
+            None => self.close_step(),
         }
-        if self.edits != edits {
+        if changed {
             Applied::Changed
         } else {
             Applied::Moved
         }
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            lines: self.lines.clone(),
-            cursor: self.cursor,
-            anchor: self.anchor,
-            auto_closers: self.auto_closers.clone(),
-            version: self.history.version,
-            stale: self.history.stale,
-        }
+    /// Whether a `step` edit now joins the step this view has open: both
+    /// are of one run, the edit is where the last left the cursor, and no
+    /// pause came between.
+    fn continues(&self, step: Step, now: Instant) -> bool {
+        let Step::Run(next) = step else { return false };
+        let d = self.doc.borrow();
+        let Some(Open { owner, run: Some((run, at, when)) }) = d.open else { return false };
+        owner == self.id && at == self.cursor && now.duration_since(when) < RUN_PAUSE && run.takes(next)
     }
 
-    /// Record the state before a `step` edit, unless it continues the open run.
-    /// Returns whether it opened a new undo step.
-    fn checkpoint(&mut self, step: Step) -> bool {
-        let h = &self.history;
-        if step != Step::Other && h.run == Some((step, self.cursor)) {
-            return false;
+    /// After a `step` edit changed the text: the caret its step now leaves,
+    /// and the run the next edit may continue.
+    fn note_run(&mut self, step: Step, now: Instant) {
+        let caret = self.caret();
+        let mut d = self.doc.borrow_mut();
+        if d.open.is_some_and(|o| o.owner == self.id) {
+            d.history.cur_mut().after = caret;
+            let run = match step {
+                Step::Run(r) => Some((r, self.cursor, now)),
+                Step::Other => None,
+            };
+            d.open = run.is_some().then_some(Open { owner: self.id, run });
         }
-        let snap = self.snapshot();
-        let h = &mut self.history;
-        h.undo.push(snap);
-        h.next_version += 1;
-        h.version = h.next_version;
-        true
     }
 
     /// End the open typing/deleting run, so the next edit starts a new undo
     /// step (e.g. after the cursor moved by mouse).
     pub fn end_undo_run(&mut self) {
-        self.history.run = None;
+        self.close_step();
         self.auto_closers.keep_line(self.cursor.0);
     }
 
-    /// Withdraw the step [`Self::checkpoint`] just opened.
-    fn drop_checkpoint(&mut self) {
-        if let Some(s) = self.history.undo.pop() {
-            self.history.version = s.version;
+    /// Step back to the text before the current step, with the caret as it
+    /// was before that step. Editing then adds a branch; the undone step
+    /// stays in the tree.
+    pub fn undo(&mut self) {
+        self.sync();
+        self.close_step();
+        let (parent, caret) = {
+            let d = self.doc.borrow();
+            let n = d.history.node(d.history.current()).expect("the current step is in the tree");
+            (n.parent(), n.before.clone())
+        };
+        if let Some(parent) = parent {
+            self.jump(parent, caret);
         }
     }
 
-    /// Make `s` the buffer's state; it is unmodified if it is the saved version.
-    fn restore(&mut self, s: Snapshot) {
-        self.lines = s.lines;
-        self.auto_closers = s.auto_closers;
-        self.cursor = s.cursor;
-        self.anchor = s.anchor;
-        self.history.version = s.version;
-        self.history.stale = s.stale;
-        self.history.run = None;
+    /// Redo the step undone last from here (the branch last visited), with
+    /// the caret as that step left it.
+    pub fn redo(&mut self) {
+        self.sync();
+        self.close_step();
+        let next = {
+            let d = self.doc.borrow();
+            let n = d.history.node(d.history.current()).expect("the current step is in the tree");
+            n.redo_child().and_then(|c| Some((c, d.history.node(c)?.after.clone())))
+        };
+        if let Some((child, caret)) = next {
+            self.jump(child, caret);
+        }
+    }
+
+    /// Move to step `id` of [`Self::history`], on any branch, with the caret
+    /// as that step left it. Redo from the steps above it then leads to it.
+    /// Returns whether `id` is in the tree.
+    pub fn goto(&mut self, id: NodeId) -> bool {
+        self.sync();
+        self.close_step();
+        let caret = match self.history().node(id) {
+            Some(n) => n.after.clone(),
+            None => return false,
+        };
+        self.jump(id, caret);
+        true
+    }
+
+    /// Make `id` the history's current step and this view's text and caret
+    /// its; the buffer is unmodified if it is the saved step.
+    fn jump(&mut self, id: NodeId, caret: Caret) {
+        {
+            let mut d = self.doc.borrow_mut();
+            let Some(ops) = d.history.jump(id) else { return };
+            for op in &ops {
+                op.apply(&mut d.text);
+            }
+            d.open = None;
+        }
+        self.sync();
+        self.cursor = self.clamp(caret.cursor);
+        self.anchor = caret.anchor.map(|a| self.clamp(a));
+        self.auto_closers = caret.closers;
         self.edits = self.edits.wrapping_add(1);
-        self.dirty_from = Some(0);
-        self.modified = s.version != self.history.saved_version;
         // Marked while saving this text would ask: it predates a reload, or
         // the file changed since the buffer read it.
-        self.changed_on_disk = self.conflicted();
-    }
-
-    /// Step back to the state before the last undo step.
-    pub fn undo(&mut self) {
-        if let Some(s) = self.history.undo.pop() {
-            let cur = self.snapshot();
-            self.history.redo.push(cur);
-            self.restore(s);
-        }
-    }
-
-    /// Re-apply the last undone step.
-    pub fn redo(&mut self) {
-        if let Some(s) = self.history.redo.pop() {
-            let cur = self.snapshot();
-            self.history.undo.push(cur);
-            self.restore(s);
-        }
+        let conflicted = self.conflicted();
+        self.set_changed_on_disk(conflicted);
     }
 
     /// Comment out the selected lines (the cursor's line without a selection),
@@ -697,25 +863,23 @@ impl EditorBuffer {
     /// whether the text changed (not when blank or the language has no comment
     /// syntax).
     pub fn toggle_comment(&mut self, syntax: CommentSyntax, lead: &[usize]) -> bool {
+        self.sync();
         let (first, last) = self.line_rows();
         let lead = Lead { first, cols: lead };
         let edits = self.edits;
-        let opened = self.checkpoint(Step::Other);
+        self.close_step();
+        self.before = Some(self.caret());
         if let Some(token) = syntax.line {
             self.toggle_line_comment(token, first, last, lead);
         } else if let Some((open, close)) = syntax.block {
             self.toggle_block_comment(open, close, first, last, lead);
         }
-        self.history.run = None;
-        if self.edits == edits {
-            if opened {
-                self.drop_checkpoint();
-            }
-            return false;
+        self.before = None;
+        let changed = self.edits != edits;
+        if changed {
+            self.note_run(Step::Other, Instant::now());
         }
-        self.dirty_from = Some(self.dirty_from.map_or(first, |d| d.min(first)));
-        self.history.committed();
-        true
+        changed
     }
 
     /// The rows among `first..=last` with text past their lead.
@@ -817,8 +981,7 @@ impl EditorBuffer {
 
     /// Insert `text` at `(row, col)`, moving the cursor and anchor along.
     fn insert_at(&mut self, row: usize, col: usize, text: &str) {
-        let b = self.byte_of(row, col);
-        self.lines[row].insert_str(b, text);
+        self.splice((row, col), (row, col), text);
         let n = text.chars().count();
         self.auto_closers.inserted(row, col, n);
         let shift = |p: &mut (usize, usize)| {
@@ -828,13 +991,11 @@ impl EditorBuffer {
         };
         shift(&mut self.cursor);
         self.anchor.iter_mut().for_each(shift);
-        self.touch(row);
     }
 
     /// Remove `n` chars at `(row, col)`, moving the cursor and anchor along.
     fn remove_at(&mut self, row: usize, col: usize, n: usize) {
-        let (from, to) = (self.byte_of(row, col), self.byte_of(row, col + n));
-        self.lines[row].replace_range(from..to, "");
+        self.splice((row, col), (row, col + n), "");
         self.auto_closers.removed(row, col, n);
         let shift = |p: &mut (usize, usize)| {
             if p.0 == row && p.1 > col {
@@ -843,7 +1004,6 @@ impl EditorBuffer {
         };
         shift(&mut self.cursor);
         self.anchor.iter_mut().for_each(shift);
-        self.touch(row);
     }
 
     /// Scroll to keep the cursor visible — vertically within `body_h` px,
@@ -902,56 +1062,59 @@ impl EditorBuffer {
     }
 
     /// Replace the text with its file's as it is on disk now (another program
-    /// wrote it), as one undo step; the buffer is then unmodified, and undoing
-    /// the step returns to the old text as an unsaved edit that saving asks
-    /// about. Returns whether the text changed. A file that can't be read as
-    /// text keeps the buffer, marked changed on disk, and counts as seen, so
-    /// the next check doesn't read it again.
+    /// wrote it), as one undo step after the current one holding only the
+    /// lines that differ. That step is the saved one; every other step is
+    /// stale, so undoing past the reload gives an unsaved edit that saving
+    /// asks about. Returns whether the text changed. A file that can't be
+    /// read as text keeps the buffer, marked changed on disk, and counts as
+    /// seen, so the next check doesn't read it again.
     pub fn reload(&mut self) -> std::io::Result<bool> {
-        let Some(path) = &self.path else { return Ok(false) };
-        self.disk = Stamp::of(path);
-        let lines = match read_text(path) {
+        self.sync();
+        let Some(path) = self.path.clone() else { return Ok(false) };
+        self.doc.borrow_mut().disk = Stamp::of(&path);
+        let lines = match read_text(&path) {
             Ok(text) => split_lines(&text),
             Err(e) => {
-                self.changed_on_disk = true;
-                self.history.set_stale(true);
+                let mut d = self.doc.borrow_mut();
+                d.changed_on_disk = true;
+                d.history.mark_stale(true);
                 return Err(e);
             }
         };
-        self.changed_on_disk = false;
-        self.history.stale = false;
-        if lines == self.lines {
-            // Already what's on disk, whatever the history says.
-            self.history.saved_version = self.history.version;
-            self.modified = false;
-            return Ok(false);
+        self.doc.borrow_mut().changed_on_disk = false;
+        let changed = lines != self.lines;
+        if changed {
+            self.close_step();
+            self.doc.borrow_mut().open = None;
+            self.before = Some(self.caret());
+            let (from, to, text) = line_diff(&self.lines, &lines);
+            self.splice(from, to, &text);
+            self.before = None;
+            let op = self.history().node(self.at.0).and_then(|n| n.ops().last().cloned());
+            if let Some(op) = op {
+                self.cursor = self.clamp(history::shift(self.cursor, &op));
+            }
+            self.anchor = None;
+            self.auto_closers = AutoClosers::default();
+            self.clamp_scroll_bounds();
+            let caret = self.caret();
+            let mut d = self.doc.borrow_mut();
+            d.history.cur_mut().after = caret;
+            d.open = None;
+            d.history.mark_stale(true);
         }
-        self.checkpoint(Step::Other);
-        self.history.committed();
-        self.history.run = None;
-        self.history.saved_version = self.history.version;
-        // Remembered texts predate the reload; undoing to one leaves it
-        // differing from a file it never saw.
-        for s in &mut self.history.undo {
-            s.stale = true;
-        }
-        self.lines = lines;
-        let row = self.cursor.0.min(self.lines.len() - 1);
-        self.cursor = (row, self.cursor.1.min(self.line_len(row)));
-        self.anchor = None;
-        self.auto_closers = AutoClosers::default();
-        self.clamp_scroll_bounds();
-        self.edits = self.edits.wrapping_add(1);
-        self.dirty_from = Some(0);
-        self.modified = false;
-        Ok(true)
+        // Already what's on disk if unchanged, whatever the history says.
+        let mut d = self.doc.borrow_mut();
+        d.history.cur_mut().stale = false;
+        d.history.set_saved();
+        Ok(changed)
     }
 
     /// Whether another program wrote the file since the buffer loaded or wrote
     /// it. A file that is gone is not a change: saving recreates it.
     pub fn disk_changed(&self) -> bool {
         let Some(now) = self.path.as_deref().and_then(Stamp::of) else { return false };
-        self.disk != Some(now)
+        self.doc.borrow().disk != Some(now)
     }
 
     /// Whether writing the buffer now could lose what is on disk: the file
@@ -959,11 +1122,16 @@ impl EditorBuffer {
     /// isn't based on the file as it was last read (undo went back past a
     /// reload, or the file became unreadable).
     pub fn conflicted(&self) -> bool {
-        self.history.stale || self.disk_changed()
+        let stale = {
+            let d = self.doc.borrow();
+            d.history.node(d.history.current()).is_some_and(|n| n.stale)
+        };
+        stale || self.disk_changed()
     }
 
     /// Write the buffer to its path. Returns whether it had a path to save to.
     pub fn save(&mut self) -> std::io::Result<bool> {
+        self.sync();
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
@@ -971,11 +1139,13 @@ impl EditorBuffer {
         Ok(true)
     }
 
-    /// Write the buffer to `path` and make that its file. On failure the
-    /// buffer keeps its old path, so later saves don't aim at the failed one.
+    /// Write the buffer to `path` and make that its file, keeping its
+    /// history. On failure the buffer keeps its old path, so later saves
+    /// don't aim at the failed one.
     pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.sync();
         self.write_to(&path)?;
-        self.path = Some(path);
+        self.moved_to(path);
         Ok(())
     }
 
@@ -994,14 +1164,47 @@ impl EditorBuffer {
 
     fn write_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         std::fs::write(path, self.file_text())?;
-        self.disk = Stamp::of(path);
-        self.changed_on_disk = false;
-        self.history.set_stale(false);
-        self.modified = false;
+        let mut d = self.doc.borrow_mut();
+        d.disk = Stamp::of(path);
+        d.changed_on_disk = false;
+        d.history.mark_stale(false);
         // Typing after a save starts a new step, so undo can return here.
-        self.history.saved_version = self.history.version;
-        self.history.run = None;
+        d.history.set_saved();
+        d.open = None;
         Ok(())
+    }
+}
+
+/// The change that takes `old` to `new` (which differ), as a splice of the
+/// rows between their common first and last rows.
+fn line_diff(old: &[String], new: &[String]) -> (Pos, Pos, String) {
+    let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - pre;
+    let suf = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    let (old_end, new_end) = (old.len() - suf, new.len() - suf);
+    let mid = new[pre..new_end].join("\n");
+    let end = |row: usize| (row, old[row].chars().count());
+    if pre > 0 {
+        // From the end of the last row kept above, taking its newline.
+        let from = end(pre - 1);
+        let to = if old_end > pre { end(old_end - 1) } else { from };
+        let text = if new_end > pre { format!("\n{mid}") } else { String::new() };
+        (from, to, text)
+    } else if suf > 0 {
+        // Up to the start of the first row kept below, taking the newline.
+        let text = if new_end > 0 { format!("{mid}\n") } else { String::new() };
+        ((0, 0), (old_end, 0), text)
+    } else {
+        ((0, 0), end(old.len() - 1), mid)
+    }
+}
+
+#[cfg(test)]
+impl EditorBuffer {
+    /// Take the text as saved, without writing it.
+    fn mark_saved(&mut self) {
+        self.close_step();
+        self.doc.borrow_mut().history.set_saved();
     }
 }
 
@@ -1087,7 +1290,7 @@ mod tests {
         e.apply(Edit::Insert("q".into()), &mut None::<String>);
         assert_eq!(e.dirty_from.take(), Some(2));
         e.apply(Edit::Undo, &mut None::<String>);
-        assert_eq!(e.dirty_from.take(), Some(0), "a restore may change any line");
+        assert_eq!(e.dirty_from.take(), Some(2), "from the line the undone change was on");
     }
 
     #[test]
@@ -1102,7 +1305,7 @@ mod tests {
         e.insert_char('d');
         assert_eq!(e.lines, vec!["abc".to_string(), "d".to_string()]);
         assert_eq!(e.cursor, (1, 1));
-        assert!(e.modified);
+        assert!(e.modified());
     }
 
     #[test]
@@ -1232,7 +1435,7 @@ mod tests {
         e.insert_str(text);
         e.cursor = (0, 0);
         e.anchor = None;
-        e.modified = false;
+        e.mark_saved();
         e
     }
 
@@ -1454,10 +1657,10 @@ mod tests {
         let mut e = buffer_with("\nx");
         assert!(!e.toggle_comment(HASH, &[]));
         assert!(!e.toggle_comment(CommentSyntax::default(), &[]));
-        assert!(!e.modified);
-        let undo_before = e.history.undo.len();
+        assert!(!e.modified());
+        let steps = e.history().steps();
         e.toggle_comment(HASH, &[]);
-        assert_eq!(e.history.undo.len(), undo_before, "a no-op leaves no undo step");
+        assert_eq!(e.history().steps(), steps, "a no-op leaves no undo step");
     }
 
     #[test]
@@ -1498,10 +1701,10 @@ mod tests {
         let mut e = buffer_with("a\nb\nc");
         select(&mut e, (0, 0), (2, 1));
         e.toggle_comment(HASH, &[]);
-        assert!(e.modified);
+        assert!(e.modified());
         e.undo();
         assert_eq!(e.lines, vec!["a", "b", "c"]);
-        assert!(!e.modified);
+        assert!(!e.modified());
         e.redo();
         assert_eq!(e.lines, vec!["# a", "# b", "# c"]);
         assert!(e.dirty_from.is_some());
@@ -1560,12 +1763,12 @@ mod tests {
         assert!(e.reload().unwrap());
         assert_eq!(e.lines, ["uno"]);
         assert_eq!((e.cursor, e.anchor), ((0, 3), None));
-        assert!(!e.modified, "it is what's on disk");
+        assert!(!e.modified(), "it is what's on disk");
         e.undo();
         assert_eq!(e.lines, ["one", "two three"]);
-        assert!(e.modified, "the old text is now an unsaved edit");
+        assert!(e.modified(), "the old text is now an unsaved edit");
         e.redo();
-        assert!(!e.modified);
+        assert!(!e.modified());
     }
 
     #[test]
@@ -1575,11 +1778,11 @@ mod tests {
         typed(&mut e, "saved");
         e.save().unwrap();
         typed(&mut e, "!");
-        assert!(e.modified);
+        assert!(e.modified());
         e.undo();
-        assert!(!e.modified, "back to what's on disk");
+        assert!(!e.modified(), "back to what's on disk");
         e.undo();
-        assert!(e.modified);
+        assert!(e.modified());
         let _ = std::fs::remove_file(path);
     }
 
@@ -1597,12 +1800,12 @@ mod tests {
     fn deleting_past_the_end_of_a_line_changes_nothing() {
         let mut e = EditorBuffer::scratch();
         e.insert_str("ab");
-        e.modified = false;
+        e.mark_saved();
         e.cursor = (0, 5);
         let edits = e.edits;
         assert_eq!(e.apply(Edit::Delete(Motion::Left), &mut None::<String>), Applied::Moved);
         assert_eq!(e.edits, edits);
-        assert!(!e.modified);
+        assert!(!e.modified());
         assert_eq!(e.lines, vec!["ab"]);
         assert_eq!(e.cursor, (0, 2), "back on the line");
     }
@@ -1616,20 +1819,6 @@ mod tests {
         e.apply(Edit::Cut, &mut None::<String>);
         e.redo();
         assert_eq!(e.lines, vec!["a"]);
-    }
-
-    #[test]
-    fn undo_keeps_at_most_max_undo_steps() {
-        let mut e = EditorBuffer::scratch();
-        for _ in 0..MAX_UNDO + 5 {
-            e.apply(Edit::Insert("ab".into()), &mut None::<String>);
-        }
-        assert_eq!(e.history.undo.len(), MAX_UNDO);
-        e.undo();
-        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
-        e.apply(Edit::Move { to: Motion::DocStart, select: false }, &mut None::<String>);
-        e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
-        assert_eq!(e.history.undo.len(), MAX_UNDO, "a no-op evicts nothing");
     }
 
     #[test]
@@ -1756,7 +1945,7 @@ mod tests {
             e.insert_char(c);
         }
         assert!(e.save().unwrap(), "a path-backed buffer saves");
-        assert!(!e.modified);
+        assert!(!e.modified());
         let back = EditorBuffer::open(path.clone()).unwrap();
         assert_eq!(back.lines, vec!["hello".to_string(), "world".to_string()]);
         let _ = std::fs::remove_file(path);
@@ -1790,5 +1979,196 @@ mod tests {
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(EditorBuffer::open(fifo).is_err());
+    }
+
+    /// Let the open run's last edit be a pause ago.
+    fn pause(e: &EditorBuffer) {
+        let mut d = e.doc.borrow_mut();
+        if let Some(Open { run: Some((_, _, when)), .. }) = &mut d.open {
+            *when -= RUN_PAUSE;
+        }
+    }
+
+    #[test]
+    fn a_typing_run_breaks_where_a_word_starts_and_after_a_pause() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "ab, cd");
+        e.undo();
+        assert_eq!(e.lines, ["ab, "], "a word after punctuation and space starts a step");
+        e.undo();
+        assert_eq!(e.lines, [""]);
+        typed(&mut e, "ab");
+        pause(&e);
+        typed(&mut e, "c");
+        e.undo();
+        assert_eq!(e.lines, ["ab"], "the pause ended the run");
+        // Deletes merge, and a pause ends them too.
+        typed(&mut e, "cdef");
+        pause(&e);
+        let back = |e: &mut EditorBuffer| e.apply(Edit::Delete(Motion::Left), &mut None::<String>);
+        back(&mut e);
+        back(&mut e);
+        pause(&e);
+        back(&mut e);
+        assert_eq!(e.lines, ["abc"]);
+        e.undo();
+        assert_eq!(e.lines, ["abcd"]);
+        e.undo();
+        assert_eq!(e.lines, ["abcdef"]);
+        // Typing over a selection starts a step that typing on continues.
+        let mut e = buffer_with("abcd");
+        select(&mut e, (0, 1), (0, 3));
+        typed(&mut e, "xy");
+        e.undo();
+        assert_eq!((e.lines.clone(), e.selection()), (vec!["abcd".to_string()], Some(((0, 1), (0, 3)))));
+    }
+
+    #[test]
+    fn editing_after_an_undo_adds_a_branch_and_keeps_the_old_one() {
+        let mut e = EditorBuffer::scratch();
+        typed(&mut e, "one");
+        let one = e.history().current();
+        e.apply(Edit::Insert("\n".into()), &mut None::<String>);
+        typed(&mut e, "two");
+        let two = e.history().current();
+        e.undo();
+        e.undo();
+        typed(&mut e, "!");
+        let bang = e.history().current();
+        assert_eq!(e.lines, ["one!"]);
+        assert_eq!(e.history().node(one).unwrap().children().len(), 2, "both branches stay");
+        // Undo and redo walk the branch last visited.
+        e.undo();
+        e.redo();
+        assert_eq!(e.lines, ["one!"]);
+        // Switching back to the old branch, with the caret as its step left it.
+        assert!(e.goto(two));
+        assert_eq!((e.lines.clone(), e.cursor), (vec!["one".to_string(), "two".to_string()], (1, 3)));
+        e.undo();
+        e.undo();
+        e.redo();
+        e.redo();
+        assert_eq!(e.lines, ["one", "two"], "redo now follows the old branch");
+        assert!(e.goto(bang));
+        assert_eq!(e.lines, ["one!"]);
+        let root = e.history().root();
+        assert!(e.goto(root));
+        assert_eq!(e.lines, [""]);
+    }
+
+    #[test]
+    fn a_paste_is_one_change_and_steps_hold_changes_not_copies() {
+        let mut e = buffer_with(&"x\n".repeat(10_000));
+        let bytes = e.history().bytes();
+        let mut clip = Some("a\r\nb".to_string());
+        e.apply(Edit::Paste, &mut clip);
+        assert_eq!((&e.lines[..2], e.cursor), (&["a".to_string(), "bx".to_string()][..], (1, 1)));
+        let h = e.history();
+        assert_eq!(h.node(h.current()).unwrap().ops().len(), 1);
+        assert!(h.bytes() - bytes < 1_000, "the step holds the paste, not the file: {}", h.bytes() - bytes);
+    }
+
+    #[test]
+    fn views_of_one_file_share_its_text_and_history_until_the_last_closes() {
+        let tmp = crate::plugin::testing::tmpdir("buffer-shared");
+        let path = tmp.join("f.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let mut one = EditorBuffer::open(path.clone()).unwrap();
+        let mut two = EditorBuffer::open(path.clone()).unwrap();
+        two.cursor = (1, 1);
+        one.cursor = (0, 1);
+        typed(&mut one, "x");
+        assert!(two.modified(), "the history is the file's");
+        assert!(two.sync());
+        assert_eq!((two.lines.clone(), two.cursor), (vec!["ax".to_string(), "b".to_string()], (1, 1)));
+        one.cursor = (0, 0);
+        one.apply(Edit::Insert("\n".into()), &mut None::<String>);
+        two.sync();
+        assert_eq!(two.cursor, (2, 1), "the caret moves with the text");
+        // Undo in one view undoes the other's edit.
+        two.undo();
+        two.undo();
+        assert_eq!(two.lines, ["a", "b"]);
+        assert!(!two.modified());
+        one.sync();
+        assert_eq!(one.lines, ["a", "b"]);
+        // A third view opens on the shared text and history.
+        one.redo();
+        let three = EditorBuffer::open(path.clone()).unwrap();
+        assert_eq!(three.lines, ["ax", "b"]);
+        drop((one, two, three));
+        let fresh = EditorBuffer::open(path).unwrap();
+        assert_eq!(
+            (fresh.lines.clone(), fresh.history().steps()),
+            (vec!["a".to_string(), "b".to_string()], 1),
+            "closed: history gone"
+        );
+    }
+
+    #[test]
+    fn history_survives_save_as_and_moves_every_view() {
+        let tmp = crate::plugin::testing::tmpdir("buffer-save-as");
+        let (old, new) = (tmp.join("old.txt"), tmp.join("new.txt"));
+        std::fs::write(&old, "a\n").unwrap();
+        let mut e = EditorBuffer::open(old.clone()).unwrap();
+        let mut other = EditorBuffer::open(old).unwrap();
+        e.cursor = (0, 1);
+        typed(&mut e, "b");
+        e.save_as(new.clone()).unwrap();
+        assert!(!e.modified());
+        other.sync();
+        assert_eq!(other.path.as_deref(), Some(new.as_path()), "the file moved for every view");
+        assert_eq!(EditorBuffer::open(new.clone()).unwrap().history().steps(), e.history().steps());
+        e.undo();
+        assert_eq!(e.lines, ["a"]);
+        assert!(e.modified(), "the new file holds the edit");
+        e.redo();
+        assert!(!e.modified());
+    }
+
+    #[test]
+    fn a_reload_keeps_the_history_and_changes_only_the_lines_that_differ() {
+        let tmp = crate::plugin::testing::tmpdir("buffer-reload-history");
+        let path = tmp.join("f.txt");
+        std::fs::write(&path, "head\nmid\ntail\n").unwrap();
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
+        e.cursor = (2, 4);
+        typed(&mut e, "!");
+        e.save().unwrap();
+        std::fs::write(&path, "head\nMID\nmore\ntail!\n").unwrap();
+        assert!(e.reload().unwrap());
+        assert_eq!(e.lines, ["head", "MID", "more", "tail!"]);
+        assert_eq!(e.cursor, (3, 5), "the caret stays on its line");
+        {
+            let h = e.history();
+            let op = &h.node(h.current()).unwrap().ops()[0];
+            assert_eq!((op.del.as_str(), op.ins.as_str()), ("\nmid", "\nMID\nmore"));
+        }
+        assert!(!e.modified() && !e.conflicted());
+        e.undo();
+        e.undo();
+        assert_eq!(e.lines, ["head", "mid", "tail"], "steps before the reload stay");
+        assert!(e.modified() && e.conflicted(), "older text asks before it overwrites the file");
+    }
+
+    #[test]
+    fn a_line_diff_splices_only_the_rows_between_common_ends() {
+        let l = |s: &str| s.split('\n').map(str::to_string).collect::<Vec<_>>();
+        for (old, new) in [
+            ("a\nb\nc", "a\nc"),
+            ("a\nc", "a\nb\nc"),
+            ("a\nb", "x\nb"),
+            ("a", "a\nb"),
+            ("a\nb", "a"),
+            ("a\nb", "b"),
+            ("b", "a\nb"),
+            ("a", "b"),
+            ("a\nb\nc", "x\ny"),
+        ] {
+            let mut text = l(old);
+            let (from, to, ins) = line_diff(&text, &l(new));
+            history::splice(&mut text, from, to, &ins);
+            assert_eq!(text, l(new), "{old:?} -> {new:?}");
+        }
     }
 }

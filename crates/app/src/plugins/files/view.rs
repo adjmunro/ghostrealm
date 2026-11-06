@@ -1462,7 +1462,7 @@ mod tests {
         h.mouse(&mut v, down(sidebar_row(1)));
         let ed = |v: &FilesView| {
             let b = v.doc_view().and_then(|d| d.downcast_ref::<EditorView>()).unwrap().buffer();
-            (b.modified, b.selection())
+            (b.modified(), b.selection())
         };
         assert!(!ed(&v).0, "saved as the keys left");
         assert!(v.show_path(&d.join("a.md")));

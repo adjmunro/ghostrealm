@@ -270,7 +270,7 @@ pub fn edit_for(k: &KeyPress) -> Option<Edit> {
 }
 
 /// Word characters, for Option motion: letters, digits, and `_`.
-fn is_word(c: char) -> bool {
+pub(crate) fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -438,7 +438,7 @@ struct LineSnapshot {
 
 /// What the open undo run merges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Run {
+pub(crate) enum Run {
     /// Typed characters; `word` is whether the last one was a word character.
     Typing { word: bool },
     /// Single-character deletes.
@@ -448,7 +448,7 @@ enum Run {
 impl Run {
     /// Whether `next` joins a run of `self`: same kind, and typing doesn't
     /// start a new word.
-    fn takes(self, next: Run) -> bool {
+    pub(crate) fn takes(self, next: Run) -> bool {
         match (self, next) {
             (Run::Typing { word: prev }, Run::Typing { word }) => prev || !word,
             (a, b) => a == b,

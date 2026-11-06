@@ -1423,7 +1423,7 @@ mod tests {
         }
         assert!(!h.key(&mut v, cmd(Key::Char('v'))).0, "no paste");
         assert_eq!(v.text(), before);
-        assert!(!v.buf.modified);
+        assert!(!v.buf.modified());
         let top = |h: &Harness| drawn(h)[0].0.clone();
         assert_eq!(top(&h), "Paragraph 0.");
         let (used, out) = h.key(&mut v, press(Key::PageDown));

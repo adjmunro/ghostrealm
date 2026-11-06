@@ -4,6 +4,7 @@
 //! language service shows its diagnostics and hover docs.
 
 pub mod buffer;
+pub mod history;
 mod stats;
 pub mod lang;
 pub mod md_preview;
@@ -505,7 +506,18 @@ impl EditorView {
     }
 
     pub fn buffer_mut(&mut self) -> &mut EditorBuffer {
+        self.sync();
         &mut self.buf
+    }
+
+    /// Catch up with edits made in another view of the file
+    /// ([`EditorBuffer::sync`]). Returns whether the text changed.
+    fn sync(&mut self) -> bool {
+        let changed = self.buf.sync();
+        if changed {
+            self.note_edits();
+        }
+        changed
     }
 
     /// Draw the document header above the text (its host, a Files surface,
@@ -658,11 +670,11 @@ impl EditorView {
     /// and the buffer stays modified: only an explicit save may ask to
     /// overwrite it. A failed write leaves the buffer modified.
     fn save_if_modified(&mut self) -> Result<Option<PathBuf>> {
-        if !self.buf.modified || self.buf.path.is_none() {
+        if !self.buf.modified() || self.buf.path.is_none() {
             return Ok(None);
         }
         if self.buf.conflicted() {
-            self.buf.changed_on_disk = true;
+            self.buf.set_changed_on_disk(true);
             return Ok(None);
         }
         if !self.buf.save()? {
@@ -729,7 +741,7 @@ impl EditorView {
     fn note_edits(&mut self) {
         if self.buf.edits != self.seen_edits {
             self.seen_edits = self.buf.edits;
-            if self.buf.modified {
+            if self.buf.modified() {
                 self.last_edit_at = Some(Instant::now());
             }
         }
@@ -1036,8 +1048,8 @@ impl EditorView {
             name: &title,
             path: e.path.as_deref(),
             kind: &kind,
-            modified: e.modified,
-            changed_on_disk: e.changed_on_disk,
+            modified: e.modified(),
+            changed_on_disk: e.changed_on_disk(),
             extra: None,
         };
         let name = self.header.paint(cx, r, left, &text, Some(BTN_NAME));
@@ -1347,10 +1359,11 @@ impl View for EditorView {
     }
 
     fn modified(&self) -> bool {
-        self.buf.modified
+        self.buf.modified()
     }
 
     fn paint(&mut self, cx: &mut PaintCx, rect: Rect) {
+        self.sync();
         if cx.modal {
             self.dismiss_popup();
         }
@@ -1698,6 +1711,7 @@ impl View for EditorView {
     /// Text editing per [`crate::plugin::text_edit`] (with undo/redo), plus
     /// Enter, Tab, and Cmd+S (save; Shift+S saves as).
     fn key(&mut self, cx: &mut EventCx, k: &KeyPress) -> bool {
+        self.sync();
         if self.dismiss_popup() {
             cx.redraw();
         }
@@ -1751,6 +1765,7 @@ impl View for EditorView {
     }
 
     fn mouse(&mut self, cx: &mut EventCx, event: &MouseEvent) {
+        self.sync();
         if event.is_other_button() {
             return;
         }
@@ -1922,6 +1937,7 @@ impl View for EditorView {
     }
 
     fn button(&mut self, cx: &mut EventCx, id: u32) {
+        self.sync();
         match id {
             BTN_NAME => {
                 if let Some(hit) = self.name_hit {
@@ -1979,7 +1995,7 @@ impl View for EditorView {
                 let on = !self.autosave_on(cx.cfg);
                 self.autosave = Some(on);
                 // Switching on arms the idle timer for edits already pending.
-                if on && self.buf.modified {
+                if on && self.buf.modified() {
                     self.last_edit_at = Some(Instant::now());
                 }
             }
@@ -2035,7 +2051,7 @@ impl View for EditorView {
     }
 
     fn refresh(&mut self) -> bool {
-        let stats = self.stats.poll() | self.preview.poll() | self.outline.poll();
+        let stats = self.sync() | self.stats.poll() | self.preview.poll() | self.outline.poll();
         let lines = &self.buf.lines;
         stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
@@ -2054,6 +2070,7 @@ impl View for EditorView {
     /// Creates missing parent directories, so a typed `sub/name` works. The
     /// old file's language service doesn't apply to the new one, so it stops.
     fn save_copy(&mut self, path: PathBuf) -> Result<()> {
+        self.sync();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -2066,7 +2083,7 @@ impl View for EditorView {
         let Some(to) = self.buf.path.as_deref().and_then(|p| crate::file_ops::follow(p, moved)) else {
             return;
         };
-        self.buf.path = Some(to.clone());
+        self.buf.moved_to(to.clone());
         self.header.refresh(Some(&to));
         self.lang = None;
         self.stats.fetch_head(Some(to));
@@ -2080,11 +2097,11 @@ impl View for EditorView {
             return false;
         }
         self.header.refresh(self.buf.path.as_deref());
-        if self.buf.modified {
+        if self.buf.modified() {
             // Repaints the mark only the first time.
-            !std::mem::replace(&mut self.buf.changed_on_disk, true)
+            !self.buf.set_changed_on_disk(true)
         } else {
-            let marked = self.buf.changed_on_disk;
+            let marked = self.buf.changed_on_disk();
             match self.buf.reload() {
                 Ok(true) => {
                     self.note_edits();
@@ -2098,7 +2115,7 @@ impl View for EditorView {
     }
 
     fn marked_changed_on_disk(&self) -> bool {
-        self.buf.changed_on_disk
+        self.buf.changed_on_disk()
     }
 
     fn disk_conflict(&self) -> bool {
@@ -2136,6 +2153,7 @@ impl View for EditorView {
     }
 
     fn text(&mut self) -> Option<String> {
+        self.sync();
         Some(self.buf.lines.join("\n"))
     }
 
@@ -2432,7 +2450,7 @@ mod tests {
     fn the_statistic_ends_where_the_disk_button_begins_and_cycles_on_click() {
         let mut v = hosted(view_with("one two"));
         let tmp = tmpdir("editor-stat");
-        v.buf.path = Some(tmp.join("f.txt"));
+        v.buf.moved_to(tmp.join("f.txt"));
         let mut h = Harness::new();
         let buttons = paint_plain(&mut h, &mut v).view_buttons.clone();
         let at = |id| buttons.iter().find(|b| b.2 == id).unwrap().0;
@@ -2571,6 +2589,19 @@ mod tests {
     }
 
     #[test]
+    fn a_second_view_of_a_file_shows_the_firsts_edits_on_refresh() {
+        let tmp = tmpdir("editor-two-views");
+        let path = tmp.join("f.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut one = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        let mut two = EditorView::new(EditorBuffer::open(path).unwrap());
+        one.buffer_mut().apply(Edit::Insert("x".into()), &mut None::<String>);
+        assert!(two.refresh(), "the edit repaints the other view");
+        assert_eq!(two.buffer().lines, ["xa"]);
+        assert!(two.modified() && !two.refresh());
+    }
+
+    #[test]
     fn a_file_changed_on_disk_reloads_an_unmodified_buffer_and_spares_unsaved_edits() {
         let dir = tmpdir("editor-on-disk");
         let path = dir.join("config.toml");
@@ -2605,14 +2636,14 @@ mod tests {
         std::fs::write(&path, "one two\n").unwrap();
         assert!(v.changed_on_disk(&path));
         assert_eq!(v.buffer().lines, ["one two"]);
-        assert!(!v.buffer().changed_on_disk && !v.modified());
+        assert!(!v.buffer().changed_on_disk() && !v.modified());
         assert!(!v.changed_on_disk(&path), "taken once");
 
         v.buffer_mut().insert_str("my ");
         std::fs::write(&path, "one two three\n").unwrap();
         assert!(v.changed_on_disk(&path), "the mark appears");
         assert_eq!(v.buffer().lines, ["my one two"], "unsaved edits stay");
-        assert!(v.buffer().changed_on_disk && v.modified());
+        assert!(v.buffer().changed_on_disk() && v.modified());
         assert!(v.marked_changed_on_disk(), "the tab strip shows it too");
         assert!(!v.changed_on_disk(&path), "marked once");
         assert!(v.disk_conflict(), "and still a conflict");
@@ -2627,7 +2658,7 @@ mod tests {
         v.buffer_mut().insert_str("b");
         std::fs::remove_file(&path).unwrap();
         assert!(!v.changed_on_disk(&path));
-        assert!(!v.buffer().changed_on_disk && !v.disk_conflict());
+        assert!(!v.buffer().changed_on_disk() && !v.disk_conflict());
         assert_eq!(v.buffer().lines, ["ba"]);
     }
 
@@ -2850,7 +2881,7 @@ mod tests {
         assert_eq!(v.save_if_modified().unwrap(), None);
         assert_eq!(v.autosave(&h.cfg).unwrap(), None, "nor on quit or app blur");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's\n");
-        assert!(v.modified() && v.buffer().changed_on_disk, "still unsaved, and marked");
+        assert!(v.modified() && v.buffer().changed_on_disk(), "still unsaved, and marked");
     }
 
     #[test]
@@ -2864,7 +2895,7 @@ mod tests {
         assert_eq!(v.buffer().lines, ["new"]);
         v.buffer_mut().undo();
         assert_eq!(v.buffer().lines, ["old"]);
-        assert!(v.modified() && v.buffer().changed_on_disk && v.disk_conflict());
+        assert!(v.modified() && v.buffer().changed_on_disk() && v.disk_conflict());
         let h = Harness::new();
         assert_eq!(v.save_if_modified().unwrap(), None, "autosave skips it");
         assert_eq!(v.autosave(&h.cfg).unwrap(), None);
@@ -2896,7 +2927,7 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
         assert!(v.changed_on_disk(&path), "the mark appears");
         assert_eq!(v.buffer().lines, ["text"], "the text is kept");
-        assert!(v.buffer().changed_on_disk && !v.modified());
+        assert!(v.buffer().changed_on_disk() && !v.modified());
         assert!(!v.buffer().disk_changed(), "the new version counts as seen");
         assert!(!v.changed_on_disk(&path), "and is not read again");
         v.buffer_mut().insert_str("x");
