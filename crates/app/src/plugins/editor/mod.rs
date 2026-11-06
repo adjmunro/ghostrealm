@@ -2065,6 +2065,9 @@ impl View for EditorView {
                 return;
             }
             id if id >= BTN_UNDO => {
+                // The window takes presses on buttons, so a row's press never
+                // reaches `mouse`: its click gives the panel the keys.
+                self.undo.focus(true);
                 let Some(step) = self.undo.step(id - BTN_UNDO) else { return };
                 self.goto_step(step);
             }

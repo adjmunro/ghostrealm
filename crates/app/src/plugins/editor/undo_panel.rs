@@ -264,10 +264,15 @@ impl UndoPanel {
     /// first): Up and Down move to the next newer and older step, whatever
     /// its branch, Page Up and Page Down a panel's height, Home and End to
     /// the newest step and the oldest. Escape and Enter give the keys back
-    /// to the text; any other key without a modifier goes to the text and
-    /// takes them with it.
+    /// to the text. A Cmd or Ctrl chord goes to the text and leaves the keys
+    /// here; any other key goes to the text and takes them with it, since
+    /// it types or moves the text's caret.
     pub fn key(&mut self, k: &KeyPress) -> PanelKey {
-        if !self.is_focused() || k.mods != Default::default() {
+        if !self.is_focused() || k.mods.super_ || k.mods.ctrl {
+            return PanelKey::Pass;
+        }
+        if k.mods.shift || k.mods.alt {
+            self.focused = false;
             return PanelKey::Pass;
         }
         let Some((_, g)) = &self.graph else { return PanelKey::Pass };
@@ -425,6 +430,12 @@ mod tests {
     use super::*;
     use crate::plugin::testing::{cmd, press, tmpdir, Harness, UI};
     use crate::plugin::{MouseButton, MouseEvent, View};
+    use ghostrealm_terminal::Mods;
+
+    /// `key` with Shift, typing `text`.
+    fn shifted(key: Key, text: Option<&str>) -> KeyPress {
+        KeyPress { key, mods: Mods { shift: true, ..Mods::default() }, text: text.map(str::to_string) }
+    }
 
     fn add(t: &mut UndoTree, text: &str) -> NodeId {
         t.push(Caret::default(), usize::MAX);
@@ -580,6 +591,19 @@ mod tests {
         assert_eq!(p.key(&press(Key::PageUp)), PanelKey::Goto(a));
         assert_eq!(p.key(&cmd(Key::Char('z'))), PanelKey::Pass, "a chord passes");
         assert!(p.is_focused(), "and keeps the keys");
+        let ctrl = KeyPress { mods: Mods { ctrl: true, ..Mods::default() }, ..press(Key::Char('a')) };
+        assert_eq!(p.key(&ctrl), PanelKey::Pass);
+        assert!(p.is_focused(), "so does a Ctrl chord");
+        for k in [
+            shifted(Key::Char('A'), Some("A")),
+            shifted(Key::Up, None),
+            KeyPress { mods: Mods { alt: true, ..Mods::default() }, ..press(Key::Char('=')) },
+        ] {
+            p.focus(true);
+            assert_eq!(p.key(&k), PanelKey::Pass, "{k:?}");
+            assert!(!p.is_focused(), "{k:?} types or moves the caret: the text takes the keys");
+        }
+        p.focus(true);
         assert_eq!(p.key(&press(Key::Escape)), PanelKey::Took);
         assert!(!p.is_focused());
         p.focus(true);
@@ -667,16 +691,47 @@ mod tests {
         typed(&h, &mut v, &[Key::Escape, Key::Up]);
         assert_eq!(lines(&v), ["a", "b"], "Up moved the caret, not the history");
         assert_eq!(v.buffer().cursor, (0, 1));
-        let (_, row) = rows(&h)[1];
-        let on_row = (row.x + 4.0, row.y + 4.0);
-        h.mouse(&mut v, MouseEvent::Down { pos: on_row, button: MouseButton::Left, clicks: 1 });
-        h.mouse(&mut v, MouseEvent::Up { pos: on_row, button: MouseButton::Left, dragged: false });
-        assert_eq!(v.buffer().cursor, (0, 1), "a press on the panel isn't the text's");
+        // The window takes a press on a row (a button): its click gives the
+        // panel the keys.
+        h.button(&mut v, BTN_UNDO + 1);
+        assert_eq!(lines(&v), ["a", ""]);
         typed(&h, &mut v, &[Key::Down]);
+        assert_eq!(lines(&v), ["a"]);
+        typed(&h, &mut v, &[Key::Up]);
         assert_eq!(lines(&v), ["a", ""]);
         h.mouse(&mut v, MouseEvent::Down { pos: (10.0, 10.0), button: MouseButton::Left, clicks: 1 });
         typed(&h, &mut v, &[Key::Down]);
         assert_eq!(lines(&v), ["a", ""], "Down moved the caret");
+        // A press on the panel beside its buttons, on its title.
+        let (_, row) = rows(&h)[0];
+        let on_title = (row.x + 4.0, row.y - 4.0);
+        let cursor = v.buffer().cursor;
+        h.mouse(&mut v, MouseEvent::Down { pos: on_title, button: MouseButton::Left, clicks: 1 });
+        h.mouse(&mut v, MouseEvent::Up { pos: on_title, button: MouseButton::Left, dragged: false });
+        assert_eq!(v.buffer().cursor, cursor, "a press on the panel isn't the text's");
+        typed(&h, &mut v, &[Key::Down]);
+        assert_eq!(lines(&v), ["a"]);
+    }
+
+    #[test]
+    fn a_shifted_or_option_key_types_and_gives_the_text_the_keys() {
+        let mut h = Harness::new();
+        let mut v = three_steps(&mut h);
+        h.key(&mut v, shifted(Key::Char('A'), Some("A")));
+        assert_eq!(lines(&v), ["a", "bA"]);
+        typed(&h, &mut v, &[Key::Up]);
+        assert_eq!(lines(&v), ["a", "bA"], "Up moved the caret, not the history");
+        h.paint(&mut v, RECT);
+        h.button(&mut v, BTN_UNDO);
+        let opt = KeyPress { mods: Mods { alt: true, ..Mods::default() }, key: Key::Char('='), text: Some("\u{2260}".into()) };
+        h.key(&mut v, opt);
+        assert_eq!(lines(&v), ["a", "bA\u{2260}"], "at the caret the current step left");
+        h.paint(&mut v, RECT);
+        h.button(&mut v, BTN_UNDO);
+        h.key(&mut v, shifted(Key::Left, None));
+        assert_eq!(v.buffer().selected_text().as_deref(), Some("\u{2260}"), "Shift+Left selected");
+        typed(&h, &mut v, &[Key::Down]);
+        assert_eq!(lines(&v), ["a", "bA\u{2260}"], "Down moved the caret");
     }
 
     #[test]
