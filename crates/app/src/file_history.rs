@@ -163,6 +163,15 @@ impl FileOp {
     }
 }
 
+/// What a file sidebar asks of its workspace's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Walk {
+    Undo,
+    Redo,
+    /// Undo and redo to this step.
+    To(StepId),
+}
+
 /// One step of an undo walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Move {

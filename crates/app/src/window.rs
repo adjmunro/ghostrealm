@@ -2036,6 +2036,12 @@ impl State {
                     self.app.close_surface_id(sid);
                 }
                 Request::CloseDoc(doc) => self.app.close_doc_of(sid, doc),
+                Request::FileHistory(walk) => {
+                    if self.app.walk_file_history(sid, walk) {
+                        self.dirty = true;
+                        self.window.request_redraw();
+                    }
+                }
                 Request::FileMenu { target, at, align } => self.open_file_menu(sid, target, at, align),
                 Request::Menu { items, at, align } => self.open_view_menu(sid, items, at, align),
             }

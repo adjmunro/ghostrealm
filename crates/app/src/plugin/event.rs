@@ -131,6 +131,9 @@ pub enum Request {
     },
     /// Remove the toast keyed `key`, if any (what it reported is over).
     DismissToast { key: String },
+    /// Undo, redo or walk the file history of the view's workspace (a file
+    /// sidebar's Cmd+Z, or its undo panel).
+    FileHistory(crate::file_history::Walk),
 }
 
 /// A button on a view's toast ([`Request::Toast`]). The app runs it, so the

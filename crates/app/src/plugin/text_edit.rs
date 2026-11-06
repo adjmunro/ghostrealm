@@ -553,6 +553,16 @@ impl LineEdit {
         self.anchor = None;
     }
 
+    /// Whether undo has a step to go back to.
+    pub fn can_undo(&self) -> bool {
+        !self.history.undo.is_empty()
+    }
+
+    /// Whether redo has a step to go forward to.
+    pub fn can_redo(&self) -> bool {
+        !self.history.redo.is_empty()
+    }
+
     fn snapshot(&self) -> LineSnapshot {
         LineSnapshot { text: self.text.clone(), cursor: self.cursor, anchor: self.anchor }
     }

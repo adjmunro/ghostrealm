@@ -1785,6 +1785,9 @@ impl AppState {
                 Request::OpenFile(path) => {
                     let _ = self.open_file_from(sid, &path);
                 }
+                Request::FileHistory(walk) => {
+                    self.walk_file_history(sid, walk);
+                }
                 _ => {}
             }
         }

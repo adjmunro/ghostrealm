@@ -30,7 +30,8 @@ use ghostrealm_terminal::{Key, KeyPress};
 use crate::app_state::AppState;
 use crate::file_menu::{FileTarget, Kind as TargetKind, Origin};
 use crate::plugin::icons::{FileKind, Icon};
-use crate::plugin::text_edit::{Applied, LineEdit};
+use crate::file_history::Walk;
+use crate::plugin::text_edit::{self, Applied, Edit, LineEdit};
 use crate::plugin::{
     rect_contains, theme, widgets, widgets::FieldMouse, EventCx, Font, MenuAlign, MouseEvent, OpenCx, PaintCx, Plugin,
     MenuItem, Request, UiMetrics, View, Waker,
@@ -362,6 +363,19 @@ impl FileBrowserView {
     pub fn select_listed(&mut self, path: &Path) {
         if self.tree.query().is_empty() && self.tree.rows().iter().any(|r| !r.is_category && r.path == path) {
             self.chosen = Some(path.to_path_buf());
+        }
+    }
+
+    /// The file-history step a sidebar's undo or redo chord asks for: only
+    /// while the filter is empty and has nothing of its own to undo or redo.
+    fn file_undo_key(&self, k: &KeyPress) -> Option<Walk> {
+        if self.mode != Mode::Sidebar || !self.input.is_empty() {
+            return None;
+        }
+        match text_edit::edit_for(k)? {
+            Edit::Undo if !self.input.can_undo() => Some(Walk::Undo),
+            Edit::Redo if !self.input.can_redo() => Some(Walk::Redo),
+            _ => None,
         }
     }
 
@@ -1007,6 +1021,11 @@ impl View for FileBrowserView {
         self.settle_error();
         if self.mode == Mode::Save {
             return self.save_key(cx, k);
+        }
+        if let Some(walk) = self.file_undo_key(k) {
+            cx.request(Request::FileHistory(walk));
+            cx.redraw();
+            return true;
         }
         if self.searching() {
             if let Some(used) = self.search_key(cx, k) {
@@ -1714,6 +1733,29 @@ mod tests {
             ghostrealm_terminal::Mods { ctrl: true, ..Default::default() }
         };
         KeyPress { key: Key::Char('z'), mods, text: None }
+    }
+
+    #[test]
+    fn the_sidebar_undo_chord_walks_the_file_history_only_when_the_filter_has_nothing_to_undo() {
+        let (_d, mut v) = fixture();
+        let h = Harness::new();
+        let walks = |out: crate::plugin::Outcome| -> Vec<Walk> {
+            out.requests.into_iter().filter_map(|r| if let Request::FileHistory(w) = r { Some(w) } else { None }).collect()
+        };
+        let mut redo = undo_key();
+        redo.mods.shift = true;
+        let (used, out) = h.key(&mut v, undo_key());
+        assert!(used);
+        assert_eq!(walks(out), [Walk::Undo]);
+        assert_eq!(walks(h.key(&mut v, redo.clone()).1), [Walk::Redo]);
+        h.key(&mut v, press(Key::Char('b')));
+        assert!(walks(h.key(&mut v, undo_key()).1).is_empty(), "with text, undo edits the filter");
+        assert_eq!(v.tree().query(), "");
+        assert!(walks(h.key(&mut v, redo).1).is_empty(), "the empty filter can redo its own edit");
+        assert_eq!(v.tree().query(), "b");
+        h.key(&mut v, press(Key::Backspace));
+        assert!(walks(h.key(&mut v, undo_key()).1).is_empty(), "the empty filter can undo its own edit");
+        assert_eq!(v.tree().query(), "b");
     }
 
     #[test]

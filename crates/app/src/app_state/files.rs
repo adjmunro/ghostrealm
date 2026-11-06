@@ -564,7 +564,7 @@ impl AppState {
 
     /// The documents showing `path` or something in it with unsaved changes
     /// (none when closing doesn't ask about them).
-    fn unsaved_under(&self, path: &Path) -> Vec<DocRef> {
+    pub(super) fn unsaved_under(&self, path: &Path) -> Vec<DocRef> {
         if !self.guard_unsaved {
             return Vec::new();
         }
