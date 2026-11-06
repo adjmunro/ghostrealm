@@ -292,7 +292,10 @@
 - Requires: NO BLOCKERS
 - Detail: DONE: editor undo is a tree of changes per open file, shared by
   its views (see DECISION.md, item 14 parts 1–2). Single-line fields
-  (`LineEdit`) have linear undo. REMAINING: the undo panel (item 14 part 4).
+  (`LineEdit`) have linear undo. The editor has an undo panel
+  (`plugins::editor::undo_panel`, item 14 part 4); not yet checked at a
+  desktop. REMAINING: the file browser's undo panel, with file-operation undo
+  (item 14 part 3).
   Editor follow-ups: (a) every view keeps its own copy of the text and the
   file's shared document keeps one more, so one open file holds two copies;
   (b) a view syncs with the others at input, paint and refresh only, so a
@@ -312,12 +315,12 @@
   the first registered (disk stamps still raise a conflict before one
   overwrites the other); (f) a reload whose change exceeds the 64 MB history
   cap is one step past the cap, so the next keystroke prunes all history,
-  the reload step included; (g) for the part-4 panel: `history()` returns a
-  `Ref` into the shared document, so holding it across a call into another
-  view of the same file panics on `borrow_mut`; (h) nit: in `reload()`
-  (crates/app/src/plugins/editor/buffer.rs, ~line 1086) the comment "The next
-  edit starts a step, whether the reload changed the text or only made the
-  current step the saved one" sits above the first `open = None`. In the
+  the reload step included; (g) `history()` returns a `Ref` into the shared
+  document, so holding it across a call into another view of the same file
+  panics on `borrow_mut` (the undo panel drops it before `goto`); (h) nit:
+  in `reload()` (crates/app/src/plugins/editor/buffer.rs, ~line 1086) the
+  comment "The next edit starts a step, whether the reload changed the text
+  or only made the current step the saved one" sits above the first `open = None`. In the
   changed-text case it is the second reset, after the splice, that makes it
   true. Move the comment or say so; (i) after `prune`, the step that becomes
   the root has its changes cleared, so a view at (that step, k>0) no longer

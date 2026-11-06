@@ -284,6 +284,14 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   top of the next; `reveal` (a search match) leaves Preview for Integrated,
   where a selection shows. `text` (the agent's) is the buffer whatever the
   mode.
+- Undo panel (`plugins::editor::undo_panel`): an `EditorView` toggles it
+  (`toggle_undo_panel`, the `⋯` menu, `editor.toggle_undo_history`, bound
+  to `cmd+shift+u` in a new config file); it takes the right of the body,
+  in every mode. `Graph::of` lays out the
+  buffer's `history()` as rows, newest first, and lanes; the panel rebuilds
+  it when the tree's root, current or saved step, or step count changes.
+  Row `i` is button `BTN_UNDO + i`; a row clicked or reached with the keys
+  calls `EditorBuffer::goto`, after the `history()` borrow ends.
 - Preview (`plugins::editor::md_preview`): the buffer rendered read-only,
   unsaved edits included. `parse` turns Markdown (pulldown-cmark:
   CommonMark, GFM tables, task lists, strikethrough) into a flat list of
