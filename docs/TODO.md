@@ -337,7 +337,21 @@
   compile-time check ties the history's most steps to the `1 << 28` row
   ids (`BTN_UNDO`, editor/mod.rs). Direction: assert
   `HISTORY_BYTES / NODE_BYTES < 1 << 28` in mod.rs's existing const assert,
-  making one of them `pub(super)`.
+  making one of them `pub(super)`; (c) `merged` (undo_panel.rs ~154-172)
+  reads "2 changes" for a typing step that ends in an auto-closed bracket
+  pair followed by a non-word character (`print("`, `if (!`, `foo((`, `({`,
+  `f(&`). `insert_typed` records `(` and `)` as two ops that merge into
+  `+()`; the next character lands inside that text, so it does not merge.
+  Direction: also merge a pure insert whose `at` falls inside the merged
+  insert's span on the same row, splicing it in at the char offset; add
+  `print("` and `((` test cases; (d) `label` (undo_panel.rs ~139, ~156-158)
+  clones every op's text on every visible row each paint via `merged()`,
+  including single-op steps. A select-all paste on a large file copies both
+  whole strings per repaint to show `LABEL_CHARS` chars. Direction: return
+  early for one-op steps without cloning, or merge into a struct holding
+  `at`, lengths and a `LABEL_CHARS`-long prefix; (e) nit: the `merged` doc
+  comment (~148-152) should say a typing step never holds a delete
+  (`Run::takes` closes the step), which keeps `merged` simple.
   `LineEdit` follow-ups: (a) `Edit::Insert` / `Edit::Paste` return `Changed`
   when the control-char filter leaves nothing and there is no selection (e.g.
   pasting only `\u{1b}`), pushing a no-op undo step and clearing redo; (b) no
