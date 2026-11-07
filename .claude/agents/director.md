@@ -51,6 +51,7 @@ Track each agent: id, role, model, start time, tokens from its latest report.
 
 - No agent context above 300,000 tokens; `haiku` above 100,000. Before a follow-up would cross that, get a handoff note (state, branch, open items) and give it to a fresh agent.
 - Don't resume an agent started more than an hour ago; hand off to a fresh one.
+- A plan-only 🔨 Code Implementer over about 150,000 tokens: give the implementation to a fresh implementer starting from the plan doc, not a follow-up.
 - Otherwise, follow-ups on the same work go to the same agent (`SendMessage`): its context is cached, which costs less than a fresh agent re-reading files. Reviews of fixes still go to a fresh reviewer.
 - Subagents nest at most three layers below the main session (director → department director → worker → helper).
 

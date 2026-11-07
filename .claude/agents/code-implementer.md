@@ -3,6 +3,7 @@ name: code-implementer
 description: 🔨 Code Implementer. Plans and implements one unit of work in a single context, commits it on a branch, and reports. Can stop after the plan for review.
 model: opus
 effort: high
+disallowedTools: mcp__ccd_turn__update_plan, mcp__ccd_turn__wrap_up
 autoCompactWindow: 300000
 color: green
 experimental:
@@ -25,8 +26,10 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 
 ## Implement
 
-- Branch from the base in the brief, per `docs/GIT.md`. Commit as you go and push your branch. Never move `develop`.
+- Branch from the base in the brief, per `docs/GIT.md`. Never move `develop`. Push after each commit and before starting a long build or check. Record deviations and open items in commit bodies or the plan doc as they arise, so a cut-off run loses only the report.
+- Edit source with Edit/Write. Worktree isolation refuses `python3 - <<EOF` and multi-line `sed -i` edits as unverifiable, and line-number `sed` deletes drift after earlier edits.
 - Write and run the tests that cover what you changed, including a test per deletion guard outside `target/` that drives it to fail and asserts the file is kept.
+- Drive view tests the way the host does. A press on a painted button reaches the view only as `Harness::button(id)`: `arm_button()` in `crates/app/src/window.rs` claims presses on buttons, while `Harness::mouse` hands any event straight to `View::mouse`. Build state through realistic input (whole words, Backspace runs, typing over a selection, auto-closed brackets), not hand-built single-char steps.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
 - If you near 300,000 tokens of context, or the work grows well beyond the brief or 50% over the plan's size, stop and report with a handoff note.
