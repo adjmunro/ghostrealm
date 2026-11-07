@@ -346,7 +346,8 @@ impl Image {
     pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Arc<Image> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "RGBA8 size");
-        for px in rgba.chunks_exact_mut(4) {
+        // The assert above makes the length a multiple of 4, so the remainder is empty.
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             let a = px[3];
             if a != 255 {
