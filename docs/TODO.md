@@ -1574,8 +1574,21 @@
 
 ---
 
-[2026-11-07@d3290fb]
+[2026-11-07T15:40+1300@d3290fb]
 
 - Requires: NO BLOCKERS
 - Detail: Make `Harness::mouse` (`crates/app/src/plugin/testing.rs`) mimic `arm_button` (`crates/app/src/window.rs`): a Down on a registered button rect arms it and the matching Up calls `button()` instead of `View::mouse`.
 - Reason: tests that click a painted button through `Harness::mouse` reach `View::mouse`, which the real app never does for a button press, so they pass on bugs the app shows (the undo panel click bug).
+
+---
+
+[2026-11-07T15:55+1300@e024bbb]
+
+- Requires: NO BLOCKERS
+- Detail: `disallowedTools` in `.claude/agents/code-implementer.md` (`mcp__ccd_turn__update_plan`, `mcp__ccd_turn__wrap_up`) also applies when the owner runs the role as the main session (`claude --agent code-implementer` or `agent` in `settings.local.json`; `.claude/agents/README.md` "Taking a role"), hiding the desktop app's task list and next-step box. Direction: accept it and say so in the README, or enforce it in prose for the subagent case only.
+- Detail: nit: `.claude/agents/code-implementer.md` Implement, view-test bullet: in the app the view sees `View::button` (`arm_button` claims the press); `Harness::button(id)` is how a test sends it. Separate the two.
+- Detail: nit: `.claude/agents/code-implementer.md` Implement, Edit/Write bullet names worktree isolation as what refuses heredoc and multi-line `sed -i` edits. Unconfirmed by the review; the recording run saw worktree isolation refuse a compound heredoc command ("too complex to verify that it stays inside the worktree"). Confirm the wording or say "are refused".
+- Detail: nit: `crates/app/src/window.rs:504` comment "A close button arms on press" is too narrow: `arm_button` covers every button kind.
+- Detail: nit: this file's Instructions say "This files is"; make it "This file is".
+- Detail: `crates/app/src/plugin/paint.rs` ~350: `as_chunks_mut::<4>().0` drops a remainder silently; a `debug_assert!(rest.is_empty())` would catch a later edit that relaxes the length assert above it. Low value.
+- Reason: non-blocking findings and nits from the reviews of the role lessons branch and the paint.rs clippy fix, recorded rather than fixed.
