@@ -546,6 +546,20 @@ mod tests {
         assert_eq!(read(&d.join("b.md")), "B");
     }
 
+    #[test]
+    fn a_redo_of_a_create_whose_entry_is_back_in_place_takes_the_step_without_acting() {
+        let mut f = fx("redo-done");
+        let d = f.d.to_path_buf();
+        f.s.new_entry(&d, "src", true).unwrap();
+        f.go(Walk::Undo);
+        // Put back by hand (Finder's Put Back, say).
+        std::fs::rename(f.trash.join("src"), d.join("src")).unwrap();
+        assert!(f.go(Walk::Redo));
+        assert_eq!(trail(&mut f.s, f.vt), ["Start", "New folder src"]);
+        assert_eq!(f.calls.borrow().len(), 1, "only the undo trashed anything");
+        assert!(d.join("src").is_dir());
+    }
+
     // Each check refuses and keeps the data.
 
     #[test]

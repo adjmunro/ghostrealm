@@ -132,8 +132,9 @@ impl FileOp {
     /// What redoing it does, or why it can't.
     pub fn redo_act(&self) -> Result<Act, String> {
         match self {
-            FileOp::Create { path, fresh, .. } => match entry(path)? {
+            FileOp::Create { path, id, fresh } => match entry(path)? {
                 None => Ok(Act::Create { path: path.clone(), folder: fresh.is_none() }),
+                Some(now) if *id == Some(now) => Ok(Act::Done),
                 Some(_) => Err(format!("{} already exists", name(path))),
             },
             FileOp::Rename { from, to, id, .. } => rename_act(from, to, *id),
