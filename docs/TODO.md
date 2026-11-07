@@ -1555,8 +1555,6 @@
 
 ---
 
----
-
 [2026-11-07T12:33+1300@aff740a]
 
 - Requires: NO BLOCKERS
@@ -1567,4 +1565,9 @@
 - Detail: Finder writes `.DS_Store` into a folder it shows, so an undone "New folder" viewed in Finder isn't empty and refuses.
 - Detail: Agents' file operations land in the user's per-workspace tree once item 3 (per-workspace agent scope) is built; decide whether they show there.
 - Detail: SMB, exFAT and some FUSE volumes lack an atomic no-replace rename, so every undo there refuses with "this volume can't rename without risking what is in the way"; name the volume kind in the toast.
-- Reason: follow-ups from the file-operation undo plan's review, recorded rather than built.
+- Detail: `fresh: None` means both "a folder" and "a file whose metadata couldn't be read" (`file_history.rs` `FileOp::Create`, `label`, `redo_act`; `app_state/file_undo.rs` where a create is recorded): after a failed metadata read on a Create redo the label becomes "New folder X", and if the file is then removed outside the app a later redo creates a folder. No data lost. Store is-folder separately.
+- Detail: `trash_now` (`app_state/files.rs`) returns `Ok(at.zip(id))`, dropping the Trash location when `Id::of` fails though the Trash reported it; a later undo can't name it or suggest Put Back. Return `(Option<PathBuf>, Option<Id>)`.
+- Detail: The file sidebar's history `Rc` is bound at `insert_view`, while walks look up the workspace from the surface; they'd diverge if surfaces could move between workspaces (`move_surface` stays within one).
+- Detail: An undo panel (sidebar or editor) can keep the keys after focus leaves for another surface and returns, so Up/Down walk the history instead of the list or text.
+- Detail: Flaky: `crates/app/tests/web_host_build.rs` `artifact_lock::only_a_held_artifact_lock_is_this_builds` passed once and failed once with no code change.
+- Reason: follow-ups from the file-operation undo plan's review and the branch review, recorded rather than built.

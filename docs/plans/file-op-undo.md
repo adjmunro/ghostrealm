@@ -196,7 +196,9 @@ exclusively back to the `Path=` in `info/<name>.trashinfo`, then remove that
 `.trashinfo` only after the rename succeeds. That goes in the existing TODO
 bullet "Delete on other platforms". The non-macOS `cfg` changes are
 compile-checked with the build skill's scratchpad `target_os` swap. Rename
-and move undo use `cfg(unix)` code shared with macOS and are run-tested here.
+and move undo use `cfg(unix)` code shared with macOS and are run-tested here,
+except the Linux `renameat2` branch of `rename_exclusive`, which is
+compile-checked only.
 
 ## The tree
 
