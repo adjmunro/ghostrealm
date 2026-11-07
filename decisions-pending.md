@@ -19,7 +19,7 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 21. **Web preload / prerender default**: off, connect, or prerender?
 22. **Comment mode storage**: where do comment threads live?
 23. **GIT.md "committing is pre-authorised"**: is this intended?
-24. **Recording review findings**: may the director write `record` findings into `docs/TODO.md` itself, and may docs-only fix commits skip the delta review?
+24. **Recording review findings**: may the director write `record` findings into `docs/TODO.md` itself, and may notes-only fix commits skip the delta review?
 
 ---
 
@@ -564,11 +564,11 @@ Agents read comments through the agent channel, within item 3's scope.
 - `docs/GIT.md` says fixes get a fresh delta review. The director's eight lines of owner notes went through four agents: rebase, review (which found a stale branch reference and a wrong example), fix, delta review.
 
 **Options:**
-- **A. Director records findings.** The director appends an approved review's `record` findings and nits to `docs/TODO.md` and commits and pushes them. These commits already need no review (`docs/GIT.md`).
+- **A. Director records findings.** The director appends an approved review's `record` findings, and nits from a branch's last review, to `docs/TODO.md` and commits and pushes them (`docs/GIT.md` already exempts such commits from review). Needs a change to `.claude/agents/director.md`, which today allows only its `decisions-pending.md` entries. Which findings get copied, and how, is then the director's unreviewed judgement.
 - **B. No delta review for notes-only fixes.** A commit that touches only `decisions-pending.md` or `docs/TODO.md` and only applies an approved review's findings counts as approved.
 - **C. Neither.** Keep today's rules.
 
-**Recommendation:** A. It removes the tiny-agent chain without touching what reaches `develop` unreviewed. B saves less and lets an unchecked edit land.
+**Recommendation:** A. It removes the tiny-agent chain at the cost of a director role change; recording commits already land unreviewed today, only the author changes. B saves less and lets an unchecked edit land.
 
 **Your answer:**
 >
