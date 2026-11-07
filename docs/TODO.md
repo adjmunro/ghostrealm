@@ -1571,3 +1571,11 @@
 - Detail: An undo panel (sidebar or editor) can keep the keys after focus leaves for another surface and returns, so Up/Down walk the history instead of the list or text.
 - Detail: Flaky: `crates/app/tests/web_host_build.rs` `artifact_lock::only_a_held_artifact_lock_is_this_builds` passed once and failed once with no code change.
 - Reason: follow-ups from the file-operation undo plan's review and the branch review, recorded rather than built.
+
+---
+
+[2026-11-07@d3290fb]
+
+- Requires: NO BLOCKERS
+- Detail: Make `Harness::mouse` (`crates/app/src/plugin/testing.rs`) mimic `arm_button` (`crates/app/src/window.rs`): a Down on a registered button rect arms it and the matching Up calls `button()` instead of `View::mouse`.
+- Reason: tests that click a painted button through `Harness::mouse` reach `View::mouse`, which the real app never does for a button press, so they pass on bugs the app shows (the undo panel click bug).
