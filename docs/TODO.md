@@ -662,12 +662,15 @@
 [2026-10-05@93248d9] Agent channel → the running app (+ MCP server)
 
 - Requires: NO BLOCKERS
-- Detail: `ghostrealm agent` runs its own headless AppState; it cannot see or drive
-  the panes in an open window. Serve the same protocol from the running app over a
-  local socket (per-window path, exported to child shells as an env var), and wrap
-  it as an MCP server (stdio shim that connects to that socket) so an agent in a
-  terminal tab controls *this* window's workspaces, terminals, and web panes.
-  Scope agent access per the existing "hide from agent" idea.
+- Detail: the window serves the protocol over its socket, scoped per workspace
+  (DECISION.md, Agents / security; decisions-pending.md item 3). Left: an MCP
+  server (a stdio shim over that socket); the per-workspace standing grant and
+  approval prompts (until then `workspace.new` and every other workspace are out
+  of reach); agent web profiles, agent-opened browsers and login handover (then
+  `web.*` gets a class that checks the page's profile); a config "hide from
+  agent" list; binding each connection to the client's process ancestry
+  (`LOCAL_PEERPID` / `SO_PEERCRED`, then the parent chain up to a workspace
+  shell), which closes the borrowed-token gap (decisions-pending.md).
 - Web profiles, proposal (a consequence of the profile lock, not an owner
   decision): Chromium locks a profile to one process, so the web host would be
   owned by the running app and agents would connect through this socket instead
@@ -690,7 +693,8 @@
 
 [2026-10-05@93248d9] Agent screenshot command
 
-- Requires: agent channel → running app (for terminal/chrome captures)
+- Requires: NO BLOCKERS (the window's agent channel is in; a workspace's agent
+  may capture only what it reaches, so no chrome and no web pages)
 - Detail: `get what=screenshot` (surface id, or the whole window) returning a PNG
   (base64; an MCP image result). Web surfaces can encode their latest shared frame
   directly; terminals/chrome need an offscreen render of the scene.
@@ -1251,8 +1255,8 @@
 
 [2026-10-23T18:52+1300@cfbb8bc1] Web — revisit the person/agent pop-up rule if agents drive the GUI
 
-- Requires: the agent channel moving into the running app (agent.rs; TODO.md
-  "Agent channel → the running app")
+- Requires: agent web profiles (TODO.md "Agent channel → the running app"): a
+  workspace's agent in the window reaches no web page yet
 - Detail: A pop-up is a person's when a press or key reached its opener in
   the last 5 s (DECISION.md, Web surface / pop-ups). Today agents drive only
   the headless `ghostrealm agent`, where no person input arrives. Once they
@@ -1592,3 +1596,14 @@
 - Detail: nit: this file's Instructions say "This files is"; make it "This file is".
 - Detail: `crates/app/src/plugin/paint.rs` ~350: `as_chunks_mut::<4>().0` drops a remainder silently; a `debug_assert!(rest.is_empty())` would catch a later edit that relaxes the length assert above it. Low value.
 - Reason: non-blocking findings and nits from the reviews of the role lessons branch and the paint.rs clippy fix, recorded rather than fixed.
+
+---
+
+[2026-11-11T21:49+1300@219d5f58] Agent socket — findings recorded from the review
+
+- Requires: NO BLOCKERS
+- Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. Find the settings workspace by something an agent can't set.
+- Detail: a connection that never sends its `hello` holds one of the 32 slots until the window closes. Give the first line a read timeout.
+- Detail: `input` replies before its bytes reach the terminal, so an agent sending input faster than the shell reads it grows the terminal's input queue without bound. Bound the queue, or reply once the bytes are written.
+- Detail: `file.delete` under a workspace's agent refuses a path with a document open in another workspace, checked when the command runs. A delete that first asks (an untracked file) or waits for its git check closes the documents open under the path when it goes ahead, so a document another workspace opened in between is closed too. Check again before the delete goes ahead.
+- Reason: review findings on the live agent channel (feat/agent-channel-live), recorded rather than fixed in that increment.

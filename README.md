@@ -13,7 +13,7 @@ builds the bundled `libghostty-vt` from source on first build (~2 min, cached).
 
 ```bash
 mise exec -- cargo run            # open the window
-mise exec -- cargo run -- agent   # JSON agent channel on stdin/stdout
+mise exec -- cargo run -- agent --headless   # JSON agent channel on stdin/stdout
 mise exec -- cargo run -- dump 'ls -la /'   # headless: print a grid as text
 mise exec -- cargo test           # 44 tests
 ```
@@ -118,6 +118,24 @@ line — over the same command registry the palette and keybindings use:
 {"op":"get","what":"surface","id":3}       # a surface's grid as text
 {"op":"input","text":"ls\r","id":3}        # type into a surface
 ```
+
+In a window's terminal, `ghostrealm agent` relays to that window as the
+terminal's workspace. The window serves a Unix socket in a directory only your
+user can enter, and gives each terminal two variables: `GHOSTREALM_AGENT_SOCKET`
+(the socket) and `GHOSTREALM_AGENT_TOKEN` (its workspace's token, revoked when
+the workspace closes), which every process started there inherits. A
+workspace's agent reaches its own workspace's terminals and Files surfaces and
+the commands open to it (`help` lists them); never web pages, other workspaces,
+pickers or your desktop. If the socket can't be reached, `ghostrealm agent`
+exits 1.
+
+`ghostrealm agent --headless [cmd…]`, or `ghostrealm agent` outside a window,
+runs a headless app of its own, whose first terminal runs `cmd`; everything in
+it is the agent's. Its web pages use their own profile
+(`<cache>/ghostrealm/web-agent`), not yours.
+
+An agent that runs its commands in a sandbox needs connecting to Unix sockets
+allowed to reach the window.
 
 ## Layout
 

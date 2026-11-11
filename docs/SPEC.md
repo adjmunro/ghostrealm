@@ -52,6 +52,17 @@ crates/web-host    (bin "ghostrealm-web-host") CEF off-screen browser process; n
   views paint immediate-mode through `PaintCx` and take input through `EventCx`.
   Contract: [PLUGINS.md](PLUGINS.md).
 
+- **The agent channel is one protocol on two channels.** `ghostrealm agent
+  --headless` builds an app of its own and serves stdin/stdout. The window binds a
+  Unix socket (`agent/socket.rs`) before its first terminal and gives each
+  terminal the socket and its workspace's token in its environment; `ghostrealm
+  agent` there relays to it (`agent/client.rs`). An accept thread and a thread per
+  connection hand request lines to the UI thread through a channel and a
+  `UserEvent`; the UI thread serves them within a time budget and does no socket
+  I/O. A command that starts file jobs replies once they finish. Every request
+  passes `agent::serve`, which decides what a workspace's token reaches
+  ([DECISION.md](DECISION.md)).
+
 ## Rendering model (current)
 
 Per frame: every view is pumped (a terminal checks its VT worker's published
@@ -109,7 +120,9 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 
 - [x] Phase 1: libghostty verification + backend + window spike.
 - [x] Phase 2: command registry + tab/split tree + command palette (Cmd+K).
-- [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON).
+- [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON):
+      headless, and live in the window, scoped to the terminal's workspace.
+      To do: the MCP shim, the standing grant, agent web profiles (TODO.md).
 - [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
 - [~] Phase 5: inbox status — background output → unread, sticky needs_input

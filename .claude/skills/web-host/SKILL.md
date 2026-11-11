@@ -8,4 +8,4 @@ description: Use when building, bundling, testing or driving the CEF web host (c
 - The host is not a default workspace member. Its unit tests (`browser.rs`): `cargo test -p ghostrealm-web-host --features bundle --target-dir target/web-host`, which reuses the nested build's CEF; without those flags Cargo builds a second CEF in `target/`.
 - `cargo test -p ghostrealm-web` doesn't build the app, so it doesn't refresh the bundle: it tests whatever the last app build placed. Run `cargo build` first after changing the host.
 - The real-host tests (`crates/web/tests`, the app's `real_host`) skip unless the bundle exists, and when `GHOSTREALM_NO_WEB` is set.
-- The host runs headless, so web behaviour is verifiable without a GUI: drive it with `ghostrealm agent` (`web.new`, `web.eval`, `get surface`) or the host test.
+- The host runs headless, so web behaviour is verifiable without a GUI: drive it with `ghostrealm agent --headless` (`web.new`, `web.eval`, `get surface`) or the host test. Its pages use the profile `<cache>/ghostrealm/web-agent` unless `GHOSTREALM_WEB_CACHE` is set; a window's agent reaches no web pages.

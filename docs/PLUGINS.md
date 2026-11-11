@@ -57,9 +57,15 @@ should be too. The API lives in
   every other hook defaults to "not interested". Views live in
   `AppState::views` (headless-safe: the agent channel and tests drive them with no
   window).
+  `agent_reachable` (default `false`) opts the view in to a workspace's agent
+  in the window: only then can that agent see it in `get tree`, read it, type
+  into it, or close the pane holding it. Terminals and Files surfaces opt in;
+  web pages don't (they are on the person's profile). A new surface kind is out
+  of reach until its view opts in.
 - **Hidden surfaces**: a surface in `AppState::views` but in no pane: never
   painted, shown, or focused, still reached by commands and `get surface`
-  by id, listed last by `get tree`. A web pop-up an agent opened is one;
+  by id, listed last by `get tree` (on the headless channel; a workspace's
+  agent sees none, as they are in no workspace). A web pop-up an agent opened is one;
   it goes when its page closes or its opener's surface does. Each pump
   `AppState::adopt_popups` places what `WebView::take_opened` returns:
   hidden surfaces, and a person's new tabs (right after the opener's tab).

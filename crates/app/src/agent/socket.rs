@@ -181,7 +181,7 @@ impl Server {
         self.parked.len() != before
     }
 
-    /// Stop serving: the accept thread ends within [`POLL`], every
+    /// Stop serving: the accept thread ends within a quarter second, every
     /// connection is shut down, and the socket file is removed if it is still
     /// the one bound. No thread is joined: one may be blocked on a client.
     /// AppKit's terminate may exit without dropping the window, so the window

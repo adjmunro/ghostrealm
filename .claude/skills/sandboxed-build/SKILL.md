@@ -10,3 +10,4 @@ With the sandbox on, PTY, GPU, local-port and CEF-host tests fail and the build 
 - `CARGO_HOME` and `ZIG_GLOBAL_CACHE_DIR` under `$TMPDIR`.
 - `CARGO_NET_GIT_FETCH_WITH_CLI=true` and `GIT_CONFIG_GLOBAL=/dev/null`.
 - `GHOSTTY_SOURCE_DIR` set to the extracted pinned Ghostty source, its Zig dependencies `zig fetch`ed, and `xcrun`/`mktemp` in its `src/build/libsystem_override.sh` kept off the per-user temp dir.
+- `ghostrealm agent` in a window's terminal connects to the window's Unix socket (`$GHOSTREALM_AGENT_SOCKET`): the sandbox must allow connecting to Unix sockets, or it exits 1 unable to reach it.

@@ -20,6 +20,7 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 22. **Comment mode storage**: where do comment threads live?
 23. **GIT.md "committing is pre-authorised"**: is this intended?
 24. **Recording review findings**: may the director write `record` findings into `docs/TODO.md` itself, and may notes-only fix commits skip the delta review?
+25. **Borrowed agent tokens**: accept that a same-user process can borrow a workspace's token from a shell's environment, or bind each connection to its process ancestry?
 
 ---
 
@@ -65,6 +66,8 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 > **Profile access lives on the profile.** Which workspaces can use a profile, and whether it's human-only or human+agent, are profile settings (see item 4).
 >
 > **Open risk / follow-up:** CEF stores cookies and logins on disk, readable by any same-user process (including an agent's shell). Check whether CEF uses Keychain-backed cookie encryption on macOS. Explore app-managed encryption at rest, one key per profile (not per workspace) held in the Keychain so only Ghost Realm can unlock it.
+
+**Built:** the first increment, on branch `feat/agent-channel-live`: the window serves the agent channel over a per-window socket; each workspace's terminals get a token bound to it, and an agent there reaches only that workspace's terminals and Files surfaces and the commands classified for it, refused by default; no web page is reachable (DECISION.md, Agents / security). Left: the standing-grant toggle and approval prompts, agent web profiles and login handover, the MCP shim, a config "hide from agent" list, screenshots, cookie encryption at rest, and binding connections to the client's process ancestry (item 25).
 
 ---
 
@@ -575,9 +578,43 @@ Agents read comments through the agent channel, within item 3's scope.
 
 ---
 
+## 25. Borrowed agent tokens
+
+**Source:** item 3, first increment (branch `feat/agent-channel-live`); DECISION.md, Agents / security
+
+**What's being decided:** whether a same-user process outside a workspace may gain that workspace's agent reach by reading a token from a shell's environment.
+
+**Background:**
+- Each workspace's terminals hold its token in `GHOSTREALM_AGENT_TOKEN`, so every process started there inherits it, and a descendant keeps it (a tmux server started in one workspace and attached from another, say).
+- Linux: any process running as you can read another's environment from `/proc/<pid>/environ`, so any of your processes can borrow a token.
+- macOS: item 3's background said reading another process's environment is restricted. That is unverified: a probe from the agent sandbox (`ps -wwE`) showed no environment, which the sandbox may explain. It needs a check at a desktop (below).
+- A borrowed token reaches only that workspace: its terminals and Files surfaces and the commands open to agents, never web pages.
+
+**Options:**
+- **A. Accept and document.** The boundary holds against an agent that doesn't go looking, not against a same-user process that does.
+  - Pros: nothing to build.
+  - Cons: on Linux, any of your processes can drive any workspace's terminals.
+- **B. Bind each connection to the client's process ancestry.** On `hello`, the app reads the client's pid from the socket (`LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux) and walks its parent chain up to a shell of that workspace; otherwise it refuses. What a client sends doesn't change.
+  - Pros: a token is useless outside its workspace's process tree.
+  - Cons: a process reparented to launchd or init (a daemonised server, `nohup … &` after its shell exits) loses access; pid reuse needs care.
+  - Effort: small to medium.
+
+**Recommendation:** B, as the next increment of item 3. Until then A holds, and is documented in DECISION.md.
+
+**Your answer:**
+>
+
+---
+
 ## Decisions I'd take by default unless you object
 
 Each line gives the item and the default that will be applied if you don't veto it.
+
+**Agents** (item 3, first increment; branch `feat/agent-channel-live`)
+- **Commands closed to a workspace's agent:** every `web.*` command (pages are on your profile); `workspace.new` and `workspace.close` (outside its workspace, or closing your pages in it); pickers (`workspace.pick_dir`, `editor.save_as`, `file.save_copy_as`, and `editor.open` with no path); `toast.dismiss`; the file clipboard (`file.cut`, `file.copy`, `file.paste`); and your desktop (`file.copy_path`, `file.copy_relative_path`, `file.reveal`, `file.open_default`). A command nobody classified is closed too. Alternative: open any of these; each is a one-line change.
+- **A dead socket:** `ghostrealm agent` in a window's terminal exits 1 when the socket can't be reached, with no fallback. `--headless` runs a headless app on request. Alternative: fall back to headless, which lets an agent drive a copy believing it drives the window.
+- **Exited terminals follow `close_on_exit`** in the window, so an agent can't read a terminal that closed itself (headless keeps them). Alternative: keep them for agents, which changes what you see.
+- **An agent's question is yours to answer:** a command that asks (Close with unsaved changes, Delete of an untracked file) shows the question naming the workspace, marked late (keys ignored for a moment, Enter cancels); one that would replace a question already open is refused. Alternative: refuse such commands, which removes closing and deleting from agents.
 
 **Web**
 - **Pages an agent drives stay visible to Chromium** (`docs/DECISION.md`, Web pop-ups; built in 8af2376): agent-owned pages, including hidden pop-ups and pages created off screen, report themselves visible to Chromium (as headless Chrome and Puppeteer do), at 10 fps while nobody sees them; a person's background tabs stay hidden. Alternatives: show a page only while an eval runs (pages see `visibilitychange` around each eval), or wait longer for hidden pages (blocks the UI thread up to 30 s).
@@ -660,6 +697,8 @@ These can't be verified in the headless sandbox:
 - **Editor undo panel:** on `develop`, open it from an editor's `⋯` menu ("Undo history") or Cmd+Shift+U (add `cmd+shift+u = "editor.toggle_undo_history"` to an existing `config.toml`; only new configs get it). Type, undo, type again to make a branch. Check the lanes, dots, diagonal branch edges, the "saved" tag, the focus border and close icon; whether newest-at-top reads well; that clicking a row and Up/Down walk the history; and that Cmd+Shift+U clashes with nothing in macOS.
 - **File browser undo:** on `develop`, in a file sidebar create, rename, move (cut/paste) and Delete (Trash) a few scratch files, then Cmd+Z / Cmd+Shift+Z with the filter empty, and open the sidebar's undo panel with Cmd+Shift+U while the sidebar has the keys. Check the panel at the sidebar's bottom (top edge line, rows, "Restore" on a Trash row restoring out of order), the toast naming each step undone or redone, a refusal toast after changing a file in Finder, and that a trashed file comes back from `~/.Trash`.
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
+- **Agent channel in the window:** on branch `feat/agent-channel-live`, open two workspaces with a terminal each. In one, run `ghostrealm agent` and send `{"op":"get","what":"tree"}`, `{"op":"input","text":"echo hi\r"}` and `{"op":"set","id":"split.leftright"}`: the tree lists only that workspace, the text appears in its terminal, and the split happens there. Ask for the other workspace's terminal by id (`{"op":"get","what":"surface","id":N}`): `unknown surface N`. Quit: the socket file in `$TMPDIR/ghostrealm-<uid>/` is gone.
+- **Borrowing a token on macOS** (item 25): in a terminal outside ghostrealm, `ps -wwE -p <pid of a ghostrealm shell>`: does the output show `GHOSTREALM_AGENT_TOKEN`?
 
 ## Parked (no decision needed yet)
 
