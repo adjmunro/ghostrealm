@@ -57,18 +57,17 @@ pub fn run_cli() -> Result<()> {
             if headless {
                 args.remove(0);
             }
-            if let Some(socket) = std::env::var_os(agent::SOCKET_ENV).filter(|_| !headless) {
+            let in_window = std::env::var_os(agent::SOCKET_ENV);
+            if let Some(socket) = in_window.as_ref().filter(|_| !headless) {
                 if !args.is_empty() {
-                    anyhow::bail!("a window's agent channel runs no command of its own; `ghostrealm agent --headless {}` does", args.join(" "));
+                    anyhow::bail!("`ghostrealm agent` in a window's terminal takes no arguments: it relays requests on stdin to the window");
                 }
                 let token = std::env::var(agent::TOKEN_ENV).unwrap_or_default();
                 let stdin = std::io::stdin();
                 return agent::client::relay(socket.as_ref(), &token, stdin.lock(), std::io::stdout().lock());
             }
-            // Its web pages are on a profile of its own, never the person's.
-            if std::env::var_os(ghostrealm_web::profile::CACHE_ENV).is_none() {
-                std::env::set_var(ghostrealm_web::profile::CACHE_ENV, ghostrealm_web::profile::headless_agent_root());
-            }
+            let cache = std::env::var_os(ghostrealm_web::profile::CACHE_ENV);
+            std::env::set_var(ghostrealm_web::profile::CACHE_ENV, headless_web_root(cache, in_window.is_some()));
             let mut state = app_state::AppState::new();
             if !args.is_empty() {
                 state = app_state::AppState::new().with_shell_line(args.join(" "));
@@ -99,6 +98,17 @@ pub fn run_cli() -> Result<()> {
             };
             window::run(command_line)
         }
+    }
+}
+
+/// The profile root of a headless app's web pages: one of its own, never
+/// the person's. `cache` (`GHOSTREALM_WEB_CACHE`) chooses it, except in a
+/// window's terminal (`in_window`), which inherits the window's: the
+/// person's.
+fn headless_web_root(cache: Option<std::ffi::OsString>, in_window: bool) -> std::path::PathBuf {
+    match cache {
+        Some(root) if !in_window => root.into(),
+        _ => ghostrealm_web::profile::headless_agent_root(),
     }
 }
 
@@ -147,4 +157,24 @@ fn dump(command_line: &str) -> Result<()> {
         grid.cursor.col, grid.cursor.row, grid.cursor.visible
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghostrealm_web::profile::headless_agent_root;
+
+    /// Given a headless app started with or without `GHOSTREALM_WEB_CACHE`,
+    /// in a window's terminal or outside one;
+    /// when it chooses its web profile root;
+    /// then only an override outside a window's terminal is taken; else it
+    /// is the headless agent's own.
+    #[test]
+    fn a_headless_app_takes_a_cache_override_only_outside_a_windows_terminal() {
+        let set = || Some(std::ffi::OsString::from("/chosen"));
+        assert_eq!(headless_web_root(set(), false), std::path::PathBuf::from("/chosen"));
+        assert_eq!(headless_web_root(set(), true), headless_agent_root());
+        assert_eq!(headless_web_root(None, false), headless_agent_root());
+        assert_eq!(headless_web_root(None, true), headless_agent_root());
+    }
 }

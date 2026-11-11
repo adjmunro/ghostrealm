@@ -33,12 +33,14 @@ fn a_dead_socket_is_an_error_with_no_fallback() {
 
 /// Given a terminal in a window;
 /// when `ghostrealm agent` runs there with a command of its own;
-/// then it exits 1: the window's channel runs none.
+/// then it exits 1: the window's channel runs none, and no other way in
+/// is offered.
 #[test]
 fn a_command_for_the_windows_channel_is_an_error() {
     let out = agent(&["true"], "/nonexistent/ghostrealm.sock", "");
-    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--headless"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("takes no arguments") && !stderr.contains("headless"), "{stderr}");
 }
 
 /// Given a terminal in a window;
