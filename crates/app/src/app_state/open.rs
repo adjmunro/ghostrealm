@@ -96,15 +96,17 @@ impl AppState {
     /// places a file.
     pub fn open_scratch(&mut self) -> Result<()> {
         let plugin = self.plugins.iter().find(|p| p.id() == editor::ID).context("no editor plugin")?;
-        let doc = plugin.open(&self.open_cx(None))?;
+        let doc = plugin.open(&self.open_cx(None, None))?;
         self.place_doc(self.files_target(), doc, None);
         Ok(())
     }
 
-    /// What a plugin opens a view with, starting in `cwd`.
-    pub(super) fn open_cx(&self, cwd: Option<PathBuf>) -> OpenCx {
+    /// What a plugin opens a view with, starting in `cwd`, for a surface of
+    /// workspace `vt`.
+    pub(super) fn open_cx(&self, vt: Option<VtabId>, cwd: Option<PathBuf>) -> OpenCx {
         OpenCx {
             cwd,
+            agent_env: self.agent_env(vt),
             command: self.shell_line.clone(),
             waker: self.waker.clone(),
             languages: self.languages.clone(),
@@ -194,7 +196,7 @@ impl AppState {
             (Some(p), _) => p.parent().map(Path::to_path_buf),
             (None, d) => d,
         };
-        let cx = self.open_cx(None);
+        let cx = self.open_cx(None, None);
         let mut files = FilesView::new(root.unwrap_or_else(|| files::start_dir(&cx)), &cx);
         files.show_doc(doc);
         let target = match self.focused_surface() {

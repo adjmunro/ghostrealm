@@ -71,6 +71,12 @@ impl Plugin for TerminalPlugin {
         if let Some(dir) = cx.cwd.as_ref().filter(|d| d.is_dir()) {
             cmd.cwd(dir);
         }
+        // The token is a secret: neither `cmd` nor the `Command` it builds is
+        // logged or `Debug`-printed with its values.
+        if let Some((socket, token)) = &cx.agent_env {
+            cmd.env(crate::agent::SOCKET_ENV, socket);
+            cmd.env(crate::agent::TOKEN_ENV, token);
+        }
         // The VT runs on a worker thread; the waker pokes the UI when it
         // publishes a new grid.
         let term = ThreadedTerminal::spawn(

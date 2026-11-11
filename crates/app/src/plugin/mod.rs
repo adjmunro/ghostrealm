@@ -98,6 +98,10 @@ pub struct OpenCx {
     /// What this run's Files surfaces share (the sidebar's last pin and
     /// width).
     pub files: crate::plugins::files::Session,
+    /// The agent channel's socket and the token of the workspace the view
+    /// opens in, for its programs' environment. `None` when the window
+    /// serves no socket, or the workspace has no token.
+    pub agent_env: Option<(PathBuf, String)>,
 }
 
 /// A kind of content a surface can hold. Registered once; opens [`View`]s.

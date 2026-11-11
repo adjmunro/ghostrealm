@@ -28,6 +28,13 @@ use serde_json::{json, Value as Json};
 
 use crate::app_state::{build_registry, AppState};
 
+/// Names the window's agent socket in a terminal's environment.
+pub const SOCKET_ENV: &str = "GHOSTREALM_AGENT_SOCKET";
+
+/// Holds the terminal's workspace's token, which a connection presents in
+/// its `hello`.
+pub const TOKEN_ENV: &str = "GHOSTREALM_AGENT_TOKEN";
+
 /// Run the REPL until the input reaches EOF.
 ///
 /// The web host's idle exit is checked before and after each request, and at

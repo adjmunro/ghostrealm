@@ -263,6 +263,11 @@ pub struct AppState {
     /// The workspace an agent's command runs as ([`Self::acting_as`]): the
     /// active one for the command, while the person's stays as it was.
     acting: Option<VtabId>,
+    /// The agent channel's socket, once the window serves one: terminals
+    /// then get it and their workspace's token in their environment.
+    agent_socket: Option<std::path::PathBuf>,
+    /// Each workspace's agent token, minted with its first terminal.
+    agent_tokens: HashMap<VtabId, String>,
 }
 
 impl AppState {
@@ -304,6 +309,8 @@ impl AppState {
             toasts: Toasts::default(),
             config_problems: false,
             acting: None,
+            agent_socket: None,
+            agent_tokens: HashMap::new(),
         }
     }
 
@@ -463,7 +470,11 @@ impl AppState {
 
     /// [`Self::materialize_plugin`], starting in `cwd`.
     fn materialize_plugin_at(&mut self, sid: SurfaceId, id: &str, cwd: Option<std::path::PathBuf>) -> Result<()> {
-        let cx = self.open_cx(cwd);
+        let vt = self.vtab_of_surface(sid);
+        if let Some(vt) = vt {
+            self.mint_agent_token(vt);
+        }
+        let cx = self.open_cx(vt, cwd);
         let plugin = self
             .plugins
             .iter()
@@ -582,7 +593,7 @@ impl AppState {
                 None => p.opens_path(path),
             })
             .ok_or_else(|| anyhow::anyhow!("no plugin opens {}", path.display()))?;
-        let cx = self.open_cx(self.active().and_then(|vt| self.resolve_cwd(vt)));
+        let cx = self.open_cx(None, self.active().and_then(|vt| self.resolve_cwd(vt)));
         plugin.open_path(path, &cx)
     }
 
@@ -1318,7 +1329,7 @@ impl AppState {
             }
             return Ok(());
         }
-        let cx = self.open_cx(None);
+        let cx = self.open_cx(None, None);
         let root = path.parent().map(Path::to_path_buf).unwrap_or_else(|| files_plugin::start_dir(&cx));
         let mut files = FilesView::new(root, &cx);
         files.show_doc(doc);
@@ -4300,7 +4311,7 @@ mod tests {
         let mut s = AppState::new();
         s.new_empty_vtab();
         let files = ["a.txt", "b.txt"].map(|n| dir.join(n));
-        let cx = s.open_cx(None);
+        let cx = s.open_cx(None, None);
         let mut view = FilesView::new(dir.to_path_buf(), &cx);
         let mut ids = Vec::new();
         for f in &files {

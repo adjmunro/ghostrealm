@@ -1,6 +1,7 @@
 //! What a workspace's agent reaches, and its commands run as that workspace
 //! ([`crate::agent::Scope::Workspace`]).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::{SurfaceId, VtabId};
@@ -62,5 +63,100 @@ impl AppState {
     /// The tree as workspace `vt`'s agent sees it.
     pub(crate) fn describe_for(&self, vt: VtabId) -> String {
         self.describe_tree(Some(vt))
+    }
+
+    /// Serve the agent channel at `socket`: terminals opened from now on get
+    /// it and their workspace's token in their environment.
+    pub fn set_agent_socket(&mut self, socket: PathBuf) {
+        self.agent_socket = Some(socket);
+    }
+
+    /// Give workspace `vt` a token, unless it has one or no socket is served.
+    /// One that can't be made leaves the workspace without: its terminals get
+    /// no agent environment.
+    pub(super) fn mint_agent_token(&mut self, vt: VtabId) {
+        if self.agent_socket.is_none() || self.agent_tokens.contains_key(&vt) {
+            return;
+        }
+        match new_token() {
+            Ok(token) => {
+                self.agent_tokens.insert(vt, token);
+            }
+            Err(e) => eprintln!("ghostrealm: no agent token for workspace {}: {e}", vt.0),
+        }
+    }
+
+    /// The socket and workspace `vt`'s token, for a terminal's environment.
+    pub(super) fn agent_env(&self, vt: Option<VtabId>) -> Option<(PathBuf, String)> {
+        Some((self.agent_socket.clone()?, self.agent_tokens.get(&vt?)?.clone()))
+    }
+
+    /// The workspace `token` is the token of, while that workspace is open.
+    /// Closing a workspace by any path revokes its token here; workspace ids
+    /// aren't reused, so an old token never names a new one. Each token is
+    /// compared in constant time.
+    pub fn agent_token_workspace(&mut self, token: &str) -> Option<VtabId> {
+        let tree = &self.tree;
+        self.agent_tokens.retain(|vt, _| tree.vtab(*vt).is_some());
+        self.agent_tokens.iter().filter(|(_, t)| same(t.as_bytes(), token.as_bytes())).map(|(vt, _)| *vt).next()
+    }
+}
+
+/// 32 random bytes, hex-encoded.
+fn new_token() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `a` and `b` are equal, in a time that depends only on their
+/// lengths.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The text of terminal `sid` once it shows `want`, waiting up to 10 s.
+    fn shows(s: &mut AppState, sid: SurfaceId, want: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = s.surface_text(sid).unwrap_or_default();
+            if want(&text) || Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Given an app serving the agent socket;
+    /// when terminals open in two workspaces, and the first closes;
+    /// then each terminal's environment holds the socket and its workspace's
+    /// token, the tokens differ and each names its workspace, and the closed
+    /// workspace's token names none.
+    #[test]
+    fn each_workspaces_terminals_get_its_token_until_it_closes() {
+        let mut s = AppState::new().with_shell_line(r#"printf "<$GHOSTREALM_AGENT_SOCKET|$GHOSTREALM_AGENT_TOKEN>"; sleep 5"#);
+        s.set_agent_socket(PathBuf::from("/tmp/agent.sock"));
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let vt = s.new_vtab().unwrap();
+            let sid = s.focused_surface().unwrap();
+            let text = shows(&mut s, sid, |t| t.contains('>'));
+            // The line wraps at the terminal's width.
+            let inner = text.split_once("</tmp/agent.sock|").and_then(|(_, t)| t.split_once('>')).map(|(t, _)| t.replace('\n', ""));
+            let token = inner.unwrap_or_else(|| panic!("socket and token in the environment: {text}"));
+            assert_eq!(token.len(), 64, "{token}");
+            assert_eq!(s.agent_token_workspace(&token), Some(vt));
+            seen.push((vt, token));
+        }
+        assert_ne!(seen[0].1, seen[1].1);
+        s.close_vtab(seen[0].0);
+        assert_eq!(s.agent_token_workspace(&seen[0].1), None, "revoked with its workspace");
+        assert_eq!(s.agent_token_workspace(&seen[1].1), Some(seen[1].0));
+        assert_eq!(s.agent_token_workspace(""), None);
     }
 }
