@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use ghostrealm_core::{Args, CloseOnExit, CommandMeta, Registry, SurfaceId, Value};
+use ghostrealm_core::{AgentReach, Args, CloseOnExit, CommandMeta, Registry, SurfaceId, Value, VtabId};
 use serde_json::{json, Value as Json};
 
 use crate::app_state::{build_registry, AppState};
@@ -50,7 +50,7 @@ pub fn run<R: BufRead + Send + 'static, W: Write>(
             continue;
         }
         state.tick_web(Instant::now());
-        let response = handle(trimmed, &mut state, &mut registry);
+        let response = serve(trimmed, Scope::Full, &mut state, &mut registry).wait(&mut state);
         state.tick_web(Instant::now());
         serde_json::to_writer(&mut output, &response)?;
         output.write_all(b"\n")?;
@@ -141,76 +141,203 @@ fn keep_exited(state: &mut AppState) {
     state.set_close_on_exit(CloseOnExit::Never);
 }
 
-fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -> Json {
-    let req: Json = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => return json!({ "ok": false, "error": format!("invalid json: {e}") }),
+/// Whom a request is served for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The headless channel: the whole app is the agent's.
+    Full,
+    /// A workspace's agent in the window: it reaches that workspace's
+    /// terminals and Files surfaces, and runs the commands classified for it
+    /// ([`AgentReach`]), as that workspace.
+    Workspace(VtabId),
+}
+
+/// A request, parsed.
+enum Op {
+    Help,
+    Search(String),
+    Set { id: String, args: Args },
+    GetTree,
+    GetSurface(SurfaceId),
+    Input { id: Option<SurfaceId>, text: String },
+    Pump,
+}
+
+/// What [`serve`] answers.
+#[must_use]
+pub enum Reply {
+    Done(Json),
+    /// A command started file jobs `[since, until)`; the reply carries their
+    /// outcome, once they are done ([`Reply::wait`], [`settled`]).
+    Jobs { since: u64, until: u64, message: Option<String> },
+}
+
+impl Reply {
+    /// The reply, once the jobs it waits for are done: blocks for them.
+    pub fn wait(self, state: &mut AppState) -> Json {
+        match self {
+            Reply::Done(json) => json,
+            Reply::Jobs { since, message, .. } => {
+                // A job a result submits (past `until`) is waited for too.
+                state.wait_file_jobs_since(since);
+                finished(message, state.take_file_reports_since(since))
+            }
+        }
+    }
+}
+
+/// The reply to a command that started file jobs `[since, until)`, once the
+/// file worker holds none of them; `None` while it does. A job that finished
+/// inside the command reported only a warning, so a missing report is no
+/// reason to wait.
+pub fn settled(state: &mut AppState, since: u64, until: u64, message: &Option<String>) -> Option<Json> {
+    if state.file_jobs_hold(since..until) {
+        return None;
+    }
+    Some(finished(message.clone(), state.take_file_reports_in(since..until)))
+}
+
+/// A command's reply: what it said, unless a job's report speaks for it (what
+/// the command said was that the job is running).
+fn finished(message: Option<String>, reports: Vec<crate::app_state::FileReport>) -> Json {
+    match reports.into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>() {
+        Err(e) => json!({ "ok": false, "error": e }),
+        Ok(messages) if messages.is_empty() => json!({ "ok": true, "message": message }),
+        Ok(messages) => json!({ "ok": true, "message": messages.into_iter().rfind(|m| !m.is_empty()) }),
+    }
+}
+
+/// Serve one request line for `scope`: parse, authorize, run. Every request
+/// from either channel passes here, and what a workspace's agent may do is
+/// decided only here.
+pub fn serve(line: &str, scope: Scope, state: &mut AppState, registry: &mut Registry<AppState>) -> Reply {
+    let op = match parse(line) {
+        Ok(op) => op,
+        Err(e) => return Reply::Done(json!({ "ok": false, "error": e })),
     };
-    match req.get("op").and_then(Json::as_str).unwrap_or("") {
-        "help" => {
-            let commands: Vec<Json> = registry.metas().map(meta_json).collect();
+    if let Err(e) = authorize(&op, scope, state, registry) {
+        return Reply::Done(json!({ "ok": false, "error": e }));
+    }
+    execute(op, scope, state, registry)
+}
+
+fn parse(line: &str) -> Result<Op, String> {
+    let req: Json = serde_json::from_str(line).map_err(|e| format!("invalid json: {e}"))?;
+    let str_of = |key| req.get(key).and_then(Json::as_str).unwrap_or("").to_string();
+    Ok(match req.get("op").and_then(Json::as_str).unwrap_or("") {
+        "help" => Op::Help,
+        "search" => Op::Search(str_of("query")),
+        "set" => Op::Set { id: str_of("id"), args: parse_args(req.get("args"))? },
+        "get" => match req.get("what").and_then(Json::as_str).unwrap_or("tree") {
+            "tree" => Op::GetTree,
+            "surface" => match req.get("id").and_then(Json::as_u64) {
+                Some(id) => Op::GetSurface(SurfaceId(id)),
+                None => return Err("get surface needs an integer `id`".into()),
+            },
+            other => return Err(format!("unknown get target: {other}")),
+        },
+        "input" => Op::Input { id: req.get("id").and_then(Json::as_u64).map(SurfaceId), text: str_of("text") },
+        "pump" => Op::Pump,
+        "" => return Err("missing `op`".into()),
+        other => return Err(format!("unknown op: {other}")),
+    })
+}
+
+/// Whether `scope` may run `op`. No wildcard arm: a new op is classified
+/// before it compiles.
+fn authorize(op: &Op, scope: Scope, state: &AppState, registry: &Registry<AppState>) -> Result<(), String> {
+    let Scope::Workspace(vt) = scope else { return Ok(()) };
+    let reaches = |sid: SurfaceId| match state.agent_reaches(vt, sid) {
+        true => Ok(()),
+        false => Err(format!("unknown surface {}", sid.0)),
+    };
+    match op {
+        // Listed for the scope; the tree is the workspace's.
+        Op::Help | Op::Search(_) | Op::GetTree | Op::Pump => Ok(()),
+        Op::GetSurface(sid) => reaches(*sid),
+        Op::Input { id, .. } => match id.or_else(|| state.focused_surface_in(vt)) {
+            Some(sid) => reaches(sid),
+            None => Err("no focused surface".into()),
+        },
+        Op::Set { id, args } => {
+            let meta = registry.meta(id).ok_or_else(|| format!("unknown command: {id}"))?;
+            match meta.agent {
+                AgentReach::Refused(why) => return Err(format!("{id} isn't open to a workspace's agent: {why}")),
+                AgentReach::Workspace => {}
+                AgentReach::FocusedPane if state.focused_pane_reachable(vt) => {}
+                AgentReach::FocusedPane => {
+                    return Err(format!("{id} would close what the workspace's agent can't reach"));
+                }
+            }
+            match args.get("id") {
+                Some(Value::Int(sid)) => reaches(SurfaceId(*sid as u64)),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+fn execute(op: Op, scope: Scope, state: &mut AppState, registry: &mut Registry<AppState>) -> Reply {
+    let allowed = |m: &CommandMeta| scope == Scope::Full || !matches!(m.agent, AgentReach::Refused(_));
+    Reply::Done(match op {
+        Op::Help => {
+            let commands: Vec<Json> = registry.metas().filter(|m| allowed(m)).map(meta_json).collect();
             json!({ "ok": true, "commands": commands })
         }
-        "search" => {
-            let q = req.get("query").and_then(Json::as_str).unwrap_or("");
+        Op::Search(q) => {
             let hits: Vec<Json> = registry
-                .search(q, 20)
+                .search(&q, usize::MAX)
                 .into_iter()
+                .filter(|h| allowed(h.meta))
+                .take(SEARCH_HITS)
                 .map(|h| json!({ "id": h.meta.id, "title": h.meta.title, "score": h.score }))
                 .collect();
             json!({ "ok": true, "hits": hits })
         }
-        "set" => {
-            let id = req.get("id").and_then(Json::as_str).unwrap_or("");
-            let args = match parse_args(req.get("args")) {
-                Ok(a) => a,
-                Err(e) => return json!({ "ok": false, "error": e }),
-            };
+        Op::Set { id, args } => {
             let mark = state.file_job_mark();
-            let ran = registry.execute(id, &args, state);
-            // A file command's work on the file worker finishes before the
-            // reply, which carries its outcome. Jobs the user started before
+            let ran = match scope {
+                Scope::Full => registry.execute(&id, &args, state),
+                Scope::Workspace(vt) => match state.acting_as(vt, |s| registry.execute(&id, &args, s)) {
+                    Ok(ran) => ran,
+                    Err(e) => return Reply::Done(json!({ "ok": false, "error": e })),
+                },
+            };
+            // A file command's reply waits for its jobs on the file worker,
+            // and carries their outcome. Jobs the person started before
             // aren't waited for, and their reports stay queued for the
             // window.
-            state.wait_file_jobs_since(mark);
-            let finished =
-                state.take_file_reports_since(mark).into_iter().map(|r| r.result).collect::<Result<Vec<_>, _>>();
-            match (ran, finished) {
-                (Err(e), _) => json!({ "ok": false, "error": e.to_string() }),
-                (Ok(_), Err(e)) => json!({ "ok": false, "error": e }),
-                // A job that reported speaks for the command: what the command
-                // said was that the job is running.
-                (Ok(out), Ok(messages)) if messages.is_empty() => json!({ "ok": true, "message": out.message }),
-                (Ok(_), Ok(messages)) => {
-                    let message = messages.into_iter().rfind(|m| !m.is_empty());
-                    json!({ "ok": true, "message": message })
+            match ran {
+                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                Ok(out) if state.file_job_mark() > mark => {
+                    return Reply::Jobs { since: mark, until: state.file_job_mark(), message: out.message };
                 }
+                Ok(out) => json!({ "ok": true, "message": out.message }),
             }
         }
-        "get" => {
+        Op::GetTree => {
             state.pump_all();
-            match req.get("what").and_then(Json::as_str).unwrap_or("tree") {
-                "tree" => json!({ "ok": true, "tree": state.describe() }),
-                "surface" => match req.get("id").and_then(Json::as_u64) {
-                    Some(id) => match state.surface_text(SurfaceId(id)) {
-                        Some(text) => json!({ "ok": true, "text": text }),
-                        None => json!({ "ok": false, "error": format!("unknown surface {id}") }),
-                    },
-                    None => json!({ "ok": false, "error": "get surface needs an integer `id`" }),
-                },
-                other => json!({ "ok": false, "error": format!("unknown get target: {other}") }),
+            let tree = match scope {
+                Scope::Full => state.describe(),
+                Scope::Workspace(vt) => state.describe_for(vt),
+            };
+            json!({ "ok": true, "tree": tree })
+        }
+        Op::GetSurface(id) => {
+            state.pump_all();
+            match state.surface_text(id) {
+                Some(text) => json!({ "ok": true, "text": text }),
+                None => json!({ "ok": false, "error": format!("unknown surface {}", id.0) }),
             }
         }
-        "input" => {
-            let text = req.get("text").and_then(Json::as_str).unwrap_or("");
-            let id = match req.get("id").and_then(Json::as_u64) {
-                Some(id) => Some(SurfaceId(id)),
-                None => state.focused_surface(),
+        Op::Input { id, text } => {
+            let id = match (id, scope) {
+                (Some(id), _) => Some(id),
+                (None, Scope::Full) => state.focused_surface(),
+                (None, Scope::Workspace(vt)) => state.focused_surface_in(vt),
             };
             match id {
-                Some(id) if state.write_input(id, text.as_bytes()) => {
-                    json!({ "ok": true, "surface": id.0 })
-                }
+                Some(id) if state.write_input(id, text.as_bytes()) => json!({ "ok": true, "surface": id.0 }),
                 Some(id) if state.has_surface(id) => {
                     json!({ "ok": false, "error": format!("surface {} takes no raw input", id.0) })
                 }
@@ -218,14 +345,15 @@ fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -
                 None => json!({ "ok": false, "error": "no focused surface" }),
             }
         }
-        "pump" => {
+        Op::Pump => {
             state.pump_all();
             json!({ "ok": true })
         }
-        "" => json!({ "ok": false, "error": "missing `op`" }),
-        other => json!({ "ok": false, "error": format!("unknown op: {other}") }),
-    }
+    })
 }
+
+/// How many hits `search` returns.
+const SEARCH_HITS: usize = 20;
 
 fn meta_json(m: &CommandMeta) -> Json {
     let args: Vec<Json> = m
@@ -270,6 +398,11 @@ fn parse_args(value: Option<&Json>) -> Result<Args, String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Serve `line` headless, as [`run`] does.
+    fn handle(line: &str, state: &mut AppState, registry: &mut Registry<AppState>) -> Json {
+        serve(line, Scope::Full, state, registry).wait(state)
+    }
 
     /// Drive the REPL with a script of request lines; return parsed responses.
     fn drive(lines: &[&str]) -> Vec<Json> {
@@ -578,5 +711,251 @@ mod tests {
         let r = &drive(&[r#"{"op":"frobnicate"}"#])[0];
         assert_eq!(r["ok"], json!(false));
         assert!(r["error"].as_str().unwrap().contains("frobnicate"));
+    }
+
+    /// Serve `req` for workspace `vt`'s agent, waiting for its file jobs.
+    fn scoped(state: &mut AppState, registry: &mut Registry<AppState>, vt: VtabId, req: &str) -> Json {
+        serve(req, Scope::Workspace(vt), state, registry).wait(state)
+    }
+
+    /// `{"op":"set","id":<id>,"args":<args>}`.
+    fn set(id: &str, args: Json) -> String {
+        json!({ "op": "set", "id": id, "args": args }).to_string()
+    }
+
+    fn error(reply: &Json) -> &str {
+        reply["error"].as_str().unwrap_or_else(|| panic!("an error: {reply:?}"))
+    }
+
+    /// Given a registry with a command registered without a class;
+    /// when a workspace's agent and the headless channel each run it;
+    /// then the agent is refused and the headless channel runs it.
+    #[test]
+    fn a_command_nobody_classified_is_refused_to_a_workspace_and_runs_headless() {
+        let mut state = AppState::new();
+        let vt = state.new_empty_vtab();
+        let mut registry = build_registry();
+        registry.register(
+            CommandMeta::new("test.unclassified", "Unclassified", "A command nobody classified"),
+            Box::new(|_: &mut AppState, _| Ok(ghostrealm_core::CmdOutcome::msg("ran"))),
+        );
+        let req = set("test.unclassified", json!({}));
+        let reply = scoped(&mut state, &mut registry, vt, &req);
+        assert!(error(&reply).contains("isn't open to a workspace's agent"), "{reply:?}");
+        assert_eq!(handle(&req, &mut state, &mut registry)["message"], json!("ran"));
+    }
+
+    /// The commands a workspace's agent may run, with their arguments' names
+    /// and the arguments [`every_command_open_to_an_agent_leaves_other_workspaces_alone`]
+    /// runs each with (`{d}`: its folder). A command that gains an argument
+    /// fails the pin below until it is classified again here.
+    const OPEN_TO_AGENTS: &[(&str, &[&str], &str)] = &[
+        ("workspace.rename", &["name"], r#"{"name":"agent's"}"#),
+        ("workspace.mark_read", &[], "{}"),
+        ("workspace.mark_unread", &[], "{}"),
+        ("workspace.needs_input", &[], "{}"),
+        ("workspace.dismiss", &[], "{}"),
+        ("split.leftright", &[], "{}"),
+        ("split.topbottom", &[], "{}"),
+        ("pane.focus_next", &[], "{}"),
+        ("pane.focus_prev", &[], "{}"),
+        ("surface.new", &[], "{}"),
+        ("terminal.new", &[], "{}"),
+        ("file_browser.new", &[], "{}"),
+        ("editor.new", &[], "{}"),
+        ("editor.open", &["path"], r#"{"path":"{d}/b.txt"}"#),
+        ("editor.toggle_comment", &[], "{}"),
+        ("editor.cycle_view_mode", &[], "{}"),
+        ("editor.toggle_undo_history", &[], "{}"),
+        ("files.focus_sidebar", &[], "{}"),
+        ("files.next_tab", &[], "{}"),
+        ("files.prev_tab", &[], "{}"),
+        ("file.open", &["path"], r#"{"path":"{d}/c.txt"}"#),
+        ("file.show_in_browser", &["path"], r#"{"path":"{d}/a.txt"}"#),
+        ("file.open_in_terminal", &["path"], r#"{"path":"{d}"}"#),
+        ("file.duplicate", &["path"], r#"{"path":"{d}/a.txt"}"#),
+        ("file.delete", &["path"], r#"{"path":"{d}/shared.txt"}"#),
+        ("file.new_file", &["name", "dir"], r#"{"name":"new.txt","dir":"{d}"}"#),
+        ("file.new_folder", &["name", "dir"], r#"{"name":"new","dir":"{d}"}"#),
+        ("file.rename", &["name", "path"], r#"{"name":"renamed.txt","path":"{d}/c.txt"}"#),
+        ("file.add_to_gitignore", &["path"], r#"{"path":"{d}/a.txt"}"#),
+        ("file.add_to_git_exclude", &["path"], r#"{"path":"{d}/a.txt"}"#),
+        ("pane.close", &[], "{}"),
+        ("pane.close_all", &[], "{}"),
+    ];
+
+    /// Given the registry;
+    /// when its commands open to a workspace's agent are listed with their
+    /// arguments' names;
+    /// then they are exactly those classified above, and every other command
+    /// is refused for a reason of its own.
+    #[test]
+    fn the_commands_open_to_agents_and_their_arguments_are_pinned() {
+        let registry = build_registry();
+        let mut open: Vec<(&str, Vec<&str>)> = Vec::new();
+        for m in registry.metas() {
+            match m.agent {
+                AgentReach::Refused(why) => assert_ne!(why, "not classified for a workspace's agent", "{}", m.id),
+                AgentReach::Workspace | AgentReach::FocusedPane => open.push((m.id, m.args.iter().map(|a| a.name).collect())),
+            }
+        }
+        let mut pinned: Vec<(&str, Vec<&str>)> = OPEN_TO_AGENTS.iter().map(|(id, args, _)| (*id, args.to_vec())).collect();
+        open.sort();
+        pinned.sort();
+        assert_eq!(open, pinned);
+        let focused_pane: Vec<&str> =
+            registry.metas().filter(|m| m.agent == AgentReach::FocusedPane).map(|m| m.id).collect();
+        assert_eq!(focused_pane, ["pane.close", "pane.close_all"]);
+    }
+
+    /// Given workspace A with a terminal and a Files surface, and workspace B,
+    /// active, with a Files surface showing a file of A's folder;
+    /// when A's agent runs every command open to it, in turn;
+    /// then B stays active and its panes, surfaces and titles stay as they
+    /// were, and Delete of the file B shows is refused and leaves it.
+    #[test]
+    fn every_command_open_to_an_agent_leaves_other_workspaces_alone() {
+        let d = crate::plugin::testing::tmpdir("agent-scope-every");
+        for f in ["a.txt", "b.txt", "c.txt", "shared.txt"] {
+            std::fs::write(d.join(f), f).unwrap();
+        }
+        let mut state = AppState::new().with_shell_line("sleep 5");
+        let a = state.new_vtab().unwrap();
+        state.set_active_root_dir(&*d);
+        state.open_file_in_new_surface(&d.join("a.txt")).unwrap();
+        let b = state.new_empty_vtab();
+        state.open_file_in_new_surface(&d.join("shared.txt")).unwrap();
+        let mut registry = build_registry();
+        let b_tree = |s: &AppState| s.describe_for(b).split_once('\n').map(|(_, panes)| panes.to_string());
+        let before = b_tree(&state);
+        assert!(before.as_deref().is_some_and(|t| t.contains("shared.txt")), "{before:?}");
+        for (id, _, args) in OPEN_TO_AGENTS {
+            let args: Json = serde_json::from_str(&args.replace("{d}", d.to_str().unwrap())).unwrap();
+            let reply = scoped(&mut state, &mut registry, a, &set(id, args));
+            assert_eq!(state.tree.active_vtab(), Some(b), "{id} left B active: {reply:?}");
+            assert_eq!(b_tree(&state), before, "{id} left B as it was: {reply:?}");
+            if *id == "file.delete" {
+                assert!(error(&reply).contains("open outside this workspace"), "{reply:?}");
+                assert!(d.join("shared.txt").exists());
+            }
+        }
+    }
+
+    /// Given workspace A with two terminals in split panes, and workspace B,
+    /// active, with a terminal;
+    /// when A's agent sends input with no `id`;
+    /// then it goes to A's focused terminal.
+    #[test]
+    fn input_with_no_id_goes_to_the_agents_focused_surface() {
+        let mut state = AppState::new().with_shell_line("sleep 5");
+        let a = state.new_vtab().unwrap();
+        let a_term = state.focused_surface().unwrap();
+        let _b = state.new_vtab().unwrap();
+        let mut registry = build_registry();
+        let reply = scoped(&mut state, &mut registry, a, r#"{"op":"input","text":"x"}"#);
+        assert_eq!(reply, json!({ "ok": true, "surface": a_term.0 }));
+    }
+
+    /// Given a workspace's agent;
+    /// when it asks for help and searches;
+    /// then both list only the commands open to it.
+    #[test]
+    fn help_and_search_list_only_the_commands_open_to_a_workspace() {
+        let mut state = AppState::new();
+        let vt = state.new_empty_vtab();
+        let mut registry = build_registry();
+        let reply = scoped(&mut state, &mut registry, vt, r#"{"op":"help"}"#);
+        let mut listed: Vec<&str> = reply["commands"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        let mut open: Vec<&str> = OPEN_TO_AGENTS.iter().map(|(id, _, _)| *id).collect();
+        listed.sort();
+        open.sort();
+        assert_eq!(listed, open);
+        // More than 20 commands match "e": the refused ones mustn't take
+        // places among the 20.
+        let reply = scoped(&mut state, &mut registry, vt, r#"{"op":"search","query":"e"}"#);
+        let hits: Vec<&str> = reply["hits"].as_array().unwrap().iter().map(|h| h["id"].as_str().unwrap()).collect();
+        assert_eq!(hits.len(), SEARCH_HITS, "{hits:?}");
+        assert!(hits.iter().all(|id| open.contains(id)), "{hits:?}");
+    }
+
+    /// Given the window's guard on unsaved changes, a file edited in
+    /// workspace A, and the person in workspace B;
+    /// when A's agent deletes the file and the person presses Enter at once;
+    /// then the question names A, ignores keys for a moment, and Enter
+    /// cancels it, leaving the file; and while it is open, another of the
+    /// agent's questions is refused and leaves it.
+    #[test]
+    fn an_agents_question_is_late_and_never_replaces_one_already_open() {
+        let d = crate::plugin::testing::tmpdir("agent-scope-ask");
+        let path = d.join("a.txt");
+        std::fs::write(&path, "A").unwrap();
+        let mut state = AppState::new().with_unsaved_guard();
+        let a = state.new_empty_vtab();
+        let sid = state.open_file_in_new_surface(&path).unwrap();
+        assert!(state.write_input(sid, b"edit "));
+        state.rename_active_vtab("agent's");
+        let _b = state.new_empty_vtab();
+        let mut registry = build_registry();
+        let delete = set("file.delete", json!({ "path": path }));
+        let reply = scoped(&mut state, &mut registry, a, &delete);
+        assert_eq!(reply["ok"], json!(true), "{reply:?}");
+        let asked = state.confirm().expect("asks about the unsaved changes").clone();
+        assert!(asked.message.starts_with("From workspace \u{201c}agent's\u{201d}: "), "{}", asked.message);
+        assert!(!asked.takes_keys_at(Instant::now()) && asked.enter_cancels());
+        let reply = scoped(&mut state, &mut registry, a, &set("pane.close", json!({})));
+        assert!(error(&reply).contains("a question is open"), "{reply:?}");
+        assert_eq!(state.confirm(), Some(&asked), "the open question stays");
+        state.enter_confirm().unwrap();
+        assert!(state.confirm().is_none() && path.exists(), "Enter cancelled it");
+    }
+
+    /// Given workspace A with a terminal and, beside it in the same pane, a
+    /// web page the person opened, and workspace B with a terminal;
+    /// when A's agent reads the tree and the page, types into the page and
+    /// B's terminal, lists and runs web commands, and closes the page;
+    /// then the page and B's terminal are absent or unknown to it, every web
+    /// command is refused, and the page stays.
+    #[cfg(unix)]
+    #[test]
+    fn web_pages_and_other_workspaces_are_out_of_an_agents_reach() {
+        use crate::plugins::web::tests::{stub_app_host, TEST_HOST};
+        let dir = crate::plugin::testing::TmpDir::new("agent-scope-web");
+        stub_app_host(&dir, &[], "cat > /dev/null");
+        // A waker, as the window gives: the page is the person's.
+        let mut state = AppState::new().with_shell_line("sleep 5").with_waker(std::sync::Arc::new(|| {}));
+        let a = state.new_vtab().unwrap();
+        let a_term = state.focused_surface().unwrap();
+        let mut registry = build_registry();
+        assert_eq!(handle(&set("web.new", json!({})), &mut state, &mut registry)["ok"], json!(true));
+        let page = state.focused_surface().unwrap();
+        let b = state.new_vtab().unwrap();
+        let b_term = state.focused_surface().unwrap();
+        let mut ask = |state: &mut AppState, req: &str| scoped(state, &mut registry, a, req);
+        let tree = ask(&mut state, r#"{"op":"get","what":"tree"}"#)["tree"].as_str().unwrap().to_string();
+        assert!(tree.contains(&format!("surface {} ", a_term.0)), "{tree}");
+        for gone in [page, b_term] {
+            assert!(!tree.contains(&format!("surface {} ", gone.0)), "{tree}");
+            let unknown = format!("unknown surface {}", gone.0);
+            let reply = ask(&mut state, &format!(r#"{{"op":"get","what":"surface","id":{}}}"#, gone.0));
+            assert_eq!(error(&reply), unknown);
+            let reply = ask(&mut state, &format!(r#"{{"op":"input","id":{},"text":"x"}}"#, gone.0));
+            assert_eq!(error(&reply), unknown);
+        }
+        assert!(!tree.contains(&format!("vtab {} ", b.0)), "{tree}");
+        let help = ask(&mut state, r#"{"op":"help"}"#).to_string();
+        let search = ask(&mut state, r#"{"op":"search","query":"web"}"#).to_string();
+        assert!(!help.contains("\"web.") && !search.contains("\"web."), "{help}\n{search}");
+        for id in ["web.new", "web.eval", "web.close"] {
+            let reply = ask(&mut state, &set(id, json!({})));
+            assert!(error(&reply).contains(crate::app_state::WEB_PAGES), "{reply:?}");
+        }
+        // The page is focused in A's focused pane.
+        state.focus_vtab(a);
+        assert_eq!(state.focused_surface(), Some(page));
+        state.focus_vtab(b);
+        let reply = ask(&mut state, &set("pane.close", json!({})));
+        assert!(error(&reply).contains("can't reach"), "{reply:?}");
+        assert!(state.has_surface(page), "the page stays");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 }

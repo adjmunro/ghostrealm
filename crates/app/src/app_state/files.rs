@@ -235,6 +235,11 @@ impl AppState {
     fn run_file_job(&mut self, job: FileJob) -> Result<String> {
         let started = job.started();
         let id = self.file_jobs.submit(job);
+        // Nothing is taken back without a wait, a job before it neither: its
+        // question would seem this command's.
+        if self.file_job_wait.is_zero() {
+            return Ok(started);
+        }
         let deadline = Instant::now() + self.file_job_wait;
         while let Some(done) = self.file_jobs.take_until(deadline) {
             if done.id == id {
@@ -326,6 +331,18 @@ impl AppState {
         let (since, before) = std::mem::take(&mut self.file_reports).into_iter().partition(|r| r.job >= mark);
         self.file_reports = before;
         since
+    }
+
+    /// Whether a file job numbered in `ids` hasn't been applied yet.
+    pub fn file_jobs_hold(&self, ids: std::ops::Range<u64>) -> bool {
+        self.file_jobs.holds(ids)
+    }
+
+    /// Take the reports of the jobs numbered in `ids`; others stay queued.
+    pub fn take_file_reports_in(&mut self, ids: std::ops::Range<u64>) -> Vec<FileReport> {
+        let (taken, left) = std::mem::take(&mut self.file_reports).into_iter().partition(|r| ids.contains(&r.job));
+        self.file_reports = left;
+        taken
     }
 
     fn report_file_job(&mut self, done: Done) {
@@ -523,6 +540,12 @@ impl AppState {
     pub fn delete_path(&mut self, path: &Path) -> Result<String> {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
+        }
+        if let Some(vt) = self.agent_scope() {
+            // Trashing closes the documents of it wherever they are.
+            if self.docs_under(path).iter().any(|(sid, _)| self.vtab_of_surface(*sid) != Some(vt)) {
+                bail!("{} is open outside this workspace", path.display());
+            }
         }
         let vtab = self.active();
         let unsaved = self.unsaved_under(path);

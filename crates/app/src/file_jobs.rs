@@ -312,6 +312,11 @@ impl FileJobs {
         out
     }
 
+    /// Whether a job with an id in `ids` hasn't been taken back.
+    pub fn holds(&self, ids: std::ops::Range<u64>) -> bool {
+        self.active.iter().any(|(id, _)| ids.contains(id)) || self.checks.keys().any(|id| ids.contains(id))
+    }
+
     /// Whether every copy and move given has finished (its result may still
     /// be waiting). Delete's checks don't count: a quit drops them.
     pub fn idle(&self) -> bool {

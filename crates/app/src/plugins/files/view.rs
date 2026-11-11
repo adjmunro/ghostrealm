@@ -924,6 +924,10 @@ impl View for FilesView {
         }
     }
 
+    fn agent_reachable(&self) -> bool {
+        true
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         let used = self.docs.get_mut(self.active).is_some_and(|t| t.view.write_input(bytes));
         self.settle();

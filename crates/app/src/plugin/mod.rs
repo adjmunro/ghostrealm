@@ -355,6 +355,13 @@ pub trait View: Any {
         Ok(())
     }
 
+    /// Whether an agent scoped to the surface's workspace may read and type
+    /// into it. A kind that may hold what is the person's alone (a web page on
+    /// their profile) keeps the default.
+    fn agent_reachable(&self) -> bool {
+        false
+    }
+
     /// Raw input from the agent channel. Returns whether the view accepts it.
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         let active = self.active_doc();

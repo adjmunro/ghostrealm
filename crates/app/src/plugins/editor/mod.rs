@@ -224,6 +224,9 @@ impl Plugin for EditorPlugin {
             .agent_workspace(),
             Box::new(move |s: &mut AppState, a| {
                 if a.get("path").is_none() {
+                    if s.agent_scope().is_some() {
+                        return Err(CmdError::Inapplicable("a workspace's agent passes `path`: the picker is the person's".into()));
+                    }
                     s.open_picker(crate::app_state::Pick::Open);
                     return Ok(CmdOutcome::ok());
                 }

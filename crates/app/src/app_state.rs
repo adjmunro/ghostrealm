@@ -37,6 +37,7 @@ use crate::toasts::{self, Level, Scope, Toast, ToastAction, Toasts};
 mod file_undo;
 mod files;
 mod open;
+mod scoped;
 pub use files::{FileClip, FileReport};
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
@@ -259,6 +260,9 @@ pub struct AppState {
     toasts: Toasts,
     /// The last config load had problems: a clean one then says so.
     config_problems: bool,
+    /// The workspace an agent's command runs as ([`Self::acting_as`]): the
+    /// active one for the command, while the person's stays as it was.
+    acting: Option<VtabId>,
 }
 
 impl AppState {
@@ -299,6 +303,7 @@ impl AppState {
             web_idle,
             toasts: Toasts::default(),
             config_problems: false,
+            acting: None,
         }
     }
 
@@ -401,8 +406,10 @@ impl AppState {
         Ok(vt)
     }
 
+    /// The workspace commands act on: the one an agent's command runs as,
+    /// else the person's active one.
     fn active(&self) -> Option<VtabId> {
-        self.tree.active_vtab()
+        self.acting.or_else(|| self.tree.active_vtab())
     }
 
     fn focused_pane(&self) -> Option<(VtabId, ghostrealm_core::tree::PaneId)> {
@@ -1750,7 +1757,11 @@ impl AppState {
 
     /// The active surface of the focused pane of the active vtab.
     pub fn focused_surface(&self) -> Option<SurfaceId> {
-        let vt = self.active()?;
+        self.focused_surface_in(self.active()?)
+    }
+
+    /// The active surface of workspace `vt`'s focused pane.
+    pub(crate) fn focused_surface_in(&self, vt: VtabId) -> Option<SurfaceId> {
         let v = self.tree.vtab(vt)?;
         let pane = v.panes().into_iter().find(|p| p.id == v.focused_pane)?;
         pane.active_surface().map(|s| s.id)
@@ -1954,10 +1965,16 @@ impl AppState {
 
     /// A human/agent-readable dump of the workspace structure.
     pub fn describe(&self) -> String {
+        self.describe_tree(None)
+    }
+
+    /// [`Self::describe`], or with `only` a workspace: that workspace, the
+    /// surfaces in it its agent reaches (and empty ones), and no hidden ones.
+    fn describe_tree(&self, only: Option<VtabId>) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let active = self.active();
-        for v in self.tree.vtabs() {
+        for v in self.tree.vtabs().iter().filter(|v| only.is_none_or(|vt| vt == v.id)) {
             let act = if Some(v.id) == active {
                 " (active)"
             } else {
@@ -1972,6 +1989,9 @@ impl AppState {
                 };
                 let _ = writeln!(out, "  pane {}{}", p.id.0, foc);
                 for (i, s) in p.surfaces.iter().enumerate() {
+                    if only.is_some_and(|vt| self.views.contains_key(&s.id) && !self.agent_reaches(vt, s.id)) {
+                        continue;
+                    }
                     let a = if i == p.active { " (active)" } else { "" };
                     let title = if s.title.is_empty() {
                         "<untitled>"
@@ -1984,6 +2004,9 @@ impl AppState {
         }
         if out.is_empty() {
             out.push_str("(no vtabs)\n");
+        }
+        if only.is_some() {
+            return out;
         }
         let mut hidden: Vec<(&SurfaceId, &HiddenOf)> = self.hidden.iter().collect();
         hidden.sort();

@@ -724,6 +724,10 @@ impl View for TerminalView {
         }
     }
 
+    fn agent_reachable(&self) -> bool {
+        true
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         self.term.write_bytes(bytes);
         true
