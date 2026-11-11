@@ -1602,8 +1602,21 @@
 [2026-11-11T21:49+1300@219d5f58] Agent socket — findings recorded from the review
 
 - Requires: NO BLOCKERS
-- Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. Find the settings workspace by something an agent can't set.
+- Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. Find the settings workspace by something an agent can't set. The same name labels the agent's questions ("From workspace “<name>”"), so an agent can make its questions read as another workspace's. Both want a workspace identity the agent can't set.
 - Detail: a connection that never sends its `hello` holds one of the 32 slots until the window closes. Give the first line a read timeout.
 - Detail: `input` replies before its bytes reach the terminal, so an agent sending input faster than the shell reads it grows the terminal's input queue without bound. Bound the queue, or reply once the bytes are written.
 - Detail: `file.delete` under a workspace's agent refuses a path with a document open in another workspace, checked when the command runs. A delete that first asks (an untracked file) or waits for its git check closes the documents open under the path when it goes ahead, so a document another workspace opened in between is closed too. Check again before the delete goes ahead.
+- Reason: review findings on the live agent channel (feat/agent-channel-live), recorded rather than fixed in that increment.
+
+---
+
+[2026-11-11T22:23+1300@0e3a9371] Agent socket — findings recorded from the fix round's review
+
+- Requires: NO BLOCKERS
+- Detail: a headless app started in a window's terminal (`ghostrealm agent --headless`) keeps the window's `GHOSTREALM_AGENT_SOCKET` and `GHOSTREALM_AGENT_TOKEN` in its process, and `TerminalPlugin::open` sets nothing when `agent_env` is `None`, so its terminals inherit them: `ghostrealm agent` typed there relays to the real window as that workspace. No reach gained. Direction: remove both variables in the headless branch of `run_cli` (`crates/app/src/lib.rs`) before building `AppState`.
+- Detail: close and rebind can race (`crates/app/src/agent/socket.rs`, `Accept::run` and `Server::close`): the accept thread passes its `stop` check, `close` sets `stop` and removes the file, then the recheck finds it missing and binds again, leaving a stale socket file. Direction: check `stop` again inside `bind_again_if_gone`, under the `bound` lock `close` takes.
+- Detail: uncertain: on ext4 or tmpfs a new file can reuse a freed inode, so the `(dev, ino)` guard in `remove_if_bound` could match a replacement, and `a_file_in_the_sockets_place_is_kept` could fail intermittently. Unconfirmed; passes on APFS. Direction: also require the file to still be a socket, and in the test create the new file before unlinking the old.
+- Detail: no test shows `Server::drain` stopping near its budget with requests left and waking the loop again.
+- Detail: the README says "44 tests".
+- Detail: `Confirmed::Trash` closes the documents under the path when the person accepts, without rechecking for unsaved edits made after the question opened. The same holds for the person's own deletes.
 - Reason: review findings on the live agent channel (feat/agent-channel-live), recorded rather than fixed in that increment.
