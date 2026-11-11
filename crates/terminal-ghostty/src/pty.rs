@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 /// A program to run on a PTY, with its arguments, extra environment and
 /// working directory; or the user's login shell.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandBuilder {
     /// The program then its arguments; empty runs the login shell.
     argv: Vec<OsString>,
@@ -29,6 +29,15 @@ pub struct CommandBuilder {
     env: Vec<(OsString, OsString)>,
     /// Used when it is a directory; else the home directory.
     cwd: Option<PathBuf>,
+}
+
+/// Names the environment it sets, not the values: a value can be a secret (a
+/// workspace's agent token).
+impl std::fmt::Debug for CommandBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: Vec<&OsString> = self.env.iter().map(|(k, _)| k).collect();
+        f.debug_struct("CommandBuilder").field("argv", &self.argv).field("env", &env).field("cwd", &self.cwd).finish()
+    }
 }
 
 impl CommandBuilder {
@@ -454,6 +463,14 @@ mod tests {
         // SAFETY: F_GETFD only reads the descriptor's flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         flags >= 0 && flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn debug_names_the_env_it_sets_but_not_the_values() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("GHOSTREALM_AGENT_TOKEN", "s3cret");
+        let shown = format!("{cmd:?}");
+        assert!(shown.contains("GHOSTREALM_AGENT_TOKEN") && !shown.contains("s3cret"), "{shown}");
     }
 
     #[test]
