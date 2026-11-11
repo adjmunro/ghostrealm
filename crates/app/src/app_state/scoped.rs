@@ -78,7 +78,7 @@ impl AppState {
         if self.agent_socket.is_none() || self.agent_tokens.contains_key(&vt) {
             return;
         }
-        match new_token() {
+        match crate::agent::random_hex(32) {
             Ok(token) => {
                 self.agent_tokens.insert(vt, token);
             }
@@ -91,6 +91,12 @@ impl AppState {
         Some((self.agent_socket.clone()?, self.agent_tokens.get(&vt?)?.clone()))
     }
 
+    /// Workspace `vt`'s token, if it has one.
+    #[cfg(test)]
+    pub(crate) fn agent_token(&self, vt: VtabId) -> Option<String> {
+        self.agent_tokens.get(&vt).cloned()
+    }
+
     /// The workspace `token` is the token of, while that workspace is open.
     /// Closing a workspace by any path revokes its token here; workspace ids
     /// aren't reused, so an old token never names a new one. Each token is
@@ -100,14 +106,6 @@ impl AppState {
         self.agent_tokens.retain(|vt, _| tree.vtab(*vt).is_some());
         self.agent_tokens.iter().filter(|(_, t)| same(t.as_bytes(), token.as_bytes())).map(|(vt, _)| *vt).next()
     }
-}
-
-/// 32 random bytes, hex-encoded.
-fn new_token() -> std::io::Result<String> {
-    use std::io::Read;
-    let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Whether `a` and `b` are equal, in a time that depends only on their

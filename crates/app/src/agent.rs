@@ -28,6 +28,16 @@ use serde_json::{json, Value as Json};
 
 use crate::app_state::{build_registry, AppState};
 
+pub mod socket;
+
+/// `bytes` random bytes from `/dev/urandom`, hex-encoded.
+pub(crate) fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Names the window's agent socket in a terminal's environment.
 pub const SOCKET_ENV: &str = "GHOSTREALM_AGENT_SOCKET";
 
@@ -636,6 +646,57 @@ mod tests {
         state.wait_file_jobs();
         let left: Vec<_> = state.take_file_reports().into_iter().map(|r| r.result).collect();
         assert_eq!(left, [Ok(format!("duplicated to {path}/a copy.txt"))], "the user's report stays");
+    }
+
+    /// Given a command whose file job finishes inside it (an inline wait);
+    /// when its reply is settled;
+    /// then it is ready at once, with the job's outcome.
+    #[test]
+    fn a_reply_whose_job_finished_inline_settles_at_once() {
+        let d = crate::plugin::testing::tmpdir("agent-settle-inline");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let mut state = AppState::new().with_file_job_wait(std::time::Duration::from_secs(10));
+        state.new_empty_vtab();
+        let mut registry = build_registry();
+        let req = set("file.duplicate", json!({ "path": d.join("a.txt") }));
+        let Reply::Jobs { since, until, message } = serve(&req, Scope::Full, &mut state, &mut registry) else {
+            panic!("a file job ran");
+        };
+        let want = json!({ "ok": true, "message": format!("duplicated to {}", d.join("a copy.txt").display()) });
+        assert_eq!(settled(&mut state, since, until, &message), Some(want));
+    }
+
+    /// Given a workspace's agent's command whose file job runs in the
+    /// background;
+    /// when its reply is settled as the window polls;
+    /// then it waits while the job is held, then carries the job's outcome
+    /// and takes its report from the window.
+    #[test]
+    fn a_reply_whose_job_runs_in_the_background_settles_once_it_is_done() {
+        let d = crate::plugin::testing::tmpdir("agent-settle-bg");
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        let mut state = AppState::new();
+        let vt = state.new_empty_vtab();
+        let mut registry = build_registry();
+        let req = set("file.duplicate", json!({ "path": d.join("a.txt") }));
+        let Reply::Jobs { since, until, message } = serve(&req, Scope::Workspace(vt), &mut state, &mut registry) else {
+            panic!("a file job ran");
+        };
+        assert!(state.file_jobs_hold(since..until), "no inline wait under a workspace's agent");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let reply = loop {
+            state.poll_file_jobs();
+            let held = state.file_jobs_hold(since..until);
+            match settled(&mut state, since, until, &message) {
+                Some(reply) => break reply,
+                None => assert!(held, "waits only while the job is held"),
+            }
+            assert!(Instant::now() < deadline, "settled");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let want = json!({ "ok": true, "message": format!("duplicated to {}", d.join("a copy.txt").display()) });
+        assert_eq!(reply, want);
+        assert_eq!(state.take_file_reports(), []);
     }
 
     #[test]
