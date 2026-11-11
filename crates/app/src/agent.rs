@@ -950,6 +950,19 @@ mod tests {
         assert!(hits.iter().all(|id| open.contains(id)), "{hits:?}");
     }
 
+    /// Given a workspace's agent;
+    /// when it opens a file in an editor without a `path`;
+    /// then it is refused, and no picker opens.
+    #[test]
+    fn an_agents_editor_open_without_a_path_opens_no_picker() {
+        let mut state = AppState::new();
+        let vt = state.new_empty_vtab();
+        let mut registry = build_registry();
+        let reply = scoped(&mut state, &mut registry, vt, &set("editor.open", json!({})));
+        assert!(error(&reply).contains("the picker is the person's"), "{reply:?}");
+        assert!(!state.picker_open());
+    }
+
     /// Given the window's guard on unsaved changes, a file edited in
     /// workspace A, and the person in workspace B;
     /// when A's agent deletes the file and the person presses Enter at once;
