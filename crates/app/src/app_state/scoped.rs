@@ -26,19 +26,27 @@ impl AppState {
         let out = f(self);
         self.acting = acting;
         self.file_job_wait = wait;
-        match (open, &mut self.confirm) {
-            (None, Some(asked)) => {
-                let name = self.tree.vtab(vt).map(|v| v.name.clone()).unwrap_or_default();
-                asked.message = format!("From workspace \u{201c}{name}\u{201d}: {}", asked.message);
-                asked.late = Some(Instant::now());
+        match open {
+            None => {
+                let from = self.asked_from(vt);
+                if let Some(asked) = &mut self.confirm {
+                    asked.message.insert_str(0, &from);
+                    asked.late = Some(Instant::now());
+                }
             }
-            (Some(open), Some(asked)) if *asked != open => {
+            Some(open) if self.confirm.as_ref().is_some_and(|asked| *asked != open) => {
                 self.confirm = Some(open);
                 return Err("a question is open in the window; try again once the person has answered it".into());
             }
-            _ => {}
+            Some(_) => {}
         }
         Ok(out)
+    }
+
+    /// The start of a question workspace `vt`'s agent raised, naming `vt`.
+    pub(super) fn asked_from(&self, vt: VtabId) -> String {
+        let name = self.tree.vtab(vt).map(|v| v.name.as_str()).unwrap_or_default();
+        format!("From workspace \u{201c}{name}\u{201d}: ")
     }
 
     /// The workspace the running command acts as for an agent, if it does.

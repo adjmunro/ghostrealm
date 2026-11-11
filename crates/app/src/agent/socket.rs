@@ -650,6 +650,31 @@ mod tests {
         assert_eq!(ui.state.take_file_reports(), []);
     }
 
+    /// Given a client with workspace A's token, and the person in workspace
+    /// B;
+    /// when it deletes a file git holds no copy of, and the window settles
+    /// its reply after the check;
+    /// then the reply says the delete awaits the person's answer, and the
+    /// question names A, ignores keys for a moment and leaves the file.
+    #[test]
+    fn an_agents_delete_that_asks_names_its_workspace_and_says_it_awaits_the_person() {
+        let dir = TmpDir::new("sock-delete");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "A").unwrap();
+        let mut ui = Ui::new(&dir.join("s"));
+        let a = ui.state.new_vtab().unwrap();
+        ui.state.rename_active_vtab("agent's");
+        ui.state.new_vtab().unwrap();
+        let mut c = Client::connect(ui.server.path());
+        assert_eq!(c.hello_as(&mut ui, a)["ok"], json!(true));
+        c.send(&json!({ "op": "set", "id": "file.delete", "args": { "path": path } }).to_string());
+        assert_eq!(c.recv(&mut ui), Some(json!({ "ok": true, "message": crate::app_state::AWAITS_ANSWER })));
+        let asked = ui.state.confirm().expect("untracked: asks first");
+        assert!(asked.message.starts_with("From workspace \u{201c}agent's\u{201d}: Move "), "{}", asked.message);
+        assert!(!asked.takes_keys_at(Instant::now()) && asked.enter_cancels());
+        assert!(path.exists());
+    }
+
     /// `ghostrealm agent`'s relay of `input` with `token`, run on a thread
     /// while the window serves: its output and outcome.
     fn relayed(ui: &mut Ui, token: &str, input: &str) -> (String, anyhow::Result<()>) {

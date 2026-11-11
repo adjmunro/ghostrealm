@@ -39,6 +39,8 @@ mod files;
 mod open;
 mod scoped;
 pub use files::{FileClip, FileReport};
+#[cfg(test)]
+pub(crate) use files::AWAITS_ANSWER;
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";

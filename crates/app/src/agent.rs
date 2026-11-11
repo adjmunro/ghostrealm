@@ -624,13 +624,11 @@ mod tests {
         let dup = format!(r#"{{"op":"set","id":"file.duplicate","args":{{"path":"{path}/a.txt"}}}}"#);
         let resp = handle(&dup, &mut state, &mut registry);
         assert_eq!(resp["message"], json!(format!("duplicated to {path}/a copy.txt")), "{resp:?}");
-        // Delete's check says nothing once done (here it asks first).
+        // Delete's check asks first (the file is untracked), and says so.
         let del = format!(r#"{{"op":"set","id":"file.delete","args":{{"path":"{path}/a.txt"}}}}"#);
         let resp = handle(&del, &mut state, &mut registry);
-        assert_eq!(resp, json!({ "ok": true, "message": null }));
-        if ghostrealm_core::git::repo_root(&d).is_none() {
-            assert!(state.confirm().is_some(), "untracked: asks first");
-        }
+        assert_eq!(resp, json!({ "ok": true, "message": crate::app_state::AWAITS_ANSWER }));
+        assert!(state.confirm().is_some(), "untracked: asks first");
     }
 
     #[test]
@@ -972,7 +970,7 @@ mod tests {
         let mut registry = build_registry();
         let delete = set("file.delete", json!({ "path": path }));
         let reply = scoped(&mut state, &mut registry, a, &delete);
-        assert_eq!(reply["ok"], json!(true), "{reply:?}");
+        assert_eq!(reply, json!({ "ok": true, "message": crate::app_state::AWAITS_ANSWER }));
         let asked = state.confirm().expect("asks about the unsaved changes").clone();
         assert!(asked.message.starts_with("From workspace \u{201c}agent's\u{201d}: "), "{}", asked.message);
         assert!(!asked.takes_keys_at(Instant::now()) && asked.enter_cancels());

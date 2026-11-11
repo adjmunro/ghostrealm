@@ -25,6 +25,10 @@ use crate::plugins::terminal;
 /// slower one is applied when it finishes.
 pub(super) const INLINE_WAIT: Duration = Duration::from_millis(30);
 
+/// What a Delete that asked says: nothing is trashed until the person
+/// answers in the window.
+pub(crate) const AWAITS_ANSWER: &str = "the delete awaits the person's answer in the window";
+
 /// How a file job that finished after its command returned turned out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileReport {
@@ -425,8 +429,8 @@ impl AppState {
             }
             // A copy or move using the path while git looked may have changed
             // what git saw (or be reading from it): ask.
-            (FileJob::DeleteCheck { path, vtab }, Ok(Output::Clean(clean))) => {
-                self.delete_checked(&path, clean && !busy, vtab).map(|()| String::new())
+            (FileJob::DeleteCheck { path, vtab, agent }, Ok(Output::Clean(clean))) => {
+                self.delete_checked(&path, clean && !busy, vtab, agent)
             }
             (_, Err(e)) => Err(e),
             (job, Ok(output)) => bail!("{} produced {output:?}", job.command()),
@@ -541,7 +545,8 @@ impl AppState {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
         }
-        if let Some(vt) = self.agent_scope() {
+        let agent = self.agent_scope();
+        if let Some(vt) = agent {
             // Trashing closes the documents of it wherever they are.
             if self.docs_under(path).iter().any(|(sid, _)| self.vtab_of_surface(*sid) != Some(vt)) {
                 bail!("{} is open outside this workspace", path.display());
@@ -551,16 +556,18 @@ impl AppState {
         let unsaved = self.unsaved_under(path);
         if !unsaved.is_empty() {
             self.ask_unsaved_trash(path, &unsaved, vtab);
-            return Ok(String::new());
+            return Ok(AWAITS_ANSWER.into());
         }
-        self.run_file_job(FileJob::DeleteCheck { path: path.to_path_buf(), vtab })
+        self.run_file_job(FileJob::DeleteCheck { path: path.to_path_buf(), vtab, agent })
     }
 
     /// Finish a Delete once git said whether it holds a copy of `path`
     /// (`clean`). What changed during the check counts: the entry must still
     /// be there, a view of it edited meanwhile asks about its unsaved
-    /// changes, and a question opened meanwhile (a quit) isn't replaced.
-    fn delete_checked(&mut self, path: &Path, clean: bool, vtab: Option<VtabId>) -> Result<()> {
+    /// changes, and a question opened meanwhile (a quit) isn't replaced. A
+    /// question for workspace `agent`'s agent names that workspace: the
+    /// command that asked for it has returned. Returns what the command says.
+    fn delete_checked(&mut self, path: &Path, clean: bool, vtab: Option<VtabId>, agent: Option<VtabId>) -> Result<String> {
         if path.symlink_metadata().is_err() {
             bail!("{} doesn't exist", path.display());
         }
@@ -581,8 +588,15 @@ impl AppState {
             });
         } else {
             self.delete_now(path, vtab)?;
+            return Ok(String::new());
         }
-        Ok(())
+        if let Some(vt) = agent {
+            let from = self.asked_from(vt);
+            if let Some(asked) = &mut self.confirm {
+                asked.message.insert_str(0, &from);
+            }
+        }
+        Ok(AWAITS_ANSWER.into())
     }
 
     /// The documents showing `path` or something in it with unsaved changes
@@ -1646,7 +1660,7 @@ mod tests {
     fn a_running_delete_check_doesnt_hold_up_a_quit() {
         let d = tmpdir("fm-quit-check");
         let mut s = guarded_app();
-        s.file_jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
+        s.file_jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None, agent: None });
         s.request_quit();
         assert!(s.confirm().is_none() && s.quitting());
     }
@@ -1661,7 +1675,7 @@ mod tests {
         start(&mut s, "file.delete", &[("path", &d.join("b.txt"))]).unwrap();
         s.wait_file_jobs();
         let reports = s.take_file_reports();
-        assert_eq!(reports[0].result, Ok(String::new()));
+        assert_eq!(reports[0].result, Ok(AWAITS_ANSWER.into()));
         let err = reports[1].result.as_ref().unwrap_err();
         assert!(err.contains("another question is open"), "{err}");
         assert!(s.confirm().unwrap().message.contains("a.txt"), "the first question stays");

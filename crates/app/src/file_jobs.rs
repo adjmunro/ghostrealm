@@ -35,8 +35,10 @@ pub enum FileJob {
     Duplicate { src: PathBuf },
     /// Find whether git holds a copy of everything at `path` (tracked and
     /// unmodified), which decides whether Delete asks first, for the
-    /// workspace `vtab` (whose file history records the Trash).
-    DeleteCheck { path: PathBuf, vtab: Option<VtabId> },
+    /// workspace `vtab` (whose file history records the Trash). `agent` is
+    /// the workspace whose agent asked for it: a question the check leads to
+    /// names it.
+    DeleteCheck { path: PathBuf, vtab: Option<VtabId>, agent: Option<VtabId> },
     /// A copy of `src` into `dir` that runs until `until` exists, for tests
     /// that need one in flight.
     #[cfg(test)]
@@ -461,11 +463,11 @@ pub mod tests {
     fn a_delete_check_doesnt_wait_behind_a_copy_or_count_as_pending() {
         let d = tmpdir("jobs-lanes");
         let mut jobs = FileJobs::default();
-        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None, agent: None });
         assert!(jobs.idle(), "a check alone holds up nothing");
         jobs.wait_all();
         let hold = jobs.submit(FileJob::Hold { src: d.join("a"), dir: d.join("b"), until: d.join("go") });
-        let check = jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
+        let check = jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None, agent: None });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("the check finishes first");
         assert_eq!(done.id, check);
         assert!(!jobs.idle(), "the copy still runs");
@@ -483,7 +485,7 @@ pub mod tests {
         let hold = |until: &str| FileJob::Hold { src: d.join("a/b"), dir: d.join("to"), until: d.join(until) };
         jobs.submit(hold("go"));
         for (path, busy) in [("a", true), ("a/b/c", true), ("a/bc", false), ("to/x", true), ("elsewhere", false)] {
-            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None });
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None, agent: None });
             let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
             assert_eq!(done.busy, busy, "{path}");
         }
@@ -492,7 +494,7 @@ pub mod tests {
         std::fs::write(d.join("go"), "").unwrap();
         let done = jobs.wait_all();
         assert_eq!(done.len(), 2);
-        let check = jobs.submit(FileJob::DeleteCheck { path: d.join("late"), vtab: None });
+        let check = jobs.submit(FileJob::DeleteCheck { path: d.join("late"), vtab: None, agent: None });
         jobs.submit(FileJob::Duplicate { src: d.join("late/f") });
         let done = jobs.wait_all();
         assert!(done.iter().find(|x| x.id == check).unwrap().busy);
@@ -506,16 +508,16 @@ pub mod tests {
         std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
         let mut jobs = FileJobs::default();
         jobs.submit(FileJob::Hold { src: d.join("link/a"), dir: d.join("to"), until: d.join("go") });
-        jobs.submit(FileJob::DeleteCheck { path: d.join("real/a"), vtab: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("real/a"), vtab: None, agent: None });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(done.busy, "the same folder, spelled through the link");
         // The link the copy reads through, though only a link.
-        jobs.submit(FileJob::DeleteCheck { path: d.join("link"), vtab: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("link"), vtab: None, agent: None });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(done.busy, "it holds the copy's source as spelled");
         // Inside the destination, spelled through the link, before it exists.
-        jobs.submit(FileJob::DeleteCheck { path: d.join("link/../to/new"), vtab: None });
-        jobs.submit(FileJob::DeleteCheck { path: d.join("elsewhere"), vtab: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("link/../to/new"), vtab: None, agent: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.join("elsewhere"), vtab: None, agent: None });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(done.busy, "inside the destination folder");
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
@@ -532,7 +534,7 @@ pub mod tests {
         let mut jobs = FileJobs::default();
         jobs.submit(FileJob::Hold { src: d.join("real/b"), dir: d.join("to"), until: d.join("go") });
         for (path, busy) in [("real/a/..", true), ("real/./b", true), ("real/a/../a", false), ("nope/../to/x", true)] {
-            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None });
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None, agent: None });
             let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
             assert_eq!(done.busy, busy, "{path}");
         }
@@ -554,7 +556,7 @@ pub mod tests {
         jobs.submit(FileJob::Hold { src: d.join("link"), dir: d.join("elsewhere"), until: d.join("go") });
         jobs.submit(FileJob::Hold { src: d.join("src"), dir: d.join("other/to"), until: d.join("go") });
         for (path, busy) in [("x/../link", true), ("link/../to/nonex", true), ("to/nonex", false)] {
-            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None });
+            jobs.submit(FileJob::DeleteCheck { path: d.join(path), vtab: None, agent: None });
             let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).unwrap();
             assert_eq!(done.busy, busy, "{path}");
         }
@@ -567,9 +569,9 @@ pub mod tests {
         let mut jobs = FileJobs::default();
         assert!(jobs.take_until(Instant::now() + Duration::from_millis(5)).is_none(), "no worker yet");
         let d = tmpdir("jobs-deadline");
-        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
+        jobs.submit(FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None, agent: None });
         let done = jobs.take_until(Instant::now() + Duration::from_secs(30)).expect("arrives");
-        assert_eq!(done.job, FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None });
+        assert_eq!(done.job, FileJob::DeleteCheck { path: d.to_path_buf(), vtab: None, agent: None });
         assert!(matches!(done.result.unwrap(), Output::Clean(_)));
     }
 }
