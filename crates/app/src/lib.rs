@@ -41,7 +41,11 @@ use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
 
 /// Dispatch the CLI:
 /// - `ghostrealm`                 → open the window (single terminal, for now)
-/// - `ghostrealm agent [cmd...]`  → JSON agent channel over stdin/stdout
+/// - `ghostrealm agent`           → JSON agent channel over stdin/stdout: in a
+///   window's terminal (`GHOSTREALM_AGENT_SOCKET` set), that window's, as the
+///   terminal's workspace; else a headless app's
+/// - `ghostrealm agent --headless [cmd...]` → a headless app's, whose first
+///   terminal runs `cmd`
 /// - `ghostrealm dump [cmd...]`   → headless: run a command, print the grid
 /// - `ghostrealm lsp <name>`      → serve a first-party language server on stdio
 pub fn run_cli() -> Result<()> {
@@ -49,6 +53,22 @@ pub fn run_cli() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("agent") => {
             args.remove(0);
+            let headless = args.first().is_some_and(|a| a == "--headless");
+            if headless {
+                args.remove(0);
+            }
+            if let Some(socket) = std::env::var_os(agent::SOCKET_ENV).filter(|_| !headless) {
+                if !args.is_empty() {
+                    anyhow::bail!("a window's agent channel runs no command of its own; `ghostrealm agent --headless {}` does", args.join(" "));
+                }
+                let token = std::env::var(agent::TOKEN_ENV).unwrap_or_default();
+                let stdin = std::io::stdin();
+                return agent::client::relay(socket.as_ref(), &token, stdin.lock(), std::io::stdout().lock());
+            }
+            // Its web pages are on a profile of its own, never the person's.
+            if std::env::var_os(ghostrealm_web::profile::CACHE_ENV).is_none() {
+                std::env::set_var(ghostrealm_web::profile::CACHE_ENV, ghostrealm_web::profile::headless_agent_root());
+            }
             let mut state = app_state::AppState::new();
             if !args.is_empty() {
                 state = app_state::AppState::new().with_shell_line(args.join(" "));

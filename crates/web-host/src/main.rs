@@ -18,10 +18,6 @@ use std::sync::{Mutex, OnceLock};
 use cef::*;
 use ghostrealm_web::protocol::{Event, Request, PROTOCOL_VERSION};
 
-/// Overrides the profile root: CEF's `root_cache_path`, which holds the
-/// profile's cookies, cache and local storage in `Default/`.
-const CACHE_ENV: &str = "GHOSTREALM_WEB_CACHE";
-
 /// How long closing the browsers may take after the app hangs up before the
 /// host exits anyway, so a stalled CEF shutdown never leaves it running.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -70,24 +66,6 @@ fn running(pid: u32) -> bool {
         let _ = pid;
         true
     }
-}
-
-/// Profile root: `$GHOSTREALM_WEB_CACHE`, else the platform cache dir.
-fn cache_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os(CACHE_ENV) {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let base = if cfg!(target_os = "macos") {
-        home.join("Library/Caches")
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cache"))
-    };
-    base.join("ghostrealm").join("web")
 }
 
 /// Point Chromium's temp dir at one of this host's own ([`HostTemp`]), unless
@@ -152,7 +130,7 @@ fn main() -> ExitCode {
     ghostrealm_web::frame::remove_stale(&frames, running);
     ghostrealm_web::frame::remove_stale_dirs(&temp, running);
     let _ = FRAME_DIR.set(frames);
-    let cache = cache_dir();
+    let cache = ghostrealm_web::profile::root();
     let _ = std::fs::create_dir_all(&cache);
     // CEF resolves symlinks in `root_cache_path` (as under macOS's temp dir,
     // `/var` -> `/private/var`) but not in `cache_path`, which must be the

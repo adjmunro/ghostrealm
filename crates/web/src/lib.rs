@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod frame;
+pub mod profile;
 pub mod protocol;
 pub mod temp;
 

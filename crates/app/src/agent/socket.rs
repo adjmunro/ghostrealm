@@ -650,6 +650,49 @@ mod tests {
         assert_eq!(ui.state.take_file_reports(), []);
     }
 
+    /// `ghostrealm agent`'s relay of `input` with `token`, run on a thread
+    /// while the window serves: its output and outcome.
+    fn relayed(ui: &mut Ui, token: &str, input: &str) -> (String, anyhow::Result<()>) {
+        let (path, token, input) = (ui.server.path().to_path_buf(), token.to_string(), input.to_string());
+        let relay = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let result = super::super::client::relay(&path, &token, input.as_bytes(), &mut out);
+            (String::from_utf8(out).unwrap(), result)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !relay.is_finished() {
+            assert!(Instant::now() < deadline, "relayed");
+            ui.serve();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        relay.join().unwrap()
+    }
+
+    /// Given a window with workspaces A and B;
+    /// when `ghostrealm agent` relays requests with A's token, and again with
+    /// a token no workspace has;
+    /// then each request's reply is written, one line each, for A; and the
+    /// unknown token is an error that names no other way in.
+    #[test]
+    fn the_agent_command_relays_requests_as_its_terminals_workspace() {
+        let dir = TmpDir::new("sock-relay");
+        let mut ui = Ui::new(&dir.join("s"));
+        let a = ui.state.new_vtab().unwrap();
+        ui.state.new_vtab().unwrap();
+        let token = ui.token(a);
+        let (out, result) = relayed(&mut ui, &token, "{\"op\":\"get\",\"what\":\"tree\"}\n\n{\"op\":\"pump\"}\n");
+        result.unwrap();
+        let replies: Vec<Json> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 2, "{out}");
+        assert_eq!(replies[0]["tree"].as_str().unwrap().matches("vtab ").count(), 1, "A's alone: {out}");
+        assert_eq!(replies[1], json!({ "ok": true }));
+        let (out, result) = relayed(&mut ui, &"0".repeat(64), "{\"op\":\"pump\"}\n");
+        let error = format!("{:#}", result.unwrap_err());
+        assert_eq!(out, "");
+        assert!(error.contains(REFUSED), "{error}");
+        assert!(!error.contains("headless") && !error.contains("unset"), "{error}");
+    }
+
     /// Given a server;
     /// when it closes;
     /// then its socket file is gone.

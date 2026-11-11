@@ -28,6 +28,7 @@ use serde_json::{json, Value as Json};
 
 use crate::app_state::{build_registry, AppState};
 
+pub mod client;
 pub mod socket;
 
 /// `bytes` random bytes from `/dev/urandom`, hex-encoded.
