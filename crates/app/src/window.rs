@@ -2168,14 +2168,6 @@ impl State {
         self.exit_if_quitting();
     }
 
-    /// Exit the process once a quit has been agreed. Hides the window first
-    /// for instant visual feedback, then exits outright: graceful teardown
-    /// (the wgpu/Metal device drop) is synchronous and can stall for seconds,
-    /// sometimes long enough that macOS marks the app unresponsive. Exiting
-    /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
-    /// child shells, exactly as closing any terminal does. A copy or move
-    /// still running was asked about before the quit was agreed; the copies
-    /// and moves the file worker finished are reported first.
     /// Serve the agent channel on a socket of this window's, its requests
     /// waking the loop. Without one, a warning says so and terminals get no
     /// agent environment.
@@ -2206,6 +2198,14 @@ impl State {
         }
     }
 
+    /// Exit the process once a quit has been agreed. Hides the window first
+    /// for instant visual feedback, then exits outright: graceful teardown
+    /// (the wgpu/Metal device drop) is synchronous and can stall for seconds,
+    /// sometimes long enough that macOS marks the app unresponsive. Exiting
+    /// lets the OS reclaim threads and fds; the closing PTY masters SIGHUP the
+    /// child shells, exactly as closing any terminal does. A copy or move
+    /// still running was asked about before the quit was agreed; the copies
+    /// and moves the file worker finished are reported first.
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
