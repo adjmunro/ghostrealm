@@ -13,10 +13,15 @@
 //!   defaulting to the focused surface)
 //! - `{"op":"pump"}`                         → drain background output
 //!
-//! One JSON object per request line, one JSON object per response line. Being
-//! generic over `BufRead`/`Write` keeps it testable with in-memory buffers and
-//! reusable for a socket later. It is the agent's drive + observe loop, and the
-//! display-free way to test app behaviour end to end.
+//! One JSON object per request line, one JSON object per response line. It is
+//! the agent's drive + observe loop, and the display-free way to test app
+//! behaviour end to end.
+//!
+//! Two channels serve it, both through [`serve`]: the headless one ([`run`],
+//! `ghostrealm agent --headless`), where the whole app is the agent's; and a
+//! window's socket ([`socket`], which `ghostrealm agent` reaches through
+//! [`client`] from that window's terminals), where each connection is one
+//! workspace's agent ([`Scope::Workspace`]).
 
 use std::io::{BufRead, Write};
 use std::sync::mpsc;

@@ -89,6 +89,9 @@ pub fn run_cli() -> Result<()> {
             dump(&command_line)
         }
         _ => {
+            // Its terminals get this window's socket and tokens; none of another's.
+            std::env::remove_var(agent::SOCKET_ENV);
+            std::env::remove_var(agent::TOKEN_ENV);
             let command_line = if args.is_empty() {
                 None
             } else {

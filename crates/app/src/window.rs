@@ -87,6 +87,9 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const SHAPE_BUDGET: Duration = Duration::from_millis(5);
 /// How long a tooltip's anchor must stay hovered before the tooltip shows.
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
+/// How long serving the agent socket's waiting requests may take before the
+/// loop handles input; it is woken again for the rest.
+const AGENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 /// Max child-output bytes drained per surface per frame. Bounds VT-parse work so
 /// one burst can't stall a frame; the remainder is pumped on following frames.
 const PUMP_BUDGET: usize = 512 * 1024;
@@ -126,6 +129,8 @@ enum UserEvent {
     /// The system asked the app to terminate (the app menu, the Dock, logout)
     /// and is waiting for `about_to_wait` to answer.
     Terminate,
+    /// The agent socket has requests waiting.
+    Agent,
 }
 
 pub fn run(command_line: Option<String>) -> Result<()> {
@@ -278,6 +283,14 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::FontsLoaded => state.upgrade_fonts(),
             // Answered in `about_to_wait`, once the unsaved state is exact.
             UserEvent::Terminate => {}
+            UserEvent::Agent => {
+                if let Some(agent) = &mut state.agent {
+                    if agent.drain(&mut state.app, &mut state.registry, AGENT_DRAIN_BUDGET) {
+                        state.dirty = true;
+                        state.window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -286,6 +299,7 @@ impl ApplicationHandler<UserEvent> for App {
     /// file worker finished, as an in-window quit does before it exits.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            state.close_agent_socket();
             state.app.poll_file_jobs_on_exit();
             state.print_file_reports();
         }
@@ -304,6 +318,11 @@ impl ApplicationHandler<UserEvent> for App {
             if let Some(cb) = state.clipboard.as_mut() {
                 let _ = cb.set_text(text);
             }
+        }
+        // Before the reports are toasted: an agent's command takes its own.
+        if state.agent.as_mut().is_some_and(|agent| agent.settle(&mut state.app)) {
+            state.dirty = true;
+            state.window.request_redraw();
         }
         if state.app.toast_file_reports() {
             state.dirty = true;
@@ -752,6 +771,8 @@ struct State {
 
     app: AppState,
     registry: Registry<AppState>,
+    /// The agent socket this window serves, if it could bind one.
+    agent: Option<crate::agent::socket::Server>,
     /// Every config option, for checking the config file on (re)load.
     catalogue: Arc<Catalogue>,
     cfg: Config,
@@ -1328,6 +1349,8 @@ impl State {
         app.set_inbox_config(cfg.inbox);
         app.set_default_dir(cfg.default_dir());
         app.set_close_on_exit(cfg.terminal.close_on_exit);
+        // Before the first terminal, which gets the socket in its environment.
+        let agent = Self::serve_agents(&mut app, proxy.clone());
         // A CLI command spawns a terminal running it; a bare launch opens the empty
         // "nothing open" workspace where the user picks what to open.
         if has_command {
@@ -1437,6 +1460,7 @@ impl State {
             quad_capacity,
             app,
             registry,
+            agent,
             catalogue,
             cfg,
             chrome,
@@ -2152,9 +2176,40 @@ impl State {
     /// child shells, exactly as closing any terminal does. A copy or move
     /// still running was asked about before the quit was agreed; the copies
     /// and moves the file worker finished are reported first.
+    /// Serve the agent channel on a socket of this window's, its requests
+    /// waking the loop. Without one, a warning says so and terminals get no
+    /// agent environment.
+    fn serve_agents(app: &mut AppState, proxy: EventLoopProxy<UserEvent>) -> Option<crate::agent::socket::Server> {
+        use crate::agent::socket;
+        let waker: socket::Waker = Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::Agent);
+        });
+        let uid = socket::uid();
+        match socket::Server::bind(&socket::dir(uid), uid, waker) {
+            Ok(server) => {
+                app.set_agent_socket(server.path().to_path_buf());
+                Some(server)
+            }
+            Err(e) => {
+                app.notify(Toast::new(Level::Warning, format!("Agent channel unavailable: {e}")));
+                None
+            }
+        }
+    }
+
+    /// Stop serving the agent socket and remove it. AppKit's terminate and
+    /// [`Self::exit_if_quitting`] exit without dropping the window, so they
+    /// call this.
+    fn close_agent_socket(&mut self) {
+        if let Some(agent) = &mut self.agent {
+            agent.close();
+        }
+    }
+
     fn exit_if_quitting(&mut self) {
         if self.app.quitting() {
             self.window.set_visible(false);
+            self.close_agent_socket();
             self.app.poll_file_jobs_on_exit();
             self.print_file_reports();
             std::process::exit(0);
