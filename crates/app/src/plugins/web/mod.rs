@@ -394,6 +394,9 @@ impl Plugin for WebPlugin {
     }
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
+        let web_meta = |id, title, description| {
+            CommandMeta::new(id, title, description).agent_refused(crate::app_state::WEB_PAGES)
+        };
         let id_arg = || {
             ArgSpec::optional(
                 "id",
@@ -402,7 +405,7 @@ impl Plugin for WebPlugin {
             )
         };
         r.register(
-            CommandMeta::new(
+            web_meta(
                 "web.new",
                 "New Web Browser",
                 "Open a web page in the focused pane",
@@ -434,7 +437,7 @@ impl Plugin for WebPlugin {
             }),
         );
         r.register(
-            CommandMeta::new(
+            web_meta(
                 "web.navigate",
                 "Web: Go to URL",
                 "Load an address or search in a web surface",
@@ -465,7 +468,7 @@ impl Plugin for WebPlugin {
             ("web.reload", "Web: Reload", "Reload a web surface's page"),
         ] {
             r.register(
-                CommandMeta::new(cmd, title, desc).arg(id_arg()),
+                web_meta(cmd, title, desc).arg(id_arg()),
                 Box::new(move |s: &mut AppState, a| {
                     let page = target(s, a)?;
                     let done = match cmd {
@@ -482,7 +485,7 @@ impl Plugin for WebPlugin {
             );
         }
         r.register(
-            CommandMeta::new(
+            web_meta(
                 "web.close",
                 "Web: Close",
                 "Close a web surface: a hidden pop-up (see `get tree`), or a tab",
@@ -499,7 +502,7 @@ impl Plugin for WebPlugin {
             }),
         );
         r.register(
-            CommandMeta::new(
+            web_meta(
                 "web.focus_url",
                 "Web: Edit URL",
                 "Focus the focused web page's URL bar",
@@ -510,7 +513,7 @@ impl Plugin for WebPlugin {
             }),
         );
         r.register(
-            CommandMeta::new(
+            web_meta(
                 "web.eval",
                 "Web: Evaluate JavaScript",
                 "Run JavaScript in a web page (after it loads) and return its JSON-encoded \

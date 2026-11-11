@@ -110,7 +110,8 @@ impl Plugin for FileBrowserPlugin {
                 "file_browser.new",
                 "New File Browser",
                 "Open a Files surface showing only its file sidebar in the focused pane",
-            ),
+            )
+            .agent_workspace(),
             Box::new(|s: &mut AppState, _| {
                 s.open_plugin_in_focused(files::ID)
                     .map_err(|e| CmdError::Failed(format!("{e:#}")))?;

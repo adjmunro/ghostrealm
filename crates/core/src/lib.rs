@@ -24,7 +24,7 @@ pub mod tree;
 
 pub use config::{Chrome, CloseOnExit, Config, HeaderIcon, Headings, Inbox, LineNumbers, Side, Web};
 
-pub use command::{ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
+pub use command::{AgentReach, ArgError, ArgKind, ArgSpec, Args, CommandMeta, Value};
 pub use registry::{CmdError, CmdOutcome, Registry, SearchHit};
 pub use tab_drop::{Edge, TabDrop};
 pub use tree::{Axis, Divider, Node, Pane, PaneId, Rect, SplitPath, Surface, SurfaceId, TabStatus, Tree, Vtab, VtabId};

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ghostrealm_core::{git, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry, VtabId};
+use ghostrealm_core::{git, AgentReach, ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Registry, VtabId};
 
 use super::{AppState, Confirm, Confirmed, DocRef, Pick};
 use crate::file_history::{FileHistory, FileOp, Fresh};
@@ -653,15 +653,24 @@ fn pasted_message(pasted: &file_ops::Moved) -> String {
     format!("pasted {}{left}", pasted.dest.display())
 }
 
+/// Why a workspace's agent may not run a command that reaches the person's
+/// desktop: the system clipboard, the file manager, other apps.
+const DESKTOP: &str = "it reaches the person's desktop";
+
+/// Why a workspace's agent may not Cut, Copy or Paste files.
+const FILE_CLIP: &str = "it uses the person's file clipboard";
+
 fn dir_arg() -> ArgSpec {
     ArgSpec::optional("dir", ArgKind::Str, "the folder (the focused file's folder unless given)")
 }
 
 /// Register the `file.*` commands.
 pub(super) fn register(r: &mut Registry<AppState>) {
-    let mut path_command = |action: FileAction, description: &'static str, run: fn(&mut AppState, &Path) -> Result<String>| {
+    let mut path_command = |action: FileAction, agent: AgentReach, description: &'static str, run: fn(&mut AppState, &Path) -> Result<String>| {
+        let mut meta = CommandMeta::new(action.command(), action.title(), description).arg(path_arg());
+        meta.agent = agent;
         r.register(
-            CommandMeta::new(action.command(), action.title(), description).arg(path_arg()),
+            meta,
             Box::new(move |s: &mut AppState, a| {
                 let path = s.subject_or(a.opt_str("path"))?;
                 let msg = run(s, &path).map_err(failed)?;
@@ -669,44 +678,45 @@ pub(super) fn register(r: &mut Registry<AppState>) {
             }),
         );
     };
-    path_command(FileAction::Reveal, "Show a file or folder in the system file manager", |s, p| {
+    path_command(FileAction::Reveal, AgentReach::Refused(DESKTOP), "Show a file or folder in the system file manager", |s, p| {
         s.system.reveal(p).map(|()| String::new())
     });
-    path_command(FileAction::OpenDefault, "Open a file or folder with its default application", |s, p| {
+    path_command(FileAction::OpenDefault, AgentReach::Refused(DESKTOP), "Open a file or folder with its default application", |s, p| {
         s.system.open_default(p).map(|()| String::new())
     });
-    path_command(FileAction::OpenInTerminal, "Open a new terminal in a folder (a file's folder)", |s, p| {
+    path_command(FileAction::OpenInTerminal, AgentReach::Workspace, "Open a new terminal in a folder (a file's folder)", |s, p| {
         s.open_terminal_at(p).map(|()| String::new())
     });
-    path_command(FileAction::ShowInBrowser, "Show a file in a file browser", |s, p| {
+    path_command(FileAction::ShowInBrowser, AgentReach::Workspace, "Show a file in a file browser", |s, p| {
         s.show_in_browser(p).map(|()| String::new())
     });
-    path_command(FileAction::Cut, "Cut a file or folder, to move it with Paste", |s, p| {
+    path_command(FileAction::Cut, AgentReach::Refused(FILE_CLIP), "Cut a file or folder, to move it with Paste", |s, p| {
         s.clip_file(p, true);
         Ok(String::new())
     });
-    path_command(FileAction::Copy, "Copy a file or folder, to copy it with Paste", |s, p| {
+    path_command(FileAction::Copy, AgentReach::Refused(FILE_CLIP), "Copy a file or folder, to copy it with Paste", |s, p| {
         s.clip_file(p, false);
         Ok(String::new())
     });
-    path_command(FileAction::Duplicate, "Copy a file or folder next to itself", |s, p| s.duplicate_path(p));
-    path_command(FileAction::CopyPath, "Copy a file's absolute path to the clipboard", |s, p| {
+    path_command(FileAction::Duplicate, AgentReach::Workspace, "Copy a file or folder next to itself", |s, p| s.duplicate_path(p));
+    path_command(FileAction::CopyPath, AgentReach::Refused(DESKTOP), "Copy a file's absolute path to the clipboard", |s, p| {
         Ok(s.copy_path_text(p, false))
     });
-    path_command(FileAction::CopyRelativePath, "Copy a file's path relative to the workspace root", |s, p| {
+    path_command(FileAction::CopyRelativePath, AgentReach::Refused(DESKTOP), "Copy a file's path relative to the workspace root", |s, p| {
         Ok(s.copy_path_text(p, true))
     });
-    path_command(FileAction::AddToGitignore, "Add a file or folder to its repository's .gitignore", |s, p| {
+    path_command(FileAction::AddToGitignore, AgentReach::Workspace, "Add a file or folder to its repository's .gitignore", |s, p| {
         s.ignore_path(p, false).map(|changed| if changed { "added".into() } else { "already ignored".into() })
     });
-    path_command(FileAction::AddToExclude, "Add a file or folder to its repository's .git/info/exclude", |s, p| {
+    path_command(FileAction::AddToExclude, AgentReach::Workspace, "Add a file or folder to its repository's .git/info/exclude", |s, p| {
         s.ignore_path(p, true).map(|changed| if changed { "added".into() } else { "already excluded".into() })
     });
-    path_command(FileAction::SaveCopyAs, "Save a copy of an open document's file to a file chosen in a picker", |s, p| {
+    path_command(FileAction::SaveCopyAs, AgentReach::Refused(crate::app_state::PICKER), "Save a copy of an open document's file to a file chosen in a picker", |s, p| {
         s.save_copy_of(p).map(|()| String::new())
     });
     path_command(
         FileAction::Delete,
+        AgentReach::Workspace,
         "Move a file or folder to the Trash, asking first unless git holds a copy; closes its editors",
         |s, p| s.delete_path(p),
     );
@@ -718,7 +728,8 @@ pub(super) fn register(r: &mut Registry<AppState>) {
         r.register(
             CommandMeta::new(action.command(), action.title(), description)
                 .arg(ArgSpec::required("name", ArgKind::Str, "the new name"))
-                .arg(dir_arg()),
+                .arg(dir_arg())
+                .agent_workspace(),
             Box::new(move |s: &mut AppState, a| {
                 let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
                 let path = s.new_entry(&dir, a.get_str("name")?, folder).map_err(failed)?;
@@ -732,7 +743,8 @@ pub(super) fn register(r: &mut Registry<AppState>) {
             FileAction::Paste.title(),
             "Paste the cut or copied file or folder into a folder",
         )
-        .arg(dir_arg()),
+        .arg(dir_arg())
+        .agent_refused(FILE_CLIP),
         Box::new(|s: &mut AppState, a| {
             let dir = s.dir_or(a.opt_str("dir")).map_err(failed)?;
             Ok(CmdOutcome::msg(s.paste_into(&dir).map_err(failed)?))
@@ -741,7 +753,8 @@ pub(super) fn register(r: &mut Registry<AppState>) {
     r.register(
         CommandMeta::new(FileAction::Rename.command(), FileAction::Rename.title(), "Rename a file or folder")
             .arg(ArgSpec::required("name", ArgKind::Str, "the new name"))
-            .arg(path_arg()),
+            .arg(path_arg())
+            .agent_workspace(),
         Box::new(|s: &mut AppState, a| {
             let path = s.subject_or(a.opt_str("path"))?;
             let path = s.rename_path(&path, a.get_str("name")?).map_err(failed)?;

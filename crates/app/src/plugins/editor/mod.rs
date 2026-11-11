@@ -208,7 +208,7 @@ impl Plugin for EditorPlugin {
     fn register_commands(&self, r: &mut Registry<AppState>) {
         let failed = |e: anyhow::Error| CmdError::Failed(format!("{e:#}"));
         r.register(
-            CommandMeta::new("editor.new", "New Editor", "Open an empty text document in a Files surface"),
+            CommandMeta::new("editor.new", "New Editor", "Open an empty text document in a Files surface").agent_workspace(),
             Box::new(move |s: &mut AppState, _| {
                 s.open_scratch().map_err(failed)?;
                 Ok(CmdOutcome::ok())
@@ -220,7 +220,8 @@ impl Plugin for EditorPlugin {
                 "Open File in Editor",
                 "Open a file in a Files surface: the focused one, else the workspace's last focused one, else a new one",
             )
-            .arg(ArgSpec::optional("path", ArgKind::Str, "the file to open (chosen in a picker unless given)")),
+            .arg(ArgSpec::optional("path", ArgKind::Str, "the file to open (chosen in a picker unless given)"))
+            .agent_workspace(),
             Box::new(move |s: &mut AppState, a| {
                 if a.get("path").is_none() {
                     s.open_picker(crate::app_state::Pick::Open);
@@ -236,7 +237,8 @@ impl Plugin for EditorPlugin {
                 "editor.toggle_comment",
                 "Toggle Comment",
                 "Comment or uncomment the selected lines of the focused editor, per the file's language",
-            ),
+            )
+            .agent_workspace(),
             Box::new(move |s: &mut AppState, _| {
                 let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
                 let editor = doc
@@ -252,7 +254,8 @@ impl Plugin for EditorPlugin {
                 "editor.cycle_view_mode",
                 "Cycle View Mode",
                 "Show the focused document in its next view mode (Preview, Integrated, Source: those its language offers)",
-            ),
+            )
+            .agent_workspace(),
             Box::new(move |s: &mut AppState, _| {
                 let doc = s.focused_surface().and_then(|sid| s.active_doc(sid));
                 let editor = doc
@@ -270,7 +273,8 @@ impl Plugin for EditorPlugin {
                 "Show or hide the focused editor's undo panel: its file's undo tree, where a step clicked or reached \
                  with Up and Down becomes the text. While a file sidebar has the keys, its panel of the workspace's \
                  file operations instead",
-            ),
+            )
+            .agent_workspace(),
             Box::new(move |s: &mut AppState, _| {
                 let files = s.focused_surface().and_then(|sid| s.view_mut(sid)).and_then(|v| v.downcast_mut::<FilesView>());
                 if let Some(files) = files.filter(|f| f.sidebar_has_keys()) {
@@ -293,7 +297,8 @@ impl Plugin for EditorPlugin {
                 "editor.save_as",
                 "Save As…",
                 "Save the focused editor to a file chosen in a picker",
-            ),
+            )
+            .agent_refused(crate::app_state::PICKER),
             Box::new(move |s: &mut AppState, _| {
                 let sid = s
                     .focused_surface()

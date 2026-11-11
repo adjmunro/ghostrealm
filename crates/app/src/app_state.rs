@@ -2271,6 +2271,12 @@ fn failed(e: anyhow::Error) -> CmdError {
     CmdError::Failed(format!("{e:#}"))
 }
 
+/// Why a workspace's agent may not run a command that opens the picker.
+pub(crate) const PICKER: &str = "it opens the picker, a modal for the person";
+
+/// Why a workspace's agent may not run a command on web pages.
+pub(crate) const WEB_PAGES: &str = "every page in the window is on the person's profile";
+
 /// Build the command registry over [`AppState`]. This is the one catalog the
 /// palette, keybindings, and agent channel all use.
 pub fn build_registry() -> Registry<AppState> {
@@ -2282,7 +2288,8 @@ pub fn build_registry() -> Registry<AppState> {
             "New Workspace",
             "Open a new empty workspace in a directory (chosen in a picker unless given)",
         )
-        .arg(ArgSpec::optional("dir", ArgKind::Str, "the workspace directory")),
+        .arg(ArgSpec::optional("dir", ArgKind::Str, "the workspace directory"))
+        .agent_refused("it reaches outside the agent's workspace, and makes the new one active"),
         Box::new(|s: &mut AppState, a| {
             if a.get("dir").is_none() {
                 s.open_picker(Pick::NewWorkspace);
@@ -2293,14 +2300,16 @@ pub fn build_registry() -> Registry<AppState> {
         }),
     );
     r.register(
-        CommandMeta::new("toast.dismiss", "Dismiss Toast", "Dismiss the notice showing across the top of a pane or the workspace"),
+        CommandMeta::new("toast.dismiss", "Dismiss Toast", "Dismiss the notice showing across the top of a pane or the workspace")
+            .agent_refused("it dismisses what the person is reading"),
         Box::new(|s: &mut AppState, _| {
             s.dismiss_head_toast();
             Ok(CmdOutcome::ok())
         }),
     );
     r.register(
-        CommandMeta::new("workspace.close", "Close Workspace", "Close the active workspace"),
+        CommandMeta::new("workspace.close", "Close Workspace", "Close the active workspace")
+            .agent_refused("it closes every surface in the workspace, the person's web pages included; a shell can exit"),
         Box::new(|s: &mut AppState, _| {
             s.close_active_vtab();
             Ok(CmdOutcome::ok())
@@ -2308,7 +2317,8 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new("workspace.rename", "Rename Workspace", "Rename the active workspace")
-            .arg(ArgSpec::required("name", ArgKind::Str, "the new workspace name")),
+            .arg(ArgSpec::required("name", ArgKind::Str, "the new workspace name"))
+            .agent_workspace(),
         Box::new(|s: &mut AppState, a| {
             s.rename_active_vtab(a.get_str("name")?);
             Ok(CmdOutcome::ok())
@@ -2319,7 +2329,8 @@ pub fn build_registry() -> Registry<AppState> {
             "workspace.pick_dir",
             "Set Workspace Directory",
             "Choose the active workspace's directory in a floating file picker",
-        ),
+        )
+        .agent_refused(PICKER),
         Box::new(|s: &mut AppState, _| {
             s.open_picker(Pick::ActiveRoot);
             Ok(CmdOutcome::ok())
@@ -2330,7 +2341,8 @@ pub fn build_registry() -> Registry<AppState> {
             "split.leftright",
             "Split Left/Right",
             "Split the focused pane side by side",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.split_focused(Axis::LeftRight).map_err(failed)?;
             Ok(CmdOutcome::ok())
@@ -2341,7 +2353,8 @@ pub fn build_registry() -> Registry<AppState> {
             "split.topbottom",
             "Split Top/Bottom",
             "Split the focused pane stacked",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.split_focused(Axis::TopBottom).map_err(failed)?;
             Ok(CmdOutcome::ok())
@@ -2352,7 +2365,8 @@ pub fn build_registry() -> Registry<AppState> {
             "pane.close",
             "Close",
             "Close the focused tab, or the file it shows when it holds several; collapses the pane, then the workspace, when it was the last",
-        ),
+        )
+        .agent_focused_pane(),
         Box::new(|s: &mut AppState, _| {
             s.close_focused_surface();
             Ok(CmdOutcome::ok())
@@ -2363,7 +2377,8 @@ pub fn build_registry() -> Registry<AppState> {
             "pane.close_all",
             "Close Pane",
             "Close the focused pane and every tab in it",
-        ),
+        )
+        .agent_focused_pane(),
         Box::new(|s: &mut AppState, _| {
             s.close_focused_pane();
             Ok(CmdOutcome::ok())
@@ -2374,7 +2389,8 @@ pub fn build_registry() -> Registry<AppState> {
             "pane.focus_next",
             "Focus Next Pane",
             "Move focus to the next pane",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.focus_next_pane();
             Ok(CmdOutcome::ok())
@@ -2385,7 +2401,8 @@ pub fn build_registry() -> Registry<AppState> {
             "pane.focus_prev",
             "Focus Previous Pane",
             "Move focus to the previous pane",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.focus_prev_pane();
             Ok(CmdOutcome::ok())
@@ -2396,7 +2413,8 @@ pub fn build_registry() -> Registry<AppState> {
             "surface.new",
             "New Tab",
             "Add a new tab to the focused pane; pick what to open",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.add_empty_surface_in_focused();
             Ok(CmdOutcome::ok())
@@ -2408,7 +2426,8 @@ pub fn build_registry() -> Registry<AppState> {
             "Open File",
             "Open a file in a Files surface: the focused one, else the workspace's last focused one, else a new one",
         )
-        .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open")),
+        .arg(ArgSpec::required("path", ArgKind::Str, "the file path to open"))
+        .agent_workspace(),
         Box::new(|s: &mut AppState, a| {
             let path = std::path::PathBuf::from(a.get_str("path")?);
             s.open_file(&path).map_err(failed)?;
@@ -2420,7 +2439,8 @@ pub fn build_registry() -> Registry<AppState> {
             "workspace.mark_read",
             "Mark Workspace Read",
             "Clear the active workspace's inbox status",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::Read);
             Ok(CmdOutcome::ok())
@@ -2431,7 +2451,8 @@ pub fn build_registry() -> Registry<AppState> {
             "workspace.mark_unread",
             "Mark Workspace Unread",
             "Flag the active workspace as unread",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::Unread { success: true });
             Ok(CmdOutcome::ok())
@@ -2443,7 +2464,8 @@ pub fn build_registry() -> Registry<AppState> {
             "Mark Workspace Needs Input",
             "Flag the active workspace as blocked awaiting the user (agent self-report)",
         )
-        .hidden(),
+        .hidden()
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::NeedsInput);
             Ok(CmdOutcome::ok())
@@ -2454,7 +2476,8 @@ pub fn build_registry() -> Registry<AppState> {
             "workspace.dismiss",
             "Dismiss Workspace Status",
             "Clear a sticky needs-input flag",
-        ),
+        )
+        .agent_workspace(),
         Box::new(|s: &mut AppState, _| {
             s.set_active_status(TabStatus::Read);
             Ok(CmdOutcome::ok())

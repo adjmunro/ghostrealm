@@ -86,7 +86,7 @@ impl Plugin for TerminalPlugin {
 
     fn register_commands(&self, r: &mut Registry<AppState>) {
         r.register(
-            CommandMeta::new("terminal.new", "New Terminal", "Open a terminal in the focused pane"),
+            CommandMeta::new("terminal.new", "New Terminal", "Open a terminal in the focused pane").agent_workspace(),
             Box::new(|s: &mut AppState, _| {
                 s.open_plugin_in_focused(ID)
                     .map_err(|e| CmdError::Failed(format!("{e:#}")))?;

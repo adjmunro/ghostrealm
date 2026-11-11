@@ -70,6 +70,21 @@ pub struct CommandMeta {
     /// Agent-only: runnable via the registry (agent/keybinding) but hidden from the
     /// human command palette (e.g. an agent self-report action).
     pub hidden: bool,
+    /// What an agent scoped to one workspace may do with it.
+    pub agent: AgentReach,
+}
+
+/// What an agent scoped to one workspace (a terminal's in the window) may do
+/// with a command. A command nobody classified is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentReach {
+    /// Not run; the reason is the refusal's.
+    Refused(&'static str),
+    /// Runs with the agent's workspace as the active one.
+    Workspace,
+    /// As `Workspace`, and only while everything in the workspace's focused
+    /// pane is the agent's to reach: the command closes part of it.
+    FocusedPane,
 }
 
 impl CommandMeta {
@@ -80,7 +95,23 @@ impl CommandMeta {
             description,
             args: Vec::new(),
             hidden: false,
+            agent: AgentReach::Refused("not classified for a workspace's agent"),
         }
+    }
+    /// A workspace's agent may run it, in its own workspace.
+    pub fn agent_workspace(mut self) -> Self {
+        self.agent = AgentReach::Workspace;
+        self
+    }
+    /// A workspace's agent may run it on its workspace's focused pane.
+    pub fn agent_focused_pane(mut self) -> Self {
+        self.agent = AgentReach::FocusedPane;
+        self
+    }
+    /// A workspace's agent may not run it, for `reason`.
+    pub fn agent_refused(mut self, reason: &'static str) -> Self {
+        self.agent = AgentReach::Refused(reason);
+        self
     }
     pub fn arg(mut self, spec: ArgSpec) -> Self {
         self.args.push(spec);

@@ -87,7 +87,7 @@ impl Plugin for FilesPlugin {
     fn register_commands(&self, r: &mut Registry<AppState>) {
         let mut on_focused = |id: &'static str, title: &'static str, description: &'static str, f: fn(&mut FilesView)| {
             r.register(
-                CommandMeta::new(id, title, description),
+                CommandMeta::new(id, title, description).agent_workspace(),
                 Box::new(move |s: &mut AppState, _| {
                     let files = s
                         .focused_surface()
