@@ -677,7 +677,7 @@
 
 ---
 
-[2026-11-15@5a382e7] Agent MCP server — the 2026-07-28 revision
+[2026-11-15@5a382e7] Agent MCP server — the 2026-07-28 revision and review findings
 
 - Requires: NO BLOCKERS
 - Detail: `ghostrealm agent --mcp` speaks MCP 2025-11-25 (and 2025-06-18), whose
@@ -685,6 +685,23 @@
   in `_meta`, `server/discover` replaces `initialize`, `ping` is gone, and
   `tools/list` results carry `resultType`, `ttlMs` and `cacheScope`. Add it once
   clients need it, from the full spec (not a summary).
+- Detail: a `tools/call` whose request line exceeds the socket's `MAX_LINE` (1 MiB,
+  e.g. a large `input`) makes the socket close the connection. The shim then answers
+  that call as a tool error and exits 1, so Claude Code shows the server as failed
+  until reconnected; the plain relay behaves the same. Direction: the shim refuses
+  an over-long request as a tool error without sending it, sharing the limit.
+- Detail: owner's choice. The README's `claude mcp add --scope user …` makes every
+  Claude Code session outside ghostrealm report a failed server, since `--mcp` exits
+  1 outside a window. Direction: suggest project or local scope, or, outside a
+  window, serve `initialize` with no tools and an instruction saying why.
+- Detail: verified: Claude Code 2.1.308 on stdio probes `server/discover`, takes the
+  −32601 as legacy, and falls back to `initialize` with 2025-11-25, which the shim
+  answers. A client that drops pre-2026 versions would fail.
+- Detail: `SUPPORTED` in `crates/app/src/agent/mcp.rs` could also echo 2025-03-26,
+  whose tool messages the server satisfies.
+- Detail: with `CLAUDE_CODE_MCP_ALLOWLIST_ENV` set (or Claude Code's `local-agent`
+  entrypoint) the server gets no `GHOSTREALM_AGENT_*` variables and refuses with
+  "isn't a ghostrealm window's terminal", which is misleading inside a window.
 - Reason: clients that speak only 2026-07-28 can't use the server.
 
 ---
