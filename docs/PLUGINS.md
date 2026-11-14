@@ -535,11 +535,14 @@ in-process; external ones are spawned processes speaking LSP on stdio.
 `ghostrealm_core::highlight` is a registry of `Highlighter`s keyed by file
 extension (`for_path`, `for_extension`; the list is `highlight::ALL`). A
 highlighter turns one line plus the `State` carried from the line before into
-contiguous `Span`s of palette-free `Token`s (`Comment`, `Heading`, `Key`,
-`Marker`, `Strong`, `Emphasis`, `Code`, `Link`, ...). `syntax::row_spans` maps
+contiguous `Span`s of palette-free `Token`s: `Plain`, `Code(Code)` for what
+code is (`Comment`, `Keyword`, `String`, `Type`, `Function`, `Property`, ...)
+and `Rich(Rich)` for rich-text structure (`Heading`, `Marker`, `Strong`,
+`Emphasis`, `Code`, `Link`, ...). `syntax::row_spans` maps
 them to colours (`syntax::color`) and slices them to a visual row, ready for
-`PaintCx::row`/`budgeted_row`; `syntax::styled_row_spans` also maps them to
-`RunStyle`s (Strong/Heading bold, Emphasis italic, Link underline, Code boxed).
+`PaintCx::row`/`budgeted_row`; `syntax::styled_row_spans` also maps `Rich`
+tokens to `RunStyle`s (Strong/Heading bold, Emphasis italic, Link underline,
+Code boxed); a `Code` token is a colour only.
 `Highlighter::block_row` places a row in a block drawn as a unit (a fenced code
 block's opening fence, body, or closing fence): the editor draws each block,
 fences included, as one rounded, outlined box the text area's width (open at

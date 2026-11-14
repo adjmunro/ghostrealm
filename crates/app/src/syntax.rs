@@ -1,7 +1,7 @@
 //! The palette for core's highlight tokens, and coloured row spans built from
 //! them. Shared by every text surface (editor, file preview).
 
-use ghostrealm_core::highlight::{Span, Token};
+use ghostrealm_core::highlight::{Code, Rich, Span, Token};
 
 use crate::row_cache::RunStyle;
 
@@ -9,30 +9,50 @@ use crate::row_cache::RunStyle;
 pub fn color(token: Token, plain: [u8; 3]) -> [u8; 3] {
     match token {
         Token::Plain => plain,
-        Token::Comment => [110, 140, 110],
-        Token::Heading => [220, 180, 120],
-        Token::Key => [130, 170, 225],
-        Token::String => [170, 200, 140],
-        Token::Number => [200, 160, 220],
-        Token::Marker => [100, 130, 108],
-        Token::Strong => [235, 205, 160],
-        Token::Emphasis => [190, 165, 215],
+        Token::Code(c) => code_color(c),
+        Token::Rich(r) => rich_color(r),
+    }
+}
+
+fn code_color(c: Code) -> [u8; 3] {
+    match c {
+        Code::Comment => [110, 140, 110],
+        Code::Keyword => [205, 145, 125],
+        Code::String => [170, 200, 140],
+        Code::Number => [200, 160, 220],
+        Code::Constant => [225, 165, 200],
+        Code::Type => [120, 190, 190],
+        Code::Function => [215, 200, 130],
+        Code::Property => [130, 170, 225],
+        Code::Attribute => [175, 175, 120],
+        Code::Operator => [175, 185, 205],
+        Code::Punctuation => [140, 148, 165],
+    }
+}
+
+fn rich_color(r: Rich) -> [u8; 3] {
+    match r {
+        Rich::Heading => [220, 180, 120],
+        Rich::Marker => [100, 130, 108],
+        Rich::Strong => [235, 205, 160],
+        Rich::Emphasis => [190, 165, 215],
         // Near the text colour: the code box, not a hue, sets code apart.
-        Token::Code => [200, 206, 218],
-        Token::Link => [100, 170, 235],
-        Token::Url => [85, 125, 170],
-        Token::Quote => [150, 160, 180],
+        Rich::Code => [200, 206, 218],
+        Rich::Link => [100, 170, 235],
+        Rich::Url => [85, 125, 170],
+        Rich::Quote => [150, 160, 180],
     }
 }
 
 /// How `token` is drawn beyond its colour: strong text bold, emphasis italic,
-/// link text underlined, headings bold, inline code boxed.
+/// link text underlined, headings bold, inline code boxed. Code is a colour
+/// only.
 pub fn style(token: Token) -> RunStyle {
     match token {
-        Token::Strong | Token::Heading => RunStyle::BOLD,
-        Token::Emphasis => RunStyle::ITALIC,
-        Token::Link => RunStyle::UNDERLINE,
-        Token::Code => RunStyle::BOX,
+        Token::Rich(Rich::Strong | Rich::Heading) => RunStyle::BOLD,
+        Token::Rich(Rich::Emphasis) => RunStyle::ITALIC,
+        Token::Rich(Rich::Link) => RunStyle::UNDERLINE,
+        Token::Rich(Rich::Code) => RunStyle::BOX,
         _ => RunStyle::PLAIN,
     }
 }
@@ -78,7 +98,7 @@ fn build(
         let token = token_at.peek().filter(|s| s.start <= i).map_or(Token::Plain, |s| s.token);
         let c = color(token, plain);
         let st = match styled {
-            Some(block) if !(block && token == Token::Code) => style(token),
+            Some(block) if !(block && token == Token::Rich(Rich::Code)) => style(token),
             _ => RunStyle::PLAIN,
         };
         let last_style = styles.last().copied().unwrap_or(RunStyle::PLAIN);
@@ -148,9 +168,9 @@ mod tests {
         let (_, inside) = Markdown.line("```", 0);
         let line = "# not *a* heading";
         let fenced = row_spans(line, &Markdown.line(line, inside).0, 0, 99, FG);
-        assert_eq!(fenced, vec![(line.to_string(), color(Token::Code, FG))]);
+        assert_eq!(fenced, vec![(line.to_string(), color(Token::Rich(Rich::Code), FG))]);
         let free = row_spans(line, &Markdown.line(line, 0).0, 0, 99, FG);
-        assert_eq!(free[0], ("#".to_string(), color(Token::Marker, FG)));
+        assert_eq!(free[0], ("#".to_string(), color(Token::Rich(Rich::Marker), FG)));
         assert!(free.len() > 1);
     }
 
@@ -162,13 +182,26 @@ mod tests {
 
     #[test]
     fn tokens_map_to_styles() {
-        assert_eq!(style(Token::Strong), RunStyle::BOLD);
-        assert_eq!(style(Token::Heading), RunStyle::BOLD);
-        assert_eq!(style(Token::Emphasis), RunStyle::ITALIC);
-        assert_eq!(style(Token::Link), RunStyle::UNDERLINE);
-        assert_eq!(style(Token::Code), RunStyle::BOX);
-        for t in [Token::Plain, Token::Marker, Token::Url, Token::Comment, Token::Key, Token::Quote] {
+        assert_eq!(style(Token::Rich(Rich::Strong)), RunStyle::BOLD);
+        assert_eq!(style(Token::Rich(Rich::Heading)), RunStyle::BOLD);
+        assert_eq!(style(Token::Rich(Rich::Emphasis)), RunStyle::ITALIC);
+        assert_eq!(style(Token::Rich(Rich::Link)), RunStyle::UNDERLINE);
+        assert_eq!(style(Token::Rich(Rich::Code)), RunStyle::BOX);
+        for t in [Token::Plain, Token::Rich(Rich::Marker), Token::Rich(Rich::Url), Token::Rich(Rich::Quote)] {
             assert!(style(t).is_plain(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn code_is_a_colour_only_and_each_kind_has_its_own() {
+        use Code::*;
+        let all = [Comment, Keyword, String, Number, Constant, Type, Function, Property, Attribute, Operator, Punctuation];
+        let mut seen = Vec::new();
+        for c in all {
+            assert!(style(Token::Code(c)).is_plain(), "{c:?}");
+            let rgb = color(Token::Code(c), FG);
+            assert!(rgb != FG && !seen.contains(&rgb), "{c:?}");
+            seen.push(rgb);
         }
     }
 
@@ -191,7 +224,7 @@ mod tests {
         assert_eq!(styles.len(), spans.len(), "one style per span");
         let marker = spans.iter().position(|(t, _)| t == "**").unwrap();
         assert!(styles[marker].is_plain());
-        assert_eq!(spans[marker].1, color(Token::Marker, FG), "markers stay visible, dimmed");
+        assert_eq!(spans[marker].1, color(Token::Rich(Rich::Marker), FG), "markers stay visible, dimmed");
     }
 
     #[test]
@@ -212,7 +245,7 @@ mod tests {
         let (_, inside) = Markdown.line("```", 0);
         let line = "let x = 1;";
         let fenced = styled_row_spans(line, &Markdown.line(line, inside).0, 0, 99, FG, true);
-        assert_eq!(fenced.0, vec![(line.to_string(), color(Token::Code, FG))]);
+        assert_eq!(fenced.0, vec![(line.to_string(), color(Token::Rich(Rich::Code), FG))]);
         assert!(fenced.1.is_empty(), "the block's own box replaces the inline one");
     }
 

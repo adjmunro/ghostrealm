@@ -864,7 +864,7 @@ fn inline_text(runs: &[Inline], font: Font, size: f32, line_h: f32, color: [u8; 
         // heading's text is.
         let code_size = (size * look.mono / look.size).round();
         let (face, run_size, mut c) = match r.style.code {
-            true => (Font::MONO.bold(face.bold), code_size, syntax::color(highlight::Token::Code, EDITOR_FG)),
+            true => (Font::MONO.bold(face.bold), code_size, syntax::color(highlight::Token::Rich(highlight::Rich::Code), EDITOR_FG)),
             false => (face, size, color),
         };
         if r.style.image {

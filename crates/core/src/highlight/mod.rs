@@ -17,12 +17,35 @@ pub mod toml;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Token {
     Plain,
+    Code(Code),
+    Rich(Rich),
+}
+
+/// What a piece of code is: drawn as a colour only, so code is never bold,
+/// boxed or underlined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Code {
     Comment,
-    /// A section title: a TOML `[table]`, a Markdown heading's text.
-    Heading,
-    Key,
+    Keyword,
     String,
     Number,
+    /// A named constant, a boolean, `null`.
+    Constant,
+    Type,
+    Function,
+    /// A field or key: a TOML key, a Markdown fence's language word.
+    Property,
+    /// An annotation or attribute: `@JvmStatic`, `#[derive]`.
+    Attribute,
+    Operator,
+    Punctuation,
+}
+
+/// Rich-text structure: a colour and a style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rich {
+    /// A section title: a TOML `[table]`, a Markdown heading's text.
+    Heading,
     /// Punctuation that only marks structure: a heading's `#`, emphasis
     /// asterisks, code fences and backticks, list bullets, `>`, link brackets.
     Marker,
@@ -30,12 +53,25 @@ pub enum Token {
     Strong,
     /// Text between emphasis markers (render italic).
     Emphasis,
+    /// Code in prose: a code span, a fenced block's body.
     Code,
     /// A link's visible text.
     Link,
     /// A link's target.
     Url,
     Quote,
+}
+
+impl From<Code> for Token {
+    fn from(c: Code) -> Token {
+        Token::Code(c)
+    }
+}
+
+impl From<Rich> for Token {
+    fn from(r: Rich) -> Token {
+        Token::Rich(r)
+    }
 }
 
 /// A run of one [`Token`] in a line, in char indices (`end` exclusive).
@@ -348,12 +384,13 @@ mod tests {
     #[test]
     fn runs_merge_equal_neighbours() {
         use Token::*;
-        let spans = runs(&[Plain, Plain, Key, Plain]);
+        let key = Token::Code(super::Code::Property);
+        let spans = runs(&[Plain, Plain, key, Plain]);
         assert_eq!(
             spans,
             vec![
                 Span { start: 0, end: 2, token: Plain },
-                Span { start: 2, end: 3, token: Key },
+                Span { start: 2, end: 3, token: key },
                 Span { start: 3, end: 4, token: Plain },
             ]
         );

@@ -2,7 +2,7 @@
 //! `key =` names, quoted strings, and numbers/booleans. No multi-line strings,
 //! which is plenty for a config file.
 
-use super::{runs, CommentSyntax, Highlighter, Span, State, Token};
+use super::{runs, Code, CommentSyntax, Highlighter, Rich, Span, State, Token};
 
 pub struct Toml;
 
@@ -97,12 +97,12 @@ fn tokens(line: &str) -> Vec<Token> {
     }
     // Whole-line comment.
     if chars[ts] == '#' {
-        tok[ts..].fill(Token::Comment);
+        tok[ts..].fill(Token::Code(Code::Comment));
         return tok;
     }
     // Section header `[..]` (possibly `[[..]]`).
     if chars[ts] == '[' && header(line).is_some() {
-        tok[ts..].fill(Token::Heading);
+        tok[ts..].fill(Token::Rich(Rich::Heading));
         return tok;
     }
     // Find the top-level `=`, a trailing `#` comment, tracking string quotes.
@@ -131,7 +131,7 @@ fn tokens(line: &str) -> Vec<Token> {
     }
     // Key: the name left of `=`.
     if let Some(e) = eq {
-        tok[ts..e].fill(Token::Key);
+        tok[ts..e].fill(Token::Code(Code::Property));
     }
     let val_start = eq.map(|e| e + 1).unwrap_or(ts);
     let val_end = comment_at.unwrap_or(n);
@@ -142,13 +142,13 @@ fn tokens(line: &str) -> Vec<Token> {
     while j < val_end {
         let c = chars[j];
         if let Some(q) = in_str {
-            tok[j] = Token::String;
+            tok[j] = Token::Code(Code::String);
             if c == q {
                 in_str = None;
             }
         } else if c == '"' || c == '\'' {
             in_str = Some(c);
-            tok[j] = Token::String;
+            tok[j] = Token::Code(Code::String);
         } else if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' || c == '_' {
             if tok_start.is_none() {
                 tok_start = Some(j);
@@ -162,7 +162,7 @@ fn tokens(line: &str) -> Vec<Token> {
         mark_bare_token(&chars, s, val_end, &mut tok);
     }
     if let Some(ca) = comment_at {
-        tok[ca..].fill(Token::Comment);
+        tok[ca..].fill(Token::Code(Code::Comment));
     }
     tok
 }
@@ -173,7 +173,7 @@ fn mark_bare_token(chars: &[char], s: usize, e: usize, tok: &mut [Token]) {
     let is_num = word.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '+')
         && word.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | '_' | 'e' | 'E'));
     if is_num || word == "true" || word == "false" {
-        tok[s..e].fill(Token::Number);
+        tok[s..e].fill(Token::Code(Code::Number));
     }
 }
 
@@ -187,14 +187,14 @@ mod tests {
 
     #[test]
     fn toml_highlight_basics() {
-        assert!(tokens("# hi").iter().all(|t| *t == Token::Comment));
-        assert!(tokens("[editor]").iter().all(|t| *t == Token::Heading));
+        assert!(tokens("# hi").iter().all(|t| *t == Token::Code(Code::Comment)));
+        assert!(tokens("[editor]").iter().all(|t| *t == Token::Rich(Rich::Heading)));
         let line = "soft_wrap = true";
-        assert_eq!(tokens(line)[0], Token::Key, "key name");
-        assert_eq!(at(line, "true"), Token::Number, "bool");
+        assert_eq!(tokens(line)[0], Token::Code(Code::Property), "key name");
+        assert_eq!(at(line, "true"), Token::Code(Code::Number), "bool");
         let line = "name = \"value\"  # note";
-        assert_eq!(at(line, "\""), Token::String, "string");
-        assert_eq!(at(line, "#"), Token::Comment, "trailing comment");
+        assert_eq!(at(line, "\""), Token::Code(Code::String), "string");
+        assert_eq!(at(line, "#"), Token::Code(Code::Comment), "trailing comment");
     }
 
     #[test]
@@ -218,11 +218,11 @@ mod tests {
 
     #[test]
     fn an_array_value_on_its_own_line_is_not_coloured_as_a_table() {
-        assert!(tokens("[editor] # note")[..8].iter().all(|t| *t == Token::Heading));
+        assert!(tokens("[editor] # note")[..8].iter().all(|t| *t == Token::Rich(Rich::Heading)));
         for line in ["  [1, 2],", "[1.5, 2.5],", "["] {
-            assert!(!tokens(line).contains(&Token::Heading), "{line:?}");
+            assert!(!tokens(line).contains(&Token::Rich(Rich::Heading)), "{line:?}");
         }
-        assert_eq!(at("[1.5, 2.5],", "1.5"), Token::Number);
+        assert_eq!(at("[1.5, 2.5],", "1.5"), Token::Code(Code::Number));
     }
 
     #[test]

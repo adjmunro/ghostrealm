@@ -19,7 +19,7 @@
 //! [`MAX_FAILED`] openers with no matching closer the rest of the line is left
 //! unmarked, so a pathological line costs a bounded number of scans.
 
-use super::{runs, BlockRow, CommentSyntax, Highlighter, Span, State, Token, ALL, LANGUAGES};
+use super::{runs, BlockRow, Code, CommentSyntax, Highlighter, Rich, Span, State, Token, ALL, LANGUAGES};
 
 pub struct Markdown;
 
@@ -110,7 +110,7 @@ impl Highlighter for Markdown {
         }
         let (spans, _) = self.line(line, 0);
         let mut title = String::new();
-        for s in spans.iter().filter(|s| !matches!(s.token, Token::Marker | Token::Url)) {
+        for s in spans.iter().filter(|s| !matches!(s.token, Token::Rich(Rich::Marker) | Token::Rich(Rich::Url))) {
             title.extend(&c[s.start.min(end)..s.end.min(end)]);
         }
         title.trim().to_string()
@@ -259,7 +259,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
                     if c.get(p) != Some(&'>') {
                         break;
                     }
-                    tok[p] = Token::Marker;
+                    tok[p] = Token::Rich(Rich::Marker);
                     p += 1;
                 }
             } else if indent <= 3 {
@@ -267,7 +267,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
             }
             let run = run_of(c, p, fc);
             if run >= flen && blank(&c[p + run..]) && (container != TOP || indent <= 3) {
-                fill(tok, p, n, Token::Marker);
+                fill(tok, p, n, Token::Rich(Rich::Marker));
                 return 0;
             }
             // A language past `ALL` has no highlighter: its body is plain code.
@@ -279,7 +279,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
                         fill(tok, p + sp.start, p + sp.end, sp.token);
                     }
                 }
-                None => fill(tok, p, n, Token::Code),
+                None => fill(tok, p, n, Token::Rich(Rich::Code)),
             }
             return state;
         }
@@ -287,15 +287,15 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
     if indent <= 3 && indent < n {
         let first = c[indent];
         if let Some((fc, run)) = fence_at(c, indent) {
-            fill(tok, indent, indent + run, Token::Marker);
-            fill(tok, indent + run, n, Token::Key);
+            fill(tok, indent, indent + run, Token::Rich(Rich::Marker));
+            fill(tok, indent + run, n, Token::Code(Code::Property));
             return fence_state(fc, run, TOP, fence_lang(&c[indent + run..]));
         }
         if first == '#' {
             let hashes = run_of(c, indent, '#');
             if hashes <= 6 && (indent + hashes == n || c[indent + hashes] == ' ') {
-                fill(tok, indent, indent + hashes, Token::Marker);
-                fill(tok, indent + hashes, n, Token::Heading);
+                fill(tok, indent, indent + hashes, Token::Rich(Rich::Marker));
+                fill(tok, indent + hashes, n, Token::Rich(Rich::Heading));
                 inline_line(c, indent + hashes, n, tok);
                 return 0;
             }
@@ -303,7 +303,7 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
         if matches!(first, '-' | '*' | '_') {
             let marks = c.iter().filter(|x| **x == first).count();
             if marks >= 3 && c[indent..].iter().all(|x| *x == first || *x == ' ') {
-                fill(tok, indent, n, Token::Marker);
+                fill(tok, indent, n, Token::Rich(Rich::Marker));
                 return 0;
             }
         }
@@ -312,42 +312,42 @@ fn block(c: &[char], tok: &mut [Token], state: State) -> State {
     let mut p = indent;
     let mut base = Token::Plain;
     while c.get(p) == Some(&'>') {
-        tok[p] = Token::Marker;
+        tok[p] = Token::Rich(Rich::Marker);
         p += 1;
         if c.get(p) == Some(&' ') {
-            tok[p] = Token::Marker;
+            tok[p] = Token::Rich(Rich::Marker);
             p += 1;
         }
-        base = Token::Quote;
+        base = Token::Rich(Rich::Quote);
     }
     let item = list_marker(c, p);
     if item > 0 {
-        fill(tok, p, p + item, Token::Marker);
+        fill(tok, p, p + item, Token::Rich(Rich::Marker));
         p += item;
         p += run_of(c, p, ' ');
         if let Some(task) = task_box(c, p) {
-            fill(tok, p, p + task, Token::Marker);
+            fill(tok, p, p + task, Token::Rich(Rich::Marker));
             p += task;
         }
     } else if base == Token::Plain && c.get(p) == Some(&'[') {
         if let Some(label_end) = c[p..].iter().position(|x| *x == ']').map(|i| p + i) {
             if c.get(label_end + 1) == Some(&':') {
                 // A link reference definition: `[label]: target`.
-                fill(tok, p, label_end + 1, Token::Link);
-                tok[p] = Token::Marker;
-                tok[label_end] = Token::Marker;
-                tok[label_end + 1] = Token::Marker;
-                fill(tok, label_end + 2, n, Token::Url);
+                fill(tok, p, label_end + 1, Token::Rich(Rich::Link));
+                tok[p] = Token::Rich(Rich::Marker);
+                tok[label_end] = Token::Rich(Rich::Marker);
+                tok[label_end + 1] = Token::Rich(Rich::Marker);
+                fill(tok, label_end + 2, n, Token::Rich(Rich::Url));
                 return 0;
             }
         }
     }
-    if base == Token::Quote || item > 0 {
+    if base == Token::Rich(Rich::Quote) || item > 0 {
         let at = p + run_of(c, p, ' ').min(3);
         if let Some((fc, run)) = fence_at(c, at) {
-            fill(tok, at, at + run, Token::Marker);
-            fill(tok, at + run, n, Token::Key);
-            let container = match (base == Token::Quote, item > 0) {
+            fill(tok, at, at + run, Token::Rich(Rich::Marker));
+            fill(tok, at + run, n, Token::Code(Code::Property));
+            let container = match (base == Token::Rich(Rich::Quote), item > 0) {
                 (true, true) => QUOTED_LIST,
                 (false, true) => LIST,
                 _ => QUOTE,
@@ -502,9 +502,9 @@ fn inline(c: &[char], from: usize, to: usize, depth: usize, budget: &mut Budget,
                 let run = run_of(c, i, '`').min(to - i);
                 match find_run(c, i + run, to, '`', run) {
                     Some(close) => {
-                        fill(tok, i, i + run, Token::Marker);
-                        fill(tok, i + run, close, Token::Code);
-                        fill(tok, close, close + run, Token::Marker);
+                        fill(tok, i, i + run, Token::Rich(Rich::Marker));
+                        fill(tok, i + run, close, Token::Rich(Rich::Code));
+                        fill(tok, close, close + run, Token::Rich(Rich::Marker));
                         i = close + run;
                     }
                     None => {
@@ -521,10 +521,10 @@ fn inline(c: &[char], from: usize, to: usize, depth: usize, budget: &mut Budget,
                 let close = if opens { find_closer(c, i + run, to, ch, run) } else { None };
                 match close {
                     Some(close) => {
-                        let t = if run == 1 { Token::Emphasis } else { Token::Strong };
-                        fill(tok, i, i + run, Token::Marker);
+                        let t = if run == 1 { Token::Rich(Rich::Emphasis) } else { Token::Rich(Rich::Strong) };
+                        fill(tok, i, i + run, Token::Rich(Rich::Marker));
                         fill(tok, i + run, close, t);
-                        fill(tok, close, close + run, Token::Marker);
+                        fill(tok, close, close + run, Token::Rich(Rich::Marker));
                         if depth < MAX_DEPTH {
                             inline(c, i + run, close, depth + 1, budget, tok);
                         }
@@ -546,17 +546,17 @@ fn inline(c: &[char], from: usize, to: usize, depth: usize, budget: &mut Budget,
                 match link(c, open, to) {
                     Some(l) => {
                         if bang {
-                            tok[i] = Token::Marker;
+                            tok[i] = Token::Rich(Rich::Marker);
                         }
-                        fill(tok, open + 1, l.text_end, Token::Link);
+                        fill(tok, open + 1, l.text_end, Token::Rich(Rich::Link));
                         if depth < MAX_DEPTH {
                             inline(c, open + 1, l.text_end, depth + 1, budget, tok);
                         }
                         for at in [open, l.text_end, l.target_open, l.target_close] {
-                            tok[at] = Token::Marker;
+                            tok[at] = Token::Rich(Rich::Marker);
                         }
-                        fill(tok, l.target_open + 1, l.url_end, Token::Url);
-                        fill(tok, l.url_end, l.target_close, Token::String);
+                        fill(tok, l.target_open + 1, l.url_end, Token::Rich(Rich::Url));
+                        fill(tok, l.url_end, l.target_close, Token::Code(Code::String));
                         i = l.target_close + 1;
                     }
                     None => {
@@ -567,16 +567,16 @@ fn inline(c: &[char], from: usize, to: usize, depth: usize, budget: &mut Budget,
             }
             '<' => match autolink(c, i, to) {
                 Some(close) => {
-                    tok[i] = Token::Marker;
-                    fill(tok, i + 1, close, Token::Url);
-                    tok[close] = Token::Marker;
+                    tok[i] = Token::Rich(Rich::Marker);
+                    fill(tok, i + 1, close, Token::Rich(Rich::Url));
+                    tok[close] = Token::Rich(Rich::Marker);
                     i = close + 1;
                 }
                 None => i += 1,
             },
             'h' if i == from || !c[i - 1].is_alphanumeric() => match bare_url(c, i, to) {
                 Some(end) => {
-                    fill(tok, i, end, Token::Url);
+                    fill(tok, i, end, Token::Rich(Rich::Url));
                     i = end;
                 }
                 None => i += 1,
@@ -629,7 +629,9 @@ fn autolink(c: &[char], i: usize, to: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use Token::{Code, Emphasis, Heading, Key, Link, Marker, Plain, Quote, Strong, Url};
+    use crate::highlight::Code::Property as Key;
+    use Rich::{Code, Emphasis, Heading, Link, Marker, Quote, Strong, Url};
+    use Token::Plain;
 
     /// The line's tokens as `(text, token)` runs, for readable assertions.
     fn lex(line: &str) -> Vec<(String, Token)> {
@@ -643,8 +645,8 @@ mod tests {
         (out, next)
     }
 
-    fn run(text: &str, token: Token) -> (String, Token) {
-        (text.to_string(), token)
+    fn run(text: &str, token: impl Into<Token>) -> (String, Token) {
+        (text.to_string(), token.into())
     }
 
     #[test]
@@ -678,7 +680,7 @@ mod tests {
         assert_eq!(level("# after the quote", quoted), Some(1));
         // Every line `heading_level` names, `line` marks as a heading.
         for (line, st) in [("## a", 0), ("# after the list", listed)] {
-            assert!(Markdown.line(line, st).0.iter().any(|s| s.token == Heading), "{line:?}");
+            assert!(Markdown.line(line, st).0.iter().any(|s| s.token == Heading.into()), "{line:?}");
         }
     }
 
@@ -769,7 +771,7 @@ mod tests {
         let (body, s) = lex_in("name = \"x\"", s);
         assert_eq!(
             body,
-            vec![run("name ", Key), run("= ", Plain), run("\"x\"", Token::String)]
+            vec![run("name ", Key), run("= ", Plain), run("\"x\"", crate::highlight::Code::String)]
         );
         let (table, s) = lex_in("[editor]", s);
         assert_eq!(table, vec![run("[editor]", Heading)]);
@@ -871,7 +873,7 @@ mod tests {
                 run("the docs", Link),
                 run("](", Marker),
                 run("https://x.io/a", Url),
-                run(" \"T\"", Token::String),
+                run(" \"T\"", crate::highlight::Code::String),
                 run(")", Marker),
                 run(" ok", Plain),
             ]

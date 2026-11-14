@@ -3282,8 +3282,8 @@ mod tests {
         assert_eq!(boxes[0], (text_x - pad, ch + line, RECT.w - text_x + pad, 3.0 * ch - 2.0 * line));
         assert!(boxes[1].1 >= 4.0 * ch, "the inline box is on the prose row: {boxes:?}");
         // The body is coloured as TOML (a key, an operator, a number), not as one run of code.
-        let toml_row = [("name ", syntax::color(highlight::Token::Key, EDITOR_FG)), ("= ", EDITOR_FG),
-            ("1", syntax::color(highlight::Token::Number, EDITOR_FG))];
+        let toml_row = [("name ", syntax::color(highlight::Token::Code(highlight::Code::Property), EDITOR_FG)), ("= ", EDITOR_FG),
+            ("1", syntax::color(highlight::Token::Code(highlight::Code::Number), EDITOR_FG))];
         let key = h.text.row_cache.row_key(toml_row.into_iter());
         assert_eq!(text_item(&h, 2), TextSrc::Row(key));
     }
