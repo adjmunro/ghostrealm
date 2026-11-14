@@ -609,24 +609,32 @@ Agents read comments through the agent channel, within item 3's scope.
 
 ## 26. Agent commands and your keyboard focus
 
-**Source:** review of item 3's first increment (landed on local `develop` at a58c4d0); `docs/TODO.md`, Agent socket entry
+**Source:** review of item 3's first increment (a58c4d0); `docs/TODO.md`, Agent socket entry; DECISION.md, "UX principle / agent-operated surfaces" (2026-10-13) and "Architecture / files and editing" (2026-10-17)
 
-**What's being decided:** whether an agent's commands may move the focused pane or surface of the workspace you are typing in.
+**What's being decided:** whether an agent's commands may change what is focused or shown in the workspace you are typing in.
 
 **Background:**
-- A workspace's agent runs its commands as that workspace (`acting_as` in `crates/app/src/app_state/scoped.rs`). `split.*`, `pane.focus_*`, `terminal.new`, `surface.new`, `file.open`, `editor.open` and `file.show_in_browser` change that workspace's focus.
-- When that workspace is also your active one, your keys go wherever the agent moved focus. Halfway through typing a command in terminal X, the agent runs `pane.focus_next` and the rest of the line, Enter included, runs in terminal Y, possibly in another directory.
-- It gives the agent no reach it lacks: it can already type into X. It is the same hazard as a stray Enter answering a question, which late-marked questions guard against.
+- A workspace's agent runs its commands as that workspace (`acting_as` in `crates/app/src/app_state/scoped.rs`). When that workspace is also your active one, they act on the panes and surfaces in front of you:
+  - `split.*`, `pane.focus_*`, `surface.new` and `terminal.new` move the focused pane or the pane's active tab. `terminal.new` also fills a focused empty surface, replacing its picker.
+  - `file.open`, `editor.open` and `file.show_in_browser` focus a Files surface and, per the files decision, use the focused one first: with you typing in an editor, an agent's `file.open` swaps the document under your keys.
+  - `pane.close` and `pane.close_all` close the agent's focused pane, which is then the one you are typing in.
+- Example: halfway through typing a command in terminal X, the agent runs `pane.focus_next` and the rest of the line, Enter included, runs in terminal Y, possibly in another directory.
+- On a surface the agent can already address this gives it no new reach: it can type into X anyway. It is the same hazard as a stray Enter answering a question, which late-marked questions guard against.
+- The 2026-10-13 decision says agent-operated browser and emulator work "does not refocus or distract the human". Whether that extends to terminals and Files is this item.
 
 **Options:**
-- **A. Keep your focus.** While its workspace is your active one, an agent's command creates or changes panes and surfaces but leaves your focused one focused.
-  - Pros: your typing never lands somewhere you didn't put it.
-  - Cons: an agent that opens a file for you to look at doesn't bring it forward; you switch to it yourself. Effort: small.
+- **A. Never take your focus.** While its workspace is your active one, an agent's commands create panes and surfaces without focusing them, `file.open` opens in a Files surface other than the one you are focused in (a new one if needed), and `pane.close` / `pane.close_all` are refused.
+  - Pros: what you are typing into stays put; matches the 2026-10-13 preference.
+  - Cons:
+    - The files decision's routing for `file.open` changes for agents.
+    - An agent's `input` without an `id` goes to the workspace's focused surface, so after `terminal.new` it would reach your terminal; `terminal.new` and `surface.new` would need to reply with the new surface's id.
+    - An agent that opens a file for you to look at doesn't bring it forward.
+  - Effort: medium. Focus lives in the tree (focused pane, each pane's active tab) and in view state (the Files sidebar focus, the last-focused Files surface), so each of about a dozen commands needs its own check.
 - **B. Accept and document** in DECISION.md.
-  - Pros: nothing to build; the agent's actions are visible as they happen.
-  - Cons: the hazard above stays.
+  - Pros: nothing to build; the agent's actions show as they happen.
+  - Cons: the hazard above stays, against the 2026-10-13 preference.
 
-**Recommendation:** A. Your keys should go where you put them.
+**Recommendation:** A. A command you are halfway through typing shouldn't run in a terminal you didn't choose.
 
 **Your answer:**
 >
