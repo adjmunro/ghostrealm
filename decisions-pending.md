@@ -21,6 +21,7 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 23. **GIT.md "committing is pre-authorised"**: is this intended?
 24. **Recording review findings**: may the director write `record` findings into `docs/TODO.md` itself, and may notes-only fix commits skip the delta review?
 25. **Borrowed agent tokens**: accept that a same-user process can borrow a workspace's token from a shell's environment, or bind each connection to its process ancestry?
+26. **Agent commands and your keyboard focus**: may an agent's command move the focus of the workspace you're typing in?
 
 ---
 
@@ -600,6 +601,32 @@ Agents read comments through the agent channel, within item 3's scope.
   - Effort: small to medium.
 
 **Recommendation:** B, as the next increment of item 3. Until then A holds, and is documented in DECISION.md.
+
+**Your answer:**
+>
+
+---
+
+## 26. Agent commands and your keyboard focus
+
+**Source:** review of item 3's first increment (landed on local `develop` at a58c4d0); `docs/TODO.md`, Agent socket entry
+
+**What's being decided:** whether an agent's commands may move the focused pane or surface of the workspace you are typing in.
+
+**Background:**
+- A workspace's agent runs its commands as that workspace (`acting_as` in `crates/app/src/app_state/scoped.rs`). `split.*`, `pane.focus_*`, `terminal.new`, `surface.new`, `file.open`, `editor.open` and `file.show_in_browser` change that workspace's focus.
+- When that workspace is also your active one, your keys go wherever the agent moved focus. Halfway through typing a command in terminal X, the agent runs `pane.focus_next` and the rest of the line, Enter included, runs in terminal Y, possibly in another directory.
+- It gives the agent no reach it lacks: it can already type into X. It is the same hazard as a stray Enter answering a question, which late-marked questions guard against.
+
+**Options:**
+- **A. Keep your focus.** While its workspace is your active one, an agent's command creates or changes panes and surfaces but leaves your focused one focused.
+  - Pros: your typing never lands somewhere you didn't put it.
+  - Cons: an agent that opens a file for you to look at doesn't bring it forward; you switch to it yourself. Effort: small.
+- **B. Accept and document** in DECISION.md.
+  - Pros: nothing to build; the agent's actions are visible as they happen.
+  - Cons: the hazard above stays.
+
+**Recommendation:** A. Your keys should go where you put them.
 
 **Your answer:**
 >
