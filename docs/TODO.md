@@ -1628,3 +1628,13 @@
 - Detail: nothing tests that `run_cli` passes `in_window` from the socket variable and sets `GHOSTREALM_WEB_CACHE` to `headless_web_root`'s result: swapping `in_window.is_some()` for `headless` passes every test. Direction: a `crates/app/tests/agent_cli.rs` case with both variables set, if the profile root can be observed cheaply.
 - Detail: nit: `asked_from` (`crates/app/src/app_state/scoped.rs`) gives `From workspace “”: ` when the agent's workspace closes while its git check runs, so the question names no workspace.
 - Reason: review findings on the live agent channel (feat/agent-channel-live), recorded rather than fixed in that increment.
+
+---
+
+[2026-11-15T00:25+1300@ea2cbbb] Role lessons — findings from the approved review
+
+- Requires: NO BLOCKERS
+- Detail: `.claude/agents/director.md` sizing paragraph (Plan step): "measure the branch the same way" points back to a measure it no longer states. Restate it at the check: "estimated insertions plus deletions, and agent time" compared with `git diff --shortstat develop...<tip>`.
+- Detail: the compaction point is stated with different certainty. `.claude/agents/README.md` (Shared frontmatter) says it was "observed" near 265,000 and derives the 230,000 budget from it; `.claude/agents/director.md` (Context and cache) and `.claude/agents/code-implementer.md` (Implement) say compaction "fires near" 265,000. Make all three say: compaction has been observed near 265,000; 230,000 is a chosen margin below it.
+- Detail: uncertain: `.claude/agents/director.md` (Context and cache) says "Don't resume an agent started more than an hour ago", counting from the agent's start. `.claude/agents/README.md` ties `experimental.cacheTtl: 1h` to the director's reuse window, and a prompt-cache TTL restarts on each read, so the cache is warm for an hour after the agent's last use. The rule as written refuses a resume whose cache is still warm, and a resume the rule allows can hit an expired cache. Decide which clock the rule means. If it is the cache, count from the last use; if it is context age, say that, since the cache is not the reason.
+- Reason: review of the role lessons from the agent channel goal, recorded rather than fixed in that change.
