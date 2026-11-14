@@ -883,8 +883,9 @@ mod tests {
     /// Given workspace A with a terminal and a Files surface, and workspace B,
     /// active, with a Files surface showing a file of A's folder;
     /// when A's agent runs every command open to it, in turn;
-    /// then B stays active and its panes, surfaces and titles stay as they
-    /// were, and Delete of the file B shows is refused and leaves it.
+    /// then B stays active, its name, status, panes, surfaces and titles stay
+    /// as they were, Split adds a pane to A, and Delete of the file B shows is
+    /// refused and leaves it.
     #[test]
     fn every_command_open_to_an_agent_leaves_other_workspaces_alone() {
         let d = crate::plugin::testing::tmpdir("agent-scope-every");
@@ -898,14 +899,18 @@ mod tests {
         let b = state.new_empty_vtab();
         state.open_file_in_new_surface(&d.join("shared.txt")).unwrap();
         let mut registry = build_registry();
-        let b_tree = |s: &AppState| s.describe_for(b).split_once('\n').map(|(_, panes)| panes.to_string());
-        let before = b_tree(&state);
-        assert!(before.as_deref().is_some_and(|t| t.contains("shared.txt")), "{before:?}");
+        let before = state.describe_for(b);
+        assert!(before.contains("shared.txt"), "{before:?}");
+        let a_panes = |s: &AppState| s.tree.vtab(a).unwrap().panes().len();
         for (id, _, args) in OPEN_TO_AGENTS {
             let args: Json = serde_json::from_str(&args.replace("{d}", d.to_str().unwrap())).unwrap();
+            let panes = a_panes(&state);
             let reply = scoped(&mut state, &mut registry, a, &set(id, args));
             assert_eq!(state.tree.active_vtab(), Some(b), "{id} left B active: {reply:?}");
-            assert_eq!(b_tree(&state), before, "{id} left B as it was: {reply:?}");
+            assert_eq!(state.describe_for(b), before, "{id} left B as it was: {reply:?}");
+            if *id == "split.leftright" {
+                assert_eq!(a_panes(&state), panes + 1, "{id} split A: {reply:?}");
+            }
             if *id == "file.delete" {
                 assert!(error(&reply).contains("open outside this workspace"), "{reply:?}");
                 assert!(d.join("shared.txt").exists());
