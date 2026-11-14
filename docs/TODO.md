@@ -1644,3 +1644,16 @@
 - Detail: `Server::bind_with` (`crates/app/src/agent/socket.rs`) calls `sweep` on macOS only, since its deletions were never run on Linux. Run `stale_sockets_of_dead_windows_are_swept`, `binding_sweeps_dead_windows_sockets_and_keeps_live_ones` and the other sweep tests there, then enable it.
 - Detail: before enabling, make the sweep's `connect` non-blocking or time-limited: on Linux a connect to a live listener whose backlog is full blocks (or gives `EAGAIN` non-blocking). Count `EAGAIN` and a timeout as alive; only `ECONNREFUSED` removes. There the connect check matters more than on macOS: a window in another pid namespace sharing the directory (a sandbox, a container) reads as dead to `kill(pid, 0)`.
 - Reason: a killed or crashed window's socket file stays in `ghostrealm-<uid>/` until swept.
+
+---
+
+[2026-11-15T06:31+1300@28dd8f9e] Agent socket hardening — findings recorded from the approved review
+
+- Requires: NO BLOCKERS
+- Detail: `Connection::run` (`crates/app/src/agent/socket.rs`) removes the connection from `conns` before writing the idle line, and no test covers that order. Without it, an idle connection's immediate reopen at a workspace's cap of 8 can be refused (`WORKSPACE_FULL`) and the MCP shim exits. Direction: a test with `MAX_PER_WORKSPACE` connections, 7 kept busy, the eighth a `client::Connection` that idles then requests and must succeed. The race is microseconds, so the test may not fail reliably without the guard.
+- Detail: `socket.rs` ignores every error from `set_read_timeout`, but its comment names only `EINVAL`. Direction: ignore only `EINVAL`, and treat any other error as `TimedOut`.
+- Detail: `docs/DECISION.md` (agent channel input bound) says `input` is refused while the surface holds more than 1 MiB unread. The code refuses when the queue already holds bytes and this input would take it past 1 MiB. Reword the entry to match the code.
+- Detail: `docs/PLUGINS.md` ("A terminal returns what its child has yet to read") and `crates/terminal-ghostty/src/threaded.rs` (`input_queued` doc, "that the child has yet to take") both count bytes not yet written to the PTY, not bytes unread in the tty buffer. Say "not yet written to the terminal" in both.
+- Detail: out of scope, pre-existing: a worker blocked in `write_all` to a child that isn't reading also stops reading that child's output.
+- Detail: out of scope, pre-existing and untested: on macOS a canonical-mode tty may drop input past `MAX_INPUT` instead of blocking, so the input bound never applies there.
+- Reason: review of the agent socket hardening (fix/agent-socket-hardening), recorded rather than fixed in that change.
