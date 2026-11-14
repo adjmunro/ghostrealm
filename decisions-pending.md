@@ -616,8 +616,8 @@ Agents read comments through the agent channel, within item 3's scope.
 **Background:**
 - A workspace's agent runs its commands as that workspace (`acting_as` in `crates/app/src/app_state/scoped.rs`). When that workspace is also your active one, they act on the panes and surfaces in front of you:
   - `split.*`, `pane.focus_*`, `surface.new` and `terminal.new` move the focused pane or the pane's active tab. `terminal.new` also fills a focused empty surface, replacing its picker.
-  - `file.open`, `editor.open` and `file.show_in_browser` focus a Files surface and, per the files decision, use the focused one first: with you typing in an editor, an agent's `file.open` swaps the document under your keys.
-  - `pane.close` and `pane.close_all` close the agent's focused pane, which is then the one you are typing in.
+  - `file.open` and `editor.open` use the focused Files surface first (per the files decision) and bring a new tab into view there: with you typing in an editor, your keys land in the agent's file. `file.show_in_browser` moves keyboard focus into a Files surface's sidebar.
+  - `pane.close` and `pane.close_all` close the agent's focused pane, which is then the one you are typing in. Today's check (`focused_pane_reachable`) only requires every surface in that pane to be empty or reachable by the agent, which your terminal in its workspace is.
 - Example: halfway through typing a command in terminal X, the agent runs `pane.focus_next` and the rest of the line, Enter included, runs in terminal Y, possibly in another directory.
 - On a surface the agent can already address this gives it no new reach: it can type into X anyway. It is the same hazard as a stray Enter answering a question, which late-marked questions guard against.
 - The 2026-10-13 decision says agent-operated browser and emulator work "does not refocus or distract the human". Whether that extends to terminals and Files is this item.
@@ -629,7 +629,7 @@ Agents read comments through the agent channel, within item 3's scope.
     - The files decision's routing for `file.open` changes for agents.
     - An agent's `input` without an `id` goes to the workspace's focused surface, so after `terminal.new` it would reach your terminal; `terminal.new` and `surface.new` would need to reply with the new surface's id.
     - An agent that opens a file for you to look at doesn't bring it forward.
-  - Effort: medium. Focus lives in the tree (focused pane, each pane's active tab) and in view state (the Files sidebar focus, the last-focused Files surface), so each of about a dozen commands needs its own check.
+  - Effort: medium. Focus lives in the tree (focused pane, each pane's active tab) and in view state (the Files sidebar focus, the last-focused Files surface), so each command above, plus `editor.new`, needs its own check.
 - **B. Accept and document** in DECISION.md.
   - Pros: nothing to build; the agent's actions show as they happen.
   - Cons: the hazard above stays, against the 2026-10-13 preference.
