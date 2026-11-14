@@ -123,8 +123,9 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 - [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON):
       headless, and live in the window, scoped to the terminal's workspace.
       With the person's standing grant, it reaches every workspace's
-      terminals and Files surfaces, never web pages.
-      To do: the MCP shim, agent web profiles (TODO.md).
+      terminals and Files surfaces, never web pages. `ghostrealm agent --mcp`
+      serves the same reach as MCP tools over stdio.
+      To do: agent web profiles (TODO.md).
 - [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
 - [~] Phase 5: inbox status — background output → unread, sticky needs_input

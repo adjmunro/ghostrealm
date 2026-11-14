@@ -663,8 +663,8 @@
 
 - Requires: NO BLOCKERS
 - Detail: the window serves the protocol over its socket, scoped per workspace
-  (DECISION.md, Agents / security; decisions-pending.md item 3). Left: an MCP
-  server (a stdio shim over that socket); agent web profiles, agent-opened
+  (DECISION.md, Agents / security; decisions-pending.md item 3), and as MCP tools
+  through `ghostrealm agent --mcp`. Left: agent web profiles, agent-opened
   browsers and login handover (then `web.*` gets a class that checks the page's
   profile); a config "hide from agent" list; binding each connection to the client's process ancestry
   (`LOCAL_PEERPID` / `SO_PEERCRED`, then the parent chain up to a workspace
@@ -674,6 +674,18 @@
   owned by the running app and agents would connect through this socket instead
   of spawning their own host (see "Web — profiles").
 - Reason: agent control of the live UI is the point of the agent channel.
+
+---
+
+[2026-11-15@5a382e7] Agent MCP server — the 2026-07-28 revision
+
+- Requires: NO BLOCKERS
+- Detail: `ghostrealm agent --mcp` speaks MCP 2025-11-25 (and 2025-06-18), whose
+  `initialize` handshake 2026-07-28 removes: each request then carries its revision
+  in `_meta`, `server/discover` replaces `initialize`, `ping` is gone, and
+  `tools/list` results carry `resultType`, `ttlMs` and `cacheScope`. Add it once
+  clients need it, from the full spec (not a summary).
+- Reason: clients that speak only 2026-07-28 can't use the server.
 
 ---
 

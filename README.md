@@ -140,6 +140,26 @@ it is the agent's. Its web pages use their own profile
 An agent that runs its commands in a sandbox needs connecting to Unix sockets
 allowed to reach the window.
 
+### MCP
+
+`ghostrealm agent --mcp` is an MCP server on stdin/stdout (protocol 2025-11-25,
+also answering clients that ask for 2025-06-18) for the window whose terminal it
+runs in, as that terminal's workspace. Its tools are the protocol's ops: `help`,
+`search`, `set`, `get` and `input`, each call one request on the window's socket,
+which allows and refuses exactly as it does for `ghostrealm agent`. Outside a
+window's terminal, or if the socket can't be reached, it exits 1; it has no
+headless mode.
+
+To give Claude Code these tools, add the server once:
+
+```
+claude mcp add --scope user ghostrealm -- /path/to/ghostrealm agent --mcp
+```
+
+and start `claude` in a ghostrealm terminal: the server inherits that
+terminal's socket and token. Started anywhere else, the server fails to start
+and Claude Code lists it as failed.
+
 ## Layout
 
 ```
