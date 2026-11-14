@@ -1636,6 +1636,9 @@
 - Detail: `a_granted_agent_closes_a_workspace_of_terminals_and_its_token_goes` (`crates/app/src/agent.rs`) makes workspace C both the person's active workspace and the target, so a `workspace.close` that closed the active workspace instead of the named one would pass. Direction: make another workspace active first and assert it survives and stays active.
 - Detail: on a granted workspace `get tree` marks the person's active workspace "(active)", so a granted agent sees where the person is (relevant to decisions-pending item 26).
 - Detail: `pane.close` on a workspace's only pane closes the workspace: a second route to the reach `workspace.close` gives.
+- Detail: the "Agent channel → the running app (+ MCP server)" entry has one line starting "profile); a config" about 100 columns wide, while the rest of the entry wraps near 80. Re-wrap it to match.
+- Detail: `docs/DECISION.md` 2026-11-15 Agents/security entry: "its row then reads as B's" has no clear referent. Say that the grant row on the agent's own workspace menu then shows B's old root path.
+- Detail: the "Agent socket" entry says `workspace_menu`'s root hint "cuts a long root keeping its start". `workspace_menu` (`crates/app/src/window.rs`) does not cut the hint. The cut happens at render time: the menu places the hint right-aligned and clamps its left edge to the row's start (`window.rs`, the `hint_w` placement in the menu draw), so an overflowing hint keeps its start. The entry's claim about the kept end is correct; the cut is not in `workspace_menu`.
 - Reason: review of the per-workspace standing grant (feat/agent-standing-grant), recorded rather than fixed in that change.
 
 ---
