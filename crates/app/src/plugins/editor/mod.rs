@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use ghostrealm_core::config::{Kind, OptionSpec, SectionSpec};
 use ghostrealm_core::highlight::{self, BlockRow, Highlighter, SpanCache, StateCache};
 use ghostrealm_core::outline::Outline;
+use ghostrealm_core::syntax::{SyntaxDoc, TextEdits};
 use ghostrealm_core::{
     ArgKind, ArgSpec, CmdError, CmdOutcome, CommandMeta, Config, HeaderIcon, LineNumbers, Rect, Registry,
 };
@@ -446,6 +447,12 @@ pub struct EditorView {
     hl_states: StateCache,
     /// Highlight of the lines on screen, kept between frames.
     hl_spans: SpanCache,
+    /// The syntax tree a code language is highlighted from (its line
+    /// highlighter-less files: Kotlin, Java, Rust).
+    tree: Option<Box<dyn SyntaxDoc>>,
+    /// Wakes the UI when background work lands; a tree opened later (after
+    /// a Save As) takes it.
+    waker: Option<Waker>,
     /// The code blocks on screen, as last painted.
     code_blocks: Vec<ShownBlock>,
     /// The first line on screen of the code block the last paint found under
@@ -513,7 +520,9 @@ impl EditorView {
             center_caret: false,
             mode: None,
             preview: md_preview::Preview::new(waker.clone()),
-            outline: Outline::new(waker),
+            outline: Outline::new(waker.clone()),
+            tree: None,
+            waker,
             toc: Toc::default(),
             toc_press: false,
             undo: UndoPanel::default(),
@@ -1009,6 +1018,22 @@ impl EditorView {
         }
         self.goal_x = Some((goal, self.buf.cursor));
         used
+    }
+
+    /// Bring the syntax tree up to the buffer's text, first opening the one
+    /// for the file's language if the view holds another or none (a Save As
+    /// or a rename changes it); a file without a grammar drops it. The
+    /// buffer logs its edits only while there is a tree.
+    fn sync_tree(&mut self) {
+        let path = self.buf.path.as_deref();
+        if self.tree.as_ref().map(|t| t.name()) != path.and_then(ghostrealm_syntax_tree_sitter::language) {
+            self.tree = path.and_then(|p| ghostrealm_syntax_tree_sitter::open(p, self.waker.clone()));
+            self.buf.text_edits = self.tree.as_ref().map(|_| TextEdits::reset());
+        }
+        if let Some(t) = &mut self.tree {
+            let edits = self.buf.text_edits.replace(TextEdits::default()).unwrap_or_else(TextEdits::reset);
+            t.update(edits, &self.buf.lines);
+        }
     }
 
     /// The highlighter for the buffer's file, if any.
@@ -1548,6 +1573,7 @@ impl View for EditorView {
         }
         self.buf.clamp_scroll_bounds();
         self.layout_rows();
+        self.sync_tree();
 
         let e = &self.buf;
         let (cursor, sel) = (e.cursor, e.selection());
@@ -1561,6 +1587,9 @@ impl View for EditorView {
 
         // Visible text rows, top to bottom.
         let vis: Vec<TextRow> = self.rows.text_rows().collect();
+        if let (Some(t), Some(first), Some(last)) = (&mut self.tree, vis.first(), vis.last()) {
+            t.highlight(&e.lines, first.ln..last.ln + 1);
+        }
 
         self.code_blocks.clear();
         self.hover_block = None;
@@ -1692,7 +1721,10 @@ impl View for EditorView {
                         None => (syntax::row_spans(line, hl, r.start, r.len, EDITOR_FG), Vec::new()),
                     }
                 }
-                None => (vec![(line.chars().skip(r.start).take(r.len).collect(), EDITOR_FG)], Vec::new()),
+                None => match &self.tree {
+                    Some(t) => (syntax::row_spans(line, t.line(r.ln), r.start, r.len, EDITOR_FG), Vec::new()),
+                    None => (vec![(line.chars().skip(r.start).take(r.len).collect(), EDITOR_FG)], Vec::new()),
+                },
             };
             let styles = RowStyles::new(&styles, cw).scaled(r.scale);
             let key = cx.row_key_styled(spans.iter().map(|(s, c)| (s.as_str(), *c)), styles);
@@ -2174,7 +2206,11 @@ impl View for EditorView {
     }
 
     fn refresh(&mut self) -> bool {
-        let stats = self.sync() | self.stats.poll() | self.preview.poll() | self.outline.poll();
+        let stats = self.sync()
+            | self.stats.poll()
+            | self.preview.poll()
+            | self.outline.poll()
+            | self.tree.as_mut().is_some_and(|t| t.poll());
         let lines = &self.buf.lines;
         stats | self.lang.as_mut().is_some_and(|l| l.refresh(lines))
     }
@@ -4516,5 +4552,176 @@ body
         v.cycle_view_mode();
         paint_plain(&mut h, &mut v);
         assert_eq!(v.buf.scroll, 23);
+    }
+
+    /// The rows `v` draws, painted.
+    fn drawn(h: &mut Harness, v: &mut EditorView) -> Vec<Option<TextSrc>> {
+        paint_plain(h, v);
+        let row = |r: usize| {
+            let (x, y) = at(r, 0);
+            h.frame.text.iter().find(|t| t.left == x && (t.top - y).abs() < 2.0).map(|t| t.src)
+        };
+        (0..v.buf.lines.len().min(8)).map(row).collect()
+    }
+
+    /// The rows a fresh view of `v`'s text, in a file named as `v`'s, draws.
+    fn drawn_fresh(h: &mut Harness, v: &EditorView) -> Vec<Option<TextSrc>> {
+        let name = v.buf.path.as_ref().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+        let (_dir, mut fresh) = file_view("editor-fresh", &name, &v.buf.lines.join("\n"));
+        assert_eq!(fresh.buf.lines, v.buf.lines);
+        drawn(h, &mut fresh)
+    }
+
+    /// The key a row drawn in `spans` has.
+    fn row_of(h: &Harness, spans: &[(&str, [u8; 3])]) -> Option<TextSrc> {
+        Some(TextSrc::Row(h.text.row_cache.row_key(spans.iter().copied())))
+    }
+
+    fn code(c: highlight::Code) -> [u8; 3] {
+        syntax::color(highlight::Token::Code(c), EDITOR_FG)
+    }
+
+    fn type_text(h: &Harness, v: &mut EditorView, text: &str) {
+        for c in text.chars() {
+            h.key(v, press(Key::Char(c)));
+        }
+    }
+
+    fn shift(key: Key) -> KeyPress {
+        KeyPress { mods: ghostrealm_terminal::Mods { shift: true, ..Default::default() }, ..press(key) }
+    }
+
+    #[test]
+    fn code_files_draw_in_their_languages_colours() {
+        use highlight::Code::*;
+        let mut h = Harness::new();
+        let fg = EDITOR_FG;
+        type Runs<'a> = &'a [(&'a str, [u8; 3])];
+        let cases: [(&str, &str, Runs); 6] = [
+            ("A.kt", "val x = 42 // c", &[("val", code(Keyword)), (" x ", fg), ("=", code(Operator)), (" ", fg), ("42", code(Number)), (" ", fg), ("// c", code(Comment))]),
+            ("build.gradle.kts", "id(\"x\")", &[("id", code(Function)), ("(", code(Punctuation)), ("\"x\"", code(String)), (")", code(Punctuation))]),
+            ("A.java", "class A {}", &[("class", code(Keyword)), (" ", fg), ("A", code(Type)), (" {}", fg)]),
+            ("a.rs", "fn f() {}", &[("fn", code(Keyword)), (" ", fg), ("f", code(Function)), ("()", code(Punctuation)), (" ", fg), ("{}", code(Punctuation))]),
+            ("a.toml", "name = 1", &[("name ", code(Property)), ("= ", fg), ("1", code(Number))]),
+            ("a.zzz", "val x = 1", &[("val x = 1", fg)]),
+        ];
+        for (name, text, want) in cases {
+            let (_dir, mut v) = file_view("editor-code-colours", name, text);
+            assert_eq!(drawn(&mut h, &mut v), [row_of(&h, want)], "{name}");
+        }
+    }
+
+    #[test]
+    fn code_highlight_columns_count_chars() {
+        use highlight::Code::*;
+        let mut h = Harness::new();
+        let fg = EDITOR_FG;
+        let (_dir, mut v) = file_view("editor-code-chars", "A.kt", "val é = \"🦀\" // ü\n/*é🦀*/ val y = 1");
+        let want = [
+            row_of(&h, &[("val", code(Keyword)), (" é ", fg), ("=", code(Operator)), (" ", fg), ("\"🦀\"", code(String)), (" ", fg), ("// ü", code(Comment))]),
+            row_of(&h, &[("/*é🦀*/", code(Comment)), (" ", fg), ("val", code(Keyword)), (" y ", fg), ("=", code(Operator)), (" ", fg), ("1", code(Number))]),
+        ];
+        assert_eq!(drawn(&mut h, &mut v), want);
+    }
+
+    #[test]
+    fn a_code_files_edits_draw_in_both_views_as_a_fresh_view_would() {
+        let mut h = Harness::new();
+        let (_dir, mut a) = file_view("editor-code-two-views", "A.kt", "fun main() {\n    val x = 1\n}");
+        let path = a.buf.path.clone().unwrap();
+        let mut b = EditorView::new(EditorBuffer::open(path.clone()).unwrap());
+        drawn(&mut h, &mut a);
+        drawn(&mut h, &mut b);
+        a.buf.cursor = (1, 13);
+        // Auto-closed quote and brace, stepped over.
+        type_text(&h, &mut a, " + \"s${x}\"");
+        h.key(&mut a, press(Key::Enter));
+        type_text(&h, &mut a, "/* note");
+        for _ in 0..3 {
+            h.key(&mut a, press(Key::Backspace));
+        }
+        // Typed over a selection.
+        for _ in 0..4 {
+            h.key(&mut a, shift(Key::Left));
+        }
+        type_text(&h, &mut a, "val y = 2");
+        assert!(a.buf.lines[1].ends_with(" + \"s${x}\""), "{:?}", a.buf.lines);
+        assert_eq!(a.buf.lines[2].trim(), "val y = 2");
+        let check = |h: &mut Harness, a: &mut EditorView, b: &mut EditorView, why: &str| {
+            let got = drawn(h, b);
+            assert_eq!(b.buf.lines, a.buf.lines, "{why}");
+            assert_eq!(got, drawn_fresh(h, b), "the other view, {why}");
+            assert_eq!(drawn(h, a), drawn_fresh(h, a), "the edited view, {why}");
+        };
+        check(&mut h, &mut a, &mut b, "after typing");
+        h.key(&mut a, cmd(Key::Char('z')));
+        check(&mut h, &mut a, &mut b, "after an undo");
+        h.key(&mut a, cmd(Key::Char('z')));
+        check(&mut h, &mut a, &mut b, "after two");
+        std::fs::write(&path, "/* a\n*/ class C {\n    fun f() = \"x\"\n}\n").unwrap();
+        a.reload().unwrap();
+        check(&mut h, &mut a, &mut b, "after a reload");
+    }
+
+    #[test]
+    fn save_as_to_another_language_draws_it_in_that_ones_colours() {
+        let mut h = Harness::new();
+        let tmp = tmpdir("editor-code-save-as");
+        let mut v = view_with("val x = 1");
+        v.save_as(tmp.join("a.txt")).unwrap();
+        let mut other = EditorView::new(EditorBuffer::open(tmp.join("a.txt")).unwrap());
+        assert_eq!(drawn(&mut h, &mut v), [row_of(&h, &[("val x = 1", EDITOR_FG)])]);
+        drawn(&mut h, &mut other);
+        assert!(v.buf.text_edits.is_none(), "no tree, no log");
+        type_text(&h, &mut v, "fun ");
+        v.save_as(tmp.join("A.kt")).unwrap();
+        let kotlin = drawn(&mut h, &mut v);
+        assert_eq!(kotlin, drawn_fresh(&mut h, &v));
+        assert_ne!(kotlin, [row_of(&h, &[("fun val x = 1", EDITOR_FG)])]);
+        assert_eq!(drawn(&mut h, &mut other), kotlin, "the file's other view follows it");
+        h.key(&mut v, press(Key::End));
+        type_text(&h, &mut v, " // done");
+        assert_eq!(drawn(&mut h, &mut v), drawn_fresh(&mut h, &v), "edits after the move");
+        v.save_as(tmp.join("A.md")).unwrap();
+        assert_eq!(drawn(&mut h, &mut v), drawn_fresh(&mut h, &v));
+        assert!(v.tree.is_none() && v.buf.text_edits.is_none(), "Markdown has no tree");
+    }
+
+    #[test]
+    fn a_code_file_shows_its_source_only_and_comments_by_line() {
+        let mut h = Harness::new();
+        let (_dir, mut v) = file_view("editor-code-modes", "A.kt", "val x = 1");
+        assert_eq!(v.view_modes(), [ViewMode::Source]);
+        drawn(&mut h, &mut v);
+        v.toggle_comment().unwrap();
+        assert_eq!(v.buf.lines, ["// val x = 1"]);
+        assert_eq!(drawn(&mut h, &mut v), [row_of(&h, &[("// val x = 1", code(highlight::Code::Comment))])]);
+    }
+
+    #[test]
+    fn a_large_code_file_draws_plain_until_its_worker_lands_then_repaints() {
+        let mut h = Harness::new();
+        let text = "fun f() = 1\n".repeat(ghostrealm_syntax_tree_sitter::WORKER_BYTES / 10);
+        let (_dir, mut v) = file_view("editor-code-large", "A.kt", text.trim_end());
+        // The gutter is wider than `at` places rows for: find them by key.
+        let shows = |h: &Harness, spans: &[(&str, [u8; 3])]| h.frame.text.iter().any(|t| Some(t.src) == row_of(h, spans));
+        paint_plain(&mut h, &mut v);
+        assert!(shows(&h, &[("fun f() = 1", EDITOR_FG)]), "no tree yet");
+        let start = Instant::now();
+        loop {
+            let repaint = v.refresh();
+            if !v.tree.as_ref().unwrap().working() {
+                assert!(repaint, "the tree landing repaints");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the worker finishes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        paint_plain(&mut h, &mut v);
+        use highlight::Code::*;
+        let (fg, p) = (EDITOR_FG, code(Punctuation));
+        let row = [("fun", code(Keyword)), (" ", fg), ("f", code(Function)), ("()", p), (" ", fg), ("=", code(Operator)), (" ", fg), ("1", code(Number))];
+        assert!(shows(&h, &row));
+        assert!(!shows(&h, &[("fun f() = 1", EDITOR_FG)]));
     }
 }

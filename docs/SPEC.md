@@ -11,6 +11,8 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 - PTY: own unix code (`posix_openpt`, std `Command`). Fonts/shaping/raster: `glyphon` (cosmic-text) for now.
 - Toolchain: Zig 0.16.0 (pinned in [`../mise.toml`](../mise.toml)) is required to
   build `libghostty-vt-sys`. `.cargo/config.toml` sets `LIBGHOSTTY_VT_SYS_CPU=native`.
+  The tree-sitter runtime and grammars are C built through `cc` with the system C
+  compiler (on Linux, a `cc` on `PATH`), not Zig.
 
 ## Crate layout (seams)
 
@@ -18,9 +20,10 @@ investigation and verified toolchain are in [libghostty-findings.md](libghostty-
 crates/app         (bin "ghostrealm")  winit + wgpu scene + glyphon + input routing
   src/plugin/        the plugin API: Plugin/View, PaintCx, EventCx, test harness
   src/plugins/       first-party plugins: terminal, files (+ editor, file_browser), web
-crates/core        app spine: command registry, tab/split tree, inbox, sidebar order, config, fs tree, syntax highlighters
+crates/core        app spine: command registry, tab/split tree, inbox, sidebar order, config, fs tree, line highlighters, the syntax-tree seam
 crates/lsp         language services over LSP: first-party server host + editor client
 crates/process     long-lived child processes that inherit only their stdio
+crates/syntax-tree-sitter   tree-sitter grammars and highlight queries behind core's SyntaxDoc
 crates/terminal    the seam: TerminalBackend trait + Grid/Cell/Cursor/KeyPress
 crates/terminal-ghostty   libghostty-vt + PTY impl of the seam
 crates/web         web surface contract: JSON-line protocol, shared-memory frames, host client

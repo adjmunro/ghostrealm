@@ -5,7 +5,6 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 3. **Agent channel into the running app**: which processes may connect, and what may each one reach?
 4. **Web profiles, concrete model**: which profiles exist by default, who creates them, what scope they default to, and who owns the host?
 5. **Web downloads, uploads, and JS dialogs**: what may an agent-driven page do with files and dialogs?
-6. **Syntax highlighting direction**: tree-sitter, hand-written lexers, or LSP semantic tokens?
 7. **Dependency policy**: what must a new dependency clear, and do we start replacing existing ones?
 10. **Settings regenerate / cleanup / reset**: which of these commands, and how do they behave?
 11. **Video playback**: which decoder stack, if any?
@@ -157,38 +156,6 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 > **Download location:** agent downloads go to `~/Downloads/Ghost Realm/<workspace>/`. Human downloads go to `~/Downloads` as normal.
 >
 > **Quarantine:** make sure downloads get the macOS `com.apple.quarantine` attribute (verify CEF does this; don't assume) so Gatekeeper checks on open. Note: an agent executing a file from its shell bypasses this, and that's governed by agent shell policy, not the download path.
-
----
-
-## 6. Syntax highlighting direction
-
-**Source:** docs/TODO.md entry "DISCUSSION: syntax highlighting direction" (line ~1055); "Syntax highlighting — more languages" (line ~425); "Markdown rich text — follow-ups" (Kotlin heading modes, stateful fences); "Editor — section outline" (line ~564)
-
-**What's being decided:** how code languages get highlighted. This choice also decides whether we have a syntax tree for outlines and the "Kotlin class as H1" modes.
-
-**Background:**
-- `ghostrealm_core::highlight::ALL` holds two hand-written, line-local highlighters: TOML and Markdown.
-- The `Token` vocabulary mixes generic categories (Key, String, Comment) with Markdown-only ones (Strong, Emphasis, Link, Marker). It needs splitting into syntax categories and rich-text styles under every option.
-- Your languages: Kotlin, Gradle KTS, Java; then Swift and Rust; then web. You want Markdown to keep its own highlighter.
-- Tree-sitter: an MIT-licensed C library plus one generated C parser per language, compiled with `cc`. It parses incrementally, and its `highlights.scm` queries give standard capture names. Grammar quality varies; Kotlin's grammar is community-maintained.
-
-**Options:**
-- **A. Tree-sitter for code languages**; Markdown and TOML stay hand-written.
-  - Pros: many languages from existing grammars. The syntax tree also feeds the outline, the Kotlin heading modes, and fence highlighting.
-  - Cons: C dependencies and longer builds, which cuts against "Reduce dependencies"; grammars must be pinned and updated.
-  - Effort: medium for the integration, small per language after that.
-- **B. Hand-written lexers per language** behind a shared keyword API.
-  - Pros: no dependencies; full control.
-  - Cons: every language is a project, and keyword lists drift over time. A lexer gives no structure, so class and function headings still need a parser.
-  - Effort: large across five or more languages.
-- **C. LSP semantic tokens first**, with a minimal lexer as fallback.
-  - Pros: exact highlighting.
-  - Cons: needs a server installed per language; tokens arrive late after open; Markdown fences get nothing without a server.
-
-**Recommendation:** A. Split the `Token` vocabulary first. The heading modes and outline you want need a syntax tree, which only A provides cheaply.
-
-**Your answer:**
-> **A: tree-sitter** for code languages (via the official `tree-sitter` Rust crate plus per-language grammar crates). Markdown and TOML keep their hand-written highlighters. Split the `Token` vocabulary first. Accepted as a core dependency: stable, widely used (Neovim, Helix, Zed, GitHub), incremental and error-tolerant. The syntax tree should also feed the outline, Kotlin heading modes, fence highlighting, and later the indexer (item 18).
 
 ---
 
@@ -432,7 +399,7 @@ Colour values could be theme names (the terminal's ANSI palette: `red`, `bright-
 **Background:**
 - No index exists. The recursive fuzzy file walk stops at 20,000 entries (`FILTER_WALK_CAP`).
 - Search in files is being built on `feat/files-6-search` (issue #1).
-- Symbols could come from LSP `workspace/symbol` (needs servers running) or from tree-sitter tag queries (if item 6 goes with A).
+- Symbols could come from LSP `workspace/symbol` (needs servers running) or from tree-sitter tag queries (code languages are on tree-sitter now: `docs/DECISION.md`, syntax highlighting).
 - A persisted free-text index means a trigram index of our own, or a large dependency such as `tantivy`.
 
 **Options:**
@@ -440,7 +407,7 @@ Colour values could be theme names (the terminal's ANSI palette: `red`, `bright-
 - **B. An in-memory symbol index** per workspace root, built from tree-sitter tags and updated on file change.
 - **C. Free text and symbols, persisted** in the state dir.
 
-**Recommendation:** A now; B once item 6 is decided; C only if scans get slow on your repos. Also tell us what you want to find that on-demand search wouldn't give you.
+**Recommendation:** A now; B on the tree-sitter trees code languages now have; C only if scans get slow on your repos. Also tell us what you want to find that on-demand search wouldn't give you.
 
 **Your answer:**
 >
@@ -686,6 +653,9 @@ Each line gives the item and the default that will be applied if you don't veto 
 - **Pages an agent drives stay visible to Chromium** (`docs/DECISION.md`, Web pop-ups; built in 8af2376): agent-owned pages, including hidden pop-ups and pages created off screen, report themselves visible to Chromium (as headless Chrome and Puppeteer do), at 10 fps while nobody sees them; a person's background tabs stay hidden. Alternatives: show a page only while an eval runs (pages see `visibilitychange` around each eval), or wait longer for hidden pages (blocks the UI thread up to 30 s).
 
 **Editor**
+- **Kotlin grammar** (`docs/DECISION.md`, syntax highlighting; built on `feat/tree-sitter-highlighting`): fwcd's `tree-sitter-kotlin` pinned by git rev, the one grammar that parses Kotlin 2.x (context parameters, `when` guards, multi-dollar strings); it adds 6.1 MB to the binary and about 5 s to a clean build. Our own highlight query. Alternative: `tree-sitter-kotlin-ng` from crates.io (3.5 MB), which leaves those constructs as errors.
+- **Code files offer Source only** (same): Kotlin, Java and Rust files show no Integrated mode until the Kotlin heading modes give it something to format. Alternative: keep an Integrated mode that looks the same as Source.
+- **Syntax colours fixed** (same): the new code colours (keyword, type, function, constant, attribute, operator, punctuation) are fixed in `crates/app/src/syntax.rs`, as the existing ones are. Alternative: make them configurable, which adds a theme feature.
 - **Undo panel open per view** (`docs/DECISION.md`, editor undo panel, recorded there as an implementation choice; built in d6abbc4): each editor view (an editor pane or a Files tab) opens or closes its own undo panel, though every view of a file shows the same tree. Alternative: one open/closed state per file, shared by its panes.
 - **File-operation undo: a Trash row restores on its own** (`docs/plans/file-op-undo.md`; built in 5371a9c, aff740a): the file browser's undo history is one tree per workspace and undo walks it in order, so one step that can't be undone (a created file you've since written to refuses its undo) would block reaching an older Trash step. Default: a Trash row in the file browser's undo panel can be restored on its own, out of order, with the same safety checks, and is then marked restored. Steps that can never be undone (cross-volume moves, creates on Linux, no-op renames) aren't recorded, and a step whose undo is already in effect (e.g. you put the file back in Finder) counts as done. Alternative: strictly in-order undo only.
 - **Cmd+Z in the file browser** (same plan): Cmd+Z undoes a file operation only when the filter field is empty and has nothing of its own to undo; otherwise it undoes the filter text. When the undo panel is closed, a toast names the step undone or redone ("Undid rename a.md → b.md"). Alternative: file undo only from the panel or with the file list focused.
@@ -765,6 +735,7 @@ These can't be verified in the headless sandbox:
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 - **Agent channel in the window:** on branch `feat/agent-channel-live`, open two workspaces with a terminal each. In one, run `ghostrealm agent` and send `{"op":"get","what":"tree"}`, `{"op":"input","text":"echo hi\r"}` and `{"op":"set","id":"split.leftright"}`: the tree lists only that workspace, the text appears in its terminal, and the split happens there. Ask for the other workspace's terminal by id (`{"op":"get","what":"surface","id":N}`): `unknown surface N`. Quit: the socket file in `$TMPDIR/ghostrealm-<uid>/` is gone.
 - **Standing grant:** on branch `feat/agent-standing-grant`, right-click a workspace in the sidebar: the menu has "Agents reach all workspaces" with its directory at the right (hover highlight, fires on mouse-up, check mark once on). Switched on, an amber bar runs along the row's edge: check it on the active row, a hovered row, each status dot, a two-line (renamed) row, and on a folded directory header whose group holds a granted workspace. Then, live: with two workspaces A and B with terminals, grant A; from `ghostrealm agent` in A, `{"op":"get","what":"tree"}` lists both; `{"op":"set","id":"workspace.new","args":{"dir":"/tmp"}}` adds a workspace without switching your view; `{"op":"set","id":"split.leftright","workspace":<B>}` splits B; `{"op":"set","id":"workspace.close","workspace":<C>}` closes a workspace of terminals. Switch the grant off in the menu and send the split again in the same session: refused.
+- **Code highlighting:** on branch `feat/tree-sitter-highlighting`, open a Kotlin file, a `build.gradle.kts`, a Java file and a Rust file (this repo's `crates/core/src/syntax.rs` will do): the colours (keyword, type, function, string, number, comment, constant, attribute, operator, punctuation) are legible and distinct on the editor background; typing, Backspace and undo keep them right with no flicker; a large file (about 50,000 lines) opens and scrolls without a stall, its colours arriving shortly after it opens and after each edit; TOML and Markdown look as before.
 - **Borrowing a token on macOS** (item 25): in a terminal outside ghostrealm, `ps -wwE -p <pid of a ghostrealm shell>`: does the output show `GHOSTREALM_AGENT_TOKEN`?
 
 ## Parked (no decision needed yet)

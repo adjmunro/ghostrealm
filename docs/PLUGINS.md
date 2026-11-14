@@ -278,8 +278,8 @@ A change of `rect` is the resize signal (the terminal resizes its PTY there).
   `set_header(true)` (the Files surface does); `MediaView` always does.
 - View modes: an `EditorView` document shows in one `ViewMode` of those
   its language offers (`view_modes`): Markdown all three (Preview,
-  Integrated, Source), another highlighted language Integrated and Source,
-  a file with no highlighter Source only. Each document keeps its own; it
+  Integrated, Source), TOML Integrated and Source, any other file (a code
+  language highlighted from its syntax tree included) Source only. Each document keeps its own; it
   opens in Integrated where offered. The header's view-mode button (only
   with two modes or more) shows the mode's icon (`ViewPreview`,
   `ViewMixed`, `ViewSource`) and steps to the next, its tooltip naming both;
@@ -532,6 +532,8 @@ in-process; external ones are spawned processes speaking LSP on stdio.
 
 ## Syntax highlighting
 
+Rich formats (TOML, Markdown) have line highlighters; code languages are
+highlighted from a syntax tree (below, "Code languages").
 `ghostrealm_core::highlight` is a registry of `Highlighter`s keyed by file
 extension (`for_path`, `for_extension`; the list is `highlight::ALL`). A
 highlighter turns one line plus the `State` carried from the line before into
@@ -609,13 +611,45 @@ A highlighter must bound its work per line: a paint highlights every visible lin
 `Highlighter::comment` declares the language's line and block comment tokens
 (`CommentSyntax`); `comment_on` gives a line's, which differs inside an embedded
 language (a Markdown code block), and `comment_lead` the chars a comment goes
-after there (a quoted block's `>`). A language with no highlighter yet declares its
-comment tokens in `highlight::LANGUAGES` (found by fence word or extension with
-`language`). The editor's `editor.toggle_comment` (bound to `cmd+/` in a new
+after there (a quoted block's `>`). A language with no line highlighter (a code
+language too) declares its comment tokens in `highlight::LANGUAGES` (found by fence
+word or extension with `language`). The editor's `editor.toggle_comment` (bound to `cmd+/` in a new
 config file, never implicitly) reads them, taking an embedded language's only
 when every selected line is inside one block of it.
-To add a language, implement `Highlighter` in a module under `core/src/highlight/`,
+To add a rich format, implement `Highlighter` in a module under `core/src/highlight/`,
 list it in `ALL`, and drop its `LANGUAGES` entry.
+
+Code languages: `ghostrealm_core::syntax::SyntaxDoc` is one document's syntax
+tree, kept in step with its text, and the highlight read from it.
+`ghostrealm-syntax-tree-sitter` implements it on tree-sitter and is the only crate
+that names a tree-sitter type. Its registry finds a language by extension
+(`language(path)`, `open(path, waker)`): Kotlin (`kt`, `kts`), Java, Rust. Each
+has a highlight query whose capture names map to `Code` by their longest listed
+prefix (`function.method` is `Function`); `@variable`, `@variable.parameter`,
+`@label`, `@none` and `_`-names are plain, and a test checks every name a query
+uses is one or the other. Of the captures of one range, a coloured one beats a
+plain one (Java's first pattern is a catch-all `(identifier) @variable`), then the
+query's first pattern; ranges paint outer first, so an inner node, plain or not,
+paints over its parent (an interpolation inside a string). Kotlin's query is ours
+(`queries/kotlin.scm`); Rust's and Java's are their grammars' with patterns of ours
+put first. A query that fails to compile opens its language plain.
+Every tree reads the text as the rows joined by `\n`, none after the last
+(`syntax::chunk`, `chunks`, `text`). While a view holds a tree its buffer logs
+each change as a `TextEdit` (bytes and points) in `EditorBuffer::text_edits`
+(`None` otherwise); past `MAX_EDITS` (256), or when a pruned history step takes the
+text whole, the log collapses to a fresh parse (`TextEdits::reset`). At paint the
+view looks the language up by path, so a Save As or a rename swaps the document
+or drops it; hands it the log (`update`); and highlights the visible rows
+(`highlight`, then `line(ln)`, contiguous char-indexed `Span`s, kept until the
+tree or text changes). A document under `WORKER_BYTES` (64 KiB, about 10 ms of
+Kotlin in release) parses on the UI thread; a larger one on a worker woken
+through the waker (`refresh` polls it), highlighting meanwhile from the old tree
+with its nodes shifted by the edits; edits made while it runs are replayed onto
+its tree when it lands. Broken code parses with ERROR nodes, coloured around
+them; an unclosed `(` or string runs on until something closes it. Code files
+offer Source only. To add a code language, add its grammar crate and a `Grammar`
+entry (extensions, query parts) in `crates/syntax-tree-sitter/src/lib.rs`, and
+keep its `LANGUAGES` entry (comment toggle and file icons read it).
 
 ## Testing
 

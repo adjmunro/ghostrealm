@@ -422,15 +422,21 @@
 [2026-09-29@6641e98] Syntax highlighting — more languages
 
 - Requires: NO BLOCKERS
-- Detail: The registry (`ghostrealm_core::highlight`) has TOML and Markdown. Add
-  more as small `Highlighter` modules (JSON, YAML, Rust, shell, ...); each is one
-  line in `highlight::ALL`, declares its comment tokens (`Highlighter::comment`)
-  and drops its `highlight::LANGUAGES` entry. Later: consider LSP-backed semantic highlight, but
-  keep the rule-based path for the common case. Markdown has no setext headings,
+- Detail: Code languages are tree-sitter grammars in
+  `crates/syntax-tree-sitter` (Kotlin, Java, Rust today): each is a grammar
+  crate and a `Grammar` entry with its extensions and highlight query (PLUGINS.md
+  "Syntax highlighting"). Next: Swift, then web languages (HTML, CSS,
+  JavaScript/TypeScript). Line highlighters (`ghostrealm_core::highlight`) are
+  for rich formats (TOML, Markdown; maybe JSON, YAML): each is one line in
+  `highlight::ALL`, declares its comment tokens (`Highlighter::comment`) and
+  drops its `highlight::LANGUAGES` entry. Markdown has no setext headings,
   indented code, or YAML front matter (they need line-number or neighbouring-line
-  context). The direction for the main languages (tree-sitter, hand-written, or
-  a unified keyword API) is open: see "DISCUSSION: syntax highlighting
-  direction".
+  context).
+- Detail: Still to build on the syntax tree: the outline and Kotlin heading
+  modes (a query per language beside the highlight one), Markdown fence
+  highlighting for tree-sitter languages (Preview and Integrated code blocks:
+  the registry is keyed by extension; fence words like `kotlin` would join it),
+  and the indexer.
 - Reason: expand language support over time as little modules; requested.
 
 ---
@@ -792,11 +798,11 @@
     findings), 24 (stuck mount), 36 (unbracketed paste),
     and the "To confirm" note in [stack-review-findings.md](stack-review-findings.md).
   - The open design items: the profile scope controls and picker (TODO "Web —
-    profiles"), syntax highlighting direction.
+    profiles").
   Decided in the review rounds and no longer open: Chromium sandbox on, web
   profile location, pop-up handling, shell exit, Delete = Trash, GitHub
   permalinks (future), the file-browser date view naming, the Files surface
-  (GitHub issue #1).
+  (GitHub issue #1), syntax highlighting (tree-sitter for code languages).
 - Reason: several decisions are pending and may interact.
 
 ---
@@ -943,58 +949,6 @@
 > The entries below are from the owner's second review round (2026-10-13). The
 > owner asked that ideas be written down with what they actually said, so each
 > entry carries the verbatim quote (spoken, lightly cleaned of filler words).
-
----
-
-[2026-10-13T20:45+1300@6bc650f] DISCUSSION: syntax highlighting direction
-
-- Requires: a design session with the owner; do not implement yet
-- Detail: Explore a generic tree-sitter highlighter. The owner's main languages:
-  Kotlin, Gradle (Kotlin DSL), Java; then Swift and Rust; then web languages.
-  Open: a hand-written highlighter per main language (languages gain keywords
-  over time, which a hand-written one must track), or a unified API for
-  identifying a language's keywords, possibly backed by tree-sitter.
-- Detail: Markdown keeps its own highlighter, because it renders, formats, and
-  shows the syntax at once ("Markdown rich text — follow-ups"). Other rich formats (HTML headers, bold) may want the same;
-  undecided, since HTML is far denser. TOML moves to tree-sitter only if that
-  beats the hand-written one.
-- Context: the shared `Token` vocabulary in `ghostrealm_core::highlight` mixes
-  generic categories (Key, String, Number, Comment) with Markdown-only ones
-  (Strong, Emphasis, Link, Url, Quote, Marker). With many languages it needs
-  general categories (keyword, type, function, operator, ..., like tree-sitter's
-  capture names). Bold and italic are styles, not colours, so the vocabulary may
-  split into syntax tokens and rich-text styles. That is the weak point of the
-  Markdown-specific labels the owner asked about; if Markdown stays a separate
-  highlighter, the split is what lets it still run through the same API.
-- Related: per-language comment tokens for the editor's comment toggle live in
-  the same per-language registry (`Highlighter::comment`). Fenced code blocks in Markdown use these
-  highlighters.
-- Owner, verbatim:
-  > Oh, okay, I misunderstood you about highlighting in that they were the same
-  > thing. We might need to explore a generic syntax highlighter using tree
-  > sitter a bit more. Not implementing that just yet. So I'm thinking like my
-  > main languages, I might hard code one specifically for that language, unless
-  > there's a good reason why I shouldn't. Like I guess maybe the language
-  > evolves over time, so there's new keywords or something. Or we can make a
-  > unified API for like identifying which keywords there are. And then, yeah,
-  > maybe that does use tree sitter. Specifically for Markdown, though, I think
-  > Markdown deserves its own syntax highlighter just because of the way that I
-  > want it to both render and format and show the syntax all at the same time,
-  > which is a bit different. Oh, but you could argue that maybe we want that
-  > for other rich formats, such as HTML as well. At least for like headers and
-  > bold and whatnot. Then again, maybe not. HTML is far more complicated and
-  > far more dense. I'm not sure if you would use the tree sitter generic thing
-  > for Toml. Maybe. I don't see why you wouldn't. We'll think about that one
-  > more. It would have to be an improvement on the Toml one that's hard-coded,
-  > I think. My main language is Kotlin, so I would be looking at primarily
-  > doing like Kotlin, Gradle, Java, syntax highlighters, or maybe Swift and
-  > Rust because we do that a bit too. And then I guess there's also web. You're
-  > going to have to explain to me the weak point with markdown specific labels,
-  > I think. But it might not be a problem if we're keeping markdown separate
-  > because rendered markdown is its own kind of fancy thing, I think. Mind you,
-  > it's probably still running through the same API, isn't it? We can discuss
-  > more.
-- Reason: decide the highlighting architecture before adding many languages.
 
 ---
 

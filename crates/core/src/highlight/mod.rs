@@ -92,9 +92,10 @@ pub struct CommentSyntax {
     pub block: Option<(&'static str, &'static str)>,
 }
 
-/// A language with no highlighter yet, known so a comment toggle works on it
-/// (a whole file, or a Markdown code block). A language that gains a
-/// highlighter declares its syntax there and leaves this table.
+/// A language with no line highlighter, known so a comment toggle works on it
+/// (a whole file, or a Markdown code block). Code languages stay here when
+/// highlighted from a syntax tree ([`crate::syntax`]); a format that gains a
+/// line highlighter declares its syntax there and leaves this table.
 #[derive(Debug)]
 pub struct Language {
     /// The fence info words and file extensions (lowercase, no dot) naming it.

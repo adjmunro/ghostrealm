@@ -186,7 +186,7 @@
 [2026-10-17T23:58+1300@dd14e905]
 
 - Category: UX / files and editing
-- Detail: A document has three view modes, Preview (rendered, read-only), Integrated (source with formatting, editable), and Source (plain, editable), stepped by one header button (Preview → Integrated → Source) whose icon shows the current mode; the `⋯` menu and `editor.cycle_view_mode` do the same. A language offers only the modes it supports: Markdown all three, other highlighted languages Integrated and Source, others Source. Markdown opens in Integrated.
+- Detail: A document has three view modes, Preview (rendered, read-only), Integrated (source with formatting, editable), and Source (plain, editable), stepped by one header button (Preview → Integrated → Source) whose icon shows the current mode; the `⋯` menu and `editor.cycle_view_mode` do the same. A language offers only the modes it supports: Markdown all three, TOML Integrated and Source, others Source. Markdown opens in Integrated.
 - Detail: Preview body text is serif (`[editor] preview_font`, else New York / Georgia / fontconfig's serif) at 1.15 times the editor's size; code stays monospace.
 - Detail: Markdown parses with `pulldown-cmark` (CommonMark + GFM tables, task lists, strikethrough; no default features) into a flat block list; inline below 64 KiB, else on a worker.
 - Detail: A Preview link to a path (or a `file:` URL's path) opens in a Files surface, never in another program. Only `http`, `https`, and `mailto` URLs go to the system's handler (`Request::OpenUrl`), and `AppState::open_url` enforces the same list for every caller; any other scheme is not opened, and the link's hover says so.
@@ -451,3 +451,14 @@
 - Detail: its tools are five of the protocol's ops, `help`, `search`, `set`, `get` and `input`; a call becomes the request `{"op": <tool>, ...arguments}` (an `op` among the arguments is overwritten), sent on one connection opened with the terminal's `GHOSTREALM_AGENT_SOCKET` and `GHOSTREALM_AGENT_TOKEN`. It holds no reach of its own: every call passes `agent::serve`'s checks for that token's workspace. `pump` is left out: `get` drains background output itself.
 - Detail: it connects and says `hello` before reading stdin, so an unreachable socket or a refused token exits 1 with nothing on stdout. Outside a window's terminal (no socket variable) it refuses, as it does with `--headless`: there is no headless MCP server.
 - Reason: a fixed tool set never goes stale when the person switches the grant (a per-command list would, with no event to send `tools/list_changed` on), and `help`/`search` already list what the token may run at that moment. Refusing outside a window keeps an MCP client configured once from getting a headless app wherever it starts, unasked.
+
+---
+
+[2026-11-15T03:04+1300@458e86f7]
+
+- Category: Editor / syntax highlighting / core dependency
+- Detail: code languages are highlighted from a tree-sitter syntax tree; rich formats (TOML, Markdown) keep their line highlighters. The seam is `ghostrealm_core::syntax::SyntaxDoc` (one document's tree, kept in step with its text by logged `TextEdit`s, and the highlight read from it); `crates/syntax-tree-sitter` implements it and is the only crate naming a tree-sitter type, so another parser library or LSP semantic tokens can replace it behind the same trait.
+- Detail: dependencies: `tree-sitter` 0.27.1 (MIT; its optional `wasm` feature off) and one grammar crate per language: `tree-sitter-java` 0.23.5, `tree-sitter-rust` 0.24.2 (crates.io, MIT), and Kotlin from fwcd's `tree-sitter-kotlin` pinned by git rev `d6af96d2` (MIT). The crates.io release of fwcd's grammar (0.3.8) needs tree-sitter < 0.23, and no Kotlin grammar released two weeks or more ago parses Kotlin 2.x (context parameters, `when` guards, multi-dollar strings); fwcd's rev parses all three without error. Measured in release: about 10 ms per 64 KiB of Kotlin, a 5 s build-script run on a clean build (rebuilds skip it), and 6.1 MB added to the binary (its generated parser is 34 MB of C).
+- Detail: the runtime and grammars are C compiled through `cc` with the system C compiler, not Zig: Linux builds need a C compiler on `PATH`. No `cfg` code.
+- Detail: highlight queries are ours where a shipped one won't do: Kotlin's (fwcd's uses Neovim's `#lua-match?`, which tree-sitter's Rust binding doesn't evaluate) and patterns put before Rust's and Java's shipped queries. Syntax colours are fixed in `crates/app/src/syntax.rs`, as the line highlighters' are.
+- Reason: decisions-pending item 6 (owner): accurate, incremental, error-tolerant highlighting for the owner's languages (Kotlin first), on a syntax tree that the outline, Kotlin heading modes, fence highlighting and the indexer can share.
