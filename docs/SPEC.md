@@ -122,7 +122,8 @@ PTY foreground process-group = authoritative busy/idle; OSC 133 = exit code;
 - [x] Phase 2: command registry + tab/split tree + command palette (Cmd+K).
 - [x] Phase 3: agent control/introspection channel (`ghostrealm agent`, JSON):
       headless, and live in the window, scoped to the terminal's workspace.
-      With the person's standing grant, it reaches every workspace.
+      With the person's standing grant, it reaches every workspace's
+      terminals and Files surfaces, never web pages.
       To do: the MCP shim, agent web profiles (TODO.md).
 - [x] Phase 4: multi-pane GUI (splits both directions), sidebar of vtabs, per-pane
       htab strips (autohide), focus routing, mouse (click vtab/pane/tab).
