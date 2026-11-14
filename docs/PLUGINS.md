@@ -59,7 +59,8 @@ should be too. The API lives in
   window).
   `agent_reachable` (default `false`) opts the view in to a workspace's agent
   in the window: only then can that agent see it in `get tree`, read it, type
-  into it, or close the pane holding it. Terminals and Files surfaces opt in;
+  into it, or close the pane or workspace holding it (its own workspace's, or
+  any once the person grants it all). Terminals and Files surfaces opt in;
   web pages don't (they are on the person's profile). A new surface kind is out
   of reach until its view opts in.
 - **Hidden surfaces**: a surface in `AppState::views` but in no pane: never

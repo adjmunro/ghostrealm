@@ -126,8 +126,11 @@ user can enter, and gives each terminal two variables: `GHOSTREALM_AGENT_SOCKET`
 the workspace closes), which every process started there inherits. A
 workspace's agent reaches its own workspace's terminals and Files surfaces and
 the commands open to it (`help` lists them); never web pages, other workspaces,
-pickers or your desktop. If the socket can't be reached, `ghostrealm agent`
-exits 1.
+pickers or your desktop. "Agents reach all workspaces" in a workspace's sidebar
+menu (right-click) lets its agents reach every workspace's terminals and Files
+surfaces, run commands as another workspace (`"workspace": N` on `set`), and
+open and close workspaces; an amber bar marks it. If the socket can't be
+reached, `ghostrealm agent` exits 1.
 
 `ghostrealm agent --headless [cmd…]`, or `ghostrealm agent` outside a window,
 runs a headless app of its own, whose first terminal runs `cmd`; everything in

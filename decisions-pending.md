@@ -22,6 +22,7 @@ Open items from `docs/TODO.md`, `docs/IDEAS.md`, the two stack-review findings f
 24. **Recording review findings**: may the director write `record` findings into `docs/TODO.md` itself, and may notes-only fix commits skip the delta review?
 25. **Borrowed agent tokens**: accept that a same-user process can borrow a workspace's token from a shell's environment, or bind each connection to its process ancestry?
 26. **Agent commands and your keyboard focus**: may an agent's command move the focus of the workspace you're typing in?
+27. **Standing grant on Linux**: build item 25's option B before or with leaving a grant on, or accept that any of your processes can borrow a granted token there?
 
 ---
 
@@ -68,7 +69,7 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 >
 > **Open risk / follow-up:** CEF stores cookies and logins on disk, readable by any same-user process (including an agent's shell). Check whether CEF uses Keychain-backed cookie encryption on macOS. Explore app-managed encryption at rest, one key per profile (not per workspace) held in the Keychain so only Ghost Realm can unlock it.
 
-**Built:** the first increment, on branch `feat/agent-channel-live`: the window serves the agent channel over a per-window socket; each workspace's terminals get a token bound to it, and an agent there reaches only that workspace's terminals and Files surfaces and the commands classified for it, refused by default; no web page is reachable (DECISION.md, Agents / security). Left: the standing-grant toggle and approval prompts, agent web profiles and login handover, the MCP shim, a config "hide from agent" list, screenshots, cookie encryption at rest, and binding connections to the client's process ancestry (item 25).
+**Built:** the first increment, on branch `feat/agent-channel-live`: the window serves the agent channel over a per-window socket; each workspace's terminals get a token bound to it, and an agent there reaches only that workspace's terminals and Files surfaces and the commands classified for it, refused by default; no web page is reachable (DECISION.md, Agents / security). The second increment, on branch `feat/agent-standing-grant`: the standing grant, a per-workspace row in the sidebar's workspace menu, "Agents reach all workspaces", after which that workspace's agents reach every workspace's terminals and Files surfaces, run commands as another workspace, and open and close workspaces; what is yours stays refused (DECISION.md, Agents / security, 2026-11-15). No approval prompts: the toggle is the approval. Left: agent web profiles and login handover, the MCP shim, a config "hide from agent" list, screenshots, cookie encryption at rest, and binding connections to the client's process ancestry (item 25).
 
 ---
 
@@ -590,6 +591,7 @@ Agents read comments through the agent channel, within item 3's scope.
 - Linux: any process running as you can read another's environment from `/proc/<pid>/environ`, so any of your processes can borrow a token.
 - macOS: item 3's background said reading another process's environment is restricted. That is unverified: a probe from the agent sandbox (`ps -wwE`) showed no environment, which the sandbox may explain. It needs a check at a desktop (below).
 - A borrowed token reaches only that workspace: its terminals and Files surfaces and the commands open to agents, never web pages.
+- A granted workspace's token reaches every workspace's terminals and Files surfaces and opens `workspace.new` / `workspace.close`, so borrowing it gets all that; and a granted agent can read the other workspaces' tokens from their terminals and keep them after the grant is off (item 27).
 
 **Options:**
 - **A. Accept and document.** The boundary holds against an agent that doesn't go looking, not against a same-user process that does.
@@ -621,6 +623,7 @@ Agents read comments through the agent channel, within item 3's scope.
 - Example: halfway through typing a command in terminal X, the agent runs `pane.focus_next` and the rest of the line, Enter included, runs in terminal Y, possibly in another directory.
 - On a surface the agent can already address this gives it no new reach: it can type into X anyway. It is the same hazard as a stray Enter answering a question, which late-marked questions guard against.
 - The 2026-10-13 decision says agent-operated browser and emulator work "does not refocus or distract the human". Whether that extends to terminals and Files is this item.
+- With the standing grant, an agent anywhere can act as the workspace you are typing in and type into its terminals, so a check here keys on "the workspace the command acts as is your active one", not on the agent's own workspace. An agent's `workspace.new` already keeps your active workspace; its `workspace.close` can close the one you are in.
 
 **Options:**
 - **A. Never take your focus.** While its workspace is your active one, an agent's commands create panes and surfaces without focusing them, `file.open` opens in a Files surface other than the one you are focused in (a new one if needed), and `pane.close` / `pane.close_all` are refused.
@@ -635,6 +638,34 @@ Agents read comments through the agent channel, within item 3's scope.
   - Cons: the hazard above stays, against the 2026-10-13 preference.
 
 **Recommendation:** A. A command you are halfway through typing shouldn't run in a terminal you didn't choose.
+
+**Your answer:**
+>
+
+---
+
+## 27. Standing grant on Linux
+
+**Source:** item 3, second increment (branch `feat/agent-standing-grant`); review of its plan; DECISION.md, Agents / security (2026-11-15)
+
+**What's being decided:** whether leaving a workspace's standing grant on is acceptable on Linux before item 25's option B is built.
+
+**Background:**
+- A granted workspace's token reaches every workspace's terminals and Files surfaces and opens `workspace.new` / `workspace.close`.
+- On Linux any process running as you can read a shell's environment from `/proc/<pid>/environ`. While any workspace is granted, any of your processes can take its token and drive every workspace's terminals. So on Linux the grant is not per-workspace in practice.
+- The grant also goes to every process started in the granted workspace's terminals (build scripts, git hooks, tmux), not only the agent.
+- macOS: whether another process can read the environment is unverified (item 25's desktop check).
+
+**Options:**
+- **A. Build item 25's option B before or with relying on the grant.** Each connection is bound to the client's process ancestry, so a borrowed token is refused outside its workspace's process tree.
+  - Pros: the grant stays per-workspace on Linux; also stops a granted agent keeping other workspaces' tokens after the grant is off.
+  - Cons: item 25's cons (daemonised processes lose access; pid reuse needs care).
+  - Effort: small to medium.
+- **B. Accept it on Linux and document it** (DECISION.md already says so).
+  - Pros: nothing to build.
+  - Cons: on Linux, a grant switched on anywhere opens every workspace's terminals to every process running as you.
+
+**Recommendation:** A, next in item 3. ghostrealm runs on macOS today, so the grant can be used there meanwhile.
 
 **Your answer:**
 >
@@ -733,6 +764,7 @@ These can't be verified in the headless sandbox:
 - **File browser undo:** on `develop`, in a file sidebar create, rename, move (cut/paste) and Delete (Trash) a few scratch files, then Cmd+Z / Cmd+Shift+Z with the filter empty, and open the sidebar's undo panel with Cmd+Shift+U while the sidebar has the keys. Check the panel at the sidebar's bottom (top edge line, rows, "Restore" on a Trash row restoring out of order), the toast naming each step undone or redone, a refusal toast after changing a file in Finder, and that a trashed file comes back from `~/.Trash`.
 - **CEF host tests:** `ghostrealm-web --test host` (10–12 tests) and `popups_with_the_real_host` fail on `develop` in agent runs. See the TODO entry; check whether they pass on your machine with a fresh bundle.
 - **Agent channel in the window:** on branch `feat/agent-channel-live`, open two workspaces with a terminal each. In one, run `ghostrealm agent` and send `{"op":"get","what":"tree"}`, `{"op":"input","text":"echo hi\r"}` and `{"op":"set","id":"split.leftright"}`: the tree lists only that workspace, the text appears in its terminal, and the split happens there. Ask for the other workspace's terminal by id (`{"op":"get","what":"surface","id":N}`): `unknown surface N`. Quit: the socket file in `$TMPDIR/ghostrealm-<uid>/` is gone.
+- **Standing grant:** on branch `feat/agent-standing-grant`, right-click a workspace in the sidebar: the menu has "Agents reach all workspaces" with its directory at the right (hover highlight, fires on mouse-up, check mark once on). Switched on, an amber bar runs along the row's edge: check it on the active row, a hovered row, each status dot, a two-line (renamed) row, and on a folded directory header whose group holds a granted workspace. Then, live: with two workspaces A and B with terminals, grant A; from `ghostrealm agent` in A, `{"op":"get","what":"tree"}` lists both; `{"op":"set","id":"workspace.new","args":{"dir":"/tmp"}}` adds a workspace without switching your view; `{"op":"set","id":"split.leftright","workspace":<B>}` splits B; `{"op":"set","id":"workspace.close","workspace":<C>}` closes a workspace of terminals. Switch the grant off in the menu and send the split again in the same session: refused.
 - **Borrowing a token on macOS** (item 25): in a terminal outside ghostrealm, `ps -wwE -p <pid of a ghostrealm shell>`: does the output show `GHOSTREALM_AGENT_TOKEN`?
 
 ## Parked (no decision needed yet)

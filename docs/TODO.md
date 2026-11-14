@@ -664,9 +664,7 @@
 - Requires: NO BLOCKERS
 - Detail: the window serves the protocol over its socket, scoped per workspace
   (DECISION.md, Agents / security; decisions-pending.md item 3). Left: an MCP
-  server (a stdio shim over that socket); the per-workspace standing grant and
-  approval prompts (until then `workspace.new` and every other workspace are out
-  of reach); agent web profiles, agent-opened browsers and login handover (then
+  server (a stdio shim over that socket); agent web profiles, agent-opened browsers and login handover (then
   `web.*` gets a class that checks the page's profile); a config "hide from
   agent" list; binding each connection to the client's process ancestry
   (`LOCAL_PEERPID` / `SO_PEERCRED`, then the parent chain up to a workspace
@@ -1602,7 +1600,7 @@
 [2026-11-11T21:49+1300@219d5f58] Agent socket — findings recorded from the review
 
 - Requires: NO BLOCKERS
-- Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. Find the settings workspace by something an agent can't set. The same name labels the agent's questions ("From workspace “<name>”"), so an agent can make its questions read as another workspace's. Both want a workspace identity the agent can't set.
+- Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. A granted workspace's agent can rename any workspace. Find the settings workspace by something an agent can't set. The same name labels the agent's questions ("From workspace “<name>”"), so an agent can make its questions read as another workspace's. Both want a workspace identity the agent can't set.
 - Detail: the 32-connection cap (`crates/app/src/agent/socket.rs`) is window-wide, a connection that never sends its `hello` holds its slot until the window closes, and one past `hello` never times out, so one workspace's agent can lock out the others. Direction: a per-workspace cap, a read timeout on the first line, and an idle timeout.
 - Detail: owner decision pending (decisions-pending item 26): commands open to an agent that run through `acting_as` (`crates/app/src/app_state/scoped.rs`), such as `split.*`, `pane.focus_*`, `terminal.new`, `surface.new`, `file.open`, `editor.open` and `file.show_in_browser`, move the person's keyboard focus when the agent's workspace is the person's active one, so keys the person types mid-line can land in another terminal.
 - Detail: the sockets of killed or crashed windows are never swept from `ghostrealm-<uid>/`. The pid is in the name, so sweep stale ones as `ghostrealm_web::frame::remove_stale` does.
