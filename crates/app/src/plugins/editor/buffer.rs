@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ghostrealm_core::highlight::CommentSyntax;
+use ghostrealm_core::syntax::{TextEdit, TextEdits};
 
 use super::history::{self, Caret, NodeId, Op, Pos, UndoTree};
 use crate::file_stamp::Stamp;
@@ -45,6 +46,9 @@ pub struct EditorBuffer {
     /// The first line changed since a consumer last took this (`None` = none).
     /// Lets a per-line cache re-check only from there on.
     pub dirty_from: Option<usize>,
+    /// The text changes since a syntax tree last took them; `None` (nothing
+    /// recorded) unless a view holding a tree turns it on.
+    pub text_edits: Option<TextEdits>,
     /// Selection anchor (row, col); `None` = no selection. The selection spans
     /// anchor..cursor.
     pub anchor: Option<(usize, usize)>,
@@ -227,6 +231,7 @@ impl EditorBuffer {
             path,
             edits: 0,
             dirty_from: None,
+            text_edits: None,
             anchor: None,
             auto_closers: AutoClosers::default(),
             doc,
@@ -309,6 +314,7 @@ impl EditorBuffer {
                 for op in &ops {
                     first = first.min(op.at.0);
                     op.apply(&mut self.lines);
+                    log_edit(&mut self.text_edits, &self.lines, op.at, &op.del, &op.ins);
                     self.cursor = history::shift(self.cursor, op);
                     self.anchor = self.anchor.map(|a| history::shift(a, op));
                 }
@@ -317,6 +323,9 @@ impl EditorBuffer {
             None => {
                 first = 0;
                 self.lines = d.text.clone();
+                if let Some(log) = &mut self.text_edits {
+                    *log = TextEdits::reset();
+                }
             }
         }
         drop(d);
@@ -454,6 +463,7 @@ impl EditorBuffer {
             d.open = Some(Open { owner: self.id, run: None });
         }
         let (del, _) = history::splice(&mut self.lines, from, to, text);
+        log_edit(&mut self.text_edits, &self.lines, from, &del, text);
         history::splice(&mut d.text, from, to, text);
         d.history.record(Op { at: from, del, ins: text.to_string() });
         self.at = d.history.tip();
@@ -1181,6 +1191,14 @@ impl EditorBuffer {
     }
 }
 
+/// Log the change of `del` at `at` to `ins` in `log`, on `lines` (the text
+/// after it), unless the log is off or already asks for a fresh parse.
+fn log_edit(log: &mut Option<TextEdits>, lines: &[String], at: Pos, del: &str, ins: &str) {
+    if let Some(log) = log.as_mut().filter(|l| !l.reset) {
+        log.push(TextEdit::of(lines, at, del, ins));
+    }
+}
+
 /// The change that takes `old` to `new` (which differ), as a splice of the
 /// rows between their common first and last rows.
 fn line_diff(old: &[String], new: &[String]) -> (Pos, Pos, String) {
@@ -1264,6 +1282,7 @@ pub fn read_text(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostrealm_core::syntax::MAX_EDITS;
 
     #[test]
     fn edits_report_the_first_line_they_changed() {
@@ -2257,6 +2276,101 @@ mod tests {
         a.undo();
         in_step(&mut a, &mut b);
         assert_eq!(b.lines, ["one", "two"]);
+    }
+
+    /// Take the edits `e` logged since `old` (its text then) and check them
+    /// against its text now: replayed onto `old`'s bytes, with the bytes each
+    /// puts in unknown, they leave the new text's length and its bytes
+    /// wherever they are known. Returns the text now.
+    fn replayed(e: &mut EditorBuffer, old: &str) -> String {
+        let log = e.text_edits.replace(TextEdits::default()).expect("the log is on");
+        assert!(!log.reset, "a reset where edits were expected");
+        let new = e.lines.join("\n");
+        let mut shadow: Vec<Option<u8>> = old.bytes().map(Some).collect();
+        for ed in &log.edits {
+            assert!(ed.start_byte <= ed.old_end_byte && ed.old_end_byte <= shadow.len(), "{ed:?} in {old:?}");
+            let gap = std::iter::repeat_n(None, ed.new_end_byte - ed.start_byte);
+            shadow.splice(ed.start_byte..ed.old_end_byte, gap);
+        }
+        assert_eq!(shadow.len(), new.len(), "{old:?} -> {new:?}: {log:?}");
+        for (i, b) in shadow.iter().enumerate() {
+            assert!(b.is_none_or(|b| b == new.as_bytes()[i]), "byte {i}: {old:?} -> {new:?}: {log:?}");
+        }
+        new
+    }
+
+    #[test]
+    fn with_the_log_on_every_change_is_logged_as_byte_edits() {
+        let tmp = crate::plugin::testing::tmpdir("buffer-text-edits");
+        let path = tmp.join("f.kt");
+        std::fs::write(&path, "val é = 1\nfun a() {}\n").unwrap();
+        let mut e = EditorBuffer::open(path.clone()).unwrap();
+        let mut other = EditorBuffer::open(path.clone()).unwrap();
+        e.text_edits = Some(TextEdits::default());
+        let mut text = e.lines.join("\n");
+        let mut clip = None::<String>;
+        // A word typed with its auto-closed bracket, then a Backspace run.
+        e.cursor = (1, 10);
+        e.apply(Edit::Insert("\n".into()), &mut clip);
+        typed(&mut e, "fun main(");
+        assert_eq!(e.lines[2], "fun main()");
+        text = replayed(&mut e, &text);
+        for _ in 0..6 {
+            e.apply(Edit::Delete(Motion::Left), &mut clip);
+        }
+        assert_eq!(e.lines[2], "fun");
+        text = replayed(&mut e, &text);
+        // Typing over a selection that spans lines.
+        select(&mut e, (0, 4), (1, 3));
+        typed(&mut e, "🦀");
+        text = replayed(&mut e, &text);
+        // A multi-line paste.
+        clip = Some("x\ny🦀\n".into());
+        e.apply(Edit::Paste, &mut clip);
+        text = replayed(&mut e, &text);
+        // Undo, redo, and a jump to a step on another branch.
+        e.end_undo_run();
+        e.undo();
+        text = replayed(&mut e, &text);
+        e.redo();
+        text = replayed(&mut e, &text);
+        let pasted = e.history().current();
+        e.undo();
+        typed(&mut e, "z");
+        e.end_undo_run();
+        text = replayed(&mut e, &text);
+        assert!(e.goto(pasted));
+        text = replayed(&mut e, &text);
+        // Another view's edit, synced in.
+        other.sync();
+        other.cursor = (0, 0);
+        typed(&mut other, "// ");
+        e.sync();
+        text = replayed(&mut e, &text);
+        // A reload from disk.
+        std::fs::write(&path, "val é = 2\nfun b() {}\n").unwrap();
+        assert!(e.reload().unwrap());
+        replayed(&mut e, &text);
+        // Off, nothing is logged.
+        e.text_edits = None;
+        typed(&mut e, "x");
+        assert!(e.text_edits.is_none());
+    }
+
+    #[test]
+    fn a_pruned_step_or_too_many_edits_logs_a_fresh_parse() {
+        let mut a = EditorBuffer::scratch();
+        let mut b = EditorBuffer::with_doc(a.doc.clone());
+        b.text_edits = Some(TextEdits::default());
+        typed(&mut a, "one");
+        a.apply(Edit::Insert("\n".into()), &mut None::<String>);
+        typed(&mut a, "two");
+        a.doc.borrow_mut().history.prune(0);
+        b.sync();
+        assert_eq!(b.text_edits.take(), Some(TextEdits::reset()), "the text was taken whole");
+        b.text_edits = Some(TextEdits::default());
+        typed(&mut b, &"x".repeat(MAX_EDITS + 44));
+        assert_eq!(b.text_edits, Some(TextEdits::reset()), "300 edits collapse to one parse");
     }
 
     #[test]
