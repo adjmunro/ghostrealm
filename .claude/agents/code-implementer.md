@@ -32,7 +32,7 @@ If the brief says plan only, report the plan and stop. Feedback arrives as a fol
 - Drive view tests the way the host does. A press on a painted button reaches the view only as `Harness::button(id)`: `arm_button()` in `crates/app/src/window.rs` claims presses on buttons, while `Harness::mouse` hands any event straight to `View::mouse`. Build state through realistic input (whole words, Backspace runs, typing over a selection, auto-closed brackets), not hand-built single-char steps.
 - For a wide search, dispatch an `Explore` agent rather than reading many files yourself.
 - Stay within the brief. Work it turns up that is out of scope goes in your report, not your branch.
-- If you near 300,000 tokens of context, or the work grows well beyond the brief or 50% over the plan's size, stop and report with a handoff note.
+- If you near 230,000 tokens of context (compaction fires near 265,000), or the work grows well beyond the brief or 50% over the plan's size, stop and report with a handoff note.
 - Keep your worktree's `target/`: reviews and fixes reuse it, and the director removes the worktree once the goal lands. Before reporting, delete any target dir you created outside it.
 
 ## Report
@@ -44,4 +44,5 @@ Short:
 - For each OS-specific code path you touched: run, compile-checked (the build skill says how) or only read.
 - Deviations from the plan, and why.
 - Open questions and anything left undone.
+- Whether your context compacted.
 - Handoff note (state, branch, open items) if you stopped early.

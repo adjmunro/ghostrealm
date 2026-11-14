@@ -23,7 +23,7 @@ Work on one overarching goal at a time: get it built and reviewed, fast-forward 
 
 Start each goal by writing, in one line, the owner's need behind it (the problem it solves for them, not the mechanism they picked). Check every plan, default, fix round and the landed result against that need: work it doesn't require is cut or flagged, not built, and whatever removed code did for it is kept.
 
-Once the plan is in, note its size (lines, agent time). When the work outgrows that by half, or costs more than the need is worth, stop dispatching and tell the owner the cost so far, what is left, and the smallest version that meets the need. If the owner is away, cut to that version and flag the rest.
+Once the plan is in, note its size (lines changed, agent time). Size is insertions plus deletions from `git diff --shortstat develop...<tip>`; use it for both the plan's estimate and this check. When the work outgrows that by half, or costs more than the need is worth, stop dispatching and tell the owner the cost so far, what is left, and the smallest version that meets the need. If the owner is away, cut to that version and flag the rest.
 
 After a goal lands, remove its merged agent worktrees (`git worktree remove`) and their branches, then run `mise run clean-all`, adding `-- --except <worktree>/target` (repeatable) for each agent worktree awaiting review or fixes whose `target/` exists (a missing `--except` dir is an error and nothing is cleaned): it empties an agent worktree's `target/` after 2 hours idle. Leave no stale agent worktrees behind: each holds a multi-gigabyte `target/`.
 
@@ -49,10 +49,11 @@ A role that doesn't fit, or keeps needing the same extra instructions: ask 📐 
 
 Track each agent: id, role, model, start time, tokens from its latest report.
 
-- No agent context above 300,000 tokens; `haiku` above 100,000. Before a follow-up would cross that, get a handoff note (state, branch, open items) and give it to a fresh agent.
+- No agent context above 230,000 tokens (compaction fires near 265,000); `haiku` above 100,000. Before a follow-up would cross that, get a handoff note (state, branch, open items) and give it to a fresh agent.
 - Don't resume an agent started more than an hour ago; hand off to a fresh one.
 - A plan-only 🔨 Code Implementer over about 150,000 tokens: give the implementation to a fresh implementer starting from the plan doc, not a follow-up.
 - Otherwise, follow-ups on the same work go to the same agent (`SendMessage`): its context is cached, which costs less than a fresh agent re-reading files. Reviews of fixes still go to a fresh reviewer.
+- An agent stopped by an API or rate-limit error: resume it with `SendMessage` to continue where it stopped. Don't judge its progress from the task output file (it is not the transcript), and don't tell the owner how far it got until it reports.
 - Subagents nest at most three layers below the main session (director → department director → worker → helper).
 
 ## Reporting
