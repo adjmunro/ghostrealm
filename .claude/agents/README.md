@@ -28,5 +28,5 @@ Defaults apply only when the dispatcher passes no `model` or `effort`. The role 
 
 ## Shared frontmatter
 
-- `autoCompactWindow: 300000`: backstop for the context budget. Compaction fires about 35,000 tokens below the window (around 265,000), after reserving room for output, so the budget is 230,000. Compaction drops detail, so the director hands off to a fresh agent before it triggers. Haiku's window is smaller than this, so its 100,000 budget rests on the director alone.
+- `autoCompactWindow: 300000`: backstop for the context budget. Compaction has been observed firing around 265,000, so the budget is 230,000. Compaction drops detail, so the director hands off to a fresh agent before it triggers. Haiku's window is smaller than this, so its 100,000 budget rests on the director alone.
 - `experimental.cacheTtl: 1h`: matches the director's one-hour reuse window, so a follow-up within the hour reads the agent's context from cache.
