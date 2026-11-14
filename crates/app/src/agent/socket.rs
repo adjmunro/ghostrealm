@@ -788,6 +788,91 @@ mod tests {
         assert!(!error.contains("headless") && !error.contains("unset"), "{error}");
     }
 
+    /// `ghostrealm agent --mcp`'s server on `input` with `token`, run on a
+    /// thread while the window serves: its replies and outcome.
+    fn mcp_served(ui: &mut Ui, token: &str, input: &[Json]) -> (Vec<Json>, anyhow::Result<()>) {
+        let path = ui.server.path().to_path_buf();
+        let token = token.to_string();
+        let input: String = input.iter().map(|m| format!("{m}\n")).collect();
+        let server = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let result = super::super::mcp::serve(&path, &token, input.as_bytes(), &mut out);
+            (String::from_utf8(out).unwrap(), result)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() {
+            assert!(Instant::now() < deadline, "served");
+            ui.serve();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (out, result) = server.join().unwrap();
+        (out.lines().map(|l| serde_json::from_str(l).unwrap()).collect(), result)
+    }
+
+    fn mcp_call(id: u32, name: &str, arguments: Json) -> Json {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } })
+    }
+
+    /// Given a window with workspaces A and B, A ungranted;
+    /// when an MCP client with A's token initializes, lists the tools, reads
+    /// the tree and `help`, then splits B, reads and types into B's terminal
+    /// and splits B again; and a client with a token no workspace has
+    /// starts;
+    /// then the tree is A's alone and `help` lists no refused command; each
+    /// call on B is a tool error with the socket's reason, the second split
+    /// as much as the first, and B is untouched; the unknown token is an
+    /// error before any reply.
+    #[test]
+    fn the_mcp_server_has_its_workspaces_reach_and_no_more() {
+        let dir = TmpDir::new("sock-mcp");
+        let mut ui = Ui::new(&dir.join("s"));
+        let a = ui.state.new_vtab().unwrap();
+        let b = ui.state.new_vtab().unwrap();
+        let theirs = ui.state.focused_surface_in(b).unwrap();
+        let token = ui.token(a);
+        let split = mcp_call(5, "set", json!({ "id": "split.leftright", "workspace": b.0 }));
+        let (replies, result) = mcp_served(
+            &mut ui,
+            &token,
+            &[
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": super::super::mcp::PROTOCOL_VERSION, "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" } } }),
+                json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+                mcp_call(3, "get", json!({ "what": "tree" })),
+                mcp_call(4, "help", json!({})),
+                split.clone(),
+                mcp_call(6, "get", json!({ "what": "surface", "id": theirs.0 })),
+                mcp_call(7, "input", json!({ "text": "touch pwned\r", "id": theirs.0 })),
+                split,
+            ],
+        );
+        result.unwrap();
+        let ids: Vec<Json> = replies.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 5].map(|n| json!(n)));
+        assert_eq!(replies[0]["result"]["protocolVersion"], super::super::mcp::PROTOCOL_VERSION);
+        let text = |r: &Json, i: usize| r["result"]["content"][i]["text"].as_str().unwrap().to_string();
+        assert_eq!(replies[2]["result"]["isError"], false);
+        assert_eq!(text(&replies[2], 1).matches("vtab ").count(), 1, "A's alone: {:?}", replies[2]);
+        let help: Json = serde_json::from_str(&text(&replies[3], 0)).unwrap();
+        let listed: Vec<&str> = help["commands"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert!(listed.contains(&"split.leftright") && !listed.contains(&"file.reveal"), "{listed:?}");
+        for (r, why) in [
+            (&replies[4], "outside this agent's workspace"),
+            (&replies[5], "unknown surface"),
+            (&replies[6], "unknown surface"),
+            (&replies[7], "outside this agent's workspace"),
+        ] {
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(text(r, 0).contains(why), "{r}");
+        }
+        assert_eq!(ui.state.tree.vtab(b).unwrap().panes().len(), 1);
+        let (replies, result) = mcp_served(&mut ui, &"0".repeat(64), &[json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })]);
+        assert!(replies.is_empty());
+        assert!(format!("{:#}", result.unwrap_err()).contains(REFUSED));
+    }
+
     /// Given a server;
     /// when it closes;
     /// then its socket file is gone.

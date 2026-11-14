@@ -22,7 +22,8 @@
 //! Two channels serve it, both through [`serve`]: the headless one ([`run`],
 //! `ghostrealm agent --headless`), where the whole app is the agent's; and a
 //! window's socket ([`socket`], which `ghostrealm agent` reaches through
-//! [`client`] from that window's terminals), where each connection is one
+//! [`client`] from that window's terminals, and `ghostrealm agent --mcp`
+//! through [`mcp`]), where each connection is one
 //! workspace's agent ([`Scope::Workspace`]). The person can grant a
 //! workspace's agents reach over all workspaces ([`Grants`]), from the
 //! sidebar's workspace menu only.
@@ -39,6 +40,7 @@ use serde_json::{json, Value as Json};
 use crate::app_state::{build_registry, Agent, AppState};
 
 pub mod client;
+pub mod mcp;
 pub mod socket;
 
 /// `bytes` random bytes from `/dev/urandom`, hex-encoded.

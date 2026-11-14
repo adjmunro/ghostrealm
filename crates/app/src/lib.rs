@@ -46,6 +46,8 @@ use ghostrealm_terminal_ghostty::{CommandBuilder, GhosttyTerminal};
 ///   terminal's workspace; else a headless app's
 /// - `ghostrealm agent --headless [cmd...]` → a headless app's, whose first
 ///   terminal runs `cmd`
+/// - `ghostrealm agent --mcp`     → an MCP server on stdin/stdout for the
+///   window's channel, as the terminal's workspace; no headless mode
 /// - `ghostrealm dump [cmd...]`   → headless: run a command, print the grid
 /// - `ghostrealm lsp <name>`      → serve a first-party language server on stdio
 pub fn run_cli() -> Result<()> {
@@ -53,9 +55,15 @@ pub fn run_cli() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("agent") => {
             args.remove(0);
+            if args.first().is_some_and(|a| a == "--mcp") {
+                return agent_mcp(&args[1..]);
+            }
             let headless = args.first().is_some_and(|a| a == "--headless");
             if headless {
                 args.remove(0);
+                if args.first().is_some_and(|a| a == "--mcp") {
+                    anyhow::bail!("`ghostrealm agent --mcp` has no headless mode: it serves the window whose terminal it runs in");
+                }
             }
             let in_window = std::env::var_os(agent::SOCKET_ENV);
             if let Some(socket) = in_window.as_ref().filter(|_| !headless) {
@@ -99,6 +107,24 @@ pub fn run_cli() -> Result<()> {
             window::run(command_line)
         }
     }
+}
+
+/// `ghostrealm agent --mcp`: serve MCP for the window whose terminal this
+/// runs in, as its workspace. Outside a window's terminal it refuses: an MCP
+/// client configured once would otherwise get a headless app wherever it
+/// starts, unasked.
+fn agent_mcp(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        anyhow::bail!("`ghostrealm agent --mcp` takes no arguments: it serves the window whose terminal it runs in");
+    }
+    let Some(socket) = std::env::var_os(agent::SOCKET_ENV) else {
+        anyhow::bail!(
+            "`ghostrealm agent --mcp` serves the window whose terminal it runs in, and this isn't a ghostrealm window's terminal ({} is unset)",
+            agent::SOCKET_ENV
+        );
+    };
+    let token = std::env::var(agent::TOKEN_ENV).unwrap_or_default();
+    agent::mcp::serve(socket.as_ref(), &token, std::io::stdin().lock(), std::io::stdout().lock())
 }
 
 /// The profile root of a headless app's web pages: one of its own, never
