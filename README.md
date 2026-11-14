@@ -130,7 +130,8 @@ pickers or your desktop. "Agents reach all workspaces" in a workspace's sidebar
 menu (right-click) lets its agents reach every workspace's terminals and Files
 surfaces, run commands as another workspace (`"workspace": N` on `set`), and
 open and close workspaces; an amber bar marks it. If the socket can't be
-reached, `ghostrealm agent` exits 1.
+reached, `ghostrealm agent` exits 1. The window closes a connection idle for 5
+minutes; `ghostrealm agent` and the MCP server reopen it on their next request.
 
 `ghostrealm agent --headless [cmd…]`, or `ghostrealm agent` outside a window,
 runs a headless app of its own, whose first terminal runs `cmd`; everything in

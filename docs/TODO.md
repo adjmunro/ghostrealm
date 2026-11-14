@@ -691,11 +691,6 @@
   in `_meta`, `server/discover` replaces `initialize`, `ping` is gone, and
   `tools/list` results carry `resultType`, `ttlMs` and `cacheScope`. Add it once
   clients need it, from the full spec (not a summary).
-- Detail: a `tools/call` whose request line exceeds the socket's `MAX_LINE` (1 MiB,
-  e.g. a large `input`) makes the socket close the connection. The shim then answers
-  that call as a tool error and exits 1, so Claude Code shows the server as failed
-  until reconnected; the plain relay behaves the same. Direction: the shim refuses
-  an over-long request as a tool error without sending it, sharing the limit.
 - Detail: owner's choice. The README's `claude mcp add --scope user …` makes every
   Claude Code session outside ghostrealm report a failed server, since `--mcp` exits
   1 outside a window. Direction: suggest project or local scope, or, outside a
@@ -1585,12 +1580,7 @@
 - Requires: NO BLOCKERS
 - Detail: `workspace.rename` is open to a workspace's agent; renaming its workspace "settings" makes `open_settings` (which finds the settings workspace by name) pick the agent's workspace. A granted workspace's agent can rename any workspace. Find the settings workspace by something an agent can't set. The same name labels the agent's questions ("From workspace “<name>”"), so an agent can make its questions read as another workspace's. The grant's menu row (`workspace_menu`, `crates/app/src/window.rs`) names the workspace by its root, which an agent can also set: `file.rename` is open to every agent with unscoped paths and moves the root of every workspace rooted at the renamed folder (`rename_path` → `changed()`, `crates/app/src/app_state/files.rs`), so an ungranted agent can rename B's root away, rename its own root to B's old path and its workspace to B's name; workspaces sharing a root show the same hint. All three want a workspace identity the agent can't set.
 - Detail: `workspace_menu`'s root hint cuts a long root keeping its start, the least distinctive part, and repeats `shorten_dir`'s `~` substitution. Direction: show the tail as `shorten_dir` does, by calling it.
-- Detail: the 32-connection cap (`crates/app/src/agent/socket.rs`) is window-wide, a connection that never sends its `hello` holds its slot until the window closes, and one past `hello` never times out, so one workspace's agent can lock out the others. Direction: a per-workspace cap, a read timeout on the first line, and an idle timeout.
 - Detail: owner decision pending (decisions-pending item 26): commands open to an agent that run through `acting_as` (`crates/app/src/app_state/scoped.rs`), such as `split.*`, `pane.focus_*`, `terminal.new`, `surface.new`, `file.open`, `editor.open` and `file.show_in_browser`, move the person's keyboard focus when the agent's workspace is the person's active one, so keys the person types mid-line can land in another terminal.
-- Detail: the sockets of killed or crashed windows are never swept from `ghostrealm-<uid>/`. The pid is in the name, so sweep stale ones as `ghostrealm_web::frame::remove_stale` does.
-- Detail: `an_unreadable_directory_keeps_the_socket` passes with its guard removed: mode 0200 makes `remove_file` fail regardless. Make the test reach the guard.
-- Detail: out of scope here: a long `$TMPDIR` can push the socket path past `sun_path`'s limit (104 bytes on macOS); bind then fails with only a warning toast.
-- Detail: `input` replies before its bytes reach the terminal, so an agent sending input faster than the shell reads it grows the terminal's input queue without bound. Bound the queue, or reply once the bytes are written.
 - Detail: `file.delete` under a workspace's agent refuses a path with a document open in another workspace, checked when the command runs. A delete that first asks (an untracked file) or waits for its git check closes the documents open under the path when it goes ahead, so a document another workspace opened in between is closed too. Check again before the delete goes ahead.
 - Reason: review findings on the live agent channel (feat/agent-channel-live), recorded rather than fixed in that increment.
 
@@ -1601,7 +1591,7 @@
 - Requires: NO BLOCKERS
 - Detail: a headless app started in a window's terminal (`ghostrealm agent --headless`) keeps the window's `GHOSTREALM_AGENT_SOCKET` and `GHOSTREALM_AGENT_TOKEN` in its process, and `TerminalPlugin::open` sets nothing when `agent_env` is `None`, so its terminals inherit them: `ghostrealm agent` typed there relays to the real window as that workspace. No reach gained. Direction: remove both variables in the headless branch of `run_cli` (`crates/app/src/lib.rs`) before building `AppState`. A window started from a ghostrealm terminal whose socket bind fails doesn't have the same problem: the window branch of `run_cli` removes both variables before `window::run`, its only caller, so its terminals inherit neither.
 - Detail: close and rebind can race (`crates/app/src/agent/socket.rs`, `Accept::run` and `Server::close`): the accept thread passes its `stop` check, `close` sets `stop` and removes the file, then the recheck finds it missing and binds again, leaving a stale socket file. Direction: check `stop` again inside `bind_again_if_gone`, under the `bound` lock `close` takes.
-- Detail: uncertain: on ext4 or tmpfs a new file can reuse a freed inode, so the `(dev, ino)` guard in `remove_if_bound` could match a replacement, and `a_file_in_the_sockets_place_is_kept` could fail intermittently. Unconfirmed; passes on APFS. Direction: also require the file to still be a socket, and in the test create the new file before unlinking the old.
+- Detail: uncertain: on ext4 or tmpfs a new file can reuse a freed inode, so the `(dev, ino)` guard in `remove_if_bound` (`crates/app/src/agent/socket.rs`) could match a replacement. A file other than a socket no longer matches (`identity` requires a socket); another socket bound at the path after the window's was deleted still could. Unconfirmed.
 - Detail: no test shows `Server::drain` stopping near its budget with requests left and waking the loop again.
 - Detail: the README says "44 tests".
 - Detail: unconfirmed: `Confirmed::Trash` closes the documents under the path when the person accepts, without rechecking for unsaved edits. The review found no way to make such edits while a Trash question is open: an open question blocks input (the `confirm().is_some()` checks in `crates/app/src/window.rs`, such as `may_hover`, `on_key_release` and `press_view`), and a workspace's agent can't reach editors. Verify that when picked up. The same holds for the person's own deletes.
@@ -1645,3 +1635,12 @@
 - Detail: nit: the header of `crates/syntax-tree-sitter/queries/rust.scm` has one line about 111 columns wide (its third), while the rest wraps near 75. Re-wrap it to match.
 - Detail: nit: the doc comment on `Grammar::query` (`crates/syntax-tree-sitter/src/lib.rs`) says the prepended patterns "take its nodes first". That holds only among coloured captures: a plain capture of ours loses to a coloured one of the grammar's. Point the comment at the rule stated in the query headers.
 - Reason: review of tree-sitter syntax highlighting (feat/tree-sitter-highlighting), recorded rather than fixed in that change.
+
+---
+
+[2026-11-15T06:19+1300@d8afc430] Agent socket — sweep dead windows' sockets on Linux
+
+- Requires: a Linux machine to run the tests on
+- Detail: `Server::bind_with` (`crates/app/src/agent/socket.rs`) calls `sweep` on macOS only, since its deletions were never run on Linux. Run `stale_sockets_of_dead_windows_are_swept`, `binding_sweeps_dead_windows_sockets_and_keeps_live_ones` and the other sweep tests there, then enable it.
+- Detail: before enabling, make the sweep's `connect` non-blocking or time-limited: on Linux a connect to a live listener whose backlog is full blocks (or gives `EAGAIN` non-blocking). Count `EAGAIN` and a timeout as alive; only `ECONNREFUSED` removes. There the connect check matters more than on macOS: a window in another pid namespace sharing the directory (a sandbox, a container) reads as dead to `kill(pid, 0)`.
+- Reason: a killed or crashed window's socket file stays in `ghostrealm-<uid>/` until swept.
