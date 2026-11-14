@@ -1,6 +1,6 @@
-; Patterns put before tree-sitter-rust's own query, whose first pattern
-; capturing a node sets its colour: a method call's name is a function, not
-; a property; an all-caps name is a constant (the shipped pattern's regex
+; Patterns put before tree-sitter-rust's own query. Of the captures of one
+; range, a coloured one beats a plain one, then the first pattern wins: a
+; method call's name is a function, not a property; an all-caps name is a constant (the shipped pattern's regex
 ; ends in a stray `'`, so it never matches); numbers are numbers, not
 ; constants.
 

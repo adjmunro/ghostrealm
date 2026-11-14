@@ -1,7 +1,7 @@
-; Kotlin highlights for fwcd/tree-sitter-kotlin. The first pattern that
-; captures a node sets its colour, so specific patterns come before general
-; ones; a node inside another's range paints over it (an interpolation
-; inside a string).
+; Kotlin highlights for fwcd/tree-sitter-kotlin. Of the captures of one
+; range, a coloured one beats a plain one, then the first pattern wins, so
+; specific patterns come before general ones; a node inside another's range
+; paints over it (an interpolation inside a string).
 
 ; Comments, strings, numbers
 

@@ -62,18 +62,6 @@ pub enum Rich {
     Quote,
 }
 
-impl From<Code> for Token {
-    fn from(c: Code) -> Token {
-        Token::Code(c)
-    }
-}
-
-impl From<Rich> for Token {
-    fn from(r: Rich) -> Token {
-        Token::Rich(r)
-    }
-}
-
 /// A run of one [`Token`] in a line, in char indices (`end` exclusive).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {

@@ -459,8 +459,8 @@
     blocks, a run button in the left gutter for each runnable command; an
     LSP for the fence's
     language; highlighting a fence in a stateful language (Markdown in
-    Markdown) needs the inner state carried too; see "DISCUSSION: syntax
-    highlighting direction".
+    Markdown) needs the inner state carried too; tree-sitter fences are in
+    "Syntax highlighting — more languages".
   - Links: look and feel (colours) of internal and external links, to discuss.
   - Nesting: the highlighter gives each char one token, so emphasis inside
     strong (or a link or heading) loses the outer style; needs a token set per
@@ -1633,3 +1633,13 @@
 - Detail: the compaction point is stated with different certainty. `.claude/agents/README.md` (Shared frontmatter) says it was "observed" near 265,000 and derives the 230,000 budget from it; `.claude/agents/director.md` (Context and cache) and `.claude/agents/code-implementer.md` (Implement) say compaction "fires near" 265,000. Make all three say: compaction has been observed near 265,000; 230,000 is a chosen margin below it.
 - Detail: uncertain: `.claude/agents/director.md` (Context and cache) says "Don't resume an agent started more than an hour ago", counting from the agent's start. `.claude/agents/README.md` ties `experimental.cacheTtl: 1h` to the director's reuse window, and a prompt-cache TTL restarts on each read, so the cache is warm for an hour after the agent's last use. The rule as written refuses a resume whose cache is still warm, and a resume the rule allows can hit an expired cache. Decide which clock the rule means. If it is the cache, count from the last use; if it is context age, say that, since the cache is not the reason.
 - Reason: review of the role lessons from the agent channel goal, recorded rather than fixed in that change.
+
+---
+
+[2026-11-15T12:00+1300@6a334cb] Tree-sitter highlighting — findings recorded from the review
+
+- Requires: NO BLOCKERS
+- Detail: a log past `MAX_EDITS` (`TextEdits::push`, `crates/core/src/syntax.rs`) resets, and a reset drops the tree (`TreeDoc::update`, `crates/syntax-tree-sitter/src/doc.rs`), so a file past `WORKER_BYTES` (64 KiB) paints plain until the worker's full parse lands (e.g. undoing a 300-line comment toggle). Direction: fold an overflow into one edit covering the changed bytes, or keep painting the old tree until the new one lands. A reset from a pruned undo step still drops.
+- Detail: Java colours unevenly: `LOG` is Constant in its declaration but Type in `LOG.info(...)`, since the shipped query's `^[A-Z]` type pattern wins; and Java's shipped query leaves operators and brackets plain while Kotlin and Rust colour them. Direction: an all-caps constant override in `queries/java.scm` like Rust's; decide on operators and punctuation for all languages at once.
+- Detail: out of scope, noted: each view parses its own tree, so two views of a large file parse it twice; a worker isn't cancelled on reset or drop (`ParseOptions::progress_callback` can cancel it); no file size above which highlighting is skipped; `TextEdit::of` (`crates/core/src/syntax.rs`) is O(row) per edit, so a 256-edit undo at a million lines stalls about 128 ms.
+- Reason: review of tree-sitter syntax highlighting (feat/tree-sitter-highlighting), recorded rather than fixed in that change.

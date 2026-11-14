@@ -645,8 +645,29 @@ mod tests {
         (out, next)
     }
 
-    fn run(text: &str, token: impl Into<Token>) -> (String, Token) {
-        (text.to_string(), token.into())
+    /// What a test run's token may be named by: a [`Token`], or a [`Rich`]
+    /// or [`Code`](crate::highlight::Code) it wraps.
+    trait Tok {
+        fn tok(self) -> Token;
+    }
+    impl Tok for Token {
+        fn tok(self) -> Token {
+            self
+        }
+    }
+    impl Tok for Rich {
+        fn tok(self) -> Token {
+            Token::Rich(self)
+        }
+    }
+    impl Tok for crate::highlight::Code {
+        fn tok(self) -> Token {
+            Token::Code(self)
+        }
+    }
+
+    fn run(text: &str, token: impl Tok) -> (String, Token) {
+        (text.to_string(), token.tok())
     }
 
     #[test]
@@ -680,7 +701,7 @@ mod tests {
         assert_eq!(level("# after the quote", quoted), Some(1));
         // Every line `heading_level` names, `line` marks as a heading.
         for (line, st) in [("## a", 0), ("# after the list", listed)] {
-            assert!(Markdown.line(line, st).0.iter().any(|s| s.token == Heading.into()), "{line:?}");
+            assert!(Markdown.line(line, st).0.iter().any(|s| s.token == Token::Rich(Heading)), "{line:?}");
         }
     }
 

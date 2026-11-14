@@ -71,7 +71,7 @@ impl Grammar {
 
     fn load(&self) -> Result<Loaded, String> {
         let language = (self.language)();
-        let query = Query::new(&language, &self.query.concat()).map_err(|e| format!("{}: {e}", self.name))?;
+        let query = Query::new(&language, &self.query.join("\n")).map_err(|e| format!("{}: {e}", self.name))?;
         let codes = query.capture_names().iter().map(|n| code_of(n)).collect();
         Ok(Loaded { name: self.name, language, query, codes })
     }

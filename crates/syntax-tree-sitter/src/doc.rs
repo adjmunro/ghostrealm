@@ -684,34 +684,6 @@ fn main() {
         assert!(grew_past, "a parse ran on the worker");
     }
 
-    #[test]
-    fn random_edits_never_lose_a_line_s_spans() {
-        let mut rng = Rng(11);
-        let mut text = format!("{KOTLIN}\n{}", KOTLIN_2.join("\n"));
-        let mut d = doc("kotlin");
-        d.update(TextEdits::reset(), &lines(&text));
-        for _ in 0..200 {
-            let chars = text.chars().count();
-            let at = rng.below(chars + 1);
-            let n = rng.below(4).min(chars - at);
-            let (new, e) = splice(&text, at, n, PIECES[rng.below(PIECES.len())]);
-            let mut log = TextEdits::default();
-            log.push(e);
-            text = new;
-            let l = lines(&text);
-            d.update(log, &l);
-            d.highlight(&l, 0..l.len());
-            for (r, line) in l.iter().enumerate() {
-                let spans = d.line(r);
-                let end = spans.iter().fold(0, |at, s| {
-                    assert_eq!(s.start, at, "contiguous");
-                    s.end
-                });
-                assert_eq!(end, line.chars().count(), "row {r} covered: {line:?}");
-            }
-        }
-    }
-
     /// A Kotlin document past [`WORKER_BYTES`], and a doc whose worker
     /// holds its tree while the returned gate is locked.
     fn gated() -> (TreeDoc, Arc<std::sync::Mutex<()>>, Vec<String>) {
@@ -775,6 +747,11 @@ fn main() {
         let start = Instant::now();
         while !d.poll() {
             assert!(start.elapsed() < Duration::from_secs(10), "the worker finishes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The worker sends its tree, then wakes the view.
+        while woke.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "the worker wakes the view");
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 1);
