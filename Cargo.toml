@@ -9,6 +9,7 @@ members = [
     "crates/web",
     "crates/web-host",
     "crates/process",
+    "crates/syntax-tree-sitter",
 ]
 # The CEF web host downloads and links Chromium. The app's build script builds
 # and bundles it in its own target dir (target/web-host, see crates/app/build.rs),
@@ -21,6 +22,7 @@ default-members = [
     "crates/app",
     "crates/web",
     "crates/process",
+    "crates/syntax-tree-sitter",
 ]
 
 # Every test binary links wgpu, Ghostty and cosmic-text; with full debug info
@@ -41,6 +43,7 @@ ghostrealm-core = { path = "crates/core" }
 ghostrealm-lsp = { path = "crates/lsp" }
 ghostrealm-web = { path = "crates/web" }
 ghostrealm-process = { path = "crates/process" }
+ghostrealm-syntax-tree-sitter = { path = "crates/syntax-tree-sitter" }
 
 # libghostty-vt: git, not crates.io — the published crate pins a Zig-0.15-era
 # Ghostty. This rev pins Ghostty 22d13172 (requires Zig 0.16.0, see mise.toml).

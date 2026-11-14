@@ -1,0 +1,16 @@
+[package]
+name = "ghostrealm-syntax-tree-sitter"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ghostrealm-core.workspace = true
+tree-sitter = "0.27.1"
+tree-sitter-java = "0.23.5"
+tree-sitter-rust = "0.24.2"
+# fwcd's grammar by git rev: its crates.io release
+# (0.3.8) needs tree-sitter < 0.23, and it parses Kotlin 2.x (context
+# parameters, `when` guards, multi-dollar strings) where kotlin-ng doesn't.
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
