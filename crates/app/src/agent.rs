@@ -434,7 +434,12 @@ fn execute(op: Op, scope: Scope, state: &mut AppState, registry: &mut Registry<A
                 (None, Scope::Full) => state.focused_surface(),
                 (None, Scope::Workspace(a)) => state.focused_surface_in(a.home),
             };
+            let queued = id.map_or(0, |id| state.input_queued(id));
             match id {
+                Some(id) if queued > 0 && queued + text.len() > MAX_INPUT_QUEUED => json!({
+                    "ok": false,
+                    "error": format!("surface {} isn't reading its input: {queued} bytes still queued", id.0),
+                }),
                 Some(id) if state.write_input(id, text.as_bytes()) => json!({ "ok": true, "surface": id.0 }),
                 Some(id) if state.has_surface(id) => {
                     json!({ "ok": false, "error": format!("surface {} takes no raw input", id.0) })
@@ -452,6 +457,11 @@ fn execute(op: Op, scope: Scope, state: &mut AppState, registry: &mut Registry<A
 
 /// How many hits `search` returns.
 const SEARCH_HITS: usize = 20;
+
+/// The most input a surface may hold queued before `input` adds more: the
+/// size of one request line. Past it, `input` is refused until the surface
+/// reads some; one `input` into an empty queue is always taken.
+const MAX_INPUT_QUEUED: usize = 1 << 20;
 
 fn meta_json(m: &CommandMeta) -> Json {
     let args: Vec<Json> = m
@@ -1038,6 +1048,31 @@ mod tests {
         let mut registry = build_registry();
         let reply = scoped(&mut state, &mut registry, a, r#"{"op":"input","text":"x"}"#);
         assert_eq!(reply, json!({ "ok": true, "surface": a_term.0 }));
+    }
+
+    /// Given a terminal whose program never reads its input;
+    /// when 600 KiB is sent, then 600 KiB more;
+    /// then the first is taken and the second refused, naming the bytes
+    /// still queued.
+    #[test]
+    fn input_to_a_terminal_not_reading_is_refused_past_the_bound() {
+        let mut state = AppState::new().with_shell_line("stty raw -echo; echo ready; exec sleep 30");
+        state.new_vtab().unwrap();
+        let id = state.focused_surface().unwrap();
+        let mut registry = build_registry();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.surface_text(id).is_some_and(|t| t.contains("ready")) {
+            assert!(std::time::Instant::now() < deadline, "the program didn't start");
+            state.pump_all();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let input = json!({ "op": "input", "id": id.0, "text": "x".repeat(600 << 10) }).to_string();
+        assert_eq!(handle(&input, &mut state, &mut registry), json!({ "ok": true, "surface": id.0 }));
+        let reply = handle(&input, &mut state, &mut registry);
+        let error = reply["error"].as_str().unwrap_or_else(|| panic!("{reply}"));
+        assert!(error.starts_with(&format!("surface {} isn't reading its input: ", id.0)), "{error}");
+        let queued: usize = error.rsplit(": ").next().unwrap().trim_end_matches(" bytes still queued").parse().unwrap();
+        assert!(queued > MAX_INPUT_QUEUED - (600 << 10), "{error}");
     }
 
     /// Given a workspace's agent;

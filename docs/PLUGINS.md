@@ -62,7 +62,9 @@ should be too. The API lives in
   into it, or close the pane or workspace holding it (its own workspace's, or
   any once the person grants it all). Terminals and Files surfaces opt in;
   web pages don't (they are on the person's profile). A new surface kind is out
-  of reach until its view opts in.
+  of reach until its view opts in. `input_queued` (default 0) is the raw input
+  accepted and not yet read: the agent channel refuses `input` past 1 MiB of
+  it. A terminal returns what its child has yet to read.
 - **Hidden surfaces**: a surface in `AppState::views` but in no pane: never
   painted, shown, or focused, still reached by commands and `get surface`
   by id, listed last by `get tree` (on the headless channel; a workspace's

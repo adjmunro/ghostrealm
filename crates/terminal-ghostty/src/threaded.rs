@@ -9,7 +9,7 @@
 //! input/resize/scroll as messages. The result: no VT parsing or snapshotting on
 //! the UI thread, so rendering never blocks on terminal work.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -61,6 +61,17 @@ enum Cmd {
     Shutdown,
 }
 
+impl Cmd {
+    /// The input bytes it holds, as counted in [`Shared::queued`].
+    fn queued(&self) -> usize {
+        match self {
+            Cmd::Bytes(b) => b.len(),
+            Cmd::Paste(t) => t.len(),
+            _ => 0,
+        }
+    }
+}
+
 /// Cheap terminal state the UI reads without touching the VT.
 #[derive(Clone)]
 struct Meta {
@@ -91,6 +102,9 @@ struct Shared {
     /// else in the process may call `wait` or `waitpid(-1)`, or
     /// set SIGCHLD to `SIG_IGN` (which reaps children on exit).
     child: Mutex<ChildState>,
+    /// Input bytes sent to the worker and not yet written to the PTY, as
+    /// [`Cmd::queued`] counts them: added when sent, subtracted once written.
+    queued: AtomicUsize,
 }
 
 /// Where the child's pid stands; see [`Shared::child`].
@@ -118,6 +132,7 @@ impl Shared {
             }),
             generation: AtomicU64::new(0),
             child: Mutex::new(ChildState::Watched),
+            queued: AtomicUsize::new(0),
         }
     }
 }
@@ -212,7 +227,18 @@ impl ThreadedTerminal {
     }
 
     fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.send(cmd);
+        let queued = cmd.queued();
+        self.shared.queued.fetch_add(queued, Ordering::AcqRel);
+        if self.cmd_tx.send(cmd).is_err() {
+            self.shared.queued.fetch_sub(queued, Ordering::AcqRel);
+        }
+    }
+
+    /// Input bytes written or pasted that the child has yet to take: the
+    /// worker writes them while the child reads, so this grows while it
+    /// doesn't.
+    pub fn input_queued(&self) -> usize {
+        self.shared.queued.load(Ordering::Acquire)
     }
 }
 
@@ -509,22 +535,27 @@ fn worker_loop(
     while let Ok(first) = cmd_rx.recv() {
         let mut pump = false;
         let mut shutdown = false;
-        let mut apply = |m: Cmd, term: &mut GhosttyTerminal| match m {
-            Cmd::Key(k) => term.send_key(&k),
-            Cmd::Bytes(b) => term.write_bytes(&b),
-            Cmd::Paste(t) => term.paste(&t),
-            Cmd::Mouse(r) => term.send_mouse(&r),
-            Cmd::Resize {
-                cols,
-                rows,
-                cell_w,
-                cell_h,
-            } => term.resize(cols, rows, cell_w, cell_h),
-            Cmd::Scroll(s) => term.scroll(s),
-            Cmd::PtyReady => pump = true,
-            // The meta refresh below reaps it.
-            Cmd::ChildExited => {}
-            Cmd::Shutdown => shutdown = true,
+        let mut apply = |m: Cmd, term: &mut GhosttyTerminal| {
+            // What `send` added, not what the paste encodes to.
+            let queued = m.queued();
+            match m {
+                Cmd::Key(k) => term.send_key(&k),
+                Cmd::Bytes(b) => term.write_bytes(&b),
+                Cmd::Paste(t) => term.paste(&t),
+                Cmd::Mouse(r) => term.send_mouse(&r),
+                Cmd::Resize {
+                    cols,
+                    rows,
+                    cell_w,
+                    cell_h,
+                } => term.resize(cols, rows, cell_w, cell_h),
+                Cmd::Scroll(s) => term.scroll(s),
+                Cmd::PtyReady => pump = true,
+                // The meta refresh below reaps it.
+                Cmd::ChildExited => {}
+                Cmd::Shutdown => shutdown = true,
+            }
+            shared.queued.fetch_sub(queued, Ordering::AcqRel);
         };
         apply(first, term);
         while let Ok(m) = cmd_rx.try_recv() {
@@ -1048,5 +1079,28 @@ mod tests {
         let mut g = Grid::empty();
         term.snapshot_into(&mut g);
         assert_eq!(row_text(&g, 0), "X");
+    }
+
+    /// Given a child that reads its input, and turned on bracketed paste
+    /// (which makes a paste longer than its text once encoded);
+    /// when 64 KiB is written and a line pasted;
+    /// then the queued count goes back to 0.
+    #[test]
+    fn queued_input_drains_once_written() {
+        let child = sh("printf '\\033[?2004hREADY'; stty -echo; exec cat >/dev/null");
+        let mut term = ThreadedTerminal::spawn(40, 10, 8, 16, Some(child), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !row_text(&term.snapshot(), 0).contains("READY") {
+            assert!(Instant::now() < deadline, "no output");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let line = format!("{}\n", "x".repeat(63));
+        term.write_bytes(line.repeat(1024).as_bytes());
+        term.paste("pasted\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while term.input_queued() != 0 {
+            assert!(Instant::now() < deadline, "still queued: {}", term.input_queued());
+            std::thread::sleep(Duration::from_millis(15));
+        }
     }
 }

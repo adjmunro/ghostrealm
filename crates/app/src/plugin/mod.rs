@@ -372,6 +372,12 @@ pub trait View: Any {
         self.doc_mut(active).is_some_and(|d| d.write_input(bytes))
     }
 
+    /// Input bytes accepted and not yet taken by what reads them (a
+    /// terminal's child): the agent channel refuses more past a bound.
+    fn input_queued(&self) -> usize {
+        0
+    }
+
     /// A plain-text rendering of the view's content, for the agent channel.
     fn text(&mut self) -> Option<String> {
         let active = self.active_doc();

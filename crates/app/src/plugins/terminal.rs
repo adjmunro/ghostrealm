@@ -739,6 +739,10 @@ impl View for TerminalView {
         true
     }
 
+    fn input_queued(&self) -> usize {
+        self.term.input_queued()
+    }
+
     fn text(&mut self) -> Option<String> {
         // A peek: new output and the exit stay news for `pump`, which drives
         // the redraw and the inbox's unread mark.

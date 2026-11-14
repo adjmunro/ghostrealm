@@ -1791,6 +1791,12 @@ impl AppState {
         self.views.get_mut(&id).is_some_and(|v| v.write_input(bytes))
     }
 
+    /// Input bytes surface `id` has accepted and not yet passed on
+    /// ([`crate::plugin::View::input_queued`]); 0 for no such surface.
+    pub fn input_queued(&self, id: SurfaceId) -> usize {
+        self.views.get(&id).map_or(0, |v| v.input_queued())
+    }
+
     /// Deliver a key press to the focused view, as the GUI does but without a
     /// window (no clipboard; default config and cell size), applying the
     /// workspace-level requests it makes. Returns whether the view used it.
