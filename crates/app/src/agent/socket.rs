@@ -2,7 +2,8 @@
 //! only the person's user can enter. A connection's first line is
 //! `{"op":"hello","token":"…"}` with a workspace's token
 //! ([`crate::agent::TOKEN_ENV`]); every later line is a request, served for
-//! that workspace's agent ([`Scope::Workspace`]) while the workspace is open.
+//! that workspace's agent ([`Scope::Workspace`]) while the workspace is open,
+//! with the reach its grant gives at that request ([`Grants`]).
 //!
 //! Each connection has a thread that reads a line, hands it to the UI thread
 //! (which owns the app state) through a channel and the waker, and writes the
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 use ghostrealm_core::Registry;
 use serde_json::{json, Value as Json};
 
-use super::{serve, settled, Reply, Scope};
+use super::{serve, settled, Grants, Reply};
 use crate::app_state::AppState;
 
 /// Wakes the UI thread to serve what is waiting.
@@ -129,14 +130,15 @@ impl Server {
         &self.path
     }
 
-    /// Serve the requests waiting, for about `budget` at most; the loop is
-    /// woken again for any left. Returns whether any was served.
-    pub fn drain(&mut self, state: &mut AppState, registry: &mut Registry<AppState>, budget: Duration) -> bool {
+    /// Serve the requests waiting, each with the reach `grants` gives its
+    /// workspace, for about `budget` at most; the loop is woken again for any
+    /// left. Returns whether any was served.
+    pub fn drain(&mut self, state: &mut AppState, registry: &mut Registry<AppState>, grants: &Grants, budget: Duration) -> bool {
         let start = Instant::now();
         let mut any = false;
         while let Ok(req) = self.requests.try_recv() {
             any = true;
-            self.answer(req, state, registry);
+            self.answer(req, state, registry, grants);
             if start.elapsed() >= budget {
                 (self.waker)();
                 break;
@@ -145,7 +147,7 @@ impl Server {
         any
     }
 
-    fn answer(&mut self, req: Incoming, state: &mut AppState, registry: &mut Registry<AppState>) {
+    fn answer(&mut self, req: Incoming, state: &mut AppState, registry: &mut Registry<AppState>, grants: &Grants) {
         let Some(vt) = state.agent_token_workspace(&req.token) else {
             let _ = req.reply.send(Out { json: json!({ "ok": false, "error": REFUSED }), close: true });
             return;
@@ -154,7 +156,7 @@ impl Server {
             let _ = req.reply.send(Out { json: json!({ "ok": true, "workspace": vt.0 }), close: false });
             return;
         };
-        match serve(&line, Scope::Workspace(vt), state, registry) {
+        match serve(&line, grants.scope(vt), state, registry) {
             Reply::Done(json) => {
                 let _ = req.reply.send(Out { json, close: false });
             }
@@ -427,6 +429,7 @@ mod tests {
         state: AppState,
         registry: Registry<AppState>,
         server: Server,
+        grants: Grants,
     }
 
     impl Ui {
@@ -434,11 +437,11 @@ mod tests {
             let server = Server::bind(dir, uid(), Arc::new(|| {})).unwrap();
             let mut state = AppState::new().with_shell_line("sleep 5");
             state.set_agent_socket(server.path().to_path_buf());
-            Self { state, registry: build_registry(), server }
+            Self { state, registry: build_registry(), server, grants: Grants::default() }
         }
 
         fn serve(&mut self) {
-            self.server.drain(&mut self.state, &mut self.registry, Duration::from_millis(50));
+            self.server.drain(&mut self.state, &mut self.registry, &self.grants, Duration::from_millis(50));
             self.server.settle(&mut self.state);
         }
 
@@ -675,6 +678,73 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// Given a client with workspace A's token, A granted, and the person in
+    /// workspace B;
+    /// when it deletes, as B, a file git holds no copy of, and the window
+    /// settles its reply after the check;
+    /// then the question names A, not B, and ignores keys for a moment.
+    #[test]
+    fn a_granted_agents_delete_as_another_workspace_names_its_home() {
+        let dir = TmpDir::new("sk-gdel");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "A").unwrap();
+        let mut ui = Ui::new(&dir.join("s"));
+        let a = ui.state.new_vtab().unwrap();
+        ui.state.rename_active_vtab("agent's");
+        let b = ui.state.new_vtab().unwrap();
+        ui.grants.toggle(a);
+        let mut c = Client::connect(ui.server.path());
+        assert_eq!(c.hello_as(&mut ui, a)["ok"], json!(true));
+        c.send(&json!({ "op": "set", "id": "file.delete", "args": { "path": path }, "workspace": b.0 }).to_string());
+        assert_eq!(c.recv(&mut ui), Some(json!({ "ok": true, "message": crate::app_state::AWAITS_ANSWER })));
+        let asked = ui.state.confirm().expect("untracked: asks first");
+        assert!(asked.message.starts_with("From workspace \u{201c}agent's\u{201d}: Move "), "{}", asked.message);
+        assert!(!asked.takes_keys_at(Instant::now()) && asked.enter_cancels());
+        assert!(path.exists());
+    }
+
+    /// Given a client with workspace A's token, A granted, and workspace B;
+    /// when it reads the tree and splits B, opens a workspace and a terminal
+    /// there, then the grant is switched off between requests;
+    /// then the tree lists B and the split lands there; the new terminal's
+    /// token is ungranted; and once off, the same connection's split of B is
+    /// refused while a request for A is served.
+    #[test]
+    fn switching_a_grant_off_narrows_a_live_connection_at_its_next_request() {
+        let dir = TmpDir::new("sk-grant");
+        let mut ui = Ui::new(&dir.join("s"));
+        let a = ui.state.new_vtab().unwrap();
+        let b = ui.state.new_vtab().unwrap();
+        ui.grants.toggle(a);
+        let mut c = Client::connect(ui.server.path());
+        assert_eq!(c.hello_as(&mut ui, a)["ok"], json!(true));
+        c.send(r#"{"op":"get","what":"tree"}"#);
+        let reply = c.recv(&mut ui).unwrap();
+        assert!(reply["tree"].as_str().unwrap().contains(&format!("vtab {} ", b.0)), "{reply:?}");
+        let split = json!({ "op": "set", "id": "split.leftright", "workspace": b.0 }).to_string();
+        c.send(&split);
+        assert_eq!(c.recv(&mut ui).unwrap()["ok"], json!(true));
+        assert_eq!(ui.state.tree.vtab(b).unwrap().panes().len(), 2);
+        c.send(&json!({ "op": "set", "id": "workspace.new", "args": { "dir": &*dir } }).to_string());
+        let reply = c.recv(&mut ui).unwrap();
+        let new = reply["message"].as_str().and_then(|m| m.strip_prefix("opened workspace ")).unwrap_or_else(|| panic!("{reply:?}"));
+        let new = VtabId(new.parse().unwrap());
+        c.send(&json!({ "op": "set", "id": "terminal.new", "workspace": new.0 }).to_string());
+        assert_eq!(c.recv(&mut ui).unwrap()["ok"], json!(true));
+        let mut theirs = Client::connect(ui.server.path());
+        assert_eq!(theirs.hello_as(&mut ui, new)["ok"], json!(true));
+        theirs.send(&json!({ "op": "set", "id": "split.leftright", "workspace": a.0 }).to_string());
+        let reply = theirs.recv(&mut ui).unwrap();
+        assert!(reply["error"].as_str().unwrap().contains("outside this agent's workspace"), "{reply:?}");
+        ui.grants.toggle(a);
+        c.send(&split);
+        let reply = c.recv(&mut ui).unwrap();
+        assert!(reply["error"].as_str().unwrap().contains("outside this agent's workspace"), "{reply:?}");
+        assert_eq!(ui.state.tree.vtab(b).unwrap().panes().len(), 2);
+        c.send(r#"{"op":"pump"}"#);
+        assert_eq!(c.recv(&mut ui), Some(json!({ "ok": true })));
+    }
+
     /// `ghostrealm agent`'s relay of `input` with `token`, run on a thread
     /// while the window serves: its output and outcome.
     fn relayed(ui: &mut Ui, token: &str, input: &str) -> (String, anyhow::Result<()>) {
@@ -811,7 +881,7 @@ mod tests {
     fn a_socket_deleted_while_serving_is_bound_again() {
         let dir = TmpDir::new("sock-again");
         let server = Server::bind_with(&dir.join("s"), uid(), Arc::new(|| {}), Duration::from_millis(50)).unwrap();
-        let mut ui = Ui { state: AppState::new().with_shell_line("sleep 5"), registry: build_registry(), server };
+        let mut ui = Ui { state: AppState::new().with_shell_line("sleep 5"), registry: build_registry(), server, grants: Grants::default() };
         ui.state.set_agent_socket(ui.server.path().to_path_buf());
         let a = ui.state.new_vtab().unwrap();
         fs::remove_file(ui.server.path()).unwrap();

@@ -78,13 +78,20 @@ pub struct CommandMeta {
 /// with a command. A command nobody classified is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentReach {
-    /// Not run; the reason is the refusal's.
+    /// Not run; the reason is the refusal's. No grant opens it: it is the
+    /// person's alone.
     Refused(&'static str),
     /// Runs with the agent's workspace as the active one.
     Workspace,
     /// As `Workspace`, and only while everything in the workspace's focused
     /// pane is the agent's to reach: the command closes part of it.
     FocusedPane,
+    /// As `Workspace` for an agent whose workspace the person has granted
+    /// reach over all workspaces; refused otherwise, for the reason.
+    Granted(&'static str),
+    /// As `Granted`, and only while every surface in the workspace it acts as
+    /// is empty or the agent's to reach: the command closes that workspace.
+    GrantedWorkspace(&'static str),
 }
 
 impl CommandMeta {
@@ -106,6 +113,16 @@ impl CommandMeta {
     /// A workspace's agent may run it on its workspace's focused pane.
     pub fn agent_focused_pane(mut self) -> Self {
         self.agent = AgentReach::FocusedPane;
+        self
+    }
+    /// A granted workspace's agent may run it; others may not, for `reason`.
+    pub fn agent_granted(mut self, reason: &'static str) -> Self {
+        self.agent = AgentReach::Granted(reason);
+        self
+    }
+    /// As [`Self::agent_granted`], on a workspace the agent reaches all of.
+    pub fn agent_granted_workspace(mut self, reason: &'static str) -> Self {
+        self.agent = AgentReach::GrantedWorkspace(reason);
         self
     }
     /// A workspace's agent may not run it, for `reason`.

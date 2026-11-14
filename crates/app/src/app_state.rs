@@ -41,6 +41,7 @@ mod scoped;
 pub use files::{FileClip, FileReport};
 #[cfg(test)]
 pub(crate) use files::AWAITS_ANSWER;
+pub use scoped::Agent;
 
 /// Name of the dedicated workspace the settings file opens in (shown italic).
 pub const SETTINGS_VTAB_NAME: &str = "settings";
@@ -262,9 +263,10 @@ pub struct AppState {
     toasts: Toasts,
     /// The last config load had problems: a clean one then says so.
     config_problems: bool,
-    /// The workspace an agent's command runs as ([`Self::acting_as`]): the
-    /// active one for the command, while the person's stays as it was.
-    acting: Option<VtabId>,
+    /// The agent whose command is running and the workspace it runs as
+    /// ([`Self::acting_as`]): the active one for the command, while the
+    /// person's stays as it was.
+    acting: Option<scoped::Acting>,
     /// The agent channel's socket, once the window serves one: terminals
     /// then get it and their workspace's token in their environment.
     agent_socket: Option<std::path::PathBuf>,
@@ -418,7 +420,7 @@ impl AppState {
     /// The workspace commands act on: the one an agent's command runs as,
     /// else the person's active one.
     fn active(&self) -> Option<VtabId> {
-        self.acting.or_else(|| self.tree.active_vtab())
+        self.acting.map(|a| a.target).or_else(|| self.tree.active_vtab())
     }
 
     fn focused_pane(&self) -> Option<(VtabId, ghostrealm_core::tree::PaneId)> {
@@ -1293,10 +1295,13 @@ impl AppState {
         Ok(None)
     }
 
-    /// Create a new empty workspace rooted at `dir`; it becomes active.
+    /// Create a new empty workspace rooted at `dir`; it becomes the person's
+    /// active one.
     pub fn new_workspace_in(&mut self, dir: impl Into<std::path::PathBuf>) -> VtabId {
         let vt = self.new_empty_vtab();
-        self.set_active_root_dir(dir);
+        if let Some(v) = self.tree.vtab_mut(vt) {
+            v.root_dir = Some(dir.into());
+        }
         vt
     }
 
@@ -1981,13 +1986,15 @@ impl AppState {
         self.describe_tree(None)
     }
 
-    /// [`Self::describe`], or with `only` a workspace: that workspace, the
-    /// surfaces in it its agent reaches (and empty ones), and no hidden ones.
-    fn describe_tree(&self, only: Option<VtabId>) -> String {
+    /// [`Self::describe`], or as `agent` sees it: its home (every workspace
+    /// when granted), the surfaces there it reaches (and empty ones), and no
+    /// hidden ones.
+    fn describe_tree(&self, agent: Option<Agent>) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let active = self.active();
-        for v in self.tree.vtabs().iter().filter(|v| only.is_none_or(|vt| vt == v.id)) {
+        let listed = |vt: VtabId| agent.is_none_or(|a| a.granted || a.home == vt);
+        for v in self.tree.vtabs().iter().filter(|v| listed(v.id)) {
             let act = if Some(v.id) == active {
                 " (active)"
             } else {
@@ -2002,7 +2009,7 @@ impl AppState {
                 };
                 let _ = writeln!(out, "  pane {}{}", p.id.0, foc);
                 for (i, s) in p.surfaces.iter().enumerate() {
-                    if only.is_some_and(|vt| self.views.contains_key(&s.id) && !self.agent_reaches(vt, s.id)) {
+                    if agent.is_some_and(|a| self.views.contains_key(&s.id) && !self.agent_reaches(a, s.id)) {
                         continue;
                     }
                     let a = if i == p.active { " (active)" } else { "" };
@@ -2018,7 +2025,7 @@ impl AppState {
         if out.is_empty() {
             out.push_str("(no vtabs)\n");
         }
-        if only.is_some() {
+        if agent.is_some() {
             return out;
         }
         let mut hidden: Vec<(&SurfaceId, &HiddenOf)> = self.hidden.iter().collect();
@@ -2325,13 +2332,22 @@ pub fn build_registry() -> Registry<AppState> {
             "Open a new empty workspace in a directory (chosen in a picker unless given)",
         )
         .arg(ArgSpec::optional("dir", ArgKind::Str, "the workspace directory"))
-        .agent_refused("it reaches outside the agent's workspace, and makes the new one active"),
+        .agent_granted("it reaches outside the agent's workspace"),
         Box::new(|s: &mut AppState, a| {
+            let agent = s.agent_scope().is_some();
             if a.get("dir").is_none() {
+                if agent {
+                    return Err(CmdError::Inapplicable("a workspace's agent passes `dir`: the picker is the person's".into()));
+                }
                 s.open_picker(Pick::NewWorkspace);
                 return Ok(CmdOutcome::ok());
             }
+            let person = s.tree.active_vtab();
             let id = s.new_workspace_in(a.get_str("dir")?);
+            // An agent's new workspace doesn't take the person's keys.
+            if let Some(vt) = person.filter(|_| agent) {
+                s.tree.focus_vtab(vt);
+            }
             Ok(CmdOutcome::msg(format!("opened workspace {}", id.0)))
         }),
     );
@@ -2345,7 +2361,7 @@ pub fn build_registry() -> Registry<AppState> {
     );
     r.register(
         CommandMeta::new("workspace.close", "Close Workspace", "Close the active workspace")
-            .agent_refused("it closes every surface in the workspace, the person's web pages included; a shell can exit"),
+            .agent_granted_workspace("it closes every surface in the workspace; a shell can exit"),
         Box::new(|s: &mut AppState, _| {
             s.close_active_vtab();
             Ok(CmdOutcome::ok())

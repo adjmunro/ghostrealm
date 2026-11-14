@@ -546,12 +546,14 @@ impl AppState {
             bail!("{} doesn't exist", path.display());
         }
         let agent = self.agent_scope();
-        if let Some(vt) = agent {
+        if let Some(agent) = agent {
             // Trashing closes the documents of it wherever they are.
-            if self.docs_under(path).iter().any(|(sid, _)| self.vtab_of_surface(*sid) != Some(vt)) {
-                bail!("{} is open outside this workspace", path.display());
+            if self.docs_under(path).iter().any(|(sid, _)| !self.agent_reaches(agent, *sid)) {
+                bail!("{} is open where this agent can't reach", path.display());
             }
         }
+        // A question the check raises names the agent's home.
+        let agent = agent.map(|a| a.home);
         let vtab = self.active();
         let unsaved = self.unsaved_under(path);
         if !unsaved.is_empty() {

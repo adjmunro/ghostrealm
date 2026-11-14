@@ -8,27 +8,44 @@ use ghostrealm_core::{SurfaceId, VtabId};
 
 use super::AppState;
 
+/// A workspace's agent in the window: the workspace whose token it holds
+/// (its home), and whether the person has let that workspace's agents reach
+/// all workspaces (the standing grant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Agent {
+    pub home: VtabId,
+    pub granted: bool,
+}
+
+/// An agent's command running ([`AppState::acting_as`]): the workspace it
+/// acts on, and the agent.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Acting {
+    pub target: VtabId,
+    pub agent: Agent,
+}
+
 impl AppState {
-    /// Run `f`, an agent's command, as workspace `vt`: the active workspace
-    /// for it ([`Self::active`] and all that derives from it), while the
-    /// person's stays. A file job it starts runs in the background (no
-    /// inline wait), so the UI never blocks on it.
+    /// Run `f`, `agent`'s command, as workspace `target`: the active
+    /// workspace for it ([`Self::active`] and all that derives from it),
+    /// while the person's stays. A file job it starts runs in the background
+    /// (no inline wait), so the UI never blocks on it.
     ///
     /// A question it raises is shown to the person marked late (keys ignored
-    /// for a moment, Enter cancels), naming `vt`: it came while they may be
-    /// typing elsewhere. One that would replace a question already open is
-    /// withdrawn, and `Err` says why; nothing else ran, since asking is all
-    /// such a command does.
-    pub(crate) fn acting_as<T>(&mut self, vt: VtabId, f: impl FnOnce(&mut Self) -> T) -> Result<T, String> {
+    /// for a moment, Enter cancels), naming the agent's home: it came while
+    /// they may be typing elsewhere. One that would replace a question
+    /// already open is withdrawn, and `Err` says why; nothing else ran, since
+    /// asking is all such a command does.
+    pub(crate) fn acting_as<T>(&mut self, agent: Agent, target: VtabId, f: impl FnOnce(&mut Self) -> T) -> Result<T, String> {
         let open = self.confirm.clone();
-        let acting = self.acting.replace(vt);
+        let acting = self.acting.replace(Acting { target, agent });
         let wait = std::mem::replace(&mut self.file_job_wait, Duration::ZERO);
         let out = f(self);
         self.acting = acting;
         self.file_job_wait = wait;
         match open {
             None => {
-                let from = self.asked_from(vt);
+                let from = self.asked_from(agent.home);
                 if let Some(asked) = &mut self.confirm {
                     asked.message.insert_str(0, &from);
                     asked.late = Some(Instant::now());
@@ -49,28 +66,38 @@ impl AppState {
         format!("From workspace \u{201c}{name}\u{201d}: ")
     }
 
-    /// The workspace the running command acts as for an agent, if it does.
-    pub(crate) fn agent_scope(&self) -> Option<VtabId> {
-        self.acting
+    /// The agent whose command is running, if one is.
+    pub(crate) fn agent_scope(&self) -> Option<Agent> {
+        self.acting.map(|a| a.agent)
     }
 
-    /// Whether workspace `vt`'s agent reaches surface `sid`: it is in `vt`'s
-    /// panes and its view opts in ([`crate::plugin::View::agent_reachable`]).
-    pub(crate) fn agent_reaches(&self, vt: VtabId, sid: SurfaceId) -> bool {
-        self.vtab_of_surface(sid) == Some(vt) && self.views.get(&sid).is_some_and(|v| v.agent_reachable())
+    /// Whether `agent` reaches surface `sid`: its view opts in
+    /// ([`crate::plugin::View::agent_reachable`]), and it is in the agent's
+    /// home, or in any workspace when granted.
+    pub(crate) fn agent_reaches(&self, agent: Agent, sid: SurfaceId) -> bool {
+        let place = self.vtab_of_surface(sid);
+        let placed = if agent.granted { place.is_some() } else { place == Some(agent.home) };
+        placed && self.views.get(&sid).is_some_and(|v| v.agent_reachable())
     }
 
-    /// Whether every surface in `vt`'s focused pane is empty or one its agent
-    /// reaches: closing it takes nothing that isn't the agent's.
-    pub(crate) fn focused_pane_reachable(&self, vt: VtabId) -> bool {
-        let Some(v) = self.tree.vtab(vt) else { return false };
+    /// Whether every surface in `target`'s focused pane is empty or one
+    /// `agent` reaches: closing it takes nothing that isn't the agent's.
+    pub(crate) fn focused_pane_reachable(&self, agent: Agent, target: VtabId) -> bool {
+        let Some(v) = self.tree.vtab(target) else { return false };
         let Some(pane) = v.panes().into_iter().find(|p| p.id == v.focused_pane) else { return false };
-        pane.surfaces.iter().all(|s| !self.views.contains_key(&s.id) || self.agent_reaches(vt, s.id))
+        pane.surfaces.iter().all(|s| !self.views.contains_key(&s.id) || self.agent_reaches(agent, s.id))
     }
 
-    /// The tree as workspace `vt`'s agent sees it.
-    pub(crate) fn describe_for(&self, vt: VtabId) -> String {
-        self.describe_tree(Some(vt))
+    /// Whether every surface in workspace `target` is empty or one `agent`
+    /// reaches: closing it takes nothing that isn't the agent's.
+    pub(crate) fn workspace_reachable(&self, agent: Agent, target: VtabId) -> bool {
+        let Some(v) = self.tree.vtab(target) else { return false };
+        v.panes().iter().flat_map(|p| &p.surfaces).all(|s| !self.views.contains_key(&s.id) || self.agent_reaches(agent, s.id))
+    }
+
+    /// The tree as `agent` sees it.
+    pub(crate) fn describe_for(&self, agent: Agent) -> String {
+        self.describe_tree(Some(agent))
     }
 
     /// Serve the agent channel at `socket`: terminals opened from now on get

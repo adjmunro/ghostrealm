@@ -285,7 +285,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Terminate => {}
             UserEvent::Agent => {
                 if let Some(agent) = &mut state.agent {
-                    if agent.drain(&mut state.app, &mut state.registry, AGENT_DRAIN_BUDGET) {
+                    state.agent_grants.prune(&state.app.tree);
+                    if agent.drain(&mut state.app, &mut state.registry, &state.agent_grants, AGENT_DRAIN_BUDGET) {
                         state.dirty = true;
                         state.window.request_redraw();
                     }
@@ -773,6 +774,10 @@ struct State {
     registry: Registry<AppState>,
     /// The agent socket this window serves, if it could bind one.
     agent: Option<crate::agent::socket::Server>,
+    /// The workspaces whose agents the person let reach all workspaces, from
+    /// the workspace menu. Kept here, out of every command's reach: commands
+    /// take only the app state.
+    agent_grants: crate::agent::Grants,
     /// Every config option, for checking the config file on (re)load.
     catalogue: Arc<Catalogue>,
     cfg: Config,
@@ -938,6 +943,9 @@ enum MenuAction {
     SetDir,
     /// Move the workspace between the pinned list and the other.
     TogglePin,
+    /// Switch the workspace's standing grant: its agents reach all
+    /// workspaces. Only the person's release on this row sets it.
+    ToggleAgentGrant,
     Close,
     /// An item of the file menu.
     File(FileAction),
@@ -945,6 +953,38 @@ enum MenuAction {
     View(u32),
     /// A horizontal rule between sections; not clickable.
     Rule,
+}
+
+/// The workspace menu's rows for a workspace with `status`, `pinned` and
+/// `granted`, rooted at `root`. The grant's row names the root, which no
+/// agent can set, since its name and place in the sidebar are an agent's to
+/// change.
+fn workspace_menu(status: TabStatus, pinned: bool, granted: bool, root: Option<&std::path::Path>) -> Vec<MenuRow> {
+    let first = match status {
+        TabStatus::Unread { .. } => MenuRow::new("Mark read", MenuAction::MarkRead),
+        TabStatus::NeedsInput => MenuRow::new("Dismiss", MenuAction::Dismiss),
+        _ => MenuRow::new("Mark unread", MenuAction::MarkUnread),
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let root = match (root, home) {
+        (None, _) => "no directory".to_string(),
+        (Some(r), Some(h)) if r == h => "~".to_string(),
+        (Some(r), Some(h)) if r.starts_with(&h) => format!("~/{}", r.strip_prefix(&h).unwrap_or(r).display()),
+        (Some(r), _) => r.display().to_string(),
+    };
+    let grant = MenuRow {
+        checked: Some(granted),
+        hint: Some(root),
+        ..MenuRow::new("Agents reach all workspaces", MenuAction::ToggleAgentGrant)
+    };
+    vec![
+        first,
+        MenuRow::new(if pinned { "Unpin" } else { "Pin" }, MenuAction::TogglePin),
+        grant,
+        MenuRow::new("Rename…", MenuAction::Rename),
+        MenuRow::new("Set directory…", MenuAction::SetDir),
+        MenuRow::new("Close workspace", MenuAction::Close),
+    ]
 }
 
 /// What a context menu's actions apply to.
@@ -1461,6 +1501,7 @@ impl State {
             app,
             registry,
             agent,
+            agent_grants: Default::default(),
             catalogue,
             cfg,
             chrome,
@@ -2458,19 +2499,10 @@ impl State {
             self.dirty = true;
             return;
         };
-        let Some((status, pinned)) = self.app.tree.vtab(target).map(|v| (v.status, v.pinned)) else {
+        let Some(v) = self.app.tree.vtab(target) else {
             return;
         };
-        let mut items = Vec::new();
-        match status {
-            TabStatus::Unread { .. } => items.push(MenuRow::new("Mark read", MenuAction::MarkRead)),
-            TabStatus::NeedsInput => items.push(MenuRow::new("Dismiss", MenuAction::Dismiss)),
-            _ => items.push(MenuRow::new("Mark unread", MenuAction::MarkUnread)),
-        }
-        items.push(MenuRow::new(if pinned { "Unpin" } else { "Pin" }, MenuAction::TogglePin));
-        items.push(MenuRow::new("Rename…", MenuAction::Rename));
-        items.push(MenuRow::new("Set directory…", MenuAction::SetDir));
-        items.push(MenuRow::new("Close workspace", MenuAction::Close));
+        let items = workspace_menu(v.status, v.pinned, self.agent_grants.has(target), v.root_dir.as_deref());
         let over_picker = self.app.picker_open();
         self.menu = Some(Menu::new(MenuTarget::Vtab(target), (x, y), MenuAlign::Left, items, over_picker));
         self.dirty = true;
@@ -2548,6 +2580,11 @@ impl State {
             MenuAction::TogglePin => {
                 if let Some(v) = self.app.tree.vtab_mut(target) {
                     v.pinned = !v.pinned;
+                }
+            }
+            MenuAction::ToggleAgentGrant => {
+                if self.app.tree.vtab(target).is_some() {
+                    self.agent_grants.toggle(target);
                 }
             }
             // Rename / Set directory act on the active workspace, so focus the
@@ -3612,7 +3649,11 @@ impl State {
             italic: bool,
             dot: Option<TabStatus>,
             active: bool,
+            /// The standing grant's bar: the workspace's, or a folded
+            /// group's member's.
+            granted: bool,
         }
+        let grants = &self.agent_grants;
         let mut lines: Vec<Line> = Vec::with_capacity(n);
         for row in &order {
             match row {
@@ -3626,9 +3667,14 @@ impl State {
                         label: format!("{chevron} {}", shorten_dir(dir, text_w_chars.saturating_sub(2).max(3))),
                         sub: None,
                         italic: false,
-                        // Folded, the header stands for its members' dots.
+                        // Folded, the header stands for its members' dots
+                        // and grants.
                         dot: collapsed.then_some(*status),
                         active: false,
+                        granted: *collapsed
+                            && self.app.tree.vtabs().iter().any(|v| {
+                                v.pinned == *pinned && v.root_dir.as_deref() == Some(dir.as_path()) && grants.has(v.id)
+                            }),
                     });
                 }
                 Row::Vtab { id, grouped } => {
@@ -3651,6 +3697,7 @@ impl State {
                         italic: v.name == SETTINGS_VTAB_NAME,
                         dot: Some(v.status),
                         active: Some(*id) == active,
+                        granted: grants.has(*id),
                     });
                 }
             }
@@ -3696,6 +3743,10 @@ impl State {
             }
             if header_hovered {
                 quads.push(rect_quad(vis, sw, sh, theme::HOVER_BG, theme::HOVER_ALPHA));
+            }
+            if line.granted {
+                let bar = Rect { w: 3.0 * self.scale, ..vis };
+                quads.push(rect_quad(bar, sw, sh, AGENT_GRANT_BAR, 1.0));
             }
             let dot_y = y + (rh - dot) * 0.5;
             if let Some(status) = line.dot.filter(|_| dot_y >= list_top && dot_y + dot <= sh) {
@@ -5563,6 +5614,10 @@ fn status_color(status: TabStatus) -> [u8; 3] {
     }
 }
 
+/// The bar along a sidebar row whose workspace's agents reach all
+/// workspaces.
+const AGENT_GRANT_BAR: [u8; 3] = [235, 170, 40];
+
 /// A compact directory label that fits in `max` characters, no wrap/overflow:
 /// prefer "parent/current", else "current", else "curr…" truncated with an
 /// ellipsis. `~` is substituted for the home directory's own segment.
@@ -6512,6 +6567,24 @@ mod tests {
             let narrow = menu_layout(&items(), &label_w, &hint_w, (0.0, 0.0), MenuAlign::Left, (200.0, 600.0), UI);
             let h = narrow.rows[0].hint;
             assert!(h.is_none_or(|h| h.w < 90.0), "the hint is cut or dropped: {h:?}");
+        }
+
+        /// Given a granted workspace with a root and an ungranted one with none;
+        /// when their workspace menus are built;
+        /// then each has the grant's row, checked as granted and naming the
+        /// root, or that there is none.
+        #[test]
+        fn the_workspace_menu_has_the_grants_row_naming_the_root() {
+            use ghostrealm_core::TabStatus;
+            let grant = |granted, root: Option<&std::path::Path>| {
+                let rows = super::super::workspace_menu(TabStatus::Read, false, granted, root);
+                let row = rows.into_iter().find(|r| r.action == MenuAction::ToggleAgentGrant).expect("the grant's row");
+                (row.label, row.checked, row.hint)
+            };
+            let label = "Agents reach all workspaces".to_string();
+            let root = std::path::Path::new("/srv/proj");
+            assert_eq!(grant(true, Some(root)), (label.clone(), Some(true), Some("/srv/proj".into())));
+            assert_eq!(grant(false, None), (label, Some(false), Some("no directory".into())));
         }
     }
 
