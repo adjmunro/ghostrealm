@@ -43,7 +43,7 @@ use ghostrealm_core::{
 use ghostrealm_terminal::{Key, KeyPress};
 use ghostrealm_web::protocol::{mods, POPUP_IDS};
 use ghostrealm_web::{
-    Cursor, EditAction, Exiting, MouseAction, MouseButton as PageButton, PopupInfo, PopupKind,
+    Cursor, DialogEnd, DialogInfo, DialogKind, EditAction, Exiting, MouseAction, MouseButton as PageButton, PopupInfo, PopupKind,
     Request as HostRequest, SharedFrame, ViewState, WebHost,
 };
 use glyphon::Family;
@@ -68,6 +68,10 @@ const BTN_FORWARD: u32 = 1;
 const BTN_RELOAD: u32 = 2;
 /// A pop-up's close button.
 const BTN_CLOSE: u32 = 3;
+/// The buttons of the modal a page's JavaScript dialog shows: OK (or
+/// Leave) and Cancel (or Stay).
+const BTN_DIALOG_OK: u32 = 4;
+const BTN_DIALOG_CANCEL: u32 = 5;
 /// Id base of the floating pop-up's buttons and image.
 const POPUP_BASE: u32 = 1000;
 /// Space kept between a floating pop-up and its opener's page edges, in
@@ -544,6 +548,35 @@ impl Plugin for WebPlugin {
                     .map_err(CmdError::Failed)
             }),
         );
+        r.register(
+            web_meta(
+                "web.dialog",
+                "Web: Answer Dialog",
+                "Answer the JavaScript dialog (alert, confirm, prompt, beforeunload) a web page has \
+                 open, which stops the page until answered. Replies and `get surface` list open \
+                 dialogs. On an agent's page one left unanswered for 60s is dismissed",
+            )
+            .arg(ArgSpec::required(
+                "accept",
+                ArgKind::Bool,
+                "true answers OK (Leave for beforeunload), false Cancel (Stay)",
+            ))
+            .arg(ArgSpec::optional(
+                "text",
+                ArgKind::Str,
+                "a prompt's answer (default: its default text)",
+            ))
+            .arg(id_arg())
+            .hidden(),
+            Box::new(|s: &mut AppState, a| {
+                let accept = a.get_bool("accept")?;
+                let text = a.opt_str("text").map(str::to_string);
+                target(s, a)?
+                    .answer_dialog(accept, text)
+                    .map(CmdOutcome::msg)
+                    .map_err(CmdError::Failed)
+            }),
+        );
     }
 
     fn config_sections(&self) -> Vec<SectionSpec> {
@@ -693,6 +726,14 @@ pub struct WebView {
     /// was refused and the next tick hasn't said so: refresh sees it but
     /// can't raise requests.
     refused_at: Option<Instant>,
+    /// The answer being typed into a prompt dialog's modal, for that
+    /// dialog's number.
+    dialog_edit: Option<(u64, LineEdit)>,
+    /// The mouse in the prompt's field.
+    dialog_field: FieldMouse,
+    /// The dialog the person last answered: its modal hides until the host
+    /// reports it closed, so a second press can't answer it again.
+    dialog_answered: Option<u64>,
 }
 
 /// A pop-up that a later host couldn't make again, and the pop-ups it
@@ -768,6 +809,9 @@ impl WebView {
             focused: false,
             opened: Vec::new(),
             refused_at: None,
+            dialog_edit: None,
+            dialog_field: FieldMouse::default(),
+            dialog_answered: None,
         }
     }
 
@@ -1193,15 +1237,94 @@ impl WebView {
             h.wait_loaded(id, LOAD_WAIT);
             h.eval_as(id, js, gesture, REPLY_WAIT)
         }) {
+            Some(Err(e)) if self.open_dialog().is_some() => Err(format!("{e}; answer it with web.dialog")),
             Some(r) => r,
             None => Err(self.no_host()),
         }
     }
 
+    /// The JavaScript dialog the page has open, as the host last reported.
+    pub fn open_dialog(&self) -> Option<DialogInfo> {
+        let slot = self.slot.borrow();
+        if self.created_in == 0 || self.created_in != slot.generation {
+            return None;
+        }
+        slot.host.as_ref()?.view(self.page)?.dialog
+    }
+
+    /// Answer the page's dialog: OK (or Leave) when `accept`, else Cancel (or
+    /// Stay). `text` is a prompt's answer (default: its default text).
+    pub fn answer_dialog(&mut self, accept: bool, text: Option<String>) -> Result<String, String> {
+        let Some(d) = self.open_dialog() else {
+            let last = self.with_host(|h, id| h.view(id).and_then(|v| v.dialog_ended)).flatten();
+            return Err(match last {
+                Some((d, end)) => format!("no dialog is open; the last, {}, {}", d.describe(), ended(end)),
+                None => "no dialog is open".into(),
+            });
+        };
+        let done = self.with_host(|h, id| h.answer_dialog(id, d.dialog, accept, text, REPLY_WAIT));
+        match done.unwrap_or_else(|| Err(self.no_host()))? {
+            DialogEnd::Accepted | DialogEnd::Dismissed => {
+                Ok(format!("{} {}", if accept { "accepted" } else { "dismissed" }, d.describe()))
+            }
+            end => Err(format!("{} {} before the answer", d.describe(), ended(end))),
+        }
+    }
+
+    /// The dialog whose modal shows: the open one, until the person answers
+    /// it.
+    fn modal(&self) -> Option<&DialogInfo> {
+        self.state.dialog.as_ref().filter(|d| self.dialog_answered != Some(d.dialog))
+    }
+
+    /// The prompt modal's field, made with the default text selected for each
+    /// new prompt; `None` for other dialogs.
+    fn modal_edit(&mut self) -> Option<&mut LineEdit> {
+        let d = self.modal().filter(|d| d.kind == DialogKind::Prompt)?;
+        let (n, default) = (d.dialog, d.default_text.clone());
+        if self.dialog_edit.as_ref().is_none_or(|(e, _)| *e != n) {
+            let mut e = LineEdit::new(default).with_plain_brackets();
+            let _ = e.apply(Edit::SelectAll, &mut None::<String>);
+            self.dialog_edit = Some((n, e));
+        }
+        self.dialog_edit.as_mut().map(|(_, e)| e)
+    }
+
+    /// Answer the modal's dialog from the person's press or key.
+    fn answer_modal(&mut self, cx: &mut EventCx, accept: bool) {
+        let Some(n) = self.modal().map(|d| d.dialog) else { return };
+        let text = if accept { self.modal_edit().map(|e| e.text().to_string()) } else { None };
+        self.dialog_edit = None;
+        self.dialog_answered = Some(n);
+        if !self.send(Some(HostRequest::Dialog { id: self.page, dialog: n, accept, text })) {
+            let e = self.no_host();
+            self.report(cx, "Can't answer the page's dialog", Err(e));
+        }
+        cx.redraw();
+    }
+
+    /// A key while the modal shows: Enter answers OK, Escape Cancel, and a
+    /// prompt's field takes the rest. The page gets none; Cmd chords the
+    /// field doesn't use go on to the app.
+    fn dialog_key(&mut self, cx: &mut EventCx, press: &KeyPress) -> bool {
+        match press.key {
+            Key::Enter if !press.mods.super_ => self.answer_modal(cx, true),
+            Key::Escape => self.answer_modal(cx, false),
+            _ => {
+                if !self.modal_edit().is_some_and(|e| e.key(press, cx).used()) {
+                    return !press.mods.super_;
+                }
+            }
+        }
+        cx.redraw();
+        true
+    }
+
     fn refresh_state(&mut self) -> bool {
         let slot = self.slot.borrow();
         let Some(v) = slot.host.as_ref().and_then(|h| h.view(self.page)) else {
-            return false;
+            // A dialog goes with its host.
+            return self.state.dialog.take().is_some();
         };
         // Off screen, a new frame changes nothing drawn; an agent's page
         // keeps painting there (`UNSEEN_FRAME_RATE`).
@@ -1313,6 +1436,99 @@ impl WebView {
 }
 
 impl WebView {
+    /// Show the page's dialog as a modal over `body` (the toolbar stays live:
+    /// navigating dismisses it): its message, a prompt's field, and OK /
+    /// Cancel, or Leave / Stay for beforeunload.
+    fn paint_dialog(&mut self, cx: &mut PaintCx, body: Rect) {
+        let Some(d) = self.modal().cloned() else { return };
+        let keys = cx.focused && self.url_edit.is_none() && !(self.float_keys && !self.floating.is_empty());
+        if self.modal_edit().is_none() {
+            self.dialog_edit = None;
+        }
+        let (scale, ch, cw) = (cx.ui.scale, cx.ui.cell_h, cx.ui.cell_w);
+        let pad = 12.0 * scale;
+        let bh = ch + 8.0 * scale;
+        let buttons: &[(&str, u32, bool)] = match d.kind {
+            DialogKind::Alert => &[("OK", BTN_DIALOG_OK, true)],
+            DialogKind::BeforeUnload => &[("Leave", BTN_DIALOG_OK, true), ("Stay", BTN_DIALOG_CANCEL, false)],
+            DialogKind::Confirm | DialogKind::Prompt => &[("OK", BTN_DIALOG_OK, true), ("Cancel", BTN_DIALOG_CANCEL, false)],
+        };
+        let label_w = |l: &str| l.chars().count() as f32 * cw;
+        let buttons_w = buttons.iter().map(|(l, ..)| label_w(l) + pad * 3.0).sum::<f32>() - pad;
+        let pw = (body.w * 0.6)
+            .clamp(280.0 * scale, 480.0 * scale)
+            .max(buttons_w + pad * 2.0)
+            .min((body.w - pad * 2.0).max(1.0));
+        let text_w = (pw - pad * 2.0).max(1.0);
+        // Chromium shows no page's own text for beforeunload.
+        let message = match d.kind {
+            DialogKind::BeforeUnload => "Leave this page? Changes you made may not be saved.",
+            _ => d.message.as_str(),
+        };
+        let field_h = if self.dialog_edit.is_some() { bh + pad } else { 0.0 };
+        // Shaped text doesn't wrap: break the message into lines that fit,
+        // as many as the page has room for.
+        let max_lines = (((body.h - field_h - bh - pad * 3.0) / ch).floor() as usize).max(1);
+        let mut lines = Vec::new();
+        for para in message.split('\n') {
+            let wrapped = crate::window::wrap_words(para, text_w, |s| cx.shape(s, Family::SansSerif, f32::MAX).width);
+            if wrapped.is_empty() {
+                lines.push(String::new());
+            } else {
+                lines.extend(wrapped);
+            }
+        }
+        if lines.len() > max_lines {
+            lines.truncate(max_lines);
+            if let Some(last) = lines.last_mut() {
+                last.push('\u{2026}');
+            }
+        }
+        let ph = pad + ch * lines.len() as f32 + field_h + pad + bh + pad;
+        let panel = Rect {
+            x: body.x + ((body.w - pw) * 0.5).max(0.0),
+            y: body.y + ((body.h - ph) * 0.5).max(0.0),
+            w: pw,
+            h: ph,
+        };
+        cx.cursor(body, CursorIcon::Default);
+        let (edit, field) = (&self.dialog_edit, &self.dialog_field);
+        cx.above(|cx| {
+            cx.fill_alpha(body, [0, 0, 0], 0.4);
+            cx.fill(panel, cx.chrome.background);
+            cx.border(panel, cx.chrome.accent);
+            for (i, line) in lines.iter().enumerate() {
+                let s = cx.shape(line, Family::SansSerif, text_w);
+                cx.place(s, panel.x + pad, panel.y + pad + ch * i as f32, panel, theme::TITLE);
+            }
+            if let Some((_, edit)) = edit {
+                let r = Rect { x: panel.x + pad, y: panel.y + pad + ch * lines.len() as f32 + pad, w: text_w, h: bh };
+                let geom = widgets::text_field(cx, r, edit, "", keys);
+                field.painted(cx, geom);
+            }
+            // Right to left; the primary one is what Enter presses.
+            let by = panel.y + ph - pad - bh;
+            let mut right = panel.x + pw - pad;
+            for &(label, id, primary) in buttons {
+                let w = label_w(label);
+                let hit = Rect { x: right - w - pad * 2.0, y: by, w: w + pad * 2.0, h: bh };
+                let hov = cx.button(hit, id);
+                if primary {
+                    cx.fill_alpha(hit, cx.chrome.accent, 0.5);
+                } else {
+                    cx.fill(hit, cx.chrome.sidebar);
+                }
+                if hov {
+                    cx.highlight(hit);
+                }
+                let s = cx.shape(label, Family::SansSerif, w + pad);
+                let color = if primary || hov { theme::LABEL_HOVER } else { theme::LABEL };
+                cx.place(s, hit.x + (hit.w - s.width) * 0.5, by + (bh - ch) * 0.5, hit, color);
+                right -= w + pad * 3.0;
+            }
+        });
+    }
+
     /// Float the newest pop-up a person opened over the page, centred in
     /// `body`; the ones under it stop rendering.
     fn paint_floating(&mut self, cx: &mut PaintCx, body: Rect) {
@@ -1480,6 +1696,16 @@ fn reopenable(url: &str) -> bool {
 /// What to tell a person about a page named `name` (a title or address)
 /// that a later host couldn't make again, and the pop-ups named `with` that
 /// it opened, which closed with it: `what` is "Pop-up" or "Tab".
+/// How a dialog closed, said after its description.
+fn ended(end: DialogEnd) -> &'static str {
+    match end {
+        DialogEnd::Accepted => "was accepted",
+        DialogEnd::Dismissed => "was dismissed",
+        DialogEnd::TimedOut => "went unanswered and was dismissed",
+        DialogEnd::Cancelled => "closed as its page navigated or closed",
+    }
+}
+
 pub fn lost_message(what: &str, name: &str, with: &[String]) -> String {
     let mut message = format!("{what} \"{name}\" closed: the web host restarted, and it had no address to reopen");
     if !with.is_empty() {
@@ -1717,6 +1943,7 @@ impl View for WebView {
         let error = self.slot.borrow().error.clone().or_else(|| {
             self.state.gone.as_ref().map(|gone| format!("{gone}. Reload to restart it."))
         });
+        self.dialog_field.clear();
         match error {
             Some(err) => {
                 cx.fill(body, cx.chrome.background);
@@ -1741,7 +1968,11 @@ impl View for WebView {
                     };
                     cx.image(0, version, Arc::new(image), rect, body);
                 }
-                cx.cursor(body, cursor_icon(self.state.cursor));
+                if self.modal().is_some() {
+                    self.paint_dialog(cx, body);
+                } else {
+                    cx.cursor(body, cursor_icon(self.state.cursor));
+                }
             }
         }
         self.paint_floating(cx, body);
@@ -1757,6 +1988,12 @@ impl View for WebView {
         if self.url_edit.is_some() {
             return match (&key.press, pressed) {
                 (Some(press), true) => self.url_key(cx, press),
+                _ => true,
+            };
+        }
+        if self.modal().is_some() {
+            return match (&key.press, pressed) {
+                (Some(press), true) => self.dialog_key(cx, press),
                 _ => true,
             };
         }
@@ -1790,6 +2027,9 @@ impl View for WebView {
                 return cx.with_id_base(POPUP_BASE, |cx| f.key(cx, press));
             }
         }
+        if self.url_edit.is_none() && self.modal().is_some() {
+            return self.dialog_key(cx, press);
+        }
         self.url_key(cx, press)
     }
 
@@ -1804,6 +2044,25 @@ impl View for WebView {
             }
         }
         let flags = keys::modifier_flags(cx.mods);
+        if self.modal().is_some() {
+            if let Some((_, edit)) = self.dialog_edit.as_mut() {
+                if self.dialog_field.event(edit, event, cx.mods.shift) {
+                    cx.redraw();
+                    return;
+                }
+            }
+            // The page under the modal gets no presses or hover; a press it
+            // already holds still ends there.
+            match *event {
+                MouseEvent::Down { pos, .. } | MouseEvent::Move { pos } if rect_contains(self.body, pos.0, pos.1) => {
+                    if std::mem::take(&mut self.hovering) {
+                        self.mouse_to_page(pos, 0, flags, MouseAction::Leave);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match *event {
             MouseEvent::Down { pos, clicks, button } => {
                 if rect_contains(self.url_box, pos.0, pos.1) {
@@ -1863,7 +2122,7 @@ impl View for WebView {
             }
             return;
         }
-        if !rect_contains(self.body, pos.0, pos.1) {
+        if !rect_contains(self.body, pos.0, pos.1) || self.modal().is_some() {
             return;
         }
         let action = MouseAction::Wheel {
@@ -1896,6 +2155,8 @@ impl View for WebView {
                 self.report(cx, "Can't reload", done);
             }
             BTN_CLOSE => self.dismissed = true,
+            BTN_DIALOG_OK => self.answer_modal(cx, true),
+            BTN_DIALOG_CANCEL => self.answer_modal(cx, false),
             _ => {}
         }
         cx.redraw();
@@ -1971,6 +2232,9 @@ impl View for WebView {
         }
         if let Some(gone) = &v.gone {
             out.push_str(&format!("error: {gone}; reload to restart it\n"));
+        }
+        if let Some(d) = &v.dialog {
+            out.push_str(&format!("dialog: {} (answer it with web.dialog)\n", d.describe()));
         }
         if v.popups_refused > 0 {
             let max = ghostrealm_web::protocol::MAX_POPUPS;
@@ -3991,5 +4255,112 @@ pub(crate) mod tests {
         }
         Harness::new().key(&mut v, press(Key::Enter));
         assert!(v.url_edit.is_none());
+    }
+
+    /// The host's `dialog` event for dialog `n` of `kind` on page 1.
+    fn dialog_event(n: u64, kind: &str, message: &str, default_text: &str) -> String {
+        format!(
+            r#"{{"ev":"dialog","id":1,"dialog":{n},"kind":"{kind}","message":"{message}","default_text":"{default_text}","url":"https://a.test/"}}"#
+        )
+    }
+
+    /// Paint `v` until its modal shows dialog `n`.
+    fn paint_until_modal(h: &mut Harness, v: &mut WebView, n: u64) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while v.modal().map(|d| d.dialog) != Some(n) {
+            assert!(Instant::now() < until, "dialog {n} never showed");
+            h.paint(v, RECT);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        h.paint(v, RECT);
+    }
+
+    fn has_button(h: &Harness, id: u32) -> bool {
+        h.frame.view_buttons.iter().any(|(_, _, b)| *b == id)
+    }
+
+    fn dialog_answer(dialog: u64, accept: bool, text: Option<&str>) -> HostRequest {
+        HostRequest::Dialog { id: 1, dialog, accept, text: text.map(str::to_string) }
+    }
+
+    /// Given a person's page whose host reports a prompt;
+    /// when the person presses on the page under it, types a name over the
+    /// selected default text (a typo fixed with Backspace), and presses Enter;
+    /// then the modal shows the message, the field and OK / Cancel, the page
+    /// hears no press, the answer carries the typed name, and the modal hides
+    /// once answered.
+    #[test]
+    fn a_prompt_shows_a_modal_that_enter_answers_with_the_typed_text() {
+        let dir = TmpDir::new("web-dialog-prompt");
+        let script = format!(
+            "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\ncat > \"$0.requests\"",
+            dialog_event(7, "prompt", "Your name?", "anon")
+        );
+        let (mut v, runs) = stub_host(&dir, &script);
+        let log = runs.with_file_name("host.sh.requests");
+        let mut h = Harness::new();
+        paint_until_modal(&mut h, &mut v, 7);
+        let texts = h.texts();
+        for want in ["Your name?", "anon", "OK", "Cancel"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+        assert!(has_button(&h, BTN_DIALOG_OK) && has_button(&h, BTN_DIALOG_CANCEL));
+
+        let corner = (v.body.x + 2.0, v.body.y + 2.0);
+        let left = MouseButton::Left;
+        h.mouse(&mut v, MouseEvent::Down { pos: corner, clicks: 1, button: left });
+        h.mouse(&mut v, MouseEvent::Up { pos: corner, dragged: false, button: left });
+        for c in "Adaa".chars() {
+            h.key(&mut v, press(Key::Char(c)));
+        }
+        h.key(&mut v, press(Key::Backspace));
+        assert_eq!(v.dialog_edit.as_ref().map(|(_, e)| e.text()), Some("Ada"));
+        h.key(&mut v, press(Key::Enter));
+        assert!(v.modal().is_none(), "answered: the modal hides");
+        let got = host_requests(&requests(&log, |s| host_requests(s).iter().any(|r| matches!(r, HostRequest::Dialog { .. }))));
+        assert!(got.contains(&dialog_answer(7, true, Some("Ada"))), "{got:?}");
+        assert!(!got.iter().any(|r| matches!(r, HostRequest::Mouse { action: MouseAction::Down { .. }, .. })), "{got:?}");
+        h.paint(&mut v, RECT);
+        assert!(!has_button(&h, BTN_DIALOG_OK));
+    }
+
+    /// Given a person's page whose host reports a confirm, and an alert once
+    /// the confirm is answered;
+    /// when the person presses Cancel, then Escape on the alert;
+    /// then each answer dismisses its own dialog, the alert's modal has only
+    /// OK, and the next dialog shows once the host closes the first.
+    #[test]
+    fn cancel_and_escape_dismiss_a_dialog() {
+        let dir = TmpDir::new("web-dialog-cancel");
+        let closed = r#"{"ev":"dialog_closed","id":1,"dialog":3,"end":"dismissed"}"#;
+        let script = format!(
+            "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\n\
+             while read -r l; do echo \"$l\" >> \"$0.requests\"; case \"$l\" in *'\"dialog\":3'*) echo '{closed}'; echo '{}';; esac; done",
+            dialog_event(3, "confirm", "Delete it?", ""),
+            dialog_event(4, "alert", "Gone", ""),
+        );
+        let (mut v, runs) = stub_host(&dir, &script);
+        let log = runs.with_file_name("host.sh.requests");
+        let mut h = Harness::new();
+        paint_until_modal(&mut h, &mut v, 3);
+        assert!(has_button(&h, BTN_DIALOG_CANCEL));
+        h.button(&mut v, BTN_DIALOG_CANCEL);
+        paint_until_modal(&mut h, &mut v, 4);
+        assert!(has_button(&h, BTN_DIALOG_OK) && !has_button(&h, BTN_DIALOG_CANCEL), "an alert has only OK");
+        h.key(&mut v, press(Key::Escape));
+        let got = requests(&log, |s| host_requests(s).contains(&dialog_answer(4, false, None)));
+        assert!(host_requests(&got).contains(&dialog_answer(3, false, None)), "{got}");
+    }
+
+    #[test]
+    fn web_dialog_names_the_agent_timeout() {
+        let r = {
+            let mut r = Registry::new();
+            WebPlugin::new().register_commands(&mut r);
+            r
+        };
+        let meta = r.metas().find(|m| m.id == "web.dialog").unwrap();
+        let secs = ghostrealm_web::protocol::AGENT_DIALOG_TIMEOUT.as_secs();
+        assert!(meta.description.contains(&format!(" {secs}s ")), "{}", meta.description);
     }
 }

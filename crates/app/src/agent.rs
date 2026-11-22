@@ -15,6 +15,10 @@
 //!   defaulting to the focused surface)
 //! - `{"op":"pump"}`                         → drain background output
 //!
+//! `set` and `get` replies list the JavaScript dialogs open on the web pages
+//! the agent reaches, as `"dialogs"`, when there are any: a page with one is
+//! stopped until `web.dialog` answers it.
+//!
 //! One JSON object per request line, one JSON object per response line. It is
 //! the agent's drive + observe loop, and the display-free way to test app
 //! behaviour end to end.
@@ -278,7 +282,41 @@ pub fn serve(line: &str, scope: Scope, state: &mut AppState, registry: &mut Regi
     if let Err(e) = authorize(&op, scope, state, registry) {
         return Reply::Done(json!({ "ok": false, "error": e }));
     }
-    execute(op, scope, state, registry)
+    let reports = matches!(op, Op::Set { .. } | Op::GetTree | Op::GetSurface(_));
+    match execute(op, scope, state, registry) {
+        Reply::Done(mut reply) if reports => {
+            let open = dialogs(scope, state);
+            if !open.is_empty() {
+                reply["dialogs"] = Json::Array(open);
+            }
+            Reply::Done(reply)
+        }
+        reply => reply,
+    }
+}
+
+/// The JavaScript dialogs open on the web pages `scope` reaches, by surface.
+fn dialogs(scope: Scope, state: &AppState) -> Vec<Json> {
+    // A workspace's agent reaches no web page.
+    if !matches!(scope, Scope::Full) {
+        return Vec::new();
+    }
+    let mut open: Vec<(u64, Json)> = state
+        .views()
+        .filter_map(|(sid, v)| {
+            let d = v.as_any().downcast_ref::<crate::plugins::web::WebView>()?.open_dialog()?;
+            let reply = json!({
+                "surface": sid.0,
+                "type": d.kind,
+                "message": d.message,
+                "default": d.default_text,
+                "url": d.url,
+            });
+            Some((sid.0, reply))
+        })
+        .collect();
+    open.sort_by_key(|(sid, _)| *sid);
+    open.into_iter().map(|(_, d)| d).collect()
 }
 
 fn parse(line: &str) -> Result<Op, String> {
@@ -1188,6 +1226,61 @@ mod tests {
         let reply = ask(&mut state, &set("pane.close", json!({})));
         assert!(error(&reply).contains("can't reach"), "{reply:?}");
         assert!(state.has_surface(page), "the page stays");
+        TEST_HOST.with_borrow_mut(|h| *h = None);
+    }
+
+    /// Given the headless channel and a web host whose page opens a confirm,
+    /// and which closes a dialog as answered once told to;
+    /// when the agent opens the page, reads it, answers the dialog, and
+    /// answers again;
+    /// then replies list the dialog until it is answered, `get surface` says
+    /// so too, the answer says what it answered, and the second says none is
+    /// open and how the last one ended. A workspace's agent sees none.
+    #[cfg(unix)]
+    #[test]
+    fn replies_list_open_dialogs_until_web_dialog_answers_them() {
+        use crate::plugins::web::tests::{stub_app_host, TEST_HOST};
+        let dir = crate::plugin::testing::TmpDir::new("agent-web-dialog");
+        let log = dir.join("log");
+        let dialog = r#"{"ev":"dialog","id":1,"dialog":2,"kind":"confirm","message":"Sure?","default_text":"","url":"https://a.test/"}"#;
+        let closed = r#"{"ev":"dialog_closed","id":1,"dialog":2,"end":"accepted"}"#;
+        stub_app_host(
+            &dir,
+            &[dialog.to_string()],
+            &format!(
+                r#"while read -r l; do echo "$l" >> '{}'; case "$l" in *'"op":"dialog"'*) echo '{closed}';; esac; done"#,
+                log.display()
+            ),
+        );
+        let mut state = AppState::new().with_shell_line("sleep 5");
+        let vt = state.new_vtab().unwrap();
+        let mut registry = build_registry();
+        assert_eq!(handle(&set("web.new", json!({})), &mut state, &mut registry)["ok"], json!(true));
+        let page = state.focused_surface().unwrap();
+        let want = json!([{ "surface": page.0, "type": "confirm", "message": "Sure?", "default": "", "url": "https://a.test/" }]);
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let reply = handle(r#"{"op":"get","what":"tree"}"#, &mut state, &mut registry);
+            if reply.get("dialogs") == Some(&want) {
+                break;
+            }
+            assert!(Instant::now() < until, "{reply:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let reply = handle(&format!(r#"{{"op":"get","what":"surface","id":{}}}"#, page.0), &mut state, &mut registry);
+        assert_eq!(reply["dialogs"], want);
+        let text = reply["text"].as_str().unwrap();
+        assert!(text.contains("dialog: confirm \"Sure?\" (answer it with web.dialog)"), "{text}");
+        let reply = scoped(&mut state, &mut registry, vt, r#"{"op":"get","what":"tree"}"#);
+        assert_eq!(reply.get("dialogs"), None, "{reply:?}");
+
+        let reply = handle(&set("web.dialog", json!({ "accept": true })), &mut state, &mut registry);
+        assert_eq!(reply, json!({ "ok": true, "message": "accepted confirm \"Sure?\"" }));
+        let sent = std::fs::read_to_string(&log).unwrap();
+        assert!(sent.contains(r#"{"op":"dialog","id":1,"dialog":2,"accept":true}"#), "{sent}");
+        let reply = handle(&set("web.dialog", json!({ "accept": false })), &mut state, &mut registry);
+        assert_eq!(error(&reply), "no dialog is open; the last, confirm \"Sure?\", was accepted");
+        assert_eq!(reply.get("dialogs"), None, "{reply:?}");
         TEST_HOST.with_borrow_mut(|h| *h = None);
     }
 
