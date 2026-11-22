@@ -169,7 +169,15 @@ fn dialog_timeout() -> Duration {
 /// [`Event::Dialog`]; on an agent's page, dismiss it after
 /// [`dialog_timeout`]. Returns false to have CEF suppress it: the page is
 /// gone, or already has one open.
-fn open_dialog(id: u64, kind: DialogKind, message: String, default_text: String, url: String, callback: JsdialogCallback) -> bool {
+fn open_dialog(
+    id: u64,
+    kind: DialogKind,
+    message: String,
+    default_text: String,
+    url: String,
+    reload: bool,
+    callback: JsdialogCallback,
+) -> bool {
     let n = NEXT_DIALOG.get();
     let agent = BROWSERS.with_borrow_mut(|m| {
         let e = m.get_mut(&id).filter(|e| e.dialog.is_none())?;
@@ -178,7 +186,7 @@ fn open_dialog(id: u64, kind: DialogKind, message: String, default_text: String,
     });
     let Some(agent) = agent else { return false };
     NEXT_DIALOG.set(n + 1);
-    emit(&Event::Dialog { id, dialog: n, kind, message, default_text, url });
+    emit(&Event::Dialog { id, dialog: n, kind, message, default_text, url, reload });
     if agent {
         let ms = dialog_timeout().as_millis().min(i64::MAX as u128) as i64;
         post_delayed_task(ThreadId::UI, Some(&mut DialogTimeout::new(id, n)), ms);
@@ -1636,7 +1644,7 @@ wrap_jsdialog_handler! {
                 _ => DialogKind::Alert,
             };
             let held = callback.is_some_and(|cb| {
-                open_dialog(self.id, kind, string(message_text), string(default_prompt_text), string(origin_url), cb.clone())
+                open_dialog(self.id, kind, string(message_text), string(default_prompt_text), string(origin_url), false, cb.clone())
             });
             if !held {
                 if let Some(s) = suppress_message {
@@ -1646,18 +1654,18 @@ wrap_jsdialog_handler! {
             held as c_int
         }
 
-        /// A `beforeunload` handler asks whether to leave: the app answers,
-        /// as for `confirm`. Unheld, CEF's default lets the page go.
+        /// A `beforeunload` handler asks whether to leave or reload: the app
+        /// answers, as for `confirm`. Unheld, CEF's default lets the page go.
         fn on_before_unload_dialog(
             &self,
             browser: Option<&mut Browser>,
             message_text: Option<&CefString>,
-            _is_reload: c_int,
+            is_reload: c_int,
             callback: Option<&mut JsdialogCallback>,
         ) -> c_int {
             let url = browser.and_then(|b| b.main_frame()).map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
             let Some(cb) = callback else { return 0 };
-            if open_dialog(self.id, DialogKind::BeforeUnload, string(message_text), String::new(), url, cb.clone()) {
+            if open_dialog(self.id, DialogKind::BeforeUnload, string(message_text), String::new(), url, is_reload != 0, cb.clone()) {
                 return 1;
             }
             // A page with a dialog open can't also ask to leave: stay.

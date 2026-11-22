@@ -1448,7 +1448,7 @@ impl WebView {
 impl WebView {
     /// Show the page's dialog as a modal over `body` (the toolbar stays live:
     /// navigating dismisses it): its message, a prompt's field, and OK /
-    /// Cancel, or Leave / Stay for beforeunload.
+    /// Cancel, or for beforeunload Leave / Stay (Reload / Cancel on a reload).
     fn paint_dialog(&mut self, cx: &mut PaintCx, body: Rect) {
         let Some(d) = self.modal().cloned() else { return };
         let keys = cx.focused && self.url_edit.is_none() && !(self.float_keys && !self.floating.is_empty());
@@ -1460,6 +1460,7 @@ impl WebView {
         let bh = ch + 8.0 * scale;
         let buttons: &[(&str, u32, bool)] = match d.kind {
             DialogKind::Alert => &[("OK", BTN_DIALOG_OK, true)],
+            DialogKind::BeforeUnload if d.reload => &[("Reload", BTN_DIALOG_OK, true), ("Cancel", BTN_DIALOG_CANCEL, false)],
             DialogKind::BeforeUnload => &[("Leave", BTN_DIALOG_OK, true), ("Stay", BTN_DIALOG_CANCEL, false)],
             DialogKind::Confirm | DialogKind::Prompt => &[("OK", BTN_DIALOG_OK, true), ("Cancel", BTN_DIALOG_CANCEL, false)],
         };
@@ -1472,6 +1473,7 @@ impl WebView {
         let text_w = (pw - pad * 2.0).max(1.0);
         // Chromium shows no page's own text for beforeunload.
         let message = match d.kind {
+            DialogKind::BeforeUnload if d.reload => "Reload site? Changes you made may not be saved.",
             DialogKind::BeforeUnload => "Leave this page? Changes you made may not be saved.",
             _ => d.message.as_str(),
         };
@@ -4360,6 +4362,44 @@ pub(crate) mod tests {
         h.key(&mut v, press(Key::Escape));
         let got = requests(&log, |s| host_requests(s).contains(&dialog_answer(4, false, None)));
         assert!(host_requests(&got).contains(&dialog_answer(3, false, None)), "{got}");
+    }
+
+    /// Given a person's page whose host reports a beforeunload for leaving,
+    /// then, once that is answered, one for a reload;
+    /// when the person presses Stay;
+    /// then leaving asks with Leave / Stay, and reloading asks "Reload
+    /// site?" with Reload / Cancel.
+    #[test]
+    fn a_beforeunload_for_a_reload_asks_to_reload() {
+        let dir = TmpDir::new("web-dialog-reload");
+        let unload = |n: u64, reload: bool| {
+            format!(
+                r#"{{"ev":"dialog","id":1,"dialog":{n},"kind":"before_unload","message":"","default_text":"","url":"https://a.test/","reload":{reload}}}"#
+            )
+        };
+        let closed = r#"{"ev":"dialog_closed","id":1,"dialog":1,"end":"dismissed"}"#;
+        let script = format!(
+            "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\necho '{}'\n\
+             while read -r l; do case \"$l\" in *'\"dialog\":1'*) echo '{closed}'; echo '{}';; esac; done",
+            unload(1, false),
+            unload(2, true),
+        );
+        let (mut v, _) = stub_host(&dir, &script);
+        let mut h = Harness::new();
+        paint_until_modal(&mut h, &mut v, 1);
+        let texts = h.texts();
+        for want in ["Leave", "Stay"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t.starts_with("Leave this page?")), "{texts:?}");
+        h.button(&mut v, BTN_DIALOG_CANCEL);
+        paint_until_modal(&mut h, &mut v, 2);
+        let texts = h.texts();
+        for want in ["Reload", "Cancel"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t.starts_with("Reload site?")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Leave" || t == "Stay"), "{texts:?}");
     }
 
     /// Given a person's page whose host reports alert 1, and exits once it

@@ -1886,9 +1886,10 @@ fn only_an_agents_unanswered_dialog_times_out() {
 
 /// Given an agent's page with a `beforeunload` handler that a gesture has
 /// armed;
-/// when the agent navigates away, stays, and navigates again, leaving;
-/// then each navigation asks with a beforeunload dialog, staying keeps the
-/// page, and leaving loads the next one.
+/// when the agent navigates away, stays, reloads, stays, and navigates
+/// again, leaving;
+/// then each navigation asks with a beforeunload dialog (saying when it is
+/// a reload), staying keeps the page, and leaving loads the next one.
 #[test]
 fn leaving_a_page_that_asks_waits_for_the_answer() {
     let Some((host, cache)) = spawn("dialog-unload") else {
@@ -1901,8 +1902,8 @@ fn leaving_a_page_that_asks_waits_for_the_answer() {
     // Chromium asks only once the page has had a user activation.
     assert_eq!(host.eval_as(1, "1", true, Duration::from_secs(5)), Ok("1".into()));
     let next = data_url("<title>Next</title>");
-    let ask = |host: &WebHost| {
-        assert!(host.send(&Request::Navigate { id: 1, url: next.clone() }));
+    let ask_on = |host: &WebHost, req: Request| {
+        assert!(host.send(&req));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(d) = host.view(1).and_then(|v| v.dialog) {
@@ -1912,11 +1913,19 @@ fn leaving_a_page_that_asks_waits_for_the_answer() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
+    let ask = |host: &WebHost| ask_on(host, Request::Navigate { id: 1, url: next.clone() });
+    let stay = |host: &WebHost, d: DialogInfo| {
+        assert_eq!(host.answer_dialog(1, d.dialog, false, None, Duration::from_secs(5)), Ok(DialogEnd::Dismissed));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Asks\"".into()));
+    };
     let d = ask(&host);
-    assert_eq!(d.kind, DialogKind::BeforeUnload);
-    assert_eq!(host.answer_dialog(1, d.dialog, false, None, Duration::from_secs(5)), Ok(DialogEnd::Dismissed));
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Asks\"".into()));
+    assert_eq!((d.kind, d.reload), (DialogKind::BeforeUnload, false));
+    stay(&host, d);
+
+    let d = ask_on(&host, Request::Reload { id: 1 });
+    assert_eq!((d.kind, d.reload), (DialogKind::BeforeUnload, true), "a reload asks to reload");
+    stay(&host, d);
 
     let d = ask(&host);
     host.expect_load(1);

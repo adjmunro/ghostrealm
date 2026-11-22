@@ -228,8 +228,8 @@ pub enum DialogKind {
     Confirm,
     /// `prompt()`: a line of text, OK or Cancel.
     Prompt,
-    /// A `beforeunload` handler asking whether to leave (or reload) the
-    /// page: OK leaves, Cancel stays.
+    /// A `beforeunload` handler asking whether to leave or reload the page
+    /// (as [`Event::Dialog`]'s `reload` says): OK goes on, Cancel stays.
     BeforeUnload,
 }
 
@@ -397,6 +397,9 @@ pub enum Event {
         default_text: String,
         /// The address of the document that opened it.
         url: String,
+        /// A beforeunload dialog's navigation is a reload.
+        #[serde(default)]
+        reload: bool,
     },
     /// Dialog `dialog` of page `id` closed.
     DialogClosed {
@@ -545,6 +548,7 @@ mod tests {
             message: "m".into(),
             default_text: String::new(),
             url: "https://a.test/".into(),
+            reload: true,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""ev":"dialog""#) && s.contains(r#""kind":"before_unload""#), "{s}");

@@ -123,6 +123,8 @@ pub struct DialogInfo {
     pub default_text: String,
     /// The address of the document that opened it.
     pub url: String,
+    /// A beforeunload dialog's navigation is a reload.
+    pub reload: bool,
 }
 
 impl DialogInfo {
@@ -861,8 +863,8 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
             s.views.entry(id).or_default().error = Some(format!("{error} ({url})"));
         }
         Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
-        Event::Dialog { id, dialog, kind, message, default_text, url } => {
-            s.views.entry(id).or_default().dialog = Some(DialogInfo { dialog, kind, message, default_text, url });
+        Event::Dialog { id, dialog, kind, message, default_text, url, reload } => {
+            s.views.entry(id).or_default().dialog = Some(DialogInfo { dialog, kind, message, default_text, url, reload });
         }
         Event::DialogClosed { id, dialog, end } => {
             let v = s.views.entry(id).or_default();
@@ -1360,6 +1362,7 @@ mod tests {
             message: "Sure?".into(),
             default_text: String::new(),
             url: "https://a.test/".into(),
+            reload: false,
         }
     }
 
