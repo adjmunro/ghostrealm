@@ -1693,9 +1693,6 @@ fn reopenable(url: &str) -> bool {
     !(url.is_empty() || url.starts_with("about:") || url.starts_with("blob:"))
 }
 
-/// What to tell a person about a page named `name` (a title or address)
-/// that a later host couldn't make again, and the pop-ups named `with` that
-/// it opened, which closed with it: `what` is "Pop-up" or "Tab".
 /// How a dialog closed, said after its description.
 fn ended(end: DialogEnd) -> &'static str {
     match end {
@@ -1706,6 +1703,9 @@ fn ended(end: DialogEnd) -> &'static str {
     }
 }
 
+/// What to tell a person about a page named `name` (a title or address)
+/// that a later host couldn't make again, and the pop-ups named `with` that
+/// it opened, which closed with it: `what` is "Pop-up" or "Tab".
 pub fn lost_message(what: &str, name: &str, with: &[String]) -> String {
     let mut message = format!("{what} \"{name}\" closed: the web host restarted, and it had no address to reopen");
     if !with.is_empty() {
