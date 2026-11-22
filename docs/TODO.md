@@ -1653,3 +1653,13 @@
 - Requires: NO BLOCKERS
 - Detail: nit: `docs/DECISION.md`, the licence / dependency policy entry: the LGPL Detail leaves out the owner's rationale "Playback only needs decoders, which LGPL builds include". Add it if the owner wants the rationale kept.
 - Reason: review of the relicense and dependency rules (chore/relicense-fsl), recorded rather than fixed in that change.
+
+---
+
+[2026-11-22T23:15+1300@22decfe] Web — untested host dialog paths
+
+- Requires: NO BLOCKERS
+- Detail: `crates/web-host/src/browser.rs` has no test for suppressing a dialog while the page holds one (`on_jsdialog`'s `!held` branch, and `on_before_unload_dialog` answering Stay when a dialog is open), nor for `on_reset_dialog_state`.
+- Detail: risk: a cross-origin iframe's dialog while the top frame holds one, or a renderer crash while a dialog is held. If CEF doesn't call `OnResetDialogState` on a crash, the client keeps a stale dialog, and a person's page, which has no timeout, shows it until navigated.
+- Detail: suggested tests: a cross-origin iframe opening a dialog while the top frame holds one; `chrome://crash` with a dialog held.
+- Reason: review of the JS dialogs change (fix/web-js-dialogs), recorded rather than fixed in that change.
