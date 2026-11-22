@@ -398,6 +398,18 @@ impl WebHost {
             Request::Create { id, .. } => Some(*id).filter(|id| self.shared.0.lock().unwrap().made.insert(*id)),
             _ => None,
         };
+        // The host dismisses an open dialog before it navigates. Its close
+        // trails the request, so mirror it now: a reply or wait that follows
+        // would otherwise see the dialog still open. Done before the host can
+        // read the request, so a dialog the navigation raises (beforeunload)
+        // is never the one dropped here.
+        if let Request::Navigate { id, .. } | Request::Back { id } | Request::Forward { id } | Request::Reload { id } = req {
+            if let Some(v) = self.shared.0.lock().unwrap().views.get_mut(id) {
+                if let Some(d) = v.dialog.take() {
+                    v.dialog_ended = Some((d, DialogEnd::Cancelled));
+                }
+            }
+        }
         let sent = enqueue(&self.outbox, req);
         if let (false, Some(id)) = (sent, made) {
             self.shared.0.lock().unwrap().made.remove(&id);
@@ -1400,6 +1412,42 @@ mod tests {
 
         assert_eq!(host.answer_dialog(1, 5, true, None, long), Ok(DialogEnd::Accepted));
         assert!(host.view(1).unwrap().dialog.is_none());
+        let pid = host.pid().unwrap();
+        drop(host);
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+
+    /// Given a page with a dialog open, and a host that hasn't yet reported
+    /// it closed;
+    /// when the app navigates, then evals;
+    /// then the dialog is closed (cancelled) as soon as the navigation is
+    /// sent, and the eval waits for its result rather than failing on it.
+    #[cfg(unix)]
+    #[test]
+    fn navigating_closes_the_open_dialog_at_once() {
+        let script = format!(
+            r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'
+            echo '{dialog}'
+            while read l; do case "$l" in
+             *'"op":"eval"'*) req=$(printf '%s' "$l" | sed 's/.*"req":\([0-9]*\).*/\1/')
+              echo "{{\"ev\":\"eval_result\",\"id\":1,\"req\":$req,\"ok\":true,\"value\":\"2\"}}";;
+            esac; done"#,
+            dialog = serde_json::to_string(&dialog_event(1, 5)).unwrap(),
+        );
+        let mut sh = Command::new("/bin/sh");
+        sh.args(["-c", &script]);
+        let host = WebHost::start(sh, None).unwrap();
+        assert!(host.wait_ready(Duration::from_secs(10)));
+        let until = Instant::now() + Duration::from_secs(10);
+        while host.view(1).and_then(|v| v.dialog).is_none() {
+            assert!(Instant::now() < until, "the dialog never opened");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(host.send(&Request::Navigate { id: 1, url: "https://b.test/".into() }));
+        let v = host.view(1).unwrap();
+        assert!(v.dialog.is_none(), "closed with the navigation");
+        assert_eq!(v.dialog_ended.map(|(d, end)| (d.dialog, end)), Some((5, DialogEnd::Cancelled)));
+        assert_eq!(host.eval(1, "1 + 1", Duration::from_secs(10)), Ok("2".into()));
         let pid = host.pid().unwrap();
         drop(host);
         let _ = Command::new("kill").arg(pid.to_string()).status();
