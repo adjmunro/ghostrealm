@@ -726,15 +726,20 @@ pub struct WebView {
     /// was refused and the next tick hasn't said so: refresh sees it but
     /// can't raise requests.
     refused_at: Option<Instant>,
-    /// The answer being typed into a prompt dialog's modal, for that
-    /// dialog's number.
-    dialog_edit: Option<(u64, LineEdit)>,
+    /// The answer being typed into a prompt dialog's modal, for that dialog
+    /// ([`DialogKey`]).
+    dialog_edit: Option<(DialogKey, LineEdit)>,
     /// The mouse in the prompt's field.
     dialog_field: FieldMouse,
     /// The dialog the person last answered: its modal hides until the host
     /// reports it closed, so a second press can't answer it again.
-    dialog_answered: Option<u64>,
+    dialog_answered: Option<DialogKey>,
 }
+
+/// A dialog, as the host generation the page was made in and that host's
+/// number for it: each host numbers its dialogs from 1, and a view outlives
+/// its host.
+type DialogKey = (u64, u64);
 
 /// A pop-up that a later host couldn't make again, and the pop-ups it
 /// opened that went with it, for the app to tell the person.
@@ -1274,28 +1279,33 @@ impl WebView {
     /// The dialog whose modal shows: the open one, until the person answers
     /// it.
     fn modal(&self) -> Option<&DialogInfo> {
-        self.state.dialog.as_ref().filter(|d| self.dialog_answered != Some(d.dialog))
+        self.state.dialog.as_ref().filter(|d| self.dialog_answered != Some(self.key_of(d)))
+    }
+
+    /// `d`'s [`DialogKey`].
+    fn key_of(&self, d: &DialogInfo) -> DialogKey {
+        (self.created_in, d.dialog)
     }
 
     /// The prompt modal's field, made with the default text selected for each
     /// new prompt; `None` for other dialogs.
     fn modal_edit(&mut self) -> Option<&mut LineEdit> {
         let d = self.modal().filter(|d| d.kind == DialogKind::Prompt)?;
-        let (n, default) = (d.dialog, d.default_text.clone());
-        if self.dialog_edit.as_ref().is_none_or(|(e, _)| *e != n) {
+        let (key, default) = (self.key_of(d), d.default_text.clone());
+        if self.dialog_edit.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut e = LineEdit::new(default).with_plain_brackets();
             let _ = e.apply(Edit::SelectAll, &mut None::<String>);
-            self.dialog_edit = Some((n, e));
+            self.dialog_edit = Some((key, e));
         }
         self.dialog_edit.as_mut().map(|(_, e)| e)
     }
 
     /// Answer the modal's dialog from the person's press or key.
     fn answer_modal(&mut self, cx: &mut EventCx, accept: bool) {
-        let Some(n) = self.modal().map(|d| d.dialog) else { return };
+        let Some((key, n)) = self.modal().map(|d| (self.key_of(d), d.dialog)) else { return };
         let text = if accept { self.modal_edit().map(|e| e.text().to_string()) } else { None };
         self.dialog_edit = None;
-        self.dialog_answered = Some(n);
+        self.dialog_answered = Some(key);
         if !self.send(Some(HostRequest::Dialog { id: self.page, dialog: n, accept, text })) {
             let e = self.no_host();
             self.report(cx, "Can't answer the page's dialog", Err(e));
@@ -4350,6 +4360,39 @@ pub(crate) mod tests {
         h.key(&mut v, press(Key::Escape));
         let got = requests(&log, |s| host_requests(s).contains(&dialog_answer(4, false, None)));
         assert!(host_requests(&got).contains(&dialog_answer(3, false, None)), "{got}");
+    }
+
+    /// Given a person's page whose host reports alert 1, and exits once it
+    /// is answered;
+    /// when the person presses OK, then Reload starts a host that reports
+    /// its own alert 1;
+    /// then the new alert's modal shows: an answer to the old host's dialog
+    /// doesn't hide the new host's dialog of the same number.
+    #[test]
+    fn a_dialog_from_a_new_host_shows_though_an_old_one_had_its_number() {
+        let dir = TmpDir::new("web-dialog-respawn");
+        // The second run reports its alert once asked to reload: before
+        // that, the Reload that starts it would dismiss it.
+        let script = format!(
+            "echo '{{\"ev\":\"ready\",\"protocol\":{PROTOCOL_VERSION}}}'\n\
+             if [ \"$(wc -l < \"$(dirname \"$0\")/runs\")\" -eq 1 ]; then\n\
+               echo '{alert}'\n\
+               while read -r l; do case \"$l\" in *'\"op\":\"dialog\"'*) exit 1;; esac; done\n\
+             fi\n\
+             while read -r l; do case \"$l\" in *'\"op\":\"reload\"'*) echo '{alert}';; esac; done",
+            alert = dialog_event(1, "alert", "Hello", ""),
+        );
+        let (mut v, runs_file) = stub_host(&dir, &script);
+        let mut h = Harness::new();
+        paint_until_modal(&mut h, &mut v, 1);
+        h.button(&mut v, BTN_DIALOG_OK);
+        assert!(v.modal().is_none(), "answered: the modal hides");
+        wait_exit(&v);
+        h.paint(&mut v, RECT);
+        v.reload().unwrap();
+        paint_until_modal(&mut h, &mut v, 1);
+        assert!(has_button(&h, BTN_DIALOG_OK));
+        assert_eq!(runs(&runs_file), 2, "shown by the second host");
     }
 
     #[test]
