@@ -652,10 +652,10 @@
   commands). REMAINING: (1) verify on a real desktop session — page drawing,
   HiDPI sharpness, cursor shapes, typing (incl. Option/dead keys) and
   Cmd+C/V/X/A in pages; (2) IME composition (`ime_set_composition`); (3) file
-  upload dialogs, downloads, JS alert/confirm dialogs (currently CEF defaults /
-  unhandled); (4) drag and drop; (5) restart the host automatically after a crash
-  (today a dead host is noticed on the next resize/open); (6) Linux bundle is
-  untested; (7) devtools (`show_dev_tools`, or the remote debugging port) as a
+  upload dialogs and downloads (currently CEF defaults / unhandled; JS dialogs
+  are handled, DECISION.md "Web surface / JS dialogs"); (4) drag and drop; (5)
+  restart the host automatically after a crash (today a dead host is noticed
+  on the next resize/open); (6) Linux bundle is untested; (7) devtools (`show_dev_tools`, or the remote debugging port) as a
   command; (8) don't render a page nobody is watching: skip painting when the
   page is not visible to the user (hidden tab or workspace) AND no agent is
   actively watching it. Owner (round 3): "Is it visible to the user [...] And is
@@ -1172,18 +1172,6 @@
   would have to be requested per call and marked as such.
 - Reason: isolation is the safe default, but app-state debugging needs page
   globals.
-
----
-
-[2026-10-23@e32ebd4] Web — JS dialogs hang the page
-
-- Requires: an owner decision on how web downloads, uploads, and JS dialogs
-  are handled
-- Detail: The host has no `JsDialogHandler`, so a page calling `alert()`,
-  `confirm()` or `prompt()` waits forever for an answer nothing gives: evals
-  and navigations on it stall. How dialogs are answered (shown to a human,
-  auto-dismissed and reported to an agent) waits on that decision.
-- Reason: a page must not be able to freeze its pane or the agent driving it.
 
 ---
 

@@ -477,3 +477,15 @@
 - Detail: large jobs (codecs, the browser, tree-sitter) stay dependencies.
 - Detail: watch the transitive tree (`cargo tree`): a dependency that pulls in C/C++ or a large transitive tree needs the owner's OK.
 - Reason: decisions-pending item 7 (owner): "Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years."
+
+---
+
+[2026-11-22T22:54+1300@e5274f3a]
+
+- Category: Web surface / JS dialogs
+- Detail: the web host holds every `alert`, `confirm`, `prompt` and `beforeunload` dialog (CEF `JsdialogHandler`) for the app to answer, numbered so an answer only reaches the dialog it names. It reports each open (`Event::Dialog`: kind, message, default text, the opener's address) and close (`Event::DialogClosed`: accepted, dismissed, timed out, cancelled). A page holds one dialog at a time; a second is suppressed. The app's navigations (Back, Forward, Reload, an address) dismiss an open dialog first, since a renderer waiting on one can't unload.
+- Detail: a person's page shows the dialog as a modal over the page body, in the window's confirmation style: the message, a field for a prompt (its default text selected), OK and Cancel (Leave and Stay for `beforeunload`, OK alone for `alert`), Enter for OK, Escape for Cancel. The toolbar stays live, and the page gets no input while it shows. It waits for the person, with no timeout. There is no "stop this page making more dialogs": a page that repeats them is left by navigating or closing its tab.
+- Detail: an agent's page (`Create { agent: true }`) holds the dialog for the agent. `set` and `get` replies on the headless channel list open dialogs as `"dialogs"` (surface, type, message, default, url), `get surface` adds a `dialog:` line, and an eval the dialog interrupts fails saying so (its result is dropped). The hidden command `web.dialog` (`accept`, optional `text`, `id`) answers it. A dialog left unanswered for `AGENT_DIALOG_TIMEOUT` (60 s) is dismissed by the host, so `confirm` gets `false` and `prompt` `null`.
+- Detail: a window's agents reach no web page, so the MCP shim (which runs in a window's terminal) gets no dialog tool.
+- Reason: decisions-pending item 5 (owner): hold an agent's dialog and report it so agents can test sites Playwright-style, dismiss on timeout so a page never stalls, and give people normal in-app modals.
+- Reason: 60 s for the timeout: long enough to span an LLM agent's turn between tool calls (reading the reply, thinking, answering), short enough that a page nobody drives is freed within a minute; it matches the host's eval TTL. Waits on the page don't sit through it: a dialog ends the app's load, text and eval waits on its page at once.
