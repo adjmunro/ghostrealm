@@ -1657,3 +1657,11 @@
 - Detail: out of scope, pre-existing: a worker blocked in `write_all` to a child that isn't reading also stops reading that child's output.
 - Detail: out of scope, pre-existing and untested: on macOS a canonical-mode tty may drop input past `MAX_INPUT` instead of blocking, so the input bound never applies there.
 - Reason: review of the agent socket hardening (fix/agent-socket-hardening), recorded rather than fixed in that change.
+
+---
+
+[2026-11-22T22:20+1300@6fd84ebe] Licence / dependency policy — LGPL rationale nit
+
+- Requires: NO BLOCKERS
+- Detail: nit: `docs/DECISION.md`, the licence / dependency policy entry: the LGPL Detail leaves out the owner's rationale "Playback only needs decoders, which LGPL builds include". Add it if the owner wants the rationale kept.
+- Reason: review of the relicense and dependency rules (chore/relicense-fsl), recorded rather than fixed in that change.
