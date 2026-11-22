@@ -117,8 +117,9 @@ pub const LAYOUT_HINT: &str = "the build script can't see a command-line `--targ
 /// `target_directory` and `build_directory` (absent before Cargo had a
 /// separate build dir: then the target dir), and `$TARGET`.
 ///
-/// `OUT_DIR` must be `<profile>/build/ghostrealm-<hash>/out` or
-/// `<triple>/<profile>/build/ghostrealm-<hash>/out` under the build dir:
+/// `OUT_DIR` must be `<profile>/build/ghostrealm-<hash>/out` (Cargo before
+/// 1.100) or `<profile>/build/ghostrealm/<hash>/out`, either optionally under
+/// `<triple>/`, in the build dir:
 /// otherwise this build's target dir isn't the one metadata names (a
 /// command-line `--target-dir`, `cargo install`), whose lock this build
 /// doesn't hold.
@@ -135,12 +136,15 @@ pub fn dirs(out_dir: &Path, target_dir: &Path, build_dir: Option<&Path>, triple:
         layout(format!("OUT_DIR {} is not under the build dir {}", out.display(), build.display()))
     })?;
     let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    let unit = |p: &str| {
-        p.strip_prefix("ghostrealm-").is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
-    };
+    let hash = |h: &str| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit());
+    let unit = |p: &str| p.strip_prefix("ghostrealm-").is_some_and(hash);
     let (t, profile_dir) = match parts.as_slice() {
         [p, b, u, o] if b == "build" && unit(u) && o == "out" => (None, p.clone()),
+        [p, b, n, h, o] if b == "build" && n == "ghostrealm" && hash(h) && o == "out" => (None, p.clone()),
         [t, p, b, u, o] if t == triple && b == "build" && unit(u) && o == "out" => (Some(t.clone()), p.clone()),
+        [t, p, b, n, h, o] if t == triple && b == "build" && n == "ghostrealm" && hash(h) && o == "out" => {
+            (Some(t.clone()), p.clone())
+        }
         _ => return Err(layout(format!("OUT_DIR {} has an unknown layout under {}", out.display(), build.display()))),
     };
     let mut artifact = target.clone();

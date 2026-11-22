@@ -119,6 +119,13 @@ fn dirs_follow_the_out_dir_shape() {
     assert_eq!((d.triple.as_deref(), d.profile()), (Some("aarch64-apple-darwin"), "release"));
     assert_eq!(d.nested_profile(), t.join("target/web-host/aarch64-apple-darwin/release"));
 
+    let out = layout(&t, "debug/build/ghostrealm/0123456789abcdef/out", "debug");
+    let d = dirs(&out, &t.join("target"), Some(&t.join("build-dir")), "aarch64-apple-darwin").unwrap();
+    assert_eq!((d.artifact.clone(), d.triple.as_deref()), (t.join("target/debug"), None));
+    let out = layout(&t, "aarch64-apple-darwin/release/build/ghostrealm/0123456789abcdef/out", "aarch64-apple-darwin/release");
+    let d = dirs(&out, &t.join("target"), Some(&t.join("build-dir")), "aarch64-apple-darwin").unwrap();
+    assert_eq!((d.artifact.clone(), d.triple.as_deref()), (t.join("target/aarch64-apple-darwin/release"), Some("aarch64-apple-darwin")));
+
     let out = layout(&t, &format!("profiling/build/{UNIT}/out"), "profiling");
     let d = dirs(&out, &t.join("target"), None, "x").unwrap_err();
     assert!(matches!(d, DirsError::Layout(_)), "no build dir: the target dir is the build dir: {d:?}");
@@ -150,6 +157,8 @@ fn an_out_dir_of_another_shape_or_elsewhere_is_a_layout_skip() {
     skip(&layout(&t, &format!("debug/build/{UNIT}/out/more"), "debug"));
     skip(&layout(&t, "debug/build/other-0123456789abcdef/out", "debug"));
     skip(&layout(&t, "build/ghostrealm/0123456789abcdef/out", "debug"));
+    skip(&layout(&t, "debug/build/other/0123456789abcdef/out", "debug"));
+    skip(&layout(&t, "debug/build/ghostrealm/xyz/out", "debug"));
     assert!(!target.join("web-host").exists());
 }
 
