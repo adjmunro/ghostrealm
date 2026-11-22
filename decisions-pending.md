@@ -196,6 +196,8 @@ Sub-question: should "hide from agent" be a list in `config.toml` (shareable) or
 >
 > **Hard rule: no GPL dependencies.** GPL is incompatible with FSL. Any dependency that is GPL (or would force GPL) must be flagged to me for a licence review and never just added. LGPL is acceptable only when dynamically linked and replaceable (e.g. an LGPL-only ffmpeg build: no `--enable-gpl`, no x264/x265). Playback only needs decoders, which LGPL builds include.
 
+**Built:** the licence part, on branch `chore/relicense-fsl`: `LICENSE.md` (FSL-1.1-MIT, copyright 2026 Adam Munro), `license = "FSL-1.1-MIT"` in the workspace `Cargo.toml`, and the licence and dependency rules in DECISION.md (Licence / dependency policy, 2026-11-22).
+
 ---
 
 ## 10. Settings regenerate / cleanup / reset

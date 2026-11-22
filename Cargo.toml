@@ -34,7 +34,7 @@ debug = "line-tables-only"
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
-license = "MIT"
+license = "FSL-1.1-MIT"
 
 [workspace.dependencies]
 ghostrealm-terminal = { path = "crates/terminal" }

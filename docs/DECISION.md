@@ -463,3 +463,14 @@
 - Detail: the runtime and grammars are C compiled through `cc` with the system C compiler, not Zig: Linux builds need a C compiler on `PATH`. No `cfg` code.
 - Detail: highlight queries are ours where a shipped one won't do: Kotlin's (fwcd's uses Neovim's `#lua-match?`, which tree-sitter's Rust binding doesn't evaluate) and patterns put before Rust's and Java's shipped queries. Syntax colours are fixed in `crates/app/src/syntax.rs`, as the line highlighters' are.
 - Reason: decisions-pending item 6 (owner): accurate, incremental, error-tolerant highlighting for the owner's languages (Kotlin first), on a syntax tree that the outline, Kotlin heading modes, fence highlighting and the indexer can share.
+
+---
+
+[2026-11-22T22:15+1300@55102243]
+
+- Category: Licence / dependency policy
+- Detail: the project is licensed under the Functional Source License, Version 1.1, MIT Future License (SPDX `FSL-1.1-MIT`): `LICENSE.md` at the repo root, from the canonical template at fsl.software, copyright 2026 Adam Munro; the workspace `Cargo.toml` sets `license = "FSL-1.1-MIT"`, which every crate inherits.
+- Detail: no GPL dependencies: GPL is incompatible with FSL. A dependency that is GPL, or would force GPL, is flagged to the owner for a licence review and never just added.
+- Detail: LGPL is acceptable only when dynamically linked and replaceable (e.g. an LGPL-only ffmpeg build: no `--enable-gpl`, no x264/x265).
+- Detail: a dependency that pulls in C/C++ or a large transitive tree (`cargo tree`) needs the owner's OK.
+- Reason: decisions-pending item 7 (owner): "Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years." The MIT licence was not a deliberate choice.
