@@ -472,5 +472,8 @@
 - Detail: the project is licensed under the Functional Source License, Version 1.1, MIT Future License (SPDX `FSL-1.1-MIT`): `LICENSE.md` at the repo root, from the canonical template at fsl.software, copyright 2026 Adam Munro; the workspace `Cargo.toml` sets `license = "FSL-1.1-MIT"`, which every crate inherits.
 - Detail: no GPL dependencies: GPL is incompatible with FSL. A dependency that is GPL, or would force GPL, is flagged to the owner for a licence review and never just added.
 - Detail: LGPL is acceptable only when dynamically linked and replaceable (e.g. an LGPL-only ffmpeg build: no `--enable-gpl`, no x264/x265).
-- Detail: a dependency that pulls in C/C++ or a large transitive tree (`cargo tree`) needs the owner's OK.
-- Reason: decisions-pending item 7 (owner): "Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years." The MIT licence was not a deliberate choice.
+- Detail: a dependency that isn't integral sits behind our own trait or interface so it can be swapped. Integral ones, which we are deeply coupled to, are exempt: the graphics stack, the browser engine, VT-level jobs.
+- Detail: simple dependencies doing simple jobs get replaced with our own code over time, to cut the risk surface.
+- Detail: large jobs (codecs, the browser, tree-sitter) stay dependencies.
+- Detail: watch the transitive tree (`cargo tree`): a dependency that pulls in C/C++ or a large transitive tree needs the owner's OK.
+- Reason: decisions-pending item 7 (owner): "Anyone may read, modify, fork, and use it, including commercially at work, but not repackage or sell it as a competing product. Each version converts to a permissive licence after two years."
