@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use ghostrealm_process::inherit_stdio_only;
 
 use crate::frame::FrameReader;
-use crate::protocol::{Cursor, Event, MouseAction, PopupKind, Request, PROTOCOL_VERSION};
+use crate::protocol::{Cursor, DialogEnd, DialogKind, Event, MouseAction, PopupKind, Request, PROTOCOL_VERSION};
 
 /// Executable name of the host (and of its macOS bundle, `<name>.app`).
 pub const HOST_NAME: &str = "ghostrealm-web-host";
@@ -101,12 +101,51 @@ pub struct ViewState {
     /// taken ([`WebHost::take_input_refusals`]), so it can say so: an agent
     /// reads `popups_refused`, a person sees nothing open.
     pub input_refusals: u32,
+    /// The JavaScript dialog the page has open, until it closes.
+    pub dialog: Option<DialogInfo>,
+    /// The last dialog that closed, and how.
+    pub dialog_ended: Option<(DialogInfo, DialogEnd)>,
     /// Bumped on every event for this page but a frame, so a caller can tell
     /// it changed.
     pub version: u64,
     /// Bumped on every frame: a page off screen can paint without anything
     /// on screen changing.
     pub frames: u64,
+}
+
+/// A JavaScript dialog a page opened ([`Event::Dialog`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogInfo {
+    /// The host's number for it, which an answer names.
+    pub dialog: u64,
+    pub kind: DialogKind,
+    pub message: String,
+    pub default_text: String,
+    /// The address of the document that opened it.
+    pub url: String,
+}
+
+impl DialogInfo {
+    /// Its kind and text, as `confirm "Leave?"` (a prompt's default text
+    /// after it).
+    pub fn describe(&self) -> String {
+        let kind = match self.kind {
+            DialogKind::Alert => "alert",
+            DialogKind::Confirm => "confirm",
+            DialogKind::Prompt => "prompt",
+            DialogKind::BeforeUnload => "beforeunload",
+        };
+        let mut out = format!("{kind} {:?}", self.message);
+        if self.kind == DialogKind::Prompt {
+            out.push_str(&format!(", default {:?}", self.default_text));
+        }
+        out
+    }
+}
+
+/// The dialog page `id` has open.
+fn dialog_of(s: &Shared, id: u64) -> Option<&DialogInfo> {
+    s.views.get(&id).and_then(|v| v.dialog.as_ref())
 }
 
 /// A pop-up the host made ([`Event::Popup`]), until the app takes it.
@@ -508,24 +547,52 @@ impl WebHost {
         }
     }
 
-    /// Block until browser `id` has finished loading (or `timeout`).
+    /// Block until browser `id` has finished loading (or `timeout`, or it
+    /// opens a dialog, which stops its load until answered). Returns whether
+    /// it has loaded.
     pub fn wait_loaded(&self, id: u64, timeout: Duration) -> bool {
-        self.wait_until(timeout, |s| {
-            s.views.get(&id).is_some_and(|v| v.loaded && !v.loading)
-        })
-        .is_some_and(|s| s.views.get(&id).is_some_and(|v| v.loaded && !v.loading))
+        let loaded = |s: &Shared| s.views.get(&id).is_some_and(|v| v.loaded && !v.loading);
+        self.wait_until(timeout, |s| loaded(s) || dialog_of(s, id).is_some()).is_some_and(|s| loaded(&s))
     }
 
-    /// The main frame's visible text.
+    /// The main frame's visible text; `None` on timeout, or while the page
+    /// has a dialog open (the renderer answers only once it closes).
     pub fn text(&self, id: u64, timeout: Duration) -> Option<String> {
         let req = self.expect_reply(id);
         if !self.send(&Request::Text { id, req }) {
             self.forget_reply(req);
             return None;
         }
-        match self.wait_reply(req, timeout)? {
+        match self.wait_reply_on(id, req, timeout).ok()? {
             Event::Text { text, .. } => Some(text),
             _ => None,
+        }
+    }
+
+    /// Answer page `id`'s dialog `dialog` (see [`Request::Dialog`]) and wait
+    /// up to `timeout` for the host to report it closed: how it closed, which
+    /// is not this answer when it had closed already.
+    pub fn answer_dialog(
+        &self,
+        id: u64,
+        dialog: u64,
+        accept: bool,
+        text: Option<String>,
+        timeout: Duration,
+    ) -> Result<DialogEnd, String> {
+        if !self.send(&Request::Dialog { id, dialog, accept, text }) {
+            return Err("web host is not running".into());
+        }
+        let open = |s: &Shared| dialog_of(s, id).is_some_and(|d| d.dialog == dialog);
+        let s = self.wait_until(timeout, |s| !open(s)).ok_or("web host is not running")?;
+        if open(&s) {
+            return Err(format!("the host didn't close the dialog within {}s", timeout.as_secs_f32()));
+        }
+        let ended = s.views.get(&id).and_then(|v| v.dialog_ended.as_ref());
+        match ended {
+            Some((d, end)) if d.dialog == dialog => Ok(*end),
+            // The page closed, or the host exited.
+            _ => Ok(DialogEnd::Cancelled),
         }
     }
 
@@ -550,11 +617,15 @@ impl WebHost {
             self.forget_reply(req);
             return Err("web host is not running".into());
         }
-        match self.wait_reply(req, timeout) {
-            Some(Event::EvalResult {
+        match self.wait_reply_on(id, req, timeout) {
+            Ok(Event::EvalResult {
                 ok: true, value, ..
             }) => Ok(value),
-            Some(Event::EvalResult { value, .. }) => Err(value),
+            Ok(Event::EvalResult { value, .. }) => Err(value),
+            Err(Some(d)) => Err(format!(
+                "the page has a dialog open ({}), which stops it until answered; the eval's result is dropped",
+                d.describe()
+            )),
             _ => Err(format!("no result within {}s", timeout.as_secs_f32())),
         }
     }
@@ -572,12 +643,19 @@ impl WebHost {
         s.replies.remove(&req);
     }
 
-    /// The reply to `req`, or `None` on timeout or exit. Either way the request
-    /// is no longer pending, so a late reply is dropped.
-    fn wait_reply(&self, req: u64, timeout: Duration) -> Option<Event> {
-        let mut s = self.wait_until(timeout, |s| s.replies.contains_key(&req))?;
+    /// The reply to `req` about page `id`; else the dialog page `id` has
+    /// open, which holds the reply back until it closes; else `Err(None)` on
+    /// timeout or exit. Either way the request is no longer pending, so a
+    /// late reply is dropped.
+    fn wait_reply_on(&self, id: u64, req: u64, timeout: Duration) -> Result<Event, Option<DialogInfo>> {
+        let mut s = self
+            .wait_until(timeout, |s| s.replies.contains_key(&req) || dialog_of(s, id).is_some())
+            .ok_or(None)?;
         s.pending.remove(&req);
-        s.replies.remove(&req)
+        match s.replies.remove(&req) {
+            Some(reply) => Ok(reply),
+            None => Err(dialog_of(&s, id).cloned()),
+        }
     }
 
     /// Wait for `done` (or exit/timeout), returning the locked state.
@@ -771,6 +849,15 @@ fn apply_event(shared: &(Mutex<Shared>, Condvar), ev: Event) -> Vec<u64> {
             s.views.entry(id).or_default().error = Some(format!("{error} ({url})"));
         }
         Event::RendererGone { id, error } => s.views.entry(id).or_default().gone = Some(error),
+        Event::Dialog { id, dialog, kind, message, default_text, url } => {
+            s.views.entry(id).or_default().dialog = Some(DialogInfo { dialog, kind, message, default_text, url });
+        }
+        Event::DialogClosed { id, dialog, end } => {
+            let v = s.views.entry(id).or_default();
+            if v.dialog.as_ref().is_some_and(|d| d.dialog == dialog) {
+                v.dialog_ended = v.dialog.take().map(|d| (d, end));
+            }
+        }
         Event::Popup { id, opener, url, from_input, kind, width, height } => {
             s.views.entry(id).or_default().url.clone_from(&url);
             let p = PopupInfo { id, opener, url, from_input, kind, width, height };
@@ -857,6 +944,8 @@ fn page_of(ev: &Event) -> Option<u64> {
         | Event::Cursor { id, .. }
         | Event::LoadError { id, .. }
         | Event::RendererGone { id, .. }
+        | Event::Dialog { id, .. }
+        | Event::DialogClosed { id, .. }
         | Event::Popup { id, .. }
         | Event::PopupRefused { opener: id, .. } => Some(*id),
         _ => None,
@@ -1249,5 +1338,70 @@ mod tests {
         let s = shared.0.lock().unwrap();
         assert_eq!(s.replies.get(&7), Some(&eval_result(2, 7, "2")));
         assert!(s.pending.is_empty());
+    }
+
+    fn dialog_event(id: u64, dialog: u64) -> Event {
+        Event::Dialog {
+            id,
+            dialog,
+            kind: DialogKind::Confirm,
+            message: "Sure?".into(),
+            default_text: String::new(),
+            url: "https://a.test/".into(),
+        }
+    }
+
+    /// Given a page with a dialog open;
+    /// when another dialog's close, then its own, is reported;
+    /// then only its own closes it, and how it closed is kept.
+    #[test]
+    fn a_dialog_is_open_until_its_own_close() {
+        let shared: (Mutex<Shared>, Condvar) = Default::default();
+        apply_event(&shared, dialog_event(1, 5));
+        let view = |s: &(Mutex<Shared>, Condvar)| s.0.lock().unwrap().views[&1].clone();
+        assert_eq!(view(&shared).dialog.map(|d| d.describe()).as_deref(), Some(r#"confirm "Sure?""#));
+        apply_event(&shared, Event::DialogClosed { id: 1, dialog: 4, end: DialogEnd::Accepted });
+        assert!(view(&shared).dialog.is_some(), "another dialog's close");
+        apply_event(&shared, Event::DialogClosed { id: 1, dialog: 5, end: DialogEnd::TimedOut });
+        let v = view(&shared);
+        assert!(v.dialog.is_none());
+        assert_eq!(v.dialog_ended.map(|(d, end)| (d.dialog, end)), Some((5, DialogEnd::TimedOut)));
+    }
+
+    /// Given a host that opens a dialog when asked for an eval, a text read
+    /// or a load, and closes it when answered;
+    /// when the app evals, reads the text and waits for the load;
+    /// then each returns at once with the dialog rather than waiting out
+    /// its timeout, and an answer returns once the host reports it closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_dialog_ends_the_waits_on_its_page() {
+        let script = format!(
+            r#"echo '{{"ev":"ready","protocol":{PROTOCOL_VERSION}}}'
+            echo '{{"ev":"loading","id":1,"loading":true,"can_back":false,"can_forward":false}}'
+            while read l; do case "$l" in
+             *'"op":"eval"'*) echo '{dialog}';;
+             *'"op":"dialog"'*'"accept":true'*) echo '{{"ev":"dialog_closed","id":1,"dialog":5,"end":"accepted"}}';;
+            esac; done"#,
+            dialog = serde_json::to_string(&dialog_event(1, 5)).unwrap(),
+        );
+        let mut sh = Command::new("/bin/sh");
+        sh.args(["-c", &script]);
+        let host = WebHost::start(sh, None).unwrap();
+        assert!(host.wait_ready(Duration::from_secs(10)));
+        let long = Duration::from_secs(30);
+        let t = Instant::now();
+        let err = host.eval(1, "confirm('Sure?')", long).unwrap_err();
+        assert!(err.contains(r#"dialog open (confirm "Sure?")"#), "{err}");
+        assert!(!host.wait_loaded(1, long), "still loading");
+        assert_eq!(host.text(1, long), None);
+        assert!(t.elapsed() < Duration::from_secs(10), "waited {:?}", t.elapsed());
+        assert!(host.shared.0.lock().unwrap().pending.is_empty(), "the late replies are dropped");
+
+        assert_eq!(host.answer_dialog(1, 5, true, None, long), Ok(DialogEnd::Accepted));
+        assert!(host.view(1).unwrap().dialog.is_none());
+        let pid = host.pid().unwrap();
+        drop(host);
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
 }

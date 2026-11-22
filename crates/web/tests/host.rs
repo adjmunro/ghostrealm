@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::{host_exe, running, shut_down};
 use ghostrealm_web::client::HIDDEN_EVAL;
 use ghostrealm_web::protocol::{link_script, mods, Key, KeyKind, UNSEEN_FRAME_RATE};
-use ghostrealm_web::{MouseAction, MouseButton, PopupKind, Request, WebHost};
+use ghostrealm_web::{DialogEnd, DialogInfo, DialogKind, MouseAction, MouseButton, PopupKind, Request, WebHost};
 
 /// Hosts this suite runs at once. Each is a browser, GPU, network and
 /// renderer processes; unbounded, the suite's two dozen hosts load the
@@ -1762,6 +1762,167 @@ fn an_expired_eval_making_the_world_does_not_block_later_ones() {
     // Past the TTL: the first eval is expired, and this one makes the world
     // once the page is free.
     assert_eq!(host.eval(1, "document.title", Duration::from_secs(10)), Ok("\"Busy\"".into()));
+
+    shut_down(host, &cache);
+}
+
+/// Run `js`, which opens a dialog on page `id`, and return that dialog: the
+/// eval gives up on its result once the dialog opens.
+fn open_dialog(host: &WebHost, id: u64, js: &str) -> DialogInfo {
+    let result = host.eval(id, js, Duration::from_secs(10));
+    assert!(result.as_ref().is_err_and(|e| e.contains("dialog open")), "{result:?}");
+    host.view(id).and_then(|v| v.dialog).expect("the dialog the eval reported")
+}
+
+/// Wait for `js` on page `id` to give `want` (the script that opened a
+/// dialog finishes once it is answered).
+fn wait_eval(host: &WebHost, id: u64, js: &str, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = host.eval(id, js, Duration::from_secs(5));
+        if got.as_deref() == Ok(want) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{js} is {got:?}, not {want}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn create(host: &WebHost, id: u64, url: &str, agent: bool) {
+    assert!(host.send(&Request::Create { id, url: url.into(), width: 200, height: 150, scale: 1.0, agent, opener: None }));
+    assert!(host.wait_loaded(id, Duration::from_secs(20)), "page {id} never loaded");
+}
+
+/// Given an agent's page;
+/// when its script opens a confirm, a prompt and an alert, and the agent
+/// answers each (one with an older dialog's number first);
+/// then each is held open and reported with its kind, message and default
+/// text, the script gets the answer, and an answer naming a dialog no longer
+/// open answers nothing.
+#[test]
+fn an_agents_dialogs_are_held_reported_and_answered() {
+    let Some((host, cache)) = spawn("dialogs") else {
+        return;
+    };
+    create(&host, 1, &data_url("<title>Dialogs</title><body>"), true);
+    let wait = Duration::from_secs(5);
+
+    let d = open_dialog(&host, 1, "document.body.dataset.r = String(confirm('Sure?'))");
+    assert_eq!((d.kind, d.message.as_str()), (DialogKind::Confirm, "Sure?"));
+    assert!(d.url.starts_with("data:text/html"), "{d:?}");
+    assert_eq!(host.text(1, Duration::from_millis(500)), None, "the renderer waits on the dialog");
+    assert_eq!(host.answer_dialog(1, d.dialog, true, None, wait), Ok(DialogEnd::Accepted));
+    wait_eval(&host, 1, "document.body.dataset.r", "\"true\"");
+
+    let p = open_dialog(&host, 1, "document.body.dataset.p = String(prompt('Name?', 'anon'))");
+    assert_eq!((p.kind, p.message.as_str(), p.default_text.as_str()), (DialogKind::Prompt, "Name?", "anon"));
+    assert_ne!(p.dialog, d.dialog);
+    // The confirm's number: it answers nothing, and the prompt stays open.
+    assert_eq!(host.answer_dialog(1, d.dialog, false, None, wait), Ok(DialogEnd::Accepted));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(host.view(1).and_then(|v| v.dialog).map(|o| o.dialog), Some(p.dialog));
+    assert_eq!(host.answer_dialog(1, p.dialog, true, Some("Ada".into()), wait), Ok(DialogEnd::Accepted));
+    wait_eval(&host, 1, "document.body.dataset.p", "\"Ada\"");
+
+    let p = open_dialog(&host, 1, "document.body.dataset.p = String(prompt('Name?', 'anon'))");
+    assert_eq!(host.answer_dialog(1, p.dialog, true, None, wait), Ok(DialogEnd::Accepted));
+    wait_eval(&host, 1, "document.body.dataset.p", "\"anon\"");
+    let p = open_dialog(&host, 1, "document.body.dataset.p = String(prompt('Name?', 'anon'))");
+    assert_eq!(host.answer_dialog(1, p.dialog, false, Some("ignored".into()), wait), Ok(DialogEnd::Dismissed));
+    wait_eval(&host, 1, "document.body.dataset.p", "\"null\"");
+
+    let a = open_dialog(&host, 1, "alert('Hello'); document.body.dataset.a = 'done'");
+    assert_eq!((a.kind, a.message.as_str()), (DialogKind::Alert, "Hello"));
+    assert_eq!(host.answer_dialog(1, a.dialog, false, None, wait), Ok(DialogEnd::Dismissed));
+    wait_eval(&host, 1, "document.body.dataset.a", "\"done\"");
+
+    // A navigation cancels the dialog open.
+    let c = open_dialog(&host, 1, "confirm('Again?')");
+    host.expect_load(1);
+    assert!(host.send(&Request::Navigate { id: 1, url: data_url("<title>Next</title>") }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.view(1).unwrap().dialog.is_some() {
+        assert!(Instant::now() < deadline, "the navigation left the dialog open");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let v = host.view(1).unwrap();
+    assert_eq!(v.dialog_ended.map(|(d, end)| (d.dialog, end)), Some((c.dialog, DialogEnd::Cancelled)));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "the next page never loaded");
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Next\"".into()));
+
+    shut_down(host, &cache);
+}
+
+/// Given an agent's page and a person's, each with a confirm open, and a
+/// dialog timeout of 500ms;
+/// when nothing answers for 1.5s;
+/// then the agent's is dismissed as timed out (the script gets `false`), and
+/// the person's is still open until answered.
+#[test]
+fn only_an_agents_unanswered_dialog_times_out() {
+    let Some((host, cache)) = spawn_with("dialog-timeout", &[("GHOSTREALM_WEB_DIALOG_TIMEOUT_MS", "500")]) else {
+        return;
+    };
+    let page = data_url("<title>Wait</title><body>");
+    create(&host, 1, &page, true);
+    create(&host, 2, &page, false);
+    let agents = open_dialog(&host, 1, "document.body.dataset.r = String(confirm('Agent?'))");
+    let persons = open_dialog(&host, 2, "document.body.dataset.r = String(confirm('Person?'))");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let v = host.view(1).unwrap();
+    assert!(v.dialog.is_none(), "{v:?}");
+    assert_eq!(v.dialog_ended.map(|(d, end)| (d.dialog, end)), Some((agents.dialog, DialogEnd::TimedOut)));
+    wait_eval(&host, 1, "document.body.dataset.r", "\"false\"");
+    let late = host.answer_dialog(1, agents.dialog, true, None, Duration::from_secs(5));
+    assert_eq!(late, Ok(DialogEnd::TimedOut), "a late answer changes nothing");
+
+    assert_eq!(host.view(2).and_then(|v| v.dialog).map(|d| d.dialog), Some(persons.dialog));
+    assert_eq!(host.answer_dialog(2, persons.dialog, true, None, Duration::from_secs(5)), Ok(DialogEnd::Accepted));
+    wait_eval(&host, 2, "document.body.dataset.r", "\"true\"");
+
+    shut_down(host, &cache);
+}
+
+/// Given an agent's page with a `beforeunload` handler that a gesture has
+/// armed;
+/// when the agent navigates away, stays, and navigates again, leaving;
+/// then each navigation asks with a beforeunload dialog, staying keeps the
+/// page, and leaving loads the next one.
+#[test]
+fn leaving_a_page_that_asks_waits_for_the_answer() {
+    let Some((host, cache)) = spawn("dialog-unload") else {
+        return;
+    };
+    let asks = data_url(
+        "<title>Asks</title><script>addEventListener('beforeunload', e => { e.preventDefault(); e.returnValue = ''; })</script>",
+    );
+    create(&host, 1, &asks, true);
+    // Chromium asks only once the page has had a user activation.
+    assert_eq!(host.eval_as(1, "1", true, Duration::from_secs(5)), Ok("1".into()));
+    let next = data_url("<title>Next</title>");
+    let ask = |host: &WebHost| {
+        assert!(host.send(&Request::Navigate { id: 1, url: next.clone() }));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(d) = host.view(1).and_then(|v| v.dialog) {
+                return d;
+            }
+            assert!(Instant::now() < deadline, "no beforeunload dialog");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let d = ask(&host);
+    assert_eq!(d.kind, DialogKind::BeforeUnload);
+    assert_eq!(host.answer_dialog(1, d.dialog, false, None, Duration::from_secs(5)), Ok(DialogEnd::Dismissed));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Asks\"".into()));
+
+    let d = ask(&host);
+    host.expect_load(1);
+    assert_eq!(host.answer_dialog(1, d.dialog, true, None, Duration::from_secs(5)), Ok(DialogEnd::Accepted));
+    assert!(host.wait_loaded(1, Duration::from_secs(20)), "the next page never loaded");
+    assert_eq!(host.eval(1, "document.title", Duration::from_secs(5)), Ok("\"Next\"".into()));
 
     shut_down(host, &cache);
 }

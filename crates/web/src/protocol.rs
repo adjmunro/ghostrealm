@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// The version of this protocol, frame files included. Bump it whenever a
 /// request, an event, or the frame file layout changes incompatibly: the app
 /// refuses a host that reports another one.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Ids at or above this are pages a host made for pop-ups ([`Event::Popup`]);
 /// the app numbers the pages it creates below it. A pop-up keeps its id when
@@ -25,6 +25,12 @@ pub const UNSEEN_FRAME_RATE: u32 = 10;
 /// more ([`Event::PopupRefused`]). A person's new tab or window doesn't
 /// count: it is a page of its own.
 pub const MAX_POPUPS: usize = 4;
+
+/// How long a dialog on an agent's page ([`Request::Create`]'s `agent`)
+/// waits for [`Request::Dialog`] before the host dismisses it, so a page
+/// whose agent never answers doesn't stay stopped. A person's page waits for
+/// the person.
+pub const AGENT_DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Modifier bits, numerically identical to CEF's `cef_event_flags_t` so the host
 /// passes them through unchanged.
@@ -199,6 +205,49 @@ pub enum Request {
         #[serde(default)]
         gesture: bool,
     },
+    /// Answer dialog `dialog` of page `id` ([`Event::Dialog`]): OK when
+    /// `accept`, else Cancel. `text` is a prompt's answer (its default text
+    /// when `None`). Ignored once that dialog has closed, so a late answer
+    /// never answers the next one.
+    Dialog {
+        id: u64,
+        dialog: u64,
+        accept: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+}
+
+/// What kind of JavaScript dialog a page opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogKind {
+    /// `alert()`: OK only.
+    Alert,
+    /// `confirm()`: OK or Cancel.
+    Confirm,
+    /// `prompt()`: a line of text, OK or Cancel.
+    Prompt,
+    /// A `beforeunload` handler asking whether to leave (or reload) the
+    /// page: OK leaves, Cancel stays.
+    BeforeUnload,
+}
+
+/// How a dialog closed ([`Event::DialogClosed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogEnd {
+    /// Answered OK.
+    Accepted,
+    /// Answered Cancel.
+    Dismissed,
+    /// An agent's page left it unanswered for [`AGENT_DIALOG_TIMEOUT`]: the
+    /// host dismissed it.
+    TimedOut,
+    /// The page navigated, closed or lost its renderer first, or the app
+    /// navigated it (which dismisses the dialog: a renderer waiting on one
+    /// can't unload).
+    Cancelled,
 }
 
 /// How the page asked for a pop-up to open (Chromium's window disposition).
@@ -334,6 +383,27 @@ pub enum Event {
         /// A person's input asked for it, as [`Event::Popup`]'s `from_input`.
         from_input: bool,
     },
+    /// Page `id` opened a JavaScript dialog, number `dialog` (unique in this
+    /// host). The page stops until it is answered ([`Request::Dialog`]) or
+    /// closes another way ([`Event::DialogClosed`]); its evals and text reads
+    /// wait meanwhile. A page has at most one open: the host suppresses
+    /// another while it is.
+    Dialog {
+        id: u64,
+        dialog: u64,
+        kind: DialogKind,
+        message: String,
+        /// A prompt's default answer (empty for the other kinds).
+        default_text: String,
+        /// The address of the document that opened it.
+        url: String,
+    },
+    /// Dialog `dialog` of page `id` closed.
+    DialogClosed {
+        id: u64,
+        dialog: u64,
+        end: DialogEnd,
+    },
     /// The page closed: by a `Close` request, `window.close()`, its opener
     /// closing (a pop-up), or a pop-up that was never made.
     Closed {
@@ -464,6 +534,30 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""ev":"loading""#), "{s}");
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+    }
+
+    #[test]
+    fn dialogs_round_trip_as_tagged_json() {
+        let e = Event::Dialog {
+            id: 1,
+            dialog: 2,
+            kind: DialogKind::BeforeUnload,
+            message: "m".into(),
+            default_text: String::new(),
+            url: "https://a.test/".into(),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""ev":"dialog""#) && s.contains(r#""kind":"before_unload""#), "{s}");
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+        let closed = Event::DialogClosed { id: 1, dialog: 2, end: DialogEnd::TimedOut };
+        let s = serde_json::to_string(&closed).unwrap();
+        assert_eq!(s, r#"{"ev":"dialog_closed","id":1,"dialog":2,"end":"timed_out"}"#);
+        let answer = Request::Dialog { id: 1, dialog: 2, accept: false, text: None };
+        let s = serde_json::to_string(&answer).unwrap();
+        assert_eq!(s, r#"{"op":"dialog","id":1,"dialog":2,"accept":false}"#);
+        let typed = Request::Dialog { id: 1, dialog: 2, accept: true, text: Some("x".into()) };
+        let s = serde_json::to_string(&typed).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), typed);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use cef::*;
 use ghostrealm_web::frame::FrameWriter;
 use ghostrealm_web::protocol::{
-    eval_wrapper, link_script, Cursor, EditAction, Event, Key, KeyKind, PopupKind, MouseAction, MouseButton, Request,
-    MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS, UNSEEN_FRAME_RATE,
+    eval_wrapper, link_script, Cursor, DialogEnd, DialogKind, EditAction, Event, Key, KeyKind, PopupKind, MouseAction,
+    MouseButton, Request, AGENT_DIALOG_TIMEOUT, MAX_EVAL_RESULT, MAX_POPUPS, POPUP_IDS, UNSEEN_FRAME_RATE,
 };
 use serde_json::{json, Value};
 
@@ -66,8 +66,20 @@ struct Entry {
     /// click was in.
     document: u64,
     /// An agent drives it: off screen it stays visible to Chromium
-    /// ([`Request::Visible`]).
+    /// ([`Request::Visible`]), and a dialog it leaves unanswered is
+    /// dismissed after [`AGENT_DIALOG_TIMEOUT`].
     agent: bool,
+    /// The JavaScript dialog it has open.
+    dialog: Option<OpenDialog>,
+}
+
+/// A JavaScript dialog waiting for its answer ([`Request::Dialog`]).
+struct OpenDialog {
+    /// Its number in [`Event::Dialog`].
+    n: u64,
+    callback: JsdialogCallback,
+    /// A prompt's default answer, given when an answer has no text.
+    default_text: String,
 }
 
 /// A link a page asked to open in a new tab, opened through `window.open`.
@@ -139,6 +151,58 @@ thread_local! {
     /// once CEF reports them made or aborted.
     static DROPPED: RefCell<HashMap<u64, (u64, c_int)>> = RefCell::new(HashMap::new());
     static NEXT_LINK: Cell<u64> = const { Cell::new(1) };
+    static NEXT_DIALOG: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Overrides [`AGENT_DIALOG_TIMEOUT`], in milliseconds, so tests can see an
+/// unanswered dialog dismissed quickly.
+const DIALOG_TIMEOUT_ENV: &str = "GHOSTREALM_WEB_DIALOG_TIMEOUT_MS";
+
+fn dialog_timeout() -> Duration {
+    std::env::var(DIALOG_TIMEOUT_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(AGENT_DIALOG_TIMEOUT, Duration::from_millis)
+}
+
+/// Page `id` opened a dialog: hold it for the app's answer, announced as
+/// [`Event::Dialog`]; on an agent's page, dismiss it after
+/// [`dialog_timeout`]. Returns false to have CEF suppress it: the page is
+/// gone, or already has one open.
+fn open_dialog(id: u64, kind: DialogKind, message: String, default_text: String, url: String, callback: JsdialogCallback) -> bool {
+    let n = NEXT_DIALOG.get();
+    let agent = BROWSERS.with_borrow_mut(|m| {
+        let e = m.get_mut(&id).filter(|e| e.dialog.is_none())?;
+        e.dialog = Some(OpenDialog { n, callback, default_text: default_text.clone() });
+        Some(e.agent)
+    });
+    let Some(agent) = agent else { return false };
+    NEXT_DIALOG.set(n + 1);
+    emit(&Event::Dialog { id, dialog: n, kind, message, default_text, url });
+    if agent {
+        let ms = dialog_timeout().as_millis().min(i64::MAX as u128) as i64;
+        post_delayed_task(ThreadId::UI, Some(&mut DialogTimeout::new(id, n)), ms);
+    }
+    true
+}
+
+/// Close page `id`'s dialog `n`, if it is still the one open: `answer` it
+/// (OK or Cancel, and a prompt's text), or leave it unanswered when CEF has
+/// already dropped it.
+fn close_dialog(id: u64, n: Option<u64>, answer: Option<(bool, Option<String>)>, end: DialogEnd) {
+    let open = BROWSERS.with_borrow_mut(|m| {
+        let e = m.get_mut(&id)?;
+        if n.is_some_and(|n| e.dialog.as_ref().is_none_or(|d| d.n != n)) {
+            return None;
+        }
+        e.dialog.take()
+    });
+    let Some(d) = open else { return };
+    if let Some((accept, text)) = answer {
+        let text = CefString::from(text.as_deref().unwrap_or(&d.default_text));
+        d.callback.cont(accept as c_int, Some(&text));
+    }
+    emit(&Event::DialogClosed { id, dialog: d.n, end });
 }
 
 /// The isolated world evals run in. One per document, created on first use:
@@ -583,6 +647,11 @@ pub fn handle(req: Option<Request>) {
             }
         });
     }
+    // A renderer waiting on a dialog can't unload, so the app's navigation
+    // would wait on it: dismiss it first.
+    if let Request::Navigate { id, .. } | Request::Back { id } | Request::Forward { id } | Request::Reload { id } = &req {
+        close_dialog(*id, None, Some((false, None)), DialogEnd::Cancelled);
+    }
     match req {
         Request::Create {
             id,
@@ -682,6 +751,10 @@ pub fn handle(req: Option<Request>) {
             }),
         },
         Request::Eval { id, req, js, gesture } => start_eval(id, req, js, gesture),
+        Request::Dialog { id, dialog, accept, text } => {
+            let end = if accept { DialogEnd::Accepted } else { DialogEnd::Dismissed };
+            close_dialog(id, Some(dialog), Some((accept, text)), end);
+        }
     }
 }
 
@@ -701,7 +774,8 @@ fn req_page(req: &Request) -> Option<u64> {
         | Request::Key { id, .. }
         | Request::Edit { id, .. }
         | Request::Text { id, .. }
-        | Request::Eval { id, .. } => *id,
+        | Request::Eval { id, .. }
+        | Request::Dialog { id, .. } => *id,
         Request::FirstPopup { .. } => return None,
     })
 }
@@ -770,6 +844,7 @@ fn create(id: u64, url: &str, width: u32, height: u32, scale: f32, agent: bool, 
                 links: Vec::new(),
                 document: 0,
                 agent,
+                dialog: None,
             };
             BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
         }
@@ -802,6 +877,7 @@ fn new_client(id: u64, view: &SharedView) -> Client {
         HostLifeSpan::new(id),
         HostContextMenu::new(),
         HostRequests::new(id),
+        HostDialogs::new(id),
     )
 }
 
@@ -1001,6 +1077,7 @@ fn popup_created(id: u64, b: &Browser) {
         links: Vec::new(),
         document: 0,
         agent: p.agent,
+        dialog: None,
     };
     BROWSERS.with_borrow_mut(|m| m.insert(id, entry));
     // Its opener closed meanwhile, or the host is quitting.
@@ -1500,6 +1577,7 @@ wrap_client! {
         life_span: LifeSpanHandler,
         context_menu: ContextMenuHandler,
         request: RequestHandler,
+        dialogs: JsdialogHandler,
     }
 
     impl Client {
@@ -1525,6 +1603,86 @@ wrap_client! {
 
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request.clone())
+        }
+
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(self.dialogs.clone())
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    struct HostDialogs {
+        id: u64,
+    }
+
+    impl JsdialogHandler {
+        /// `alert`, `confirm` and `prompt` wait for the app's answer. One
+        /// opened while another is open is suppressed, as CEF's own dialogs
+        /// do: CEF answers it Cancel.
+        fn on_jsdialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            dialog_type: JsdialogType,
+            message_text: Option<&CefString>,
+            default_prompt_text: Option<&CefString>,
+            callback: Option<&mut JsdialogCallback>,
+            suppress_message: Option<&mut c_int>,
+        ) -> c_int {
+            let kind = match dialog_type {
+                JsdialogType::CONFIRM => DialogKind::Confirm,
+                JsdialogType::PROMPT => DialogKind::Prompt,
+                _ => DialogKind::Alert,
+            };
+            let held = callback.is_some_and(|cb| {
+                open_dialog(self.id, kind, string(message_text), string(default_prompt_text), string(origin_url), cb.clone())
+            });
+            if !held {
+                if let Some(s) = suppress_message {
+                    *s = 1;
+                }
+            }
+            held as c_int
+        }
+
+        /// A `beforeunload` handler asks whether to leave: the app answers,
+        /// as for `confirm`. Unheld, CEF's default lets the page go.
+        fn on_before_unload_dialog(
+            &self,
+            browser: Option<&mut Browser>,
+            message_text: Option<&CefString>,
+            _is_reload: c_int,
+            callback: Option<&mut JsdialogCallback>,
+        ) -> c_int {
+            let url = browser.and_then(|b| b.main_frame()).map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
+            let Some(cb) = callback else { return 0 };
+            if open_dialog(self.id, DialogKind::BeforeUnload, string(message_text), String::new(), url, cb.clone()) {
+                return 1;
+            }
+            // A page with a dialog open can't also ask to leave: stay.
+            cb.cont(0, None);
+            1
+        }
+
+        /// The page navigated, closed or lost its renderer: CEF has dropped
+        /// its dialog.
+        fn on_reset_dialog_state(&self, _browser: Option<&mut Browser>) {
+            close_dialog(self.id, None, None, DialogEnd::Cancelled);
+        }
+    }
+}
+
+// Dismisses an agent's dialog left unanswered ([`dialog_timeout`]).
+wrap_task! {
+    struct DialogTimeout {
+        id: u64,
+        n: u64,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            close_dialog(self.id, Some(self.n), Some((false, None)), DialogEnd::TimedOut);
         }
     }
 }

@@ -10,5 +10,5 @@ pub mod profile;
 pub mod protocol;
 pub mod temp;
 
-pub use client::{find_host, Exiting, FrameInfo, PopupInfo, SharedFrame, ViewState, WebHost};
-pub use protocol::{Cursor, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, PopupKind, Request};
+pub use client::{find_host, DialogInfo, Exiting, FrameInfo, PopupInfo, SharedFrame, ViewState, WebHost};
+pub use protocol::{Cursor, DialogEnd, DialogKind, EditAction, Event, Key, KeyKind, MouseAction, MouseButton, PopupKind, Request};
